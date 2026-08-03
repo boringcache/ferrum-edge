@@ -3,9 +3,9 @@
 //!
 //! Architecture:
 //! - The CNI binary (`bin/ferrum-cni`) is invoked by kubelet during pod
-//!   sandbox setup (and periodically for CNI 1.1 GC). It hands the call
-//!   (ADD/DEL/CHECK/GC + pod identity or valid attachments) to us over a
-//!   Unix socket using the length-prefixed JSON wire format in
+//!   sandbox setup (and periodically for CNI 1.1 STATUS/GC). It hands the
+//!   call (ADD/DEL/CHECK/STATUS/GC + pod identity or valid attachments) to
+//!   us over a Unix socket using the length-prefixed JSON wire format in
 //!   [`crate::cni::rpc`].
 //! - This server runs as a tokio task spawned from
 //!   [`crate::modes::node_agent::run_with_backend`]. It accepts one
@@ -309,7 +309,7 @@ pub fn spawn_cni_listener(
         }
         info!(
             socket_path = %socket_path,
-            "Node-agent CNI listener bound; ferrum-cni binary may now forward ADD/DEL/CHECK/GC calls"
+            "Node-agent CNI listener bound; ferrum-cni binary may now forward ADD/DEL/CHECK/STATUS/GC calls"
         );
 
         let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
@@ -758,6 +758,7 @@ async fn handle_one_connection(
         RpcVerb::Add => CniCallVerb::Add,
         RpcVerb::Del => CniCallVerb::Del,
         RpcVerb::Check => CniCallVerb::Check,
+        RpcVerb::Status => CniCallVerb::Status,
         RpcVerb::Gc => CniCallVerb::Gc,
     };
     if let Err(reason) = request.validate() {

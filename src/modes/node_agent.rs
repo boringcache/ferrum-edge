@@ -1620,17 +1620,27 @@ where
                             });
                             continue;
                         };
-                        if work.request.verb == RpcVerb::Gc
+                        if matches!(work.request.verb, RpcVerb::Gc | RpcVerb::Status)
                             && !startup_ready.load(Ordering::Acquire)
                         {
                             // Durable cleanup snapshots may name IP/map keys
                             // now owned by a replacement pod. Until InitDone,
                             // pod_states is not authoritative enough to prove
                             // those keys unowned, so GC must retry later.
-                            let _ = work.respond.send(CniRpcResponse::Error {
-                                reason: "node-agent initial pod sync is incomplete; retry GC"
-                                    .to_string(),
-                            });
+                            // STATUS is fail-closed on the same gate: the
+                            // node-agent is not yet ready to authoritatively
+                            // service ADD against a complete local view.
+                            let reason = match work.request.verb {
+                                RpcVerb::Status => {
+                                    "node-agent initial pod sync is incomplete; not ready for ADD"
+                                        .to_string()
+                                }
+                                _ => {
+                                    "node-agent initial pod sync is incomplete; retry GC"
+                                        .to_string()
+                                }
+                            };
+                            let _ = work.respond.send(CniRpcResponse::Error { reason });
                             continue;
                         }
                         let enrolled_uid = process_cni_work_item(
@@ -2156,6 +2166,12 @@ pub fn apply_cni_request(
                     reason: "pod not currently enrolled".to_string(),
                 }
             }
+        }
+        RpcVerb::Status => {
+            // Reaching this arm means the CNI listener accepted the request,
+            // validation passed, and the main-loop readiness gate already
+            // confirmed initial pod sync. STATUS carries no attachment work.
+            CniRpcResponse::Ok
         }
         RpcVerb::Gc => {
             // Re-validate on the node-agent side so a hostile or buggy CNI
@@ -14825,6 +14841,51 @@ mod tests {
             "ferrum-mesh",
             "ctr-1",
             "eth0",
+        ));
+    }
+
+    #[test]
+    fn apply_cni_request_status_succeeds_without_attachment_fields() {
+        use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
+
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+
+        let req = CniRpcRequest {
+            verb: RpcVerb::Status,
+            network_name: "ferrum-mesh".to_string(),
+            pod_namespace: String::new(),
+            pod_name: String::new(),
+            pod_uid: None,
+            container_id: String::new(),
+            ifname: None,
+            netns_path: None,
+            args: HashMap::new(),
+            valid_attachments: Vec::new(),
+        };
+        assert_eq!(
+            apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req),
+            CniRpcResponse::Ok
+        );
+        assert!(pod_states.is_empty(), "STATUS must not mutate enrollment");
+
+        let mut malformed = req;
+        malformed.container_id = "ctr-1".to_string();
+        assert!(matches!(
+            apply_cni_request(&mut backend, &pod_states, &config, &metrics, &malformed),
+            CniRpcResponse::Error { .. }
         ));
     }
 

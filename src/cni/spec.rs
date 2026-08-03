@@ -4,12 +4,12 @@
 //! We implement the CNI spec on the wire directly rather than vendoring a
 //! library because Ferrum's CNI surface is intentionally narrow — we chain
 //! behind the cluster's primary CNI (which already does IP allocation,
-//! interface setup, etc.) and only need the ADD/DEL/CHECK/GC lifecycle hook
-//! so the node-agent can enroll pods into eBPF capture deterministically
+//! interface setup, etc.) and only need the ADD/DEL/CHECK/STATUS/GC lifecycle
+//! hook so the node-agent can enroll pods into eBPF capture deterministically
 //! at sandbox setup time, instead of racing the kube-rs watcher.
 //!
-//! Spec reference: <https://github.com/containernetworking/cni/blob/main/SPEC.md>
-//! (we target v0.4.0+ for ADD/DEL/CHECK; GC requires CNI 1.1.0).
+//! Spec reference: <https://github.com/containernetworking/cni/blob/spec-v1.1.0/SPEC.md>
+//! (we target v0.4.0+ for ADD/DEL/CHECK; STATUS and GC require CNI 1.1.0).
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -44,16 +44,17 @@ pub const SUPPORTED_CNI_VERSIONS: &[&str] = &["0.3.0", "0.3.1", "0.4.0", "1.0.0"
 
 /// The CNI command verb supplied via the `CNI_COMMAND` environment variable.
 ///
-/// Ferrum implements the pod-lifecycle verbs (ADD/DEL/CHECK) plus GC on CNI
-/// 1.1.0 configurations. VERSION is the negotiation handshake handled inline
-/// by the binary. Unknown verbs map to [`CniCommand::Unsupported`] so the
-/// binary can emit a structured error result and exit with code 4 per the
-/// spec's error-code table.
+/// Ferrum implements the pod-lifecycle verbs (ADD/DEL/CHECK) plus STATUS and
+/// GC on CNI 1.1.0 configurations. VERSION is the negotiation handshake
+/// handled inline by the binary. Unknown verbs map to
+/// [`CniCommand::Unsupported`] so the binary can emit a structured error
+/// result and exit with code 4 per the spec's error-code table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CniCommand {
     Add,
     Del,
     Check,
+    Status,
     Gc,
     Version,
     Unsupported,
@@ -65,6 +66,7 @@ impl CniCommand {
             Self::Add => "ADD",
             Self::Del => "DEL",
             Self::Check => "CHECK",
+            Self::Status => "STATUS",
             Self::Gc => "GC",
             Self::Version => "VERSION",
             Self::Unsupported => "UNSUPPORTED",
@@ -80,6 +82,7 @@ impl FromStr for CniCommand {
             "ADD" => Self::Add,
             "DEL" => Self::Del,
             "CHECK" => Self::Check,
+            "STATUS" => Self::Status,
             "GC" => Self::Gc,
             "VERSION" => Self::Version,
             _ => Self::Unsupported,
@@ -94,10 +97,17 @@ pub fn is_supported_cni_version(version: &str) -> bool {
         .any(|supported| *supported == version.trim())
 }
 
+/// STATUS and GC are defined by CNI 1.1.0. Older negotiated versions keep
+/// ADD/DEL/CHECK only and must fail closed on those verbs rather than
+/// advertising incomplete 1.1 protocol support.
+pub fn cni_version_supports_status(version: &str) -> bool {
+    version.trim() == "1.1.0"
+}
+
 /// GC is defined by CNI 1.1.0. Older negotiated versions keep ADD/DEL/CHECK
 /// only and must fail closed on GC rather than silently ignoring stale state.
 pub fn cni_version_supports_gc(version: &str) -> bool {
-    version.trim() == "1.1.0"
+    cni_version_supports_status(version)
 }
 
 /// Parsed CNI invocation environment as defined by SPEC §2.1 (Parameters).
@@ -108,8 +118,8 @@ pub fn cni_version_supports_gc(version: &str) -> bool {
 /// semicolon-separated form (e.g. `K8S_POD_NAMESPACE=foo;K8S_POD_NAME=bar`)
 /// — see [`parse_cni_args`] for the parsed map.
 ///
-/// GC and VERSION do not carry attachment parameters; those commands leave
-/// `container_id` empty and optional fields unset.
+/// STATUS, GC, and VERSION do not carry attachment parameters; those
+/// commands leave `container_id` empty and optional fields unset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CniInvocation {
     pub command: CniCommand,
@@ -149,6 +159,18 @@ impl CniInvocation {
                 args: None,
                 path: env::var("CNI_PATH").ok().filter(|v| !v.trim().is_empty()),
             }),
+            CniCommand::Status => {
+                // SPEC §2 STATUS: only CNI_COMMAND is required. CNI_PATH is
+                // optional. Attachment parameters are not part of STATUS.
+                Ok(Self {
+                    command,
+                    container_id: String::new(),
+                    netns: None,
+                    ifname: None,
+                    args: None,
+                    path: env::var("CNI_PATH").ok().filter(|v| !v.trim().is_empty()),
+                })
+            }
             CniCommand::Gc => {
                 // SPEC §2 GC: only CNI_COMMAND + CNI_PATH are required; there
                 // are no attachment parameters.
@@ -584,8 +606,8 @@ pub struct CniErrorResult {
 }
 
 /// Closed set of CNI errors the binary returns. Codes 1-99 are reserved
-/// for plugin-specific errors per the spec; 1-7 are the spec-defined
-/// values we map onto.
+/// for plugin-specific errors per the spec; 1-7 are the common
+/// values we map onto, and 50/51 are the CNI 1.1 STATUS availability codes.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CniError {
     #[error("required environment variable {0} is missing or invalid")]
@@ -600,6 +622,14 @@ pub enum CniError {
     Rejected(String),
     #[error("unsupported CNI command")]
     UnsupportedCommand,
+    /// CNI 1.1 STATUS code 50: plugin cannot service ADD requests.
+    #[error("CNI plugin is not available: {0}")]
+    NotAvailable(String),
+    /// CNI 1.1 STATUS code 51: unavailable and existing attachments may be
+    /// degraded. Reserved for cases where Ferrum knows capture/connectivity
+    /// for already-enrolled pods may also be limited.
+    #[error("CNI plugin is not available and existing containers may have limited connectivity: {0}")]
+    NotAvailableDegraded(String),
 }
 
 impl CniError {
@@ -615,6 +645,8 @@ impl CniError {
             Self::UnsupportedVersion => 1,
             Self::IpcFailed(_) => 11,
             Self::Rejected(_) => 12,
+            Self::NotAvailable(_) => 50,
+            Self::NotAvailableDegraded(_) => 51,
         }
     }
 }
@@ -639,18 +671,23 @@ mod tests {
         assert_eq!(CniCommand::from_str("ADD"), Ok(CniCommand::Add));
         assert_eq!(CniCommand::from_str("del"), Ok(CniCommand::Del));
         assert_eq!(CniCommand::from_str("Check"), Ok(CniCommand::Check));
+        assert_eq!(CniCommand::from_str("STATUS"), Ok(CniCommand::Status));
+        assert_eq!(CniCommand::from_str("status"), Ok(CniCommand::Status));
         assert_eq!(CniCommand::from_str("GC"), Ok(CniCommand::Gc));
         assert_eq!(CniCommand::from_str("VERSION"), Ok(CniCommand::Version));
     }
 
     #[test]
     fn parse_cni_command_unknown_maps_to_unsupported() {
-        assert_eq!(CniCommand::from_str("STATUS"), Ok(CniCommand::Unsupported));
         assert_eq!(CniCommand::from_str("FOO"), Ok(CniCommand::Unsupported));
+        assert_eq!(CniCommand::from_str("PING"), Ok(CniCommand::Unsupported));
     }
 
     #[test]
-    fn gc_requires_cni_1_1() {
+    fn status_and_gc_require_cni_1_1() {
+        assert!(cni_version_supports_status("1.1.0"));
+        assert!(!cni_version_supports_status("1.0.0"));
+        assert!(!cni_version_supports_status("0.4.0"));
         assert!(cni_version_supports_gc("1.1.0"));
         assert!(!cni_version_supports_gc("1.0.0"));
         assert!(!cni_version_supports_gc("0.4.0"));
@@ -835,6 +872,8 @@ mod tests {
         assert_eq!(CniError::UnsupportedVersion.code(), 1);
         assert_eq!(CniError::IpcFailed("x".to_string()).code(), 11);
         assert_eq!(CniError::Rejected("x".to_string()).code(), 12);
+        assert_eq!(CniError::NotAvailable("x".to_string()).code(), 50);
+        assert_eq!(CniError::NotAvailableDegraded("x".to_string()).code(), 51);
     }
 
     #[test]

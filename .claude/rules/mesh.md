@@ -166,7 +166,8 @@ Keep two things distinct: the **transport** (how a peer is reached on the wire) 
 - JWT secrets in injected manifests use `SecretKeyRef`, never plaintext.
 - Opt in with `ferrum.io/inject=true` or `ferrum.io/mesh=enabled`; opt out with `sidecar.istio.io/inject=false` or `ferrum.io/inject=false`.
 - Node-agent CNI is opt-in with `FERRUM_NODE_AGENT_CNI_ENABLED=false` by default.
-- When enabled, node-agent binds `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` and the `ferrum-cni` binary forwards kubelet ADD/DEL/CHECK/GC over that socket.
+- When enabled, node-agent binds `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` and the `ferrum-cni` binary forwards kubelet ADD/DEL/CHECK/STATUS/GC over that socket.
+- STATUS (CNI 1.1.0 only) is a fail-closed readiness probe: success means the node-agent listener is up and the main loop has completed initial pod sync so ADD can be serviced; socket/IPC failure or not-ready replies map to CNI error code 50 without attachment fields or secret/input echoing. Older negotiated versions keep ADD/DEL/CHECK and fail closed on STATUS.
 - GC (CNI 1.1.0 only) reconciles Ferrum-owned CNI attachments against the required `cni.dev/attachments` valid set and never removes watcher-only, another CNI network's, another pod's, or foreign-generation state. Ownership is mirrored into a crash-safe durable file beside the absolute `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` (bound to the exact socket path identity) so GC can rehydrate Ferrum-owned `(network, containerID, ifname) -> pod UID` identity and the cleanup snapshot required to tear down stale eBPF state after node-agent restart. GC waits for the initial pod relist before using restored cleanup keys; rejected durable state and unresolved enrollment ownership fail closed without sweeping.
 - kube-rs watcher remains source of truth; CNI only closes the kubelet-vs-watcher race and does not carry labels or annotations.
 

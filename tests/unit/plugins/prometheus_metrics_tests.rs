@@ -479,6 +479,9 @@ async fn test_registry_renders_node_agent_metrics_when_registered() {
         output.contains("ferrum_node_agent_cni_calls_total{verb=\"gc\",outcome=\"success\"} 0")
     );
     assert!(
+        output.contains("ferrum_node_agent_cni_calls_total{verb=\"status\",outcome=\"success\"} 0")
+    );
+    assert!(
         output.contains("ferrum_node_agent_cni_calls_total{verb=\"add\",outcome=\"success\"} 0")
     );
     assert!(output.contains("# TYPE ferrum_node_agent_capture_state gauge"));

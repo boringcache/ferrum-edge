@@ -71,6 +71,23 @@ fn run_ferrum_cni_gc(stdin_config: serde_json::Value) -> std::process::Output {
     child.wait_with_output().expect("wait ferrum-cni")
 }
 
+fn run_ferrum_cni_status(stdin_config: serde_json::Value) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
+        .env("CNI_COMMAND", "STATUS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferrum-cni");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(stdin_config.to_string().as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait ferrum-cni")
+}
+
 /// Drive one synthetic CNI ADD round-trip: client sends the framed
 /// request, listener task accepts the connection, work item arrives in
 /// the queue, a stub "main loop" replies `Ok`, response wire-encodes
@@ -737,4 +754,337 @@ async fn ferrum_cni_binary_gc_exits_zero_on_ok() {
     drained.await.expect("drainer joined");
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), listener).await;
+}
+
+/// STATUS wire round-trip: readiness probe reaches the main-loop work item
+/// without attachment fields and records a `status` success metric.
+#[tokio::test]
+async fn cni_status_round_trip_forwards_without_attachment_fields() {
+    let dir = tempdir().expect("tempdir");
+    let socket_path = dir.path().join("agent.sock");
+    let socket_path_str = socket_path.to_string_lossy().to_string();
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    let (work_tx, mut work_rx) = cni_work_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let drained = tokio::spawn(async move {
+        let work = work_rx.recv().await.expect("work item arrives");
+        assert_eq!(work.request.verb, RpcVerb::Status);
+        assert!(work.request.pod_namespace.is_empty());
+        assert!(work.request.pod_name.is_empty());
+        assert!(work.request.pod_uid.is_none());
+        assert!(work.request.container_id.is_empty());
+        assert!(work.request.ifname.is_none());
+        assert!(work.request.netns_path.is_none());
+        assert!(work.request.args.is_empty());
+        assert!(work.request.valid_attachments.is_empty());
+        let _ = work.respond.send(CniRpcResponse::Ok);
+    });
+
+    let listener = spawn_cni_listener(
+        socket_path_str.clone(),
+        work_tx,
+        metrics.clone(),
+        shutdown_rx,
+    );
+
+    let resp = tokio::task::spawn_blocking(move || {
+        let req = CniRpcRequest {
+            verb: RpcVerb::Status,
+            network_name: "ferrum-mesh-chain".to_string(),
+            pod_namespace: String::new(),
+            pod_name: String::new(),
+            pod_uid: None,
+            container_id: String::new(),
+            ifname: None,
+            netns_path: None,
+            args: std::collections::HashMap::new(),
+            valid_attachments: Vec::new(),
+        };
+        let mut last_err = None;
+        for _ in 0..50 {
+            match send_rpc(&socket_path_str, &req, Duration::from_secs(2)) {
+                Ok(resp) => return Ok::<_, String>(resp),
+                Err(err) => {
+                    last_err = Some(format!("{err}"));
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| "no error captured".to_string()))
+    })
+    .await
+    .expect("blocking task joined")
+    .expect("client RPC eventually succeeds");
+    assert_eq!(resp, CniRpcResponse::Ok);
+
+    drained.await.expect("drainer joined");
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot.cni_calls[ferrum_edge::ebpf::CniCallVerb::Status as usize]
+            [ferrum_edge::ebpf::CniCallOutcome::Success as usize],
+        1,
+        "expected one STATUS success in metrics"
+    );
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), listener).await;
+}
+
+/// STATUS on a pre-1.1 configuration must fail closed with unsupported version.
+#[tokio::test]
+async fn ferrum_cni_binary_status_rejects_pre_1_1_version() {
+    let output = tokio::task::spawn_blocking(|| {
+        run_ferrum_cni_status(serde_json::json!({
+            "cniVersion": "1.0.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni"
+        }))
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(
+        !output.status.success(),
+        "STATUS on 1.0.0 must fail closed, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
+    assert_eq!(payload["code"], 1);
+}
+
+/// Attachment-specific reserved fields are malformed on STATUS.
+#[tokio::test]
+async fn ferrum_cni_binary_status_rejects_attachment_fields() {
+    let output = tokio::task::spawn_blocking(|| {
+        run_ferrum_cni_status(serde_json::json!({
+            "cniVersion": "1.1.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni",
+            "cni.dev/attachments": []
+        }))
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(!output.status.success());
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
+    assert_eq!(payload["code"], 7);
+    assert!(
+        payload["msg"]
+            .as_str()
+            .is_some_and(|message| message.contains("cni.dev/attachments")),
+        "unexpected payload: {payload}"
+    );
+}
+
+/// Reserved cni.dev/ misspellings are rejected on STATUS without echoing them.
+#[tokio::test]
+async fn ferrum_cni_binary_status_rejects_reserved_cni_dev_keys() {
+    let output = tokio::task::spawn_blocking(|| {
+        run_ferrum_cni_status(serde_json::json!({
+            "cniVersion": "1.1.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni",
+            "cni.dev/secret-token": "should-not-echo"
+        }))
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(!output.status.success());
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
+    assert_eq!(payload["code"], 7);
+    let message = payload["msg"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("reserved cni.dev/"),
+        "unexpected payload: {payload}"
+    );
+    assert!(
+        !message.contains("should-not-echo"),
+        "STATUS error must not echo reserved-field contents: {message}"
+    );
+}
+
+/// Missing node-agent socket maps to CNI STATUS code 50 without path echoing.
+#[tokio::test]
+async fn ferrum_cni_binary_status_unavailable_when_socket_missing() {
+    let output = tokio::task::spawn_blocking(|| {
+        run_ferrum_cni_status(serde_json::json!({
+            "cniVersion": "1.1.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni",
+            "ferrum": { "socketPath": "/tmp/ferrum-cni-status-missing.sock" }
+        }))
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(!output.status.success());
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
+    assert_eq!(payload["code"], 50);
+    let message = payload["msg"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not available") || message.contains("unavailable"),
+        "unexpected payload: {payload}"
+    );
+    assert!(
+        !message.contains("/tmp/ferrum-cni-status-missing.sock"),
+        "STATUS unavailable error must not echo the socket path: {message}"
+    );
+}
+
+/// Node-agent not-ready replies map to CNI STATUS code 50.
+#[tokio::test]
+async fn ferrum_cni_binary_status_not_ready_maps_to_code_50() {
+    let dir = tempdir().expect("tempdir");
+    let socket_path = dir.path().join("agent.sock");
+    let socket_path_str = socket_path.to_string_lossy().to_string();
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    let (work_tx, mut work_rx) = cni_work_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let drained = tokio::spawn(async move {
+        let work = work_rx.recv().await.expect("work item arrives");
+        assert_eq!(work.request.verb, RpcVerb::Status);
+        let _ = work.respond.send(CniRpcResponse::Error {
+            reason: "node-agent initial pod sync is incomplete; not ready for ADD".to_string(),
+        });
+    });
+
+    let listener = spawn_cni_listener(
+        socket_path_str.clone(),
+        work_tx,
+        metrics.clone(),
+        shutdown_rx,
+    );
+
+    let output = tokio::task::spawn_blocking(move || {
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        run_ferrum_cni_status(serde_json::json!({
+            "cniVersion": "1.1.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni",
+            "ferrum": { "socketPath": socket_path_str }
+        }))
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(!output.status.success());
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
+    assert_eq!(payload["code"], 50);
+    let message = payload["msg"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not ready") || message.contains("not available"),
+        "unexpected payload: {payload}"
+    );
+    assert!(
+        !message.contains("initial pod sync"),
+        "STATUS must use a sanitized availability message: {message}"
+    );
+
+    drained.await.expect("drainer joined");
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), listener).await;
+}
+
+/// Binary-level STATUS against a ready node-agent succeeds with empty stdout.
+#[tokio::test]
+async fn ferrum_cni_binary_status_exits_zero_on_ok() {
+    let dir = tempdir().expect("tempdir");
+    let socket_path = dir.path().join("agent.sock");
+    let socket_path_str = socket_path.to_string_lossy().to_string();
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    let (work_tx, mut work_rx) = cni_work_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let drained = tokio::spawn(async move {
+        let work = work_rx.recv().await.expect("work item arrives");
+        assert_eq!(work.request.verb, RpcVerb::Status);
+        let _ = work.respond.send(CniRpcResponse::Ok);
+    });
+
+    let listener = spawn_cni_listener(
+        socket_path_str.clone(),
+        work_tx,
+        metrics.clone(),
+        shutdown_rx,
+    );
+
+    let output = tokio::task::spawn_blocking(move || {
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        run_ferrum_cni_status(serde_json::json!({
+            "cniVersion": "1.1.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni",
+            "ferrum": { "socketPath": socket_path_str }
+        }))
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(
+        output.status.success(),
+        "STATUS success must exit 0, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "STATUS success must emit no stdout payload"
+    );
+
+    drained.await.expect("drainer joined");
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), listener).await;
+}
+
+#[test]
+fn cni_rpc_status_boundary_rejects_attachment_specific_fields() {
+    let valid_status = CniRpcRequest {
+        verb: RpcVerb::Status,
+        network_name: "ferrum-mesh-chain".to_string(),
+        pod_namespace: String::new(),
+        pod_name: String::new(),
+        pod_uid: None,
+        container_id: String::new(),
+        ifname: None,
+        netns_path: None,
+        args: std::collections::HashMap::new(),
+        valid_attachments: Vec::new(),
+    };
+    assert!(valid_status.validate().is_ok());
+
+    let mut with_pod = valid_status.clone();
+    with_pod.pod_name = "alpha".to_string();
+    assert!(with_pod.validate().is_err());
+
+    let mut with_attachments = valid_status.clone();
+    with_attachments.valid_attachments = vec![ferrum_edge::cni::spec::CniValidAttachment {
+        container_id: "ctr-1".to_string(),
+        ifname: "eth0".to_string(),
+    }];
+    assert!(with_attachments.validate().is_err());
+
+    let mut with_netns = valid_status;
+    with_netns.netns_path = Some("/var/run/netns/cni-1".to_string());
+    assert!(with_netns.validate().is_err());
 }

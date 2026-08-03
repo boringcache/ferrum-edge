@@ -23,14 +23,15 @@ use crate::cni::spec::{
     is_safe_cni_container_id, is_safe_cni_ifname, is_safe_cni_netns_path, is_safe_cni_network_name,
 };
 
-/// Hard cap on a single RPC message. ADD/DEL/CHECK stay tiny; GC may carry a
-/// bounded valid-attachment set. One MiB is deliberately above the CNI stdin
-/// cap so a valid normalized request does not become oversized merely because
-/// the RPC envelope adds fields, while still bounding node-agent allocation.
+/// Hard cap on a single RPC message. ADD/DEL/CHECK/STATUS stay tiny; GC may
+/// carry a bounded valid-attachment set. One MiB is deliberately above the CNI
+/// stdin cap so a valid normalized request does not become oversized merely
+/// because the RPC envelope adds fields, while still bounding node-agent
+/// allocation.
 pub const MAX_RPC_BYTES: usize = 1024 * 1024;
 
 /// Explicit bounds for the pass-through CNI argument map. The map is not used
-/// for GC, but it crosses the same untrusted local RPC boundary.
+/// for STATUS/GC, but it crosses the same untrusted local RPC boundary.
 pub const MAX_RPC_ARGS: usize = 64;
 pub const MAX_RPC_ARG_FIELD_BYTES: usize = 1024;
 
@@ -38,13 +39,14 @@ pub const MAX_RPC_ARG_FIELD_BYTES: usize = 1024;
 pub const LENGTH_PREFIX_BYTES: usize = 4;
 
 /// The verb the CNI binary is asking the node-agent to perform. Mirrors
-/// the CNI `ADD`/`DEL`/`CHECK`/`GC` lifecycle one-for-one.
+/// the CNI `ADD`/`DEL`/`CHECK`/`STATUS`/`GC` lifecycle one-for-one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RpcVerb {
     Add,
     Del,
     Check,
+    Status,
     Gc,
 }
 
@@ -54,6 +56,7 @@ impl RpcVerb {
             Self::Add => "add",
             Self::Del => "del",
             Self::Check => "check",
+            Self::Status => "status",
             Self::Gc => "gc",
         }
     }
@@ -86,10 +89,10 @@ pub struct CniRpcRequest {
     /// CNI network configuration name. GC is authoritative only within this
     /// scope; omitting it would let one network sweep another network's claim.
     pub network_name: String,
-    /// Empty on GC (no attachment parameters).
+    /// Empty on STATUS/GC (no attachment parameters).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pod_namespace: String,
-    /// Empty on GC (no attachment parameters).
+    /// Empty on STATUS/GC (no attachment parameters).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pod_name: String,
     /// Optional because not every CRI surfaces `K8S_POD_UID`. When absent
@@ -97,7 +100,7 @@ pub struct CniRpcRequest {
     /// means the CNI hot path may be a no-op for that pod.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_uid: Option<String>,
-    /// Empty on GC (no attachment parameters).
+    /// Empty on STATUS/GC (no attachment parameters).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub container_id: String,
     /// Interface name from `CNI_IFNAME` on ADD/DEL/CHECK. Combined with
@@ -128,7 +131,7 @@ impl CniRpcRequest {
             return Err("invalid CNI network name".to_string());
         }
 
-        if self.verb == RpcVerb::Gc {
+        if matches!(self.verb, RpcVerb::Gc | RpcVerb::Status) {
             if !self.pod_namespace.is_empty()
                 || !self.pod_name.is_empty()
                 || self.pod_uid.is_some()
@@ -137,7 +140,18 @@ impl CniRpcRequest {
                 || self.netns_path.is_some()
                 || !self.args.is_empty()
             {
-                return Err("GC request contains attachment-specific fields".to_string());
+                return Err(match self.verb {
+                    RpcVerb::Status => {
+                        "STATUS request contains attachment-specific fields".to_string()
+                    }
+                    _ => "GC request contains attachment-specific fields".to_string(),
+                });
+            }
+            if self.verb == RpcVerb::Status {
+                if !self.valid_attachments.is_empty() {
+                    return Err("STATUS request contains a GC attachment set".to_string());
+                }
+                return Ok(());
             }
             ingest_valid_attachments(self.valid_attachments.clone())
                 .map(|_| ())
@@ -270,7 +284,13 @@ mod tests {
 
     #[test]
     fn rpc_verb_round_trips_through_json() {
-        for verb in [RpcVerb::Add, RpcVerb::Del, RpcVerb::Check, RpcVerb::Gc] {
+        for verb in [
+            RpcVerb::Add,
+            RpcVerb::Del,
+            RpcVerb::Check,
+            RpcVerb::Status,
+            RpcVerb::Gc,
+        ] {
             let json = serde_json::to_string(&verb).expect("serialize");
             let back: RpcVerb = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(verb, back);
@@ -395,6 +415,7 @@ mod tests {
         assert_eq!(RpcVerb::Add.metric_label(), "add");
         assert_eq!(RpcVerb::Del.metric_label(), "del");
         assert_eq!(RpcVerb::Check.metric_label(), "check");
+        assert_eq!(RpcVerb::Status.metric_label(), "status");
         assert_eq!(RpcVerb::Gc.metric_label(), "gc");
     }
 
