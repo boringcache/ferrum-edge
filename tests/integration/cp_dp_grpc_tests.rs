@@ -180,6 +180,7 @@ fn create_test_mesh_config() -> GatewayConfig {
                 namespace: Some("ferrum".to_string()),
             },
             service_name: "api".to_string(),
+            service_namespace: None,
             addresses: Vec::new(),
             ports: vec![WorkloadPort {
                 port: 8080,

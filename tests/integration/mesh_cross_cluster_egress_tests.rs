@@ -61,6 +61,7 @@ fn remote_workload(network: Option<&str>) -> Workload {
             namespace: Some("default".to_string()),
         },
         service_name: "svc-b".to_string(),
+        service_namespace: None,
         // A remote pod IP — it must NEVER be dialed directly (the cross-cluster
         // target dials the east-west gateway instead).
         addresses: vec!["10.244.5.5".to_string()],

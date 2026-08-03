@@ -294,6 +294,7 @@ mod tests {
                 namespace: Some(namespace.to_string()),
             },
             service_name: name.to_string(),
+            service_namespace: None,
             addresses: addresses.iter().map(|a| (*a).to_string()).collect(),
             ports: vec![WorkloadPort {
                 port: 27017,

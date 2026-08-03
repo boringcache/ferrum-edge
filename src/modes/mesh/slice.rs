@@ -1145,19 +1145,19 @@ impl MeshSlice {
                     .collect();
             let local_keys: BTreeSet<(&str, &str)> = local_workloads
                 .iter()
-                .map(|w| (w.service_name.as_str(), w.namespace.as_str()))
+                .map(|w| (w.service_name.as_str(), w.attached_service_namespace()))
                 .collect();
+            // Local inbound services are the workload's own attached Service(s).
+            // Key by attached Service identity and do NOT apply subscription /
+            // service-waypoint namespace visibility here: a cross-namespace
+            // WorkloadEntry attachment is authorized upstream (ReferenceGrant),
+            // and gating on the identity/subscription namespace would drop the
+            // only valid inbound anchor (or force a service-waypoint workaround
+            // that then strips unrelated egress-admitted services).
             let services = mesh
                 .services
                 .iter()
-                .filter(|s| {
-                    local_keys.contains(&(s.name.as_str(), s.namespace.as_str()))
-                        && resource_namespace_visible(
-                            &service_waypoint_namespaces,
-                            &s.namespace,
-                            &namespace,
-                        )
-                })
+                .filter(|s| local_keys.contains(&(s.name.as_str(), s.namespace.as_str())))
                 .cloned()
                 .collect::<Vec<_>>();
             (local_workloads, services)
@@ -1757,10 +1757,10 @@ fn narrow_workload_identities(
     workloads
         .into_iter()
         .filter(|workload| {
-            admitted_service_keys
-                .contains(&(workload.namespace.as_str(), workload.service_name.as_str()))
+            let service_ns = workload.attached_service_namespace();
+            admitted_service_keys.contains(&(service_ns, workload.service_name.as_str()))
                 && reachable_workloads.contains(&(
-                    workload.namespace.as_str(),
+                    service_ns,
                     workload.service_name.as_str(),
                     &workload.spiffe_id,
                 ))
@@ -2589,7 +2589,7 @@ pub(crate) fn resolve_local_workloads<'a>(
     // service share its `service_name` and collapse to a single distinct entry.)
     let distinct_services: BTreeSet<(&str, &str)> = matched
         .iter()
-        .map(|w| (w.service_name.as_str(), w.namespace.as_str()))
+        .map(|w| (w.service_name.as_str(), w.attached_service_namespace()))
         .collect();
     if distinct_services.len() > 1 {
         warn!(
@@ -3132,6 +3132,7 @@ mod tests {
                 namespace: Some(namespace.into()),
             },
             service_name: service.into(),
+            service_namespace: None,
             addresses: vec!["10.0.0.1".into()],
             ports: vec![WorkloadPort {
                 port: 8080,
@@ -5923,6 +5924,7 @@ mod tests {
                     namespace: Some("default".into()),
                 },
                 service_name: "v6".into(),
+                service_namespace: None,
                 addresses: vec!["2001:db8::10".into()],
                 ports: vec![WorkloadPort {
                     port: 8080,
@@ -5961,6 +5963,7 @@ mod tests {
                     namespace: Some("default".into()),
                 },
                 service_name: "v6".into(),
+                service_namespace: None,
                 addresses: vec!["[2001:0DB8::10]".into()],
                 ports: Vec::new(),
                 trust_domain,
