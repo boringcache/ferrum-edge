@@ -9093,9 +9093,12 @@ mod tests {
 
         let mut grpc_routes = Vec::new();
         for index in 0..8 {
+            // Identical method predicate so these claim the same conflict key;
+            // distinct methods intentionally do not conflict (see
+            // `distinct_grpc_predicates_on_one_listener_do_not_conflict`).
             let mut route = cross_kind_grpc_route(
                 serde_json::json!({"name": "edge"}),
-                serde_json::json!({"method": format!("SayHello{index}")}),
+                serde_json::json!({"method": "SayHello"}),
             );
             route.metadata.name = format!("grpc-{index}");
             route.metadata.creation_timestamp = Some(format!("2026-01-{:02}T00:00:00Z", index + 1));
