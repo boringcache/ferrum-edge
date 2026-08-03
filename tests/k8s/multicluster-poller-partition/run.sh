@@ -5,11 +5,11 @@ set -euo pipefail
 # through active bounded polling; the only sleeps are polling-loop cadences.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-MANIFESTS="$ROOT_DIR/tests/k8s/multicluster-poller-partition/manifests.yaml"
+FIXTURE_DIR="$ROOT_DIR/tests/k8s/multicluster-poller-partition"
+MANIFESTS="$FIXTURE_DIR/manifests.yaml"
+SPIRE_MANIFESTS="$FIXTURE_DIR/spire-manifests.yaml"
 RESULTS_DIR="${FERRUM_POLLER_RESULTS_DIR:-$ROOT_DIR/target/multicluster-poller-partition}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/.context/multicluster-poller-partition}"
-source ./tests/k8s/lib/live_assertions.sh
-source ./tests/k8s/lib/spire.sh
 
 CLUSTER_A="${CLUSTER_A:-ferrum-poller-a}"
 CLUSTER_B="${CLUSTER_B:-ferrum-poller-b}"
@@ -19,6 +19,11 @@ TOXIPROXY_CONTAINER="${TOXIPROXY_CONTAINER:-ferrum-poller-toxiproxy}"
 TOXIPROXY_IMAGE="${TOXIPROXY_IMAGE:-ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e}"
 NS="${FERRUM_NAMESPACE:-ferrum}"
 SPIRE_NS="${FERRUM_SPIRE_NAMESPACE:-spire-system}"
+SPIRE_SERVER_IMAGE="${FERRUM_SPIRE_SERVER_IMAGE:-ghcr.io/spiffe/spire-server:1.12.4}"
+SPIRE_AGENT_IMAGE="${FERRUM_SPIRE_AGENT_IMAGE:-ghcr.io/spiffe/spire-agent:1.12.4}"
+SPIRE_SERVER_HEALTH_PORT="${FERRUM_SPIRE_SERVER_HEALTH_PORT:-8080}"
+SPIRE_AGENT_HEALTH_PORT="${FERRUM_SPIRE_AGENT_HEALTH_PORT:-8082}"
+SPIRE_BUNDLE_ENDPOINT_PORT="${FERRUM_SPIRE_BUNDLE_ENDPOINT_PORT:-8443}"
 TD_A="${FERRUM_TRUST_DOMAIN_A:-cluster-a.test}"
 TD_B="${FERRUM_TRUST_DOMAIN_B:-cluster-b.test}"
 IMAGE_REPOSITORY="${FERRUM_IMAGE_REPOSITORY:-ferrum-edge}"
@@ -38,6 +43,8 @@ DISC_BA_PORT=15444
 NODE_A="" NODE_B="" TOXI_IP="" ADMIN_SECRET="" JWT_A="" JWT_B=""
 INITIAL_TRUST_AGE=0 INITIAL_ENDPOINT_AGE=0
 INITIAL_FEDERATION_SUCCESS_AT=0 INITIAL_DISCOVERY_SUCCESSES=0
+INITIAL_FEDERATION_FAILURES=0 INITIAL_DISCOVERY_FAILURES=0
+TRANSIENT_FEDERATION_FAILURE_DELTA=0 TRANSIENT_DISCOVERY_FAILURE_DELTA=0
 RECORDED=" "
 
 REQUIRED_LIVE_ASSERTIONS=(
@@ -63,8 +70,8 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "missing required command: $1
 
 record() {
   local id="$1" status="$2" outcome="${3:-}" diagnostic="${4:-}"
-  ferrum_live_record_assertion "$LIVE_ASSERTIONS_FILE" "$id" "$status" \
-    "mesh-dp" "mesh-dp" "$outcome" "" "" "" "$diagnostic"
+  python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py record "$LIVE_ASSERTIONS_FILE" \
+    "$id" "$status" "$outcome" "$diagnostic"
   RECORDED="$RECORDED$id "
 }
 
@@ -110,7 +117,7 @@ run_wait_predicate() {
   case "$predicate" in
     ages_increased_below_stale) ages_increased_below_stale "$@" ;;
     curl) curl "$@" ;;
-    failure_counters_positive) failure_counters_positive "$@" ;;
+    failure_counter_deltas_positive) failure_counter_deltas_positive "$@" ;;
     fresh_state) fresh_state "$@" ;;
     kubectl) kubectl "$@" ;;
     no_configured_state) no_configured_state "$@" ;;
@@ -122,8 +129,93 @@ run_wait_predicate() {
   esac
 }
 
+# Keep this policy-scanned fixture's dependency graph limited to the exact
+# SPIRE operations it uses. Shared live helpers also serve broader suites and
+# expose unrelated automation that this gate neither needs nor should inherit.
+spire_apply_minimal() {
+  local context="$1" trust_domain="$2" namespace="$3"
+  sed -e "s|__SPIRE_NAMESPACE__|$namespace|g" \
+    -e "s|__TRUST_DOMAIN__|$trust_domain|g" \
+    -e "s|__SPIRE_SERVER_IMAGE__|$SPIRE_SERVER_IMAGE|g" \
+    -e "s|__SPIRE_AGENT_IMAGE__|$SPIRE_AGENT_IMAGE|g" \
+    -e "s|__SPIRE_SERVER_HEALTH_PORT__|$SPIRE_SERVER_HEALTH_PORT|g" \
+    -e "s|__SPIRE_AGENT_HEALTH_PORT__|$SPIRE_AGENT_HEALTH_PORT|g" \
+    -e "s|__SPIRE_BUNDLE_ENDPOINT_PORT__|$SPIRE_BUNDLE_ENDPOINT_PORT|g" \
+    "$SPIRE_MANIFESTS" | kubectl --context "$context" apply -f -
+}
+
+spire_wait_ready() {
+  local context="$1" namespace="$2" timeout="$3"
+  kubectl --context "$context" -n "$namespace" rollout status statefulset/spire-server --timeout="$timeout"
+  kubectl --context "$context" -n "$namespace" rollout status daemonset/spire-agent --timeout="$timeout"
+}
+
+spire_agent_nodes() {
+  kubectl --context "$1" -n "$2" get pod -l app=spire-agent \
+    -o jsonpath='{range .items[*]}{.status.phase}{"\t"}{.spec.nodeName}{"\n"}{end}' |
+    awk '$1 == "Running" && $2 != "" {print $2}' | sort -u
+}
+
+spire_server_pod() {
+  kubectl --context "$1" -n "$2" get pod -l app=spire-server \
+    -o jsonpath='{.items[0].metadata.name}'
+}
+
+spire_server_exec() {
+  local context="$1" namespace="$2" pod
+  shift 2
+  pod="$(spire_server_pod "$context" "$namespace")"
+  [[ -n "$pod" ]] || { echo "no spire-server pod found in namespace $namespace" >&2; return 1; }
+  kubectl --context "$context" -n "$namespace" exec "$pod" -- \
+    /opt/spire/bin/spire-server "$@" -socketPath /run/spire/server.sock
+}
+
+spire_entry_has_selectors() {
+  local output="$1" selector
+  shift
+  for selector in "$@"; do
+    grep -q "Selector[[:space:]]*:[[:space:]]*$selector" <<<"$output" || return 1
+  done
+}
+
+spire_parent_id_for_node() {
+  local context="$1" namespace="$2" trust_domain="$3" node_name="$4"
+  local attempts="${FERRUM_SPIRE_AGENT_PARENT_ID_ATTEMPTS:-30}"
+  local sleep_seconds="${FERRUM_SPIRE_AGENT_PARENT_ID_SLEEP_SECONDS:-2}"
+  local node_uid parent_id attempt
+  node_uid="$(kubectl --context "$context" get node "$node_name" -o jsonpath='{.metadata.uid}')"
+  [[ -n "$node_uid" ]] || { echo "node $node_name has no Kubernetes UID" >&2; return 1; }
+  parent_id="spiffe://$trust_domain/spire/agent/k8s_psat/$trust_domain/$node_uid"
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if spire_server_exec "$context" "$namespace" agent show -spiffeID "$parent_id" >/dev/null 2>&1; then
+      printf '%s\n' "$parent_id"
+      return 0
+    fi
+    sleep "$sleep_seconds"
+  done
+  echo "SPIRE agent for node $node_name is not attested" >&2
+  spire_server_exec "$context" "$namespace" agent list >&2 || true
+  return 1
+}
+
+spire_register_workload() {
+  local context="$1" namespace="$2" spiffe_id="$3" parent_id="$4"
+  local workload_namespace="$5" service_account="$6" selector existing=""
+  shift 6
+  local -a selectors=("k8s:ns:$workload_namespace" "k8s:sa:$service_account") args
+  for selector in "$@"; do selectors+=("$selector"); done
+  if existing="$(spire_server_exec "$context" "$namespace" entry show \
+      -spiffeID "$spiffe_id" -parentID "$parent_id" 2>/dev/null)" &&
+    spire_entry_has_selectors "$existing" "${selectors[@]}"; then
+    return 0
+  fi
+  args=(entry create -spiffeID "$spiffe_id" -parentID "$parent_id")
+  for selector in "${selectors[@]}"; do args+=(-selector "$selector"); done
+  spire_server_exec "$context" "$namespace" "${args[@]}"
+}
+
 spire_bundle_b64der() {
-  ferrum_spire_server_exec "$1" "$SPIRE_NS" bundle show -format pem 2>/dev/null |
+  spire_server_exec "$1" "$SPIRE_NS" bundle show -format pem 2>/dev/null |
     awk '/BEGIN CERTIFICATE/{cap=1;buf="";next}/END CERTIFICATE/{if(cap)print buf;cap=0;next}cap{gsub(/[[:space:]]/,"");buf=buf $0}'
 }
 
@@ -218,10 +310,10 @@ generate_transport_material() {
 register_spire_workload() {
   local context="$1" td="$2" node parent
   while IFS= read -r node; do
-    parent="$(ferrum_spire_k8s_psat_agent_parent_id_for_node "$context" "$SPIRE_NS" "$td" "$node")"
-    ferrum_spire_register_k8s_workload "$context" "$SPIRE_NS" \
+    parent="$(spire_parent_id_for_node "$context" "$SPIRE_NS" "$td" "$node")"
+    spire_register_workload "$context" "$SPIRE_NS" \
       "spiffe://$td/ns/$NS/sa/mesh-dp" "$parent" "$NS" mesh-dp "k8s:node-name:$node"
-  done < <(ferrum_spire_agent_nodes "$context" "$SPIRE_NS")
+  done < <(spire_agent_nodes "$context" "$SPIRE_NS")
 }
 
 apply_support_material() {
@@ -381,11 +473,39 @@ metric_value() {
     END {print found ? value : 0}'
 }
 
-failure_counters_positive() {
+metric_file_value() {
+  local file="$1" metric="$2" selector="$3"
+  awk -v metric="$metric" -v selector="$selector" '
+    index($0,metric "{")==1 && index($0,selector) && !found {value=$NF; found=1}
+    END {print found ? value : 0}' "$file"
+}
+
+bounded_uint() {
+  local value="$1" label="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ || ${#value} -gt 18 ]]; then
+    echo "metric is not a bounded unsigned integer: $label" >&2
+    return 1
+  fi
+  printf '%s\n' "$((10#$value))"
+}
+
+metric_uint_value() {
+  local value metric="$3"
+  value="$(metric_value "$@")" || return 1
+  bounded_uint "$value" "$metric"
+}
+
+metric_file_uint_value() {
+  local value metric="$2"
+  value="$(metric_file_value "$@")" || return 1
+  bounded_uint "$value" "$metric"
+}
+
+failure_counter_deltas_positive() {
   local ff df
-  ff="$(metric_value "$1" "$2" ferrum_mesh_federation_poll_failures_total "trust_domain=\"$3\"")"
-  df="$(metric_value "$1" "$2" ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"$4\"")"
-  (( ff > 0 && df > 0 ))
+  ff="$(metric_uint_value "$1" "$2" ferrum_mesh_federation_poll_failures_total "trust_domain=\"$3\"")" || return 1
+  df="$(metric_uint_value "$1" "$2" ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"$4\"")" || return 1
+  (( ff > INITIAL_FEDERATION_FAILURES && df > INITIAL_DISCOVERY_FAILURES ))
 }
 
 ages_between() {
@@ -455,10 +575,10 @@ signal_reload() {
 }
 
 deploy_topology() {
-  ferrum_spire_apply_minimal "$CONTEXT_A" "$TD_A" "$SPIRE_NS"
-  ferrum_spire_apply_minimal "$CONTEXT_B" "$TD_B" "$SPIRE_NS"
-  ferrum_spire_wait_ready "$CONTEXT_A" "$SPIRE_NS" 5m
-  ferrum_spire_wait_ready "$CONTEXT_B" "$SPIRE_NS" 5m
+  spire_apply_minimal "$CONTEXT_A" "$TD_A" "$SPIRE_NS"
+  spire_apply_minimal "$CONTEXT_B" "$TD_B" "$SPIRE_NS"
+  spire_wait_ready "$CONTEXT_A" "$SPIRE_NS" 5m
+  spire_wait_ready "$CONTEXT_B" "$SPIRE_NS" 5m
   register_spire_workload "$CONTEXT_A" "$TD_A"
   register_spire_workload "$CONTEXT_B" "$TD_B"
   ADMIN_SECRET="$(openssl rand -hex 32)"
@@ -483,21 +603,33 @@ scenario_initial() {
   wait_until "A to B initial traffic" 60 traffic_once "$CONTEXT_A" echo-b echo-b
   wait_until "B to A initial traffic" 60 traffic_once "$CONTEXT_B" echo-a echo-a
   capture_boundary "$CONTEXT_A" "$JWT_A" poller.initial.polled_trust_endpoints_installed
+  local initial_metrics="$RESULTS_DIR/poller.initial.polled_trust_endpoints_installed.prom"
+  INITIAL_FEDERATION_FAILURES="$(metric_file_uint_value "$initial_metrics" ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
+  INITIAL_DISCOVERY_FAILURES="$(metric_file_uint_value "$initial_metrics" ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
   record multicluster_poller.initial.polled_trust_endpoints_installed pass "both-directions-polled-and-200" "poller.initial.polled_trust_endpoints_installed.{json,prom}"
 }
 
 scenario_transient() {
   set_all_proxies false
-  wait_until "bounded poll failures" 15 failure_counters_positive "$CONTEXT_A" "$JWT_A" "$TD_B" cluster-b
+  wait_until "bounded poll failure deltas" 15 failure_counter_deltas_positive "$CONTEXT_A" "$JWT_A" "$TD_B" cluster-b
   wait_until "last-good cache ages increase below both stale windows" 12 ages_increased_below_stale "$CONTEXT_A" "$JWT_A" cluster-b
   traffic_once "$CONTEXT_A" echo-b echo-b; traffic_once "$CONTEXT_B" echo-a echo-a
   capture_boundary "$CONTEXT_A" "$JWT_A" poller.transient.last_good_retained
   record multicluster_poller.transient.last_good_retained pass "traffic-200-during-short-partition" "poller.transient.last_good_retained.{json,prom}"
   record multicluster_poller.transient.cache_age_increased pass "trust-and-endpoint-age-3-to-7-seconds" "poller.transient.last_good_retained.json"
-  local ff df
-  ff="$(metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
-  df="$(metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
-  (( ff >= 1 && ff <= 5 && df >= 1 && df <= 5 )) || { echo "unbounded failure series during backoff: federation=$ff discovery=$df" >&2; return 1; }
+  local ff df transient_metrics="$RESULTS_DIR/poller.transient.last_good_retained.prom"
+  ff="$(metric_file_uint_value "$transient_metrics" ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
+  df="$(metric_file_uint_value "$transient_metrics" ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
+  (( ff >= INITIAL_FEDERATION_FAILURES && df >= INITIAL_DISCOVERY_FAILURES )) || {
+    echo "failure counter regressed across partition boundary" >&2; return 1;
+  }
+  TRANSIENT_FEDERATION_FAILURE_DELTA=$((ff - INITIAL_FEDERATION_FAILURES))
+  TRANSIENT_DISCOVERY_FAILURE_DELTA=$((df - INITIAL_DISCOVERY_FAILURES))
+  (( TRANSIENT_FEDERATION_FAILURE_DELTA >= 1 && TRANSIENT_FEDERATION_FAILURE_DELTA <= 5 &&
+     TRANSIENT_DISCOVERY_FAILURE_DELTA >= 1 && TRANSIENT_DISCOVERY_FAILURE_DELTA <= 5 )) || {
+    echo "unbounded partition failure deltas during backoff: federation=$TRANSIENT_FEDERATION_FAILURE_DELTA discovery=$TRANSIENT_DISCOVERY_FAILURE_DELTA" >&2
+    return 1
+  }
   set_all_proxies true
   wait_until "same-generation transient recovery" 40 fresh_state "$CONTEXT_A" "$JWT_A" cluster-b
   wait_until "same-generation reverse recovery" 40 fresh_state "$CONTEXT_B" "$JWT_B" cluster-a
@@ -509,7 +641,9 @@ scenario_transient() {
   }
   assert_metric_admin_parity "$CONTEXT_A" "$JWT_A" cluster-b "$TD_B"
   capture_boundary "$CONTEXT_A" "$JWT_A" poller.metrics.failure_backoff_recovery_cache_age
-  record multicluster_poller.metrics.failure_backoff_recovery_bounded pass "bounded-series-redacted-labels-recovered" "poller.metrics.failure_backoff_recovery_cache_age.prom"
+  record multicluster_poller.metrics.failure_backoff_recovery_bounded pass \
+    "bounded-partition-deltas-federation-$TRANSIENT_FEDERATION_FAILURE_DELTA-discovery-$TRANSIENT_DISCOVERY_FAILURE_DELTA-redacted-labels-recovered" \
+    "poller.initial.polled_trust_endpoints_installed.prom,poller.transient.last_good_retained.prom,poller.metrics.failure_backoff_recovery_cache_age.prom"
   record multicluster_poller.metrics.admin_status_parity pass "cache-ages-within-two-seconds" "parity.{json,prom}"
 }
 
@@ -601,9 +735,8 @@ print(json.dumps(d,indent=2,sort_keys=True))' > "$RESULTS_DIR/toxiproxy-redacted
 
 main() {
   preflight
-  export FERRUM_LIVE_REPO_ROOT="$ROOT_DIR"
-  ferrum_live_assertions_init "$LIVE_ASSERTIONS_FILE" multicluster-poller-partition \
-    "$(ferrum_live_git_commit)" "$LIVE_PLATFORM_PROFILE"
+  python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py init "$LIVE_ASSERTIONS_FILE" \
+    "$(git -C "$ROOT_DIR" rev-parse HEAD)" "$LIVE_PLATFORM_PROFILE"
   [[ "${FERRUM_SKIP_IMAGE_BUILD:-0}" == 1 ]] || {
     echo "poller fixture requires a pre-packaged runtime image; set FERRUM_SKIP_IMAGE_BUILD=1" >&2
     return 1
@@ -617,7 +750,8 @@ main() {
   scenario_trust_expiry
   scenario_inflight_withdrawal
   collect_diagnostics
-  ferrum_live_assertions_require_all_passed "$LIVE_ASSERTIONS_FILE" "${REQUIRED_LIVE_ASSERTIONS[@]}"
+  python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py require "$LIVE_ASSERTIONS_FILE" \
+    "${REQUIRED_LIVE_ASSERTIONS[@]}"
   log "all poller partition boundaries passed"
 }
 
