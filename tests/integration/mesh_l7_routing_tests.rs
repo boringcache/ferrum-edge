@@ -2690,7 +2690,7 @@ fn mesh_tier3_l4_tls_virtual_service_materializes_sni_passthrough_proxy() {
         &[object(
             "VirtualService",
             serde_json::json!({
-                "hosts": ["secure.example.com"],
+                "hosts": ["tls.example.com"],
                 "tls": [{
                     "match": [{"sniHosts": ["secure.example.com"], "port": 8443}],
                     "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 8443}}}]

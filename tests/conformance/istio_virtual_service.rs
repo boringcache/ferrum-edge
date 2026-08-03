@@ -374,7 +374,7 @@ fn vs_tls_l4_sni_passthrough() {
     );
     let result = translate_k8s_objects(
         &[virtual_service(json!({
-            "hosts": ["secure.example.com"],
+            "hosts": ["tls.example.com"],
             "tls": [{
                 "match": [{"sniHosts": ["secure.example.com"], "port": 8443}],
                 "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 8443}}}]
