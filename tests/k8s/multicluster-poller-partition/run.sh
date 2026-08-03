@@ -286,7 +286,7 @@ spire_register_workload() {
 
 spire_bundle_b64der() {
   spire_server_exec "$1" "$SPIRE_NS" bundle show -format pem 2>/dev/null |
-    awk '/BEGIN CERTIFICATE/{cap=1;buf="";next}/END CERTIFICATE/{if(cap)print buf;cap=0;next}cap{gsub(/[[:space:]]/,"");buf=buf $0}'
+    awk '/BEGIN CERTIFICATE/{cap=1;buf="";next}/END CERTIFICATE/{if(cap)print buf;cap=0;next}cap{gsub(/[[:space:]]/,"");buf=buf substr($0,1)}'
 }
 
 mint_admin_jwt() {
