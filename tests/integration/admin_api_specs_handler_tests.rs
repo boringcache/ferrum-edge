@@ -6925,7 +6925,8 @@ async fn external_ref_http_admission_runs_off_the_async_worker() {
         "x-ferrum-proxy": {
             "id": proxy_id.clone(),
             "backend_host": "backend.internal",
-            "backend_port": 443
+            "backend_port": 443,
+            "listen_path": "/items"
         },
         "paths": {
             "/items": {
