@@ -177,15 +177,29 @@ async fn start_h3_policy_gateway(
             format!("mesh preparation failed: {e}").into()
         },
     )?;
+    // Subset-inheritable HTTP fields (`http1MaxPendingRequests`, and siblings)
+    // land on `dispatch_port_override_fallback` so cold-path projection can keep
+    // port > subset > top-level. TLS still projects onto upstream/port slots.
+    // Checking both carriers keeps this setup gate aligned with production.
+    let projected_dr_policy = prepared.upstreams.iter().any(|upstream| {
+        upstream.backend_tls_sni.as_deref() == Some("backend-sni.example.com")
+            || upstream
+                .port_overrides
+                .values()
+                .any(|slot| slot.tls.is_some())
+            || upstream
+                .dispatch_port_override_fallback
+                .as_ref()
+                .is_some_and(|fallback| fallback.http1_max_pending_requests == Some(1))
+    }) || prepared.proxies.iter().any(|proxy| {
+        proxy
+            .dispatch_port_override_fallback
+            .as_ref()
+            .is_some_and(|fallback| fallback.http1_max_pending_requests == Some(1))
+    });
     assert!(
-        prepared.upstreams.iter().any(|upstream| {
-            upstream.backend_tls_sni.as_deref() == Some("backend-sni.example.com")
-                || upstream
-                    .port_overrides
-                    .values()
-                    .any(|slot| slot.http1_max_pending_requests == Some(1) || slot.tls.is_some())
-        }),
-        "mesh DestinationRule was not projected onto upstream port overrides"
+        projected_dr_policy,
+        "mesh DestinationRule was not projected onto upstream TLS or dispatch fallback"
     );
 
     let jwt_manager = JwtManager::new(JwtConfig {

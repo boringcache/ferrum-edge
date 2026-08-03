@@ -1160,6 +1160,7 @@ jobs:
               functional_early_upload_deadline_test
               functional_h3_authority_validation_test
               functional_h3_local_policy_test
+              functional_subset_http_policy_test
               functional_h3_grpc_web_test
               functional_h3_grpc_streaming_test
               functional_h3_mtls_early_data_test
