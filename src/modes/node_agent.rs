@@ -34,7 +34,8 @@ use crate::capture::{
 use crate::cni::ownership::{
     DurableCniCleanupSnapshot, DurableCniOwnershipRecord, cni_ownership_store_is_rejected,
     configure_cni_ownership_store, is_safe_cni_pod_uid, load_configured_cni_ownership,
-    ownership_store_path_for_socket, persist_configured_cni_ownership,
+    load_durable_cni_ownership, ownership_store_path_for_socket,
+    persist_configured_cni_ownership,
 };
 use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
 use crate::cni::spec::{
@@ -7150,16 +7151,25 @@ async fn handle_fallback(
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
-    let cni_handles =
-        if cni_config.enabled && matches!(config.fallback_mode, FallbackMode::Iptables) {
-            Some(spawn_cni_passthrough_listener(
-                cni_config.socket_path.clone(),
-                metrics.clone(),
-                shutdown_tx.subscribe(),
-            ))
-        } else {
-            None
-        };
+    let cni_handles = if cni_config.enabled
+        && matches!(config.fallback_mode, FallbackMode::Iptables)
+    {
+        let ownership_store_path = ownership_store_path_for_socket(&cni_config.socket_path);
+        if ownership_store_path.is_none() {
+            warn!(
+                "Node-agent iptables fallback cannot derive the durable CNI ownership path; GC will fail closed"
+            );
+        }
+        Some(spawn_cni_passthrough_listener(
+            cni_config.socket_path.clone(),
+            metrics.clone(),
+            shutdown_tx.subscribe(),
+            startup_ready.clone(),
+            ownership_store_path,
+        ))
+    } else {
+        None
+    };
 
     let result = handle_fallback_with(
         config,
@@ -7188,16 +7198,83 @@ fn spawn_cni_passthrough_listener(
     socket_path: String,
     metrics: Arc<NodeAgentMetrics>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    startup_ready: Arc<AtomicBool>,
+    ownership_store_path: Option<std::path::PathBuf>,
 ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
     let (cni_work_tx, mut cni_work_rx) = cni_work_channel();
     let listener = spawn_cni_listener(socket_path, cni_work_tx.clone(), metrics, shutdown);
     drop(cni_work_tx);
     let worker = tokio::spawn(async move {
         while let Some(work) = cni_work_rx.recv().await {
-            let _ = work.respond.send(CniRpcResponse::Ok);
+            let response = fallback_cni_response(
+                &work.request,
+                startup_ready.load(Ordering::Acquire),
+                ownership_store_path.as_deref(),
+            );
+            let _ = work.respond.send(response);
         }
     });
     (listener, worker)
+}
+
+/// CNI behavior for the explicit node-global iptables fallback.
+///
+/// That mode has no per-pod eBPF backend or pod watcher. ADD/CHECK/STATUS may
+/// therefore succeed only after the fallback rules are fully installed, while
+/// DEL remains an idempotent no-op during startup. GC may acknowledge only when
+/// the requested network has no stale claim in the socket-bound durable store;
+/// a stale eBPF claim needs an eBPF-capable generation to perform its exact
+/// teardown and must never be discarded or reported reconciled here.
+fn fallback_cni_response(
+    request: &CniRpcRequest,
+    startup_ready: bool,
+    ownership_store_path: Option<&std::path::Path>,
+) -> CniRpcResponse {
+    if request.verb == RpcVerb::Del {
+        return CniRpcResponse::Ok;
+    }
+    if !startup_ready {
+        return CniRpcResponse::Error {
+            reason: "node-agent iptables fallback capture is not ready".to_string(),
+        };
+    }
+    if request.verb != RpcVerb::Gc {
+        return CniRpcResponse::Ok;
+    }
+
+    let Some(path) = ownership_store_path else {
+        return CniRpcResponse::Error {
+            reason: "gc refused because durable Ferrum CNI ownership is unavailable".to_string(),
+        };
+    };
+    let records = match load_durable_cni_ownership(path) {
+        Ok(records) => records,
+        Err(_) => {
+            return CniRpcResponse::Error {
+                reason: "gc refused because durable Ferrum CNI ownership state is rejected"
+                    .to_string(),
+            };
+        }
+    };
+    let valid = request
+        .valid_attachments
+        .iter()
+        .map(|attachment| {
+            (
+                attachment.container_id.as_str(),
+                attachment.ifname.as_str(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    if records.iter().any(|record| {
+        record.network_name == request.network_name
+            && !valid.contains(&(record.container_id.as_str(), record.ifname.as_str()))
+    }) {
+        return CniRpcResponse::Error {
+            reason: "gc cannot clean stale eBPF ownership in iptables fallback mode".to_string(),
+        };
+    }
+    CniRpcResponse::Ok
 }
 
 /// Test seam for [`handle_fallback`]. The production path passes
@@ -11442,6 +11519,115 @@ mod tests {
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK,
             "explicit iptables fallback should be observable as node-global fallback"
+        );
+    }
+
+    #[test]
+    fn cni_iptables_fallback_gates_readiness_and_durable_gc() {
+        use crate::cni::ownership::{
+            DurableCniOwnershipRecord, ownership_store_path_for_socket,
+            store_durable_cni_ownership,
+        };
+        use crate::cni::spec::CniValidAttachment;
+
+        let request = |verb, network_name: &str, valid_attachments| CniRpcRequest {
+            verb,
+            network_name: network_name.to_string(),
+            pod_namespace: String::new(),
+            pod_name: String::new(),
+            pod_uid: None,
+            container_id: String::new(),
+            ifname: None,
+            netns_path: None,
+            args: HashMap::new(),
+            valid_attachments,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("node-agent-cni.sock");
+        let store_path = ownership_store_path_for_socket(&socket_path.to_string_lossy())
+            .expect("ownership path");
+
+        assert!(matches!(
+            fallback_cni_response(
+                &request(RpcVerb::Add, "network-a", Vec::new()),
+                false,
+                Some(&store_path),
+            ),
+            CniRpcResponse::Error { .. }
+        ));
+        assert_eq!(
+            fallback_cni_response(
+                &request(RpcVerb::Del, "network-a", Vec::new()),
+                false,
+                Some(&store_path),
+            ),
+            CniRpcResponse::Ok,
+            "DEL remains an idempotent no-op while fallback setup is incomplete"
+        );
+        assert_eq!(
+            fallback_cni_response(
+                &request(RpcVerb::Status, "network-a", Vec::new()),
+                true,
+                Some(&store_path),
+            ),
+            CniRpcResponse::Ok
+        );
+        assert_eq!(
+            fallback_cni_response(
+                &request(RpcVerb::Gc, "network-a", Vec::new()),
+                true,
+                Some(&store_path),
+            ),
+            CniRpcResponse::Ok,
+            "a missing durable store proves fallback has no attachment state to reconcile"
+        );
+
+        store_durable_cni_ownership(
+            &store_path,
+            &[DurableCniOwnershipRecord {
+                network_name: "network-a".to_string(),
+                container_id: "ctr-stale".to_string(),
+                ifname: "eth0".to_string(),
+                pod_uid: "pod-uid-stale".to_string(),
+                cleanup: durable_cleanup_snapshot_from_state(&enrolled_pod_state(
+                    "pod-uid-stale",
+                )),
+            }],
+        )
+        .expect("seed durable ownership");
+
+        assert_eq!(
+            fallback_cni_response(
+                &request(
+                    RpcVerb::Gc,
+                    "network-a",
+                    vec![CniValidAttachment {
+                        container_id: "ctr-stale".to_string(),
+                        ifname: "eth0".to_string(),
+                    }],
+                ),
+                true,
+                Some(&store_path),
+            ),
+            CniRpcResponse::Ok,
+            "a still-valid durable attachment requires no fallback cleanup"
+        );
+        assert!(matches!(
+            fallback_cni_response(
+                &request(RpcVerb::Gc, "network-a", Vec::new()),
+                true,
+                Some(&store_path),
+            ),
+            CniRpcResponse::Error { .. }
+        ));
+        assert_eq!(
+            fallback_cni_response(
+                &request(RpcVerb::Gc, "network-b", Vec::new()),
+                true,
+                Some(&store_path),
+            ),
+            CniRpcResponse::Ok,
+            "fallback GC remains network-scoped"
         );
     }
 
