@@ -2084,6 +2084,7 @@ async fn functional_mesh_inbound_server_identity_rotates_with_svid_files() {
             );
             kill_child(&mut child);
             cp.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
 
@@ -2561,6 +2562,7 @@ async fn functional_mesh_mode_strict_inbound_requires_peer_svid() {
             );
             kill_child(&mut child);
             cp.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
 
@@ -3226,7 +3228,6 @@ async fn drive_cross_namespace_workload_entry_inbound(
             );
             kill_child(&mut child);
             cp.shutdown().await;
-            tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
 
@@ -3255,7 +3256,6 @@ async fn drive_cross_namespace_workload_entry_inbound(
             last_failure = format!("attempt {attempt}: {exited}\n{}", captured_output(&temp));
             kill_child(&mut child);
             cp.shutdown().await;
-            tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
 
