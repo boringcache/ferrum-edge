@@ -3390,13 +3390,15 @@ async fn dead_letter_recovery_reuses_quota_held_by_a_partially_published_payload
     assert!(encoded.len() > 4 * 1024);
 
     let temp = tempfile::tempdir().unwrap();
-    let spool =
-        SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
     let source = spool.write_events(&[event]).unwrap();
     let meta_path = dead_letter_meta_path(&source);
     let meta_temp = meta_path.with_file_name(format!(
         "{}.tmp",
-        meta_path.file_name().and_then(|name| name.to_str()).unwrap()
+        meta_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
     ));
     fs::create_dir(&meta_temp).unwrap();
 

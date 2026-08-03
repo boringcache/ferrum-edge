@@ -8241,10 +8241,7 @@ impl DeadLetterPayloadWriter {
         // handoff artifacts under the namespace lock before rebuilding so
         // recovery never needs quota for two complete rejected payloads and
         // never evicts unrelated active spool data merely to duplicate one.
-        for (path, kind) in [
-            (&prior_meta_path, "metadata"),
-            (&final_path, "payload"),
-        ] {
+        for (path, kind) in [(&prior_meta_path, "metadata"), (&final_path, "payload")] {
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
