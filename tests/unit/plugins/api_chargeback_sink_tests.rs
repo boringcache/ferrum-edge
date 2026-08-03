@@ -6,19 +6,13 @@ use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use ferrum_edge::plugins::api_chargeback_sink::{
-    SpoolReplayHookPoint, probe_streaming_replay_path_swap_for_tests,
-    set_spool_replay_hook_for_tests,
-};
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, PEER_REPUBLISH_MARKER,
     QuotaEvictionReport, SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault,
     SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolStats, SpoolWriteHookPoint,
-    classify_clickhouse_acknowledgement_for_tests,
-    classify_clickhouse_http_status_for_tests, clickhouse_insert_url_for_tests,
-    compact_recovery_probe_for_tests, compile_charge_event_projection,
-    decode_spool_file_for_tests, encode_spool_bytes_for_tests,
+    classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
+    clickhouse_insert_url_for_tests, compact_recovery_probe_for_tests,
+    compile_charge_event_projection, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     encode_spool_bytes_without_content_size_for_tests,
     encode_spool_bytes_without_ratio_padding_for_tests,
     encode_zstd_declaring_content_size_for_tests, new_ulid,
@@ -30,10 +24,15 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
     replay_spool_once_with_ceiling_for_tests, serialize_json_each_row,
     serialize_json_each_row_projected, set_spool_write_hook_for_tests,
-    spool_artifact_byte_limit_for_tests,
-    spool_claim_lease_secs_for_tests, spool_decompression_limit_for_tests,
-    spool_split_worklist_max_entries_for_tests, spool_streaming_limits_for_tests,
-    write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
+    spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
+    spool_decompression_limit_for_tests, spool_split_worklist_max_entries_for_tests,
+    spool_streaming_limits_for_tests, write_private_file_atomically_for_tests,
+    write_private_file_atomically_with_fault_for_tests,
+};
+#[cfg(unix)]
+use ferrum_edge::plugins::api_chargeback_sink::{
+    SpoolReplayHookPoint, probe_streaming_replay_path_swap_for_tests,
+    set_spool_replay_hook_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::utils::byte_budget::{
@@ -8426,7 +8425,11 @@ async fn streaming_replay_reports_when_a_changed_artifact_cannot_be_quarantined(
     let day = spool.namespace_root_for_tests().join("20260524");
     fs::create_dir_all(&day).unwrap();
     let source = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FFI"));
-    fs::write(&source, br#"{"event_id":"validated-before-blocked-quarantine"}"#).unwrap();
+    fs::write(
+        &source,
+        br#"{"event_id":"validated-before-blocked-quarantine"}"#,
+    )
+    .unwrap();
     let replacement = temp.path().join("replacement-blocked-quarantine.ndjson");
     fs::write(&replacement, br#"{"event_id":"changed-after-preflight"}"#).unwrap();
 
