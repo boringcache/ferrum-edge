@@ -3890,19 +3890,25 @@ impl EnvConfig {
         let admin_spec_external_ref_policy =
             crate::admin::api_specs::ExternalRefProcessPolicy::from_env_parts(
                 admin_spec_external_refs_enabled,
-                &admin_spec_external_refs_file_root,
-                &admin_spec_external_refs_allowed_origins,
-                &admin_spec_external_refs_allow_http_origins,
-                admin_spec_external_refs_max_documents,
-                admin_spec_external_refs_max_document_bytes,
-                admin_spec_external_refs_max_aggregate_bytes,
-                admin_spec_external_refs_max_refs,
-                admin_spec_external_refs_max_uri_length,
-                admin_spec_external_refs_max_redirects,
-                admin_spec_external_refs_max_nesting,
-                admin_spec_external_refs_connect_timeout_ms,
-                admin_spec_external_refs_request_timeout_ms,
-                admin_spec_external_refs_total_timeout_ms,
+                crate::admin::api_specs::external_refs::ExternalRefEnvOrigins {
+                    file_root: &admin_spec_external_refs_file_root,
+                    allowed_origins: &admin_spec_external_refs_allowed_origins,
+                    allow_http_origins: &admin_spec_external_refs_allow_http_origins,
+                },
+                crate::admin::api_specs::external_refs::ExternalRefEnvBudgets {
+                    max_documents: admin_spec_external_refs_max_documents,
+                    max_document_bytes: admin_spec_external_refs_max_document_bytes,
+                    max_aggregate_bytes: admin_spec_external_refs_max_aggregate_bytes,
+                    max_refs: admin_spec_external_refs_max_refs,
+                    max_uri_length: admin_spec_external_refs_max_uri_length,
+                    max_redirects: admin_spec_external_refs_max_redirects,
+                    max_nesting: admin_spec_external_refs_max_nesting,
+                },
+                crate::admin::api_specs::external_refs::ExternalRefEnvTimeouts {
+                    connect_timeout_ms: admin_spec_external_refs_connect_timeout_ms,
+                    request_timeout_ms: admin_spec_external_refs_request_timeout_ms,
+                    total_timeout_ms: admin_spec_external_refs_total_timeout_ms,
+                },
             )?;
 
         let mut config = Self {

@@ -88,42 +88,57 @@ impl Default for ExternalRefProcessPolicy {
     }
 }
 
+/// Filesystem jail and origin allowlist strings from env/conf.
+pub struct ExternalRefEnvOrigins<'a> {
+    pub file_root: &'a str,
+    pub allowed_origins: &'a str,
+    pub allow_http_origins: &'a str,
+}
+
+/// Document/ref/URI nesting budgets from env/conf.
+pub struct ExternalRefEnvBudgets {
+    pub max_documents: usize,
+    pub max_document_bytes: usize,
+    pub max_aggregate_bytes: usize,
+    pub max_refs: usize,
+    pub max_uri_length: usize,
+    pub max_redirects: usize,
+    pub max_nesting: usize,
+}
+
+/// Connect/request/total timeout budgets in milliseconds from env/conf.
+pub struct ExternalRefEnvTimeouts {
+    pub connect_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub total_timeout_ms: u64,
+}
+
 impl ExternalRefProcessPolicy {
     /// Build from parsed env/conf strings. Invalid values fail closed.
     pub fn from_env_parts(
         enabled: bool,
-        file_root: &str,
-        allowed_origins: &str,
-        allow_http_origins: &str,
-        max_documents: usize,
-        max_document_bytes: usize,
-        max_aggregate_bytes: usize,
-        max_refs: usize,
-        max_uri_length: usize,
-        max_redirects: usize,
-        max_nesting: usize,
-        connect_timeout_ms: u64,
-        request_timeout_ms: u64,
-        total_timeout_ms: u64,
+        origins: ExternalRefEnvOrigins<'_>,
+        budgets: ExternalRefEnvBudgets,
+        timeouts: ExternalRefEnvTimeouts,
     ) -> Result<Self, String> {
-        let file_root = parse_optional_file_root(file_root)?;
-        let allowed_origins = parse_origin_list(allowed_origins, true)?;
-        let allow_http_origins = parse_origin_list(allow_http_origins, false)?;
-        if max_documents == 0 {
+        let file_root = parse_optional_file_root(origins.file_root)?;
+        let allowed_origins = parse_origin_list(origins.allowed_origins, true)?;
+        let allow_http_origins = parse_origin_list(origins.allow_http_origins, false)?;
+        if budgets.max_documents == 0 {
             return Err("FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_DOCUMENTS must be >= 1".to_string());
         }
-        if max_document_bytes == 0 {
+        if budgets.max_document_bytes == 0 {
             return Err(
                 "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_DOCUMENT_BYTES must be >= 1".to_string(),
             );
         }
-        if max_aggregate_bytes < max_document_bytes {
+        if budgets.max_aggregate_bytes < budgets.max_document_bytes {
             return Err(
                 "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_AGGREGATE_BYTES must be >= MAX_DOCUMENT_BYTES"
                     .to_string(),
             );
         }
-        if max_refs == 0 || max_uri_length == 0 || max_nesting == 0 {
+        if budgets.max_refs == 0 || budgets.max_uri_length == 0 || budgets.max_nesting == 0 {
             return Err("external-ref count/uri/nesting budgets must be >= 1".to_string());
         }
         Ok(Self {
@@ -131,16 +146,16 @@ impl ExternalRefProcessPolicy {
             file_root,
             allowed_origins,
             allow_http_origins,
-            max_documents,
-            max_document_bytes,
-            max_aggregate_bytes,
-            max_refs,
-            max_uri_length,
-            max_redirects,
-            max_nesting,
-            connect_timeout: Duration::from_millis(connect_timeout_ms.max(1)),
-            request_timeout: Duration::from_millis(request_timeout_ms.max(1)),
-            total_timeout: Duration::from_millis(total_timeout_ms.max(1)),
+            max_documents: budgets.max_documents,
+            max_document_bytes: budgets.max_document_bytes,
+            max_aggregate_bytes: budgets.max_aggregate_bytes,
+            max_refs: budgets.max_refs,
+            max_uri_length: budgets.max_uri_length,
+            max_redirects: budgets.max_redirects,
+            max_nesting: budgets.max_nesting,
+            connect_timeout: Duration::from_millis(timeouts.connect_timeout_ms.max(1)),
+            request_timeout: Duration::from_millis(timeouts.request_timeout_ms.max(1)),
+            total_timeout: Duration::from_millis(timeouts.total_timeout_ms.max(1)),
         })
     }
 
@@ -536,7 +551,7 @@ fn hash_json_value(hasher: &mut Sha256, value: &Value) {
             hasher.update(b"o");
             hasher.update((values.len() as u64).to_le_bytes());
             let mut entries: Vec<_> = values.iter().collect();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_unstable_by_key(|(key, _)| *key);
             for (key, value) in entries {
                 hash_len_prefixed(hasher, key.as_bytes());
                 hash_json_value(hasher, value);
@@ -718,15 +733,18 @@ pub fn load_external_documents(
     local_resources.insert(resource_uri_key(&policy.document_base));
     collect_local_resource_ids(root, &policy.document_base, &mut local_resources)?;
 
+    let mut active = HashSet::new();
     collect_refs_from_value(
         root,
         &policy.document_base,
-        policy,
-        &local_resources,
-        &mut pending,
-        &mut seen_refs,
         0,
-        &mut HashSet::new(),
+        &mut CollectRefsState {
+            policy,
+            local_resources: &local_resources,
+            pending: &mut pending,
+            seen_refs: &mut seen_refs,
+            active: &mut active,
+        },
     )?;
 
     while let Some((uri, depth)) = pending.pop_front() {
@@ -756,15 +774,18 @@ pub fn load_external_documents(
         let doc_base = doc.canonical_uri.clone();
         collect_local_resource_ids(&doc_root, &doc_base, &mut local_resources)?;
         loaded.insert(key, doc);
+        active.clear();
         collect_refs_from_value(
             &doc_root,
             &doc_base,
-            policy,
-            &local_resources,
-            &mut pending,
-            &mut seen_refs,
             depth + 1,
-            &mut HashSet::new(),
+            &mut CollectRefsState {
+                policy,
+                local_resources: &local_resources,
+                pending: &mut pending,
+                seen_refs: &mut seen_refs,
+                active: &mut active,
+            },
         )?;
     }
 
@@ -820,38 +841,43 @@ fn collect_local_resource_ids(
     }
 }
 
+/// Mutable traversal accumulators shared across a single document walk.
+struct CollectRefsState<'a> {
+    policy: &'a EffectiveExternalRefPolicy,
+    local_resources: &'a HashSet<String>,
+    pending: &'a mut VecDeque<(Url, usize)>,
+    seen_refs: &'a mut usize,
+    active: &'a mut HashSet<String>,
+}
+
 fn collect_refs_from_value(
     value: &Value,
     base: &Url,
-    policy: &EffectiveExternalRefPolicy,
-    local_resources: &HashSet<String>,
-    pending: &mut VecDeque<(Url, usize)>,
-    seen_refs: &mut usize,
     depth: usize,
-    active: &mut HashSet<String>,
+    state: &mut CollectRefsState<'_>,
 ) -> Result<(), ExtractError> {
     match value {
         Value::Object(map) => {
             let child_base = schema_child_base(map, base)?;
             if let Some(reference) = map.get("$ref").and_then(Value::as_str) {
-                *seen_refs = seen_refs.saturating_add(1);
-                if *seen_refs > policy.max_refs {
+                *state.seen_refs = state.seen_refs.saturating_add(1);
+                if *state.seen_refs > state.policy.max_refs {
                     return Err(external_ref_error(
                         "external $ref count exceeded the configured budget",
                     ));
                 }
-                if reference.len() > policy.max_uri_length {
+                if reference.len() > state.policy.max_uri_length {
                     return Err(external_ref_error(
                         "external $ref URI exceeds the configured length budget",
                     ));
                 }
                 if let Some(target) =
-                    classify_external_target(reference, &child_base, local_resources)?
+                    classify_external_target(reference, &child_base, state.local_resources)?
                 {
                     let key = resource_uri_key(&target);
-                    if active.insert(key.clone()) {
-                        pending.push_back((target, depth));
-                        active.remove(&key);
+                    if state.active.insert(key.clone()) {
+                        state.pending.push_back((target, depth));
+                        state.active.remove(&key);
                     }
                 }
             }
@@ -866,31 +892,13 @@ fn collect_refs_from_value(
                 ) {
                     continue;
                 }
-                collect_refs_from_value(
-                    child,
-                    &child_base,
-                    policy,
-                    local_resources,
-                    pending,
-                    seen_refs,
-                    depth,
-                    active,
-                )?;
+                collect_refs_from_value(child, &child_base, depth, state)?;
             }
             Ok(())
         }
         Value::Array(items) => {
             for child in items {
-                collect_refs_from_value(
-                    child,
-                    base,
-                    policy,
-                    local_resources,
-                    pending,
-                    seen_refs,
-                    depth,
-                    active,
-                )?;
+                collect_refs_from_value(child, base, depth, state)?;
             }
             Ok(())
         }

@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ferrum_edge::admin::api_specs::external_refs::{
-    ExternalDocumentLoader, contain_path, redact_reference, resource_uri_key,
-    validate_external_ref_snapshot_pair,
+    ExternalDocumentLoader, ExternalRefEnvBudgets, ExternalRefEnvOrigins, ExternalRefEnvTimeouts,
+    contain_path, redact_reference, resource_uri_key, validate_external_ref_snapshot_pair,
 };
 use ferrum_edge::admin::api_specs::{
     DefaultExternalDocumentLoader, EffectiveExternalRefPolicy, ExternalRefProcessPolicy,
@@ -1119,19 +1119,25 @@ fn disabled_extension_still_validates_allowed_origins() {
 fn ipv6_origins_are_canonicalized_with_brackets() {
     let process = ExternalRefProcessPolicy::from_env_parts(
         true,
-        "",
-        "https://[2001:4860:4860::8888]",
-        "http://[::1]:8080",
-        4,
-        1024,
-        4096,
-        8,
-        2048,
-        2,
-        4,
-        100,
-        200,
-        500,
+        ExternalRefEnvOrigins {
+            file_root: "",
+            allowed_origins: "https://[2001:4860:4860::8888]",
+            allow_http_origins: "http://[::1]:8080",
+        },
+        ExternalRefEnvBudgets {
+            max_documents: 4,
+            max_document_bytes: 1024,
+            max_aggregate_bytes: 4096,
+            max_refs: 8,
+            max_uri_length: 2048,
+            max_redirects: 2,
+            max_nesting: 4,
+        },
+        ExternalRefEnvTimeouts {
+            connect_timeout_ms: 100,
+            request_timeout_ms: 200,
+            total_timeout_ms: 500,
+        },
     )
     .unwrap();
     assert_eq!(
