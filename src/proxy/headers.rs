@@ -556,6 +556,11 @@ pub fn merge_proxy_headers_preserving_repeated(
         if raw_header_values_match_materialized(headers, &name, v) {
             continue;
         }
+        // The materialized map remains authoritative even when a plugin has
+        // produced a value that cannot be represented on the wire. Remove the
+        // pristine field set before parsing the replacement so invalid output
+        // is dropped instead of resurrecting the client's original value.
+        headers.remove(&name);
         if let Ok(val) = http::HeaderValue::from_str(v) {
             headers.insert(name, val);
         }
@@ -2211,9 +2216,12 @@ mod tests {
         headers.append("x-keep", http::HeaderValue::from_static("beta"));
         headers.append("x-rewrite", http::HeaderValue::from_static("old-one"));
         headers.append("x-rewrite", http::HeaderValue::from_static("old-two"));
+        headers.append("x-invalid", http::HeaderValue::from_static("client-one"));
+        headers.append("x-invalid", http::HeaderValue::from_static("client-two"));
         let proxy_headers = std::collections::HashMap::from([
             ("x-keep".to_string(), "alpha, beta".to_string()),
             ("x-rewrite".to_string(), "plugin-value".to_string()),
+            ("x-invalid".to_string(), "plugin\ninvalid".to_string()),
         ]);
 
         merge_proxy_headers_preserving_repeated(&mut headers, &proxy_headers);
@@ -2235,6 +2243,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![b"plugin-value".as_slice()],
             "a plugin rewrite must replace the pristine repeated field set"
+        );
+        assert!(
+            headers.get("x-invalid").is_none(),
+            "an invalid plugin rewrite must drop the pristine client field set"
         );
     }
 
