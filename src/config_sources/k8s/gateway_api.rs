@@ -4758,7 +4758,10 @@ fn listener_allowed_route_kind<'a>(kind: &Value, protocol_kinds: &'a [&str]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_sources::k8s::{K8sMetadata, K8sTranslationOptions, translate_k8s_objects};
+    use crate::config_sources::k8s::{
+        K8sMetadata, K8sTranslationOptions, gateway_api_status_conflict_context,
+        translate_k8s_objects,
+    };
     use crate::identity::spiffe::TrustDomain;
 
     fn options() -> K8sTranslationOptions {
@@ -9073,7 +9076,7 @@ mod tests {
         let http_objects: Vec<K8sObject> = std::iter::once(gateway.clone())
             .chain(http_routes)
             .collect();
-        let http_acc = super::gateway_api_status_conflict_context(&http_objects, options());
+        let http_acc = gateway_api_status_conflict_context(&http_objects, options());
         let http_conflicts = route_conflicts(&http_objects, &options(), Some(&http_acc));
         assert!(
             cross_kind_route_conflicts_only(&http_conflicts).is_empty(),
@@ -9099,7 +9102,7 @@ mod tests {
             grpc_routes.push(route);
         }
         let grpc_objects: Vec<K8sObject> = std::iter::once(gateway).chain(grpc_routes).collect();
-        let grpc_acc = super::gateway_api_status_conflict_context(&grpc_objects, options());
+        let grpc_acc = gateway_api_status_conflict_context(&grpc_objects, options());
         let grpc_conflicts = route_conflicts(&grpc_objects, &options(), Some(&grpc_acc));
         assert!(
             cross_kind_route_conflicts_only(&grpc_conflicts).is_empty(),
@@ -9120,7 +9123,7 @@ mod tests {
             serde_json::json!({"method": "SayHello"}),
         );
         let mixed_objects = vec![gateway, http_route, grpc_route];
-        let mixed_acc = super::gateway_api_status_conflict_context(&mixed_objects, options());
+        let mixed_acc = gateway_api_status_conflict_context(&mixed_objects, options());
         let mixed_conflicts = route_conflicts(&mixed_objects, &options(), Some(&mixed_acc));
         let cross_kind = cross_kind_route_conflicts_only(&mixed_conflicts);
         assert!(
