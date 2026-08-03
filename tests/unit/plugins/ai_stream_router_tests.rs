@@ -3326,7 +3326,7 @@ async fn test_gzip_streaming_decode_rejects_expansion_over_limit() {
     let out = String::from_utf8(collected).unwrap();
     assert!(out.contains("upstream_error"));
     assert!(
-        out.contains("decoded content exceeds") || out.contains("amplification exceeds"),
+        out.contains("amplification limit exceeded") || out.contains("size limit exceeded"),
         "absolute or ratio bound must fail closed: {out}"
     );
     assert_eq!(out.matches("data: [DONE]").count(), 1);
@@ -3371,7 +3371,7 @@ async fn test_gzip_streaming_decode_rejects_amplification_bomb() {
     let out = String::from_utf8(forwarded(inspector.on_end().await)).unwrap();
     assert!(out.contains("upstream_error"));
     assert!(
-        out.contains("amplification exceeds"),
+        out.contains("amplification limit exceeded"),
         "compression bomb must trip the shared ratio bound: {out}"
     );
     assert_eq!(out.matches("data: [DONE]").count(), 1);
@@ -3435,6 +3435,89 @@ async fn test_unsupported_content_encoding_is_rejected() {
             Some(502),
             "{encoding} must fail closed"
         );
+        if let PluginResult::Reject { body, .. } = &reject {
+            assert!(
+                !body.contains(encoding),
+                "rejection must not echo the raw Content-Encoding member: {body}"
+            );
+            assert!(
+                body.contains("unsupported Content-Encoding")
+                    || body.contains("malformed Content-Encoding")
+                    || body.contains("identity Content-Encoding")
+                    || body.contains("coding layer"),
+                "rejection must stay on fixed diagnostic categories: {body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_hostile_content_encoding_diagnostics_never_echo_raw_members() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    // Adversarial long / credential-like members that must never reach clients.
+    let sentinel = format!(
+        "sk-live-{}{}",
+        "A".repeat(512),
+        "-Bearer-eyJhbGciOiJIUzI1NiJ9.payload.sig"
+    );
+    let adversarial = [
+        sentinel.as_str(),
+        "gzip; password=hunter2",
+        "!!!not-a-token!!!",
+        "zstd",
+    ];
+
+    for encoding in adversarial {
+        let mut ctx = post_ctx(&claude);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        resp_headers.insert("content-encoding".to_string(), encoding.to_string());
+        let reject = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        let PluginResult::Reject { body, .. } = reject else {
+            panic!("hostile encoding must reject: {encoding}");
+        };
+        assert!(
+            !body.contains(&sentinel)
+                && !body.contains("sk-live-")
+                && !body.contains("hunter2")
+                && !body.contains("password=")
+                && !body.contains("!!!not-a-token!!!")
+                && !body.contains("zstd")
+                && !body.contains(encoding),
+            "client 502 must not echo hostile Content-Encoding text: {body}"
+        );
+
+        // Forged metadata path: ImmediateUpstreamErrorNormalizer must also redact.
+        let mut forged = post_ctx(&claude);
+        let mut headers = json_headers();
+        plugin.before_proxy(&mut forged, &mut headers).await;
+        forged.metadata.insert(
+            "ai_stream_router.provider_content_encoding".to_string(),
+            encoding.to_string(),
+        );
+        let mut inspector = plugin
+            .response_stream_inspector(&forged, 200, Some("text/event-stream"))
+            .expect("fail-closed inspector");
+        let frame = String::from_utf8(forwarded(
+            inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await,
+        ))
+        .unwrap();
+        assert!(frame.contains("upstream_error"), "{frame}");
+        assert!(
+            !frame.contains(&sentinel)
+                && !frame.contains("sk-live-")
+                && !frame.contains("hunter2")
+                && !frame.contains("password=")
+                && !frame.contains("!!!not-a-token!!!")
+                && !frame.contains("zstd")
+                && !frame.contains(encoding),
+            "normalization error frame must not echo hostile encoding text: {frame}"
+        );
+        assert!(!frame.contains("\"content\":\"Hello\""));
     }
 }
 
@@ -4719,7 +4802,7 @@ async fn test_upstream_error_envelope_is_serialized_through_the_bound() {
     let out = String::from_utf8(out).unwrap();
     assert_eq!(
         out,
-        "data: {\"error\":{\"message\":\"multiple case-variant Content-Encoding headers\",\"type\":\"upstream_error\"}}\n\ndata: [DONE]\n\n",
+        "data: {\"error\":{\"message\":\"ambiguous Content-Encoding field-lines\",\"type\":\"upstream_error\"}}\n\ndata: [DONE]\n\n",
         "the envelope written through the sink must be byte-identical to the \
          document it replaced"
     );

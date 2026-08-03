@@ -294,7 +294,13 @@ async fn unsupported_layered_coding_rejects_before_stream_fallback() {
         .after_proxy(&mut ctx, 200, &mut response_headers)
         .await;
     match result {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
+        PluginResult::Reject { status_code, body, .. } => {
+            assert_eq!(status_code, 502);
+            assert!(
+                !body.contains("zstd"),
+                "502 must not echo unsupported coding member: {body}"
+            );
+        }
         other => panic!("unsupported chain must reject before body fallback: {other:?}"),
     }
     assert!(
