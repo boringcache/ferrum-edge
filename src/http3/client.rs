@@ -31,8 +31,8 @@ use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::pool::{GenericPool, PoolManager};
 use crate::proxy::headers::{
-    is_backend_response_strip_header, parse_connection_listed_headers,
-    sanitize_backend_request_trailers,
+    is_backend_request_strip_header, is_backend_response_strip_header,
+    parse_connection_listed_headers, sanitize_backend_request_trailers,
 };
 use crate::tls::backend::{
     BackendSvidGeneration, SvidGenerationMatcher, append_backend_tls_pool_key_fields,

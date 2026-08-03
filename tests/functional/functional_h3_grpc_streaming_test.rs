@@ -409,13 +409,10 @@ async fn h3_grpc_streaming_forwards_sanitized_request_trailers() {
         "application request trailers must survive H3-to-H2 translation"
     );
     assert!(
-        request
-            .trailers
-            .iter()
-            .all(|(name, _)| !matches!(
-                name.as_str(),
-                "x-consumer-username" | "x-forwarded-for" | "forwarded" | "authorization"
-            )),
+        request.trailers.iter().all(|(name, _)| !matches!(
+            name.as_str(),
+            "x-consumer-username" | "x-forwarded-for" | "forwarded" | "authorization"
+        )),
         "client request trailers must not restate credentials or forge gateway identity"
     );
 }
