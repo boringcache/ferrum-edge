@@ -7,12 +7,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use ferrum_edge::plugins::api_chargeback_sink::probe_streaming_replay_path_swap_for_tests;
+use ferrum_edge::plugins::api_chargeback_sink::{
+    SpoolReplayHookPoint, probe_streaming_replay_path_swap_for_tests,
+    set_spool_replay_hook_for_tests,
+};
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, PEER_REPUBLISH_MARKER,
     QuotaEvictionReport, SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault,
-    SpoolManager, SpoolOwnerSpec, SpoolReplayHookPoint, SpoolSettings, SpoolStats,
-    SpoolWriteHookPoint, classify_clickhouse_acknowledgement_for_tests,
+    SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolStats, SpoolWriteHookPoint,
+    classify_clickhouse_acknowledgement_for_tests,
     classify_clickhouse_http_status_for_tests, clickhouse_insert_url_for_tests,
     compact_recovery_probe_for_tests, compile_charge_event_projection,
     decode_spool_file_for_tests, encode_spool_bytes_for_tests,
@@ -26,15 +29,15 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     publish_dead_letter_payload_for_tests, render_prometheus, render_status_json,
     replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
     replay_spool_once_with_ceiling_for_tests, serialize_json_each_row,
-    serialize_json_each_row_projected, set_spool_replay_hook_for_tests,
-    set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
+    serialize_json_each_row_projected, set_spool_write_hook_for_tests,
+    spool_artifact_byte_limit_for_tests,
     spool_claim_lease_secs_for_tests, spool_decompression_limit_for_tests,
     spool_split_worklist_max_entries_for_tests, spool_streaming_limits_for_tests,
     write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::utils::byte_budget::{
-    ProcessByteReservation, RetainedByteCeiling, probe_preallocated_payload_capacity_guard_for_tests,
+    RetainedByteCeiling, probe_preallocated_payload_capacity_guard_for_tests,
 };
 use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, REQUEST_ID_METADATA_KEY, TransactionSummary, WsDisconnectContext,
@@ -8323,23 +8326,11 @@ async fn streaming_replay_refuses_a_post_preflight_path_swap_and_continues() {
         .expect("a post-preflight identity change must quarantine and continue the tick");
 
     assert!(
-        !source.exists()
-            || source
-                .with_file_name(format!(
-                    "{}.corrupt",
-                    source.file_name().unwrap().to_string_lossy()
-                ))
-                .exists()
-            || spool
-                .list_owned_spool_files_for_tests()
-                .unwrap()
-                .iter()
-                .any(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.contains("01ARZ3NDEKTSV4RRFFQ69G5FFG"))
-                }),
-        "the swapped artifact must leave the live replay set or remain under operator quarantine"
+        fs::read_dir(&day)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".corrupt")),
+        "the swapped artifact must be retained under operator quarantine"
     );
     assert!(
         !newer.exists(),
@@ -8377,7 +8368,8 @@ async fn streaming_replay_defers_when_ceiling_starves_between_preflight_and_reop
     fs::write(&source, br#"{"event_id":"ceiling-between-passes"}"#).unwrap();
 
     let namespace_root = spool.namespace_root_for_tests().to_path_buf();
-    let peer_hold: Arc<Mutex<Option<ProcessByteReservation>>> = Arc::new(Mutex::new(None));
+    type TestReservation = ferrum_edge::plugins::utils::byte_budget::ProcessByteReservation;
+    let peer_hold: Arc<Mutex<Option<TestReservation>>> = Arc::new(Mutex::new(None));
     let peer_slot = Arc::clone(&peer_hold);
     set_spool_replay_hook_for_tests(Some(Arc::new(move |point, claimed| {
         if point != SpoolReplayHookPoint::AfterStreamingPreflight {
