@@ -8389,7 +8389,7 @@ impl DeadLetterPayloadWriter {
         // Before mutating any prior partial handoff, prove the live temp path
         // still names the descriptor whose completed metadata we captured at
         // fsync. This is a cheap fail-closed boundary; the exact streamed hash
-        // is repeated immediately before rename after quota work completes.
+        // is checked after rename and again before source removal.
         {
             let file = self.file.as_mut().ok_or_else(|| {
                 format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
@@ -8425,11 +8425,10 @@ impl DeadLetterPayloadWriter {
             let file = self.file.as_mut().ok_or_else(|| {
                 format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
             })?;
-            verify_dead_letter_payload(
+            dead_letter_payload_identity_matching(
                 file,
                 &self.temp_path,
                 self.byte_len,
-                &expected_sha256,
                 DeadLetterIdentityExpectation::Exact(synced_identity),
             )?
         };

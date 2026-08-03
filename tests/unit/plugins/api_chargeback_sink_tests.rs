@@ -7969,6 +7969,8 @@ async fn dead_letter_publish_refuses_a_final_planted_after_writer_open() {
 #[tokio::test]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn dead_letter_publish_refuses_a_completed_temp_path_replacement() {
+    use std::os::unix::fs::PermissionsExt;
+
     let server = MockServer::start().await;
     mount_status_sequence(&server, &[400]).await;
     let temp = tempfile::tempdir().unwrap();
@@ -8019,6 +8021,8 @@ async fn dead_letter_publish_refuses_a_completed_temp_path_replacement() {
             .expect("the race preserves the completed writer inode outside the managed path");
         fs::write(&completed_temp, &hostile_for_hook)
             .expect("the race plants hostile bytes at the predictable temp path");
+        fs::set_permissions(&completed_temp, fs::Permissions::from_mode(0o600))
+            .expect("the planted replacement has valid owner-only permissions");
         *planted_for_hook.lock().expect("planted temp path") = Some(completed_temp);
         replaced_for_hook.store(true, Ordering::SeqCst);
     })));
