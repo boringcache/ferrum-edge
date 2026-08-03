@@ -6518,8 +6518,14 @@ async fn test_gemini_claim_injects_alt_sse_and_goog_api_key() {
     );
     let path = ctx.route_override_path.as_deref().unwrap_or("");
     assert!(
-        path.contains("gemini-1.5-flash") && path.contains("alt=sse"),
-        "path must embed model and alt=sse, got {path}"
+        path.ends_with("/v1beta/models/gemini-1.5-flash:streamGenerateContent"),
+        "route override must keep the streamGenerateContent model path, got {path}"
+    );
+    let effective =
+        ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+    assert!(
+        effective.contains("alt=sse"),
+        "committed backend query must include alt=sse, got {effective}"
     );
     assert_eq!(
         ctx.metadata
@@ -7290,7 +7296,7 @@ async fn test_gemini_provider_error_and_premature_eof_fail_closed() {
     let partial_out = run_gemini_normalizer(4096, partial, "text/event-stream").await;
     assert!(partial_out.contains("upstream_error"), "{partial_out}");
     assert!(
-        partial_out.contains("before a terminal finishReason"),
+        partial_out.contains("before every candidate reached a terminal finishReason"),
         "{partial_out}"
     );
     assert_eq!(partial_out.matches("data: [DONE]").count(), 1);
@@ -7304,20 +7310,14 @@ async fn test_gemini_malformed_and_oversized_events_fail_closed() {
     assert!(out.contains("malformed"), "{out}");
 
     let (_plugin, _ctx, mut inspector) = claimed_gemini_inspector("text/event-stream").await;
-    let filler = vec![b'a'; 64 * 1024];
-    let mut terminated = None;
-    for _ in 0..20 {
-        match inspector.on_chunk(&filler).await {
-            ResponseStreamAction::Forward(_) => {}
-            ResponseStreamAction::Terminate(bytes) => {
-                terminated = Some(bytes);
-                break;
-            }
+    let event = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
+    match inspector.on_chunk(&event).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "oversized");
         }
+        other => panic!("oversized complete event must terminate: {other:?}"),
     }
-    let text =
-        String::from_utf8(terminated.expect("oversized").expect("payload").to_vec()).unwrap();
-    assert_bound_termination(&text, "oversized");
 }
 
 #[tokio::test]
