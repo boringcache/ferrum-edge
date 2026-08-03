@@ -3373,6 +3373,51 @@ async fn replay_keeps_original_when_dead_letter_metadata_cannot_be_written() {
     assert_rejected_sidecar(&source, 400, "permanent_http");
 }
 
+#[tokio::test]
+async fn dead_letter_recovery_reuses_quota_held_by_a_partially_published_payload() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400, 400]).await;
+
+    let mut event = sample_event("evt-partial-dead-letter-quota");
+    event.request_id = Some("x".repeat(32 * 1024));
+    let encoded = serialize_json_each_row(std::slice::from_ref(&event)).unwrap();
+    // One authoritative source + one rejected payload + bounded metadata fits.
+    // A second complete payload does not, proving recovery replaces the partial
+    // sibling instead of demanding duplicate quota or evicting other data.
+    let max_bytes = (encoded.len() as u64)
+        .saturating_mul(2)
+        .saturating_add(4 * 1024);
+    assert!(encoded.len() > 4 * 1024);
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = spool.write_events(&[event]).unwrap();
+    let meta_path = dead_letter_meta_path(&source);
+    let meta_temp = meta_path.with_file_name(format!(
+        "{}.tmp",
+        meta_path.file_name().and_then(|name| name.to_str()).unwrap()
+    ));
+    fs::create_dir(&meta_temp).unwrap();
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("blocked metadata publication must retain the source");
+    let payload_path = dead_letter_payload_path(&source);
+    assert!(source.exists());
+    assert!(payload_path.exists());
+    assert!(spool.scan_stats().unwrap().bytes <= max_bytes);
+
+    fs::remove_dir(&meta_temp).unwrap();
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect("recovery must replace the partial payload within the original quota peak");
+
+    assert_rejected_sidecar(&source, 400, "permanent_http");
+    assert_eq!(fs::read_to_string(payload_path).unwrap(), encoded);
+    assert!(spool.scan_stats().unwrap().bytes <= max_bytes);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn dead_letter_payload_publish_refuses_symlink_and_restores_the_source_claim() {

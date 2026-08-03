@@ -8229,10 +8229,33 @@ struct DeadLetterPayloadWriter {
 impl DeadLetterPayloadWriter {
     fn open(spool: &SpoolManager, source_path: &Path) -> Result<Self, String> {
         let (temp_path, final_path) = dead_letter_payload_paths(spool, source_path)?;
+        let (_, prior_meta_path) = dead_letter_meta_paths(source_path)?;
         let _guard = spool.lock_spool_mutation()?;
         spool.assert_managed_path(source_path)?;
         spool.assert_managed_path(&temp_path)?;
         spool.assert_managed_path(&final_path)?;
+        spool.assert_managed_path(&prior_meta_path)?;
+        // The source claim remains authoritative until payload + metadata are
+        // durable and the claim is removed. A previous attempt may therefore
+        // have published either sibling before failing. Remove those partial
+        // handoff artifacts under the namespace lock before rebuilding so
+        // recovery never needs quota for two complete rejected payloads and
+        // never evicts unrelated active spool data merely to duplicate one.
+        for (path, kind) in [
+            (&prior_meta_path, "metadata"),
+            (&final_path, "payload"),
+        ] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "{PLUGIN_NAME}: failed to remove prior partial dead-letter {kind} '{}': {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
         let live = LiveSpoolPathGuard::new(temp_path.clone());
         #[cfg(unix)]
         let file = OpenOptions::new()

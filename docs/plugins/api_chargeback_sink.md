@@ -633,9 +633,11 @@ fields are never logged.
   credentials, or charge-record fields. The payload file intentionally contains
   original billing rows and must remain access-controlled. If any payload,
   metadata, quota, or source-removal step fails, the original file remains
-  replayable; a successfully published payload remains recoverable and is
-  safely replaced by a later attempt. Successfully inserted rows may be retried
-  with their unchanged `event_id` idempotency identity.
+  replayable; while that source remains authoritative, a later attempt removes
+  prior partial metadata/payload siblings under the namespace lock before
+  rebuilding them, so recovery does not require quota for two rejected payloads.
+  Successfully inserted rows may be retried with their unchanged `event_id`
+  idempotency identity.
 - Temps left by an interrupted atomic write are reconciled only when this process
   demonstrably owns them (matching `process_tag`) and no live writer holds the
   path, or when they are foreign/unattributable **and** older than the stale-temp
