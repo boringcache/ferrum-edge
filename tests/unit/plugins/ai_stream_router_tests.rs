@@ -6425,7 +6425,6 @@ async fn only_the_owner_enforces_and_normalizes_under_a_forged_model_key() {
     ));
 }
 
-
 // ---------------------------------------------------------------------------
 // google_gemini adapter (issue #3299)
 // ---------------------------------------------------------------------------
@@ -6523,7 +6522,9 @@ async fn test_gemini_claim_injects_alt_sse_and_goog_api_key() {
         "path must embed model and alt=sse, got {path}"
     );
     assert_eq!(
-        ctx.metadata.get("ai_stream_router.provider_type").map(String::as_str),
+        ctx.metadata
+            .get("ai_stream_router.provider_type")
+            .map(String::as_str),
         Some("google_gemini")
     );
 }
@@ -6573,8 +6574,14 @@ async fn test_gemini_body_translation_and_final_revalidation() {
         .await
         .expect("gemini body translation");
     let parsed: Value = serde_json::from_slice(&translated).unwrap();
-    assert!(parsed.get("model").is_none(), "model is URL-scoped: {parsed}");
-    assert_eq!(parsed["systemInstruction"]["parts"][0]["text"], json!("be brief"));
+    assert!(
+        parsed.get("model").is_none(),
+        "model is URL-scoped: {parsed}"
+    );
+    assert_eq!(
+        parsed["systemInstruction"]["parts"][0]["text"],
+        json!("be brief")
+    );
     assert_eq!(parsed["contents"][0]["role"], json!("user"));
     assert_eq!(parsed["contents"][1]["role"], json!("model"));
     assert_eq!(
@@ -6612,12 +6619,13 @@ async fn test_gemini_rejects_malformed_tool_choice_at_claim() {
     let mut headers = json_headers();
     match plugin.before_proxy(&mut ctx, &mut headers).await {
         PluginResult::Reject {
-            status_code,
-            body,
-            ..
+            status_code, body, ..
         } => {
             assert_eq!(status_code, 400);
-            assert!(body.contains("tool_choice") || body.contains("Gemini"), "{body}");
+            assert!(
+                body.contains("tool_choice") || body.contains("Gemini"),
+                "{body}"
+            );
         }
         other => panic!("expected reject, got {other:?}"),
     }
@@ -6665,12 +6673,16 @@ async fn test_gemini_multi_candidate_and_safety_block() {
     assert!(out.contains("\"content\":\"A\""), "{out}");
     assert!(out.contains("\"content\":\"B\""), "{out}");
 
-    let blocked = concat!(
-        "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n",
-    );
+    let blocked = concat!("data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n",);
     let blocked_out = run_gemini_normalizer(4096, blocked, "text/event-stream").await;
-    assert!(blocked_out.contains("\"finish_reason\":\"content_filter\""), "{blocked_out}");
-    assert!(blocked_out.trim_end().ends_with("data: [DONE]"), "{blocked_out}");
+    assert!(
+        blocked_out.contains("\"finish_reason\":\"content_filter\""),
+        "{blocked_out}"
+    );
+    assert!(
+        blocked_out.trim_end().ends_with("data: [DONE]"),
+        "{blocked_out}"
+    );
 }
 
 #[tokio::test]
@@ -6702,8 +6714,14 @@ async fn test_gemini_function_call_and_tool_choice_none_fail_closed() {
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let text = String::from_utf8(collected).unwrap();
     assert!(text.contains("upstream_error"), "{text}");
-    assert!(text.contains("tool_choice none") || text.contains("tool use"), "{text}");
-    assert!(!text.contains("\"q\":\"x\""), "must not echo tool args: {text}");
+    assert!(
+        text.contains("tool_choice none") || text.contains("tool use"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("\"q\":\"x\""),
+        "must not echo tool args: {text}"
+    );
 }
 
 #[tokio::test]
@@ -6753,13 +6771,8 @@ async fn test_gemini_malformed_and_oversized_events_fail_closed() {
             }
         }
     }
-    let text = String::from_utf8(
-        terminated
-            .expect("oversized")
-            .expect("payload")
-            .to_vec(),
-    )
-    .unwrap();
+    let text =
+        String::from_utf8(terminated.expect("oversized").expect("payload").to_vec()).unwrap();
     assert_bound_termination(&text, "oversized");
 }
 
@@ -6775,7 +6788,9 @@ async fn test_gemini_reload_config_still_selects_provider() {
     let mut headers = json_headers();
     plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_eq!(
-        ctx.metadata.get("ai_stream_router.claimed").map(String::as_str),
+        ctx.metadata
+            .get("ai_stream_router.claimed")
+            .map(String::as_str),
         Some("true")
     );
 
@@ -6789,4 +6804,299 @@ async fn test_gemini_reload_config_still_selects_provider() {
         PluginResult::Continue
     ));
     assert!(ctx2.ai_stream_router_claim.is_some());
+}
+
+fn gemini_lookup_tools() -> Value {
+    json!([{
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "description": "d",
+            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+        }
+    }])
+}
+
+#[tokio::test]
+async fn test_gemini_tool_choice_and_tools_fail_closed_without_weakening() {
+    let plugin = build(gemini_config());
+
+    // auto/required/named without tools must not weaken into provider defaults.
+    for tool_choice in [
+        json!("auto"),
+        json!("required"),
+        json!({"type": "function", "function": {"name": "lookup"}}),
+    ] {
+        let body = json!({
+            "model": "gemini-1.5-flash",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": tool_choice
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        assert_eq!(
+            reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await),
+            Some(400),
+            "non-none tool_choice without tools must reject"
+        );
+    }
+
+    // Named choice that does not match a declared tool.
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": gemini_lookup_tools(),
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "other_tool"}
+        }
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), Some(400));
+    if let PluginResult::Reject { body, .. } = result {
+        assert!(
+            !body.contains("other_tool"),
+            "client error must not echo the unmatched tool name: {body}"
+        );
+    }
+
+    // Unsupported tool entry must not be silently dropped.
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}},
+            {"type": "unsupported", "name": "web_search"}
+        ],
+        "tool_choice": "auto"
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert_eq!(
+        reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await),
+        Some(400)
+    );
+
+    // tool_choice none remains valid without a tools array.
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "tool_choice": "none",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_gemini_json_array_chunk_splits_and_malformed_separators_fail_closed() {
+    let split = run_gemini_normalizer(3, GEMINI_JSON_ARRAY, "application/json").await;
+    let whole = run_gemini_normalizer(4096, GEMINI_JSON_ARRAY, "application/json").await;
+    assert_eq!(strip_created(&split), strip_created(&whole));
+    assert!(split.contains("\"content\":\"Array\""));
+    assert!(split.contains("\"finish_reason\":\"stop\""));
+
+    // Concatenated objects (non-array) remain supported.
+    let concat = concat!(
+        "{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"One\"}]}}]}",
+        "{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Two\"}]},\"finishReason\":\"STOP\"}]}",
+    );
+    let concat_out = run_gemini_normalizer(5, concat, "application/json").await;
+    assert!(concat_out.contains("\"content\":\"One\""), "{concat_out}");
+    assert!(concat_out.contains("\"content\":\"Two\""), "{concat_out}");
+    assert!(concat_out.contains("\"finish_reason\":\"stop\""), "{concat_out}");
+
+    let hostile = [
+        // leading comma
+        "[,{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}]",
+        // repeated commas
+        "[{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]}}]},,{\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}]",
+        // trailing comma
+        "[{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]},]",
+        // missing comma between values
+        "[{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]}}]}{\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}]",
+        // bytes after closing ]
+        "[{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}]{}",
+    ];
+    for body in hostile {
+        let out = run_gemini_normalizer(7, body, "application/json").await;
+        assert!(
+            out.contains("upstream_error"),
+            "malformed array must fail closed: {body} => {out}"
+        );
+        assert!(
+            out.contains("malformed") || out.contains("JSON array"),
+            "diagnostic must mention array framing: {out}"
+        );
+        assert!(
+            !out.contains("\"total_tokens\""),
+            "must not publish usage after hostile framing: {out}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_gemini_keeps_claim_model_and_pins_response_id() {
+    // Provider modelVersion must not overwrite the claim-committed model.
+    let body = concat!(
+        "data: {\"responseId\":\"resp_pin\",\"modelVersion\":\"provider-other-model\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hi\"}]}}]}\n\n",
+        "data: {\"responseId\":\"resp_pin\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"!\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, body, "text/event-stream").await;
+    assert!(out.contains("\"model\":\"gemini-1.5-flash\""), "{out}");
+    assert!(!out.contains("provider-other-model"), "{out}");
+    assert!(out.contains("\"id\":\"resp_pin\""), "{out}");
+
+    // Changed responseId mid-stream fails closed.
+    let changed = concat!(
+        "data: {\"responseId\":\"resp_a\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"A\"}]}}]}\n\n",
+        "data: {\"responseId\":\"resp_b\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"B\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let changed_out = run_gemini_normalizer(4096, changed, "text/event-stream").await;
+    assert!(changed_out.contains("upstream_error"), "{changed_out}");
+    assert!(
+        changed_out.contains("responseId"),
+        "{changed_out}"
+    );
+
+    // Non-string / empty / oversized responseId fail closed.
+    for hostile in [
+        "data: {\"responseId\":123,\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n",
+        "data: {\"responseId\":\"\",\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n",
+        &format!(
+            "data: {{\"responseId\":\"{}\",\"candidates\":[{{\"index\":0,\"finishReason\":\"STOP\"}}]}}\n\n",
+            "r".repeat(129)
+        ),
+    ] {
+        let out = run_gemini_normalizer(4096, hostile, "text/event-stream").await;
+        assert!(out.contains("upstream_error"), "{out}");
+        assert!(out.contains("responseId"), "{out}");
+    }
+
+    // Invalid modelVersion shape fails closed without trusting it as identity.
+    let bad_model = "data: {\"modelVersion\":\"../evil\",\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n";
+    let bad_out = run_gemini_normalizer(4096, bad_model, "text/event-stream").await;
+    assert!(bad_out.contains("upstream_error"), "{bad_out}");
+    assert!(bad_out.contains("modelVersion"), "{bad_out}");
+    assert!(!bad_out.contains("../evil"), "{bad_out}");
+}
+
+#[tokio::test]
+async fn test_gemini_multi_event_tool_calls_get_distinct_ids_and_indexes() {
+    // Two events each carrying part_index 0 must still mint distinct call ids /
+    // tool indexes from the monotonic per-candidate counter.
+    let body = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"one\"}}}]}}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"two\"}}}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, body, "text/event-stream").await;
+    assert!(out.contains("\"tool_calls\""), "{out}");
+    assert!(out.contains("\"index\":0"), "{out}");
+    assert!(out.contains("\"index\":1"), "{out}");
+    assert!(out.contains("\"finish_reason\":\"tool_calls\""), "{out}");
+
+    let mut call_ids = Vec::new();
+    for line in out.lines() {
+        let Some(rest) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if rest == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(rest) else {
+            continue;
+        };
+        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+            continue;
+        };
+        for choice in choices {
+            let Some(tool_calls) = choice
+                .pointer("/delta/tool_calls")
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for call in tool_calls {
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    call_ids.push(id.to_string());
+                }
+            }
+        }
+    }
+    assert_eq!(call_ids.len(), 2, "expected two tool call ids: {out}");
+    assert_ne!(call_ids[0], call_ids[1], "call ids must be distinct: {call_ids:?}");
+    assert!(
+        call_ids[0].ends_with("_0_0") && call_ids[1].ends_with("_0_1"),
+        "ids must embed choice/tool indexes: {call_ids:?}"
+    );
+    assert!(!out.contains("\"q\":\"one\""), "must not echo args: {out}");
+}
+
+#[tokio::test]
+async fn test_provider_usage_u64_overflow_fails_closed_without_wrapped_total() {
+    // Gemini path.
+    let gemini = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":18446744073709551615,\"candidatesTokenCount\":1,\"totalTokenCount\":0}}\n\n",
+    );
+    let gemini_out = run_gemini_normalizer(4096, gemini, "text/event-stream").await;
+    assert!(gemini_out.contains("upstream_error"), "{gemini_out}");
+    assert!(
+        gemini_out.contains("overflow") || gemini_out.contains("usage"),
+        "{gemini_out}"
+    );
+    assert!(
+        !gemini_out.contains("\"total_tokens\""),
+        "must not publish wrapped totals: {gemini_out}"
+    );
+    assert!(gemini_out.trim_end().ends_with("data: [DONE]"), "{gemini_out}");
+
+    // Anthropic path (shared overflow hardening).
+    let anthropic = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ovf\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":18446744073709551615,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("anthropic normalizer");
+    let mut collected = Vec::new();
+    collected.extend_from_slice(&forwarded(inspector.on_chunk(anthropic.as_bytes()).await));
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let anthropic_out = String::from_utf8(collected).unwrap();
+    assert!(anthropic_out.contains("upstream_error"), "{anthropic_out}");
+    assert!(
+        anthropic_out.contains("overflow") || anthropic_out.contains("usage"),
+        "{anthropic_out}"
+    );
+    assert!(
+        !anthropic_out.contains("\"total_tokens\""),
+        "must not publish wrapped totals: {anthropic_out}"
+    );
 }
