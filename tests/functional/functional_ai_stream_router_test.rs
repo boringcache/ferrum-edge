@@ -325,9 +325,72 @@ async fn test_ai_stream_router_live_gzip_br_chain_normalizes_through_real_proxy(
             let Ok((mut stream, _)) = provider_listener.accept().await else {
                 return;
             };
-            let mut buf = vec![0u8; 65536];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
-            let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
+            // TCP does not preserve HTTP header-write boundaries. Read through
+            // the complete header block so a split after the request line (or
+            // immediately before Accept-Encoding) cannot make this live test
+            // diagnose a correct gateway request as missing the identity
+            // negotiation. Keep the fixture bounded and deadline-controlled.
+            const MAX_REQUEST_BYTES: usize = 64 * 1024;
+            let mut request = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                if request.len() == MAX_REQUEST_BYTES {
+                    return;
+                }
+                let read_len = chunk.len().min(MAX_REQUEST_BYTES - request.len());
+                let n = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    stream.read(&mut chunk[..read_len]),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+                    Ok(Ok(n)) => n,
+                };
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+            else {
+                return;
+            };
+            let header_text = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = header_text
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find_map(|(name, value)| {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let Some(request_len) = header_end
+                .checked_add(content_length)
+                .filter(|length| *length <= MAX_REQUEST_BYTES)
+            else {
+                return;
+            };
+            // Drain the declared request body before responding. Dropping a
+            // socket with unread upload bytes can reset the response on some
+            // kernels and would turn this fixture into another transport race.
+            while request.len() < request_len {
+                let read_len = chunk.len().min(request_len - request.len());
+                let n = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    stream.read(&mut chunk[..read_len]),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+                    Ok(Ok(n)) => n,
+                };
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let raw = String::from_utf8_lossy(&request).into_owned();
             if !raw.lines().next().unwrap_or("").starts_with("POST ") {
                 let _ = stream
                     .write_all(
