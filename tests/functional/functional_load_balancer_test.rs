@@ -32,6 +32,13 @@ async fn start_identifying_server(port: u16, name: &'static str) {
             )
         });
 
+    serve_identifying_listener(listener, name).await;
+}
+
+/// Serve an identifying backend from a listener reserved by the caller.
+/// Tests that need collision-free ephemeral ports use this entry point so the
+/// socket stays owned continuously from allocation through the first request.
+async fn serve_identifying_listener(listener: TcpListener, name: &'static str) {
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
             let server_name = name;
@@ -2315,16 +2322,29 @@ async fn test_active_health_check_tcp_probe() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
-    // Server on 30221 is healthy (TCP-accepting), server on 30222 has nothing listening.
-    // TCP probe should detect 30222 as unhealthy (connection refused).
-    let config = r#"
+    // Reserve the healthy backend continuously so concurrent functional tests
+    // cannot steal a hard-coded port before its spawned server binds. Reserve a
+    // second distinct ephemeral port and release it only after both values are
+    // captured; the TCP probe should observe connection refusal there.
+    let healthy_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve healthy TCP-probe backend");
+    let healthy_port = healthy_listener.local_addr().unwrap().port();
+    let unavailable_reservation = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve unavailable TCP-probe target");
+    let unavailable_port = unavailable_reservation.local_addr().unwrap().port();
+    drop(unavailable_reservation);
+
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-tcp-probe-proxy"
     listen_path: "/tcp-probe"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30221
+    backend_port: {healthy_port}
     strip_listen_path: true
     upstream_id: "upstream-tcp-probe"
 
@@ -2334,10 +2354,10 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30221
+        port: {healthy_port}
         weight: 1
       - host: "127.0.0.1"
-        port: 30222
+        port: {unavailable_port}
         weight: 1
     health_checks:
       active:
@@ -2349,27 +2369,60 @@ upstreams:
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
         .write_all(config.as_bytes())
         .unwrap();
 
-    // Only start server on 30221; port 30222 has nothing listening (TCP probe fails)
-    let s1 = tokio::spawn(start_identifying_server(30221, "tcp-healthy"));
-    sleep(Duration::from_millis(500)).await;
+    let s1 = tokio::spawn(serve_identifying_listener(
+        healthy_listener,
+        "tcp-healthy",
+    ));
 
     let (mut gateway, proxy_port, _admin_port) =
         start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
-    // Wait for TCP health checks to detect unreachable target
-    sleep(Duration::from_secs(3)).await;
-
     let client = reqwest::Client::new();
+
+    // Observe the actual health-routing state instead of assuming two probe
+    // intervals fit inside a fixed wall-clock sleep on a contended runner. Four
+    // consecutive healthy responses cannot occur while round-robin still
+    // admits the unavailable target.
+    let convergence_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut consecutive_healthy = 0u8;
+    while consecutive_healthy < 4 && tokio::time::Instant::now() < convergence_deadline {
+        let healthy = match client
+            .get(format!("http://127.0.0.1:{proxy_port}/tcp-probe/readiness"))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let body = response.text().await.unwrap_or_default();
+                parse_server_name(&body) == "tcp-healthy"
+            }
+            Err(_) => false,
+        };
+        consecutive_healthy = if healthy {
+            consecutive_healthy + 1
+        } else {
+            0
+        };
+        if consecutive_healthy < 4 {
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+    assert_eq!(
+        consecutive_healthy, 4,
+        "TCP active health checks did not converge before the deadline"
+    );
+
     let mut counts: HashMap<String, u32> = HashMap::new();
 
-    // All traffic should go to tcp-healthy since tcp probe marks 30222 unhealthy
+    // All traffic should go to tcp-healthy after the TCP probe excludes the
+    // deliberately unbound target.
     for i in 0..20 {
         let resp = client
             .get(format!(
