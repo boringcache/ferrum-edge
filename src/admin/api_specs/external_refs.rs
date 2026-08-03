@@ -153,12 +153,23 @@ impl ExternalRefProcessPolicy {
             hasher.update(root.to_string_lossy().as_bytes());
         }
         hasher.update(b"\0");
-        for origin in &self.allowed_origins {
+        let mut allowed_origins: Vec<&str> =
+            self.allowed_origins.iter().map(String::as_str).collect();
+        allowed_origins.sort_unstable();
+        allowed_origins.dedup();
+        for origin in allowed_origins {
             hasher.update(origin.as_bytes());
             hasher.update(b"\0");
         }
         hasher.update(b"|http|");
-        for origin in &self.allow_http_origins {
+        let mut allow_http_origins: Vec<&str> = self
+            .allow_http_origins
+            .iter()
+            .map(String::as_str)
+            .collect();
+        allow_http_origins.sort_unstable();
+        allow_http_origins.dedup();
+        for origin in allow_http_origins {
             hasher.update(origin.as_bytes());
             hasher.update(b"\0");
         }
@@ -208,7 +219,10 @@ pub struct EffectiveExternalRefPolicy {
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
     pub total_timeout: Duration,
-    pub process_policy_digest: String,
+    process_policy_digest: String,
+    /// Stable digest of the fully composed process + per-spec policy. This is
+    /// the only policy provenance persisted in snapshots or used in cache keys.
+    pub effective_policy_digest: String,
 }
 
 impl EffectiveExternalRefPolicy {
@@ -231,7 +245,9 @@ impl EffectiveExternalRefPolicy {
             request_timeout: process.request_timeout,
             total_timeout: process.total_timeout,
             process_policy_digest: process.policy_digest(),
+            effective_policy_digest: String::new(),
         }
+        .with_effective_policy_digest()
     }
 
     pub fn compose(
@@ -252,7 +268,7 @@ impl EffectiveExternalRefPolicy {
             disabled.request_timeout = process.request_timeout;
             disabled.total_timeout = process.total_timeout;
             disabled.file_root = process.file_root.clone();
-            return Ok(disabled);
+            return Ok(disabled.with_effective_policy_digest());
         };
 
         let document_base = match extension.document_base.as_deref() {
@@ -294,7 +310,7 @@ impl EffectiveExternalRefPolicy {
             let mut disabled = Self::compose(process, None)?;
             disabled.document_base = document_base;
             disabled.allowed_origins = allowed_origins;
-            return Ok(disabled);
+            return Ok(disabled.with_effective_policy_digest());
         }
 
         Ok(Self {
@@ -314,23 +330,62 @@ impl EffectiveExternalRefPolicy {
             request_timeout: process.request_timeout,
             total_timeout: process.total_timeout,
             process_policy_digest: process.policy_digest(),
-        })
+            effective_policy_digest: String::new(),
+        }
+        .with_effective_policy_digest())
     }
 
     pub fn cache_key_material(&self) -> String {
-        format!(
-            "{}|{}|{}",
-            self.process_policy_digest,
-            resource_uri_key(&self.document_base),
-            u8::from(self.enabled)
-        )
+        self.effective_policy_digest.clone()
     }
+
+    fn with_effective_policy_digest(mut self) -> Self {
+        self.effective_policy_digest = effective_policy_digest(
+            &self.process_policy_digest,
+            self.enabled,
+            &self.document_base,
+            &self.allowed_origins,
+            &self.allow_http_origins,
+        );
+        self
+    }
+}
+
+fn effective_policy_digest(
+    process_policy_digest: &str,
+    enabled: bool,
+    document_base: &Url,
+    allowed_origins: &HashSet<String>,
+    allow_http_origins: &HashSet<String>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"extref-effective-v1\0");
+    hash_len_prefixed(&mut hasher, process_policy_digest.as_bytes());
+    hasher.update([u8::from(enabled)]);
+    hash_len_prefixed(&mut hasher, resource_uri_key(document_base).as_bytes());
+
+    let mut https_origins: Vec<&str> = allowed_origins.iter().map(String::as_str).collect();
+    https_origins.sort_unstable();
+    hasher.update((https_origins.len() as u64).to_le_bytes());
+    for origin in https_origins {
+        hash_len_prefixed(&mut hasher, origin.as_bytes());
+    }
+
+    let mut http_origins: Vec<&str> = allow_http_origins.iter().map(String::as_str).collect();
+    http_origins.sort_unstable();
+    hasher.update((http_origins.len() as u64).to_le_bytes());
+    for origin in http_origins {
+        hash_len_prefixed(&mut hasher, origin.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// One immutable external document admitted at import time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExternalRefSnapshotDocument {
-    /// Canonical document URI without fragment (redacted of userinfo/query).
+    /// Stable fetched-document identity without fragment. Candidate admission
+    /// forbids userinfo and queries; file identities are hashed so persisted
+    /// snapshots and backups do not disclose host paths.
     pub canonical_uri: String,
     /// SHA-256 hex of the canonical normalized JSON value as admitted.
     pub content_digest: String,
@@ -353,8 +408,8 @@ pub struct ExternalRefSnapshot {
 impl ExternalRefSnapshot {
     pub fn empty(policy: &EffectiveExternalRefPolicy) -> Self {
         let mut snap = Self {
-            policy_digest: policy.process_policy_digest.clone(),
-            root_document_base: resource_uri_key(&policy.document_base),
+            policy_digest: policy.effective_policy_digest.clone(),
+            root_document_base: snapshot_uri_identity(&policy.document_base),
             documents: Vec::new(),
             snapshot_digest: String::new(),
         };
@@ -713,7 +768,7 @@ pub fn load_external_documents(
     let mut documents: Vec<ExternalRefSnapshotDocument> = loaded
         .values()
         .map(|doc| ExternalRefSnapshotDocument {
-            canonical_uri: resource_uri_key(&doc.canonical_uri),
+            canonical_uri: snapshot_uri_identity(&doc.canonical_uri),
             content_digest: doc.content_digest.clone(),
             format: doc.format.to_string(),
             document: doc.root.clone(),
@@ -721,8 +776,8 @@ pub fn load_external_documents(
         .collect();
     documents.sort_by(|a, b| a.canonical_uri.cmp(&b.canonical_uri));
     let mut snapshot = ExternalRefSnapshot {
-        policy_digest: policy.process_policy_digest.clone(),
-        root_document_base: resource_uri_key(&policy.document_base),
+        policy_digest: policy.effective_policy_digest.clone(),
+        root_document_base: snapshot_uri_identity(&policy.document_base),
         documents,
         snapshot_digest: String::new(),
     };
@@ -1117,13 +1172,17 @@ async fn load_http_document(
                 "external $ref HTTP fetch returned a non-success status",
             ));
         }
-        if let Some(ct) = response.headers().get(reqwest::header::CONTENT_TYPE)
-            && let Ok(ct) = ct.to_str()
-            && !content_type_allowed(ct)
-        {
-            return Err(external_ref_error(
-                "external $ref response Content-Type is not an allowed OpenAPI media type",
-            ));
+        if let Some(value) = response.headers().get(reqwest::header::CONTENT_TYPE) {
+            let content_type = value.to_str().map_err(|_| {
+                external_ref_error(
+                    "external $ref response Content-Type is not an allowed OpenAPI media type",
+                )
+            })?;
+            if !content_type_allowed(content_type) {
+                return Err(external_ref_error(
+                    "external $ref response Content-Type is not an allowed OpenAPI media type",
+                ));
+            }
         }
         if response
             .content_length()
@@ -1665,8 +1724,18 @@ fn split_ref(reference: &str) -> (Option<&str>, &str) {
 pub fn resource_uri_key(url: &Url) -> String {
     let mut owned = url.clone();
     owned.set_fragment(None);
-    owned.set_query(None);
     normalize_percent_escape_case(owned.as_str())
+}
+
+fn snapshot_uri_identity(url: &Url) -> String {
+    let key = resource_uri_key(url);
+    if url.scheme() != "file" {
+        return key;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"extref-file-uri-v1\0");
+    hash_len_prefixed(&mut hasher, key.as_bytes());
+    format!("file:sha256:{}", hex::encode(hasher.finalize()))
 }
 
 fn normalize_percent_escape_case(value: &str) -> String {
@@ -1694,30 +1763,82 @@ fn normalize_percent_escape_case(value: &str) -> String {
 
 /// Redact userinfo and query from a reference before putting it in errors/logs.
 pub fn redact_reference(reference: &str) -> String {
-    let path_candidate = reference.split('?').next().unwrap_or(reference);
+    let path_candidate = strip_query_for_diagnostic(reference);
     let bytes = path_candidate.as_bytes();
     let windows_absolute = bytes.len() >= 3
         && bytes[1] == b':'
         && matches!(bytes[2], b'/' | b'\\');
     if Path::new(path_candidate).is_absolute()
+        || path_candidate.starts_with("//")
         || path_candidate.starts_with("\\\\")
         || windows_absolute
     {
+        if path_candidate.starts_with("//") && !path_candidate.starts_with("///") {
+            return redact_protocol_relative(reference);
+        }
         return "[filesystem path redacted]".to_string();
     }
     let Ok(mut url) = Url::parse(reference) else {
-        // Relative refs: strip query-looking suffixes and never echo raw paths
-        // that look absolute.
-        return truncate_utf8(path_candidate, 128);
+        if let Some(scheme) = reference_scheme(reference) {
+            return redacted_scheme(scheme);
+        }
+        return redact_relative_reference(path_candidate);
     };
     if url.scheme() == "file" {
         return "file:[redacted]".to_string();
+    }
+    if !matches!(url.scheme(), "http" | "https") {
+        return redacted_scheme(url.scheme());
+    }
+    if url.host().is_none() {
+        return redacted_scheme(url.scheme());
     }
     let _ = url.set_username("");
     let _ = url.set_password(None);
     url.set_query(None);
     let rendered = url.as_str();
     truncate_utf8(rendered, 256)
+}
+
+fn strip_query_for_diagnostic(reference: &str) -> &str {
+    reference.split_once('?').map_or(reference, |(path, _)| path)
+}
+
+fn redact_protocol_relative(reference: &str) -> String {
+    let Ok(mut url) = Url::parse(&format!("https:{reference}")) else {
+        return "[network reference redacted]".to_string();
+    };
+    if url.host().is_none() {
+        return "[network reference redacted]".to_string();
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    let rendered = url.as_str().strip_prefix("https:").unwrap_or("//[redacted]");
+    truncate_utf8(rendered, 256)
+}
+
+fn reference_scheme(reference: &str) -> Option<&str> {
+    let (scheme, _) = reference.split_once(':')?;
+    let mut bytes = scheme.bytes();
+    if !bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(scheme)
+}
+
+fn redacted_scheme(scheme: &str) -> String {
+    let scheme = truncate_utf8(scheme, 32);
+    format!("{}:[redacted]", scheme.to_ascii_lowercase())
+}
+
+fn redact_relative_reference(reference: &str) -> String {
+    if let Some((_, suffix)) = reference.rsplit_once('@') {
+        return truncate_utf8(&format!("[userinfo redacted]@{suffix}"), 128);
+    }
+    truncate_utf8(reference, 128)
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {
@@ -1733,44 +1854,4 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 
 fn external_ref_error(message: &str) -> ExtractError {
     ExtractError::SchemaReference(message.to_string())
-}
-
-#[cfg(test)]
-mod policy_unit_tests {
-    use super::*;
-
-    #[test]
-    fn absent_extension_stays_disabled() {
-        let process = ExternalRefProcessPolicy {
-            enabled: true,
-            ..ExternalRefProcessPolicy::default()
-        };
-        let effective = EffectiveExternalRefPolicy::compose(&process, None).unwrap();
-        assert!(!effective.enabled);
-    }
-
-    #[test]
-    fn both_gates_required() {
-        let process = ExternalRefProcessPolicy {
-            enabled: true,
-            allowed_origins: vec!["https://schemas.example.com:443".to_string()],
-            ..ExternalRefProcessPolicy::default()
-        };
-        let ext = ExternalRefSpecExtension {
-            enabled: true,
-            document_base: None,
-            allowed_origins: vec![],
-        };
-        let effective = EffectiveExternalRefPolicy::compose(&process, Some(&ext)).unwrap();
-        assert!(effective.enabled);
-    }
-
-    #[test]
-    fn redact_strips_userinfo_and_query() {
-        let redacted = redact_reference("https://user:pass@example.com/a.json?token=secret#/x");
-        assert!(!redacted.contains("user"));
-        assert!(!redacted.contains("pass"));
-        assert!(!redacted.contains("token"));
-        assert!(redacted.contains("example.com"));
-    }
 }

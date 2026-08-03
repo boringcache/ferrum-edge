@@ -5400,7 +5400,10 @@ paths:
           to opt this document into external / cross-document `$ref`
           resolution when the process gate is also enabled. Admitted
           external documents are snapshotted at import (`external_ref_digest`
-          / stored snapshot bytes); runtime validation never re-fetches.
+          / stored snapshot bytes); runtime validation never re-fetches. A
+          present external response Content-Type must be valid UTF-8 and on
+          the documented OpenAPI media allowlist; only an absent header uses
+          bounded JSON/YAML format detection.
 
         **Forbidden**: `x-ferrum-consumers` is rejected — use `POST /consumers`
         separately. Plugin `config` values must not contain credential or

@@ -39,6 +39,7 @@
 
 use ferrum_edge::{
     ExtractedBundle, GatewayConfig,
+    admin::api_specs::{EffectiveExternalRefPolicy, ExternalRefSnapshot},
     config::{
         BackendAllowIps, BackendEgressPolicy,
         db_backend::{
@@ -2063,7 +2064,11 @@ async fn list_api_specs_does_not_hydrate_spec_content_blob() {
         plugins: vec![],
     };
     let raw_content = vec![b'x'; 1024 * 64];
-    let spec = make_spec(&spec_id, &proxy_id, ns, &raw_content);
+    let mut spec = make_spec(&spec_id, &proxy_id, ns, &raw_content);
+    let snapshot = ExternalRefSnapshot::empty(&EffectiveExternalRefPolicy::disabled());
+    let snapshot_bytes = snapshot.gzip_bytes().expect("snapshot gzip");
+    spec.external_ref_snapshot = Some(snapshot_bytes.clone());
+    spec.external_ref_digest = Some(snapshot.snapshot_digest.clone());
     let stored_spec_content = spec.spec_content.clone();
     store
         .submit_api_spec_bundle(&bundle, &spec)
@@ -2078,9 +2083,14 @@ async fn list_api_specs_does_not_hydrate_spec_content_blob() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, spec_id);
     assert_eq!(listed[0].content_hash, spec.content_hash);
+    assert_eq!(listed[0].external_ref_digest, spec.external_ref_digest);
     assert!(
         listed[0].spec_content.is_empty(),
         "list_api_specs is a summary path and must not hydrate the compressed spec blob"
+    );
+    assert!(
+        listed[0].external_ref_snapshot.is_none(),
+        "list_api_specs must keep external snapshot bytes private"
     );
 
     let fetched = store
@@ -2092,6 +2102,7 @@ async fn list_api_specs_does_not_hydrate_spec_content_blob() {
         fetched.spec_content, stored_spec_content,
         "single-spec GET must still hydrate the compressed spec blob"
     );
+    assert_eq!(fetched.external_ref_snapshot, Some(snapshot_bytes));
 }
 
 // ---------------------------------------------------------------------------

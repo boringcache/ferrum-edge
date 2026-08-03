@@ -3432,8 +3432,10 @@ pub async fn handle_list_api_specs(
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
-    // Build summary items — intentionally OMIT spec_content (heavy blob) and
-    // resource_hash (internal implementation detail, not for client display).
+    // Build summary items — intentionally OMIT spec_content / external snapshot
+    // bytes (heavy private blobs) and resource_hash (internal implementation
+    // detail, not for client display). The non-secret snapshot integrity digest
+    // is part of the public summary contract.
     let items: Vec<Value> = paginated
         .items
         .iter()
@@ -3455,6 +3457,7 @@ pub async fn handle_list_api_specs(
                 "operation_count": s.operation_count,
                 "uncompressed_size": s.uncompressed_size,
                 "content_hash": s.content_hash,
+                "external_ref_digest": s.external_ref_digest,
                 "created_at": s.created_at,
                 "updated_at": s.updated_at,
             })

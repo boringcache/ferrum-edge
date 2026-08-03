@@ -237,9 +237,9 @@ x-ferrum-external-refs:
 
 - **Files**: only under `FERRUM_ADMIN_SPEC_EXTERNAL_REFS_FILE_ROOT` (absolute). On Unix, each path component is opened relative to the already-open canonical jail descriptor with no-follow semantics, and bytes are read from the verified regular-file descriptor; symlink swaps and `..` traversal therefore fail closed without a check/reopen race. File refs are refused on platforms where this descriptor-relative containment primitive is unavailable. Client errors never echo raw host paths.
 - **Network**: HTTPS origins listed in `FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ALLOWED_ORIGINS` only (plus optional explicit HTTP fixture origins). Embedded credentials and query strings are rejected. HTTPS is always public-only, independently of `FERRUM_BACKEND_ALLOW_IPS`: localhost, private, link-local, metadata, multicast/broadcast, and unspecified addresses fail closed. The only non-public HTTP exception is loopback on an explicitly configured fixture/development origin. Every redirect hop is re-allowlisted, re-resolved, screened, and pinned into that hop's HTTP client, preserving hostname/SNI validation without an unchecked second DNS lookup. Redirects cannot downgrade HTTPS, and no ambient admin credentials, cookies, bearer tokens, or proxy credentials are forwarded.
-- **Budgets**: per-document and aggregate byte caps, document count, reference count, URI length, nesting depth, connect/request/total timeouts, and allowed Content-Types. `Content-Length` is preflighted without reserving from it, chunked/streamed bodies abort as soon as the cap is crossed, and the absolute total deadline covers DNS, connect/request, redirects, and every body read. Unknown, invalid, or oversized inputs fail closed with field-specific, redacted diagnostics.
+- **Budgets and response media**: per-document and aggregate byte caps, document count, reference count, URI length, nesting depth, connect/request/total timeouts, and allowed Content-Types. A present response `Content-Type` must be valid UTF-8 and match the OpenAPI JSON/YAML/plain/octet-stream allowlist; malformed and unsupported values fail closed with the same generic redacted diagnostic. Only an absent `Content-Type` uses bounded first-byte JSON/YAML detection. `Content-Length` is preflighted without reserving from it, chunked/streamed bodies abort as soon as the cap is crossed, and the absolute total deadline covers DNS, connect/request, redirects, and every body read. Unknown, invalid, or oversized inputs fail closed with field-specific, redacted diagnostics.
 
-**Snapshot / last-good:** successful admission persists a gzip-compressed normalized document set with per-document content digests and an aggregate `external_ref_digest`. The aggregate digest includes the canonical document values, and every full SQL/Mongo/backup decode enforces the 64 MiB compressed / 128 MiB decompressed caps, revalidates each document digest, and requires the snapshot/digest fields to be present as a matching pair. Cache keys include policy digest and canonical document identity. A failed PUT/extract retains the previously accepted generation (transactional replace / no write). Specs are admin-only metadata (not CP→DP published); one tenant/namespace cannot read another's snapshot. Backup section version `2` carries optional snapshot bytes; version `1` backups remain restorable without them.
+**Snapshot / last-good:** successful admission persists a gzip-compressed normalized document set with per-document content digests and an aggregate `external_ref_digest`. The aggregate digest includes the canonical document values and effective-policy provenance: the process-policy digest, enabled state, canonical document base, and canonical sorted effective HTTPS/HTTP origin sets. Different per-spec narrowing therefore produces a different digest while ordering-equivalent allowlists remain stable. Every full SQL/Mongo/backup decode enforces the 64 MiB compressed / 128 MiB decompressed caps, revalidates each document digest, and requires the snapshot/digest fields to be present as a matching pair. Cache keys use the same effective-policy digest without rendering a file base, and serialized file-document identities are stable hashes rather than host paths. A failed PUT/extract retains the previously accepted generation (transactional replace / no write). Specs are admin-only metadata (not CP→DP published); `GET /api-specs` returns only the non-secret digest and never the snapshot bytes, and one tenant/namespace cannot read another's snapshot. Backup section version `2` carries optional snapshot bytes; version `1` backups remain restorable without them.
 
 ## Storage model
 
@@ -265,8 +265,8 @@ x-ferrum-external-refs:
 | `server_urls` | string[] | `servers[].url` for 3.x; `{scheme}://{host}{basePath}` for 2.0 |
 | `operation_count` | uint32 | HTTP method keys summed across all `paths.*` entries |
 | `resource_hash` | string | SHA-256 hex of the serialised bundle (internal; not returned in list) |
-| `external_ref_snapshot` | bytes? | gzip JSON snapshot of admitted external documents (admin/backup; not runtime) |
-| `external_ref_digest` | string? | Aggregate digest of the external-ref snapshot |
+| `external_ref_snapshot` | bytes? | gzip JSON snapshot of admitted external documents (private storage/backup only; never returned by list) |
+| `external_ref_digest` | string? | Aggregate digest of the external-ref snapshot; returned by list, or `null` when absent |
 | `created_at` | timestamp | Set on POST; preserved on PUT |
 | `updated_at` | timestamp | Set on POST and PUT |
 
@@ -365,6 +365,7 @@ At submit time, the gateway extracts the following fields from the spec document
 | `tags` | `tags[].name` | De-duplicated and sorted; supported in both 2.0 and 3.x |
 | `server_urls` | `servers[].url` (3.x) or `{scheme}://{host}{basePath}` (2.0) | |
 | `operation_count` | Count of HTTP methods across all `paths.*` | `get`, `post`, `put`, `delete`, `options`, `head`, `patch`, `trace` |
+| `external_ref_digest` | External-ref admission snapshot | Lowercase SHA-256 hex when external refs were admitted; otherwise `null`. Snapshot bytes are never listed. |
 
 These fields are stored at INSERT time and do not require re-parsing the spec for list queries.
 
@@ -411,7 +412,7 @@ Unknown `sort_by` or `order` values, SQL `LIKE` wildcards in `spec_version` or
 }
 ```
 
-- `items` — page of spec summaries (no `spec_content` or `resource_hash`).
+- `items` — page of spec summaries (including nullable `external_ref_digest`, but never `spec_content`, `resource_hash`, or external snapshot bytes).
 - `limit` / `offset` — the pagination parameters that were applied.
 - `next_offset` — set to `offset + items.len()` when that value is strictly greater than `offset`, remains below `total`, and fits in the 32-bit offset range; `null` on the last page or when the next cursor cannot be represented.
 - `total` — count of all rows matching the filter (ignoring `limit`/`offset`). Use this to build "showing 1–50 of 327" pagination UI.

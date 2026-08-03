@@ -101,6 +101,23 @@ async fn load_production_http(
     .map_err(|_| ExtractError::SchemaReference("blocking test worker failed".to_string()))?
 }
 
+fn spawn_raw_http_response(response: Vec<u8>) -> (u16, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP fixture");
+    let port = listener.local_addr().expect("HTTP fixture address").port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept HTTP fixture request");
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request);
+        stream
+            .write_all(&response)
+            .expect("write HTTP fixture response");
+    });
+    (port, server)
+}
+
 #[test]
 fn absent_policy_keeps_external_refs_unsupported() {
     let spec = format!(
@@ -208,6 +225,91 @@ fn map_loader_resolves_external_path_item_and_schema_chain() {
     assert_eq!(
         config["operations"][0]["responses"]["200"]["application/json"]["required"],
         json!(["id"])
+    );
+}
+
+#[test]
+fn query_bearing_and_queryless_schema_resources_remain_distinct() {
+    let mut loader = MapExternalDocumentLoader::default();
+    loader.docs.insert(
+        "https://schemas.example.com/resource.json".to_string(),
+        br#"{
+  "type": "object",
+  "required": ["from_queryless_resource"],
+  "properties": {"from_queryless_resource": {"type": "boolean"}}
+}"#
+        .to_vec(),
+    );
+    let spec = format!(
+        r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "Query identity", "version": "1"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-external-refs": true,
+  "x-ferrum-proxy": {proxy},
+  "components": {{
+    "schemas": {{
+      "QueryResource": {{
+        "$id": "https://schemas.example.com/resource.json?view=local",
+        "type": "object",
+        "required": ["from_query_resource"],
+        "properties": {{"from_query_resource": {{"type": "string"}}}}
+      }}
+    }}
+  }},
+  "paths": {{
+    "/plain": {{
+      "get": {{
+        "responses": {{
+          "200": {{
+            "description": "ok",
+            "content": {{
+              "application/json": {{
+                "schema": {{"$ref": "https://schemas.example.com/resource.json"}}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }},
+    "/query": {{
+      "get": {{
+        "responses": {{
+          "200": {{
+            "description": "ok",
+            "content": {{
+              "application/json": {{
+                "schema": {{
+                  "$ref": "https://schemas.example.com/resource.json?view=local"
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block()
+    );
+
+    let config = extract_validator_ops(&spec, &process_enabled(None), &loader);
+    let operations = config["operations"].as_array().expect("operations array");
+    let plain = operations
+        .iter()
+        .find(|operation| operation["path_template"] == "/plain")
+        .expect("queryless operation");
+    let query = operations
+        .iter()
+        .find(|operation| operation["path_template"] == "/query")
+        .expect("query-bearing operation");
+    assert_eq!(
+        plain["responses"]["200"]["application/json"]["required"],
+        json!(["from_queryless_resource"])
+    );
+    assert_eq!(
+        query["responses"]["200"]["application/json"]["required"],
+        json!(["from_query_resource"])
     );
 }
 
@@ -640,6 +742,147 @@ fn snapshot_is_reproducible_and_digest_stable() {
     assert_eq!(restored.snapshot_digest, s1.snapshot_digest);
 }
 
+#[test]
+fn effective_policy_digest_tracks_narrowing_and_canonical_set_order() {
+    let mut process = process_enabled(None);
+    process.allowed_origins = vec![
+        "https://schemas.example.com:443".to_string(),
+        "https://alternate.example.com:443".to_string(),
+    ];
+    process.allow_http_origins = vec![
+        "http://127.0.0.1:9".to_string(),
+        "http://localhost:8080".to_string(),
+    ];
+
+    let narrowed_schemas = EffectiveExternalRefPolicy::compose(
+        &process,
+        Some(&ExternalRefSpecExtension {
+            enabled: true,
+            document_base: None,
+            allowed_origins: vec!["https://schemas.example.com".to_string()],
+        }),
+    )
+    .unwrap();
+    let narrowed_alternate = EffectiveExternalRefPolicy::compose(
+        &process,
+        Some(&ExternalRefSpecExtension {
+            enabled: true,
+            document_base: None,
+            allowed_origins: vec!["https://alternate.example.com".to_string()],
+        }),
+    )
+    .unwrap();
+    assert_ne!(
+        narrowed_schemas.effective_policy_digest,
+        narrowed_alternate.effective_policy_digest
+    );
+    let schemas_snapshot = ExternalRefSnapshot::empty(&narrowed_schemas);
+    let alternate_snapshot = ExternalRefSnapshot::empty(&narrowed_alternate);
+    assert_ne!(schemas_snapshot.policy_digest, alternate_snapshot.policy_digest);
+    assert_ne!(schemas_snapshot.snapshot_digest, alternate_snapshot.snapshot_digest);
+
+    let mut reordered_process = process.clone();
+    reordered_process.allowed_origins.reverse();
+    reordered_process.allow_http_origins.reverse();
+    let all_origins = EffectiveExternalRefPolicy::compose(
+        &process,
+        Some(&ExternalRefSpecExtension {
+            enabled: true,
+            document_base: None,
+            allowed_origins: vec![
+                "https://schemas.example.com".to_string(),
+                "https://alternate.example.com".to_string(),
+            ],
+        }),
+    )
+    .unwrap();
+    let reordered_all_origins = EffectiveExternalRefPolicy::compose(
+        &reordered_process,
+        Some(&ExternalRefSpecExtension {
+            enabled: true,
+            document_base: None,
+            allowed_origins: vec![
+                "https://alternate.example.com".to_string(),
+                "https://schemas.example.com".to_string(),
+            ],
+        }),
+    )
+    .unwrap();
+    assert_eq!(process.policy_digest(), reordered_process.policy_digest());
+    assert_eq!(
+        all_origins.effective_policy_digest,
+        reordered_all_origins.effective_policy_digest
+    );
+    assert_eq!(
+        all_origins.cache_key_material(),
+        all_origins.effective_policy_digest
+    );
+    let all_snapshot = ExternalRefSnapshot::empty(&all_origins);
+    let reordered_snapshot = ExternalRefSnapshot::empty(&reordered_all_origins);
+    assert_eq!(all_snapshot.policy_digest, reordered_snapshot.policy_digest);
+    assert_eq!(all_snapshot.snapshot_digest, reordered_snapshot.snapshot_digest);
+
+    let disabled = EffectiveExternalRefPolicy::compose(
+        &process,
+        Some(&ExternalRefSpecExtension {
+            enabled: false,
+            document_base: None,
+            allowed_origins: vec![
+                "https://schemas.example.com".to_string(),
+                "https://alternate.example.com".to_string(),
+            ],
+        }),
+    )
+    .unwrap();
+    assert_ne!(
+        all_origins.effective_policy_digest,
+        disabled.effective_policy_digest
+    );
+}
+
+#[test]
+fn effective_policy_cache_key_does_not_expose_file_base() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let process = process_enabled(Some(root.clone()));
+    let document_base = Url::from_file_path(root.join("root.json"))
+        .expect("file document base")
+        .to_string();
+    let policy = EffectiveExternalRefPolicy::compose(
+        &process,
+        Some(&ExternalRefSpecExtension {
+            enabled: true,
+            document_base: Some(document_base),
+            allowed_origins: Vec::new(),
+        }),
+    )
+    .unwrap();
+    let cache_key = policy.cache_key_material();
+    assert_eq!(cache_key, policy.effective_policy_digest);
+    let raw_root = root.to_string_lossy().to_string();
+    assert!(!cache_key.contains(&raw_root));
+
+    let empty_snapshot = ExternalRefSnapshot::empty(&policy);
+    assert!(empty_snapshot.root_document_base.starts_with("file:sha256:"));
+    assert!(!empty_snapshot.root_document_base.contains(&raw_root));
+
+    let child_uri = Url::from_file_path(root.join("child.json")).expect("child file URI");
+    let mut loader = MapExternalDocumentLoader::default();
+    loader.docs.insert(
+        resource_uri_key(&child_uri),
+        br#"{"type":"string"}"#.to_vec(),
+    );
+    let (_, snapshot) = ferrum_edge::admin::api_specs::load_external_documents(
+        &json!({"$ref": "child.json"}),
+        &policy,
+        &loader,
+    )
+    .expect("file snapshot identity");
+    assert_eq!(snapshot.documents.len(), 1);
+    assert!(snapshot.documents[0].canonical_uri.starts_with("file:sha256:"));
+    assert!(!snapshot.documents[0].canonical_uri.contains(&raw_root));
+}
+
 #[tokio::test]
 async fn http_fixture_listener_resolves_under_explicit_http_allowlist() {
     use std::io::{Read, Write};
@@ -650,7 +893,7 @@ async fn http_fixture_listener_resolves_under_explicit_http_allowlist() {
     let addr = listener.local_addr().expect("local_addr");
     let origin = format!("http://127.0.0.1:{}", addr.port());
     let body = br#"{"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}"#;
-    thread::spawn(move || {
+    let server = thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
@@ -713,6 +956,7 @@ async fn http_fixture_listener_resolves_under_explicit_http_allowlist() {
     .await
     .expect("blocking worker")
     .expect("HTTP fixture fetch must succeed under explicit allowlist");
+    server.join().expect("HTTP fixture thread");
     assert!(meta.external_ref_snapshot.is_some());
     let config = bundle
         .plugins
@@ -746,6 +990,52 @@ fn redaction_is_utf8_safe_and_hides_filesystem_paths() {
         redact_reference("file:///srv/private/specs/root.yaml?token=secret"),
         "file:[redacted]"
     );
+    let protocol_relative = redact_reference(
+        "//protocol-user:protocol-secret@host.example/path?token=protocol-query#/schema",
+    );
+    assert!(protocol_relative.contains("host.example"));
+    assert!(protocol_relative.contains("#/schema"));
+    assert_eq!(
+        redact_reference(
+            "https://malformed-user:malformed-secret@ bad-host/path?token=malformed-query"
+        ),
+        "https:[redacted]"
+    );
+
+    let adversarial = [
+        "//protocol-user:protocol-secret@host.example/path?token=protocol-query#/schema",
+        "https://malformed-user:malformed-secret@ bad-host/path?token=malformed-query",
+        "https:/absolute-ish-user:absolute-ish-secret@host.example/path?token=absolute-ish-query",
+        "relative/relative-user:relative-secret@host.example/path?token=relative-query",
+        r"\\server\private\credential.txt?token=windows-query",
+        r"D:\private\credential.txt?token=drive-query",
+    ];
+    for reference in adversarial {
+        let rendered = redact_reference(reference);
+        for secret in [
+            "protocol-user",
+            "protocol-secret",
+            "protocol-query",
+            "malformed-user",
+            "malformed-secret",
+            "malformed-query",
+            "absolute-ish-user",
+            "absolute-ish-secret",
+            "absolute-ish-query",
+            "relative-user",
+            "relative-secret",
+            "relative-query",
+            "windows-query",
+            "drive-query",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "redacted reference exposed '{secret}': {rendered}"
+            );
+        }
+        assert!(rendered.len() <= 257, "diagnostic must remain bounded");
+        assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
+    }
 }
 
 #[test]
@@ -927,7 +1217,7 @@ async fn redirect_to_origin_outside_policy_is_rejected() {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    thread::spawn(move || {
+    let server = thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut request = [0u8; 1024];
             let _ = stream.read(&mut request);
@@ -941,6 +1231,7 @@ async fn redirect_to_origin_outside_policy_is_rejected() {
     let error = load_production_http(format!("http://127.0.0.1:{port}/start"), process)
         .await
         .expect_err("redirect outside the explicit origin policy must fail");
+    server.join().expect("redirect fixture thread");
     assert!(matches!(error, ExtractError::UnsupportedExternalRef { .. }));
 }
 
@@ -971,21 +1262,67 @@ async fn oversized_chunked_response_aborts_at_document_cap() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn response_content_type_allowlist_rejects_invalid_and_unsupported_headers() {
+    for content_type in [
+        b"application/xml".as_slice(),
+        b"application/json\xff".as_slice(),
+    ] {
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: ".to_vec();
+        response.extend_from_slice(content_type);
+        response.extend_from_slice(
+            b"\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        );
+        let (port, server) = spawn_raw_http_response(response);
+        let mut process = process_enabled(None);
+        process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
+        let error = load_production_http(
+            format!("http://127.0.0.1:{port}/content-type"),
+            process,
+        )
+        .await
+        .expect_err("present invalid or unsupported Content-Type must fail closed");
+        server.join().expect("HTTP fixture thread");
+        let rendered = error.to_string();
+        assert!(rendered.contains(
+            "external $ref response Content-Type is not an allowed OpenAPI media type"
+        ));
+        assert!(!rendered.contains("application/xml"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn absent_response_content_type_uses_bounded_format_detection() {
+    let response =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"type\":\"string\"}"
+            .to_vec();
+    let (port, server) = spawn_raw_http_response(response);
+    let mut process = process_enabled(None);
+    process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
+    let loaded = load_production_http(
+        format!("http://127.0.0.1:{port}/no-content-type"),
+        process,
+    )
+    .await
+    .expect("absent Content-Type may use bounded JSON/YAML detection");
+    server.join().expect("HTTP fixture thread");
+    assert_eq!(loaded.root, json!({"type": "string"}));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn total_deadline_covers_response_io() {
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::net::TcpListener;
     use std::thread;
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    thread::spawn(move || {
+    let server = thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut request = [0u8; 1024];
             let _ = stream.read(&mut request);
-            thread::sleep(Duration::from_millis(150));
-            let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-            );
+            // Never produce a response. The client must stop waiting at its
+            // own total deadline; the second read returns when it closes.
+            let _ = stream.read(&mut request);
         }
     });
     let mut process = process_enabled(None);
@@ -995,6 +1332,7 @@ async fn total_deadline_covers_response_io() {
     let error = load_production_http(format!("http://127.0.0.1:{port}/slow"), process)
         .await
         .expect_err("total timeout must cover request and response I/O");
+    server.join().expect("deadline fixture thread");
     assert!(error.to_string().contains("timed out") || error.to_string().contains("timeout"));
 }
 

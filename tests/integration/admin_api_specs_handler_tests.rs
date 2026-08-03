@@ -1535,6 +1535,12 @@ async fn list_does_not_include_spec_content() {
             item.get("spec_content").is_none(),
             "spec_content must NOT be in list response; item: {item}"
         );
+        assert!(
+            item.get("external_ref_digest").is_some_and(Value::is_null),
+            "external_ref_digest must be null when no snapshot was admitted; item: {item}"
+        );
+        assert!(item.get("external_ref_snapshot").is_none());
+        assert!(item.get("external_ref_snapshot_base64").is_none());
     }
 }
 
@@ -6888,7 +6894,7 @@ async fn external_ref_http_admission_runs_off_the_async_worker() {
 
     let fixture = TcpListener::bind("127.0.0.1:0").expect("bind external-ref fixture");
     let fixture_port = fixture.local_addr().expect("fixture address").port();
-    thread::spawn(move || {
+    let fixture_thread = thread::spawn(move || {
         if let Ok((mut stream, _)) = fixture.accept() {
             let mut request = [0u8; 1024];
             let _ = stream.read(&mut request);
@@ -6918,7 +6924,7 @@ async fn external_ref_http_admission_runs_off_the_async_worker() {
         "x-ferrum-validate": true,
         "x-ferrum-external-refs": true,
         "x-ferrum-proxy": {
-            "id": proxy_id,
+            "id": proxy_id.clone(),
             "backend_host": "backend.internal",
             "backend_port": 443
         },
@@ -6950,4 +6956,27 @@ async fn external_ref_http_admission_runs_off_the_async_worker() {
         reqwest::StatusCode::CREATED,
         "spawn_blocking admission must avoid runtime-thread block_on panic: {body}"
     );
+    fixture_thread.join().expect("external-ref fixture thread");
+
+    let (list_status, list_body) = client.get_json("/api-specs").await;
+    assert_eq!(list_status, reqwest::StatusCode::OK);
+    let summary = list_body["items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["proxy_id"].as_str() == Some(proxy_id.as_str()))
+        })
+        .expect("external-ref API-spec list summary");
+    let digest = summary["external_ref_digest"]
+        .as_str()
+        .expect("list summary must return the external-ref digest");
+    assert_eq!(digest.len(), 64);
+    assert!(
+        digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    assert!(summary.get("external_ref_snapshot").is_none());
+    assert!(summary.get("external_ref_snapshot_base64").is_none());
 }
