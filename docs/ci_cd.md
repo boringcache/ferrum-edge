@@ -156,9 +156,9 @@ it does **not** enable the merge queue or mutate branch protection.
 
 **Staged enablement (root-owned after this prerequisite merges):**
 
-1. Merge the workflow/`docs/ci_cd.md` prerequisite so all six owners report on
+1. Merge the workflow/`docs/ci_cd.md` prerequisite so all seven owners report on
    `merge_group`.
-2. Enable the `main` ruleset / branch protection with the six required checks
+2. Enable the `main` ruleset / branch protection with the seven required checks
    above, merge queue enabled, admin enforcement as intended.
 3. Open a throwaway test PR, enqueue it, confirm each required check runs on
    the synthesized SHA (not a stale PR SHA), and confirm release automation
@@ -169,7 +169,7 @@ it does **not** enable the merge queue or mutate branch protection.
 `.github/scripts/verify_required_ci.py` statically enforces merge_group
 triggers, unfiltered `pull_request` / `pull_request_target` triggers,
 check-name parity, event-aware SHA/base markers, and concurrency markers for
-all six owners.
+all seven owners.
 
 ### Release Pipeline Flow
 
