@@ -8545,9 +8545,7 @@ fn dead_letter_payload_identity_inner(
     validate_dead_letter_payload_metadata(path, &descriptor_metadata, expected_len)?;
     let descriptor_identity = SpoolFileIdentity::from_metadata(&descriptor_metadata);
     match expectation {
-        Some(DeadLetterIdentityExpectation::Exact(expected))
-            if descriptor_identity != expected =>
-        {
+        Some(DeadLetterIdentityExpectation::Exact(expected)) if descriptor_identity != expected => {
             return Err(format!(
                 "{PLUGIN_NAME}: dead-letter payload metadata changed before durable publication"
             ));
@@ -8624,12 +8622,7 @@ fn verify_dead_letter_payload(
     expected_sha256: &str,
     expectation: DeadLetterIdentityExpectation,
 ) -> Result<SpoolFileIdentity, String> {
-    let before = dead_letter_payload_identity_matching(
-        file,
-        path,
-        expected_len,
-        expectation,
-    )?;
+    let before = dead_letter_payload_identity_matching(file, path, expected_len, expectation)?;
     file.seek(SeekFrom::Start(0)).map_err(|error| {
         format!(
             "{PLUGIN_NAME}: failed to seek dead-letter payload '{}' for verification: {error}",
