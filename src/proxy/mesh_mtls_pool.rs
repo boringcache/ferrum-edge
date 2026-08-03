@@ -20,10 +20,9 @@
 //! stream, so the dispatch error mapping stays single-sourced.
 
 use arc_swap::ArcSwap;
-use bytes::Bytes;
 use dashmap::DashMap;
 use hyper::client::conn::http2;
-use http_body_util::{Either, Full};
+use http_body_util::Either;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
 use std::fmt::Write;
@@ -38,7 +37,7 @@ use crate::config::PoolConfig;
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::dns::DnsCache;
 use crate::identity::{SharedSvidBundle, SpiffeId, SvidBundle, TrustDomain};
-use crate::proxy::body::SizeLimitedIncoming;
+use crate::proxy::body::{ReplayableRequestBody, SizeLimitedIncoming};
 use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::spiffe::build_spiffe_outbound_config;
 
@@ -112,7 +111,7 @@ pub const MESH_CROSS_CLUSTER_TAG: &str = "mesh.cross_cluster";
 /// Request representation accepted by the multiplexed sidecar H2 pool.
 /// Streaming requests retain the existing inline size limiter; retry-enabled
 /// requests use immutable bytes finalized once before the first attempt.
-pub type MeshMtlsRequestBody = Either<SizeLimitedIncoming, Full<Bytes>>;
+pub type MeshMtlsRequestBody = Either<SizeLimitedIncoming, ReplayableRequestBody>;
 
 /// Multiplexed hyper H2 sender over the SVID-mTLS session.
 pub type MeshMtlsSender = http2::SendRequest<MeshMtlsRequestBody>;

@@ -386,7 +386,7 @@ fn mesh_retry_replays_finalized_bytes_without_rerunning_body_hooks() {
         .expect("mesh retry helper end not found");
     let helper_body = &helper_tail[..end];
 
-    assert!(helper_body.contains("MeshClientRequestBody::Replayable("));
+    assert!(helper_body.contains("MeshClientRequestBody::Replayable {"));
     assert!(helper_body.contains("resolve_effective_proxy_for_target("));
     assert!(!helper_body.contains("apply_request_body_plugins_with_context("));
     assert!(!helper_body.contains("run_final_request_body_hooks("));

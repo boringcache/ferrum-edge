@@ -4824,6 +4824,15 @@ impl RequestContext {
         self.raw_headers.is_some()
     }
 
+    /// Share the pristine request header block with a retry planner without
+    /// cloning the `HeaderMap` on every retry-enabled request. The selected
+    /// transport clones it only when an actual secured-mesh retry needs a
+    /// mutable outbound representation.
+    #[inline]
+    pub(crate) fn raw_headers_snapshot(&self) -> Option<Arc<HeaderMap>> {
+        self.raw_headers.clone()
+    }
+
     /// Look up a single header from the raw `HeaderMap` without materializing
     /// the full `HashMap<String, String>`. Returns `None` when no raw headers
     /// were stored.

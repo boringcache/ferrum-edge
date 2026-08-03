@@ -6503,6 +6503,14 @@ pub mod _test_support {
         crate::proxy::backend_dispatch::error_class_is_post_wire_backend_failure(Some(class))
     }
 
+    /// Return the fail-closed direct-dispatch refusal for a retry target whose
+    /// tags require a secure mesh transport.
+    pub fn direct_http_mesh_transport_refusal_for_test(
+        target: &crate::config::types::UpstreamTarget,
+    ) -> Option<&'static str> {
+        crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(Some(target))
+    }
+
     /// An isolated aggregate retained-response budget built from the SAME
     /// [`crate::proxy::response_buffer_budget`] code the process-global one uses
     /// — same clamping, same non-blocking admission, same charge attachment —
