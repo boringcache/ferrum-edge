@@ -3309,12 +3309,14 @@ async fn buffer_request_body_for_before_proxy(
     let trailers = collected.trailers().cloned();
     let body_bytes = collected.to_bytes().to_vec();
 
-    Ok(ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
-        method: parts.method,
-        headers: parts.headers,
-        body: body_bytes,
-        trailers,
-    })))
+    Ok(ClientRequestBody::Buffered(Box::new(
+        BufferedClientRequestBody {
+            method: parts.method,
+            headers: parts.headers,
+            body: body_bytes,
+            trailers,
+        },
+    )))
 }
 
 /// Finalize a request body for HBONE or sidecar mTLS dispatch.
