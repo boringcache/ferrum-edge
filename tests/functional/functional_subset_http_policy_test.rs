@@ -65,9 +65,10 @@ async fn functional_subset_http_h2_upgrade_policy_is_observable_at_backend() {
     .spawn()
     .expect("spawn h1 tls backend");
 
-    // v2 Upgrade must negotiate H2 against this H2-only TLS fixture. The
-    // default nonzero body limits keep this request on reqwest, whose ALPN is
-    // still H2-capable because the selected subset does not force HTTP/1.1.
+    // v2 Upgrade must negotiate H2 against this H2-only TLS fixture. Default
+    // nonzero body limits keep this request on reqwest (not direct-H2); the
+    // BuiltRustls client must therefore advertise [h2, http/1.1] so ALPN can
+    // select h2 — empty ALPN stays on H1 and hangs/502s against H2-only.
     let h2_backend = ScriptedH2Backend::builder_tls(h2_res.into_listener(), &cert, &key)
         .expect("h2 tls builder")
         .repeat_script(true)
