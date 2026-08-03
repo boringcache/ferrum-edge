@@ -8430,6 +8430,15 @@ async fn streaming_replay_reports_when_a_changed_artifact_cannot_be_quarantined(
         br#"{"event_id":"validated-before-blocked-quarantine"}"#,
     )
     .unwrap();
+    // Quarantine renames to the durable base name + ".corrupt", never the
+    // in-flight claim name. Plant the blocker on that durable path so the
+    // post-preflight identity refusal cannot complete quarantine.
+    let quarantine = source.with_file_name(format!(
+        "{}.corrupt",
+        source.file_name().unwrap().to_string_lossy()
+    ));
+    fs::create_dir(&quarantine).unwrap();
+    fs::write(quarantine.join("blocker"), b"x").unwrap();
     let replacement = temp.path().join("replacement-blocked-quarantine.ndjson");
     fs::write(&replacement, br#"{"event_id":"changed-after-preflight"}"#).unwrap();
 
@@ -8443,12 +8452,6 @@ async fn streaming_replay_reports_when_a_changed_artifact_cannot_be_quarantined(
             return;
         }
         let _ = fs::rename(&replacement_for_hook, claimed);
-        let quarantine = claimed.with_file_name(format!(
-            "{}.corrupt",
-            claimed.file_name().unwrap().to_string_lossy()
-        ));
-        let _ = fs::create_dir(&quarantine);
-        let _ = fs::write(quarantine.join("blocker"), b"x");
     })));
     struct ClearReplayHook;
     impl Drop for ClearReplayHook {

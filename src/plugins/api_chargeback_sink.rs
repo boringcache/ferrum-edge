@@ -6162,6 +6162,11 @@ impl SpoolOwnerSpec<'_> {
 /// pathname look like the original lock. Mutation transactions use a fresh
 /// descriptor so closing the transaction guard releases its OS lock without a
 /// fallible explicit unlock step.
+///
+/// Cached equality uses [`SpoolFileIdentity::same_coordination_inode`]: mode
+/// repair and other metadata updates change ctime/mtime on the same inode and
+/// must not look like a replaced lock domain. Path-vs-descriptor replacement
+/// checks still run on every validate/acquire.
 struct SpoolNamespaceLock {
     path: PathBuf,
     identity: SpoolFileIdentity,
@@ -6284,7 +6289,7 @@ impl SpoolManager {
     fn validate_namespace_lock_path(&self, anchor: &SpoolNamespaceLock) -> Result<(), String> {
         self.assert_managed_path(&anchor.path)?;
         let current = validate_spool_coordination_file(&anchor.path, &anchor.pinned)?;
-        if current != anchor.identity {
+        if !current.same_coordination_inode(&anchor.identity) {
             return Err(format!(
                 "{PLUGIN_NAME}: spool namespace coordination lock changed identity"
             ));
@@ -6300,7 +6305,7 @@ impl SpoolManager {
         self.validate_namespace_lock_path(anchor)?;
         let file = open_spool_coordination_file(&anchor.path, false)?;
         let before = validate_spool_coordination_file(&anchor.path, &file)?;
-        if before != anchor.identity {
+        if !before.same_coordination_inode(&anchor.identity) {
             return Err(format!(
                 "{PLUGIN_NAME}: refusing a replaced spool namespace coordination lock"
             ));
@@ -6314,7 +6319,7 @@ impl SpoolManager {
         // Revalidate after acquisition so a pathname replacement racing the
         // open/lock interval is never accepted as the shared lock domain.
         let after = validate_spool_coordination_file(&anchor.path, &file)?;
-        if after != anchor.identity {
+        if !after.same_coordination_inode(&anchor.identity) {
             return Err(format!(
                 "{PLUGIN_NAME}: spool namespace coordination lock changed identity while acquiring it"
             ));
@@ -8840,6 +8845,12 @@ impl StreamingReplayBatch {
 /// Stable identity captured from the file descriptor used for replay
 /// preflight. Replay opens a second descriptor only after the full validation
 /// pass and must prove that descriptor still names the same artifact.
+///
+/// Full [`PartialEq`] includes length and timestamps so an in-place rewrite of
+/// a claimed artifact between preflight and reopen still fails closed.
+/// Coordination-lock pinning uses [`Self::same_coordination_inode`] instead:
+/// intentional mode repair updates ctime on the same lock inode and must remain
+/// admissible.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SpoolFileIdentity {
     len: u64,
@@ -8883,6 +8894,22 @@ impl SpoolFileIdentity {
                 modified: metadata.modified().ok(),
                 created: metadata.created().ok(),
             }
+        }
+    }
+
+    /// Lock-domain equality for the namespace coordination inode.
+    ///
+    /// Replacement is a different device/inode at the coordination path.
+    /// Metadata mutations on the pinned inode (mode repair, empty-file touch)
+    /// are not a second lock domain.
+    fn same_coordination_inode(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == other.device && self.inode == other.inode
+        }
+        #[cfg(not(unix))]
+        {
+            self == other
         }
     }
 }
@@ -8990,7 +9017,9 @@ fn validate_spool_coordination_file(path: &Path, file: &File) -> Result<SpoolFil
     }
     let file_identity = SpoolFileIdentity::from_metadata(&metadata);
     let path_identity = SpoolFileIdentity::from_metadata(&path_metadata);
-    if file_identity != path_identity {
+    // Path vs descriptor must name the same lock inode. Timestamp drift between
+    // the two stats is not a replacement; device/inode mismatch is.
+    if !file_identity.same_coordination_inode(&path_identity) {
         return Err(format!(
             "{PLUGIN_NAME}: spool namespace coordination path '{}' does not name the opened lock file",
             path.display()
