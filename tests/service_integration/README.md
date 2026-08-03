@@ -24,8 +24,8 @@ their *failure* path, leaving the real client logic uncovered:
 | **LDAP** (`src/plugins/ldap_auth.rs`) | `ldap3` bind / search-then-bind / group membership, via `create_plugin` → `authenticate` | functional test only pointed the plugin at an *unreachable* server (500 / 401 paths) | live OpenLDAP: valid/invalid direct bind, search-then-bind, group-membership allow (Continue) vs deny (403) |
 | **Kafka** (`src/plugins/kafka_logging.rs`) | librdkafka produce, delivery callbacks, consume-back, bounded finalize | deterministic unit tests for admission/CRL/budgets/finalize ownership; ignored optional broker harness | live Redpanda: successful ack + key/record consume, unknown-topic reject after admission, broker oversized reject, paused-broker delivery timeout, producer-queue saturation, successful and stalled finalize, multi-instance generation isolation, Drop/reload disposal with pending records |
 | **MySQL** (`src/config/migrations/mod.rs`, `src/config/db_loader.rs`) | custom-plugin DDL plus tracking under MySQL's implicit-commit rules; cross-namespace `config_change_locks` exclusive-lock acquisition; V001 identity-column collation | SQLite covered atomic migration behavior; MySQL SQL was previously inspected only as strings | live MySQL 8.4: failure after committed V1 DDL, exact index reconstruction on retry, V2 index/tracker-gap recovery, SQLx Any text bindings used by `example_audit_plugin`, a bounded cross-namespace writer race proving zero ER_LOCK_DEADLOCK 1213, and NFC/NFD consumer username inserts under `utf8mb4_0900_bin` (#2994) |
-| **OIDC** (`src/plugins/oidc_relying_party.rs`) | discovery, authorization-code + PKCE, JWKS/UserInfo/end-session, encrypted sessions, claim headers, idle/absolute expiry, refresh, logout | unit tests with wiremock IdP | live Ory Hydra: full browser challenge → callback session, state/correlation/issuer/audience/signature negatives, reserved-header protection, sliding idle + absolute expiry, refresh skew, RP logout (#3333) |
-| **OAuth2 introspection** (`src/plugins/oauth2_introspection.rs`) | RFC 7662 outbound introspect, discovery, cache, scope/role/audience, client auth, failure policy | unit tests with wiremock | live Hydra opaque tokens: active/inactive, scope/role/issuer/audience, `client_secret_basic` + `client_secret_post`, discovery facade (same-origin rewrite of admin introspect), cache hit/expiry without token-key leaks, timeout/malformed/oversized/auth/unavailable → 503 (#3333) |
+| **OIDC** (`src/plugins/oidc_relying_party.rs`) | discovery, authorization-code + PKCE, JWKS/UserInfo/end-session, encrypted sessions, claim headers, idle/absolute expiry, refresh, logout | unit tests with wiremock IdP | live Ory Hydra: full browser challenge → callback session, state/correlation/nonce/issuer/audience/signature negatives (subject proven positively; `azp` multi-aud remains unit-covered), reserved-header protection, idle/absolute expiry with margin sleeps, refresh proven via token-facade `refresh_token` grant counter, RP logout (#3333) |
+| **OAuth2 introspection** (`src/plugins/oauth2_introspection.rs`) | RFC 7662 outbound introspect, discovery, cache, scope/role/audience, client auth, failure policy | unit tests with wiremock | live Hydra opaque tokens: active/inactive, scope/role/issuer/audience, `client_secret_basic` + `client_secret_post` request shaping observed on a non-secret facade, discovery facade (same-origin rewrite of admin introspect), cache hit/expiry proven by upstream-call counters without token-key leaks, timeout/malformed/oversized/wiremock-auth/unavailable → 503 (Hydra admin introspect does not enforce client auth) (#3333) |
 
 ## Running locally
 
@@ -105,10 +105,15 @@ What it drives against live Hydra:
 4. Encrypted session cookie authenticates subsequent requests; claim headers
    fan out; reserved `Authorization` mapping is rejected at config time;
    client-supplied claim destinations are overwritten only with verified values.
-5. Negatives: wrong state, missing correlation cookie, wrong issuer, wrong
-   audience, and live token endpoint + unrelated JWKS (signature failure).
-6. Short idle/absolute TTLs observe re-challenge; refresh skew forces token
-   refresh when `offline_access` is granted; logout clears the session and
+5. Negatives: wrong state, missing correlation cookie, nonce mismatch (Hydra
+   signs a different nonce than Ferrum stored), wrong issuer via explicit live
+   endpoints (signed-token `iss` rejection), wrong audience, and live token
+   endpoint + unrelated JWKS (signature failure). Subject is proven positively
+   via successful login; multi-audience `azp` enforcement remains unit-covered.
+6. Short idle/absolute TTLs observe re-challenge after margin sleeps that do
+   not slide the cookie first; a token facade shortens `expires_in` under a
+   valid `refresh_skew_secs <= ttl/2` config and asserts a real
+   `refresh_token` grant succeeded at Hydra; logout clears the session and
    targets Hydra's end-session endpoint when advertised.
 
 ### Reproduce OAuth2 introspection coverage
@@ -122,17 +127,21 @@ What it drives:
 1. Opaque access tokens from Hydra `client_credentials` and authorization-code
    grants (asserted not to contain JWT `.` separators).
 2. Direct admin introspection URL (`/admin/oauth2/introspect`) with
-   `client_secret_basic` and `client_secret_post`.
+   `client_secret_basic` and `client_secret_post` configs (Hydra admin does
+   not enforce client auth; request shaping is observed on the facade).
 3. Discovery path through a same-origin facade that rewrites Hydra's discovery
    document so `introspection_endpoint` shares scheme/host/port with discovery
    (Ferrum's discovery origin check) while still proxying to live admin
-   introspect.
+   introspect. The facade counts upstream calls and Basic vs form-secret
+   presence without recording secret values.
 4. Active/inactive outcomes, required scopes/roles, issuer/audience denial,
-   `ext.*` claim-header mapping from consent session extras, positive/negative
-   cache TTLs without logging raw tokens or client secrets.
+   `ext.*` claim-header mapping from consent session extras, positive-cache
+   hit (no second upstream call) then post-TTL upstream refresh, without
+   logging raw tokens or client secrets.
 5. Failure policy: unavailable endpoint, wiremock timeout / malformed /
    oversized / 401 client-auth responses → HTTP 503 per plugin contract; a
-   final live Hydra call proves no cross-test contamination.
+   final live Hydra call proves no cross-test contamination. Wrong secrets
+   against Hydra admin introspect are not treated as an auth-failure proof.
 
 ### Safety
 

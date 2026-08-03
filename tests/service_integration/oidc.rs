@@ -3,12 +3,20 @@
 //! Drives the real `oidc_relying_party` plugin through discovery, browser
 //! authorization-code + PKCE, callback/session establishment, claim headers,
 //! idle/absolute lifetime, refresh, and logout. Negative cases cover state /
-//! correlation, issuer, audience, and signature failure against the live
-//! provider (wrong JWKS). Secrets and tokens are never logged.
+//! correlation, nonce, issuer (signed-token), audience, and signature failure
+//! against the live provider (wrong JWKS). Secrets and tokens are never logged.
+//!
+//! Live coverage notes (keep claims evidence-based):
+//! - Subject is proven positively via successful login (`consumer_identity_claim`).
+//! - `azp` multi-audience enforcement remains unit-covered; Hydra's single-aud
+//!   ID tokens do not provide a practical live wrong-`azp` vector here.
+//! - Absolute/idle expiry are proven with margin sleeps that do not slide the
+//!   cookie before the assertion.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, create_plugin};
@@ -21,7 +29,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::common::containers::fail_in_ci_else_skip;
 use crate::common::hydra::{
     FIXTURE_EMAIL, FIXTURE_ROLE, FIXTURE_SUBJECT, HydraClient, HydraContainer,
-    start_hydra_container,
+    rewrite_authorization_nonce, start_hydra_container,
 };
 
 const SESSION_SECRET: &str = "01234567890123456789012345678901";
@@ -88,6 +96,45 @@ fn base_oidc_config(hydra: &HydraContainer, client: &HydraClient) -> Value {
             "refresh_skew_secs": 30
         }
     })
+}
+
+/// Explicit Hydra endpoints (no discovery) so issuer/JWKS negatives reach the
+/// signed-token callback path instead of stalling on discovery mismatch.
+fn explicit_oidc_config(
+    hydra: &HydraContainer,
+    client: &HydraClient,
+    discovery: &Value,
+    issuer: &str,
+    jwks_uri: Option<&str>,
+) -> Value {
+    let mut cfg = base_oidc_config(hydra, client);
+    let provider = cfg["providers"][0].as_object_mut().unwrap();
+    provider.remove("discovery_url");
+    provider.insert("issuer".to_string(), json!(issuer));
+    provider.insert(
+        "authorization_endpoint".to_string(),
+        discovery["authorization_endpoint"].clone(),
+    );
+    provider.insert(
+        "token_endpoint".to_string(),
+        discovery["token_endpoint"].clone(),
+    );
+    provider.insert(
+        "userinfo_endpoint".to_string(),
+        discovery["userinfo_endpoint"].clone(),
+    );
+    provider.insert(
+        "end_session_endpoint".to_string(),
+        discovery
+            .get("end_session_endpoint")
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    provider.insert(
+        "jwks_uri".to_string(),
+        json!(jwks_uri.unwrap_or_else(|| discovery["jwks_uri"].as_str().unwrap())),
+    );
+    cfg
 }
 
 fn html_ctx(path: &str) -> RequestContext {
@@ -167,9 +214,7 @@ async fn wait_for_browser_challenge(plugin: &Arc<dyn Plugin>) -> BrowserChalleng
                 };
             }
             PluginResult::Reject {
-                status_code,
-                body,
-                ..
+                status_code, body, ..
             } => {
                 last = format!("HTTP {status_code}");
                 let _ = body; // never log body — may contain provider details
@@ -197,12 +242,12 @@ async fn complete_login(
     let _ = &challenge.nonce; // nonce validated inside the plugin against the ID token
 
     let mut ctx = html_ctx(REDIRECT_PATH);
-    ctx.headers
-        .insert("cookie".to_string(), cookie_pair(&challenge.cookie).to_string());
-    ctx.query_params
-        .insert("state".to_string(), callback.state);
-    ctx.query_params
-        .insert("code".to_string(), callback.code);
+    ctx.headers.insert(
+        "cookie".to_string(),
+        cookie_pair(&challenge.cookie).to_string(),
+    );
+    ctx.query_params.insert("state".to_string(), callback.state);
+    ctx.query_params.insert("code".to_string(), callback.code);
 
     let PluginResult::Reject {
         status_code,
@@ -223,10 +268,8 @@ async fn complete_login(
 
 fn session_ctx(set_cookie: &str, path: &str) -> RequestContext {
     let mut ctx = html_ctx(path);
-    ctx.headers.insert(
-        "cookie".to_string(),
-        cookie_pair(set_cookie).to_string(),
-    );
+    ctx.headers
+        .insert("cookie".to_string(), cookie_pair(set_cookie).to_string());
     ctx
 }
 
@@ -235,6 +278,37 @@ fn assert_continue(result: PluginResult) {
         matches!(result, PluginResult::Continue),
         "expected Continue, got reject"
     );
+}
+
+fn assert_rechallenge(result: PluginResult, what: &str) {
+    match result {
+        PluginResult::Reject {
+            status_code: 302, ..
+        }
+        | PluginResult::Reject {
+            status_code: 401, ..
+        } => {}
+        other => panic!("{what} should re-challenge, got {other:?}"),
+    }
+}
+
+/// Sleep past an integer-second `now > issued+ttl` boundary with margin.
+/// Does not touch the session cookie (no authenticate/slide).
+async fn sleep_past_ttl_secs(ttl_secs: u64) {
+    // Integer-second comparisons need strictly greater than issued+ttl; add a
+    // full extra second plus 250ms so boundary equality cannot flake.
+    tokio::time::sleep(Duration::from_secs(ttl_secs + 1) + Duration::from_millis(250)).await;
+}
+
+async fn fetch_hydra_discovery(hydra: &HydraContainer) -> Value {
+    reqwest::Client::new()
+        .get(hydra.discovery_url())
+        .send()
+        .await
+        .expect("discovery")
+        .json()
+        .await
+        .expect("discovery json")
 }
 
 #[tokio::test]
@@ -339,10 +413,52 @@ async fn oidc_live_discovery_login_session_and_claims() {
         other => panic!("expected correlation rejection, got {other:?}"),
     }
 
-    // Negative issuer: discovery from Hydra but expected issuer mismatches.
-    let mut wrong_iss = base_oidc_config(&hydra, &client);
-    wrong_iss["providers"][0]["issuer"] = json!("http://127.0.0.1:9/");
-    let wrong_iss_plugin = oidc_plugin(wrong_iss);
+    // Negative nonce: keep Ferrum correlation cookie/state, but ask Hydra to
+    // mint an ID token with a different nonce than Ferrum stored.
+    let challenge_nonce = wait_for_browser_challenge(&plugin).await;
+    let mismatched_auth = rewrite_authorization_nonce(
+        &challenge_nonce.location,
+        &format!("mismatched-{}", hydra.isolation),
+    )
+    .expect("rewrite nonce");
+    let cb_nonce = hydra
+        .complete_authorization_redirect(&mismatched_auth)
+        .await
+        .expect("code for nonce-mismatch");
+    assert_eq!(cb_nonce.state, challenge_nonce.state);
+    let mut nonce_ctx = html_ctx(REDIRECT_PATH);
+    nonce_ctx.headers.insert(
+        "cookie".to_string(),
+        cookie_pair(&challenge_nonce.cookie).to_string(),
+    );
+    nonce_ctx
+        .query_params
+        .insert("state".to_string(), cb_nonce.state);
+    nonce_ctx
+        .query_params
+        .insert("code".to_string(), cb_nonce.code);
+    match plugin.on_request_received(&mut nonce_ctx).await {
+        PluginResult::Reject { status_code, .. } => {
+            assert!(
+                status_code == 400 || status_code == 401,
+                "nonce mismatch must fail closed, got {status_code}"
+            );
+        }
+        other => panic!("expected nonce rejection, got {other:?}"),
+    }
+
+    let discovery = fetch_hydra_discovery(&hydra).await;
+
+    // Negative issuer: explicit live Hydra endpoints + mismatched expected
+    // issuer so the signed ID token `iss` check rejects at callback (not a
+    // discovery-setup stall).
+    let wrong_iss_plugin = oidc_plugin(explicit_oidc_config(
+        &hydra,
+        &client,
+        &discovery,
+        "http://127.0.0.1:9/",
+        None,
+    ));
     let ch = wait_for_browser_challenge(&wrong_iss_plugin).await;
     let cb = hydra
         .complete_authorization_redirect(&ch.location)
@@ -352,13 +468,14 @@ async fn oidc_live_discovery_login_session_and_claims() {
     cb_ctx
         .headers
         .insert("cookie".to_string(), cookie_pair(&ch.cookie).to_string());
-    cb_ctx
-        .query_params
-        .insert("state".to_string(), cb.state);
+    cb_ctx.query_params.insert("state".to_string(), cb.state);
     cb_ctx.query_params.insert("code".to_string(), cb.code);
     match wrong_iss_plugin.on_request_received(&mut cb_ctx).await {
         PluginResult::Reject { status_code, .. } => {
-            assert!(status_code == 400 || status_code == 401 || status_code == 503);
+            assert!(
+                status_code == 400 || status_code == 401 || status_code == 503,
+                "issuer mismatch must fail closed, got {status_code}"
+            );
         }
         other => panic!("expected issuer rejection, got {other:?}"),
     }
@@ -376,9 +493,7 @@ async fn oidc_live_discovery_login_session_and_claims() {
     cb_ctx
         .headers
         .insert("cookie".to_string(), cookie_pair(&ch.cookie).to_string());
-    cb_ctx
-        .query_params
-        .insert("state".to_string(), cb.state);
+    cb_ctx.query_params.insert("state".to_string(), cb.state);
     cb_ctx.query_params.insert("code".to_string(), cb.code);
     match wrong_aud_plugin.on_request_received(&mut cb_ctx).await {
         PluginResult::Reject { status_code, .. } => {
@@ -403,24 +518,13 @@ async fn oidc_live_discovery_login_session_and_claims() {
         })))
         .mount(&jwks_mock)
         .await;
-    let discovery: Value = reqwest::Client::new()
-        .get(hydra.discovery_url())
-        .send()
-        .await
-        .expect("discovery")
-        .json()
-        .await
-        .expect("discovery json");
-    let mut wrong_sig = base_oidc_config(&hydra, &client);
-    wrong_sig["providers"][0].as_object_mut().unwrap().remove("discovery_url");
-    wrong_sig["providers"][0]["authorization_endpoint"] =
-        discovery["authorization_endpoint"].clone();
-    wrong_sig["providers"][0]["token_endpoint"] = discovery["token_endpoint"].clone();
-    wrong_sig["providers"][0]["userinfo_endpoint"] = discovery["userinfo_endpoint"].clone();
-    wrong_sig["providers"][0]["end_session_endpoint"] =
-        discovery.get("end_session_endpoint").cloned().unwrap_or(Value::Null);
-    wrong_sig["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", jwks_mock.uri()));
-    let wrong_sig_plugin = oidc_plugin(wrong_sig);
+    let wrong_sig_plugin = oidc_plugin(explicit_oidc_config(
+        &hydra,
+        &client,
+        &discovery,
+        &hydra.issuer,
+        Some(&format!("{}/jwks", jwks_mock.uri())),
+    ));
     let ch = wait_for_browser_challenge(&wrong_sig_plugin).await;
     let cb = hydra
         .complete_authorization_redirect(&ch.location)
@@ -430,9 +534,7 @@ async fn oidc_live_discovery_login_session_and_claims() {
     cb_ctx
         .headers
         .insert("cookie".to_string(), cookie_pair(&ch.cookie).to_string());
-    cb_ctx
-        .query_params
-        .insert("state".to_string(), cb.state);
+    cb_ctx.query_params.insert("state".to_string(), cb.state);
     cb_ctx.query_params.insert("code".to_string(), cb.code);
     match wrong_sig_plugin.on_request_received(&mut cb_ctx).await {
         PluginResult::Reject { status_code, .. } => {
@@ -462,57 +564,60 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
         .await
         .expect("seed session client");
 
-    // Short idle + absolute windows for deterministic expiry.
-    let mut cfg = base_oidc_config(&hydra, &client);
-    cfg["session"]["ttl_secs"] = json!(8);
-    cfg["session"]["idle_ttl_secs"] = json!(3);
-    cfg["behavior"]["refresh_skew_secs"] = json!(3600); // force refresh while session fresh
+    let discovery = fetch_hydra_discovery(&hydra).await;
+    // Token facade shortens expires_in so refresh_after reaches the plugin's
+    // REFRESH_RETRY_BACKOFF floor (~30s) while session ttl stays valid.
+    // refresh_skew must be <= ttl/2 (production constructor invariant).
+    let (token_facade_url, token_stats) = hydra
+        .start_token_facade(Some(8))
+        .await
+        .expect("token facade");
+
+    let mut cfg = explicit_oidc_config(&hydra, &client, &discovery, &hydra.issuer, None);
+    cfg["providers"][0]["token_endpoint"] = json!(token_facade_url);
+    cfg["session"]["ttl_secs"] = json!(120);
+    cfg["session"]["idle_ttl_secs"] = json!(120);
+    cfg["behavior"]["refresh_skew_secs"] = json!(60); // <= 120/2
     let plugin = oidc_plugin(cfg);
 
     let challenge = wait_for_browser_challenge(&plugin).await;
     let session_cookie = complete_login(&hydra, &plugin, &challenge).await;
-
-    // Sliding idle: authenticate twice within the idle window and expect a
-    // rolling Set-Cookie once half the idle window elapses.
-    let mut ctx = session_ctx(&session_cookie, "/app");
-    assert_continue(
-        plugin
-            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
-            .await,
-    );
-    let mut response_headers = HashMap::new();
-    assert_continue(
-        plugin
-            .after_proxy(&mut ctx, 200, &mut response_headers)
-            .await,
-    );
-
-    tokio::time::sleep(Duration::from_millis(1600)).await;
-    let mut ctx = session_ctx(
-        response_headers
-            .get("set-cookie")
-            .unwrap_or(&session_cookie),
-        "/app",
-    );
-    assert_continue(
-        plugin
-            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
-            .await,
-    );
-    let mut rolled = HashMap::new();
-    assert_continue(plugin.after_proxy(&mut ctx, 200, &mut rolled).await);
-    // Refresh success (offline_access) and/or idle slide should re-issue cookie.
-    let renewed = rolled
-        .get("set-cookie")
-        .cloned()
-        .or_else(|| response_headers.get("set-cookie").cloned())
-        .unwrap_or(session_cookie.clone());
     assert!(
-        renewed.contains("ferrum_oidc_si="),
-        "session cookie renewal expected"
+        token_stats.authorization_code_ok.load(Ordering::SeqCst) >= 1,
+        "login must complete an authorization_code grant through the facade"
+    );
+    let refresh_before = token_stats.refresh_token_ok.load(Ordering::SeqCst);
+
+    // Wait until refresh is due (floor is ~30s), then authenticate once.
+    // Poll without sliding earlier: only probe after the backoff window.
+    let refresh_deadline = Instant::now() + Duration::from_secs(45);
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    let mut renewed = session_cookie.clone();
+    let mut saw_refresh = false;
+    while Instant::now() < refresh_deadline {
+        let mut ctx = session_ctx(&renewed, "/app");
+        assert_continue(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+        );
+        let mut rolled = HashMap::new();
+        assert_continue(plugin.after_proxy(&mut ctx, 200, &mut rolled).await);
+        if let Some(set_cookie) = rolled.get("set-cookie") {
+            renewed = set_cookie.clone();
+        }
+        if token_stats.refresh_token_ok.load(Ordering::SeqCst) > refresh_before {
+            saw_refresh = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        saw_refresh,
+        "expected a successful refresh_token grant at Hydra via the token facade"
     );
 
-    // Idle expiry: wait past idle_ttl without activity on a fresh short session.
+    // Idle expiry: wait past idle_ttl without any authenticate/slide first.
     let mut idle_cfg = base_oidc_config(&hydra, &client);
     idle_cfg["session"]["ttl_secs"] = json!(30);
     idle_cfg["session"]["idle_ttl_secs"] = json!(2);
@@ -520,22 +625,16 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
     let idle_plugin = oidc_plugin(idle_cfg);
     let ch = wait_for_browser_challenge(&idle_plugin).await;
     let idle_cookie = complete_login(&hydra, &idle_plugin, &ch).await;
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    sleep_past_ttl_secs(2).await;
     let mut idle_ctx = session_ctx(&idle_cookie, "/app");
-    match idle_plugin
-        .authenticate(&mut idle_ctx, &ConsumerIndex::new(&[]))
-        .await
-    {
-        PluginResult::Reject {
-            status_code: 302, ..
-        }
-        | PluginResult::Reject {
-            status_code: 401, ..
-        } => {}
-        other => panic!("idle expiry should re-challenge, got {other:?}"),
-    }
+    assert_rechallenge(
+        idle_plugin
+            .authenticate(&mut idle_ctx, &ConsumerIndex::new(&[]))
+            .await,
+        "idle expiry",
+    );
 
-    // Absolute expiry.
+    // Absolute expiry (also no pre-assertion slide).
     let mut abs_cfg = base_oidc_config(&hydra, &client);
     abs_cfg["session"]["ttl_secs"] = json!(2);
     abs_cfg["session"]["idle_ttl_secs"] = json!(30);
@@ -543,24 +642,16 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
     let abs_plugin = oidc_plugin(abs_cfg);
     let ch = wait_for_browser_challenge(&abs_plugin).await;
     let abs_cookie = complete_login(&hydra, &abs_plugin, &ch).await;
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    sleep_past_ttl_secs(2).await;
     let mut abs_ctx = session_ctx(&abs_cookie, "/app");
-    match abs_plugin
-        .authenticate(&mut abs_ctx, &ConsumerIndex::new(&[]))
-        .await
-    {
-        PluginResult::Reject {
-            status_code: 302, ..
-        }
-        | PluginResult::Reject {
-            status_code: 401, ..
-        } => {}
-        other => panic!("absolute expiry should re-challenge, got {other:?}"),
-    }
+    assert_rechallenge(
+        abs_plugin
+            .authenticate(&mut abs_ctx, &ConsumerIndex::new(&[]))
+            .await,
+        "absolute expiry",
+    );
 
-    // Refresh failure: revoke-style by using a plugin pointed at a dead token URL
-    // after establishing a live session is covered by unit tests; here exercise
-    // successful refresh via skew forcing above, then logout.
+    // Logout against the refreshed session.
     let mut logout_ctx = session_ctx(&renewed, LOGOUT_PATH);
     match plugin.on_request_received(&mut logout_ctx).await {
         PluginResult::Reject {

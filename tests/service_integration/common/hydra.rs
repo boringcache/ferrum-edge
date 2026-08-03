@@ -10,14 +10,24 @@
 //! challenges through the admin API (no separate consent container). Ports are
 //! ephemeral; readiness is polled. Secrets and tokens are never written to
 //! diagnostics.
+//!
+//! Loopback facades used by the suites:
+//! - introspection discovery facade (same-origin rewrite + upstream call counter)
+//! - OIDC token facade (grant-type counters + optional short `expires_in`)
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use ferrum_edge::fips::approved::Sha256;
+use ferrum_edge::fips::backend::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
 use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 use url::Url;
 
 use super::containers::{BoxError, free_localhost_port};
@@ -28,6 +38,11 @@ pub const HYDRA_TAG: &str = "v2.2.0";
 
 const HYDRA_PUBLIC_PORT: u16 = 4444;
 const HYDRA_ADMIN_PORT: u16 = 4445;
+
+/// Hard caps for loopback HTTP request framing (fail closed past these).
+const FACADE_MAX_HEADER_BYTES: usize = 16 * 1024;
+const FACADE_MAX_BODY_BYTES: usize = 64 * 1024;
+const FACADE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// System secret for the disposable fixture. Not a production credential;
 /// never log this value.
@@ -62,6 +77,24 @@ pub struct HydraClient {
 pub struct AuthCodeCallback {
     pub code: String,
     pub state: String,
+}
+
+/// Observable counters for the introspection discovery facade.
+///
+/// Counts only classifications / presence bits — never secrets, tokens, or bodies.
+#[derive(Default)]
+pub struct IntrospectionFacadeStats {
+    pub upstream_introspect_calls: AtomicU64,
+    pub basic_authorization_header: AtomicU64,
+    pub post_client_secret_field: AtomicU64,
+}
+
+/// Observable counters for the OIDC token loopback facade.
+#[derive(Default)]
+pub struct TokenFacadeStats {
+    pub authorization_code_ok: AtomicU64,
+    pub refresh_token_ok: AtomicU64,
+    pub other_grant_ok: AtomicU64,
 }
 
 /// Bind an ephemeral localhost TCP port (re-exported pattern from Redpanda).
@@ -105,7 +138,10 @@ pub async fn start_hydra_container() -> Result<HydraContainer, BoxError> {
         .with_env_var("URLS_SELF_ISSUER", &issuer)
         .with_env_var("URLS_LOGIN", &login_url)
         .with_env_var("URLS_CONSENT", &consent_url)
-        .with_env_var("URLS_LOGOUT", format!("http://127.0.0.1:{consent_port}/logout"))
+        .with_env_var(
+            "URLS_LOGOUT",
+            format!("http://127.0.0.1:{consent_port}/logout"),
+        )
         .with_env_var("SERVE_PUBLIC_CORS_ENABLED", "true")
         .with_env_var("SERVE_ADMIN_CORS_ENABLED", "true")
         .with_env_var("OIDC_SUBJECT_IDENTIFIERS_SUPPORTED_TYPES", "public")
@@ -151,17 +187,29 @@ impl HydraContainer {
         )
     }
 
+    pub fn token_endpoint(&self) -> String {
+        format!("{}/oauth2/token", self.public_url.trim_end_matches('/'))
+    }
+
     /// Same-origin discovery URL whose `introspection_endpoint` proxies to the
     /// live admin introspector. Hydra advertises public discovery on :4444 and
     /// introspection on :4445; Ferrum requires discovery and introspection to
     /// share scheme/host/port, so this facade rewrites the document.
-    pub async fn start_introspection_discovery_facade(&self) -> Result<String, BoxError> {
+    ///
+    /// Returns `(discovery_url, stats)`. `stats` counts upstream introspect
+    /// calls and whether Basic vs form `client_secret` was present — never
+    /// records secret values.
+    pub async fn start_introspection_discovery_facade(
+        &self,
+    ) -> Result<(String, Arc<IntrospectionFacadeStats>), BoxError> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let facade_origin = format!("http://127.0.0.1:{port}");
         let admin_introspect = self.introspection_endpoint();
         let public_discovery = self.discovery_url();
         let client = self.client.clone();
+        let stats = Arc::new(IntrospectionFacadeStats::default());
+        let stats_accept = Arc::clone(&stats);
 
         tokio::spawn(async move {
             loop {
@@ -172,13 +220,15 @@ impl HydraContainer {
                 let admin_introspect = admin_introspect.clone();
                 let public_discovery = public_discovery.clone();
                 let facade_origin = facade_origin.clone();
+                let stats = Arc::clone(&stats_accept);
                 tokio::spawn(async move {
-                    let _ = handle_facade_connection(
+                    let _ = handle_introspection_facade_connection(
                         stream,
                         client,
                         public_discovery,
                         admin_introspect,
                         facade_origin,
+                        stats,
                     )
                     .await;
                 });
@@ -189,20 +239,70 @@ impl HydraContainer {
         for _ in 0..40 {
             if let Ok(resp) = self
                 .client
-                .get(format!(
-                    "{facade_origin}/.well-known/openid-configuration"
-                ))
+                .get(format!("{facade_origin}/.well-known/openid-configuration"))
                 .send()
                 .await
                 && resp.status().is_success()
             {
-                return Ok(format!(
-                    "{facade_origin}/.well-known/openid-configuration"
+                return Ok((
+                    format!("{facade_origin}/.well-known/openid-configuration"),
+                    stats,
                 ));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Err("introspection discovery facade not ready".into())
+    }
+
+    /// Loopback token endpoint that proxies to live Hydra `/oauth2/token`.
+    ///
+    /// Counts successful grant types (no secrets recorded). When
+    /// `shorten_expires_in_secs` is set, successful JSON responses rewrite
+    /// `expires_in` to that value so Ferrum's refresh skew can fire within a
+    /// bounded test window without changing Hydra's signed ID-token `exp`.
+    pub async fn start_token_facade(
+        &self,
+        shorten_expires_in_secs: Option<u64>,
+    ) -> Result<(String, Arc<TokenFacadeStats>), BoxError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let facade_url = format!("http://127.0.0.1:{port}/oauth2/token");
+        let upstream_token = self.token_endpoint();
+        let client = self.client.clone();
+        let stats = Arc::new(TokenFacadeStats::default());
+        let stats_accept = Arc::clone(&stats);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let client = client.clone();
+                let upstream_token = upstream_token.clone();
+                let stats = Arc::clone(&stats_accept);
+                tokio::spawn(async move {
+                    let _ = handle_token_facade_connection(
+                        stream,
+                        client,
+                        upstream_token,
+                        stats,
+                        shorten_expires_in_secs,
+                    )
+                    .await;
+                });
+            }
+        });
+
+        for _ in 0..40 {
+            // Token endpoint rejects GET; a dialable TCP accept is enough for
+            // readiness — probe with an empty POST and accept any HTTP answer.
+            if let Ok(resp) = self.client.post(&facade_url).send().await {
+                let _ = resp.status();
+                return Ok((facade_url, stats));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err("token facade not ready".into())
     }
 
     async fn wait_ready(&self) -> Result<(), BoxError> {
@@ -255,7 +355,10 @@ impl HydraContainer {
         // Admin health: create-client listing must answer.
         let health = self
             .client
-            .get(format!("{}/health/ready", self.admin_url.trim_end_matches('/')))
+            .get(format!(
+                "{}/health/ready",
+                self.admin_url.trim_end_matches('/')
+            ))
             .send()
             .await
             .map_err(|e| format!("admin health dial: {e}"))?;
@@ -263,7 +366,10 @@ impl HydraContainer {
             // Older hydra may lack /health/ready — fall back to empty client list.
             let clients = self
                 .client
-                .get(format!("{}/admin/clients?page_size=1", self.admin_url.trim_end_matches('/')))
+                .get(format!(
+                    "{}/admin/clients?page_size=1",
+                    self.admin_url.trim_end_matches('/')
+                ))
                 .send()
                 .await
                 .map_err(|e| format!("admin clients dial: {e}"))?;
@@ -299,7 +405,10 @@ impl HydraContainer {
         });
         let resp = self
             .client
-            .post(format!("{}/admin/clients", self.admin_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/admin/clients",
+                self.admin_url.trim_end_matches('/')
+            ))
             .json(&body)
             .send()
             .await
@@ -331,8 +440,8 @@ impl HydraContainer {
 
         // Cap redirect hops so a misconfigured fixture fails fast.
         for _ in 0..12 {
-            let parsed = Url::parse(&location)
-                .map_err(|e| format!("redirect location parse: {e}"))?;
+            let parsed =
+                Url::parse(&location).map_err(|e| format!("redirect location parse: {e}"))?;
 
             if let Some(code) = query_param(&parsed, "code") {
                 let state = query_param(&parsed, "state").unwrap_or_default();
@@ -365,10 +474,9 @@ impl HydraContainer {
                 location = next;
                 continue;
             }
-            return Err(format!(
-                "auth hop HTTP {status} without login/consent/code redirect"
-            )
-            .into());
+            return Err(
+                format!("auth hop HTTP {status} without login/consent/code redirect").into(),
+            );
         }
         Err("authorization redirect hop budget exhausted".into())
     }
@@ -391,7 +499,10 @@ impl HydraContainer {
         if !resp.status().is_success() {
             return Err(format!("accept login HTTP {}", resp.status()).into());
         }
-        let body: Value = resp.json().await.map_err(|e| format!("accept login json: {e}"))?;
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("accept login json: {e}"))?;
         body.get("redirect_to")
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -414,7 +525,10 @@ impl HydraContainer {
         if !info.status().is_success() {
             return Err(format!("get consent HTTP {}", info.status()).into());
         }
-        let info: Value = info.json().await.map_err(|e| format!("get consent json: {e}"))?;
+        let info: Value = info
+            .json()
+            .await
+            .map_err(|e| format!("get consent json: {e}"))?;
         let grant_scope = info
             .get("requested_scope")
             .cloned()
@@ -479,7 +593,10 @@ impl HydraContainer {
         }
         let resp = self
             .client
-            .post(format!("{}/oauth2/token", self.public_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/oauth2/token",
+                self.public_url.trim_end_matches('/')
+            ))
             .basic_auth(&client.client_id, Some(&client.client_secret))
             .form(&form)
             .send()
@@ -505,7 +622,7 @@ impl HydraContainer {
         client: &HydraClient,
         scopes: &str,
     ) -> Result<(String, Option<String>), BoxError> {
-        let verifier = pkce_verifier();
+        let verifier = pkce_verifier()?;
         let challenge = pkce_challenge_s256(&verifier);
         let state = format!("state-{}", self.isolation);
         let nonce = format!("nonce-{}", self.isolation);
@@ -536,7 +653,10 @@ impl HydraContainer {
         ];
         let resp = self
             .client
-            .post(format!("{}/oauth2/token", self.public_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/oauth2/token",
+                self.public_url.trim_end_matches('/')
+            ))
             .basic_auth(&client.client_id, Some(&client.client_secret))
             .form(&form)
             .send()
@@ -562,6 +682,33 @@ impl HydraContainer {
     }
 }
 
+/// Replace the `nonce` query parameter on an authorization URL without touching
+/// other parameters (used for live nonce-mismatch negatives).
+pub fn rewrite_authorization_nonce(
+    authorization_url: &str,
+    new_nonce: &str,
+) -> Result<String, BoxError> {
+    let mut url = Url::parse(authorization_url).map_err(|e| format!("auth url parse: {e}"))?;
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| {
+            if k == "nonce" {
+                (k.into_owned(), new_nonce.to_string())
+            } else {
+                (k.into_owned(), v.into_owned())
+            }
+        })
+        .collect();
+    url.query_pairs_mut().clear();
+    for (k, v) in &pairs {
+        url.query_pairs_mut().append_pair(k, v);
+    }
+    if !pairs.iter().any(|(k, _)| k == "nonce") {
+        url.query_pairs_mut().append_pair("nonce", new_nonce);
+    }
+    Ok(url.to_string())
+}
+
 #[derive(Default)]
 struct CookieJar {
     pairs: HashMap<String, String>,
@@ -575,7 +722,8 @@ impl CookieJar {
             };
             let pair = raw.split(';').next().unwrap_or("").trim();
             if let Some((name, val)) = pair.split_once('=') {
-                self.pairs.insert(name.trim().to_string(), val.trim().to_string());
+                self.pairs
+                    .insert(name.trim().to_string(), val.trim().to_string());
             }
         }
     }
@@ -625,74 +773,170 @@ fn sanitize_diag(raw: &str) -> String {
         .replace("client_secret", "client_secret=[REDACTED]")
 }
 
-fn pkce_verifier() -> String {
+fn pkce_verifier() -> Result<String, BoxError> {
     use base64::Engine;
     let mut bytes = [0u8; 64];
-    // Prefer OS randomness; fall back to time-derived bytes if unavailable.
-    if getrandom_fill(&mut bytes).is_err() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = ((nanos >> ((i % 16) * 8)) as u8).wrapping_add(i as u8);
-        }
-    }
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn getrandom_fill(buf: &mut [u8]) -> Result<(), ()> {
-    // Use the same getrandom the workspace already links when available.
-    #[allow(unused_imports)]
-    {
-        // std does not expose fill_bytes portably without getrandom; use
-        // a simple hash mix from process entropy as a test-only fallback path
-        // when the primary call is stubbed — prefer `rand` via os.
-    }
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    std::process::id().hash(&mut hasher);
-    std::time::SystemTime::now().hash(&mut hasher);
-    let mut state = hasher.finish();
-    for (i, b) in buf.iter_mut().enumerate() {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(i as u64 + 1);
-        *b = (state >> 33) as u8;
-    }
-    Ok(())
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "SystemRandom failed to fill PKCE verifier".to_string())?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
 fn pkce_challenge_s256(verifier: &str) -> String {
     use base64::Engine;
-    use ferrum_edge::fips::approved::Sha256;
     let digest = Sha256::digest(verifier.as_bytes());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
-async fn handle_facade_connection(
+struct ParsedHttpRequest {
+    method: String,
+    path: String,
+    /// Lowercased header name → value. Authorization is retained for upstream
+    /// forwarding only and must never be logged.
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+/// Bounded read-until-headers-complete plus Content-Length body completion.
+/// Fail-closed on timeout, truncation, oversize, or malformed framing.
+async fn read_http_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<ParsedHttpRequest, BoxError> {
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let header_end = loop {
+        if buf.len() > FACADE_MAX_HEADER_BYTES {
+            return Err("HTTP headers exceed facade cap".into());
+        }
+        if let Some(pos) = find_header_end(&buf) {
+            break pos;
+        }
+        let mut chunk = [0u8; 2048];
+        let n = timeout(FACADE_READ_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| "HTTP header read timeout")?
+            .map_err(|e| format!("HTTP header read: {e}"))?;
+        if n == 0 {
+            return Err("HTTP connection closed before headers completed".into());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    let header_bytes = &buf[..header_end];
+    let header_text = std::str::from_utf8(header_bytes)
+        .map_err(|_| "HTTP headers are not valid UTF-8")?;
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+    if method.is_empty() || path.is_empty() {
+        return Err("malformed HTTP request line".into());
+    }
+
+    let mut headers = HashMap::new();
+    let mut content_length: Option<usize> = None;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err("malformed HTTP header line".into());
+        };
+        let name_l = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_string();
+        if name_l == "content-length" {
+            let len: usize = value
+                .parse()
+                .map_err(|_| "invalid Content-Length")?;
+            if len > FACADE_MAX_BODY_BYTES {
+                return Err("HTTP body exceeds facade cap".into());
+            }
+            content_length = Some(len);
+        }
+        headers.insert(name_l, value);
+    }
+
+    let body_start = header_end + 4;
+    let mut body = if body_start <= buf.len() {
+        buf[body_start..].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    if let Some(need) = content_length {
+        while body.len() < need {
+            let mut chunk = vec![0u8; (need - body.len()).min(4096)];
+            let n = timeout(FACADE_READ_TIMEOUT, stream.read(&mut chunk))
+                .await
+                .map_err(|_| "HTTP body read timeout")?
+                .map_err(|e| format!("HTTP body read: {e}"))?;
+            if n == 0 {
+                return Err("HTTP connection closed before body completed".into());
+            }
+            body.extend_from_slice(&chunk[..n]);
+            if body.len() > FACADE_MAX_BODY_BYTES {
+                return Err("HTTP body exceeds facade cap".into());
+            }
+        }
+        body.truncate(need);
+    } else if method == "POST" || method == "PUT" || method == "PATCH" {
+        // No Content-Length: reject rather than guessing (fail closed).
+        return Err("POST/PUT/PATCH without Content-Length rejected".into());
+    }
+
+    Ok(ParsedHttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+async fn write_http_response(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(), BoxError> {
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(body).await?;
+    Ok(())
+}
+
+async fn write_simple_status(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    reason: &str,
+) -> Result<(), BoxError> {
+    write_http_response(stream, status, reason, "text/plain", reason.as_bytes()).await
+}
+
+async fn handle_introspection_facade_connection(
     mut stream: tokio::net::TcpStream,
     client: reqwest::Client,
     public_discovery: String,
     admin_introspect: String,
     facade_origin: String,
+    stats: Arc<IntrospectionFacadeStats>,
 ) -> Result<(), BoxError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let request = match read_http_request(&mut stream).await {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = write_simple_status(&mut stream, 400, "Bad Request").await;
+            return Ok(());
+        }
+    };
 
-    let mut buf = vec![0u8; 64 * 1024];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let mut lines = request.split("\r\n");
-    let request_line = lines.next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("");
-
-    if method == "GET" && path.starts_with("/.well-known/openid-configuration") {
+    if request.method == "GET" && request.path.starts_with("/.well-known/openid-configuration") {
         let upstream = client.get(&public_discovery).send().await?;
         let status = upstream.status().as_u16();
         let mut doc: Value = upstream.json().await?;
@@ -703,51 +947,181 @@ async fn handle_facade_connection(
             );
         }
         let body = serde_json::to_vec(&doc)?;
-        let response = format!(
-            "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).await?;
-        stream.write_all(&body).await?;
+        write_http_response(
+            &mut stream,
+            status,
+            "OK",
+            "application/json",
+            &body,
+        )
+        .await?;
         return Ok(());
     }
 
-    if method == "POST" && path.starts_with("/oauth2/introspect") {
-        let header_end = request
-            .find("\r\n\r\n")
-            .map(|i| i + 4)
-            .unwrap_or(request.len());
-        let body_bytes = &buf[header_end..n];
-        // Forward Authorization if present so client_secret_basic still works.
-        let mut forward = client.post(&admin_introspect);
-        for line in request[..header_end].lines().skip(1) {
-            if let Some((name, value)) = line.split_once(':') {
-                let name = name.trim();
-                if name.eq_ignore_ascii_case("authorization")
-                    || name.eq_ignore_ascii_case("content-type")
-                {
-                    forward = forward.header(name, value.trim());
-                }
-            }
+    if request.method == "POST" && request.path.starts_with("/oauth2/introspect") {
+        stats
+            .upstream_introspect_calls
+            .fetch_add(1, Ordering::SeqCst);
+        if request.headers.contains_key("authorization") {
+            stats
+                .basic_authorization_header
+                .fetch_add(1, Ordering::SeqCst);
         }
-        let upstream = forward.body(body_bytes.to_vec()).send().await?;
+        // Classify form client_secret presence without recording the value.
+        if form_has_field(&request.body, "client_secret") {
+            stats
+                .post_client_secret_field
+                .fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut forward = client.post(&admin_introspect);
+        if let Some(authorization) = request.headers.get("authorization") {
+            forward = forward.header("authorization", authorization);
+        }
+        if let Some(content_type) = request.headers.get("content-type") {
+            forward = forward.header("content-type", content_type);
+        } else {
+            forward = forward.header(
+                "content-type",
+                "application/x-www-form-urlencoded",
+            );
+        }
+        let upstream = forward.body(request.body).send().await?;
         let status = upstream.status().as_u16();
         let resp_body = upstream.bytes().await?;
-        let response = format!(
-            "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            resp_body.len()
-        );
-        stream.write_all(response.as_bytes()).await?;
-        stream.write_all(&resp_body).await?;
+        write_http_response(
+            &mut stream,
+            status,
+            "OK",
+            "application/json",
+            &resp_body,
+        )
+        .await?;
         return Ok(());
     }
 
-    let body = b"not found";
-    let response = format!(
-        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.write_all(body).await?;
+    write_simple_status(&mut stream, 404, "Not Found").await?;
     Ok(())
+}
+
+async fn handle_token_facade_connection(
+    mut stream: tokio::net::TcpStream,
+    client: reqwest::Client,
+    upstream_token: String,
+    stats: Arc<TokenFacadeStats>,
+    shorten_expires_in_secs: Option<u64>,
+) -> Result<(), BoxError> {
+    let request = match read_http_request(&mut stream).await {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = write_simple_status(&mut stream, 400, "Bad Request").await;
+            return Ok(());
+        }
+    };
+
+    if request.method != "POST" || !request.path.starts_with("/oauth2/token") {
+        write_simple_status(&mut stream, 404, "Not Found").await?;
+        return Ok(());
+    }
+
+    let grant_type = form_field_value(&request.body, "grant_type").unwrap_or_default();
+
+    let mut forward = client.post(&upstream_token);
+    if let Some(authorization) = request.headers.get("authorization") {
+        forward = forward.header("authorization", authorization);
+    }
+    if let Some(content_type) = request.headers.get("content-type") {
+        forward = forward.header("content-type", content_type);
+    } else {
+        forward = forward.header(
+            "content-type",
+            "application/x-www-form-urlencoded",
+        );
+    }
+    let upstream = forward.body(request.body.clone()).send().await?;
+    let status = upstream.status();
+    let status_code = status.as_u16();
+    let mut resp_body = upstream.bytes().await?.to_vec();
+
+    if status.is_success() {
+        match grant_type.as_str() {
+            "authorization_code" => {
+                stats.authorization_code_ok.fetch_add(1, Ordering::SeqCst);
+            }
+            "refresh_token" => {
+                stats.refresh_token_ok.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {
+                stats.other_grant_ok.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        if let Some(secs) = shorten_expires_in_secs
+            && let Ok(mut doc) = serde_json::from_slice::<Value>(&resp_body)
+        {
+            if let Some(obj) = doc.as_object_mut() {
+                obj.insert("expires_in".to_string(), json!(secs));
+            }
+            // Re-serialize without logging; tokens stay only in the bytes.
+            if let Ok(rewritten) = serde_json::to_vec(&doc) {
+                resp_body = rewritten;
+            }
+        }
+    }
+
+    write_http_response(
+        &mut stream,
+        status_code,
+        "OK",
+        "application/json",
+        &resp_body,
+    )
+    .await?;
+    Ok(())
+}
+
+fn form_has_field(body: &[u8], name: &str) -> bool {
+    form_field_value(body, name).is_some()
+}
+
+fn form_field_value(body: &[u8], name: &str) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    for pair in text.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next()?;
+        let key = urlencoding_decode(key);
+        if key == name {
+            let value = parts.next().unwrap_or("");
+            return Some(urlencoding_decode(value));
+        }
+    }
+    None
+}
+
+fn urlencoding_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &input[i + 1..i + 3];
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

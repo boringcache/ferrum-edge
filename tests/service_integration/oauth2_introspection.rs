@@ -2,13 +2,19 @@
 //!
 //! Independently runnable from the OIDC suite. Exercises active/inactive opaque
 //! tokens, scope/role/issuer/audience checks, claim-header mapping,
-//! `client_secret_basic` and `client_secret_post`, discovery vs direct endpoint
-//! configuration, cache hit/expiry without leaking token keys, and failure
-//! policy (timeout / malformed / oversized / auth / unavailable).
+//! `client_secret_basic` and `client_secret_post` request shaping (observed via
+//! the non-secret facade), discovery vs direct endpoint configuration, cache
+//! hit/expiry via an upstream-call counter, and failure policy (timeout /
+//! malformed / oversized / auth / unavailable).
+//!
+//! Note: Hydra's admin introspection endpoint does not enforce client
+//! authentication, so a wrong client secret against that URL is not a valid
+//! auth-failure proof. Auth-failure fail-closed is covered by wiremock.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, create_plugin};
@@ -18,9 +24,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::common::containers::fail_in_ci_else_skip;
-use crate::common::hydra::{
-    FIXTURE_EMAIL, FIXTURE_ROLE, HydraContainer, start_hydra_container,
-};
+use crate::common::hydra::{FIXTURE_EMAIL, FIXTURE_ROLE, HydraContainer, start_hydra_container};
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -115,11 +119,7 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
             "intro-basic",
             redirect,
             "client_secret_basic",
-            &[
-                "client_credentials",
-                "authorization_code",
-                "refresh_token",
-            ],
+            &["client_credentials", "authorization_code", "refresh_token"],
         )
         .await
         .expect("basic client");
@@ -257,7 +257,7 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
     );
 
     // Discovery via same-origin facade → live admin introspect.
-    let discovery_url = hydra
+    let (discovery_url, facade_stats) = hydra
         .start_introspection_discovery_facade()
         .await
         .expect("discovery facade");
@@ -269,10 +269,23 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
                 "method": "client_secret_basic",
                 "client_id": basic_client.client_id,
                 "client_secret": basic_client.client_secret
-            }
+            },
+            "positive_cache_ttl_secs": 3,
+            "negative_cache_ttl_secs": 1
         }]
     }));
-    wait_discovery_ready(&discovery_plugin, &active).await;
+    // Warm discovery with an inactive token so the positive cache for `active`
+    // stays cold for the hit/miss counter proof below.
+    let warmup_inactive = format!("warmup-{}", hydra.isolation);
+    wait_discovery_ready(&discovery_plugin, &warmup_inactive).await;
+
+    let calls_before = facade_stats
+        .upstream_introspect_calls
+        .load(Ordering::SeqCst);
+    let basic_before = facade_stats
+        .basic_authorization_header
+        .load(Ordering::SeqCst);
+
     let mut disc_ctx = bearer_ctx(&active);
     assert_eq!(
         reject_status(
@@ -282,6 +295,108 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
         ),
         None,
         "discovery-resolved introspection must accept active token"
+    );
+    let after_first = facade_stats
+        .upstream_introspect_calls
+        .load(Ordering::SeqCst);
+    assert!(
+        after_first > calls_before,
+        "first lookup must call upstream introspect"
+    );
+    assert!(
+        facade_stats
+            .basic_authorization_header
+            .load(Ordering::SeqCst)
+            > basic_before,
+        "client_secret_basic must present Authorization to the facade"
+    );
+
+    // Cache hit: second lookup must not call upstream again.
+    let mut disc_ctx2 = bearer_ctx(&active);
+    assert_eq!(
+        reject_status(
+            &discovery_plugin
+                .authenticate(&mut disc_ctx2, &ConsumerIndex::new(&[]))
+                .await
+        ),
+        None,
+        "cache hit must still Continue"
+    );
+    assert_eq!(
+        facade_stats
+            .upstream_introspect_calls
+            .load(Ordering::SeqCst),
+        after_first,
+        "second lookup must be a positive-cache hit (no upstream call)"
+    );
+
+    // After TTL, another upstream call is required.
+    let expiry_deadline = Instant::now() + Duration::from_secs(6);
+    tokio::time::sleep(Duration::from_secs(3) + Duration::from_millis(250)).await;
+    let mut refreshed_upstream = false;
+    while Instant::now() < expiry_deadline {
+        let before = facade_stats
+            .upstream_introspect_calls
+            .load(Ordering::SeqCst);
+        let mut disc_ctx3 = bearer_ctx(&active);
+        assert_eq!(
+            reject_status(
+                &discovery_plugin
+                    .authenticate(&mut disc_ctx3, &ConsumerIndex::new(&[]))
+                    .await
+            ),
+            None
+        );
+        if facade_stats
+            .upstream_introspect_calls
+            .load(Ordering::SeqCst)
+            > before
+        {
+            refreshed_upstream = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        refreshed_upstream,
+        "lookup after positive-cache TTL must call upstream again"
+    );
+
+    // client_secret_post shaping observed via a fresh facade (no secret values).
+    let (discovery_url_post, post_stats) = hydra
+        .start_introspection_discovery_facade()
+        .await
+        .expect("post discovery facade");
+    let post_discovery_plugin = introspection_plugin(json!({
+        "providers": [{
+            "discovery_url": discovery_url_post,
+            "client_auth": {
+                "method": "client_secret_post",
+                "client_id": post_client.client_id,
+                "client_secret": post_client.client_secret
+            }
+        }]
+    }));
+    let post_field_before = post_stats.post_client_secret_field.load(Ordering::SeqCst);
+    let basic_on_post = post_stats.basic_authorization_header.load(Ordering::SeqCst);
+    wait_discovery_ready(&post_discovery_plugin, &post_token).await;
+    assert!(
+        post_stats.post_client_secret_field.load(Ordering::SeqCst) > post_field_before,
+        "client_secret_post must include a client_secret form field"
+    );
+    assert_eq!(
+        post_stats.basic_authorization_header.load(Ordering::SeqCst),
+        basic_on_post,
+        "client_secret_post must not send Authorization"
+    );
+    let mut post_facade_ctx = bearer_ctx(&post_token);
+    assert_eq!(
+        reject_status(
+            &post_discovery_plugin
+                .authenticate(&mut post_facade_ctx, &ConsumerIndex::new(&[]))
+                .await
+        ),
+        None
     );
 
     // Claim-rich opaque token (Hydra puts consent session extras under `ext`).
@@ -295,10 +410,7 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
         .await
         .expect("claims client");
     let (claim_token, _) = hydra
-        .authorization_code_tokens(
-            &claim_client,
-            "openid offline_access profile email roles",
-        )
+        .authorization_code_tokens(&claim_client, "openid offline_access profile email roles")
         .await
         .expect("claim-bearing opaque token");
     let claim_plugin = introspection_plugin(json!({
@@ -319,10 +431,9 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
         }]
     }));
     let mut claim_ctx = bearer_ctx(&claim_token);
-    claim_ctx.headers.insert(
-        "x-introspected-email".to_string(),
-        "evil@attacker".into(),
-    );
+    claim_ctx
+        .headers
+        .insert("x-introspected-email".to_string(), "evil@attacker".into());
     assert_eq!(
         reject_status(
             &claim_plugin
@@ -349,64 +460,8 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
         Some(FIXTURE_EMAIL)
     );
 
-    let cache_plugin = introspection_plugin(json!({
-        "providers": [{
-            "introspection_endpoint": hydra.introspection_endpoint(),
-            "client_auth": {
-                "method": "client_secret_basic",
-                "client_id": basic_client.client_id,
-                "client_secret": basic_client.client_secret
-            },
-            "positive_cache_ttl_secs": 3,
-            "negative_cache_ttl_secs": 1
-        }]
-    }));
-    let mut c1 = bearer_ctx(&active);
-    assert_eq!(
-        reject_status(
-            &cache_plugin
-                .authenticate(&mut c1, &ConsumerIndex::new(&[]))
-                .await
-        ),
-        None
-    );
-    let mut c2 = bearer_ctx(&active);
-    assert_eq!(
-        reject_status(
-            &cache_plugin
-                .authenticate(&mut c2, &ConsumerIndex::new(&[]))
-                .await
-        ),
-        None,
-        "cache hit must still Continue"
-    );
-    let diag = format!("identity={:?}", c2.authenticated_identity);
-    assert_no_secret_leak(
-        &diag,
-        &[&active, &basic_client.client_secret, &claim_token],
-    );
-
-    let ghost = format!("ghost-{}", hydra.isolation);
-    let mut g1 = bearer_ctx(&ghost);
-    assert_eq!(
-        reject_status(
-            &cache_plugin
-                .authenticate(&mut g1, &ConsumerIndex::new(&[]))
-                .await
-        ),
-        Some(401)
-    );
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    let mut g2 = bearer_ctx(&ghost);
-    assert_eq!(
-        reject_status(
-            &cache_plugin
-                .authenticate(&mut g2, &ConsumerIndex::new(&[]))
-                .await
-        ),
-        Some(401),
-        "negative cache expiry must not change inactive outcome"
-    );
+    let diag = format!("identity={:?}", disc_ctx2.authenticated_identity);
+    assert_no_secret_leak(&diag, &[&active, &basic_client.client_secret, &claim_token]);
 }
 
 #[tokio::test]
@@ -430,30 +485,9 @@ async fn oauth2_live_introspection_failure_policy() {
         .await
         .expect("token for mixed tests");
 
-    let bad_secret = introspection_plugin(json!({
-        "providers": [{
-            "introspection_endpoint": hydra.introspection_endpoint(),
-            "client_auth": {
-                "method": "client_secret_basic",
-                "client_id": client.client_id,
-                "client_secret": format!("wrong-{}", hydra.isolation)
-            },
-            "request_timeout_ms": 3000
-        }]
-    }));
-    let mut ctx = bearer_ctx(&good_token);
-    // Hydra admin introspect often ignores client auth; if so, wrong secret may
-    // still Continue. Prefer 503 when auth is enforced; otherwise require that
-    // a distinct unavailable endpoint still fails closed below.
-    let bad_secret_status = reject_status(
-        &bad_secret
-            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
-            .await,
-    );
-    assert!(
-        bad_secret_status.is_none() || bad_secret_status == Some(503) || bad_secret_status == Some(401),
-        "unexpected bad-secret status {bad_secret_status:?}"
-    );
+    // Hydra admin introspect does not enforce client authentication, so a
+    // wrong secret against that URL is not an auth-failure proof. Auth failure
+    // fail-closed is covered by the wiremock 401 case below.
 
     let unavailable = introspection_plugin(json!({
         "providers": [{
