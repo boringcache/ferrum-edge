@@ -16,7 +16,7 @@ CLUSTER_B="${CLUSTER_B:-ferrum-poller-b}"
 CONTEXT_A="kind-$CLUSTER_A"
 CONTEXT_B="kind-$CLUSTER_B"
 TOXIPROXY_CONTAINER="${TOXIPROXY_CONTAINER:-ferrum-poller-toxiproxy}"
-TOXIPROXY_IMAGE="${TOXIPROXY_IMAGE:-shopify/toxiproxy:2.12.0}"
+TOXIPROXY_IMAGE="${TOXIPROXY_IMAGE:-ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e}"
 NS="${FERRUM_NAMESPACE:-ferrum}"
 SPIRE_NS="${FERRUM_SPIRE_NAMESPACE:-spire-system}"
 TD_A="${FERRUM_TRUST_DOMAIN_A:-cluster-a.test}"
@@ -92,14 +92,34 @@ preflight() {
 }
 
 wait_until() {
-  local label="$1" timeout="$2"; shift 2
+  local label="$1" timeout="$2" predicate="$3"; shift 3
   local deadline=$((SECONDS + timeout))
   while (( SECONDS < deadline )); do
-    if "$@"; then return 0; fi
+    if run_wait_predicate "$predicate" "$@"; then return 0; fi
     sleep 1
   done
   echo "timed out waiting for $label (${timeout}s)" >&2
   return 1
+}
+
+# Keep polling dispatch explicit. Besides making the live contract auditable,
+# this prevents a caller-controlled executable word from becoming an opaque
+# tool-dispatch surface inside trusted CI automation.
+run_wait_predicate() {
+  local predicate="$1"; shift
+  case "$predicate" in
+    ages_increased_below_stale) ages_increased_below_stale "$@" ;;
+    curl) curl "$@" ;;
+    failure_counters_positive) failure_counters_positive "$@" ;;
+    fresh_state) fresh_state "$@" ;;
+    kubectl) kubectl "$@" ;;
+    no_configured_state) no_configured_state "$@" ;;
+    proxy_activity_increased) proxy_activity_increased "$@" ;;
+    state_matches) state_matches "$@" ;;
+    traffic_not_found) traffic_not_found "$@" ;;
+    traffic_once) traffic_once "$@" ;;
+    *) echo "unsupported wait predicate: $predicate" >&2; return 2 ;;
+  esac
 }
 
 spire_bundle_b64der() {
@@ -128,7 +148,8 @@ create_clusters_and_fault_layer() {
   NODE_B="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER_B-control-plane")"
   [[ -n "$NODE_A" && -n "$NODE_B" ]] || { echo "kind node IP discovery failed" >&2; return 1; }
 
-  docker run -d --name "$TOXIPROXY_CONTAINER" --network kind "$TOXIPROXY_IMAGE" >/dev/null
+  docker run -d --name "$TOXIPROXY_CONTAINER" --network kind "$TOXIPROXY_IMAGE" \
+    -host=0.0.0.0 -proxy-metrics >/dev/null
   TOXI_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$TOXIPROXY_CONTAINER")"
   [[ -n "$TOXI_IP" ]] || { echo "Toxiproxy IP discovery failed" >&2; return 1; }
   wait_until "Toxiproxy API" 30 curl -fsS "http://$TOXI_IP:8474/version" >/dev/null
@@ -156,20 +177,24 @@ set_all_proxies() { local name; for name in "$FED_AB" "$DISC_AB" "$FED_BA" "$DIS
 
 add_latency() {
   curl -fsS -X POST -H 'Content-Type: application/json' "http://$TOXI_IP:8474/proxies/$1/toxics" \
-    --data '{"name":"inflight","type":"latency","stream":"downstream","toxicity":1,"attributes":{"latency":20000,"jitter":0}}' >/dev/null
+    --data '{"name":"inflight","type":"latency","stream":"downstream","toxicity":1,"attributes":{"latency":60000,"jitter":0}}' >/dev/null
 }
 
 remove_latency() { curl -fsS -X DELETE "http://$TOXI_IP:8474/proxies/$1/toxics/inflight" >/dev/null; }
 
-proxy_received_bytes() {
+proxy_received_downstream_bytes() {
   curl -fsS "http://$TOXI_IP:8474/metrics" | awk -v proxy="$1" '
-    /received_bytes/ && index($0,"proxy=\"" proxy "\"") {v=$NF+0; sum+=v; found=1}
+    /toxiproxy_proxy_received_bytes_total/ &&
+      index($0,"proxy=\"" proxy "\"") &&
+      index($0,"direction=\"downstream\"") {
+        v=$NF+0; sum+=v; found=1
+      }
     END {if(!found) exit 2; printf "%.0f\n",sum}'
 }
 
 proxy_activity_increased() {
   local current
-  current="$(proxy_received_bytes "$1")" || return 1
+  current="$(proxy_received_downstream_bytes "$1")" || return 1
   (( current > $2 ))
 }
 
@@ -521,9 +546,11 @@ scenario_trust_expiry() {
 }
 
 scenario_inflight_withdrawal() {
-  local fed_before disc_before
-  fed_before="$(proxy_received_bytes "$FED_AB")"; disc_before="$(proxy_received_bytes "$DISC_AB")"
+  local fed_before disc_before fault_started
+  fed_before="$(proxy_received_downstream_bytes "$FED_AB")"
+  disc_before="$(proxy_received_downstream_bytes "$DISC_AB")"
   add_latency "$FED_AB"; add_latency "$DISC_AB"
+  fault_started=$SECONDS
   wait_until "federation poll in flight" 20 proxy_activity_increased "$FED_AB" "$fed_before"
   wait_until "discovery poll in flight" 20 proxy_activity_increased "$DISC_AB" "$disc_before"
   local local_bundle
@@ -531,8 +558,15 @@ scenario_inflight_withdrawal() {
   apply_mesh_config "$CONTEXT_A" cluster-a "$TD_A" echo-a region-a "$local_bundle" ""
   signal_reload "$CONTEXT_A"
   wait_until "withdrawn RemoteCluster accepted" 40 no_configured_state "$CONTEXT_A" "$JWT_A"
+  (( SECONDS - fault_started < 50 )) || {
+    echo "withdrawal did not retire the generation before the delayed responses could complete" >&2
+    return 1
+  }
   remove_latency "$FED_AB"; remove_latency "$DISC_AB"
-  local deadline=$((SECONDS + 28))
+  # Removing a toxic does not have to wake a delay already sleeping inside the
+  # proxy. Observe longer than the full injected delay so both pre-withdrawal
+  # responses have time to arrive and attempt their retired-generation writes.
+  local deadline=$((SECONDS + 68))
   while (( SECONDS < deadline )); do
     no_configured_state "$CONTEXT_A" "$JWT_A" || { echo "retired poll generation reinstalled state" >&2; return 1; }
     sleep 1
@@ -544,7 +578,7 @@ scenario_inflight_withdrawal() {
   fi
   admin_json "$CONTEXT_A" "$JWT_A" > "$RESULTS_DIR/poller.withdrawal.inflight_generation_retired.json"
   record multicluster_poller.withdrawal.inflight_generation_retired pass "withdrawal-accepted-after-observed-inflight-bytes" "poller.withdrawal.inflight_generation_retired.{json,prom}"
-  record multicluster_poller.withdrawal.retired_state_not_reinstalled pass "empty-for-28s-after-fault-release" "poller.withdrawal.inflight_generation_retired.json"
+  record multicluster_poller.withdrawal.retired_state_not_reinstalled pass "empty-beyond-full-delayed-response-window" "poller.withdrawal.inflight_generation_retired.json"
 }
 
 collect_diagnostics() {

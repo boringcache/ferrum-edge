@@ -301,10 +301,11 @@ spec:
               valueFrom:
                 secretKeyRef: {name: poller-secrets, key: admin-jwt-secret}
             - {name: FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS, value: "2"}
-            - {name: FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS, value: "3"}
+            - {name: FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS, value: "90"}
             - {name: FERRUM_MESH_FEDERATION_MAX_STALE_SECONDS, value: "12"}
             - {name: FERRUM_MESH_FEDERATION_FAIL_OPEN, value: "false"}
             - {name: FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS, value: "2"}
+            - {name: FERRUM_MESH_REMOTE_DISCOVERY_POLL_TIMEOUT_SECONDS, value: "90"}
             - {name: FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS, value: "8"}
             - {name: FERRUM_MESH_LOCALITY_LB_STRICT, value: "true"}
             - {name: FERRUM_TLS_CA_BUNDLE_PATH, value: /transport/ca.pem}

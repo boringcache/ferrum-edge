@@ -142,8 +142,11 @@ cluster audience; federation uses the same verified private CA. The test-only
 stale windows are 8 seconds for endpoints and 12 seconds for trust.
 
 The required `multicluster_poller.*` evidence names every retention, expiry,
-recovery, metric-parity, and in-flight-withdrawal boundary. Conditions are
-actively polled with bounded deadlines. The fixture refuses shared cluster or
+recovery, metric-parity, and in-flight-withdrawal boundary. For withdrawal, the
+fixture observes downstream response bytes behind a 60-second delay, retires
+the generation before that delay can complete, then watches beyond the full
+delay window for forbidden state reinstallation. Conditions are actively
+polled with bounded deadlines. The fixture refuses shared cluster or
 fault-container names, and GitHub-hosted runs include `run_id`/`run_attempt` in
 all names. Diagnostics omit Secrets and ConfigMaps, redact proxy upstreams,
 and retain only admin summaries, metrics, events, and bounded logs.
