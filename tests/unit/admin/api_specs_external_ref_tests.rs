@@ -121,6 +121,37 @@ fn spawn_raw_http_response(response: Vec<u8>) -> (u16, std::thread::JoinHandle<(
     (port, server)
 }
 
+/// Accept one request and hold the socket open without writing a response.
+///
+/// The accepted stream is handed back through `stalled` so the caller owns
+/// when it is dropped. The fixture thread must not block on peer FIN: a
+/// cancelled reqwest fetch can leave the TCP session open long enough for an
+/// unbounded second `read` + `join` to hang under coverage instrumentation.
+fn spawn_stalled_http_peer() -> (
+    u16,
+    std::sync::mpsc::Receiver<std::net::TcpStream>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled HTTP fixture");
+    let port = listener
+        .local_addr()
+        .expect("stalled HTTP fixture address")
+        .port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request);
+        let _ = tx.send(stream);
+    });
+    (port, rx, server)
+}
+
 #[test]
 fn absent_policy_keeps_external_refs_unsupported() {
     let spec = format!(
@@ -1391,21 +1422,7 @@ async fn absent_response_content_type_uses_bounded_format_detection() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn total_deadline_covers_response_io() {
-    use std::io::Read;
-    use std::net::TcpListener;
-    use std::thread;
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut request = [0u8; 1024];
-            let _ = stream.read(&mut request);
-            // Never produce a response. The client must stop waiting at its
-            // own total deadline; the second read returns when it closes.
-            let _ = stream.read(&mut request);
-        }
-    });
+    let (port, stalled_rx, server) = spawn_stalled_http_peer();
     let mut process = process_enabled(None);
     process.request_timeout = Duration::from_secs(1);
     process.total_timeout = Duration::from_millis(30);
@@ -1413,6 +1430,12 @@ async fn total_deadline_covers_response_io() {
     let error = load_production_http(format!("http://127.0.0.1:{port}/slow"), process)
         .await
         .expect_err("total timeout must cover request and response I/O");
+    // Reclaim the stalled peer only after the client has fail-closed so the
+    // open, non-responding connection covered the full total deadline. Taking
+    // the stream here also finishes the fixture thread without waiting on FIN.
+    let _stalled = stalled_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("stalled fixture must accept the timed-out request");
     server.join().expect("deadline fixture thread");
     assert!(error.to_string().contains("timed out") || error.to_string().contains("timeout"));
 }
