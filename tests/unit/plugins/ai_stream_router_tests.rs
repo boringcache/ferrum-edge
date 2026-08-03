@@ -6667,6 +6667,64 @@ async fn test_gemini_rejects_unrepresentable_message_content_at_claim() {
         other => panic!("mixed text+image must reject: {other:?}"),
     }
 
+    // Closed text-part shape: extra/unknown fields must not silently drop.
+    let extra_fields = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "safe",
+                "image_url": {"url": "https://example.invalid/extra.png"}
+            }]
+        }]
+    });
+    let mut ctx = post_ctx(&extra_fields);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("invalid_request_error"), "{body}");
+            assert!(
+                body.contains("Gemini-representable") || body.contains("content"),
+                "{body}"
+            );
+            assert!(
+                !body.contains("example.invalid"),
+                "must not echo media urls from extra fields: {body}"
+            );
+        }
+        other => panic!("extra-field text part must reject: {other:?}"),
+    }
+
+    // Non-object array members fail closed.
+    let non_object = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": ["not-an-object", 7]
+        }]
+    });
+    let mut ctx = post_ctx(&non_object);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("invalid_request_error"), "{body}");
+            assert!(
+                body.contains("Gemini-representable") || body.contains("content"),
+                "{body}"
+            );
+        }
+        other => panic!("non-object content part must reject: {other:?}"),
+    }
+
     // Malformed text part (non-string text) fails closed.
     let malformed = json!({
         "model": "gemini-1.5-flash",
@@ -6716,6 +6774,55 @@ async fn test_gemini_rejects_unrepresentable_message_content_at_claim() {
             }
             other => panic!("{role} non-text must reject: {other:?}"),
         }
+    }
+
+    // System / developer null content must reject (string-or-text-parts only).
+    for role in ["system", "developer"] {
+        let body = json!({
+            "model": "gemini-1.5-flash",
+            "stream": true,
+            "messages": [
+                {"role": role, "content": null},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400, "{role}");
+                assert!(body.contains("invalid_request_error"), "{role}: {body}");
+                assert!(
+                    body.contains("content") || body.contains("string") || body.contains("text"),
+                    "{role}: {body}"
+                );
+            }
+            other => panic!("{role} null content must reject: {other:?}"),
+        }
+    }
+
+    // User null remains explicit and fail-closed.
+    let user_null = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": null}]
+    });
+    let mut ctx = post_ctx(&user_null);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("invalid_request_error"), "{body}");
+            assert!(
+                body.contains("content") || body.contains("string") || body.contains("text"),
+                "{body}"
+            );
+        }
+        other => panic!("user null content must reject: {other:?}"),
     }
 
     // Intentional assistant null content with tool_calls remains representable.

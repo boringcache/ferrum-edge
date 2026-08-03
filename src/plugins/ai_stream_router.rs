@@ -64,8 +64,11 @@
 //!   Gemini/`streamGenerateContent` (Vertex-compatible) request body; native
 //!   Gemini SSE (`alt=sse`) and Vertex-compatible JSON array / object streams
 //!   are normalized to OpenAI `chat.completion.chunk` SSE. Message content is
-//!   closed-shape at claim (string or text-parts array only; mixed/non-text/
-//!   malformed parts reject with OpenAI-shaped `400`). Content/role deltas,
+//!   closed-shape at claim (string or array of text-part objects with exactly
+//!   `type` and `text`; mixed/extra/unknown fields, non-object members,
+//!   non-text/malformed parts, and null system/developer/user content reject
+//!   with OpenAI-shaped `400`). Assistant null/empty content is preserved only
+//!   with a valid `tool_calls` or legacy `function_call`. Content/role deltas,
 //!   multi-candidate indexes, finish/terminal state, usage metadata, safety /
 //!   prompt blocks, function calls + args, and provider error envelopes are
 //!   mapped under the same bounded fail-closed policy as Anthropic. Every
@@ -1118,30 +1121,38 @@ fn flatten_content_text(content: &Value) -> String {
 
 /// Closed Gemini-representable OpenAI message `content`.
 ///
-/// Only a string or a closed array of valid text parts may be translated.
-/// Mixed text-plus-image/audio/unknown parts, malformed text parts, and
-/// non-array/non-string shapes fail closed rather than being silently reduced
-/// by [`flatten_content_text`]. Null content yields an empty string so callers
-/// can preserve intentional assistant null/empty content when tool calls are
-/// present.
+/// Only a string or a closed array of text-part objects with exactly `type` and
+/// `text` may be translated. Mixed text-plus-image/audio/unknown parts, extra
+/// or unknown fields on a text part, non-object array members, malformed text
+/// parts, null content, and non-array/non-string shapes fail closed rather than
+/// being silently reduced by [`flatten_content_text`]. Callers that intentionally
+/// allow assistant null/empty content when a valid `tool_calls` or legacy
+/// `function_call` is present must handle that null case before calling this
+/// helper.
 fn gemini_message_content_text(content: &Value) -> Result<String, String> {
     if let Some(text) = content.as_str() {
         return Ok(text.to_string());
     }
     if content.is_null() {
-        return Ok(String::new());
+        return Err("content must be a string or text-parts array".to_string());
     }
     let parts = content
         .as_array()
         .ok_or_else(|| "content must be a string or text-parts array".to_string())?;
     let mut out = String::new();
     for (index, part) in parts.iter().enumerate() {
-        if part.get("type").and_then(Value::as_str) != Some("text") {
+        let Some(object) = part.as_object() else {
+            return Err(format!(
+                "content[{index}] is not a Gemini-representable text part"
+            ));
+        };
+        // Closed claim shape: exactly `{ "type": "text", "text": "..." }`.
+        if object.len() != 2 || object.get("type").and_then(Value::as_str) != Some("text") {
             return Err(format!(
                 "content[{index}] is not a Gemini-representable text part"
             ));
         }
-        let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+        let text = object.get("text").and_then(Value::as_str).ok_or_else(|| {
             format!("content[{index}] text part is malformed")
         })?;
         if text.is_empty() {
@@ -1978,9 +1989,21 @@ fn validate_gemini_translation(openai_body: &Value) -> Result<(), String> {
         if let Some(call) = legacy_call {
             pending_legacy_by_name.insert(call.name.clone(), call.id.clone());
         }
-        let text = gemini_message_content_text(&message["content"])
-            .map_err(|error| format!("messages[{message_index}] {error}"))?;
         let has_tool_representation = !tool_calls.is_empty() || had_legacy;
+        // Null is fail-closed for system/developer/user. Assistant null/empty is
+        // intentional only when a valid modern or legacy tool representation exists.
+        let text = if message["content"].is_null() {
+            if role == "assistant" && has_tool_representation {
+                String::new()
+            } else {
+                return Err(format!(
+                    "messages[{message_index}] content must be a string or text-parts array"
+                ));
+            }
+        } else {
+            gemini_message_content_text(&message["content"])
+                .map_err(|error| format!("messages[{message_index}] {error}"))?
+        };
         if role == "assistant" && text.is_empty() && !has_tool_representation {
             return Err(format!(
                 "messages[{message_index}] has no Gemini-representable content"
@@ -2208,12 +2231,6 @@ fn translate_to_gemini(openai_body: &Value) -> Result<Vec<u8>, String> {
         }
 
         let native_role = if role == "assistant" { "model" } else { role };
-        let text = gemini_message_content_text(&message["content"])
-            .map_err(|error| format!("messages[{message_index}] {error}"))?;
-        let mut parts = Vec::new();
-        if !text.is_empty() {
-            parts.push(json!({ "text": text }));
-        }
         let tool_calls = if role == "assistant" {
             parse_openai_tool_calls(message, message_index)?
         } else {
@@ -2224,6 +2241,23 @@ fn translate_to_gemini(openai_body: &Value) -> Result<Vec<u8>, String> {
         } else {
             None
         };
+        let has_tool_representation = !tool_calls.is_empty() || legacy_call.is_some();
+        let text = if message["content"].is_null() {
+            if role == "assistant" && has_tool_representation {
+                String::new()
+            } else {
+                return Err(format!(
+                    "messages[{message_index}] content must be a string or text-parts array"
+                ));
+            }
+        } else {
+            gemini_message_content_text(&message["content"])
+                .map_err(|error| format!("messages[{message_index}] {error}"))?
+        };
+        let mut parts = Vec::new();
+        if !text.is_empty() {
+            parts.push(json!({ "text": text }));
+        }
         for call in tool_calls {
             tool_names_by_id.insert(call.id.clone(), call.name.clone());
             parts.push(json!({
