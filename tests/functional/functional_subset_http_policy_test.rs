@@ -467,20 +467,8 @@ fn assert_subset_preparation(config: &GatewayConfig, expected: ExpectedSubsetPre
     );
 
     for (subset, expected_policy, expected_port, expected_retries, expected_pending) in [
-        (
-            "v1",
-            expected.v1_h2_policy,
-            expected.v1_port,
-            1,
-            1,
-        ),
-        (
-            "v2",
-            expected.v2_h2_policy,
-            expected.v2_port,
-            3,
-            50,
-        ),
+        ("v1", expected.v1_h2_policy, expected.v1_port, 1, 1),
+        ("v2", expected.v2_h2_policy, expected.v2_port, 3, 50),
     ] {
         let proxy = config
             .proxies
