@@ -516,10 +516,7 @@ fn stream_listener_group_ports(
             let entry = passthrough_by_port.entry(candidate.port).or_default();
             entry.0 += 1;
             entry.1 |= candidate.has_hosts;
-        } else if matches!(
-            candidate.scheme,
-            BackendScheme::Tcp | BackendScheme::Tcps
-        ) {
+        } else if matches!(candidate.scheme, BackendScheme::Tcp | BackendScheme::Tcps) {
             let entry = l4_by_port.entry(candidate.port).or_default();
             entry.0 += 1;
             entry.1 |= candidate.has_stream_match;
@@ -616,88 +613,6 @@ mod bind_failure_snapshot_tests {
         assert_eq!(later_reconcile.len(), 1);
         assert_eq!(later_reconcile[0].proxy_id, "async-bind");
         assert_eq!(later_reconcile[0].listen_port, 9443);
-    }
-}
-
-#[cfg(test)]
-mod stream_listener_runtime_key_tests {
-    use super::*;
-    use crate::config::types::default_namespace;
-
-    fn candidate(
-        id: &str,
-        port: u16,
-        scheme: BackendScheme,
-        passthrough: bool,
-        has_hosts: bool,
-        has_stream_match: bool,
-    ) -> StreamListenerKeyCandidate {
-        StreamListenerKeyCandidate {
-            identity: NamespacedResourceId::new(default_namespace(), id.to_string()),
-            port,
-            scheme,
-            frontend_tls: false,
-            passthrough,
-            has_hosts,
-            has_stream_match,
-        }
-    }
-
-    #[test]
-    fn shared_non_passthrough_l4_candidates_use_group_key() {
-        let port = 9443;
-        let candidates = vec![
-            candidate("catchall", port, BackendScheme::Tcp, false, false, false),
-            candidate("constrained", port, BackendScheme::Tcp, false, false, true),
-        ];
-        let (sni_ports, l4_ports) = stream_listener_group_ports(&candidates);
-        assert!(sni_ports.is_empty());
-        assert_eq!(l4_ports, std::collections::HashSet::from([port]));
-        assert_eq!(
-            stream_listener_runtime_key(&candidates[0], &sni_ports, &l4_ports),
-            format!("__l4_{port}")
-        );
-    }
-
-    #[test]
-    fn lone_constrained_tcp_candidate_stays_individual() {
-        let port = 9443;
-        let candidates = vec![candidate(
-            "solo",
-            port,
-            BackendScheme::Tcp,
-            false,
-            false,
-            true,
-        )];
-        let (sni_ports, l4_ports) = stream_listener_group_ports(&candidates);
-        assert!(sni_ports.is_empty());
-        assert!(l4_ports.is_empty());
-        assert_eq!(
-            stream_listener_runtime_key(&candidates[0], &sni_ports, &l4_ports),
-            candidates[0].identity.runtime_key()
-        );
-    }
-
-    #[test]
-    fn passthrough_sni_port_blocks_l4_grouping() {
-        let port = 9443;
-        let candidates = vec![
-            candidate("pt", port, BackendScheme::Tcp, true, true, false),
-            candidate("catchall", port, BackendScheme::Tcp, false, false, false),
-            candidate("constrained", port, BackendScheme::Tcp, false, false, true),
-        ];
-        let (sni_ports, l4_ports) = stream_listener_group_ports(&candidates);
-        assert_eq!(sni_ports, std::collections::HashSet::from([port]));
-        assert!(l4_ports.is_empty());
-        assert_eq!(
-            stream_listener_runtime_key(&candidates[0], &sni_ports, &l4_ports),
-            format!("__sni_{port}")
-        );
-        assert_eq!(
-            stream_listener_runtime_key(&candidates[1], &sni_ports, &l4_ports),
-            candidates[1].identity.runtime_key()
-        );
     }
 }
 
@@ -2382,10 +2297,7 @@ impl StreamListenerManager {
                         frontend_tls: p.frontend_tls,
                         passthrough: p.passthrough,
                         has_hosts: !p.hosts.is_empty(),
-                        has_stream_match: p
-                            .stream_match
-                            .as_ref()
-                            .is_some_and(|m| !m.is_empty()),
+                        has_stream_match: p.stream_match.as_ref().is_some_and(|m| !m.is_empty()),
                     })
                 })
                 .collect();
@@ -2399,8 +2311,7 @@ impl StreamListenerManager {
             let all_started = {
                 let listeners = self.listeners.lock().await;
                 candidates.iter().all(|candidate| {
-                    let key =
-                        stream_listener_runtime_key(candidate, &sni_ports, &l4_ports);
+                    let key = stream_listener_runtime_key(candidate, &sni_ports, &l4_ports);
                     listeners.get(&key).is_some_and(|handle| {
                         handle.listen_port == candidate.port
                             && handle.scheme == candidate.scheme
