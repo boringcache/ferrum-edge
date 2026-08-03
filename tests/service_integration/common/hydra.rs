@@ -822,8 +822,8 @@ async fn read_http_request(
     };
 
     let header_bytes = &buf[..header_end];
-    let header_text = std::str::from_utf8(header_bytes)
-        .map_err(|_| "HTTP headers are not valid UTF-8")?;
+    let header_text =
+        std::str::from_utf8(header_bytes).map_err(|_| "HTTP headers are not valid UTF-8")?;
     let mut lines = header_text.split("\r\n");
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
@@ -845,9 +845,7 @@ async fn read_http_request(
         let name_l = name.trim().to_ascii_lowercase();
         let value = value.trim().to_string();
         if name_l == "content-length" {
-            let len: usize = value
-                .parse()
-                .map_err(|_| "invalid Content-Length")?;
+            let len: usize = value.parse().map_err(|_| "invalid Content-Length")?;
             if len > FACADE_MAX_BODY_BYTES {
                 return Err("HTTP body exceeds facade cap".into());
             }
@@ -936,7 +934,11 @@ async fn handle_introspection_facade_connection(
         }
     };
 
-    if request.method == "GET" && request.path.starts_with("/.well-known/openid-configuration") {
+    if request.method == "GET"
+        && request
+            .path
+            .starts_with("/.well-known/openid-configuration")
+    {
         let upstream = client.get(&public_discovery).send().await?;
         let status = upstream.status().as_u16();
         let mut doc: Value = upstream.json().await?;
@@ -947,14 +949,7 @@ async fn handle_introspection_facade_connection(
             );
         }
         let body = serde_json::to_vec(&doc)?;
-        write_http_response(
-            &mut stream,
-            status,
-            "OK",
-            "application/json",
-            &body,
-        )
-        .await?;
+        write_http_response(&mut stream, status, "OK", "application/json", &body).await?;
         return Ok(());
     }
 
@@ -981,22 +976,12 @@ async fn handle_introspection_facade_connection(
         if let Some(content_type) = request.headers.get("content-type") {
             forward = forward.header("content-type", content_type);
         } else {
-            forward = forward.header(
-                "content-type",
-                "application/x-www-form-urlencoded",
-            );
+            forward = forward.header("content-type", "application/x-www-form-urlencoded");
         }
         let upstream = forward.body(request.body).send().await?;
         let status = upstream.status().as_u16();
         let resp_body = upstream.bytes().await?;
-        write_http_response(
-            &mut stream,
-            status,
-            "OK",
-            "application/json",
-            &resp_body,
-        )
-        .await?;
+        write_http_response(&mut stream, status, "OK", "application/json", &resp_body).await?;
         return Ok(());
     }
 
@@ -1033,10 +1018,7 @@ async fn handle_token_facade_connection(
     if let Some(content_type) = request.headers.get("content-type") {
         forward = forward.header("content-type", content_type);
     } else {
-        forward = forward.header(
-            "content-type",
-            "application/x-www-form-urlencoded",
-        );
+        forward = forward.header("content-type", "application/x-www-form-urlencoded");
     }
     let upstream = forward.body(request.body.clone()).send().await?;
     let status = upstream.status();
