@@ -61,21 +61,19 @@ pub fn parse_content_codings(header: &str) -> Result<Vec<String>, String> {
             return Err("content-encoding contains an empty coding".to_string());
         }
         if coding.contains(';') {
-            return Err(format!(
-                "content-encoding coding '{coding}' contains unsupported parameters"
-            ));
+            // Fixed-cardinality: never interpolate the offending member.
+            return Err("content-encoding member contains unsupported parameters".to_string());
         }
         if !coding.is_ascii() || !is_http_token(coding) {
-            return Err(format!(
-                "content-encoding coding '{coding}' is not a valid HTTP token"
-            ));
+            return Err("content-encoding member is not a valid HTTP token".to_string());
         }
         let coding = coding.to_ascii_lowercase();
         let canonical = match coding.as_str() {
             "gzip" | "x-gzip" => "gzip".to_string(),
             "br" => "br".to_string(),
             "identity" => "identity".to_string(),
-            _ => return Err(format!("unsupported content-encoding '{coding}'")),
+            // Fixed-cardinality: never interpolate the unsupported token.
+            _ => return Err("unsupported content-encoding coding".to_string()),
         };
         codings.push(canonical);
     }
@@ -135,7 +133,7 @@ pub fn decode_content_encoding<'a>(
                 limits.max_decoded_bytes,
                 limits.max_amplification_ratio,
             )?,
-            _ => return Err(format!("unsupported content-encoding '{coding}'")),
+            _ => return Err("unsupported content-encoding coding".to_string()),
         };
         enforce_amplification(
             layer_input_len,
@@ -272,9 +270,12 @@ fn read_bounded(
     let mut decoded = Vec::with_capacity(8192.min(max_bytes));
     let mut chunk = [0u8; 8192];
     loop {
+        // Fixed-cardinality: never interpolate `io::Error` Display text (may be
+        // unbounded or implementation-defined). Coding is only a known token
+        // from this module's callers (`gzip` / `br`).
         let read = reader
             .read(&mut chunk)
-            .map_err(|error| format!("{coding} decompression failed: {error}"))?;
+            .map_err(|_| format!("{coding} decompression failed"))?;
         if read == 0 {
             return Ok(decoded);
         }
