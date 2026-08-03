@@ -758,8 +758,9 @@ impl AcceptFirstByteState {
     /// was in progress.
     pub const fn arm_after_enrollment(self, capture_confirmed: bool) -> Option<Self> {
         match self.phase {
-            ACCEPT_FIRST_BYTE_PHASE_ENROLLING_CONFIRMED
-            | ACCEPT_FIRST_BYTE_PHASE_CONFIRMED => Some(Self::confirmed(self.accepted_ns)),
+            ACCEPT_FIRST_BYTE_PHASE_ENROLLING_CONFIRMED | ACCEPT_FIRST_BYTE_PHASE_CONFIRMED => {
+                Some(Self::confirmed(self.accepted_ns))
+            }
             ACCEPT_FIRST_BYTE_PHASE_ENROLLING | ACCEPT_FIRST_BYTE_PHASE_PENDING => {
                 if capture_confirmed {
                     Some(Self::confirmed(self.accepted_ns))
