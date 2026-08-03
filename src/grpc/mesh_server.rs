@@ -390,10 +390,6 @@ impl MeshGrpcServer {
         )
     }
 
-    pub fn drift_registry(&self) -> Arc<MeshSliceDriftRegistry> {
-        self.drift.clone()
-    }
-
     fn filter_config_for_request(
         &self,
         config: &GatewayConfig,
@@ -554,8 +550,7 @@ impl MeshGrpcServer {
         registry: &MeshNodeRegistry,
     ) {
         if let Some(drift) = registry.drift()
-            && let Err(error) =
-                drift.reconcile_disconnected_desired(config.as_ref(), Utc::now())
+            && let Err(error) = drift.reconcile_disconnected_desired(config.as_ref(), Utc::now())
         {
             warn!(
                 field = error.field_name(),
@@ -574,8 +569,7 @@ impl MeshGrpcServer {
         registry: &MeshNodeRegistry,
     ) {
         if let Some(drift) = registry.drift()
-            && let Err(error) =
-                drift.reconcile_disconnected_desired(config.as_ref(), Utc::now())
+            && let Err(error) = drift.reconcile_disconnected_desired(config.as_ref(), Utc::now())
         {
             warn!(
                 field = error.field_name(),

@@ -64,6 +64,13 @@ pub const MESH_SLICE_DRIFT_MAX_REASON_BYTES: usize = 64;
 /// error text may contain credentials and is deliberately discarded.
 pub const MESH_SLICE_DRIFT_REJECTION_REASON: &str = "reported_rejection";
 
+// Both retained rejection labels are compile-time bounded. Keeping this as a
+// real use of the public limit also prevents the binary's private module graph
+// from treating the integration-test contract constant as dead code.
+const _: () =
+    assert!(MESH_SLICE_DRIFT_REJECTION_REASON.len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
+const _: () = assert!("unspecified".len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
+
 /// Bound the subscription selector retained for disconnected projection.
 const MESH_SLICE_DRIFT_MAX_PROJECTION_LABELS: usize = 256;
 const MESH_SLICE_DRIFT_MAX_PROJECTION_NAMESPACES: usize = 256;
@@ -321,6 +328,9 @@ impl MeshSliceDriftRegistry {
     /// Construct a smaller bounded registry for deterministic concurrency
     /// coverage. Production uses [`Self::new`] and the 4096-entry hard cap.
     #[doc(hidden)]
+    // `main.rs` compiles a private copy of the module graph while external
+    // integration tests consume the library copy of this public helper.
+    #[allow(dead_code)]
     pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
             state: Mutex::new(RegistryState::default()),
@@ -336,6 +346,8 @@ impl MeshSliceDriftRegistry {
     /// Open or replace a local mesh subscription session without retaining a
     /// projection. Intended for focused registry callers; production
     /// MeshSubscribe uses [`Self::open_projected_session`].
+    // Public integration-test helper; see `with_max_entries`.
+    #[allow(dead_code)]
     pub fn open_session(
         &self,
         node_id: &str,
@@ -448,6 +460,8 @@ impl MeshSliceDriftRegistry {
 
     /// Record a sent version for focused registry tests/callers that do not
     /// retain a production projection.
+    // Public integration-test helper; see `with_max_entries`.
+    #[allow(dead_code)]
     pub fn record_sent(
         &self,
         node_id: &str,
@@ -553,6 +567,8 @@ impl MeshSliceDriftRegistry {
     }
 
     /// Mark a matching opaque session disconnected; retain until reaper expiry.
+    // Public integration-test helper; see `with_max_entries`.
+    #[allow(dead_code)]
     pub fn mark_disconnected(&self, node_id: &str, session_token: &str, now: DateTime<Utc>) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -625,14 +641,6 @@ impl MeshSliceDriftRegistry {
     /// Lock-free immutable snapshot for admin / metrics.
     pub fn snapshot(&self) -> Arc<MeshSliceDriftSnapshot> {
         self.snapshot.load_full()
-    }
-
-    pub fn len(&self) -> usize {
-        self.snapshot.load().summary.tracked
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     fn lock_state(
@@ -1034,6 +1042,9 @@ fn append_mesh_slice_drift_summary_metrics(
 /// summary. Production scrapes load the process-global summary published with
 /// each registry snapshot.
 #[doc(hidden)]
+// Public integration-test helper; the production path calls the private
+// append function directly through `render_mesh_slice_drift_metrics`.
+#[allow(dead_code)]
 pub fn render_mesh_slice_drift_summary_metrics(
     output: &mut String,
     summary: &MeshSliceDriftSummary,
