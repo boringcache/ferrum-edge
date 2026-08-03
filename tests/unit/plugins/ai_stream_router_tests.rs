@@ -7271,10 +7271,9 @@ async fn test_gemini_function_call_and_tool_choice_none_fail_closed() {
 
 #[tokio::test]
 async fn test_gemini_provider_error_and_premature_eof_fail_closed() {
-    let err = concat!(
-        "data: {\"error\":{\"code\":400,\"message\":\"",
-        &"A".repeat(400),
-        "\",\"status\":\"INVALID_ARGUMENT\"}}\n\n",
+    let err = format!(
+        "data: {{\"error\":{{\"code\":400,\"message\":\"{}\",\"status\":\"INVALID_ARGUMENT\"}}}}\n\n",
+        "A".repeat(400),
     );
     let out = run_gemini_normalizer(4096, &err, "text/event-stream").await;
     assert!(out.contains("upstream_error"), "{out}");
@@ -7348,7 +7347,7 @@ async fn test_gemini_reload_config_still_selects_provider() {
         reloaded.before_proxy(&mut ctx2, &mut headers2).await,
         PluginResult::Continue
     ));
-    assert!(ctx2.ai_stream_router_claim.is_some());
+    assert!(ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(&ctx2));
 }
 
 fn gemini_lookup_tools() -> Value {
