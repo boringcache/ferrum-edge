@@ -65,7 +65,7 @@ fn service_in(namespace: &str, name: &str) -> MeshService {
             target_port: None,
         }],
         workloads: vec![WorkloadRef {
-            spiffe_id: SpiffeId::new(&format!("spiffe://{TRUST_DOMAIN}/ns/{namespace}/sa/{name}"))
+            spiffe_id: SpiffeId::new(format!("spiffe://{TRUST_DOMAIN}/ns/{namespace}/sa/{name}"))
                 .expect("valid spiffe id"),
         }],
         protocol_overrides: HashMap::new(),
@@ -74,7 +74,7 @@ fn service_in(namespace: &str, name: &str) -> MeshService {
 
 fn workload_in(namespace: &str, name: &str) -> Workload {
     Workload {
-        spiffe_id: SpiffeId::new(&format!("spiffe://{TRUST_DOMAIN}/ns/{namespace}/sa/{name}"))
+        spiffe_id: SpiffeId::new(format!("spiffe://{TRUST_DOMAIN}/ns/{namespace}/sa/{name}"))
             .expect("valid spiffe id"),
         selector: Default::default(),
         service_name: name.to_string(),
