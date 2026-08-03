@@ -3324,17 +3324,6 @@ fn apply_cni_gc(
         .map(|a| (a.container_id.clone(), a.ifname.clone()))
         .collect();
     let prefix = pod_state_key_prefix(pod_states);
-    if FAILED_POD_ENROLLMENT_ATTEMPTS.iter().any(|entry| {
-        entry
-            .key()
-            .strip_prefix(&prefix)
-            .is_some_and(|pod_uid| !cni_owned_claims_for_pod(pod_states, pod_uid).is_empty())
-    }) {
-        return CniRpcResponse::Error {
-            reason: "gc deferred while CNI-owned pod enrollment is unresolved; retry".to_string(),
-        };
-    }
-
     let mut stale_claims_by_uid: HashMap<String, Vec<String>> = HashMap::new();
     for entry in CNI_OWNED_ATTACHMENTS.iter() {
         if !entry.key().starts_with(&prefix) {
@@ -3356,6 +3345,14 @@ fn apply_cni_gc(
     let mut incomplete = 0usize;
     let mut teardown_uids = Vec::new();
     for (pod_uid, stale_claim_keys) in &stale_claims_by_uid {
+        if has_failed_pod_enrollment_attempt(&pod_state_key(pod_states, pod_uid)) {
+            // This UID's refresh/replacement evidence is unresolved, so its
+            // persisted cleanup snapshot cannot yet authorize teardown. Fence
+            // only the affected UID and continue removing independent stale
+            // attachments as required by the CNI GC contract.
+            incomplete += stale_claim_keys.len();
+            continue;
+        }
         let all_claims = cni_owned_claims_for_pod(pod_states, pod_uid);
         let stale_set = stale_claim_keys
             .iter()
@@ -15110,6 +15107,116 @@ mod tests {
     }
 
     #[test]
+    fn apply_cni_gc_fences_only_failed_uid_and_cleans_independent_stale_uid() {
+        use crate::cni::ownership::reset_cni_ownership_store_for_tests;
+        use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
+
+        let _cni_guard = lock_cni_ownership_tests();
+        reset_cni_ownership_store_for_tests();
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+
+        let fenced_uid = "fenced-stale-uid";
+        let removable_uid = "removable-stale-uid";
+        pod_states.insert(fenced_uid.to_string(), enrolled_pod_state(fenced_uid));
+        pod_states.insert(removable_uid.to_string(), enrolled_pod_state(removable_uid));
+        remember_cni_owned_attachment(
+            &pod_states,
+            fenced_uid,
+            "ferrum-mesh",
+            "ctr-fenced",
+            "eth0",
+        )
+        .expect("remember fenced stale claim");
+        remember_cni_owned_attachment(
+            &pod_states,
+            removable_uid,
+            "ferrum-mesh",
+            "ctr-removable",
+            "eth0",
+        )
+        .expect("remember removable stale claim");
+
+        let fenced_state_key = pod_state_key(&pod_states, fenced_uid);
+        let fenced_ip = std::net::Ipv4Addr::new(10, 244, 0, 41);
+        remember_failed_pod_enrollment(
+            &fenced_state_key,
+            test_failed_enrollment_signature(fenced_ip, Some("/cg/fenced-stale-uid")),
+            test_retryable_enrollment(fenced_uid, fenced_ip),
+        );
+
+        let response = apply_cni_request(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &CniRpcRequest {
+                verb: RpcVerb::Gc,
+                network_name: "ferrum-mesh".to_string(),
+                pod_namespace: String::new(),
+                pod_name: String::new(),
+                pod_uid: None,
+                container_id: String::new(),
+                ifname: None,
+                netns_path: None,
+                args: HashMap::new(),
+                valid_attachments: Vec::new(),
+            },
+        );
+        match response {
+            CniRpcResponse::Error { reason } => assert!(
+                reason.contains("could not complete cleanup"),
+                "GC must report deferred stale work after continuing: {reason}"
+            ),
+            other => panic!("GC with a fenced stale UID must report incomplete work: {other:?}"),
+        }
+        assert!(
+            !pod_states.contains_key(removable_uid),
+            "independent stale UID must be removed despite another UID's refresh failure"
+        );
+        assert!(
+            backend.detached_pods.contains(&removable_uid.to_string()),
+            "independent stale UID must complete backend teardown"
+        );
+        assert!(
+            cni_owned_claims_for_pod(&pod_states, removable_uid).is_empty(),
+            "independent stale UID ownership must clear"
+        );
+        assert!(
+            pod_states.contains_key(fenced_uid),
+            "failed-refresh UID must remain fenced"
+        );
+        assert!(
+            !backend.detached_pods.contains(&fenced_uid.to_string()),
+            "failed-refresh UID must not be torn down from unresolved evidence"
+        );
+        assert!(
+            !cni_owned_claims_for_pod(&pod_states, fenced_uid).is_empty(),
+            "failed-refresh UID ownership must remain for retry"
+        );
+
+        forget_failed_pod_enrollment(&fenced_state_key);
+        CNI_OWNED_ATTACHMENTS.remove(&cni_owned_attachment_key(
+            &pod_states,
+            "ferrum-mesh",
+            "ctr-fenced",
+            "eth0",
+        ));
+    }
+
+    #[test]
     fn apply_cni_gc_rejects_malformed_valid_attachments() {
         use crate::cni::ownership::reset_cni_ownership_store_for_tests;
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
@@ -15480,28 +15587,35 @@ mod tests {
     }
 
     #[test]
-    fn cni_ownership_rejected_durable_state_fails_gc_closed() {
+    fn cni_ownership_inconsistent_detached_snapshot_fails_gc_closed() {
         use crate::cni::ownership::reset_cni_ownership_store_for_tests;
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
 
         let _cni_guard = lock_cni_ownership_tests();
         let dir = tempfile::tempdir().expect("tempdir");
         let store_path = dir.path().join("cni-owned-attachments.v2");
-        std::fs::write(
-            &store_path,
-            br#"{"version":2,"attachments":[{"container_id":"../escape","ifname":"eth0","pod_uid":"uid","cleanup":{"attached":true}}]}"#,
-        )
-        .expect("seed hostile");
-        configure_cni_ownership_store(Some(store_path));
+        let stale_ip = std::net::Ipv4Addr::new(10, 244, 0, 99);
+        let durable_bytes = br#"{"version":2,"attachments":[{"network_name":"ferrum-mesh","container_id":"ctr-stale","ifname":"eth0","pod_uid":"stale-uid","cleanup":{"attached":false,"pod_ip":"10.244.0.99","include_ports_cgroup_ids":[909]}}]}"#;
+        std::fs::write(&store_path, durable_bytes).expect("seed inconsistent durable state");
+        configure_cni_ownership_store(Some(store_path.clone()));
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let err = rehydrate_cni_owned_attachments(&pod_states).expect_err("reject");
-        assert!(
-            !err.contains("../escape"),
-            "must not echo hostile id: {err}"
-        );
+        assert!(err.contains("invalid"), "expected sanitized rejection: {err}");
         assert!(cni_ownership_store_is_rejected());
 
         let mut backend = MockEbpfBackend::default();
+        backend
+            .update_pod_ip(
+                stale_ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    capture_flags: 0,
+                },
+            )
+            .expect("seed persisted pod IP key");
+        backend
+            .update_pod_include_ports(909, &IncludePortsPolicy::all())
+            .expect("seed persisted cgroup key");
         let metrics = NodeAgentMetrics::default();
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
@@ -15540,6 +15654,21 @@ mod tests {
             }
             other => panic!("expected GC error, got {other:?}"),
         }
+        assert!(
+            backend.pod_ips.contains_key(&stale_ip),
+            "rejected detached snapshot must not authorize skipping persisted pod-IP cleanup"
+        );
+        assert!(
+            backend.include_ports.contains_key(&909),
+            "rejected detached snapshot must not authorize skipping persisted cgroup cleanup"
+        );
+        let retained_durable_bytes =
+            std::fs::read(&store_path).expect("durable ownership remains");
+        assert_eq!(
+            retained_durable_bytes.as_slice(),
+            &durable_bytes[..],
+            "failed GC must not drop the durable ownership document"
+        );
 
         reset_cni_ownership_store_for_tests();
     }

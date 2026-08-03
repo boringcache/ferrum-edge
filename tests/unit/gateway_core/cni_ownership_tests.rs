@@ -80,7 +80,7 @@ fn durable_ownership_round_trip_persists_cleanup_snapshot() {
             ifname: "eth1".into(),
             pod_uid: "pod-uid-2".into(),
             cleanup: DurableCniCleanupSnapshot {
-                attached: false,
+                attached: true,
                 pod_ip: None,
                 pod_ip6: None,
                 include_ports_cgroup_ids: Vec::new(),
@@ -110,6 +110,38 @@ fn durable_ownership_round_trip_persists_cleanup_snapshot() {
 
     configure_cni_ownership_store(Some(path));
     reset_cni_ownership_store_for_tests();
+}
+
+#[test]
+fn inconsistent_detached_cleanup_snapshot_is_rejected_on_decode_and_encode() {
+    let inconsistent = br#"{"version":2,"attachments":[{"network_name":"ferrum-mesh","container_id":"ctr-stale","ifname":"eth0","pod_uid":"pod-uid-stale","cleanup":{"attached":false,"pod_ip":"10.0.0.9","include_ports_cgroup_ids":[11]}}]}"#;
+    let decode_err = parse_durable_cni_ownership_bytes(inconsistent)
+        .expect_err("detached cleanup with persisted resource keys must fail closed");
+    assert!(decode_err.to_string().contains("invalid"));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("inconsistent.v2");
+    let encode_err = store_durable_cni_ownership(
+        &path,
+        &[DurableCniOwnershipRecord {
+            network_name: "ferrum-mesh".into(),
+            container_id: "ctr-stale".into(),
+            ifname: "eth0".into(),
+            pod_uid: "pod-uid-stale".into(),
+            cleanup: DurableCniCleanupSnapshot {
+                attached: false,
+                pod_ip: Some(Ipv4Addr::new(10, 0, 0, 9)),
+                pod_ip6: None,
+                include_ports_cgroup_ids: vec![11],
+                workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
+            },
+        }],
+    )
+    .expect_err("encoder must refuse impossible detached ownership snapshots");
+    assert!(encode_err.to_string().contains("invalid"));
+    assert!(!path.exists(), "rejected snapshot must not become durable");
 }
 
 #[test]

@@ -17,7 +17,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-/// Hard cap on `cni.dev/attachments` entries accepted for one GC call.
+/// Hard cap on `cni.dev/valid-attachments` entries accepted for one GC call.
 /// Large enough for dense nodes; small enough to keep reconciliation bounded.
 pub const MAX_CNI_GC_ATTACHMENTS: usize = 8192;
 
@@ -241,18 +241,33 @@ pub fn ingest_cni_args(raw: &str) -> Result<HashMap<String, String>, CniError> {
         )));
     }
     let mut args = HashMap::new();
-    for token in raw.split(';') {
-        let Some((key, value)) = token.split_once('=') else {
-            continue;
-        };
-        let key = key.trim().to_ascii_uppercase();
-        let value = value.trim();
-        if key.is_empty() {
-            continue;
+    let mut tokens = raw.split(';').peekable();
+    while let Some(token) = tokens.next() {
+        if token.is_empty() {
+            if tokens.peek().is_none() {
+                // Some runtimes emit one harmless trailing delimiter.
+                continue;
+            }
+            return Err(CniError::BadConfig(
+                "CNI_ARGS contains a malformed key-value token".to_string(),
+            ));
         }
-        if key.len() > MAX_CNI_ARG_FIELD_BYTES
+        let Some((raw_key, value)) = token.split_once('=') else {
+            return Err(CniError::BadConfig(
+                "CNI_ARGS contains a malformed key-value token".to_string(),
+            ));
+        };
+        let trimmed_key = raw_key.trim();
+        if raw_key != trimmed_key {
+            return Err(CniError::BadConfig(
+                "CNI_ARGS contains an invalid or oversized field".to_string(),
+            ));
+        }
+        let key = trimmed_key.to_ascii_uppercase();
+        let value = value.trim();
+        if !is_safe_cni_arg_key(&key)
+            || key.len() > MAX_CNI_ARG_FIELD_BYTES
             || value.len() > MAX_CNI_ARG_FIELD_BYTES
-            || key.chars().any(char::is_control)
             || value.chars().any(char::is_control)
         {
             return Err(CniError::BadConfig(
@@ -271,6 +286,13 @@ pub fn ingest_cni_args(raw: &str) -> Result<HashMap<String, String>, CniError> {
         }
     }
     Ok(args)
+}
+
+fn is_safe_cni_arg_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+        })
 }
 
 /// Extracted Kubernetes pod identity from CNI_ARGS.
@@ -337,13 +359,14 @@ pub struct CniNetConfig {
     /// Defaults to `Default` when missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ferrum: Option<FerrumCniOptions>,
-    /// Still-valid attachments supplied on GC (CNI 1.1 `cni.dev/attachments`).
+    /// Still-valid attachments supplied on GC (CNI 1.1
+    /// `cni.dev/valid-attachments`).
     ///
     /// `None` is distinct from an explicitly empty list: the specification
     /// requires the runtime-generated key on GC, and treating omission as an
     /// empty authoritative set would widen cleanup on malformed requests.
     #[serde(
-        rename = "cni.dev/attachments",
+        rename = "cni.dev/valid-attachments",
         default,
         skip_serializing_if = "Option::is_none"
     )]
@@ -390,7 +413,7 @@ impl CniValidAttachment {
 fn validate_attachment_field(field: &str, value: &str) -> Result<(), CniError> {
     if value.is_empty() {
         return Err(CniError::BadConfig(format!(
-            "cni.dev/attachments entry missing {field}"
+            "cni.dev/valid-attachments entry missing {field}"
         )));
     }
     if value.len() > MAX_CNI_ATTACHMENT_FIELD_BYTES {
@@ -463,7 +486,7 @@ pub fn ingest_valid_attachments(
 ) -> Result<Vec<CniValidAttachment>, CniError> {
     if attachments.len() > MAX_CNI_GC_ATTACHMENTS {
         return Err(CniError::BadConfig(format!(
-            "cni.dev/attachments has {} entries; cap is {MAX_CNI_GC_ATTACHMENTS}",
+            "cni.dev/valid-attachments has {} entries; cap is {MAX_CNI_GC_ATTACHMENTS}",
             attachments.len()
         )));
     }
@@ -734,7 +757,7 @@ mod tests {
             "cniVersion": "1.1.0",
             "name": "ferrum-mesh",
             "type": "ferrum-cni",
-            "cni.dev/attachments": [
+            "cni.dev/valid-attachments": [
                 {"containerID": "ctr-alive", "ifname": "eth0"},
                 {"containerID": "ctr-alive", "ifname": "eth0"},
                 {"containerID": "ctr-other", "ifname": "eth1"}

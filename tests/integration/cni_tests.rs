@@ -53,6 +53,24 @@ fn build_request(verb: RpcVerb) -> CniRpcRequest {
     }
 }
 
+fn run_ferrum_cni_gc(stdin_config: serde_json::Value) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
+        .env("CNI_COMMAND", "GC")
+        .env("CNI_PATH", "/opt/cni/bin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferrum-cni");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(stdin_config.to_string().as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait ferrum-cni")
+}
+
 /// Drive one synthetic CNI ADD round-trip: client sends the framed
 /// request, listener task accepts the connection, work item arrives in
 /// the queue, a stub "main loop" replies `Ok`, response wire-encodes
@@ -475,7 +493,7 @@ async fn ferrum_cni_binary_gc_rejects_pre_1_1_version() {
             "cniVersion": "1.0.0",
             "name": "ferrum-mesh-chain",
             "type": "ferrum-cni",
-            "cni.dev/attachments": []
+            "cni.dev/valid-attachments": []
         })
         .to_string();
         let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
@@ -508,33 +526,43 @@ async fn ferrum_cni_binary_gc_rejects_pre_1_1_version() {
     assert_eq!(payload["code"], 1);
 }
 
-/// The CNI 1.1 reserved field is exactly `cni.dev/attachments`. A misspelled
-/// reserved key must not collapse to an authoritative empty set.
+/// Omitting the required CNI 1.1 valid-attachment field must not collapse to an
+/// authoritative empty set.
 #[tokio::test]
-async fn ferrum_cni_binary_gc_rejects_missing_or_misspelled_attachment_set() {
+async fn ferrum_cni_binary_gc_rejects_omitted_valid_attachment_set() {
     let output = tokio::task::spawn_blocking(|| {
-        let stdin_config = serde_json::json!({
+        run_ferrum_cni_gc(serde_json::json!({
+            "cniVersion": "1.1.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni"
+        }))
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(!output.status.success());
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
+    assert_eq!(payload["code"], 7);
+    assert!(
+        payload["msg"]
+            .as_str()
+            .is_some_and(|message| message.contains("cni.dev/valid-attachments")),
+        "unexpected payload: {payload}"
+    );
+}
+
+/// The historical private spelling is a reserved-key misspelling, not a
+/// compatibility alias for the authoritative CNI 1.1 wire field.
+#[tokio::test]
+async fn ferrum_cni_binary_gc_rejects_old_attachment_key() {
+    let output = tokio::task::spawn_blocking(|| {
+        run_ferrum_cni_gc(serde_json::json!({
             "cniVersion": "1.1.0",
             "name": "ferrum-mesh-chain",
             "type": "ferrum-cni",
-            "cni.dev/valid-attachments": []
-        })
-        .to_string();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
-            .env("CNI_COMMAND", "GC")
-            .env("CNI_PATH", "/opt/cni/bin")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn ferrum-cni");
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin pipe")
-            .write_all(stdin_config.as_bytes())
-            .expect("write stdin");
-        child.wait_with_output().expect("wait ferrum-cni")
+            "cni.dev/attachments": []
+        }))
     })
     .await
     .expect("blocking task joined");
@@ -595,6 +623,43 @@ fn cni_rpc_boundary_rejects_cross_verb_paths_and_identifiers() {
     assert!(oversized_args.validate().is_err());
 }
 
+#[test]
+fn cni_args_boundary_accepts_valid_identity_and_one_trailing_delimiter() {
+    let args = ferrum_edge::cni::spec::ingest_cni_args(
+        "IgnoreUnknown=1;K8S_POD_NAMESPACE=demo;K8S_POD_NAME=alpha;",
+    )
+    .expect("valid CNI_ARGS with a trailing delimiter");
+    assert_eq!(args.get("IGNOREUNKNOWN").map(String::as_str), Some("1"));
+    assert_eq!(
+        args.get("K8S_POD_NAMESPACE").map(String::as_str),
+        Some("demo")
+    );
+    assert_eq!(args.get("K8S_POD_NAME").map(String::as_str), Some("alpha"));
+}
+
+#[test]
+fn cni_args_boundary_rejects_malformed_tokens_without_echoing_them() {
+    for (raw, hostile_fragment) in [
+        ("K8S_POD_NAME=alpha;secret-token", "secret-token"),
+        ("=secret-value", "secret-value"),
+        ("BAD KEY=secret-value", "BAD KEY"),
+        (" K8S_POD_NAME=secret-value", "secret-value"),
+        ("K8S_POD_NAME=alpha;;K8S_POD_NAMESPACE=demo", ";;"),
+    ] {
+        let err = ferrum_edge::cni::spec::ingest_cni_args(raw)
+            .expect_err("malformed CNI_ARGS must fail closed");
+        let message = err.to_string();
+        assert!(
+            message.contains("CNI_ARGS"),
+            "expected sanitized boundary error, got: {message}"
+        );
+        assert!(
+            !message.contains(hostile_fragment),
+            "boundary error must not echo malformed token contents: {message}"
+        );
+    }
+}
+
 /// Binary-level GC against a live node-agent socket succeeds with empty stdout.
 #[tokio::test]
 async fn ferrum_cni_binary_gc_exits_zero_on_ok() {
@@ -608,6 +673,10 @@ async fn ferrum_cni_binary_gc_exits_zero_on_ok() {
     let drained = tokio::spawn(async move {
         let work = work_rx.recv().await.expect("work item arrives");
         assert_eq!(work.request.verb, RpcVerb::Gc);
+        assert!(
+            work.request.valid_attachments.is_empty(),
+            "an explicitly empty authoritative set must reach reconciliation"
+        );
         let _ = work.respond.send(CniRpcResponse::Ok);
     });
 
@@ -631,9 +700,7 @@ async fn ferrum_cni_binary_gc_exits_zero_on_ok() {
             "name": "ferrum-mesh-chain",
             "type": "ferrum-cni",
             "ferrum": { "socketPath": socket_path_str },
-            "cni.dev/attachments": [
-                {"containerID": "ctr-live", "ifname": "eth0"}
-            ]
+            "cni.dev/valid-attachments": []
         })
         .to_string();
 

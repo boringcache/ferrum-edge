@@ -194,6 +194,14 @@ pub fn is_safe_cni_pod_uid(value: &str) -> bool {
 }
 
 fn validate_cleanup(cleanup: &DurableCniCleanupSnapshot) -> Result<(), CniOwnershipStoreError> {
+    // A durable claim is created only after a successful CNI ADD has published
+    // an attached PodAttachmentState. Accepting `attached = false` would make
+    // rehydrated teardown skip every persisted map/rule key and then authorize
+    // ownership removal, so reject the impossible production-owned shape on
+    // both decode and encode.
+    if !cleanup.attached {
+        return Err(CniOwnershipStoreError::InvalidRecord);
+    }
     if cleanup.include_ports_cgroup_ids.len() > MAX_CNI_OWNERSHIP_CGROUP_IDS
         || cleanup.workload_identity_cgroup_ids.len() > MAX_CNI_OWNERSHIP_CGROUP_IDS
     {
