@@ -515,7 +515,8 @@ traffic_once() {
       http://127.0.0.1:15001/)" || return 1
   status="${response##*$'\n'}"
   body="${response%$'\n'*}"
-  [[ "$status" == 200 && "$body" == *"$expected"* ]]
+  [[ "$status" == 200 ]] || return 1
+  [[ "$body" == *"$expected"* ]]
 }
 
 traffic_fails() { ! traffic_once "$1" "$2" "$3"; }
@@ -527,7 +528,8 @@ traffic_not_found() {
       http://127.0.0.1:15001/)" || return 1
   status="${response##*$'\n'}"
   body="${response%$'\n'*}"
-  [[ "$status" == 404 && "$body" == *"Not Found"* ]]
+  [[ "$status" == 404 ]] || return 1
+  [[ "$body" == *"Not Found"* ]]
 }
 
 metric_value() {
