@@ -9578,6 +9578,7 @@ impl ProxyState {
                     let projected_lb_changed = !projected_lb_modified.is_empty();
                     if !mesh_changed
                         && !projected_routes_changed
+                        && !projected_lb_changed
                         && country_mmdb_plugin_cache.is_none()
                     {
                         return Ok(None);

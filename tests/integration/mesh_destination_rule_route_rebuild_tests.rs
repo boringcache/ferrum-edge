@@ -1019,3 +1019,51 @@ async fn ordinary_proxy_edit_preserves_unaffected_load_balancer_snapshot() {
         "an ordinary route-only proxy edit must not full-rebuild and reset every load balancer"
     );
 }
+
+#[tokio::test]
+async fn empty_delta_same_timestamp_upstream_target_change_republishes_load_balancer() {
+    let old_config = prepared_with_dr(None);
+    let mut new_config = old_config.clone();
+    let upstream = new_config
+        .upstreams
+        .iter_mut()
+        .find(|upstream| upstream.id == "reviews-u")
+        .expect("reviews upstream");
+    let unchanged_timestamp = upstream.updated_at;
+    upstream.targets[0].host = "reviews-v2.default.svc.cluster.local".to_string();
+    upstream.targets[0].port = 9080;
+    assert_eq!(upstream.updated_at, unchanged_timestamp);
+    new_config.normalize_fields();
+
+    let delta = ferrum_edge::config_delta::ConfigDelta::compute(&old_config, &new_config);
+    assert!(
+        delta.is_empty(),
+        "fixture must exercise the timestamp-neutral empty-delta publish path"
+    );
+
+    let (state, _handles) = new_proxy_state(old_config);
+    let before = state.load_balancer_cache.load();
+    let before_upstream =
+        LoadBalancerCache::get_upstream_from(&before, "default", "reviews-u")
+            .expect("old reviews upstream");
+    assert_eq!(
+        before_upstream.targets[0].host,
+        "reviews.default.svc.cluster.local"
+    );
+    drop(before);
+
+    assert_eq!(state.update_config(new_config), ConfigApplyOutcome::Applied);
+
+    let after = state.load_balancer_cache.load();
+    let after_upstream =
+        LoadBalancerCache::get_upstream_from(&after, "default", "reviews-u")
+            .expect("updated reviews upstream");
+    assert_eq!(
+        (
+            after_upstream.targets[0].host.as_str(),
+            after_upstream.targets[0].port,
+        ),
+        ("reviews-v2.default.svc.cluster.local", 9080),
+        "an upstream content change hidden from timestamp-based ConfigDelta must still replace the affected balancer"
+    );
+}
