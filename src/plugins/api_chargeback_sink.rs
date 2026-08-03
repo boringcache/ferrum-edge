@@ -9374,7 +9374,11 @@ pub fn probe_streaming_replay_batch_range_errors_for_tests(
     .map_err(|error| error.reason().to_string())?;
     let index_reservation = ceiling
         .try_acquire(2usize.saturating_mul(SPOOL_INDEX_ENTRY_BYTES))
-        .ok_or_else(|| PayloadMaterializationError::CeilingExhausted.reason().to_string())?;
+        .ok_or_else(|| {
+            PayloadMaterializationError::CeilingExhausted
+                .reason()
+                .to_string()
+        })?;
     let batch = StreamingReplayBatch {
         payload,
         lines: vec![(0, 7), (8, 15)],
@@ -9395,7 +9399,11 @@ pub fn probe_streaming_replay_batch_range_errors_for_tests(
     .map_err(|error| error.reason().to_string())?;
     let mismatched_index = ceiling
         .try_acquire(2usize.saturating_mul(SPOOL_INDEX_ENTRY_BYTES))
-        .ok_or_else(|| PayloadMaterializationError::CeilingExhausted.reason().to_string())?;
+        .ok_or_else(|| {
+            PayloadMaterializationError::CeilingExhausted
+                .reason()
+                .to_string()
+        })?;
     let mismatched_batch = StreamingReplayBatch {
         payload: mismatched_payload,
         // Byte end precedes byte start — structurally impossible for a real

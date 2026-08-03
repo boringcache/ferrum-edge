@@ -820,16 +820,18 @@ pub fn probe_preallocated_payload_capacity_guard_for_tests(
     ceiling: &'static RetainedByteCeiling,
 ) -> Result<(), String> {
     let reservation = ceiling.try_acquire(8).ok_or_else(|| {
-        PayloadMaterializationError::CeilingExhausted.reason().to_string()
+        PayloadMaterializationError::CeilingExhausted
+            .reason()
+            .to_string()
     })?;
     let mut bytes = Vec::with_capacity(64);
     bytes.extend_from_slice(b"probe");
     match ReservedPayload::from_preallocated_vec(bytes, reservation) {
         Err(PayloadMaterializationError::BoundExceeded) => Ok(()),
         Err(error) => Err(error.reason().to_string()),
-        Ok(_) => Err(
-            "preallocated payload capacity guard must refuse an undersized reservation".into(),
-        ),
+        Ok(_) => {
+            Err("preallocated payload capacity guard must refuse an undersized reservation".into())
+        }
     }
 }
 
