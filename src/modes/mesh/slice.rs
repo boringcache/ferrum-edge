@@ -1145,7 +1145,7 @@ impl MeshSlice {
                     .collect();
             let local_keys: BTreeSet<(&str, &str)> = local_workloads
                 .iter()
-                .map(|w| (w.service_name.as_str(), w.namespace.as_str()))
+                .map(|w| (w.service_name.as_str(), w.attached_service_namespace()))
                 .collect();
             let services = mesh
                 .services
@@ -2589,7 +2589,7 @@ pub(crate) fn resolve_local_workloads<'a>(
     // service share its `service_name` and collapse to a single distinct entry.)
     let distinct_services: BTreeSet<(&str, &str)> = matched
         .iter()
-        .map(|w| (w.service_name.as_str(), w.namespace.as_str()))
+        .map(|w| (w.service_name.as_str(), w.attached_service_namespace()))
         .collect();
     if distinct_services.len() > 1 {
         warn!(
