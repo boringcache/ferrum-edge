@@ -369,8 +369,7 @@ async fn h3_probe_classifies_backend_without_quic_as_h3_unsupported() {
     let backend_port = reservation.port;
     // Keep a real H2/TLS server available for the H2 probe, reqwest warmup,
     // and cross-protocol bridge; leave UDP unbound (no QUIC listener).
-    let _backend =
-        spawn_h2_bridge_backend(reservation.into_listener(), &cert, &key, b"ok");
+    let _backend = spawn_h2_bridge_backend(reservation.into_listener(), &cert, &key, b"ok");
 
     let (harness, _ca_pem, https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
@@ -536,8 +535,7 @@ async fn h3_backend_connection_close_mid_request_downgrades_capability() {
 
     // H2/TLS side: always answers 200 so the cross-protocol bridge works
     // on the second request.
-    let _tcp_backend =
-        spawn_h2_bridge_backend(tcp_res.into_listener(), &cert, &key, b"hello");
+    let _tcp_backend = spawn_h2_bridge_backend(tcp_res.into_listener(), &cert, &key, b"hello");
 
     // UDP side: accept handshake (lets the probe succeed) + accept stream
     // + close the connection. Once the probe completes, the gateway caches
@@ -3940,8 +3938,7 @@ async fn h3_frontend_mid_body_stream_reset_downgrades_and_bridges() {
         .expect("colocated tcp/udp");
     let backend_port = tcp_res.port;
 
-    let tcp_backend =
-        spawn_h2_bridge_backend(tcp_res.into_listener(), &cert, &key, b"bridged");
+    let tcp_backend = spawn_h2_bridge_backend(tcp_res.into_listener(), &cert, &key, b"bridged");
 
     let prefix = bytes::Bytes::from_static(b"partial-");
     let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
@@ -4121,8 +4118,7 @@ async fn h3_frontend_retry_rotation_bridges_to_h2_only_target() {
 
     let tcp_b = reserve_port().await.expect("target B port");
     let target_b_port = tcp_b.port;
-    let tcp_b_backend =
-        spawn_h2_bridge_backend(tcp_b.into_listener(), &cert, &key, b"from-b!");
+    let tcp_b_backend = spawn_h2_bridge_backend(tcp_b.into_listener(), &cert, &key, b"from-b!");
 
     let yaml = json!({
         "version": "1",
