@@ -5173,3 +5173,60 @@ async fn concurrent_put_same_spec_resource_hash_idempotent() {
         proxy_after_puts.updated_at, post_updated_at
     );
 }
+
+#[tokio::test]
+async fn full_sql_api_spec_reads_reject_corrupt_external_ref_pairs() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let namespace = "ferrum";
+    let proxy_id = uid("proxy-corrupt-extref");
+    let spec_id = uid("spec-corrupt-extref");
+    let (bundle, spec) =
+        make_spec_with_metadata(&spec_id, &proxy_id, namespace, "Integrity API", "0", &[]);
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("submit spec");
+
+    sqlx::query(
+        "UPDATE api_specs SET external_ref_digest = ? WHERE namespace = ? AND id = ?",
+    )
+    .bind("a".repeat(64))
+    .bind(namespace)
+    .bind(&spec_id)
+    .execute(&store.pool())
+    .await
+    .expect("corrupt digest pair");
+
+    let error = store
+        .get_api_spec(namespace, &spec_id)
+        .await
+        .expect_err("full row decode must reject digest without snapshot");
+    assert!(error.to_string().contains("integrity validation failed"));
+
+    // The list query intentionally projects out the blob. A well-formed digest
+    // remains usable as summary metadata without pretending the omitted blob is
+    // a corrupt full record.
+    let summary = store
+        .list_api_specs(namespace, &simple_filter(10, 0))
+        .await
+        .expect("summary projection may omit snapshot blob");
+    assert!(summary.items.iter().any(|item| item.id == spec_id));
+
+    sqlx::query(
+        "UPDATE api_specs SET external_ref_snapshot = ?, external_ref_digest = ? \
+         WHERE namespace = ? AND id = ?",
+    )
+    .bind(vec![0x1f, 0x8b, 0x00])
+    .bind("b".repeat(64))
+    .bind(namespace)
+    .bind(&spec_id)
+    .execute(&store.pool())
+    .await
+    .expect("corrupt snapshot bytes");
+    let error = store
+        .get_api_spec(namespace, &spec_id)
+        .await
+        .expect_err("full row decode must reject malformed snapshot gzip");
+    assert!(error.to_string().contains("integrity validation failed"));
+}

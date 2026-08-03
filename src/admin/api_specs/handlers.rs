@@ -2904,8 +2904,8 @@ fn json_resp(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
 /// namespace submitting large specs cannot starve another.
 const MAX_CONCURRENT_SPEC_EXTRACTIONS: usize = 4;
 
-static SPEC_EXTRACTION_SLOTS: LazyLock<Semaphore> =
-    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_SPEC_EXTRACTIONS));
+static SPEC_EXTRACTION_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_SPEC_EXTRACTIONS)));
 
 /// Run spec extraction under the bounded-admission gate.
 async fn extract_admitted(
@@ -2917,16 +2917,33 @@ async fn extract_admitted(
     // INVARIANT: `SPEC_EXTRACTION_SLOTS` is a process-lifetime static that is
     // never closed, so `acquire` cannot fail here. Fail closed rather than
     // running an unadmitted extraction if that ever changes.
-    let _permit = SPEC_EXTRACTION_SLOTS.acquire().await.map_err(|_| {
-        ApiSpecError::AdmissionUnavailable("spec extraction admission unavailable".to_string())
-    })?;
-    extract_with_external_refs(
-        body,
-        declared_format,
-        namespace,
-        state.external_ref_policy.as_ref(),
-        state.external_ref_loader.as_ref(),
-    )
+    let permit = Arc::clone(&SPEC_EXTRACTION_SLOTS)
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            ApiSpecError::AdmissionUnavailable(
+                "spec extraction admission unavailable".to_string(),
+            )
+        })?;
+    let body = body.to_vec();
+    let namespace = namespace.to_string();
+    let policy = Arc::clone(&state.external_ref_policy);
+    let loader = Arc::clone(&state.external_ref_loader);
+    // Move the semaphore permit into the worker so cancellation of the request
+    // future cannot release capacity while its non-cancellable blocking task is
+    // still running. The HTTP loader uses this Tokio runtime's handle there.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        extract_with_external_refs(
+            &body,
+            declared_format,
+            &namespace,
+            policy.as_ref(),
+            loader.as_ref(),
+        )
+    })
+    .await
+    .map_err(|_| ApiSpecError::Internal("spec extraction worker failed".to_string()))?
     .map_err(ApiSpecError::Extract)
 }
 

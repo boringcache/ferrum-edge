@@ -7,15 +7,16 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ferrum_edge::admin::api_specs::external_refs::{
     ExternalDocumentLoader, contain_path, redact_reference, resource_uri_key,
+    validate_external_ref_snapshot_pair,
 };
 use ferrum_edge::admin::api_specs::{
-    EffectiveExternalRefPolicy, ExternalRefProcessPolicy, ExternalRefSnapshot,
-    ExternalRefSpecExtension, ExtractError, MapExternalDocumentLoader, SpecFormat, extract,
-    extract_with_external_refs,
+    DefaultExternalDocumentLoader, EffectiveExternalRefPolicy, ExternalRefProcessPolicy,
+    ExternalRefSnapshot, ExternalRefSpecExtension, ExtractError, MapExternalDocumentLoader,
+    SpecFormat, extract, extract_with_external_refs,
 };
 use serde_json::{Value, json};
 use url::Url;
@@ -70,6 +71,34 @@ fn extract_validator_ops(
         .expect("openapi_validator")
         .config
         .clone()
+}
+
+async fn load_production_http(
+    uri: String,
+    process: ExternalRefProcessPolicy,
+) -> Result<
+    ferrum_edge::admin::api_specs::external_refs::LoadedExternalDocument,
+    ExtractError,
+> {
+    let extension = ExternalRefSpecExtension {
+        enabled: true,
+        document_base: None,
+        allowed_origins: Vec::new(),
+    };
+    let policy = EffectiveExternalRefPolicy::compose(&process, Some(&extension))?;
+    let deadline = Instant::now() + process.total_timeout;
+    let loader = DefaultExternalDocumentLoader {
+        egress: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        dns_cache: None,
+        fixtures: Default::default(),
+    };
+    tokio::task::spawn_blocking(move || {
+        let uri = Url::parse(&uri)
+            .map_err(|_| ExtractError::SchemaReference("invalid test URI".to_string()))?;
+        loader.load(&uri, &policy, deadline)
+    })
+    .await
+    .map_err(|_| ExtractError::SchemaReference("blocking test worker failed".to_string()))?
 }
 
 #[test]
@@ -606,6 +635,7 @@ fn snapshot_is_reproducible_and_digest_stable() {
     assert_eq!(s1.snapshot_digest, s2.snapshot_digest);
     assert_eq!(s1.compute_digest(), s1.snapshot_digest);
     let gzip = s1.gzip_bytes().unwrap();
+    validate_external_ref_snapshot_pair(Some(&gzip), Some(s1.snapshot_digest.as_str())).unwrap();
     let restored = ExternalRefSnapshot::from_gzip_bytes(&gzip, 1024 * 1024).unwrap();
     assert_eq!(restored.snapshot_digest, s1.snapshot_digest);
 }
@@ -671,13 +701,17 @@ async fn http_fixture_listener_resolves_under_explicit_http_allowlist() {
         uri = uri
     );
 
-    let (bundle, meta) = extract_with_external_refs(
-        spec.as_bytes(),
-        Some(SpecFormat::Json),
-        "prod",
-        &process,
-        &loader,
-    )
+    let (bundle, meta) = tokio::task::spawn_blocking(move || {
+        extract_with_external_refs(
+            spec.as_bytes(),
+            Some(SpecFormat::Json),
+            "prod",
+            &process,
+            &loader,
+        )
+    })
+    .await
+    .expect("blocking worker")
     .expect("HTTP fixture fetch must succeed under explicit allowlist");
     assert!(meta.external_ref_snapshot.is_some());
     let config = bundle
@@ -693,10 +727,275 @@ async fn http_fixture_listener_resolves_under_explicit_http_allowlist() {
     );
 }
 
+#[test]
+fn redaction_is_utf8_safe_and_hides_filesystem_paths() {
     let redacted = redact_reference("https://alice:s3cret@host.example/x?token=abc#/y");
     assert!(!redacted.contains("alice"));
     assert!(!redacted.contains("s3cret"));
     assert!(!redacted.contains("token"));
+    let unicode = format!("relative/{}?secret=yes", "🦀".repeat(80));
+    let unicode_redacted = redact_reference(&unicode);
+    assert!(unicode_redacted.ends_with('…'));
+    assert!(!unicode_redacted.contains("secret"));
+    assert_eq!(redact_reference("/srv/private/specs/root.yaml"), "[filesystem path redacted]");
+    assert_eq!(
+        redact_reference(r"C:\private\specs\root.yaml"),
+        "[filesystem path redacted]"
+    );
+    assert_eq!(
+        redact_reference("file:///srv/private/specs/root.yaml?token=secret"),
+        "file:[redacted]"
+    );
+}
+
+#[test]
+fn snapshot_rejects_document_tampering_even_with_recomputed_snapshot_digest() {
+    let mut loader = MapExternalDocumentLoader::default();
+    loader.docs.insert(
+        "https://schemas.example.com/value.json".to_string(),
+        br#"{"type":"string"}"#.to_vec(),
+    );
+    let process = process_enabled(None);
+    let policy = EffectiveExternalRefPolicy::compose(
+        &process,
+        Some(&ExternalRefSpecExtension {
+            enabled: true,
+            document_base: None,
+            allowed_origins: Vec::new(),
+        }),
+    )
+    .unwrap();
+    let root = json!({"$ref": "https://schemas.example.com/value.json"});
+    let (_, mut snapshot) = ferrum_edge::admin::api_specs::load_external_documents(
+        &root,
+        &policy,
+        &loader,
+    )
+    .unwrap();
+    snapshot.documents[0].document = json!({"type": "integer"});
+    snapshot.snapshot_digest = snapshot.compute_digest();
+    let gzip = snapshot.gzip_bytes().unwrap();
+    let err = validate_external_ref_snapshot_pair(
+        Some(&gzip),
+        Some(snapshot.snapshot_digest.as_str()),
+    )
+    .expect_err("retaining content_digest after document mutation must fail");
+    assert!(err.contains("integrity") || err.contains("digest"));
+}
+
+#[test]
+fn disabled_extension_still_validates_allowed_origins() {
+    let process = process_enabled(None);
+    for allowed_origins in [
+        vec!["not a URI".to_string()],
+        vec!["https://not-process-allowed.example".to_string()],
+    ] {
+        let extension = ExternalRefSpecExtension {
+            enabled: false,
+            document_base: None,
+            allowed_origins,
+        };
+        let err = EffectiveExternalRefPolicy::compose(&process, Some(&extension))
+            .expect_err("disabled malformed/disallowed fields must fail closed");
+        assert!(matches!(err, ExtractError::MalformedExtension { .. }));
+    }
+}
+
+#[test]
+fn ipv6_origins_are_canonicalized_with_brackets() {
+    let process = ExternalRefProcessPolicy::from_env_parts(
+        true,
+        "",
+        "https://[2001:4860:4860::8888]",
+        "http://[::1]:8080",
+        4,
+        1024,
+        4096,
+        8,
+        2048,
+        2,
+        4,
+        100,
+        200,
+        500,
+    )
+    .unwrap();
+    assert_eq!(
+        process.allowed_origins,
+        vec!["https://[2001:4860:4860::8888]:443"]
+    );
+    assert_eq!(process.allow_http_origins, vec!["http://[::1]:8080"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn private_https_is_denied_even_when_backend_egress_is_unrestricted() {
+    let mut process = process_enabled(None);
+    process.allowed_origins = vec!["https://10.0.0.1:443".to_string()];
+    let error = load_production_http("https://10.0.0.1/schema.json".to_string(), process)
+        .await
+        .expect_err("HTTPS RFC1918 destination must be unconditionally denied");
+    assert!(error.to_string().contains("public destination"));
+}
+
+#[cfg(unix)]
+#[test]
+fn contained_loader_rejects_intermediate_directory_symlink_swap() {
+    let temp = tempfile::tempdir().unwrap();
+    let jail = temp.path().join("jail");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(jail.join("schemas")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(jail.join("schemas/value.json"), br#"{"type":"string"}"#).unwrap();
+    fs::write(outside.join("value.json"), br#"{"secret":true}"#).unwrap();
+    let uri = Url::from_file_path(jail.join("schemas/value.json")).unwrap();
+    let process = process_enabled(Some(jail.clone()));
+    let policy = EffectiveExternalRefPolicy::compose(
+        &process,
+        Some(&ExternalRefSpecExtension {
+            enabled: true,
+            document_base: None,
+            allowed_origins: Vec::new(),
+        }),
+    )
+    .unwrap();
+    let loader = DefaultExternalDocumentLoader::default();
+    loader
+        .load(&uri, &policy, Instant::now() + Duration::from_secs(1))
+        .expect("ordinary contained file");
+
+    fs::rename(jail.join("schemas"), jail.join("schemas-old")).unwrap();
+    std::os::unix::fs::symlink(&outside, jail.join("schemas")).unwrap();
+    let error = loader
+        .load(&uri, &policy, Instant::now() + Duration::from_secs(1))
+        .expect_err("swapped intermediate symlink must be refused");
+    assert!(!error.to_string().contains("outside"));
+    assert!(!error.to_string().contains("secret"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hostname_redirect_hops_are_allowlisted_resolved_and_pinned() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+    let destination_port = destination.local_addr().unwrap().port();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = destination.accept() {
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let body = br#"{"type":"string"}"#;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(headers.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    let redirector = TcpListener::bind("127.0.0.1:0").unwrap();
+    let redirect_port = redirector.local_addr().unwrap().port();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = redirector.accept() {
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://localhost:{destination_port}/value.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    let mut process = process_enabled(None);
+    process.allow_http_origins = vec![
+        format!("http://127.0.0.1:{redirect_port}"),
+        format!("http://localhost:{destination_port}"),
+    ];
+    let loaded = load_production_http(
+        format!("http://127.0.0.1:{redirect_port}/start"),
+        process,
+    )
+    .await
+    .expect("every redirect hop should be revalidated and hostname-pinned");
+    assert_eq!(loaded.root, json!({"type": "string"}));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redirect_to_origin_outside_policy_is_rejected() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: http://localhost:9/denied\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    let mut process = process_enabled(None);
+    process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
+    let error = load_production_http(format!("http://127.0.0.1:{port}/start"), process)
+        .await
+        .expect_err("redirect outside the explicit origin policy must fail");
+    assert!(matches!(error, ExtractError::UnsupportedExternalRef { .. }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_chunked_response_aborts_at_document_cap() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n20\r\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n0\r\n\r\n",
+            );
+        }
+    });
+    let mut process = process_enabled(None);
+    process.max_document_bytes = 16;
+    process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
+    let error = load_production_http(format!("http://127.0.0.1:{port}/large"), process)
+        .await
+        .expect_err("chunked body beyond cap must abort");
+    assert!(matches!(error, ExtractError::SchemaTooLarge { .. }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn total_deadline_covers_response_io() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            thread::sleep(Duration::from_millis(150));
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            );
+        }
+    });
+    let mut process = process_enabled(None);
+    process.request_timeout = Duration::from_secs(1);
+    process.total_timeout = Duration::from_millis(30);
+    process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
+    let error = load_production_http(format!("http://127.0.0.1:{port}/slow"), process)
+        .await
+        .expect_err("total timeout must cover request and response I/O");
+    assert!(error.to_string().contains("timed out") || error.to_string().contains("timeout"));
 }
 
 #[test]

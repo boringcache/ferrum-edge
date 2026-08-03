@@ -7,13 +7,17 @@
 //! resource budgets, and SSRF screening, then returns an immutable snapshot for
 //! admission-time persistence. Runtime validation never re-fetches.
 
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::net::IpAddr;
+#[cfg(unix)]
+use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::io::Read;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::fips::approved::Sha256;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
@@ -34,6 +38,11 @@ const DEFAULT_MAX_NESTING: usize = 16;
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_TOTAL_TIMEOUT_MS: u64 = 60_000;
+/// Persistence safety ceiling. The configured aggregate fetch budget defaults
+/// to 20 MiB; this larger fixed cap leaves room for JSON framing while keeping
+/// corrupt DB rows and restore payloads from driving unbounded allocation.
+pub const MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_EXTERNAL_REF_SNAPSHOT_DECOMPRESSED_BYTES: usize = 128 * 1024 * 1024;
 
 /// Process-level external `$ref` gate and budgets (from EnvConfig / ferrum.conf).
 #[derive(Debug, Clone)]
@@ -246,16 +255,6 @@ impl EffectiveExternalRefPolicy {
             return Ok(disabled);
         };
 
-        if !process.enabled || !extension.enabled {
-            let mut disabled = Self::compose(process, None)?;
-            // Preserve document_base validation even when disabled so malformed
-            // extensions fail closed instead of being ignored.
-            if let Some(base) = extension.document_base.as_deref() {
-                disabled.document_base = parse_document_base(base, process)?;
-            }
-            return Ok(disabled);
-        }
-
         let document_base = match extension.document_base.as_deref() {
             Some(base) => parse_document_base(base, process)?,
             None => Url::parse(DEFAULT_DOCUMENT_BASE).map_err(|_| {
@@ -286,6 +285,16 @@ impl EffectiveExternalRefPolicy {
                 narrowed.insert(origin);
             }
             allowed_origins = narrowed;
+        }
+
+        // Validate every supplied extension field even when either enable gate
+        // is off. A disabled feature is not permission to persist malformed or
+        // process-disallowed policy that may become active after a config flip.
+        if !process.enabled || !extension.enabled {
+            let mut disabled = Self::compose(process, None)?;
+            disabled.document_base = document_base;
+            disabled.allowed_origins = allowed_origins;
+            return Ok(disabled);
         }
 
         Ok(Self {
@@ -323,7 +332,7 @@ impl EffectiveExternalRefPolicy {
 pub struct ExternalRefSnapshotDocument {
     /// Canonical document URI without fragment (redacted of userinfo/query).
     pub canonical_uri: String,
-    /// SHA-256 hex of the normalized UTF-8 document bytes as admitted.
+    /// SHA-256 hex of the canonical normalized JSON value as admitted.
     pub content_digest: String,
     /// `json` or `yaml`.
     pub format: String,
@@ -355,7 +364,7 @@ impl ExternalRefSnapshot {
 
     pub fn compute_digest(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"extref-snapshot-v1\0");
+        hasher.update(b"extref-snapshot-v2\0");
         hasher.update(self.policy_digest.as_bytes());
         hasher.update(b"\0");
         hasher.update(self.root_document_base.as_bytes());
@@ -367,6 +376,7 @@ impl ExternalRefSnapshot {
             hasher.update(b"\0");
             hasher.update(doc.format.as_bytes());
             hasher.update(b"\0");
+            hash_json_value(&mut hasher, &doc.document);
         }
         hex::encode(hasher.finalize())
     }
@@ -385,12 +395,104 @@ impl ExternalRefSnapshot {
             .map_err(|error| format!("external_ref_snapshot decompress failed: {error}"))?;
         let snap: Self = serde_json::from_slice(&raw)
             .map_err(|error| format!("external_ref_snapshot JSON invalid: {error}"))?;
+        for doc in &snap.documents {
+            if doc.content_digest != normalized_document_digest(&doc.document) {
+                return Err("external_ref_snapshot document digest mismatch".to_string());
+            }
+        }
         let expected = snap.compute_digest();
         if snap.snapshot_digest != expected {
             return Err("external_ref_snapshot digest mismatch".to_string());
         }
         Ok(snap)
     }
+}
+
+/// Validate the persisted snapshot/digest pair used by SQL, Mongo, and backup
+/// restore. Full-record reads must call this; summary projections intentionally
+/// use [`validate_external_ref_summary_digest`] because they omit the blob.
+pub fn validate_external_ref_snapshot_pair(
+    snapshot: Option<&[u8]>,
+    digest: Option<&str>,
+) -> Result<(), String> {
+    match (snapshot, digest) {
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("external_ref snapshot and digest must be present together".to_string())
+        }
+        (Some(bytes), Some(stored_digest)) => {
+            if bytes.len() > MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES {
+                return Err("external_ref snapshot exceeds persistence size limit".to_string());
+            }
+            validate_external_ref_summary_digest(Some(stored_digest))?;
+            let snapshot = ExternalRefSnapshot::from_gzip_bytes(
+                bytes,
+                MAX_EXTERNAL_REF_SNAPSHOT_DECOMPRESSED_BYTES,
+            )?;
+            if snapshot.snapshot_digest != stored_digest {
+                return Err(
+                    "external_ref snapshot digest does not match stored digest".to_string(),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+pub fn validate_external_ref_summary_digest(digest: Option<&str>) -> Result<(), String> {
+    if let Some(value) = digest
+        && (value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        return Err("external_ref digest is not lowercase SHA-256 hex".to_string());
+    }
+    Ok(())
+}
+
+fn normalized_document_digest(document: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"extref-document-v1\0");
+    hash_json_value(&mut hasher, document);
+    hex::encode(hasher.finalize())
+}
+
+fn hash_json_value(hasher: &mut Sha256, value: &Value) {
+    match value {
+        Value::Null => hasher.update(b"n"),
+        Value::Bool(value) => hasher.update(if *value { b"t" } else { b"f" }),
+        Value::Number(value) => {
+            hasher.update(b"d");
+            hash_len_prefixed(hasher, value.to_string().as_bytes());
+        }
+        Value::String(value) => {
+            hasher.update(b"s");
+            hash_len_prefixed(hasher, value.as_bytes());
+        }
+        Value::Array(values) => {
+            hasher.update(b"a");
+            hasher.update((values.len() as u64).to_le_bytes());
+            for value in values {
+                hash_json_value(hasher, value);
+            }
+        }
+        Value::Object(values) => {
+            hasher.update(b"o");
+            hasher.update((values.len() as u64).to_le_bytes());
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in entries {
+                hash_len_prefixed(hasher, key.as_bytes());
+                hash_json_value(hasher, value);
+            }
+        }
+    }
+}
+
+fn hash_len_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 /// Loaded external document ready for resolver indexing.
@@ -456,7 +558,14 @@ impl ExternalDocumentLoader for DefaultExternalDocumentLoader {
                 let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
                     external_ref_error("external HTTPS $ref resolution requires an async runtime")
                 })?;
-                runtime.block_on(load_http_document(uri, policy, &self.egress, self.dns_cache.as_ref(), true))
+                runtime.block_on(load_http_document(
+                    uri,
+                    policy,
+                    &self.egress,
+                    self.dns_cache.as_ref(),
+                    deadline,
+                    true,
+                ))
             }
             "http" => {
                 let origin = origin_key(uri)?;
@@ -473,6 +582,7 @@ impl ExternalDocumentLoader for DefaultExternalDocumentLoader {
                     policy,
                     &self.egress,
                     self.dns_cache.as_ref(),
+                    deadline,
                     false,
                 ))
             }
@@ -538,7 +648,9 @@ pub fn load_external_documents(
         return Ok((HashMap::new(), ExternalRefSnapshot::empty(policy)));
     }
 
-    let deadline = Instant::now() + policy.total_timeout;
+    let deadline = Instant::now()
+        .checked_add(policy.total_timeout)
+        .ok_or_else(|| external_ref_error("external $ref total timeout budget is invalid"))?;
     let mut loaded: HashMap<String, LoadedExternalDocument> = HashMap::new();
     let mut pending: VecDeque<(Url, usize)> = VecDeque::new();
     let mut seen_refs = 0usize;
@@ -830,13 +942,16 @@ fn validate_candidate_uri(uri: &Url, policy: &EffectiveExternalRefPolicy) -> Res
 }
 
 fn screen_host_literal(uri: &Url) -> Result<(), ExtractError> {
-    let host = uri.host_str().ok_or_else(|| {
-        external_ref_error("external $ref URI is missing a host")
-    })?;
-    if host.eq_ignore_ascii_case("localhost")
-        || host.ends_with(".localhost")
-        || host.eq_ignore_ascii_case("metadata.google.internal")
-    {
+    let host = uri
+        .host()
+        .ok_or_else(|| external_ref_error("external $ref URI is missing a host"))?;
+    if matches!(
+        &host,
+        url::Host::Domain(name)
+            if name.eq_ignore_ascii_case("localhost")
+                || name.ends_with(".localhost")
+                || name.eq_ignore_ascii_case("metadata.google.internal")
+    ) {
         // Loopback/metadata hostnames are rejected at the URI gate unless the
         // operator listed an explicit HTTP fixture origin (checked by caller)
         // *and* later DNS screening allows the resolved address. For HTTPS we
@@ -847,7 +962,12 @@ fn screen_host_literal(uri: &Url) -> Result<(), ExtractError> {
             ));
         }
     }
-    if let Ok(ip) = host.parse::<IpAddr>()
+    let literal_ip = match host {
+        url::Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
+        url::Host::Ipv6(ip) => Some(IpAddr::V6(ip)),
+        url::Host::Domain(_) => None,
+    };
+    if let Some(ip) = literal_ip
         && (crate::config::is_always_blocked_range(&ip)
             || crate::config::is_private_ip(&ip)
             || ip.is_loopback()
@@ -873,28 +993,8 @@ fn load_file_document(
             reference: redact_reference(uri.as_str()),
         }
     })?;
-    let path = file_uri_to_contained_path(uri, root)?;
-    let meta = fs::symlink_metadata(&path).map_err(|_| {
-        external_ref_error("external file $ref target is not readable")
-    })?;
-    if meta.file_type().is_symlink() {
-        return Err(external_ref_error(
-            "external file $ref target must not be a symbolic link",
-        ));
-    }
-    if !meta.is_file() {
-        return Err(external_ref_error(
-            "external file $ref target must be a regular file",
-        ));
-    }
-    let bytes = fs::read(&path).map_err(|_| {
-        external_ref_error("external file $ref target is not readable")
-    })?;
-    if bytes.len() > policy.max_document_bytes {
-        return Err(ExtractError::SchemaTooLarge {
-            location: "x-ferrum-external-refs".to_string(),
-        });
-    }
+    let path = file_uri_to_path(uri)?;
+    let bytes = read_contained_file(root, &path, policy.max_document_bytes)?;
     parse_loaded_document(uri, &bytes, policy)
 }
 
@@ -903,113 +1003,167 @@ async fn load_http_document(
     policy: &EffectiveExternalRefPolicy,
     egress: &crate::config::BackendEgressPolicy,
     dns_cache: Option<&std::sync::Arc<crate::dns::DnsCache>>,
+    deadline: Instant,
     require_https: bool,
 ) -> Result<LoadedExternalDocument, ExtractError> {
-    if require_https && uri.scheme() != "https" {
-        return Err(ExtractError::UnsupportedExternalRef {
-            reference: redact_reference(uri.as_str()),
-        });
-    }
-    validate_candidate_uri(uri, policy)?;
-
-    // Resolve and screen every candidate address before dialing (DNS rebinding).
-    if let Some(host) = uri.host_str()
-        && host.parse::<IpAddr>().is_err()
-    {
-        let addrs = resolve_host_addrs(host, dns_cache).await?;
-        for addr in &addrs {
-            if let Some(reason) = egress.deny_reason(addr) {
-                tracing::warn!(
-                    reason = %reason,
-                    "external OpenAPI $ref destination denied by backend egress policy"
-                );
-                return Err(external_ref_error(
-                    "external $ref destination denied by egress policy",
-                ));
-            }
+    let mut current = uri.clone();
+    for redirect_count in 0..=policy.max_redirects {
+        if require_https && current.scheme() != "https" {
+            return Err(ExtractError::UnsupportedExternalRef {
+                reference: redact_reference(current.as_str()),
+            });
         }
-        if addrs.is_empty() {
+        validate_candidate_uri(&current, policy)?;
+
+        let hop_deadline = deadline.min(
+            Instant::now()
+                .checked_add(policy.request_timeout)
+                .unwrap_or(deadline),
+        );
+        let (host, literal_ip) = match current
+            .host()
+            .ok_or_else(|| external_ref_error("external $ref URI is missing a host"))?
+        {
+            url::Host::Domain(host) => (host.to_string(), None),
+            url::Host::Ipv4(ip) => (ip.to_string(), Some(IpAddr::V4(ip))),
+            url::Host::Ipv6(ip) => (ip.to_string(), Some(IpAddr::V6(ip))),
+        };
+        let port = current
+            .port_or_known_default()
+            .ok_or_else(|| external_ref_error("external $ref URI is missing a port"))?;
+        let pinned_ips = if let Some(ip) = literal_ip {
+            vec![ip]
+        } else {
+            timeout_external_ref(
+                hop_deadline,
+                resolve_host_addrs(&host, port, dns_cache),
+                "external $ref DNS resolution timed out",
+            )
+            .await??
+        };
+        if pinned_ips.is_empty() {
             return Err(external_ref_error(
                 "external $ref host did not resolve to any address",
             ));
         }
-    } else if let Some(host) = uri.host_str()
-        && let Ok(ip) = host.parse::<IpAddr>()
-        && let Some(reason) = egress.deny_reason(&ip)
-    {
-        tracing::warn!(
-            reason = %reason,
-            "external OpenAPI $ref literal destination denied by backend egress policy"
-        );
-        return Err(external_ref_error(
-            "external $ref destination denied by egress policy",
-        ));
-    }
+        for ip in &pinned_ips {
+            screen_resolved_address(&current, ip, egress)?;
+        }
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::custom({
-            let policy = policy.clone();
-            let egress = egress.clone();
-            move |attempt| {
-                if attempt.previous().len() > policy.max_redirects {
-                    return attempt.error("external $ref redirect budget exceeded");
-                }
-                let next = attempt.url();
-                if let Err(error) = validate_candidate_uri(next, &policy) {
-                    return attempt.error(error.to_string());
-                }
-                if let Some(host) = next.host_str()
-                    && let Ok(ip) = host.parse::<IpAddr>()
-                    && egress.deny_reason(&ip).is_some()
-                {
-                    return attempt.error("external $ref redirect denied by egress policy");
-                }
-                attempt.follow()
-            }
-        }))
-        .connect_timeout(policy.connect_timeout)
-        .timeout(policy.request_timeout)
-        .no_proxy()
-        .build()
-        .map_err(|_| external_ref_error("failed to build external $ref HTTP client"))?;
+        let socket_addrs: Vec<SocketAddr> = pinned_ips
+            .iter()
+            .copied()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
+        let remaining = remaining_budget(hop_deadline)?;
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(policy.connect_timeout.min(remaining))
+            .timeout(remaining)
+            .no_proxy();
+        if literal_ip.is_none() {
+            // Pin exactly the screened address set. The request URL retains the
+            // hostname, so HTTP Host and TLS SNI/certificate validation remain
+            // tied to the policy-approved origin rather than to an IP literal.
+            builder = builder.resolve_to_addrs(&host, &socket_addrs);
+        }
+        let client = builder
+            .build()
+            .map_err(|_| external_ref_error("failed to build external $ref HTTP client"))?;
 
-    // Never forward ambient credentials: construct a bare GET with no Authorization,
-    // Cookie, or proxy auth headers.
-    let response = client
-        .get(uri.clone())
-        .header(reqwest::header::ACCEPT, "application/json, application/yaml, text/yaml, application/x-yaml, text/x-yaml, text/plain")
-        .send()
-        .await
+        // Construct a bare GET for every hop. Redirects are manual, so no
+        // Authorization, Cookie, proxy credentials, or prior-hop headers can
+        // be copied to another origin.
+        let response = timeout_external_ref(
+            hop_deadline,
+            client
+                .get(current.clone())
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/json, application/yaml, text/yaml, application/x-yaml, text/x-yaml, text/plain",
+                )
+                .send(),
+            "external $ref HTTP fetch timed out",
+        )
+        .await?
         .map_err(|_| external_ref_error("external $ref HTTP fetch failed"))?;
 
-    if !response.status().is_success() {
-        return Err(external_ref_error(
-            "external $ref HTTP fetch returned a non-success status",
-        ));
-    }
-    if let Some(ct) = response.headers().get(reqwest::header::CONTENT_TYPE)
-        && let Ok(ct) = ct.to_str()
-        && !content_type_allowed(ct)
-    {
-        return Err(external_ref_error(
-            "external $ref response Content-Type is not an allowed OpenAPI media type",
-        ));
-    }
+        if response.status().is_redirection() {
+            if redirect_count >= policy.max_redirects {
+                return Err(external_ref_error(
+                    "external $ref redirect budget exceeded",
+                ));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| external_ref_error("external $ref redirect location is invalid"))?;
+            let next = current
+                .join(location)
+                .map_err(|_| external_ref_error("external $ref redirect location is invalid"))?;
+            validate_candidate_uri(&next, policy)?;
+            if require_https && next.scheme() != "https" {
+                return Err(external_ref_error(
+                    "external $ref redirect crossed the permitted transport policy",
+                ));
+            }
+            current = next;
+            continue;
+        }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| external_ref_error("external $ref HTTP body read failed"))?;
-    if bytes.len() > policy.max_document_bytes {
-        return Err(ExtractError::SchemaTooLarge {
-            location: "x-ferrum-external-refs".to_string(),
-        });
+        if !response.status().is_success() {
+            return Err(external_ref_error(
+                "external $ref HTTP fetch returned a non-success status",
+            ));
+        }
+        if let Some(ct) = response.headers().get(reqwest::header::CONTENT_TYPE)
+            && let Ok(ct) = ct.to_str()
+            && !content_type_allowed(ct)
+        {
+            return Err(external_ref_error(
+                "external $ref response Content-Type is not an allowed OpenAPI media type",
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > policy.max_document_bytes as u64)
+        {
+            return Err(external_document_too_large());
+        }
+
+        let mut response = response;
+        let mut bytes = Vec::new();
+        loop {
+            let chunk = timeout_external_ref(
+                hop_deadline,
+                response.chunk(),
+                "external $ref HTTP body read timed out",
+            )
+            .await?
+            .map_err(|_| external_ref_error("external $ref HTTP body read failed"))?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            let new_len = bytes
+                .len()
+                .checked_add(chunk.len())
+                .ok_or_else(external_document_too_large)?;
+            if new_len > policy.max_document_bytes {
+                return Err(external_document_too_large());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        return parse_loaded_document(&current, &bytes, policy);
     }
-    parse_loaded_document(uri, &bytes, policy)
+    Err(external_ref_error(
+        "external $ref redirect budget exceeded",
+    ))
 }
 
 async fn resolve_host_addrs(
     host: &str,
+    port: u16,
     dns_cache: Option<&std::sync::Arc<crate::dns::DnsCache>>,
 ) -> Result<Vec<IpAddr>, ExtractError> {
     if let Some(cache) = dns_cache {
@@ -1019,12 +1173,67 @@ async fn resolve_host_addrs(
             .map_err(|_| external_ref_error("external $ref DNS resolution failed"));
     }
     let host_owned = host.to_string();
-    let addrs = tokio::net::lookup_host((host_owned.as_str(), 443))
+    let addrs = tokio::net::lookup_host((host_owned.as_str(), port))
         .await
         .map_err(|_| external_ref_error("external $ref DNS resolution failed"))?
         .map(|a| a.ip())
         .collect::<Vec<_>>();
     Ok(addrs)
+}
+
+async fn timeout_external_ref<F, T>(
+    deadline: Instant,
+    future: F,
+    timeout_message: &'static str,
+) -> Result<T, ExtractError>
+where
+    F: std::future::Future<Output = T>,
+{
+    let remaining = remaining_budget(deadline)?;
+    tokio::time::timeout(remaining, future)
+        .await
+        .map_err(|_| external_ref_error(timeout_message))
+}
+
+fn remaining_budget(deadline: Instant) -> Result<Duration, ExtractError> {
+    deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
+        external_ref_error("external $ref fetch exceeded the total timeout budget")
+    })
+}
+
+fn screen_resolved_address(
+    uri: &Url,
+    ip: &IpAddr,
+    egress: &crate::config::BackendEgressPolicy,
+) -> Result<(), ExtractError> {
+    let non_public = crate::config::is_always_blocked_range(ip)
+        || crate::config::is_private_ip(ip)
+        || ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || matches!(ip, IpAddr::V4(v4) if v4.is_link_local() || v4.is_broadcast())
+        || matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local());
+    // Explicit HTTP origins exist solely for local fixture/development use.
+    // Their only non-public exception is loopback; metadata, RFC1918, link-local,
+    // unspecified, multicast, and broadcast destinations remain forbidden.
+    let explicit_http_loopback = uri.scheme() == "http" && ip.is_loopback();
+    if non_public && !explicit_http_loopback {
+        return Err(external_ref_error(
+            "external $ref host is not a permitted public destination",
+        ));
+    }
+    if !explicit_http_loopback && egress.deny_reason(ip).is_some() {
+        return Err(external_ref_error(
+            "external $ref destination denied by egress policy",
+        ));
+    }
+    Ok(())
+}
+
+fn external_document_too_large() -> ExtractError {
+    ExtractError::SchemaTooLarge {
+        location: "x-ferrum-external-refs".to_string(),
+    }
 }
 
 fn content_type_allowed(content_type: &str) -> bool {
@@ -1079,10 +1288,7 @@ fn parse_loaded_document(
             )?
         }
     };
-    let normalized = serde_json::to_vec(&root).map_err(|error| {
-        ExtractError::SchemaReference(format!("failed to normalize external document: {error}"))
-    })?;
-    let digest = hex::encode(Sha256::digest(&normalized));
+    let digest = normalized_document_digest(&root);
     let mut canonical = uri.clone();
     canonical.set_fragment(None);
     canonical.set_query(None);
@@ -1102,7 +1308,7 @@ fn detect_format(bytes: &[u8]) -> &'static str {
     }
 }
 
-fn file_uri_to_contained_path(uri: &Url, root: &Path) -> Result<PathBuf, ExtractError> {
+fn file_uri_to_path(uri: &Url) -> Result<PathBuf, ExtractError> {
     if uri.scheme() != "file" {
         return Err(ExtractError::UnsupportedExternalRef {
             reference: redact_reference(uri.as_str()),
@@ -1111,7 +1317,132 @@ fn file_uri_to_contained_path(uri: &Url, root: &Path) -> Result<PathBuf, Extract
     let raw = uri.to_file_path().map_err(|_| {
         external_ref_error("external file $ref URI is not a valid filesystem path")
     })?;
-    contain_path(root, &raw)
+    Ok(raw)
+}
+
+#[cfg(unix)]
+fn read_contained_file(
+    root: &Path,
+    candidate: &Path,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ExtractError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|_| external_ref_error("external-ref file root is not accessible"))?;
+    let relative = if candidate.is_absolute() {
+        candidate
+            .strip_prefix(root)
+            .or_else(|_| candidate.strip_prefix(&canonical_root))
+            .map_err(|_| {
+                external_ref_error("external file $ref target escapes the configured file root")
+            })?
+    } else {
+        candidate
+    };
+    let mut names = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => names.push(name),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(external_ref_error(
+                    "external file $ref target escapes the configured file root",
+                ));
+            }
+        }
+    }
+    let Some((final_component, directory_components)) = names.split_last() else {
+        return Err(external_ref_error(
+            "external file $ref target must be a regular file",
+        ));
+    };
+
+    let mut root_options = OpenOptions::new();
+    root_options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let mut directory = root_options
+        .open(&canonical_root)
+        .map_err(|_| external_ref_error("external-ref file root is not accessible"))?;
+
+    for name in directory_components {
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            external_ref_error("external file $ref path contains an invalid component")
+        })?;
+        // SAFETY: `directory` is an owned, open directory descriptor and `name`
+        // is NUL-terminated. The returned descriptor is immediately owned by
+        // `File`; O_NOFOLLOW refuses a swapped symlink component.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(external_ref_error(
+                "external file $ref path is not readable without symbolic links",
+            ));
+        }
+        // SAFETY: `openat` returned a new owned descriptor on success.
+        directory = unsafe { File::from_raw_fd(fd) };
+    }
+
+    let final_name = CString::new(final_component.as_bytes()).map_err(|_| {
+        external_ref_error("external file $ref path contains an invalid component")
+    })?;
+    // O_NONBLOCK prevents a hostile FIFO/device from blocking before metadata
+    // verifies that the opened handle is a regular file.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            final_name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(external_ref_error(
+            "external file $ref target is not readable without symbolic links",
+        ));
+    }
+    // SAFETY: `openat` returned a new owned descriptor on success.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|_| external_ref_error("external file $ref target is not readable"))?;
+    if !metadata.is_file() {
+        return Err(external_ref_error(
+            "external file $ref target must be a regular file",
+        ));
+    }
+    let read_limit = (max_bytes as u64).saturating_add(1);
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|_| external_ref_error("external file $ref target is not readable"))?;
+    if bytes.len() > max_bytes {
+        return Err(external_document_too_large());
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_contained_file(
+    _root: &Path,
+    _candidate: &Path,
+    _max_bytes: usize,
+) -> Result<Vec<u8>, ExtractError> {
+    // std does not expose component-relative, no-reparse-point traversal on
+    // every supported non-Unix target. Refuse file refs instead of reopening a
+    // previously checked pathname and reintroducing containment TOCTOU.
+    Err(external_ref_error(
+        "external file $ref loading is unsupported on this platform",
+    ))
 }
 
 /// Canonicalize `candidate` and require it stay under `root` without symlink escape.
@@ -1126,11 +1457,13 @@ pub fn contain_path(root: &Path, candidate: &Path) -> Result<PathBuf, ExtractErr
     } else {
         canonical_root.join(candidate)
     };
-    // Reject `..` components before canonicalize so missing parents cannot race.
+    // Lexical traversal is never needed for an admitted canonical base and is
+    // rejected before filesystem lookup.
     for component in joined.components() {
         if matches!(component, Component::ParentDir) {
-            // Still allow ParentDir if canonicalize later keeps us inside root;
-            // the prefix check below is authoritative. Continue.
+            return Err(external_ref_error(
+                "external file $ref target escapes the configured file root",
+            ));
         }
     }
     let meta = fs::symlink_metadata(&joined).map_err(|_| {
@@ -1199,12 +1532,12 @@ fn parse_origin_list(raw: &str, https_only: bool) -> Result<Vec<String>, String>
 }
 
 fn canonicalize_origin(raw: &str, https_only: bool) -> Result<String, String> {
-    let parsed = Url::parse(raw).map_err(|_| format!("invalid origin '{raw}'"))?;
+    let parsed = Url::parse(raw).map_err(|_| "invalid origin".to_string())?;
     if https_only && parsed.scheme() != "https" {
-        return Err(format!("origin must be https: '{raw}'"));
+        return Err("origin must be https".to_string());
     }
     if !https_only && parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Err(format!("origin must be http or https: '{raw}'"));
+        return Err("origin must be http or https".to_string());
     }
     if parsed.username() != "" || parsed.password().is_some() {
         return Err("origin must not embed credentials".to_string());
@@ -1215,10 +1548,12 @@ fn canonicalize_origin(raw: &str, https_only: bool) -> Result<String, String> {
     if parsed.path() != "/" && parsed.path() != "" {
         return Err("origin must not carry a path".to_string());
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "origin is missing a host".to_string())?
-        .to_ascii_lowercase();
+    let host = match parsed.host() {
+        Some(url::Host::Domain(host)) => host.to_ascii_lowercase(),
+        Some(url::Host::Ipv4(host)) => host.to_string(),
+        Some(url::Host::Ipv6(host)) => format!("[{host}]"),
+        None => return Err("origin is missing a host".to_string()),
+    };
     let port = parsed.port_or_known_default().ok_or_else(|| {
         "origin is missing a port".to_string()
     })?;
@@ -1267,7 +1602,7 @@ fn parse_document_base(
         "https" => {
             let origin = origin_key(&parsed).map_err(|error| ExtractError::MalformedExtension {
                 which: "x-ferrum-external-refs",
-                error,
+                error: error.to_string(),
             })?;
             if !process.allowed_origins.iter().any(|o| o == &origin) {
                 return Err(ExtractError::MalformedExtension {
@@ -1279,7 +1614,7 @@ fn parse_document_base(
         "http" => {
             let origin = origin_key(&parsed).map_err(|error| ExtractError::MalformedExtension {
                 which: "x-ferrum-external-refs",
-                error,
+                error: error.to_string(),
             })?;
             if !process.allow_http_origins.iter().any(|o| o == &origin) {
                 return Err(ExtractError::MalformedExtension {
@@ -1303,9 +1638,12 @@ fn parse_document_base(
 }
 
 fn origin_key(uri: &Url) -> Result<String, ExtractError> {
-    let host = uri
-        .host_str()
-        .ok_or_else(|| external_ref_error("external $ref URI is missing a host"))?;
+    let host = match uri.host() {
+        Some(url::Host::Domain(host)) => host.to_ascii_lowercase(),
+        Some(url::Host::Ipv4(host)) => host.to_string(),
+        Some(url::Host::Ipv6(host)) => format!("[{host}]"),
+        None => return Err(external_ref_error("external $ref URI is missing a host")),
+    };
     let port = uri
         .port_or_known_default()
         .ok_or_else(|| external_ref_error("external $ref URI is missing a port"))?;
@@ -1356,24 +1694,41 @@ fn normalize_percent_escape_case(value: &str) -> String {
 
 /// Redact userinfo and query from a reference before putting it in errors/logs.
 pub fn redact_reference(reference: &str) -> String {
+    let path_candidate = reference.split('?').next().unwrap_or(reference);
+    let bytes = path_candidate.as_bytes();
+    let windows_absolute = bytes.len() >= 3
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    if Path::new(path_candidate).is_absolute()
+        || path_candidate.starts_with("\\\\")
+        || windows_absolute
+    {
+        return "[filesystem path redacted]".to_string();
+    }
     let Ok(mut url) = Url::parse(reference) else {
         // Relative refs: strip query-looking suffixes and never echo raw paths
         // that look absolute.
-        let trimmed = reference.split('?').next().unwrap_or(reference);
-        if trimmed.len() > 128 {
-            return format!("{}…", &trimmed[..128]);
-        }
-        return trimmed.to_string();
+        return truncate_utf8(path_candidate, 128);
     };
+    if url.scheme() == "file" {
+        return "file:[redacted]".to_string();
+    }
     let _ = url.set_username("");
     let _ = url.set_password(None);
     url.set_query(None);
     let rendered = url.as_str();
-    if rendered.len() > 256 {
-        format!("{}…", &rendered[..256])
-    } else {
-        rendered.to_string()
+    truncate_utf8(rendered, 256)
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
     }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
 }
 
 fn external_ref_error(message: &str) -> ExtractError {

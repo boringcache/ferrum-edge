@@ -7746,6 +7746,14 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         use crate::config::types::{AuthMode, ResponseBodyMode};
 
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+            spec.external_ref_snapshot.as_deref(),
+            spec.external_ref_digest.as_deref(),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+        })?;
+
         // --- Resource no-op shortcut (Wave 5 Feature A) -----------------------
         // Compare the current spec-owned resource graph to the incoming bundle
         // inside the SAME transaction as any subsequent write. If they already
@@ -8412,6 +8420,13 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         spec: &crate::config::types::ApiSpec,
     ) -> Result<(), anyhow::Error> {
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+            spec.external_ref_snapshot.as_deref(),
+            spec.external_ref_digest.as_deref(),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+        })?;
         let spec_format_str = match spec.spec_format {
             crate::config::types::SpecFormat::Json => "json",
             crate::config::types::SpecFormat::Yaml => "yaml",
@@ -10632,7 +10647,7 @@ pub(crate) fn strip_api_spec_id_from_runtime_config(config: &mut GatewayConfig) 
 fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
     // spec_content is stored as BLOB/BYTEA — sqlx returns Vec<u8>.
     let spec_content: Vec<u8> = row.try_get("spec_content")?;
-    row_to_api_spec_with_content(row, spec_content)
+    row_to_api_spec_with_content(row, spec_content, true)
 }
 
 /// Parse an api_specs list row into an [`ApiSpec`] summary.
@@ -10641,12 +10656,13 @@ fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow
 /// every row. Keep `spec_content` empty here; full document retrieval goes
 /// through [`row_to_api_spec`].
 fn row_to_api_spec_summary(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
-    row_to_api_spec_with_content(row, Vec::new())
+    row_to_api_spec_with_content(row, Vec::new(), false)
 }
 
 fn row_to_api_spec_with_content(
     row: &AnyRow,
     spec_content: Vec<u8>,
+    snapshot_projected: bool,
 ) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
     use crate::config::types::{ApiSpec, SpecFormat};
 
@@ -10671,12 +10687,26 @@ fn row_to_api_spec_with_content(
     let resource_hash: String = row
         .try_get::<String, _>("resource_hash")
         .unwrap_or_default();
-    let external_ref_snapshot: Option<Vec<u8>> = row
-        .try_get::<Option<Vec<u8>>, _>("external_ref_snapshot")
-        .unwrap_or(None);
-    let external_ref_digest: Option<String> = row
-        .try_get::<Option<String>, _>("external_ref_digest")
-        .unwrap_or(None);
+    let external_ref_snapshot: Option<Vec<u8>> = if snapshot_projected {
+        row.try_get("external_ref_snapshot")?
+    } else {
+        None
+    };
+    let external_ref_digest: Option<String> = row.try_get("external_ref_digest")?;
+    if snapshot_projected {
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+            external_ref_snapshot.as_deref(),
+            external_ref_digest.as_deref(),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+        })?;
+    } else {
+        crate::admin::api_specs::external_refs::validate_external_ref_summary_digest(
+            external_ref_digest.as_deref(),
+        )
+        .map_err(|_| anyhow::anyhow!("api_specs external-ref digest validation failed"))?;
+    }
 
     Ok(ApiSpec {
         id: row.try_get("id")?,

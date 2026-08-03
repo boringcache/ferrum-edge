@@ -6879,3 +6879,75 @@ async fn concurrent_cyclic_imports_all_return_deterministic_422() {
         "admin must remain serviceable after concurrent hostile imports; body: {body}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_ref_http_admission_runs_off_the_async_worker() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let fixture = TcpListener::bind("127.0.0.1:0").expect("bind external-ref fixture");
+    let fixture_port = fixture.local_addr().expect("fixture address").port();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = fixture.accept() {
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let body = br#"{"type":"object","properties":{"id":{"type":"integer"}}}"#;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(headers.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let mut state = make_admin_state(store, 25);
+    let mut policy = ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default();
+    policy.enabled = true;
+    policy.allow_http_origins = vec![format!("http://127.0.0.1:{fixture_port}")];
+    state.external_ref_policy = Arc::new(policy);
+    let (base, _shutdown) = start_admin(state).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("proxy-external-ref-worker");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "External worker", "version": "1"},
+        "x-ferrum-validate": true,
+        "x-ferrum-external-refs": true,
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443
+        },
+        "paths": {
+            "/items": {
+                "get": {
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": format!(
+                                            "http://127.0.0.1:{fixture_port}/schema.json"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "spawn_blocking admission must avoid runtime-thread block_on panic: {body}"
+    );
+}

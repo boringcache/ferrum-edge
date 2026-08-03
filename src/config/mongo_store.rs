@@ -5409,6 +5409,13 @@ mod inner {
     ///
     /// Wave 5: `tags` and `server_urls` are stored as native BSON arrays.
     fn api_spec_to_doc(spec: &ApiSpec) -> Result<Document, anyhow::Error> {
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+            spec.external_ref_snapshot.as_deref(),
+            spec.external_ref_digest.as_deref(),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+        })?;
         let mut doc = mongodb::bson::to_document(spec)?;
         doc.insert("_id", spec.id.as_str());
         doc.insert(
@@ -5482,7 +5489,14 @@ mod inner {
         Ok(event)
     }
 
-    fn doc_to_api_spec(mut doc: Document) -> Result<ApiSpec, anyhow::Error> {
+    fn doc_to_api_spec(doc: Document) -> Result<ApiSpec, anyhow::Error> {
+        doc_to_api_spec_inner(doc, true)
+    }
+
+    fn doc_to_api_spec_inner(
+        mut doc: Document,
+        snapshot_projected: bool,
+    ) -> Result<ApiSpec, anyhow::Error> {
         doc.remove("_id");
         let spec_content = match doc.remove("spec_content") {
             Some(Bson::Binary(binary)) => binary.bytes,
@@ -5512,18 +5526,29 @@ mod inner {
             None => anyhow::bail!("api_specs.spec_content missing"),
         };
         let external_ref_snapshot = match doc.remove("external_ref_snapshot") {
-            Some(Bson::Binary(binary)) => Some(binary.bytes),
+            Some(Bson::Binary(binary)) => {
+                if binary.bytes.len()
+                    > crate::admin::api_specs::external_refs::MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES
+                {
+                    anyhow::bail!("api_specs.external_ref_snapshot exceeds size limit");
+                }
+                Some(binary.bytes)
+            }
             Some(Bson::Null) | None => None,
             Some(Bson::Array(values)) => {
+                if values.len()
+                    > crate::admin::api_specs::external_refs::MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES
+                {
+                    anyhow::bail!("api_specs.external_ref_snapshot exceeds size limit");
+                }
                 let mut bytes = Vec::with_capacity(values.len());
                 for value in values {
                     let byte = match value {
                         Bson::Int32(v) if (0..=u8::MAX as i32).contains(&v) => v as u8,
                         Bson::Int64(v) if (0..=u8::MAX as i64).contains(&v) => v as u8,
-                        other => {
+                        _ => {
                             anyhow::bail!(
-                                "api_specs.external_ref_snapshot array contains non-byte value: {:?}",
-                                other
+                                "api_specs.external_ref_snapshot array contains a non-byte value"
                             );
                         }
                     };
@@ -5531,10 +5556,9 @@ mod inner {
                 }
                 Some(bytes)
             }
-            Some(other) => {
+            Some(_) => {
                 anyhow::bail!(
-                    "api_specs.external_ref_snapshot has unexpected BSON type: {:?}",
-                    other
+                    "api_specs.external_ref_snapshot has an unexpected BSON type"
                 );
             }
         };
@@ -5546,6 +5570,20 @@ mod inner {
         let mut spec: ApiSpec = mongodb::bson::from_document(doc)?;
         spec.spec_content = spec_content;
         spec.external_ref_snapshot = external_ref_snapshot;
+        if snapshot_projected {
+            crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+                spec.external_ref_snapshot.as_deref(),
+                spec.external_ref_digest.as_deref(),
+            )
+            .map_err(|_| {
+                anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+            })?;
+        } else {
+            crate::admin::api_specs::external_refs::validate_external_ref_summary_digest(
+                spec.external_ref_digest.as_deref(),
+            )
+            .map_err(|_| anyhow::anyhow!("api_specs external-ref digest validation failed"))?;
+        }
         Ok(spec)
     }
 
@@ -5557,7 +5595,7 @@ mod inner {
                 bytes: Vec::new(),
             }),
         );
-        doc_to_api_spec(doc)
+        doc_to_api_spec_inner(doc, false)
     }
 
     #[derive(Clone)]
@@ -13458,6 +13496,28 @@ mod inner {
             assert_eq!(restored.spec_content, spec.spec_content);
             assert_eq!(restored.tags, spec.tags);
             assert_eq!(restored.server_urls, spec.server_urls);
+
+            let mut mismatched = api_spec_to_doc(&spec).expect("api_spec_to_doc mismatch fixture");
+            mismatched.insert("external_ref_digest", "a".repeat(64));
+            let error = doc_to_api_spec(mismatched.clone())
+                .expect_err("full Mongo decode must reject digest without snapshot");
+            assert!(error.to_string().contains("integrity validation failed"));
+            let summary = doc_to_api_spec_summary(mismatched)
+                .expect("summary projection may omit an external-ref snapshot blob");
+            assert_eq!(summary.external_ref_digest, Some("a".repeat(64)));
+
+            let mut corrupt = api_spec_to_doc(&spec).expect("api_spec_to_doc corrupt fixture");
+            corrupt.insert("external_ref_digest", "b".repeat(64));
+            corrupt.insert(
+                "external_ref_snapshot",
+                Bson::Binary(Binary {
+                    subtype: BinarySubtype::Generic,
+                    bytes: vec![0x1f, 0x8b, 0x00],
+                }),
+            );
+            let error = doc_to_api_spec(corrupt)
+                .expect_err("full Mongo decode must reject corrupt snapshot bytes");
+            assert!(error.to_string().contains("integrity validation failed"));
         }
 
         #[test]
