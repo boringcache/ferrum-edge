@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::Utc;
 use dashmap::DashMap;
 use ferrum_edge::config::types::{
-    ActiveHealthCheck, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
-    LocalityDistribute, LocalityFailover, PassiveHealthCheck, SubsetDefinition,
-    SubsetTrafficPolicy, Upstream, UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget,
+    ActiveHealthCheck, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm, LocalityDistribute,
+    LocalityFailover, PassiveHealthCheck, SubsetDefinition, SubsetTrafficPolicy, Upstream,
+    UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::load_balancer::{HealthContext, LoadBalancerCache, target_key};
 
@@ -2755,13 +2755,9 @@ fn failover_priority_active_health_signal_enables_label_tiers() {
 #[test]
 fn failover_priority_per_port_health_signal_is_scoped_to_that_port() {
     let mut v1_9090 = target_on_port("v1-9090.local", 9090, None);
-    v1_9090
-        .tags
-        .insert("version".to_string(), "v1".to_string());
+    v1_9090.tags.insert("version".to_string(), "v1".to_string());
     let mut v2_9090 = target_on_port("v2-9090.local", 9090, None);
-    v2_9090
-        .tags
-        .insert("version".to_string(), "v2".to_string());
+    v2_9090.tags.insert("version".to_string(), "v2".to_string());
     let mut up = upstream_with_failover_priority(
         HashMap::from([("version".to_string(), "v1".to_string())]),
         vec![
@@ -2911,11 +2907,8 @@ fn failover_priority_more_than_255_components_preserves_distinct_ranks() {
         .tags
         .insert(priorities[256].clone(), "mismatch".to_string());
 
-    let up = upstream_with_failover_priority(
-        source_labels,
-        vec![higher_rank, lower_rank],
-        priorities,
-    );
+    let up =
+        upstream_with_failover_priority(source_labels, vec![higher_rank, lower_rank], priorities);
     let selection = LoadBalancerCache::select_target_from(
         &LoadBalancerCache::new(&config(up)).load(),
         "ferrum",

@@ -2643,65 +2643,61 @@ impl LoadBalancer {
         // Pre-compute subset → target indices for O(1) subset routing.
         // A target belongs to a subset if its `tags` are a superset of the
         // subset's `labels` (every label key-value pair appears in tags).
-        let (
-            subset_indices,
-            subset_algorithms,
-            subset_hash_on_strategies,
-            subset_failover_enabled,
-        ) = if let Some(defs) = subsets {
-            let mut indices_map = HashMap::with_capacity(defs.len());
-            let mut algorithm_map = HashMap::with_capacity(defs.len());
-            let mut hash_on_map = HashMap::with_capacity(defs.len());
-            let mut failover_set = HashSet::with_capacity(defs.len());
-            for def in defs {
-                let mut indices = Vec::new();
-                for (i, target) in targets.iter().enumerate() {
-                    let matches = def
-                        .labels
-                        .iter()
-                        .all(|(k, v)| target.tags.get(k).is_some_and(|tv| tv == v));
-                    if matches {
-                        indices.push(i);
+        let (subset_indices, subset_algorithms, subset_hash_on_strategies, subset_failover_enabled) =
+            if let Some(defs) = subsets {
+                let mut indices_map = HashMap::with_capacity(defs.len());
+                let mut algorithm_map = HashMap::with_capacity(defs.len());
+                let mut hash_on_map = HashMap::with_capacity(defs.len());
+                let mut failover_set = HashSet::with_capacity(defs.len());
+                for def in defs {
+                    let mut indices = Vec::new();
+                    for (i, target) in targets.iter().enumerate() {
+                        let matches = def
+                            .labels
+                            .iter()
+                            .all(|(k, v)| target.tags.get(k).is_some_and(|tv| tv == v));
+                        if matches {
+                            indices.push(i);
+                        }
+                    }
+                    let effective_algorithm = def
+                        .traffic_policy
+                        .as_ref()
+                        .and_then(|policy| policy.load_balancer_algorithm)
+                        .unwrap_or(algorithm);
+                    let effective_hash_on =
+                        if effective_algorithm == LoadBalancerAlgorithm::ConsistentHashing {
+                            def.traffic_policy
+                                .as_ref()
+                                .and_then(|policy| policy.hash_on.as_deref())
+                                .or(hash_on.as_deref())
+                        } else {
+                            None
+                        };
+                    indices_map.insert(def.name.clone(), indices);
+                    algorithm_map.insert(def.name.clone(), effective_algorithm);
+                    hash_on_map.insert(def.name.clone(), HashOnStrategy::parse(effective_hash_on));
+                    if def
+                        .traffic_policy
+                        .as_ref()
+                        .and_then(|policy| policy.passive_health_check.as_ref())
+                        .is_some()
+                    {
+                        failover_set.insert(def.name.clone());
                     }
                 }
-                let effective_algorithm = def
-                    .traffic_policy
-                    .as_ref()
-                    .and_then(|policy| policy.load_balancer_algorithm)
-                    .unwrap_or(algorithm);
-                let effective_hash_on =
-                    if effective_algorithm == LoadBalancerAlgorithm::ConsistentHashing {
-                        def.traffic_policy
-                            .as_ref()
-                            .and_then(|policy| policy.hash_on.as_deref())
-                            .or(hash_on.as_deref())
-                    } else {
-                        None
-                    };
-                indices_map.insert(def.name.clone(), indices);
-                algorithm_map.insert(def.name.clone(), effective_algorithm);
-                hash_on_map.insert(def.name.clone(), HashOnStrategy::parse(effective_hash_on));
-                if def
-                    .traffic_policy
-                    .as_ref()
-                    .and_then(|policy| policy.passive_health_check.as_ref())
-                    .is_some()
-                {
-                    failover_set.insert(def.name.clone());
-                }
-            }
-            (indices_map, algorithm_map, hash_on_map, failover_set)
-        } else {
-            (
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashSet::new(),
-            )
-        };
+                (indices_map, algorithm_map, hash_on_map, failover_set)
+            } else {
+                (
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashSet::new(),
+                )
+            };
 
-        let failover_enabled = health_checks
-            .is_some_and(|checks| checks.active.is_some() || checks.passive.is_some());
+        let failover_enabled =
+            health_checks.is_some_and(|checks| checks.active.is_some() || checks.passive.is_some());
 
         let mut subset_wrr_state = HashMap::new();
         let mut subset_hash_rings = HashMap::new();
