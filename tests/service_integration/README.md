@@ -113,8 +113,9 @@ What it drives against live Hydra:
 6. Short idle/absolute TTLs observe re-challenge after margin sleeps that do
    not slide the cookie first; a token facade shortens `expires_in` under a
    valid `refresh_skew_secs <= ttl/2` config and asserts a real
-   `refresh_token` grant succeeded at Hydra; logout clears the session and
-   targets Hydra's end-session endpoint when advertised.
+   `refresh_token` grant succeeded at Hydra and produced a newly sealed session
+   cookie; logout clears the session and targets Hydra's exact discovered
+   end-session origin/path.
 
 ### Reproduce OAuth2 introspection coverage
 

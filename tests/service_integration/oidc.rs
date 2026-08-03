@@ -184,6 +184,41 @@ fn assert_cookie_cleared(headers: &HashMap<String, String>, name: &str) {
     );
 }
 
+fn assert_loopback_cookie_security(set_cookie: &str, expected_path: &str) {
+    let attributes: Vec<&str> = set_cookie.split(';').skip(1).map(str::trim).collect();
+    let expected_path_attribute = format!("Path={expected_path}");
+    assert!(
+        attributes
+            .iter()
+            .any(|attribute| attribute.eq_ignore_ascii_case("httponly")),
+        "OIDC cookies must be HttpOnly"
+    );
+    assert!(
+        attributes
+            .iter()
+            .any(|attribute| attribute.eq_ignore_ascii_case("samesite=lax")),
+        "OIDC cookies must use SameSite=Lax in this flow"
+    );
+    assert!(
+        attributes
+            .iter()
+            .any(|attribute| *attribute == expected_path_attribute),
+        "OIDC cookie path must match its configured scope"
+    );
+    assert!(
+        !attributes
+            .iter()
+            .any(|attribute| attribute.to_ascii_lowercase().starts_with("domain=")),
+        "loopback OIDC cookies must remain host-only"
+    );
+    assert!(
+        !attributes
+            .iter()
+            .any(|attribute| attribute.eq_ignore_ascii_case("secure")),
+        "the HTTP loopback fixture explicitly configures secure=false"
+    );
+}
+
 async fn wait_for_browser_challenge(plugin: &Arc<dyn Plugin>) -> BrowserChallenge {
     let mut last = String::new();
     for _ in 0..60 {
@@ -214,6 +249,7 @@ async fn wait_for_browser_challenge(plugin: &Arc<dyn Plugin>) -> BrowserChalleng
                     .get("set-cookie")
                     .cloned()
                     .expect("correlation cookie");
+                assert_loopback_cookie_security(&cookie, REDIRECT_PATH);
                 assert!(
                     url.query_pairs().any(|(k, _)| k == "code_challenge"),
                     "PKCE code_challenge required"
@@ -246,10 +282,15 @@ async fn wait_for_browser_challenge(plugin: &Arc<dyn Plugin>) -> BrowserChalleng
 async fn complete_login(
     hydra: &HydraContainer,
     plugin: &Arc<dyn Plugin>,
+    client: &HydraClient,
     challenge: &BrowserChallenge,
 ) -> String {
     let callback = hydra
-        .complete_authorization_redirect(&challenge.location)
+        .complete_authorization_redirect(
+            &challenge.location,
+            &client.redirect_uri,
+            &challenge.state,
+        )
         .await
         .expect("Hydra authorization-code redirect");
     assert_eq!(
@@ -275,12 +316,19 @@ async fn complete_login(
         panic!("expected post-login redirect");
     };
     assert_eq!(status_code, 302, "successful callback redirects");
+    assert_eq!(
+        headers.get("location").map(String::as_str),
+        Some("http://127.0.0.1/app"),
+        "callback must return to the exact trusted original target"
+    );
+    assert_cookie_cleared(&headers, cookie_name(&challenge.cookie));
     let set_cookie = headers.get("set-cookie").expect("session Set-Cookie");
-    set_cookie
+    let session_cookie = set_cookie
         .lines()
         .find(|line| line.contains("ferrum_oidc_si="))
-        .expect("encrypted session cookie")
-        .to_string()
+        .expect("encrypted session cookie");
+    assert_loopback_cookie_security(session_cookie, "/");
+    session_cookie.to_string()
 }
 
 fn session_ctx(set_cookie: &str, path: &str) -> RequestContext {
@@ -355,7 +403,7 @@ async fn oidc_live_discovery_login_session_and_claims() {
 
     let plugin = oidc_plugin(base_oidc_config(&hydra, &client));
     let challenge = wait_for_browser_challenge(&plugin).await;
-    let session_cookie = complete_login(&hydra, &plugin, &challenge).await;
+    let session_cookie = complete_login(&hydra, &plugin, &client, &challenge).await;
 
     // Authenticated session: identity + claim headers + correlation cleared.
     let mut ctx = session_ctx(&session_cookie, "/app");
@@ -399,7 +447,11 @@ async fn oidc_live_discovery_login_session_and_claims() {
     // Negative: wrong state / missing correlation cookie.
     let challenge2 = wait_for_browser_challenge(&plugin).await;
     let callback = hydra
-        .complete_authorization_redirect(&challenge2.location)
+        .complete_authorization_redirect(
+            &challenge2.location,
+            &client.redirect_uri,
+            &challenge2.state,
+        )
         .await
         .expect("second auth code");
     let mut bad_state = html_ctx(REDIRECT_PATH);
@@ -439,7 +491,11 @@ async fn oidc_live_discovery_login_session_and_claims() {
     )
     .expect("rewrite nonce");
     let cb_nonce = hydra
-        .complete_authorization_redirect(&mismatched_auth)
+        .complete_authorization_redirect(
+            &mismatched_auth,
+            &client.redirect_uri,
+            &challenge_nonce.state,
+        )
         .await
         .expect("code for nonce-mismatch");
     assert_eq!(cb_nonce.state, challenge_nonce.state);
@@ -476,7 +532,11 @@ async fn oidc_live_discovery_login_session_and_claims() {
     ));
     let ch = wait_for_browser_challenge(&wrong_iss_plugin).await;
     let cb = hydra
-        .complete_authorization_redirect(&ch.location)
+        .complete_authorization_redirect(
+            &ch.location,
+            &client.redirect_uri,
+            &ch.state,
+        )
         .await
         .expect("code for wrong-issuer plugin");
     let mut cb_ctx = html_ctx(REDIRECT_PATH);
@@ -499,7 +559,11 @@ async fn oidc_live_discovery_login_session_and_claims() {
     let wrong_aud_plugin = oidc_plugin(wrong_aud);
     let ch = wait_for_browser_challenge(&wrong_aud_plugin).await;
     let cb = hydra
-        .complete_authorization_redirect(&ch.location)
+        .complete_authorization_redirect(
+            &ch.location,
+            &client.redirect_uri,
+            &ch.state,
+        )
         .await
         .expect("code for wrong-audience plugin");
     let mut cb_ctx = html_ctx(REDIRECT_PATH);
@@ -541,7 +605,11 @@ async fn oidc_live_discovery_login_session_and_claims() {
     ));
     let ch = wait_for_browser_challenge(&wrong_sig_plugin).await;
     let cb = hydra
-        .complete_authorization_redirect(&ch.location)
+        .complete_authorization_redirect(
+            &ch.location,
+            &client.redirect_uri,
+            &ch.state,
+        )
         .await
         .expect("code for wrong-jwks plugin");
     let mut cb_ctx = html_ctx(REDIRECT_PATH);
@@ -596,7 +664,7 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
     let plugin = oidc_plugin(cfg);
 
     let challenge = wait_for_browser_challenge(&plugin).await;
-    let session_cookie = complete_login(&hydra, &plugin, &challenge).await;
+    let session_cookie = complete_login(&hydra, &plugin, &client, &challenge).await;
     assert!(
         token_stats.authorization_code_ok.load(Ordering::SeqCst) >= 1,
         "login must complete an authorization_code grant through the facade"
@@ -618,10 +686,21 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
         );
         let mut rolled = HashMap::new();
         assert_continue(plugin.after_proxy(&mut ctx, 200, &mut rolled).await);
-        if let Some(set_cookie) = rolled.get("set-cookie") {
-            renewed = set_cookie.clone();
-        }
         if token_stats.refresh_token_ok.load(Ordering::SeqCst) > refresh_before {
+            let set_cookie = rolled
+                .get("set-cookie")
+                .expect("successful refresh must re-issue the session cookie");
+            let refreshed_cookie = set_cookie
+                .lines()
+                .find(|line| cookie_name(line) == "ferrum_oidc_si")
+                .expect("refreshed Ferrum session cookie");
+            assert_loopback_cookie_security(refreshed_cookie, "/");
+            assert_ne!(
+                cookie_pair(refreshed_cookie),
+                cookie_pair(&renewed),
+                "refreshed session must carry newly sealed state"
+            );
+            renewed = refreshed_cookie.to_string();
             saw_refresh = true;
             break;
         }
@@ -639,7 +718,7 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
     idle_cfg["behavior"]["refresh_skew_secs"] = json!(0);
     let idle_plugin = oidc_plugin(idle_cfg);
     let ch = wait_for_browser_challenge(&idle_plugin).await;
-    let idle_cookie = complete_login(&hydra, &idle_plugin, &ch).await;
+    let idle_cookie = complete_login(&hydra, &idle_plugin, &client, &ch).await;
     sleep_past_ttl_secs(2).await;
     let mut idle_ctx = session_ctx(&idle_cookie, "/app");
     assert_rechallenge(
@@ -656,7 +735,7 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
     abs_cfg["behavior"]["refresh_skew_secs"] = json!(0);
     let abs_plugin = oidc_plugin(abs_cfg);
     let ch = wait_for_browser_challenge(&abs_plugin).await;
-    let abs_cookie = complete_login(&hydra, &abs_plugin, &ch).await;
+    let abs_cookie = complete_login(&hydra, &abs_plugin, &client, &ch).await;
     sleep_past_ttl_secs(2).await;
     let mut abs_ctx = session_ctx(&abs_cookie, "/app");
     assert_rechallenge(
@@ -670,7 +749,7 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
     let expected_end_session = discovery
         .get("end_session_endpoint")
         .and_then(Value::as_str)
-        .map(str::to_owned);
+        .expect("Hydra discovery must advertise end_session_endpoint");
     let mut logout_ctx = session_ctx(&renewed, LOGOUT_PATH);
     match plugin.on_request_received(&mut logout_ctx).await {
         PluginResult::Reject {
@@ -679,15 +758,32 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
             ..
         } => {
             let location = headers.get("location").expect("logout Location");
-            if let Some(end_session) = &expected_end_session {
-                assert!(
-                    location.starts_with(end_session),
-                    "RP-initiated logout must redirect to the discovered end-session endpoint"
-                );
-            } else {
-                assert_eq!(location, "http://127.0.0.1/");
-            }
+            let actual = Url::parse(location).expect("logout Location URL");
+            let expected = Url::parse(expected_end_session).expect("end-session URL");
+            assert_eq!(actual.origin(), expected.origin());
+            assert_eq!(actual.path(), expected.path());
+            assert_eq!(
+                actual
+                    .query_pairs()
+                    .find_map(|(key, value)| (key == "post_logout_redirect_uri").then(|| value)),
+                Some("http://127.0.0.1/".into())
+            );
+            assert_eq!(
+                actual
+                    .query_pairs()
+                    .find_map(|(key, value)| (key == "client_id").then(|| value)),
+                Some(client.client_id.as_str().into())
+            );
             assert_cookie_cleared(&headers, cookie_name(&renewed));
+            let cleared = headers
+                .get("set-cookie")
+                .and_then(|cookies| {
+                    cookies
+                        .lines()
+                        .find(|line| cookie_name(line) == cookie_name(&renewed))
+                })
+                .expect("cleared session cookie");
+            assert_loopback_cookie_security(cleared, "/");
         }
         other => panic!("expected logout redirect, got {other:?}"),
     }

@@ -196,10 +196,7 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
             .authenticate(&mut scope_ctx, &ConsumerIndex::new(&[]))
             .await,
     );
-    assert!(
-        scope_status == Some(403) || scope_status == Some(401),
-        "missing required scope must deny"
-    );
+    assert_eq!(scope_status, Some(403), "missing required scope must deny");
 
     let wrong_issuer = introspection_plugin(json!({
         "providers": [{
@@ -300,6 +297,9 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
     let basic_before = facade_stats
         .basic_authorization_header
         .load(Ordering::SeqCst);
+    let post_secret_before = facade_stats
+        .post_client_secret_field
+        .load(Ordering::SeqCst);
 
     let mut disc_ctx = bearer_ctx(&active);
     assert_eq!(
@@ -324,6 +324,13 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
             .load(Ordering::SeqCst)
             > basic_before,
         "client_secret_basic must present Authorization to the facade"
+    );
+    assert_eq!(
+        facade_stats
+            .post_client_secret_field
+            .load(Ordering::SeqCst),
+        post_secret_before,
+        "client_secret_basic must not send a client_secret form field"
     );
 
     // Cache hit: second lookup must not call upstream again.
@@ -461,7 +468,7 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
         claim_ctx.authenticated_identity.as_deref(),
         Some(FIXTURE_EMAIL)
     );
-    let mut claim_upstream = HashMap::new();
+    let mut claim_upstream = claim_ctx.headers.clone();
     assert!(matches!(
         claim_plugin
             .before_proxy(&mut claim_ctx, &mut claim_upstream)
@@ -479,6 +486,29 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
             .get("x-introspected-roles")
             .is_some_and(|roles| roles.contains(FIXTURE_ROLE)),
         "roles claim must reach the configured upstream header"
+    );
+
+    let wrong_role = introspection_plugin(json!({
+        "role_claim": "ext.roles",
+        "providers": [{
+            "introspection_endpoint": hydra.introspection_endpoint(),
+            "client_auth": {
+                "method": "client_secret_basic",
+                "client_id": claim_client.client_id,
+                "client_secret": claim_client.client_secret
+            },
+            "required_roles": ["administrator"]
+        }]
+    }));
+    let mut wrong_role_ctx = bearer_ctx(&claim_token);
+    assert_eq!(
+        reject_status(
+            &wrong_role
+                .authenticate(&mut wrong_role_ctx, &ConsumerIndex::new(&[]))
+                .await
+        ),
+        Some(403),
+        "a live token missing the configured role must be denied"
     );
 }
 

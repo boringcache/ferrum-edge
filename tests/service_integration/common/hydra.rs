@@ -59,6 +59,8 @@ pub struct HydraContainer {
     pub public_url: String,
     pub admin_url: String,
     pub issuer: String,
+    login_url: String,
+    consent_url: String,
     client: reqwest::Client,
     /// Unique suffix used in client IDs for this fixture instance.
     pub isolation: String,
@@ -164,6 +166,8 @@ pub async fn start_hydra_container() -> Result<HydraContainer, BoxError> {
         public_url,
         admin_url,
         issuer,
+        login_url,
+        consent_url,
         client,
         isolation,
     };
@@ -434,9 +438,19 @@ impl HydraContainer {
     pub async fn complete_authorization_redirect(
         &self,
         authorization_url: &str,
+        expected_redirect_uri: &str,
+        expected_state: &str,
     ) -> Result<AuthCodeCallback, BoxError> {
         let mut cookies = CookieJar::default();
         let mut location = authorization_url.to_string();
+        let expected_callback = Url::parse(expected_redirect_uri)
+            .map_err(|e| format!("expected callback URL parse: {e}"))?;
+        let public_origin = Url::parse(&self.public_url)
+            .map_err(|e| format!("Hydra public URL parse: {e}"))?;
+        let login_target =
+            Url::parse(&self.login_url).map_err(|e| format!("Hydra login URL parse: {e}"))?;
+        let consent_target = Url::parse(&self.consent_url)
+            .map_err(|e| format!("Hydra consent URL parse: {e}"))?;
 
         // Cap redirect hops so a misconfigured fixture fails fast.
         for _ in 0..12 {
@@ -444,16 +458,38 @@ impl HydraContainer {
                 Url::parse(&location).map_err(|e| format!("redirect location parse: {e}"))?;
 
             if let Some(code) = query_param(&parsed, "code") {
-                let state = query_param(&parsed, "state").unwrap_or_default();
+                if !same_redirect_target(&parsed, &expected_callback) || parsed.fragment().is_some()
+                {
+                    return Err("authorization code used an unexpected callback target".into());
+                }
+                let state = query_param(&parsed, "state")
+                    .filter(|state| !state.is_empty())
+                    .ok_or("authorization callback missing state")?;
+                if state != expected_state {
+                    return Err("authorization callback state mismatch".into());
+                }
                 return Ok(AuthCodeCallback { code, state });
             }
             if let Some(challenge) = query_param(&parsed, "login_challenge") {
+                if !same_redirect_target(&parsed, &login_target) {
+                    return Err("login challenge was delivered to an unexpected target".into());
+                }
                 location = self.accept_login(&challenge).await?;
                 continue;
             }
             if let Some(challenge) = query_param(&parsed, "consent_challenge") {
+                if !same_redirect_target(&parsed, &consent_target) {
+                    return Err("consent challenge was delivered to an unexpected target".into());
+                }
                 location = self.accept_consent(&challenge).await?;
                 continue;
+            }
+
+            if !same_origin(&parsed, &public_origin)
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+            {
+                return Err("authorization redirect left the Hydra public origin".into());
             }
 
             let resp = self
@@ -644,7 +680,9 @@ impl HydraContainer {
                 .append_pair("audience", &client.audience);
         }
 
-        let callback = self.complete_authorization_redirect(auth.as_str()).await?;
+        let callback = self
+            .complete_authorization_redirect(auth.as_str(), &client.redirect_uri, &state)
+            .await?;
         let form = [
             ("grant_type", "authorization_code"),
             ("code", callback.code.as_str()),
@@ -740,6 +778,20 @@ impl CookieJar {
 fn query_param(url: &Url, name: &str) -> Option<String> {
     url.query_pairs()
         .find_map(|(k, v)| (k == name).then(|| v.into_owned()))
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    matches!(left.scheme(), "http" | "https")
+        && left.scheme() == right.scheme()
+        && left.host() == right.host()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn same_redirect_target(actual: &Url, expected: &Url) -> bool {
+    same_origin(actual, expected)
+        && actual.username() == expected.username()
+        && actual.password() == expected.password()
+        && actual.path() == expected.path()
 }
 
 fn resolve_location(current: &str, location: &str) -> String {
