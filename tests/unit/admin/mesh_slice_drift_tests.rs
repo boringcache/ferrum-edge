@@ -9,7 +9,8 @@ use ferrum_edge::grpc::cp_server::CpScope;
 use ferrum_edge::grpc::mesh_slice_drift::{
     MESH_SLICE_DRIFT_MAX_ENTRIES, MESH_SLICE_DRIFT_MAX_REASON_BYTES,
     MESH_SLICE_DRIFT_REJECTION_REASON, MeshSliceConvergenceState, MeshSliceDriftAdmitError,
-    MeshSliceDriftRegistry, sanitize_reason, validate_version,
+    MeshSliceDriftRegistry, render_mesh_slice_drift_metrics, sanitize_reason,
+    slice_content_digest, validate_version,
 };
 use ferrum_edge::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
@@ -293,6 +294,199 @@ fn projected_config(second: u32, services: Vec<MeshService>) -> GatewayConfig {
         })),
         ..GatewayConfig::default()
     }
+}
+
+fn service_with_protocol_overrides(overrides: Vec<(u16, AppProtocol)>) -> MeshService {
+    let mut service = service("api", "ferrum");
+    let mut ports: Vec<_> = overrides
+        .iter()
+        .map(|(port, protocol)| ServicePort {
+            port: *port,
+            protocol: *protocol,
+            name: Some(format!("port-{port}")),
+            target_port: None,
+        })
+        .collect();
+    ports.sort_by_key(|port| port.port);
+    service.ports = ports;
+    service.protocol_overrides = overrides.into_iter().collect();
+    service
+}
+
+fn direct_digest_bytes(slice: &MeshSlice) -> Vec<u8> {
+    let mut slice = slice.clone();
+    slice.version.clear();
+    slice.revision = None;
+    serde_json::to_vec(&slice).unwrap()
+}
+
+#[test]
+fn projected_digest_recursively_canonicalizes_nested_maps() {
+    let request = MeshSliceRequest {
+        node_id: "dp-a".to_string(),
+        namespace: "ferrum".to_string(),
+        ..MeshSliceRequest::default()
+    };
+    let overrides: Vec<_> = (9000..9016)
+        .map(|port| (port, AppProtocol::Grpc))
+        .collect();
+    let first_config = projected_config(
+        0,
+        vec![service_with_protocol_overrides(overrides.clone())],
+    );
+    let first_slice = MeshSlice::from_gateway_config(&first_config, request.clone());
+    let (reordered_config, reordered_slice) = (1..=32)
+        .find_map(|second| {
+            let mut reordered = overrides.clone();
+            reordered.reverse();
+            let config = projected_config(
+                second,
+                vec![service_with_protocol_overrides(reordered)],
+            );
+            let slice = MeshSlice::from_gateway_config(&config, request.clone());
+            (direct_digest_bytes(&first_slice) != direct_digest_bytes(&slice))
+                .then_some((config, slice))
+        })
+        .expect("construct content-equal maps with different direct serialization order");
+    let mut changed_overrides = overrides;
+    changed_overrides[0].1 = AppProtocol::Tcp;
+    let changed_config = projected_config(
+        33,
+        vec![service_with_protocol_overrides(changed_overrides)],
+    );
+    let changed_slice = MeshSlice::from_gateway_config(&changed_config, request.clone());
+
+    assert!(first_slice.content_eq(&reordered_slice));
+    assert_eq!(
+        slice_content_digest(&first_slice).unwrap(),
+        slice_content_digest(&reordered_slice).unwrap(),
+        "nested map insertion order is not semantic"
+    );
+    assert!(!first_slice.content_eq(&changed_slice));
+    assert_ne!(
+        slice_content_digest(&first_slice).unwrap(),
+        slice_content_digest(&changed_slice).unwrap(),
+        "a protocol change is semantic"
+    );
+
+    let registry = MeshSliceDriftRegistry::new();
+    let token = registry
+        .open_projected_session(
+            "dp-a",
+            "ferrum",
+            at(0),
+            &first_slice,
+            request,
+            CpScope::Single("ferrum".to_string()),
+            None,
+        )
+        .unwrap();
+    registry.mark_disconnected("dp-a", &token, at(0));
+
+    assert_eq!(
+        registry.reconcile_disconnected_desired(&reordered_config, at(1)),
+        Ok(0),
+        "content-equal reordered maps must not advance desired"
+    );
+    assert_eq!(
+        registry.snapshot().data_planes[0]
+            .desired
+            .as_ref()
+            .unwrap()
+            .version,
+        first_slice.version
+    );
+    assert_eq!(
+        registry.reconcile_disconnected_desired(&changed_config, at(2)),
+        Ok(1),
+        "semantic changes must advance desired"
+    );
+    assert_eq!(
+        registry.snapshot().data_planes[0]
+            .desired
+            .as_ref()
+            .unwrap()
+            .version,
+        changed_slice.version
+    );
+}
+
+fn assert_rendered_summary_is_coherent(output: &str) -> bool {
+    let mut tracked = None;
+    let mut states = Vec::new();
+    for line in output.lines() {
+        if line.starts_with("ferrum_mesh_slice_drift_data_planes{") {
+            states.push(
+                line.rsplit_once(' ')
+                    .expect("state metric value")
+                    .1
+                    .parse::<usize>()
+                    .expect("state metric integer"),
+            );
+        } else if line.starts_with("ferrum_mesh_slice_drift_tracked_data_planes ") {
+            tracked = Some(
+                line.rsplit_once(' ')
+                    .expect("tracked metric value")
+                    .1
+                    .parse::<usize>()
+                    .expect("tracked metric integer"),
+            );
+        }
+    }
+    let Some(tracked) = tracked else {
+        return false;
+    };
+    assert_eq!(states.len(), 5);
+    assert_eq!(tracked, states.into_iter().sum::<usize>());
+    true
+}
+
+#[test]
+fn prometheus_summary_publication_is_coherent_during_registry_mutations() {
+    let start = Arc::new(Barrier::new(3));
+    let mut writers = Vec::new();
+    for writer in 0..2 {
+        let start = start.clone();
+        writers.push(std::thread::spawn(move || {
+            let registry = MeshSliceDriftRegistry::with_max_entries(1);
+            let node_id = format!("summary-dp-{writer}");
+            let mut token = registry
+                .open_session(&node_id, "ferrum", at(0), Some("v1"))
+                .unwrap();
+            start.wait();
+            for iteration in 0..500 {
+                registry
+                    .record_sent(&node_id, &token, "v1", at(0))
+                    .unwrap();
+                if iteration % 2 == 0 {
+                    registry
+                        .record_status(&node_id, &token, "v1", None, at(0))
+                        .unwrap();
+                } else {
+                    registry.mark_disconnected(&node_id, &token, at(0));
+                    token = registry
+                        .open_session(&node_id, "ferrum", at(0), Some("v1"))
+                        .unwrap();
+                }
+                std::thread::yield_now();
+            }
+        }));
+    }
+
+    start.wait();
+    let mut observed = 0usize;
+    for _ in 0..1_000 {
+        let mut output = String::new();
+        render_mesh_slice_drift_metrics(&mut output, "");
+        if assert_rendered_summary_is_coherent(&output) {
+            observed += 1;
+        }
+        std::thread::yield_now();
+    }
+    for writer in writers {
+        writer.join().expect("summary publication writer");
+    }
+    assert!(observed > 0, "at least one non-empty summary must render");
 }
 
 #[test]

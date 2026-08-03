@@ -36,9 +36,9 @@
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 use uuid::Uuid;
 
 use super::cp_server::{CpGrpcServer, CpScope};
@@ -279,13 +279,11 @@ impl MeshSliceDriftAdmitError {
     }
 }
 
-/// Process-global summary gauges (closed-set `state` label only).
-static DRIFT_SUMMARY_CONVERGED: AtomicU64 = AtomicU64::new(0);
-static DRIFT_SUMMARY_DRIFTED: AtomicU64 = AtomicU64::new(0);
-static DRIFT_SUMMARY_REJECTING: AtomicU64 = AtomicU64::new(0);
-static DRIFT_SUMMARY_PENDING: AtomicU64 = AtomicU64::new(0);
-static DRIFT_SUMMARY_DISCONNECTED: AtomicU64 = AtomicU64::new(0);
-static DRIFT_SUMMARY_TRACKED: AtomicU64 = AtomicU64::new(0);
+/// Process-global summary gauges (closed-set `state` label only). Production
+/// has one CP registry; the immutable snapshot also keeps test registries from
+/// publishing a summary assembled from multiple generations.
+static DRIFT_SUMMARY: LazyLock<ArcSwap<MeshSliceDriftSummary>> =
+    LazyLock::new(|| ArcSwap::from_pointee(MeshSliceDriftSummary::default()));
 
 #[derive(Default)]
 struct RegistryState {
@@ -679,12 +677,7 @@ impl MeshSliceDriftRegistry {
             }
         }
 
-        DRIFT_SUMMARY_TRACKED.store(summary.tracked as u64, Ordering::Relaxed);
-        DRIFT_SUMMARY_CONVERGED.store(summary.converged as u64, Ordering::Relaxed);
-        DRIFT_SUMMARY_DRIFTED.store(summary.drifted as u64, Ordering::Relaxed);
-        DRIFT_SUMMARY_REJECTING.store(summary.rejecting as u64, Ordering::Relaxed);
-        DRIFT_SUMMARY_PENDING.store(summary.pending as u64, Ordering::Relaxed);
-        DRIFT_SUMMARY_DISCONNECTED.store(summary.disconnected as u64, Ordering::Relaxed);
+        DRIFT_SUMMARY.store(Arc::new(summary.clone()));
 
         self.snapshot.store(Arc::new(MeshSliceDriftSnapshot {
             generated_at: now,
@@ -945,13 +938,39 @@ fn validate_projection_context(
     Ok(())
 }
 
-fn slice_content_digest(slice: &MeshSlice) -> Result<[u8; 32], MeshSliceDriftAdmitError> {
+#[doc(hidden)]
+pub fn slice_content_digest(slice: &MeshSlice) -> Result<[u8; 32], MeshSliceDriftAdmitError> {
     let mut canonical = slice.clone();
     canonical.version.clear();
     canonical.revision = None;
-    serde_json::to_vec(&canonical)
+    serde_json::to_value(&canonical)
+        .map(canonical_json_value)
+        .and_then(|value| serde_json::to_vec(&value))
         .map(Sha256::digest)
         .map_err(|_| MeshSliceDriftAdmitError::ProjectionFailed)
+}
+
+/// Recursively sort every JSON object while preserving array order and scalar
+/// values. `MeshSlice` contains nested `HashMap`s whose insertion order is not
+/// semantic, while its arrays are intentionally order-sensitive.
+fn canonical_json_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let sorted: BTreeMap<String, Value> = map
+                .into_iter()
+                .map(|(key, value)| (key, canonical_json_value(value)))
+                .collect();
+            let mut canonical = serde_json::Map::with_capacity(sorted.len());
+            for (key, value) in sorted {
+                canonical.insert(key, value);
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(canonical_json_value).collect())
+        }
+        other => other,
+    }
 }
 
 /// Conservative NACK diagnostic for admin surfaces. Raw authenticated-caller
@@ -968,16 +987,11 @@ pub fn sanitize_reason(raw: &str) -> String {
 /// Render closed-set CP mesh slice convergence gauges into a Prometheus text
 /// exposition buffer. Label cardinality is fixed (`state` ∈ five values).
 pub fn render_mesh_slice_drift_metrics(output: &mut String, gateway_ns_label: &str) {
-    let tracked = DRIFT_SUMMARY_TRACKED.load(Ordering::Relaxed);
+    let summary = DRIFT_SUMMARY.load_full();
+    let tracked = summary.tracked;
     // Only emit when the CP has ever tracked a DP (avoids noise on non-CP
     // processes that share the binary).
-    if tracked == 0
-        && DRIFT_SUMMARY_CONVERGED.load(Ordering::Relaxed) == 0
-        && DRIFT_SUMMARY_DRIFTED.load(Ordering::Relaxed) == 0
-        && DRIFT_SUMMARY_REJECTING.load(Ordering::Relaxed) == 0
-        && DRIFT_SUMMARY_PENDING.load(Ordering::Relaxed) == 0
-        && DRIFT_SUMMARY_DISCONNECTED.load(Ordering::Relaxed) == 0
-    {
+    if tracked == 0 {
         return;
     }
 
@@ -986,25 +1000,13 @@ pub fn render_mesh_slice_drift_metrics(output: &mut String, gateway_ns_label: &s
     );
     output.push_str("# TYPE ferrum_mesh_slice_drift_data_planes gauge\n");
     for (state, value) in [
-        (
-            MeshSliceConvergenceState::Converged,
-            DRIFT_SUMMARY_CONVERGED.load(Ordering::Relaxed),
-        ),
-        (
-            MeshSliceConvergenceState::Drifted,
-            DRIFT_SUMMARY_DRIFTED.load(Ordering::Relaxed),
-        ),
-        (
-            MeshSliceConvergenceState::Rejecting,
-            DRIFT_SUMMARY_REJECTING.load(Ordering::Relaxed),
-        ),
-        (
-            MeshSliceConvergenceState::Pending,
-            DRIFT_SUMMARY_PENDING.load(Ordering::Relaxed),
-        ),
+        (MeshSliceConvergenceState::Converged, summary.converged),
+        (MeshSliceConvergenceState::Drifted, summary.drifted),
+        (MeshSliceConvergenceState::Rejecting, summary.rejecting),
+        (MeshSliceConvergenceState::Pending, summary.pending),
         (
             MeshSliceConvergenceState::Disconnected,
-            DRIFT_SUMMARY_DISCONNECTED.load(Ordering::Relaxed),
+            summary.disconnected,
         ),
     ] {
         output.push_str(&format!(
