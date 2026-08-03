@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::sync::{Notify, oneshot};
+use tokio::task::{AbortHandle, JoinHandle};
 
 const INBOUND_QUERY: &str = "access_token=secret&tag=red&tag=blue&page=1&flag&keep=1";
 const EXPECTED_QUERY: &str = "tag=green&tag=green&page=2&flag&keep=1&version=v2";
@@ -56,7 +56,7 @@ async fn request_transformer_query_rules_reach_primary_and_mirror_on_h1_h2_h3() 
         );
     }
 
-    harness.shutdown();
+    harness.shutdown().await;
 }
 
 #[ignore]
@@ -89,14 +89,16 @@ async fn request_transformer_query_survives_retry_on_h1() {
             "attempt {idx} must not resurrect removed credential: {target}"
         );
     }
-    harness.shutdown();
+    harness.shutdown().await;
 }
 
 struct CapturingBackend {
     port: u16,
     targets: Arc<Mutex<Vec<String>>>,
     notify: Arc<Notify>,
+    connection_aborts: Arc<Mutex<Vec<AbortHandle>>>,
     handle: Option<JoinHandle<()>>,
+    shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl CapturingBackend {
@@ -115,57 +117,84 @@ impl CapturingBackend {
         let port = listener.local_addr().expect("local addr").port();
         let targets = Arc::new(Mutex::new(Vec::new()));
         let notify = Arc::new(Notify::new());
+        let connection_aborts = Arc::new(Mutex::new(Vec::new()));
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let (accept_ready_tx, accept_ready_rx) = oneshot::channel::<()>();
         let targets_task = targets.clone();
         let notify_task = notify.clone();
+        let aborts_task = connection_aborts.clone();
         let handle = tokio::spawn(async move {
+            // Signal that the accept loop is scheduled and the listener is
+            // owned by this supervised task before the first accept waits.
+            let _ = accept_ready_tx.send(());
             loop {
-                match listener.accept().await {
-                    Ok((mut stream, _)) => {
-                        let targets = targets_task.clone();
-                        let notify = notify_task.clone();
-                        tokio::spawn(async move {
-                            let mut buf = Vec::new();
-                            let mut chunk = [0u8; 4096];
-                            loop {
-                                match stream.read(&mut chunk).await {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        buf.extend_from_slice(&chunk[..n]);
-                                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                                            break;
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => return,
+                    accept_result = listener.accept() => {
+                        match accept_result {
+                            Ok((mut stream, _)) => {
+                                let targets = targets_task.clone();
+                                let notify = notify_task.clone();
+                                let jh = tokio::spawn(async move {
+                                    let mut buf = Vec::new();
+                                    let mut chunk = [0u8; 4096];
+                                    loop {
+                                        match stream.read(&mut chunk).await {
+                                            Ok(0) => break,
+                                            Ok(n) => {
+                                                buf.extend_from_slice(&chunk[..n]);
+                                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                                    break;
+                                                }
+                                            }
+                                            Err(_) => return,
                                         }
                                     }
-                                    Err(_) => return,
+                                    let head = String::from_utf8_lossy(&buf);
+                                    let request_line = head.lines().next().unwrap_or("");
+                                    let target = request_line
+                                        .split_whitespace()
+                                        .nth(1)
+                                        .unwrap_or("")
+                                        .to_string();
+                                    targets.lock().expect("targets lock").push(target);
+                                    notify.notify_waiters();
+                                    let response = if fail_all {
+                                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                            as &[u8]
+                                    } else {
+                                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                                    };
+                                    let _ = stream.write_all(response).await;
+                                    let _ = stream.shutdown().await;
+                                });
+                                if let Ok(mut guard) = aborts_task.lock() {
+                                    guard.retain(|h| !h.is_finished());
+                                    guard.push(jh.abort_handle());
                                 }
                             }
-                            let head = String::from_utf8_lossy(&buf);
-                            let request_line = head.lines().next().unwrap_or("");
-                            let target = request_line
-                                .split_whitespace()
-                                .nth(1)
-                                .unwrap_or("")
-                                .to_string();
-                            targets.lock().expect("targets lock").push(target);
-                            notify.notify_waiters();
-                            let response = if fail_all {
-                                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                                    as &[u8]
-                            } else {
-                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
-                            };
-                            let _ = stream.write_all(response).await;
-                            let _ = stream.shutdown().await;
-                        });
+                            Err(_) => {
+                                // Listener closed during shutdown, or a transient
+                                // accept error. Re-check the shutdown channel.
+                                continue;
+                            }
+                        }
                     }
-                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
                 }
             }
         });
+        // Event-driven: do not return until the accept loop task has started.
+        accept_ready_rx
+            .await
+            .expect("capturing backend accept loop exited before signaling ready");
         Self {
             port,
             targets,
             notify,
+            connection_aborts,
             handle: Some(handle),
+            shutdown: Some(shutdown_tx),
         }
     }
 
@@ -177,7 +206,35 @@ impl CapturingBackend {
         self.targets.lock().expect("targets lock").clear();
     }
 
+    /// Signal shutdown, abort in-flight connection handlers, and join the
+    /// accept loop so cancel/panic failures are visible to the caller.
+    async fn shutdown_join(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Ok(mut guard) = self.connection_aborts.lock() {
+            for abort in guard.drain(..) {
+                abort.abort();
+            }
+        }
+        if let Some(handle) = self.handle.take() {
+            match handle.await {
+                Ok(()) => {}
+                Err(err) if err.is_cancelled() => {}
+                Err(err) => panic!("capturing backend accept loop join failed: {err}"),
+            }
+        }
+    }
+
     fn abort(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Ok(mut guard) = self.connection_aborts.lock() {
+            for abort in guard.drain(..) {
+                abort.abort();
+            }
+        }
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
@@ -274,10 +331,10 @@ impl TransformerQueryHarness {
         )
     }
 
-    fn shutdown(&mut self) {
+    async fn shutdown(&mut self) {
         self.gateway.shutdown();
-        self.primary.abort();
-        self.mirror.abort();
+        self.primary.shutdown_join().await;
+        self.mirror.shutdown_join().await;
     }
 }
 
@@ -301,7 +358,34 @@ impl TransformerRetryHarness {
             .await
             .expect("proxy port ready");
 
-        Self { gateway, backend }
+        let mut harness = Self { gateway, backend };
+        // Event-driven ownership proof: wait until *this* gateway dials *our*
+        // backend (capability / warmup probe traffic is enough). A foreign
+        // SO_REUSEPORT sharer would never dial this listener. Clear probe
+        // captures before the semantic retry request so attempt counts stay
+        // exact.
+        harness
+            .wait_for_backend_dial(Duration::from_secs(5))
+            .await
+            .expect("timed out waiting for gateway to dial capturing backend");
+        harness.backend.clear();
+        harness
+    }
+
+    async fn wait_for_backend_dial(&self, timeout: Duration) -> Option<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if !self.backend.targets().is_empty() {
+                return Some(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::select! {
+                _ = self.backend.notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
     }
 
     async fn wait_for_attempts(&self, count: usize, timeout: Duration) -> Option<Vec<String>> {
@@ -333,9 +417,9 @@ impl TransformerRetryHarness {
             .proxy_url(&format!("/resource?{INBOUND_QUERY}"))
     }
 
-    fn shutdown(&mut self) {
+    async fn shutdown(&mut self) {
         self.gateway.shutdown();
-        self.backend.abort();
+        self.backend.shutdown_join().await;
     }
 }
 
@@ -404,6 +488,7 @@ fn transformer_retry_config(backend_port: u16) -> String {
             "backend_host": "127.0.0.1",
             "backend_port": backend_port,
             "strip_listen_path": false,
+            "pool_enable_http2": false,
             "retry": {
                 "max_retries": 2,
                 "retryable_status_codes": [500],
