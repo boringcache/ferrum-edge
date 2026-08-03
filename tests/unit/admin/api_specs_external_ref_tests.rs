@@ -57,9 +57,14 @@ fn extract_validator_ops(
     process: &ExternalRefProcessPolicy,
     loader: &dyn ExternalDocumentLoader,
 ) -> Value {
-    let (bundle, meta) =
-        extract_with_external_refs(spec.as_bytes(), Some(SpecFormat::Json), "prod", process, loader)
-            .expect("extraction must succeed");
+    let (bundle, meta) = extract_with_external_refs(
+        spec.as_bytes(),
+        Some(SpecFormat::Json),
+        "prod",
+        process,
+        loader,
+    )
+    .expect("extraction must succeed");
     assert!(
         meta.external_ref_snapshot.is_some(),
         "enabled external refs must produce a snapshot"
@@ -76,10 +81,7 @@ fn extract_validator_ops(
 async fn load_production_http(
     uri: String,
     process: ExternalRefProcessPolicy,
-) -> Result<
-    ferrum_edge::admin::api_specs::external_refs::LoadedExternalDocument,
-    ExtractError,
-> {
+) -> Result<ferrum_edge::admin::api_specs::external_refs::LoadedExternalDocument, ExtractError> {
     let extension = ExternalRefSpecExtension {
         enabled: true,
         document_base: None,
@@ -490,8 +492,11 @@ fn document_count_budget_fails_closed() {
     for i in 0..5 {
         loader.docs.insert(
             format!("https://schemas.example.com/d{i}.json"),
-            format!(r#"{{"$ref":"https://schemas.example.com/d{}.json"}}"#, i + 1)
-                .into_bytes(),
+            format!(
+                r#"{{"$ref":"https://schemas.example.com/d{}.json"}}"#,
+                i + 1
+            )
+            .into_bytes(),
         );
     }
     loader.docs.insert(
@@ -615,7 +620,12 @@ fn file_root_sibling_and_traversal_rejection() {
         assert!(!msg.contains("outside-secret"));
     }
 
-    let traversal = root.join("subdir").join("..").join("..").join("etc").join("passwd");
+    let traversal = root
+        .join("subdir")
+        .join("..")
+        .join("..")
+        .join("etc")
+        .join("passwd");
     let err = contain_path(&root, &traversal).expect_err("traversal");
     assert!(!err.to_string().contains("/etc/passwd"));
 }
@@ -778,8 +788,14 @@ fn effective_policy_digest_tracks_narrowing_and_canonical_set_order() {
     );
     let schemas_snapshot = ExternalRefSnapshot::empty(&narrowed_schemas);
     let alternate_snapshot = ExternalRefSnapshot::empty(&narrowed_alternate);
-    assert_ne!(schemas_snapshot.policy_digest, alternate_snapshot.policy_digest);
-    assert_ne!(schemas_snapshot.snapshot_digest, alternate_snapshot.snapshot_digest);
+    assert_ne!(
+        schemas_snapshot.policy_digest,
+        alternate_snapshot.policy_digest
+    );
+    assert_ne!(
+        schemas_snapshot.snapshot_digest,
+        alternate_snapshot.snapshot_digest
+    );
 
     let mut reordered_process = process.clone();
     reordered_process.allowed_origins.reverse();
@@ -820,7 +836,10 @@ fn effective_policy_digest_tracks_narrowing_and_canonical_set_order() {
     let all_snapshot = ExternalRefSnapshot::empty(&all_origins);
     let reordered_snapshot = ExternalRefSnapshot::empty(&reordered_all_origins);
     assert_eq!(all_snapshot.policy_digest, reordered_snapshot.policy_digest);
-    assert_eq!(all_snapshot.snapshot_digest, reordered_snapshot.snapshot_digest);
+    assert_eq!(
+        all_snapshot.snapshot_digest,
+        reordered_snapshot.snapshot_digest
+    );
 
     let disabled = EffectiveExternalRefPolicy::compose(
         &process,
@@ -863,7 +882,11 @@ fn effective_policy_cache_key_does_not_expose_file_base() {
     assert!(!cache_key.contains(&raw_root));
 
     let empty_snapshot = ExternalRefSnapshot::empty(&policy);
-    assert!(empty_snapshot.root_document_base.starts_with("file:sha256:"));
+    assert!(
+        empty_snapshot
+            .root_document_base
+            .starts_with("file:sha256:")
+    );
     assert!(!empty_snapshot.root_document_base.contains(&raw_root));
 
     let child_uri = Url::from_file_path(root.join("child.json")).expect("child file URI");
@@ -879,7 +902,11 @@ fn effective_policy_cache_key_does_not_expose_file_base() {
     )
     .expect("file snapshot identity");
     assert_eq!(snapshot.documents.len(), 1);
-    assert!(snapshot.documents[0].canonical_uri.starts_with("file:sha256:"));
+    assert!(
+        snapshot.documents[0]
+            .canonical_uri
+            .starts_with("file:sha256:")
+    );
     assert!(!snapshot.documents[0].canonical_uri.contains(&raw_root));
 }
 
@@ -981,7 +1008,10 @@ fn redaction_is_utf8_safe_and_hides_filesystem_paths() {
     let unicode_redacted = redact_reference(&unicode);
     assert!(unicode_redacted.ends_with('…'));
     assert!(!unicode_redacted.contains("secret"));
-    assert_eq!(redact_reference("/srv/private/specs/root.yaml"), "[filesystem path redacted]");
+    assert_eq!(
+        redact_reference("/srv/private/specs/root.yaml"),
+        "[filesystem path redacted]"
+    );
     assert_eq!(
         redact_reference(r"C:\private\specs\root.yaml"),
         "[filesystem path redacted]"
@@ -1056,20 +1086,14 @@ fn snapshot_rejects_document_tampering_even_with_recomputed_snapshot_digest() {
     )
     .unwrap();
     let root = json!({"$ref": "https://schemas.example.com/value.json"});
-    let (_, mut snapshot) = ferrum_edge::admin::api_specs::load_external_documents(
-        &root,
-        &policy,
-        &loader,
-    )
-    .unwrap();
+    let (_, mut snapshot) =
+        ferrum_edge::admin::api_specs::load_external_documents(&root, &policy, &loader).unwrap();
     snapshot.documents[0].document = json!({"type": "integer"});
     snapshot.snapshot_digest = snapshot.compute_digest();
     let gzip = snapshot.gzip_bytes().unwrap();
-    let err = validate_external_ref_snapshot_pair(
-        Some(&gzip),
-        Some(snapshot.snapshot_digest.as_str()),
-    )
-    .expect_err("retaining content_digest after document mutation must fail");
+    let err =
+        validate_external_ref_snapshot_pair(Some(&gzip), Some(snapshot.snapshot_digest.as_str()))
+            .expect_err("retaining content_digest after document mutation must fail");
     assert!(err.contains("integrity") || err.contains("digest"));
 }
 
@@ -1200,12 +1224,9 @@ async fn hostname_redirect_hops_are_allowlisted_resolved_and_pinned() {
         format!("http://127.0.0.1:{redirect_port}"),
         format!("http://localhost:{destination_port}"),
     ];
-    let loaded = load_production_http(
-        format!("http://127.0.0.1:{redirect_port}/start"),
-        process,
-    )
-    .await
-    .expect("every redirect hop should be revalidated and hostname-pinned");
+    let loaded = load_production_http(format!("http://127.0.0.1:{redirect_port}/start"), process)
+        .await
+        .expect("every redirect hop should be revalidated and hostname-pinned");
     assert_eq!(loaded.root, json!({"type": "string"}));
 }
 
@@ -1269,23 +1290,20 @@ async fn response_content_type_allowlist_rejects_invalid_and_unsupported_headers
     ] {
         let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: ".to_vec();
         response.extend_from_slice(content_type);
-        response.extend_from_slice(
-            b"\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-        );
+        response.extend_from_slice(b"\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
         let (port, server) = spawn_raw_http_response(response);
         let mut process = process_enabled(None);
         process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
-        let error = load_production_http(
-            format!("http://127.0.0.1:{port}/content-type"),
-            process,
-        )
-        .await
-        .expect_err("present invalid or unsupported Content-Type must fail closed");
+        let error = load_production_http(format!("http://127.0.0.1:{port}/content-type"), process)
+            .await
+            .expect_err("present invalid or unsupported Content-Type must fail closed");
         server.join().expect("HTTP fixture thread");
         let rendered = error.to_string();
-        assert!(rendered.contains(
-            "external $ref response Content-Type is not an allowed OpenAPI media type"
-        ));
+        assert!(
+            rendered.contains(
+                "external $ref response Content-Type is not an allowed OpenAPI media type"
+            )
+        );
         assert!(!rendered.contains("application/xml"));
     }
 }
@@ -1298,12 +1316,9 @@ async fn absent_response_content_type_uses_bounded_format_detection() {
     let (port, server) = spawn_raw_http_response(response);
     let mut process = process_enabled(None);
     process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
-    let loaded = load_production_http(
-        format!("http://127.0.0.1:{port}/no-content-type"),
-        process,
-    )
-    .await
-    .expect("absent Content-Type may use bounded JSON/YAML detection");
+    let loaded = load_production_http(format!("http://127.0.0.1:{port}/no-content-type"), process)
+        .await
+        .expect("absent Content-Type may use bounded JSON/YAML detection");
     server.join().expect("HTTP fixture thread");
     assert_eq!(loaded.root, json!({"type": "string"}));
 }
@@ -1345,7 +1360,10 @@ fn policy_compose_intersects_origins() {
         allowed_origins: vec!["https://other.example.com".to_string()],
     };
     let err = EffectiveExternalRefPolicy::compose(&process, Some(&ext)).unwrap_err();
-    assert!(matches!(err, ExtractError::MalformedExtension { .. }), "{err}");
+    assert!(
+        matches!(err, ExtractError::MalformedExtension { .. }),
+        "{err}"
+    );
 }
 
 /// Tiny tempfile shim without adding a dependency if tempfile is absent.

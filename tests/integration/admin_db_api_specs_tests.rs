@@ -5199,15 +5199,13 @@ async fn full_sql_api_spec_reads_reject_corrupt_external_ref_pairs() {
         .await
         .expect("submit spec");
 
-    sqlx::query(
-        "UPDATE api_specs SET external_ref_digest = ? WHERE namespace = ? AND id = ?",
-    )
-    .bind("a".repeat(64))
-    .bind(namespace)
-    .bind(&spec_id)
-    .execute(&store.pool())
-    .await
-    .expect("corrupt digest pair");
+    sqlx::query("UPDATE api_specs SET external_ref_digest = ? WHERE namespace = ? AND id = ?")
+        .bind("a".repeat(64))
+        .bind(namespace)
+        .bind(&spec_id)
+        .execute(&store.pool())
+        .await
+        .expect("corrupt digest pair");
 
     let error = store
         .get_api_spec(namespace, &spec_id)

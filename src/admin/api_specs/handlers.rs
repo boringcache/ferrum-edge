@@ -2921,9 +2921,7 @@ async fn extract_admitted(
         .acquire_owned()
         .await
         .map_err(|_| {
-            ApiSpecError::AdmissionUnavailable(
-                "spec extraction admission unavailable".to_string(),
-            )
+            ApiSpecError::AdmissionUnavailable("spec extraction admission unavailable".to_string())
         })?;
     let body = body.to_vec();
     let namespace = namespace.to_string();
@@ -2972,10 +2970,11 @@ pub async fn handle_post_api_spec(
     };
 
     // Extract resources from the spec body.
-    let (mut bundle, metadata) = match extract_admitted(&body, declared_format, namespace, state).await {
-        Ok(v) => v,
-        Err(e) => return Ok(error_response(e)),
-    };
+    let (mut bundle, metadata) =
+        match extract_admitted(&body, declared_format, namespace, state).await {
+            Ok(v) => v,
+            Err(e) => return Ok(error_response(e)),
+        };
 
     // Assign IDs for POST: mint UUIDs for every empty ID, re-link references.
     assign_ids_for_post(&mut bundle);
@@ -3143,10 +3142,11 @@ pub async fn handle_put_api_spec(
     };
 
     // Extract resources from the spec body.
-    let (mut bundle, metadata) = match extract_admitted(&body, declared_format, namespace, state).await {
-        Ok(v) => v,
-        Err(e) => return Ok(error_response(e)),
-    };
+    let (mut bundle, metadata) =
+        match extract_admitted(&body, declared_format, namespace, state).await {
+            Ok(v) => v,
+            Err(e) => return Ok(error_response(e)),
+        };
 
     // Serialize every graph-relevant read below through replacement
     // persistence. Re-read the spec after acquiring the guard so a concurrent

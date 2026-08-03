@@ -5557,9 +5557,7 @@ mod inner {
                 Some(bytes)
             }
             Some(_) => {
-                anyhow::bail!(
-                    "api_specs.external_ref_snapshot has an unexpected BSON type"
-                );
+                anyhow::bail!("api_specs.external_ref_snapshot has an unexpected BSON type");
             }
         };
 
@@ -11785,7 +11783,9 @@ mod inner {
                 .sort(doc! { sort_field: sort_dir })
                 .skip(mongo_skip)
                 .limit(mongo_limit)
-                .projection(doc! { "spec_content": 0, "resource_hash": 0, "external_ref_snapshot": 0 })
+                .projection(
+                    doc! { "spec_content": 0, "resource_hash": 0, "external_ref_snapshot": 0 },
+                )
                 .build();
             let api_specs = self.api_specs();
             let mut cursor = api_specs.find(filter_doc).with_options(options).await?;

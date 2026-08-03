@@ -98,7 +98,6 @@ fn admin_state(require_namespace_claim: bool) -> AdminState {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
-
     }
 }
 

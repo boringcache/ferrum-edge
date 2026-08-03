@@ -128,7 +128,6 @@ fn admin_state(db: DatabaseStore) -> AdminState {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
-
     }
 }
 

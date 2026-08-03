@@ -143,7 +143,6 @@ fn admin_state_with_capability_registry(jwt: JwtManager) -> AdminState {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
-
     }
 }
 

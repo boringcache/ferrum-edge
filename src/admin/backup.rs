@@ -285,9 +285,10 @@ impl ApiSpecBackupItem {
             server_urls: spec.server_urls.clone(),
             operation_count: spec.operation_count,
             resource_hash: spec.resource_hash.clone(),
-            external_ref_snapshot_base64: spec.external_ref_snapshot.as_ref().map(|bytes| {
-                base64::engine::general_purpose::STANDARD.encode(bytes)
-            }),
+            external_ref_snapshot_base64: spec
+                .external_ref_snapshot
+                .as_ref()
+                .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
             external_ref_digest: spec.external_ref_digest.clone(),
             created_at: spec.created_at,
             updated_at: spec.updated_at,
@@ -312,7 +313,7 @@ impl ApiSpecBackupItem {
                         .saturating_add(8);
                 if encoded.len() > max_encoded {
                     return Err(
-                        "api_spec external_ref_snapshot_base64 exceeds size limit".to_string(),
+                        "api_spec external_ref_snapshot_base64 exceeds size limit".to_string()
                     );
                 }
                 let bytes = base64::engine::general_purpose::STANDARD
@@ -1706,13 +1707,14 @@ mod tests {
         .expect_err("digest without snapshot must fail");
         assert!(errors.iter().any(|error| error.contains("integrity")));
 
-        item.external_ref_snapshot_base64 = Some(
-            base64::engine::general_purpose::STANDARD.encode([0x1f, 0x8b, 0x00]),
-        );
+        item.external_ref_snapshot_base64 =
+            Some(base64::engine::general_purpose::STANDARD.encode([0x1f, 0x8b, 0x00]));
         let hostile = "SECRET-CANARY";
         item.external_ref_snapshot_base64 = Some(format!(
             "{}{}",
-            item.external_ref_snapshot_base64.as_deref().unwrap_or_default(),
+            item.external_ref_snapshot_base64
+                .as_deref()
+                .unwrap_or_default(),
             hostile
         ));
         let error = item

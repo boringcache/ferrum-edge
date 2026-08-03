@@ -84,8 +84,7 @@ pub struct SpecMetadata {
     /// `None` when external-ref resolution stayed disabled (fail-closed default).
     /// Set when the effective policy enables loading, even if no external documents
     /// were reachable.
-    pub external_ref_snapshot:
-        Option<crate::admin::api_specs::external_refs::ExternalRefSnapshot>,
+    pub external_ref_snapshot: Option<crate::admin::api_specs::external_refs::ExternalRefSnapshot>,
 }
 
 /// Errors that can occur during spec extraction.
@@ -372,8 +371,7 @@ pub fn extract_with_external_refs(
 
     // --- External / cross-document $ref policy ---------------------------
     let extension = parse_external_ref_extension(&root)?;
-    let effective =
-        EffectiveExternalRefPolicy::compose(process_policy, extension.as_ref())?;
+    let effective = EffectiveExternalRefPolicy::compose(process_policy, extension.as_ref())?;
     let (external_docs, external_ref_snapshot) = if effective.enabled {
         let (docs, snapshot) = load_external_documents(&root, &effective, loader)?;
         (docs, Some(snapshot))
@@ -597,12 +595,8 @@ pub fn extract_with_external_refs(
     };
 
     if let Some(validate_ext) = parse_x_ferrum_validate_extension(&root)? {
-        let operations = extract_operation_schemas(
-            &root,
-            &version,
-            &effective.document_base,
-            &external_docs,
-        )?;
+        let operations =
+            extract_operation_schemas(&root, &version, &effective.document_base, &external_docs)?;
         auto_inject_openapi_validator(
             &mut plugins,
             &proxy,
@@ -3368,13 +3362,15 @@ impl LocalSchemaResolver {
             let resource_root = if resource_root_pointer.is_empty() {
                 document_root
             } else {
-                document_root.pointer(resource_root_pointer).ok_or_else(|| {
-                    schema_reference_error(unresolved_internal_ref_message(
-                        reference,
-                        &resource_key,
-                        resource_root_pointer,
-                    ))
-                })?
+                document_root
+                    .pointer(resource_root_pointer)
+                    .ok_or_else(|| {
+                        schema_reference_error(unresolved_internal_ref_message(
+                            reference,
+                            &resource_key,
+                            resource_root_pointer,
+                        ))
+                    })?
             };
             // Empty fragment = schema resource root. The OpenAPI document root
             // (synthetic / envelope document base) is not a Schema Object; bare

@@ -111,7 +111,6 @@ fn admin_state_with_audit(db: DatabaseStore, admin_audit_enabled: bool) -> Admin
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
-
     }
 }
 

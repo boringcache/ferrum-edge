@@ -3,19 +3,19 @@
 //! v1 supports OpenAPI 2.0 (Swagger), 3.0.x, 3.1.x, 3.2.x in JSON or YAML.
 
 pub mod bounded_yaml;
-pub mod extractor;
 pub mod external_refs;
+pub mod extractor;
 pub mod handlers;
 
-pub use extractor::{
-    ExtractError, ExtractedBundle, SpecFormat, SpecMetadata, extract,
-    extract_declared_proxy_plugin_association_ids, extract_with_external_refs,
-    hash_resource_bundle,
-};
 pub use external_refs::{
     DefaultExternalDocumentLoader, EffectiveExternalRefPolicy, ExternalDocumentLoader,
     ExternalRefProcessPolicy, ExternalRefSnapshot, ExternalRefSpecExtension,
     MapExternalDocumentLoader, load_external_documents, parse_external_ref_extension,
+};
+pub use extractor::{
+    ExtractError, ExtractedBundle, SpecFormat, SpecMetadata, extract,
+    extract_declared_proxy_plugin_association_ids, extract_with_external_refs,
+    hash_resource_bundle,
 };
 
 /// Recover the proxy/plugin associations explicitly declared by a stored API

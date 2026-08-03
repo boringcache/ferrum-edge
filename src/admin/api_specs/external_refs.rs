@@ -162,11 +162,8 @@ impl ExternalRefProcessPolicy {
             hasher.update(b"\0");
         }
         hasher.update(b"|http|");
-        let mut allow_http_origins: Vec<&str> = self
-            .allow_http_origins
-            .iter()
-            .map(String::as_str)
-            .collect();
+        let mut allow_http_origins: Vec<&str> =
+            self.allow_http_origins.iter().map(String::as_str).collect();
         allow_http_origins.sort_unstable();
         allow_http_origins.dedup();
         for origin in allow_http_origins {
@@ -273,15 +270,16 @@ impl EffectiveExternalRefPolicy {
 
         let document_base = match extension.document_base.as_deref() {
             Some(base) => parse_document_base(base, process)?,
-            None => Url::parse(DEFAULT_DOCUMENT_BASE).map_err(|_| {
-                ExtractError::MalformedExtension {
+            None => {
+                Url::parse(DEFAULT_DOCUMENT_BASE).map_err(|_| ExtractError::MalformedExtension {
                     which: "x-ferrum-external-refs",
                     error: "internal document base is invalid".to_string(),
-                }
-            })?,
+                })?
+            }
         };
 
-        let mut allowed_origins: HashSet<String> = process.allowed_origins.iter().cloned().collect();
+        let mut allowed_origins: HashSet<String> =
+            process.allowed_origins.iter().cloned().collect();
         if !extension.allowed_origins.is_empty() {
             let mut narrowed = HashSet::new();
             for raw in &extension.allowed_origins {
@@ -438,10 +436,14 @@ impl ExternalRefSnapshot {
 
     pub fn gzip_bytes(&self) -> Result<Vec<u8>, ExtractError> {
         let json = serde_json::to_vec(self).map_err(|error| {
-            ExtractError::SchemaReference(format!("failed to serialize external-ref snapshot: {error}"))
+            ExtractError::SchemaReference(format!(
+                "failed to serialize external-ref snapshot: {error}"
+            ))
         })?;
         crate::admin::spec_codec::compress_gzip(&json).map_err(|error| {
-            ExtractError::SchemaReference(format!("failed to compress external-ref snapshot: {error}"))
+            ExtractError::SchemaReference(format!(
+                "failed to compress external-ref snapshot: {error}"
+            ))
         })
     }
 
@@ -485,9 +487,7 @@ pub fn validate_external_ref_snapshot_pair(
                 MAX_EXTERNAL_REF_SNAPSHOT_DECOMPRESSED_BYTES,
             )?;
             if snapshot.snapshot_digest != stored_digest {
-                return Err(
-                    "external_ref snapshot digest does not match stored digest".to_string(),
-                );
+                return Err("external_ref snapshot digest does not match stored digest".to_string());
             }
             Ok(())
         }
@@ -662,9 +662,12 @@ impl ExternalDocumentLoader for MapExternalDocumentLoader {
         _deadline: Instant,
     ) -> Result<LoadedExternalDocument, ExtractError> {
         let key = resource_uri_key(uri);
-        let bytes = self.docs.get(&key).ok_or_else(|| ExtractError::UnsupportedExternalRef {
-            reference: redact_reference(uri.as_str()),
-        })?;
+        let bytes = self
+            .docs
+            .get(&key)
+            .ok_or_else(|| ExtractError::UnsupportedExternalRef {
+                reference: redact_reference(uri.as_str()),
+            })?;
         parse_loaded_document(uri, bytes, policy)
     }
 }
@@ -685,12 +688,12 @@ pub fn parse_external_ref_extension(
     if value.as_bool() == Some(false) {
         return Ok(Some(ExternalRefSpecExtension::default()));
     }
-    serde_json::from_value(value.clone()).map(Some).map_err(|error| {
-        ExtractError::MalformedExtension {
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| ExtractError::MalformedExtension {
             which: "x-ferrum-external-refs",
             error: error.to_string(),
-        }
-    })
+        })
 }
 
 /// Collect and load every external document reachable from `root` under policy.
@@ -908,10 +911,7 @@ fn classify_external_target(
         return Ok(None);
     }
     let joined = base.join(uri_part).map_err(|_| {
-        ExtractError::SchemaReference(format!(
-            "invalid $ref '{}'",
-            redact_reference(reference)
-        ))
+        ExtractError::SchemaReference(format!("invalid $ref '{}'", redact_reference(reference)))
     })?;
     let mut resource = joined;
     resource.set_fragment(None);
@@ -926,7 +926,10 @@ fn classify_external_target(
     Ok(Some(resource))
 }
 
-fn schema_child_base(map: &serde_json::Map<String, Value>, base: &Url) -> Result<Url, ExtractError> {
+fn schema_child_base(
+    map: &serde_json::Map<String, Value>,
+    base: &Url,
+) -> Result<Url, ExtractError> {
     let id_value = map
         .get("$id")
         .or_else(|| map.get("id"))
@@ -945,7 +948,10 @@ fn schema_child_base(map: &serde_json::Map<String, Value>, base: &Url) -> Result
     Ok(resource)
 }
 
-fn validate_candidate_uri(uri: &Url, policy: &EffectiveExternalRefPolicy) -> Result<(), ExtractError> {
+fn validate_candidate_uri(
+    uri: &Url,
+    policy: &EffectiveExternalRefPolicy,
+) -> Result<(), ExtractError> {
     if uri.as_str().len() > policy.max_uri_length {
         return Err(external_ref_error(
             "external $ref URI exceeds the configured length budget",
@@ -1043,11 +1049,12 @@ fn load_file_document(
     uri: &Url,
     policy: &EffectiveExternalRefPolicy,
 ) -> Result<LoadedExternalDocument, ExtractError> {
-    let root = policy.file_root.as_ref().ok_or_else(|| {
-        ExtractError::UnsupportedExternalRef {
+    let root = policy
+        .file_root
+        .as_ref()
+        .ok_or_else(|| ExtractError::UnsupportedExternalRef {
             reference: redact_reference(uri.as_str()),
-        }
-    })?;
+        })?;
     let path = file_uri_to_path(uri)?;
     let bytes = read_contained_file(root, &path, policy.max_document_bytes)?;
     parse_loaded_document(uri, &bytes, policy)
@@ -1145,9 +1152,7 @@ async fn load_http_document(
 
         if response.status().is_redirection() {
             if redirect_count >= policy.max_redirects {
-                return Err(external_ref_error(
-                    "external $ref redirect budget exceeded",
-                ));
+                return Err(external_ref_error("external $ref redirect budget exceeded"));
             }
             let location = response
                 .headers()
@@ -1215,9 +1220,7 @@ async fn load_http_document(
         }
         return parse_loaded_document(&current, &bytes, policy);
     }
-    Err(external_ref_error(
-        "external $ref redirect budget exceeded",
-    ))
+    Err(external_ref_error("external $ref redirect budget exceeded"))
 }
 
 async fn resolve_host_addrs(
@@ -1255,9 +1258,9 @@ where
 }
 
 fn remaining_budget(deadline: Instant) -> Result<Duration, ExtractError> {
-    deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
-        external_ref_error("external $ref fetch exceeded the total timeout budget")
-    })
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| external_ref_error("external $ref fetch exceeded the total timeout budget"))
 }
 
 fn screen_resolved_address(
@@ -1373,9 +1376,9 @@ fn file_uri_to_path(uri: &Url) -> Result<PathBuf, ExtractError> {
             reference: redact_reference(uri.as_str()),
         });
     }
-    let raw = uri.to_file_path().map_err(|_| {
-        external_ref_error("external file $ref URI is not a valid filesystem path")
-    })?;
+    let raw = uri
+        .to_file_path()
+        .map_err(|_| external_ref_error("external file $ref URI is not a valid filesystem path"))?;
     Ok(raw)
 }
 
@@ -1451,9 +1454,8 @@ fn read_contained_file(
         directory = unsafe { File::from_raw_fd(fd) };
     }
 
-    let final_name = CString::new(final_component.as_bytes()).map_err(|_| {
-        external_ref_error("external file $ref path contains an invalid component")
-    })?;
+    let final_name = CString::new(final_component.as_bytes())
+        .map_err(|_| external_ref_error("external file $ref path contains an invalid component"))?;
     // O_NONBLOCK prevents a hostile FIFO/device from blocking before metadata
     // verifies that the opened handle is a regular file.
     let fd = unsafe {
@@ -1506,9 +1508,8 @@ fn read_contained_file(
 
 /// Canonicalize `candidate` and require it stay under `root` without symlink escape.
 pub fn contain_path(root: &Path, candidate: &Path) -> Result<PathBuf, ExtractError> {
-    let canonical_root = fs::canonicalize(root).map_err(|_| {
-        external_ref_error("external-ref file root is not accessible")
-    })?;
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|_| external_ref_error("external-ref file root is not accessible"))?;
     reject_symlink_chain(&canonical_root)?;
     // Resolve candidate relative to root when not absolute.
     let joined = if candidate.is_absolute() {
@@ -1525,17 +1526,15 @@ pub fn contain_path(root: &Path, candidate: &Path) -> Result<PathBuf, ExtractErr
             ));
         }
     }
-    let meta = fs::symlink_metadata(&joined).map_err(|_| {
-        external_ref_error("external file $ref target is not readable")
-    })?;
+    let meta = fs::symlink_metadata(&joined)
+        .map_err(|_| external_ref_error("external file $ref target is not readable"))?;
     if meta.file_type().is_symlink() {
         return Err(external_ref_error(
             "external file $ref target must not be a symbolic link",
         ));
     }
-    let canonical = fs::canonicalize(&joined).map_err(|_| {
-        external_ref_error("external file $ref target is not readable")
-    })?;
+    let canonical = fs::canonicalize(&joined)
+        .map_err(|_| external_ref_error("external file $ref target is not readable"))?;
     if !canonical.starts_with(&canonical_root) {
         return Err(external_ref_error(
             "external file $ref target escapes the configured file root",
@@ -1548,9 +1547,8 @@ pub fn contain_path(root: &Path, candidate: &Path) -> Result<PathBuf, ExtractErr
 fn reject_symlink_chain(path: &Path) -> Result<(), ExtractError> {
     let mut current = path.to_path_buf();
     loop {
-        let meta = fs::symlink_metadata(&current).map_err(|_| {
-            external_ref_error("external file $ref path is not readable")
-        })?;
+        let meta = fs::symlink_metadata(&current)
+            .map_err(|_| external_ref_error("external file $ref path is not readable"))?;
         if meta.file_type().is_symlink() {
             return Err(external_ref_error(
                 "external file $ref path must not traverse symbolic links",
@@ -1571,7 +1569,9 @@ fn parse_optional_file_root(raw: &str) -> Result<Option<PathBuf>, String> {
     }
     let path = PathBuf::from(trimmed);
     if !path.is_absolute() {
-        return Err("FERRUM_ADMIN_SPEC_EXTERNAL_REFS_FILE_ROOT must be an absolute path".to_string());
+        return Err(
+            "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_FILE_ROOT must be an absolute path".to_string(),
+        );
     }
     Ok(Some(path))
 }
@@ -1613,16 +1613,13 @@ fn canonicalize_origin(raw: &str, https_only: bool) -> Result<String, String> {
         Some(url::Host::Ipv6(host)) => format!("[{host}]"),
         None => return Err("origin is missing a host".to_string()),
     };
-    let port = parsed.port_or_known_default().ok_or_else(|| {
-        "origin is missing a port".to_string()
-    })?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "origin is missing a port".to_string())?;
     Ok(format!("{}://{}:{}", parsed.scheme(), host, port))
 }
 
-fn parse_document_base(
-    raw: &str,
-    process: &ExternalRefProcessPolicy,
-) -> Result<Url, ExtractError> {
+fn parse_document_base(raw: &str, process: &ExternalRefProcessPolicy) -> Result<Url, ExtractError> {
     let parsed = Url::parse(raw).map_err(|_| ExtractError::MalformedExtension {
         which: "x-ferrum-external-refs",
         error: "document_base must be an absolute URI".to_string(),
@@ -1638,8 +1635,9 @@ fn parse_document_base(
             let Some(root) = process.file_root.as_ref() else {
                 return Err(ExtractError::MalformedExtension {
                     which: "x-ferrum-external-refs",
-                    error: "document_base file URI requires FERRUM_ADMIN_SPEC_EXTERNAL_REFS_FILE_ROOT"
-                        .to_string(),
+                    error:
+                        "document_base file URI requires FERRUM_ADMIN_SPEC_EXTERNAL_REFS_FILE_ROOT"
+                            .to_string(),
                 });
             };
             // Ensure the declared base stays inside the jail (best-effort when
@@ -1706,11 +1704,8 @@ fn origin_key(uri: &Url) -> Result<String, ExtractError> {
     let port = uri
         .port_or_known_default()
         .ok_or_else(|| external_ref_error("external $ref URI is missing a port"))?;
-    canonicalize_origin(
-        &format!("{}://{}:{}", uri.scheme(), host, port),
-        false,
-    )
-    .map_err(|_| external_ref_error("external $ref URI origin is invalid"))
+    canonicalize_origin(&format!("{}://{}:{}", uri.scheme(), host, port), false)
+        .map_err(|_| external_ref_error("external $ref URI origin is invalid"))
 }
 
 fn split_ref(reference: &str) -> (Option<&str>, &str) {
@@ -1765,9 +1760,7 @@ fn normalize_percent_escape_case(value: &str) -> String {
 pub fn redact_reference(reference: &str) -> String {
     let path_candidate = strip_query_for_diagnostic(reference);
     let bytes = path_candidate.as_bytes();
-    let windows_absolute = bytes.len() >= 3
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\');
+    let windows_absolute = bytes.len() >= 3 && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\');
     if Path::new(path_candidate).is_absolute()
         || path_candidate.starts_with("//")
         || path_candidate.starts_with("\\\\")
@@ -1801,7 +1794,9 @@ pub fn redact_reference(reference: &str) -> String {
 }
 
 fn strip_query_for_diagnostic(reference: &str) -> &str {
-    reference.split_once('?').map_or(reference, |(path, _)| path)
+    reference
+        .split_once('?')
+        .map_or(reference, |(path, _)| path)
 }
 
 fn redact_protocol_relative(reference: &str) -> String {
@@ -1814,7 +1809,10 @@ fn redact_protocol_relative(reference: &str) -> String {
     let _ = url.set_username("");
     let _ = url.set_password(None);
     url.set_query(None);
-    let rendered = url.as_str().strip_prefix("https:").unwrap_or("//[redacted]");
+    let rendered = url
+        .as_str()
+        .strip_prefix("https:")
+        .unwrap_or("//[redacted]");
     truncate_utf8(rendered, 256)
 }
 
