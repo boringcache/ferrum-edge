@@ -734,10 +734,7 @@ impl HydraContainer {
         client: &HydraClient,
         form: &mut Vec<(&str, String)>,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        let url = format!(
-            "{}/oauth2/token",
-            self.public_url.trim_end_matches('/')
-        );
+        let url = format!("{}/oauth2/token", self.public_url.trim_end_matches('/'));
         match client.token_endpoint_auth_method {
             TokenEndpointAuthMethod::ClientSecretBasic => {
                 self.client
