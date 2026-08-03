@@ -513,11 +513,11 @@ jobs:
           tool: cargo-nextest
 
       - name: Run service-integration tests
-        # Consul, LDAP, Kafka/Redpanda, and MySQL run real third-party software
-        # through testcontainers. Nextest reports each test independently and
-        # keeps running after one backend fails so one middleware cannot mask
-        # another.
-        run: cargo nextest run --test service_integration --no-fail-fast consul ldap kafka mysql
+        # Consul, LDAP, Kafka/Redpanda, MySQL, and Hydra (OIDC / introspection)
+        # run real third-party software through testcontainers. Nextest reports
+        # each test independently and keeps running after one backend fails so
+        # one middleware cannot mask another.
+        run: cargo nextest run --test service_integration --no-fail-fast consul ldap kafka mysql oidc oauth2_introspection
         env:
           RUST_BACKTRACE: 1
 
