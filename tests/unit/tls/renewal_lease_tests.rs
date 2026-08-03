@@ -125,8 +125,8 @@ fn expire_persisted_claim(dir: &Path, name: &str) {
         .and_then(|leases| leases.get_mut(name))
         .and_then(serde_json::Value::as_object_mut)
         .expect("the crashed claim remains persisted");
-    let expired_at = Utc::now()
-        - chrono::TimeDelta::try_seconds(1).expect("one second is representable");
+    let expired_at =
+        Utc::now() - chrono::TimeDelta::try_seconds(1).expect("one second is representable");
     claim.insert(
         "expires_at".to_string(),
         serde_json::Value::String(expired_at.to_rfc3339()),
@@ -383,16 +383,12 @@ fn a_same_identity_restart_reclaims_only_after_expiry() {
     std::mem::forget(crashed);
 
     let restarted = instance(dir.path(), "replica-a");
-    let denied = restarted
-        .try_acquire(&name, ttl)
-        .expect("restart attempts");
+    let denied = restarted.try_acquire(&name, ttl).expect("restart attempts");
     assert!(denied.is_none(), "the claim is still live");
 
     expire_persisted_claim(dir.path(), &name);
 
-    let taken = restarted
-        .try_acquire(&name, ttl)
-        .expect("restart retries");
+    let taken = restarted.try_acquire(&name, ttl).expect("restart retries");
     let lease = taken.expect("an expired claim must be reclaimable");
     assert_eq!(lease.holder(), "replica-a");
     assert!(
