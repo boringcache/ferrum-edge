@@ -3697,11 +3697,20 @@ fn mesh_retry_mtls_server_config(svid: &GeneratedGatewaySvid) -> Arc<rustls::Ser
     Arc::new(config)
 }
 
-/// Hold one destination port for both attempts. The first accepted socket is
-/// closed after observing the TLS record type, before a TLS or HTTP/2 request
-/// can reach the wire. The next socket must complete mutual TLS and serves one
-/// gRPC request. Keeping the listener bound throughout removes the close/rebind
-/// race that would make a retry fixture timing-dependent.
+/// Hold one destination port for the failed application attempt and its retry.
+///
+/// File-mode gateways still run an initial backend-capability refresh that dials
+/// plaintext backends with the HTTP/2 prior-knowledge preface (`PRI *…`, first
+/// byte `0x50`) even when `FERRUM_POOL_WARMUP_ENABLED=false`. Those probes must
+/// not masquerade as the secured mesh application attempt. This fixture:
+/// 1. discards h2c preface connections as preflight,
+/// 2. treats the first non-preface connection as the failed application attempt
+///    and records its first byte (must be TLS handshake `0x16`), then drops it,
+/// 3. accepts the next non-preface connection only when it also begins with
+///    `0x16`, prepends that byte, completes mTLS, and serves one gRPC request.
+///
+/// Keeping the listener bound throughout removes the close/rebind race that
+/// would make a retry fixture timing-dependent.
 async fn start_mesh_retry_mtls_backend(
     listener: TcpListener,
     server_config: Arc<rustls::ServerConfig>,
@@ -3711,31 +3720,101 @@ async fn start_mesh_retry_mtls_backend(
     oneshot::Receiver<MeshRetryBackendObservation>,
     tokio::task::JoinHandle<()>,
 ) {
-    use tokio::io::AsyncReadExt;
+    use std::io::Error as IoError;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+
+    /// Re-inject a consumed first TLS record byte before rustls reads the socket.
+    struct PrefixedTcpStream {
+        prefix: Option<u8>,
+        inner: TcpStream,
+    }
+
+    impl AsyncRead for PrefixedTcpStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<Result<(), IoError>> {
+            if let Some(byte) = self.prefix.take() {
+                if buf.remaining() == 0 {
+                    self.prefix = Some(byte);
+                    return Poll::Ready(Ok(()));
+                }
+                buf.put_slice(&[byte]);
+                return Poll::Ready(Ok(()));
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for PrefixedTcpStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, IoError>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), IoError>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), IoError>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
 
     let (first_record_tx, first_record_rx) = oneshot::channel();
     let (observation_tx, observation_rx) = oneshot::channel();
     let observation_tx = Arc::new(Mutex::new(Some(observation_tx)));
     let task = tokio::spawn(async move {
-        let (mut first, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
-            .await
-            .expect("first mesh retry accept timed out")
-            .expect("accept first mesh retry connection");
-        let mut record_type = [0u8; 1];
-        tokio::time::timeout(Duration::from_secs(5), first.read_exact(&mut record_type))
-            .await
-            .expect("first mesh retry connection sent no bytes")
-            .expect("read first mesh retry record type");
-        let _ = first_record_tx.send(record_type[0]);
-        drop(first);
+        let mut first_record_tx = Some(first_record_tx);
+        let success = loop {
+            let (mut stream, _) =
+                tokio::time::timeout(Duration::from_secs(30), listener.accept())
+                    .await
+                    .expect("mesh retry accept timed out")
+                    .expect("accept mesh retry connection");
+            let mut record_type = [0u8; 1];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut record_type))
+                .await
+                .expect("mesh retry connection sent no bytes")
+                .expect("read mesh retry record type");
+            // Capability probes speak plaintext h2c prior-knowledge (`PRI *`).
+            if record_type[0] == b'P' {
+                drop(stream);
+                continue;
+            }
+            if let Some(tx) = first_record_tx.take() {
+                let _ = tx.send(record_type[0]);
+                // Failed application attempt: observe the TLS record, then drop
+                // before handshake/request so the gateway retries once.
+                drop(stream);
+                continue;
+            }
+            break PrefixedTcpStream {
+                prefix: Some(record_type[0]),
+                inner: stream,
+            };
+        };
 
-        let (second, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
-            .await
-            .expect("mesh retry connection was not attempted")
-            .expect("accept mesh retry connection");
+        assert_eq!(
+            success.prefix,
+            Some(0x16),
+            "successful secured retry must begin with a TLS handshake record"
+        );
+
         let tls = tokio::time::timeout(
             Duration::from_secs(5),
-            tokio_rustls::TlsAcceptor::from(server_config).accept(second),
+            tokio_rustls::TlsAcceptor::from(server_config).accept(success),
         )
         .await
         .expect("mesh retry mTLS handshake timed out")
@@ -4020,7 +4099,7 @@ plugin_configs: []
             .expect("first TLS observation timed out")
             .expect("first TLS observation sender dropped"),
         0x16,
-        "the failed first attempt must be a TLS handshake record, never plaintext HTTP"
+        "the failed application attempt (after skipping h2c capability probes) must be a TLS handshake record, never plaintext HTTP"
     );
     let observed = tokio::time::timeout(Duration::from_secs(2), observation)
         .await
