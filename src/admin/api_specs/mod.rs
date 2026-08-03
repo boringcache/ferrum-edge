@@ -7,11 +7,17 @@ pub mod external_refs;
 pub mod extractor;
 pub mod handlers;
 
+// The binary target declares this module tree privately, while the library
+// target intentionally exposes these imports to integration tests and custom
+// consumers. Some binary-only feature profiles therefore see the re-exports as
+// unused even though they are part of the library surface.
+#[allow(unused_imports)]
 pub use external_refs::{
     DefaultExternalDocumentLoader, EffectiveExternalRefPolicy, ExternalDocumentLoader,
     ExternalRefProcessPolicy, ExternalRefSnapshot, ExternalRefSpecExtension,
     MapExternalDocumentLoader, load_external_documents, parse_external_ref_extension,
 };
+#[allow(unused_imports)]
 pub use extractor::{
     ExtractError, ExtractedBundle, SpecFormat, SpecMetadata, extract,
     extract_declared_proxy_plugin_association_ids, extract_with_external_refs,

@@ -6910,9 +6910,11 @@ async fn external_ref_http_admission_runs_off_the_async_worker() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
     let mut state = make_admin_state(store, 25);
-    let mut policy = ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default();
-    policy.enabled = true;
-    policy.allow_http_origins = vec![format!("http://127.0.0.1:{fixture_port}")];
+    let policy = ferrum_edge::admin::api_specs::ExternalRefProcessPolicy {
+        enabled: true,
+        allow_http_origins: vec![format!("http://127.0.0.1:{fixture_port}")],
+        ..Default::default()
+    };
     state.external_ref_policy = Arc::new(policy);
     let (base, _shutdown) = start_admin(state).await;
     let client = AdminClient::new(base);

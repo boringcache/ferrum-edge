@@ -829,10 +829,6 @@ fn effective_policy_digest_tracks_narrowing_and_canonical_set_order() {
         all_origins.effective_policy_digest,
         reordered_all_origins.effective_policy_digest
     );
-    assert_eq!(
-        all_origins.cache_key_material(),
-        all_origins.effective_policy_digest
-    );
     let all_snapshot = ExternalRefSnapshot::empty(&all_origins);
     let reordered_snapshot = ExternalRefSnapshot::empty(&reordered_all_origins);
     assert_eq!(all_snapshot.policy_digest, reordered_snapshot.policy_digest);
@@ -876,8 +872,7 @@ fn effective_policy_cache_key_does_not_expose_file_base() {
         }),
     )
     .unwrap();
-    let cache_key = policy.cache_key_material();
-    assert_eq!(cache_key, policy.effective_policy_digest);
+    let cache_key = policy.effective_policy_digest.clone();
     let raw_root = root.to_string_lossy().to_string();
     assert!(!cache_key.contains(&raw_root));
 

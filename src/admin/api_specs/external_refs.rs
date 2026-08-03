@@ -348,10 +348,6 @@ impl EffectiveExternalRefPolicy {
         .with_effective_policy_digest())
     }
 
-    pub fn cache_key_material(&self) -> String {
-        self.effective_policy_digest.clone()
-    }
-
     fn with_effective_policy_digest(mut self) -> Self {
         self.effective_policy_digest = effective_policy_digest(
             &self.process_policy_digest,
