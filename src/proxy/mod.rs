@@ -3055,7 +3055,7 @@ pub(crate) const BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON: &str =
 
 enum ClientRequestBody {
     Streaming(Box<Request<Incoming>>),
-    Buffered(BufferedClientRequestBody),
+    Buffered(Box<BufferedClientRequestBody>),
 }
 
 /// Request body representation accepted by the secured mesh transports.
@@ -3309,12 +3309,12 @@ async fn buffer_request_body_for_before_proxy(
     let trailers = collected.trailers().cloned();
     let body_bytes = collected.to_bytes().to_vec();
 
-    Ok(ClientRequestBody::Buffered(BufferedClientRequestBody {
+    Ok(ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
         method: parts.method,
         headers: parts.headers,
         body: body_bytes,
         trailers,
-    }))
+    })))
 }
 
 /// Finalize a request body for HBONE or sidecar mTLS dispatch.
@@ -3385,7 +3385,7 @@ async fn prepare_mesh_request_body(
     };
 
     let buffered = match buffered {
-        ClientRequestBody::Buffered(buffered) => buffered,
+        ClientRequestBody::Buffered(buffered) => *buffered,
         ClientRequestBody::Streaming(request) => {
             return Ok((MeshClientRequestBody::Streaming(*request), None));
         }
@@ -25534,7 +25534,7 @@ async fn handle_proxy_request_inner(
                     body_hook_ctx.as_mut(),
                     grpc_deadline_at,
                     &hook_headers,
-                    buffered.body,
+                    std::mem::take(&mut buffered.body),
                 )
                 .await;
                 let mut final_body_result = run_final_request_body_hooks(
@@ -25977,7 +25977,7 @@ async fn handle_proxy_request_inner(
                     body_hook_ctx.as_mut(),
                     grpc_deadline_at,
                     &hook_headers,
-                    buffered.body,
+                    std::mem::take(&mut buffered.body),
                 )
                 .await;
                 let mut final_body_result = run_final_request_body_hooks(
@@ -26588,6 +26588,7 @@ async fn handle_proxy_request_inner(
                     }
                 }
                 ClientRequestBody::Buffered(buffered) => {
+                    let buffered = *buffered;
                     if effective_max_grpc_recv_size_bytes > 0
                         && buffered.body.len() > effective_max_grpc_recv_size_bytes
                     {
@@ -27013,6 +27014,7 @@ async fn handle_proxy_request_inner(
                         .await
                     }
                     ClientRequestBody::Buffered(buffered) => {
+                        let buffered = *buffered;
                         if effective_max_grpc_recv_size_bytes > 0
                             && buffered.body.len() > effective_max_grpc_recv_size_bytes
                         {
@@ -29591,12 +29593,14 @@ async fn handle_proxy_request_inner(
     // into the deferred admission/dispatch outcomes below so a late upload
     // overflow records neutral `RequestBodyTooLarge` instead of a backend
     // failure (codex r2-2 finding 5 extended it beyond HBONE).
-    let mut mesh_request_body_exceeded = None;
+    // Assigned on every continuing dispatch path before first read; leave
+    // uninitialized so an unused starter `None` cannot trip `-D warnings`.
+    let mut mesh_request_body_exceeded;
     // Mesh H2 dispatch resolves per-target proxy overrides inside
     // `proxy_to_backend`; carry the effective read timeout back to the
     // `StreamingH2` relay so native gRPC without a client deadline does not
     // fall back to the outer proxy default.
-    let mut streaming_h2_read_timeout_ms = None;
+    let mut streaming_h2_read_timeout_ms;
     let (backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
         retry_config
     {
@@ -34762,6 +34766,7 @@ async fn proxy_to_backend(
 
         match client_request_body {
             ClientRequestBody::Buffered(buffered) => {
+                let buffered = *buffered;
                 // Record pre-transform body length (bytes as received from the
                 // client — already buffered by an earlier phase such as
                 // request_mirror prebuffering) BEFORE running plugin transforms
@@ -39968,7 +39973,7 @@ async fn proxy_to_backend_http3(
     };
 
     let request_body = match client_request_body {
-        ClientRequestBody::Buffered(buffered) => buffered.body,
+        ClientRequestBody::Buffered(buffered) => (*buffered).body,
         ClientRequestBody::Streaming(original_req) => {
             let (_parts, body) = (*original_req).into_parts();
             if effective_max_request_body_size_bytes > 0 {
@@ -44263,12 +44268,12 @@ mod tests {
         let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let err = match prepare_mesh_request_body(
-            ClientRequestBody::Buffered(BufferedClientRequestBody {
+            ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
                 method: hyper::Method::POST,
                 headers: hyper::HeaderMap::new(),
                 body: b"payload".to_vec(),
                 trailers: Some(trailers),
-            }),
+            })),
             "POST",
             &headers,
             1024 * 1024,
@@ -44326,12 +44331,12 @@ mod tests {
         let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let err = match prepare_mesh_request_body(
-            ClientRequestBody::Buffered(BufferedClientRequestBody {
+            ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
                 method: hyper::Method::POST,
                 headers: hyper::HeaderMap::new(),
                 body: b"payload".to_vec(),
                 trailers: Some(trailers),
-            }),
+            })),
             "POST",
             &headers,
             1024 * 1024,
@@ -44379,12 +44384,12 @@ mod tests {
         let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let (mesh_body, retained) = match prepare_mesh_request_body(
-            ClientRequestBody::Buffered(BufferedClientRequestBody {
+            ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
                 method: hyper::Method::POST,
                 headers: hyper::HeaderMap::new(),
                 body: b"payload".to_vec(),
                 trailers: Some(hyper::HeaderMap::new()),
-            }),
+            })),
             "POST",
             &HashMap::new(),
             1024 * 1024,
@@ -44694,12 +44699,12 @@ mod tests {
             "http://127.0.0.1:1/",
             "GET",
             &HashMap::new(),
-            ClientRequestBody::Buffered(BufferedClientRequestBody {
+            ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
                 method: hyper::Method::GET,
                 headers: hyper::HeaderMap::new(),
                 body: Vec::new(),
                 trailers: None,
-            }),
+            })),
             None,
             &[],
             &[],
@@ -44758,12 +44763,12 @@ mod tests {
                 backend_url,
                 "GET",
                 &HashMap::new(),
-                ClientRequestBody::Buffered(BufferedClientRequestBody {
+                ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
                     method: hyper::Method::GET,
                     headers: hyper::HeaderMap::new(),
                     body: Vec::new(),
                     trailers: None,
-                }),
+                })),
                 None,
                 plugins,
                 &[],
@@ -44868,12 +44873,12 @@ mod tests {
                 backend_url,
                 "GET",
                 &HashMap::new(),
-                ClientRequestBody::Buffered(BufferedClientRequestBody {
+                ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
                     method: hyper::Method::GET,
                     headers: hyper::HeaderMap::new(),
                     body: Vec::new(),
                     trailers: None,
-                }),
+                })),
                 None,
                 plugins,
                 &[],
@@ -45023,12 +45028,12 @@ mod tests {
             &format!("{}/events", server.uri()),
             "GET",
             &HashMap::new(),
-            ClientRequestBody::Buffered(BufferedClientRequestBody {
+            ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
                 method: hyper::Method::GET,
                 headers: hyper::HeaderMap::new(),
                 body: Vec::new(),
                 trailers: None,
-            }),
+            })),
             None,
             &plugins,
             &[],

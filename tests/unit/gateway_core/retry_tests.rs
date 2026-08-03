@@ -1708,7 +1708,8 @@ fn test_eager_buffer_body_read_never_reports_a_pre_wire_class() {
 /// buffered arm, which has no streaming-content-type exemption (unbounded when
 /// `max_response_body_size_bytes` is `0`). Hosted acceptance coverage is
 /// `functional_retry_test::retry_streams_sse_that_succeeds_before_the_final_attempt`;
-/// this guard only pins the wiring at both dispatch arms.
+/// this guard pins the wiring at every retry dispatch arm (mesh, native-H3,
+/// and reqwest).
 #[test]
 fn retry_dispatch_arms_pass_the_streaming_decision_on_every_attempt() {
     let proxy_src = include_str!("../../../src/proxy/mod.rs");
@@ -1721,18 +1722,19 @@ fn retry_dispatch_arms_pass_the_streaming_decision_on_every_attempt() {
         .expect("bounded attempt dispatch block");
 
     assert!(
-        dispatch.contains("proxy_to_backend_http3_retry(")
+        dispatch.contains("proxy_to_backend_mesh_retry(")
+            && dispatch.contains("proxy_to_backend_http3_retry(")
             && dispatch.contains("proxy_to_backend_retry("),
-        "the bounded block must cover both retry dispatch arms"
+        "the bounded block must cover mesh, native-H3, and reqwest retry dispatch arms"
     );
     assert!(
         !dispatch.contains("is_last_attempt")
             && !dispatch.contains("attempt >= retry_config.max_retries"),
-        "neither retry dispatch arm may gate the response-streaming decision on the attempt index"
+        "no retry dispatch arm may gate the response-streaming decision on the attempt index"
     );
     assert_eq!(
         dispatch.matches("should_stream,").count(),
-        2,
-        "both the native-H3 and reqwest retry arms must forward `should_stream` unchanged"
+        3,
+        "mesh, native-H3, and reqwest retry arms must each forward `should_stream` unchanged"
     );
 }
