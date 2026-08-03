@@ -473,8 +473,9 @@ plugin_configs:
     assert!(!body.contains("content_block_delta"), "{body}");
     assert!(!body.contains("upstream_error"), "{body}");
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), provider_task)
+    tokio::time::timeout(Duration::from_secs(5), provider_task)
         .await
-        .expect("provider task finished within deadline");
+        .expect("provider task finished within deadline")
+        .expect("provider task completed without panic");
     gateway.shutdown();
 }
