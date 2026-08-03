@@ -1982,12 +1982,13 @@ async fn probe_kube_add_dependency_ready(
         .limit(1);
     match tokio::time::timeout(CNI_STATUS_KUBE_PROBE_TIMEOUT, pods.list(&list_params)).await {
         Ok(Ok(_list)) => Ok(()),
-        Ok(Err(err)) => {
-            // Log locally for operators; never forward raw kube detail over RPC.
+        Ok(Err(_error)) => {
+            // The Kubernetes Status message and request URI are remote-controlled
+            // metadata and may contain credentials or tenant identifiers. Keep
+            // both the RPC response and local logs on a fixed, redacted reason.
             debug!(
-                error = %err,
                 timeout_ms = CNI_STATUS_KUBE_PROBE_TIMEOUT.as_millis(),
-                "CNI STATUS Kubernetes API readiness probe failed"
+                "CNI STATUS Kubernetes API readiness probe failed; dependency unavailable"
             );
             Err(CNI_STATUS_KUBE_UNAVAILABLE_REASON.to_string())
         }
