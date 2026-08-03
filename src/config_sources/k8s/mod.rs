@@ -974,9 +974,7 @@ where
     // widen an otherwise identical accepted inventory.
     if acc.options.pod_discovery_enabled {
         for object in &included_objects {
-            if object.kind == "WorkloadEntry"
-                && includes_object_namespace(&acc.options, object)
-            {
+            if object.kind == "WorkloadEntry" && includes_object_namespace(&acc.options, object) {
                 collect_explicit_workload_service(&mut acc, object);
             }
         }
@@ -1383,11 +1381,10 @@ pub(crate) fn service_key_from_host(
     cluster_domain: &str,
 ) -> Option<K8sServiceKey> {
     let host = normalized_service_host(host)?;
-    let default_namespace = default_namespace.trim().to_ascii_lowercase();
     let parts: Vec<&str> = host.split('.').collect();
     match parts.as_slice() {
-        [name] => K8sServiceKey::new(default_namespace, (*name).to_string()),
-        [name, namespace] if *namespace == default_namespace.as_str() => {
+        [name] => K8sServiceKey::new(default_namespace.to_string(), (*name).to_string()),
+        [name, namespace] if *namespace == default_namespace => {
             K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
         }
         [_, _] => None,
@@ -1400,7 +1397,7 @@ pub(crate) fn service_key_from_host(
                 .trim()
                 .trim_end_matches('.')
                 .to_ascii_lowercase();
-            if suffix == cluster_domain {
+            if suffix.eq_ignore_ascii_case(&cluster_domain) {
                 K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
             } else {
                 None
@@ -1423,9 +1420,7 @@ fn normalized_service_host(host: &str) -> Option<String> {
     if host.is_empty() || host.contains('*') {
         return None;
     }
-    // Kubernetes DNS names are case-insensitive; lowercase so Service key
-    // resolution is deterministic across host casing variants.
-    Some(host.to_ascii_lowercase())
+    Some(host.to_string())
 }
 
 pub(crate) fn invalid_resource(
