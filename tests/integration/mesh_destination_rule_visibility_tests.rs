@@ -168,7 +168,7 @@ fn admitted_rule_names(mesh: &MeshConfig, namespace: &str) -> Vec<String> {
 
 fn k8s_options() -> K8sTranslationOptions {
     K8sTranslationOptions::new(
-        "default".to_string(),
+        "beta".to_string(),
         TrustDomain::new(TRUST_DOMAIN).expect("trust domain"),
     )
 }

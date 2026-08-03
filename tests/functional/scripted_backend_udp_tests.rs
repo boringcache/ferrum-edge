@@ -23,7 +23,7 @@ use crate::scaffolding::backends::{DatagramMatcher, ScriptedUdpBackend, UdpStep}
 use crate::scaffolding::clients::{UdpClient, dtls::dtls_client_hello_with_sni};
 use crate::scaffolding::ports::{reserve_udp_port, unbound_port, unbound_udp_port};
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// Locate the already-built `ferrum-edge` binary. Match the same fallback
@@ -546,19 +546,13 @@ async fn dtls_passthrough_sni_routes_to_correct_backend() {
     // Backend A: records every datagram it sees. Accepts 1 datagram.
     let res_a = reserve_udp_port().await.expect("reserve a");
     let backend_a_port = res_a.port;
-    let backend_a = ScriptedUdpBackend::builder(res_a.into_socket())
-        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
-        .spawn()
-        .expect("spawn backend a");
+    let backend_a_socket = res_a.into_socket();
 
     // Backend B: records every datagram it sees. Expects nothing —
     // we'll assert `received_datagrams().is_empty()`.
     let res_b = reserve_udp_port().await.expect("reserve b");
     let backend_b_port = res_b.port;
-    let backend_b = ScriptedUdpBackend::builder(res_b.into_socket())
-        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
-        .spawn()
-        .expect("spawn backend b");
+    let backend_b_socket = res_b.into_socket();
 
     // Two passthrough proxies sharing a frontend listen_port. The
     // `stream_listener` reconciler groups them into a single
@@ -594,6 +588,19 @@ plugin_configs: []
     let fx = start_gateway_with_retry(build_yaml, Vec::new(), true).await;
     let gateway_addr: SocketAddr = format!("127.0.0.1:{}", fx.udp_port).parse().unwrap();
 
+    // Start the scripted deadlines only after gateway readiness. The pre-bound
+    // sockets remain continuously owned during startup, but a contended hosted
+    // runner can legitimately take longer than the backend's ten-second
+    // ExpectDatagram deadline to build and launch the gateway.
+    let backend_a = ScriptedUdpBackend::builder(backend_a_socket)
+        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
+        .spawn()
+        .expect("spawn backend a");
+    let backend_b = ScriptedUdpBackend::builder(backend_b_socket)
+        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
+        .spawn()
+        .expect("spawn backend b");
+
     // Craft a DTLS 1.2 ClientHello with SNI = backend-a.test and
     // send it to the gateway. The gateway peeks SNI, routes to
     // proxy "dtls-a", and forwards the datagram to backend A.
@@ -601,13 +608,16 @@ plugin_configs: []
     let client = UdpClient::connect(gateway_addr).await.expect("client");
     client.send_datagram(&hello).await.expect("send hello");
 
-    // Give the gateway time to establish the session + forward. The
-    // gateway's UDP recv → SNI peek → session create → backend
-    // socket bind → send round trip is well under 500 ms; 2 s is
-    // generous tolerance for CI runners.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let a_dgrams = backend_a.received_datagrams().await;
+    // Observe delivery instead of assuming a fixed sleep covers the gateway's
+    // UDP receive, SNI peek, session creation, backend bind, and send path.
+    let delivery_deadline = Instant::now() + Duration::from_secs(5);
+    let a_dgrams = loop {
+        let observed = backend_a.received_datagrams().await;
+        if observed.iter().any(|d| d.payload == hello) || Instant::now() >= delivery_deadline {
+            break observed;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     let b_dgrams = backend_b.received_datagrams().await;
 
     assert!(
