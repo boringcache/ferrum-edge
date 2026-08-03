@@ -8076,9 +8076,7 @@ async fn test_gemini_claim_fail_closed_roles_tools_and_legacy_pairing() {
             } => {
                 assert_eq!(status_code, 400, "{needle}: {body}");
                 assert!(
-                    body.to_lowercase().contains(&needle.to_lowercase())
-                        || body.contains("invalid_request_error")
-                        || body.contains("Gemini"),
+                    body.to_lowercase().contains(&needle.to_lowercase()),
                     "expected diagnostic mentioning {needle}: {body}"
                 );
                 assert!(
@@ -8103,13 +8101,38 @@ async fn test_gemini_claim_fail_closed_roles_tools_and_legacy_pairing() {
             {"role": "tool", "tool_call_id": "call_unknown", "content": "x"}
         ]
     });
-    let err = translate_gemini_body(&plugin, &unknown_tool_id)
-        .await
-        .expect_err("unknown tool_call_id must fail translation");
+    let mut ctx = post_ctx(&unknown_tool_id);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let original = serde_json::to_vec(&unknown_tool_id).unwrap();
     assert!(
-        err.contains("tool_call_id") || err.contains("translation returned None"),
-        "{err}"
+        plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &original,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "unknown tool_call_id must not produce a provider body"
     );
+    match plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &original)
+        .await
+    {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400, "{body}");
+            assert!(body.contains("could not be translated safely"), "{body}");
+            assert!(!body.contains("call_unknown"), "{body}");
+        }
+        other => panic!("untranslated Gemini body must fail closed, got {other:?}"),
+    }
 }
 
 #[tokio::test]
