@@ -25,8 +25,9 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     replay_spool_once_with_ceiling_for_tests, serialize_json_each_row,
     serialize_json_each_row_projected, set_spool_write_hook_for_tests,
     spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
-    spool_decompression_limit_for_tests, spool_split_worklist_max_entries_for_tests,
-    spool_streaming_limits_for_tests, write_private_file_atomically_for_tests,
+    spool_decompression_limit_for_tests, spool_index_entry_bytes_for_tests,
+    spool_split_worklist_max_entries_for_tests, spool_streaming_limits_for_tests,
+    write_private_file_atomically_for_tests,
     write_private_file_atomically_with_fault_for_tests,
 };
 #[cfg(unix)]
@@ -7250,6 +7251,33 @@ fn spool_replay_events(count: usize) -> Vec<ChargeEvent> {
         .collect()
 }
 
+fn fixed_width_json_rows(row_bytes: usize, count: usize) -> Vec<u8> {
+    const PREFIX: &[u8] = b"{\"padding\":\"";
+    const SUFFIX: &[u8] = b"\"}\n";
+    assert!(row_bytes > PREFIX.len() + SUFFIX.len());
+    let padding = row_bytes - PREFIX.len() - SUFFIX.len();
+    let mut rows = Vec::with_capacity(row_bytes.saturating_mul(count));
+    for _ in 0..count {
+        rows.extend_from_slice(PREFIX);
+        rows.resize(rows.len().saturating_add(padding), b'x');
+        rows.extend_from_slice(SUFFIX);
+    }
+    rows
+}
+
+fn current_inflight_file(day: &Path) -> std::path::PathBuf {
+    fs::read_dir(day)
+        .expect("spool day remains readable during replay")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".inflight"))
+        })
+        .expect("replay owns one in-flight claim while delivering")
+}
+
 #[tokio::test]
 async fn spool_replay_refuses_before_decoding_when_the_ceiling_cannot_hold_the_artifact() {
     let temp = tempfile::tempdir().unwrap();
@@ -7599,6 +7627,380 @@ fn streaming_replay_batch_range_validation_fails_closed() {
     assert!(out_of_range.contains("out of range"), "{out_of_range}");
     assert!(inverted.contains("byte range is invalid"), "{inverted}");
     assert_eq!(ceiling.used(), 0);
+}
+
+#[test]
+fn streaming_replay_batch_range_probe_releases_on_second_index_refusal() {
+    let index_bytes = 2usize.saturating_mul(spool_index_entry_bytes_for_tests());
+    let ceiling = leaked_chargeback_test_ceiling(128usize.saturating_add(index_bytes));
+
+    let error = probe_streaming_replay_batch_range_errors_for_tests(ceiling)
+        .expect_err("the second line index must be refused after both payloads are charged");
+
+    assert!(
+        error.contains("ceiling") || error.contains("retained"),
+        "unexpected second-index refusal: {error}"
+    );
+    assert_eq!(ceiling.used(), 0, "all partial probe charges must release");
+}
+
+#[cfg(unix)]
+#[test]
+fn streaming_reader_rejects_a_directory_descriptor_as_non_regular() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("directory.ndjson");
+    fs::create_dir(&directory).unwrap();
+    let replacement = temp.path().join("unused-replacement.ndjson");
+    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+
+    let error = probe_streaming_replay_path_swap_for_tests(&directory, &replacement, ceiling)
+        .expect_err("a directory descriptor must fail before streaming preflight");
+
+    assert!(error.contains("not a regular file"), "unexpected error: {error}");
+    assert_eq!(ceiling.used(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn namespace_coordination_lock_rejects_initial_non_files() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory_temp = tempfile::tempdir().unwrap();
+    let directory_root = SpoolManager::namespace_root_path_for_tests(
+        directory_temp.path(),
+        &test_owner_spec("node-a"),
+    )
+    .unwrap();
+    fs::create_dir_all(directory_root.join(".spool-quota.lock")).unwrap();
+    let directory_error = match SpoolManager::for_tests(
+        spool_settings(directory_temp.path(), 1024 * 1024),
+        "node-a",
+    ) {
+        Ok(_) => panic!("a directory must never become the namespace coordination lock"),
+        Err(error) => error,
+    };
+    assert!(
+        directory_error.contains("securely open") || directory_error.contains("directory"),
+        "unexpected initial directory refusal: {directory_error}"
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    let namespace_root =
+        SpoolManager::namespace_root_path_for_tests(temp.path(), &test_owner_spec("node-a"))
+            .unwrap();
+    fs::create_dir_all(&namespace_root).unwrap();
+    let lock = namespace_root.join(".spool-quota.lock");
+    let lock_c = CString::new(lock.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(lock_c.as_ptr(), 0o600) }, 0);
+
+    let error = match SpoolManager::for_tests(
+        spool_settings(temp.path(), 1024 * 1024),
+        "node-a",
+    ) {
+        Ok(_) => panic!("a FIFO must never become the namespace coordination lock"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error.contains("not a regular file") || error.contains("securely open"),
+        "unexpected FIFO refusal: {error}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_replay_rejects_concatenated_zstd_past_the_declared_first_frame() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 8 * 1024 * 1024), "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let source = day.join(format!(
+        "01ARZ3NDEKTSV4RRFFQ69G5FG1.{}.ndjson.zst",
+        default_test_owner_tag()
+    ));
+    let first = encode_spool_bytes_without_ratio_padding_for_tests(b"{}\n").unwrap();
+    let second = encode_spool_bytes_without_ratio_padding_for_tests(b"{}\n").unwrap();
+    let mut concatenated = first;
+    concatenated.extend_from_slice(&second);
+    fs::write(&source, concatenated).unwrap();
+
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+        .await
+        .expect("bytes beyond the declared first frame are quarantined, not delivered");
+
+    assert!(!source.exists());
+    assert!(
+        source
+            .with_file_name(format!(
+                "{}.corrupt",
+                source.file_name().unwrap().to_string_lossy()
+            ))
+            .exists(),
+        "concatenated decoded bytes must fail the complete preflight bound"
+    );
+}
+
+#[tokio::test]
+async fn streaming_replay_quarantines_an_in_place_row_count_change() {
+    let server = MockServer::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 8 * 1024 * 1024), "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let source = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FG2"));
+    // A row including its newline is exactly one 64 KiB replay-reader buffer.
+    // The first 64 rows fill the 4 MiB HTTP batch, while row 65 remains fully
+    // validated and ready without any bytes from row 66 buffered behind it.
+    fs::write(&source, fixed_width_json_rows(64 * 1024, 66)).unwrap();
+    let mutated = Arc::new(AtomicBool::new(false));
+    let mutated_for_mock = Arc::clone(&mutated);
+    let day_for_mock = day.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |_: &Request| {
+            if !mutated_for_mock.swap(true, Ordering::SeqCst) {
+                let claim = current_inflight_file(&day_for_mock);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(claim)
+                    .expect("the replay mutation truncates the claimed inode in place");
+            }
+            ResponseTemplate::new(200)
+        })
+        .mount(&server)
+        .await;
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect("a changed second-pass row count is quarantined without retrying delivery");
+
+    assert!(mutated.load(Ordering::SeqCst));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "only the completely buffered first batch and row 65 may be delivered"
+    );
+    assert!(
+        source
+            .with_file_name(format!(
+                "{}.corrupt",
+                source.file_name().unwrap().to_string_lossy()
+            ))
+            .exists(),
+        "the changed artifact must leave the live replay set"
+    );
+}
+
+#[tokio::test]
+async fn streaming_replay_quarantines_a_partial_row_after_in_place_truncation() {
+    let server = MockServer::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 8 * 1024 * 1024), "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let source = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FG3"));
+    // One byte beyond the reader buffer deliberately leaves a partial following
+    // row buffered when the first 4 MiB batch is sent. Truncating the same inode
+    // must reject that partial row before a second HTTP request is attempted.
+    fs::write(&source, fixed_width_json_rows(64 * 1024 + 1, 66)).unwrap();
+    let mutated = Arc::new(AtomicBool::new(false));
+    let mutated_for_mock = Arc::clone(&mutated);
+    let day_for_mock = day.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |_: &Request| {
+            if !mutated_for_mock.swap(true, Ordering::SeqCst) {
+                let claim = current_inflight_file(&day_for_mock);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(claim)
+                    .expect("the replay mutation truncates the claimed inode in place");
+            }
+            ResponseTemplate::new(200)
+        })
+        .mount(&server)
+        .await;
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect("a partial second-pass row is quarantined without aborting the replay tick");
+
+    assert!(mutated.load(Ordering::SeqCst));
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "the partial buffered row must fail closed before a second delivery"
+    );
+    assert!(
+        source
+            .with_file_name(format!(
+                "{}.corrupt",
+                source.file_name().unwrap().to_string_lossy()
+            ))
+            .exists(),
+        "the malformed second-pass artifact must be quarantined"
+    );
+}
+
+#[tokio::test]
+async fn streaming_replay_defers_when_the_second_batch_index_is_starved() {
+    let server = MockServer::start().await;
+    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests_with_ceiling(
+        spool_settings(temp.path(), 8 * 1024 * 1024),
+        "node-a",
+        ceiling,
+    )
+    .unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let source = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FG4"));
+    fs::write(&source, fixed_width_json_rows(64 * 1024, 66)).unwrap();
+    let (_, _, batch_bytes, _) = spool_streaming_limits_for_tests();
+    let index_entry_bytes = spool_index_entry_bytes_for_tests();
+    let fixed_index_bytes = 128usize.saturating_mul(index_entry_bytes);
+    let fixed_worklist_bytes =
+        spool_split_worklist_max_entries_for_tests().saturating_mul(index_entry_bytes);
+    let narrowed = Arc::new(AtomicBool::new(false));
+    let narrowed_for_mock = Arc::clone(&narrowed);
+    Mock::given(method("POST"))
+        .respond_with(move |_: &Request| {
+            if !narrowed_for_mock.swap(true, Ordering::SeqCst) {
+                let used = ceiling.used();
+                let narrowed_max = used
+                    .checked_sub(fixed_index_bytes)
+                    .and_then(|value| value.checked_sub(fixed_worklist_bytes))
+                    .expect("the active batch holds both fixed reservations");
+                assert!(narrowed_max >= batch_bytes);
+                ceiling.set_max_unclamped_for_test(narrowed_max);
+            }
+            ResponseTemplate::new(200)
+        })
+        .mount(&server)
+        .await;
+
+    let error = replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 4, ceiling)
+        .await
+        .expect_err("the second batch body may fit while its fixed index is refused");
+
+    assert!(narrowed.load(Ordering::SeqCst));
+    assert!(
+        error.contains("ceiling") || error.contains("deferred"),
+        "unexpected second-index refusal: {error}"
+    );
+    assert!(source.exists(), "an index refusal must restore the source claim");
+    assert_eq!(ceiling.used(), 0);
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn dead_letter_publish_refuses_a_final_planted_after_writer_open() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-dead-letter-publish-race")])
+        .unwrap();
+    let namespace_root = spool.namespace_root_for_tests().to_path_buf();
+    let source_parent = source.parent().unwrap().to_path_buf();
+    let payload_final = dead_letter_payload_path(&source);
+    let payload_name = payload_final
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let planted = Arc::new(AtomicBool::new(false));
+    let planted_for_hook = Arc::clone(&planted);
+    let payload_for_hook = payload_final.clone();
+    let _clear_hook = ClearSpoolWriteHookGuard;
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, root| {
+        if point != SpoolWriteHookPoint::BeforeNamespaceLock
+            || root != namespace_root.as_path()
+            || planted_for_hook.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let writer_is_open = fs::read_dir(&source_parent)
+            .expect("dead-letter race hook reads the spool day")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    return false;
+                };
+                name.starts_with(&format!("{payload_name}.write-")) && name.ends_with(".tmp")
+            });
+        if writer_is_open {
+            fs::create_dir(&payload_for_hook)
+                .expect("the race plants a non-file final after writer preflight");
+            planted_for_hook.store(true, Ordering::SeqCst);
+        }
+    })));
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("a post-open non-file final must fail dead-letter publication");
+    set_spool_write_hook_for_tests(None);
+
+    assert!(planted.load(Ordering::SeqCst));
+    assert!(
+        error.contains("failed to replace prior dead-letter payload")
+            || error.contains("directory"),
+        "unexpected post-open publish refusal: {error}"
+    );
+    assert!(source.exists(), "the complete source claim must be restored");
+    assert!(payload_final.is_dir(), "the planted final is never replaced");
+}
+
+#[tokio::test]
+async fn dead_letter_handoff_preserves_evidence_when_the_source_path_becomes_a_directory() {
+    let server = MockServer::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-dead-letter-source-race")])
+        .unwrap();
+    let day = source.parent().unwrap().to_path_buf();
+    let displaced = temp.path().join("displaced-authoritative-source.ndjson");
+    let displaced_for_mock = displaced.clone();
+    let changed = Arc::new(AtomicBool::new(false));
+    let changed_for_mock = Arc::clone(&changed);
+    Mock::given(method("POST"))
+        .respond_with(move |_: &Request| {
+            if !changed_for_mock.swap(true, Ordering::SeqCst) {
+                let claim = current_inflight_file(&day);
+                fs::rename(&claim, &displaced_for_mock)
+                    .expect("the race preserves the original claimed inode");
+                fs::create_dir(&claim).expect("the race plants a directory at the claim path");
+            }
+            ResponseTemplate::new(400)
+        })
+        .mount(&server)
+        .await;
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("source removal must fail after the durable dead-letter handoff");
+
+    assert!(changed.load(Ordering::SeqCst));
+    assert!(
+        error.contains("failed to remove replay source"),
+        "unexpected source-removal refusal: {error}"
+    );
+    assert!(source.is_dir(), "claim release restores the planted path without deleting it");
+    let displaced_bytes = fs::read(&displaced).unwrap();
+    assert!(
+        String::from_utf8_lossy(&displaced_bytes).contains("evt-dead-letter-source-race"),
+        "the displaced authoritative evidence must remain intact"
+    );
+    assert!(dead_letter_payload_path(&source).exists());
+    assert!(dead_letter_meta_path(&source).exists());
 }
 
 #[cfg(unix)]
