@@ -2016,19 +2016,18 @@ fn apply_cni_add_from_pod(
     };
     if let Some(uid) = enrolled_uid.as_deref()
         && let Some(ifname) = request.ifname.as_deref()
-    {
-        if let Err(reason) = remember_cni_owned_attachment(
+        && let Err(reason) = remember_cni_owned_attachment(
             pod_states,
             uid,
             &request.network_name,
             &request.container_id,
             ifname,
-        ) {
-            // Enrollment may have succeeded, but GC ownership was not durably
-            // claimed. Fail closed so kubelet retries ADD rather than reporting
-            // a false durable-ownership success.
-            return (CniRpcResponse::Error { reason }, enrolled_uid);
-        }
+        )
+    {
+        // Enrollment may have succeeded, but GC ownership was not durably
+        // claimed. Fail closed so kubelet retries ADD rather than reporting
+        // a false durable-ownership success.
+        return (CniRpcResponse::Error { reason }, enrolled_uid);
     }
     (CniRpcResponse::Ok, enrolled_uid)
 }
@@ -15356,7 +15355,6 @@ mod tests {
         // Simulate process restart: empty in-memory ownership + empty pod_states,
         // durable store still names the missed-DEL attachment and cleanup keys.
         rehydrate_cni_owned_attachments(&pod_states).expect("rehydrate");
-        let state_key = pod_state_key(&pod_states, "stale-uid");
         assert!(
             !cni_owned_claims_for_pod(&pod_states, "stale-uid").is_empty(),
             "restart must rehydrate Ferrum CNI ownership"
