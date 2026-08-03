@@ -5450,7 +5450,7 @@ pub struct ProxyState {
     /// Per-destination *pending-request* limiter enforcing DestinationRule
     /// `connectionPool.http.http1MaxPendingRequests` on the reqwest/HTTP-1.1
     /// backend-dispatch path. Bounds how many requests can be simultaneously
-    /// waiting on connection capacity for a `(host, port)`; an over-cap request
+    /// in flight for a `(host, port, selected subset)`; an over-cap request
     /// is shed with a 503 ("upstream overflow") in the connection-pending phase
     /// via an RAII [`crate::backend_pending_limit::BackendPendingGuard`] held
     /// only until dispatch returns. HTTP/1.1-scoped: the multiplexed transports
@@ -31910,12 +31910,11 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
 /// unrelated sibling port's lower cap (port 8080 cap 5 wrongly limited to 1
 /// because port 9090 has cap 1) — that is what we must NOT do.
 ///
-/// In practice, for MESH upstreams — the only place `maxRetries` applies, since
-/// it is DestinationRule-derived — the per-port caps fan out UNIFORMLY: the
-/// translator (`apply_destination_rules`) fans one owning-service-port entry to
-/// every target dial port, so all of one upstream's port-override caps are
-/// equal anyway. Keying on the selected port is correct for the uniform mesh
-/// case and avoids the cross-port leakage in the mixed-cap non-mesh case.
+/// A subset cap lives on the route-selected proxy's inherited fallback. The
+/// subset is stable for the request while endpoint rotation may change host or
+/// dial port, so every target in that rotation observes the same subset tier.
+/// An explicit per-port cap engages the existing policy-port retry lane and
+/// therefore cannot rotate into a sibling port's different cap.
 ///
 /// Precedence / no-double-retry:
 /// * If the proxy already has a retry policy, the effective `max_retries`
@@ -31951,11 +31950,8 @@ pub(crate) fn cap_proxy_retry_for_target(
     // Cap from the SELECTED dispatch target's policy-port override. Retries stay in
     // this port's lane (see docstring), so this cap governs the whole sequence.
     // FIELD-level fallback: the per-port `maxRetries` wins when set, otherwise
-    // the service-discovery top-level `connectionPool.http.maxRetries` overlay
-    // (`Proxy.dispatch_port_override_fallback`) is inherited — so a per-port
-    // entry that sets only an unrelated field (e.g. `connectTimeout`) does not
-    // wipe the inherited top-level cap. Mirrors the field-merge in
-    // `resolve_effective_proxy_for_target` and the non-SD apply-time layering.
+    // the selected-subset/top-level inherited overlay is used. A per-port entry
+    // that sets only an unrelated field does not wipe the inherited cap.
     let cap = proxy
         .dispatch_port_overrides
         .as_ref()
@@ -32020,13 +32016,10 @@ pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16)
 /// workload port or mesh listener remains a transport address, not the policy
 /// source.
 ///
-/// FIELD-level fallback (#1806 codex r1): when the per-port entry carries no
-/// `http1_max_pending_requests`, inherit the service-discovery top-level
-/// `connectionPool.http.http1MaxPendingRequests` overlay
-/// (`Proxy.dispatch_port_override_fallback`) — so an SD upstream that sets ONLY a
-/// top-level cap (no per-port entry) is still capped, and a per-port entry that
-/// sets an unrelated field does not wipe the inherited cap. Mirrors how
-/// `resolve_effective_proxy_for_target` consumes the fallback.
+/// FIELD-level fallback: when the per-port entry carries no
+/// `http1_max_pending_requests`, inherit the selected-subset/top-level overlay
+/// from `Proxy.dispatch_port_override_fallback`. Thus a per-port entry that
+/// sets an unrelated field does not wipe the inherited cap.
 pub(crate) fn resolve_backend_http1_max_pending_requests(
     proxy: &Proxy,
     dispatch_port: u16,
@@ -32466,9 +32459,10 @@ pub(crate) async fn proxy_to_backend_retry(
         .unwrap_or(proxy.backend_port);
     let retry_pending_cap = resolve_backend_http1_max_pending_requests(proxy, retry_policy_port)
         .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
-    let retry_pending_slot = match state.backend_pending_limit.try_acquire(
+    let retry_pending_slot = match state.backend_pending_limit.try_acquire_for_subset(
         effective_host,
         retry_policy_port,
+        proxy.upstream_subset.as_deref(),
         retry_pending_cap,
     ) {
         Ok(slot) => slot,
@@ -34578,9 +34572,10 @@ async fn proxy_to_backend(
         // Only an HTTP/1.1-determined reqwest dispatch consults the gate; a
         // reqwest fallback that may ALPN-negotiate h2 ignores the `http1*` cap.
         .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
-    let pending_slot = match state.backend_pending_limit.try_acquire(
+    let pending_slot = match state.backend_pending_limit.try_acquire_for_subset(
         effective_host,
         pending_policy_port,
+        proxy.upstream_subset.as_deref(),
         pending_cap,
     ) {
         Ok(slot) => slot,
@@ -50585,6 +50580,7 @@ mod tests {
                     unhealthy_window_seconds: 10,
                     ..Default::default()
                 }),
+                ..Default::default()
             },
         );
         let target = target_for_test(9090);
@@ -51162,7 +51158,14 @@ mod tests {
     fn cap_proxy_retry_does_not_enable_retries_without_policy() {
         // No retry policy + DR maxRetries → still no retry policy (a budget is
         // not a retry-policy enabler).
-        let proxy = proxy_with_max_retries_override(Some(3));
+        let mut inner = (*proxy_with_max_retries_override(None)).clone();
+        inner.upstream_subset = Some("stable".to_string());
+        inner.dispatch_port_override_fallback =
+            Some(crate::config::types::ResolvedPortOverride {
+                max_retries: Some(3),
+                ..Default::default()
+            });
+        let proxy = Arc::new(inner);
         assert!(proxy.retry.is_none());
         let target = target_for_test(8080);
         let capped = cap_proxy_retry_for_target(proxy.clone(), Some(&target));
@@ -51452,6 +51455,38 @@ mod tests {
     }
 
     #[test]
+    fn resolve_effective_proxy_reapplies_selected_subset_http_policy_after_rotation() {
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        proxy.upstream_subset = Some("stable".to_string());
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+            http1_max_pending_requests: Some(3),
+            ..Default::default()
+        });
+
+        for target in [target_for_test(8080), target_for_test(9090)] {
+            let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+            assert_eq!(
+                effective.h2_upgrade_policy,
+                Some(H2UpgradePolicy::DoNotUpgrade),
+                "the selected subset's ALPN policy follows every rotated target"
+            );
+            assert_eq!(
+                effective.pool_http1_max_pending_requests,
+                Some(3),
+                "the selected subset's H1 cap follows every rotated target"
+            );
+            assert_eq!(
+                resolve_backend_http1_max_pending_requests(
+                    &proxy,
+                    target.dispatch_policy_port()
+                ),
+                Some(3)
+            );
+        }
+    }
+
+    #[test]
     fn resolve_effective_proxy_field_merges_sd_fallback_with_partial_per_port() {
         // codex r1 #1806: a partial per-port `portLevelSettings` entry that sets
         // ONLY an unrelated field (here `connectTimeout`) must NOT wipe the
@@ -51602,6 +51637,31 @@ mod tests {
             2,
             "SD top-level maxRetries fallback must cap an existing larger policy"
         );
+    }
+
+    #[test]
+    fn cap_proxy_retry_selected_subset_cap_is_stable_across_target_rotation() {
+        let mut inner = (*proxy_with_max_retries_override(None)).clone();
+        inner.upstream_subset = Some("stable".to_string());
+        inner.dispatch_port_overrides = None;
+        inner.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            max_retries: Some(2),
+            ..Default::default()
+        });
+        inner.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 5,
+            ..Default::default()
+        });
+        let proxy = Arc::new(inner);
+
+        for target in [target_for_test(8080), target_for_test(9090)] {
+            let capped = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&target));
+            assert_eq!(
+                capped.retry.as_ref().map(|retry| retry.max_retries),
+                Some(2),
+                "the selected subset cap must be re-resolvable for every target"
+            );
+        }
     }
 
     #[test]

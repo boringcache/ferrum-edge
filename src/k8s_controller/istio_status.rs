@@ -650,11 +650,6 @@ fn destination_rule_status(
             // universally deferred because Ferrum does not enforce
             // close-after-N backend requests. The other top-level/port
             // connectionPool.http knobs are projected/enforced as documented.
-            // Subset-scoped deferred (codex round-1 Finding 4): h2UpgradePolicy +
-            // maxRetries + http1MaxPendingRequests set inside a
-            // `subsets[].trafficPolicy` are applied at top-level/port but NOT for
-            // subsets (subset -> SubsetTrafficPolicy has no connectionPool.http),
-            // so they are surfaced as deferred there.
             // Now APPLIED (no longer deferred): per-subset
             // connectionPool.tcp.connectTimeout (overrides backend_connect_timeout_ms
             // for subset-bound proxies), portLevelSettings[].tls (per-port backend
@@ -715,44 +710,13 @@ fn destination_rule_status(
 /// validated, but not projected because the backend pools do not support
 /// close-after-N-request semantics. `idleTimeout`, `http2MaxRequests`,
 /// `maxRetries`, `h2UpgradePolicy`, and `http1MaxPendingRequests` are
-/// projected/enforced at top-level/port scope. The three of those that a
-/// subset's `SubsetTrafficPolicy` cannot carry
-/// (`h2UpgradePolicy` / `maxRetries` / `http1MaxPendingRequests`) are deferred
-/// ONLY for subsets — see `SUBSET_DEFERRED_CONNECTION_POOL_HTTP_FIELDS`.
+/// projected/enforced at top-level, port, and subset scope.
 const DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[(
     "maxRequestsPerConnection",
     "connectionPool.http.maxRequestsPerConnection (not applied: backend close-after-N-requests is unsupported)",
 )];
 
-/// `connectionPool.http` knobs that ARE applied at top-level /
-/// `portLevelSettings` but are deferred ONLY when set inside a
-/// `subsets[].trafficPolicy` — the mesh apply path turns subsets into a
-/// `SubsetTrafficPolicy` (LB / TLS / connectTimeout / passive-health only),
-/// which carries no `connectionPool.http`, so these are silently ignored for
-/// subsets (codex round-1 Finding 4). Keep this list in sync with the
-/// translator's subset-scoped warning loop.
-const SUBSET_DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[
-    (
-        "h2UpgradePolicy",
-        "subsets[].trafficPolicy.connectionPool.http.h2UpgradePolicy (not applied for subsets)",
-    ),
-    (
-        "maxRetries",
-        "subsets[].trafficPolicy.connectionPool.http.maxRetries (not applied for subsets)",
-    ),
-    (
-        "http1MaxPendingRequests",
-        "subsets[].trafficPolicy.connectionPool.http.http1MaxPendingRequests (not applied for subsets)",
-    ),
-];
-
-/// Collect the deferred `connectionPool.http.*` field labels. Two layers:
-/// 1. `DEFERRED_CONNECTION_POOL_HTTP_FIELDS` — deferred in EVERY scope; scanned
-///    under the top-level `trafficPolicy`, each `trafficPolicy.portLevelSettings[]`,
-///    and each subset's `trafficPolicy`.
-/// 2. `SUBSET_DEFERRED_CONNECTION_POOL_HTTP_FIELDS` — applied at top-level/port
-///    but deferred ONLY inside a `subsets[].trafficPolicy`; scanned under
-///    subsets only.
+/// Collect the deferred `connectionPool.http.*` field labels in every scope.
 ///
 /// Mirrors the translator's warning emission so the same gap shows up in
 /// `kubectl describe`.
@@ -785,7 +749,7 @@ fn deferred_connection_pool_http_fields(spec: &Value) -> Vec<&'static str> {
             .is_some()
     };
 
-    let mut deferred: Vec<&'static str> = DEFERRED_CONNECTION_POOL_HTTP_FIELDS
+    let deferred: Vec<&'static str> = DEFERRED_CONNECTION_POOL_HTTP_FIELDS
         .iter()
         .filter(|(field, _)| {
             all_scope_policies
@@ -794,14 +758,6 @@ fn deferred_connection_pool_http_fields(spec: &Value) -> Vec<&'static str> {
         })
         .map(|(_, label)| *label)
         .collect();
-
-    // Subset-only deferred knobs (applied at top-level/port, ignored for subsets).
-    deferred.extend(
-        SUBSET_DEFERRED_CONNECTION_POOL_HTTP_FIELDS
-            .iter()
-            .filter(|(field, _)| subset_policies.iter().any(|policy| http_has(policy, field)))
-            .map(|(_, label)| *label),
-    );
 
     deferred
 }
@@ -2190,13 +2146,7 @@ mod tests {
     }
 
     #[test]
-    fn destination_rule_subset_scoped_http_connection_pool_knobs_surface_as_deferred() {
-        // codex round-1 Finding 4 (+ F5.1 final knob): h2UpgradePolicy /
-        // maxRetries / http1MaxPendingRequests are APPLIED at top-level (must
-        // NOT be deferred there), but the same fields inside a SUBSET
-        // trafficPolicy are not applied (subset -> SubsetTrafficPolicy carries
-        // no connectionPool.http), so the status writer must list them as
-        // deferred.
+    fn destination_rule_subset_scoped_http_connection_pool_knobs_are_not_deferred() {
         let obj = object(
             "networking.istio.io/v1",
             "DestinationRule",
@@ -2210,7 +2160,7 @@ mod tests {
                 "subsets": [{
                     "name": "v1",
                     "labels": { "version": "v1" },
-                    // Subset: ignored — must appear as deferred.
+                    // Subset: applied — must NOT appear as deferred.
                     "trafficPolicy": {
                         "connectionPool": { "http": { "h2UpgradePolicy": "DO_NOT_UPGRADE", "maxRetries": 9, "http1MaxPendingRequests": 16 } }
                     }
@@ -2225,22 +2175,9 @@ mod tests {
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        // All three subset-scoped knobs are listed, tagged as subset-scoped.
-        for field in ["h2UpgradePolicy", "maxRetries", "http1MaxPendingRequests"] {
-            assert!(
-                deferred
-                    .iter()
-                    .any(|f| f.contains("subsets[]") && f.contains(field)),
-                "deferred_fields should mention subset-scoped {field}, got {deferred:?}"
-            );
-        }
-        // The top-level (applied) values must NOT appear as deferred. The only
-        // deferred entries should be the subset-scoped ones.
         assert!(
-            !deferred
-                .iter()
-                .any(|f| f.starts_with("trafficPolicy.connectionPool.http")),
-            "top-level applied h2UpgradePolicy/maxRetries/http1MaxPendingRequests must not be deferred, got {deferred:?}"
+            deferred.is_empty(),
+            "applied top-level/subset h2UpgradePolicy, maxRetries, and http1MaxPendingRequests must not be deferred: {deferred:?}"
         );
     }
 

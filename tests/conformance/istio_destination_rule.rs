@@ -371,6 +371,43 @@ fn dr_connection_pool_http_http1_max_pending_requests_supported() {
     assert_eq!(http.http1_max_pending_requests, Some(50));
 }
 
+/// All three subset-scoped HTTP pool fields are carried together on the mesh
+/// slice. Apply-time precedence and no-leakage are covered by the integration
+/// DestinationRule port-policy suite.
+#[test]
+fn dr_subset_connection_pool_http_combined() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "subsets[].trafficPolicy.connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}",
+        status = Status::Supported,
+        maturity = Maturity::Ga,
+        notes = "Preserved per subset; runtime precedence is explicit port-level > selected subset > top-level. H1 admission is keyed by subset and retry caps never synthesize retry policy.",
+    );
+    let dr = translated(json!({
+        "host": "echo.default.svc.cluster.local",
+        "subsets": [{
+            "name": "legacy",
+            "labels": {"version": "v1"},
+            "trafficPolicy": {"connectionPool": {"http": {
+                "h2UpgradePolicy": "DO_NOT_UPGRADE",
+                "maxRetries": 2,
+                "http1MaxPendingRequests": 7
+            }}}
+        }]
+    }));
+    let http = dr.subsets[0]
+        .traffic_policy
+        .as_ref()
+        .and_then(|policy| policy.connection_pool_http.as_ref())
+        .expect("subset HTTP pool overlay");
+    assert_eq!(
+        http.h2_upgrade_policy,
+        Some(ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade)
+    );
+    assert_eq!(http.max_retries, Some(2));
+    assert_eq!(http.http1_max_pending_requests, Some(7));
+}
+
 /// `trafficPolicy.loadBalancer.simple = ROUND_ROBIN` → `RoundRobin`.
 #[test]
 fn dr_load_balancer_simple_round_robin() {

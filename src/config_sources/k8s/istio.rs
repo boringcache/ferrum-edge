@@ -1086,20 +1086,16 @@ fn traffic_policy_has_applied_fields(policy: &MeshTrafficPolicy) -> bool {
     policy != &MeshTrafficPolicy::default()
 }
 
-/// Where a `trafficPolicy` block sits in a DestinationRule. This scopes the
-/// deferred-warning emission for `connectionPool.http` fields that are applied
-/// at top-level / `portLevelSettings` but NOT for subsets.
+/// Where a `trafficPolicy` block sits in a DestinationRule. All supported HTTP
+/// connection-pool fields are preserved in every scope; the scope remains
+/// explicit because the apply layer gives subset policy its own precedence tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrafficPolicyScope {
     /// `spec.trafficPolicy` or a `spec.trafficPolicy.portLevelSettings[]` entry.
     /// `connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}`
     /// are projected here.
     TopLevelOrPort,
-    /// `spec.subsets[].trafficPolicy`. The mesh apply path turns subsets into
-    /// `SubsetTrafficPolicy` (LB / TLS / connect-timeout / passive-health only),
-    /// so `connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}`
-    /// NEVER reach the `port_overrides` / effective `Proxy` for a subset — they
-    /// are deferred.
+    /// `spec.subsets[].trafficPolicy`.
     Subset,
 }
 
@@ -1312,11 +1308,8 @@ fn parse_keepalive_duration_seconds(
 /// `maxRetries`, and `http1MaxPendingRequests`. `maxRequestsPerConnection` is
 /// parsed and validated for operator feedback, but is NOT projected because the
 /// runtime does not have close-after-N-requests behavior for the shared backend
-/// pools. At top-level / `portLevelSettings` scope every supported field is
-/// projected. (`h2UpgradePolicy` / `maxRetries` / `http1MaxPendingRequests` are
-/// still deferred-warned for a SUBSET `trafficPolicy` — see the `scope` note
-/// below — because a subset's `SubsetTrafficPolicy` carries no
-/// `connectionPool.http`.) Returning `Ok(None)` from this function signals
+/// pools. Every supported field is preserved at top-level, port, and subset
+/// scope. Returning `Ok(None)` from this function signals
 /// "block was present but no supported field was set" so the caller can skip
 /// emitting an empty overlay on the slice.
 ///
@@ -1334,20 +1327,14 @@ fn parse_keepalive_duration_seconds(
 /// "upstream overflow" → 503). Scoped to the reqwest/H1 dispatch path; validated
 /// as a positive integer here (zero rejected) like the other uint32 knobs.
 ///
-/// `scope` distinguishes top-level/`portLevelSettings` (where `h2UpgradePolicy`
-/// / `maxRetries` / `http1MaxPendingRequests` ARE applied) from a SUBSET
-/// `trafficPolicy` (where the mesh apply path builds a `SubsetTrafficPolicy`
-/// that carries no `connectionPool.http`, so those fields are genuinely NOT
-/// applied). For a subset scope they are deferred-warned + surfaced in the
-/// DestinationRule `status.ferrum.translation.deferred_fields` (codex round-1
-/// Finding 4), matching reality; do NOT try to wire subset connectionPool.http
-/// through `SubsetTrafficPolicy`. Validation (positive int / valid enum) still
-/// runs in every scope so a malformed subset value still fails closed.
+/// `scope` keeps the translation call site explicit. Validation and carriage
+/// are identical in all scopes; cold-path apply resolves the exact
+/// `port-level > subset-level > top-level` precedence.
 fn translate_connection_pool_http(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
     http: &Value,
-    scope: TrafficPolicyScope,
+    _scope: TrafficPolicyScope,
 ) -> Result<Option<crate::modes::mesh::config::MeshConnectionPoolHttp>, K8sTranslateError> {
     use crate::modes::mesh::config::MeshConnectionPoolHttp;
 
@@ -1389,7 +1376,7 @@ fn translate_connection_pool_http(
     // Validated as a positive integer like the other uint32 knobs (zero
     // rejected: a `0` pending cap would shed every H1 request, which is not
     // what an operator setting a pending budget means). Applied at runtime as
-    // a per-`(host, port)` pending gate on the reqwest/H1 dispatch path (503
+    // a per-`(host, port, subset)` pending gate on the reqwest/H1 dispatch path (503
     // "upstream overflow" when full); see `Proxy.pool_http1_max_pending_requests`
     // and `src/backend_pending_limit.rs`. No longer deferred at top-level/port.
     let http1_max_pending_requests = match http.get("http1MaxPendingRequests") {
@@ -1400,32 +1387,6 @@ fn translate_connection_pool_http(
             false,
         )?),
         None => None,
-    };
-
-    // Subset-scoped `h2UpgradePolicy` / `maxRetries` / `http1MaxPendingRequests`:
-    // applied at top-level / `portLevelSettings`, but a SUBSET's
-    // `SubsetTrafficPolicy` carries no `connectionPool.http`, so inside a subset
-    // they are genuinely NOT applied. Warn + surface as deferred (codex round-1
-    // Finding 4) and DROP them from the (unused) subset overlay so no dead value
-    // rides the slice. Keep this list in sync with
-    // `SUBSET_DEFERRED_CONNECTION_POOL_HTTP_FIELDS` in
-    // `src/k8s_controller/istio_status.rs`.
-    let (h2_upgrade_policy, max_retries, http1_max_pending_requests) = match scope {
-        TrafficPolicyScope::TopLevelOrPort => {
-            (h2_upgrade_policy, max_retries, http1_max_pending_requests)
-        }
-        TrafficPolicyScope::Subset => {
-            for field in ["h2UpgradePolicy", "maxRetries", "http1MaxPendingRequests"] {
-                if http.get(field).is_some() {
-                    acc.warnings.push(format!(
-                        "DestinationRule {}/{}: subsets[].trafficPolicy.connectionPool.http.{field} is parsed and validated but not applied for subsets (subset traffic policy carries LB/TLS/connectTimeout/passive-health only); apply it at top-level or portLevelSettings instead",
-                        object.metadata.namespace, object.metadata.name
-                    ));
-                }
-            }
-            // Not applied for subsets — do not carry the value on the overlay.
-            (None, None, None)
-        }
     };
 
     let overlay = MeshConnectionPoolHttp {
@@ -1467,11 +1428,9 @@ fn translate_h2_upgrade_policy(
         "DEFAULT" => Ok(Some(H2UpgradePolicy::Default)),
         "UPGRADE" => Ok(Some(H2UpgradePolicy::Upgrade)),
         "DO_NOT_UPGRADE" => Ok(Some(H2UpgradePolicy::DoNotUpgrade)),
-        other => Err(invalid_resource(
+        _ => Err(invalid_resource(
             object,
-            format!(
-                "trafficPolicy.connectionPool.http.h2UpgradePolicy '{other}' is not a valid value (expected DEFAULT, UPGRADE, or DO_NOT_UPGRADE)"
-            ),
+            "trafficPolicy.connectionPool.http.h2UpgradePolicy is not a valid value (expected DEFAULT, UPGRADE, or DO_NOT_UPGRADE)",
         )),
     }
 }
@@ -1503,13 +1462,13 @@ fn translate_http_uint32(
         };
         return Err(invalid_resource(
             object,
-            format!("trafficPolicy.connectionPool.http.{field} {requirement}, got {raw}"),
+            format!("trafficPolicy.connectionPool.http.{field} {requirement}"),
         ));
     }
     if raw > i64::from(u32::MAX) {
         return Err(invalid_resource(
             object,
-            format!("trafficPolicy.connectionPool.http.{field} ({raw}) exceeds u32::MAX"),
+            format!("trafficPolicy.connectionPool.http.{field} exceeds u32::MAX"),
         ));
     }
     Ok(raw as u32)
@@ -17205,14 +17164,8 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_subset_http_connection_pool_knobs_deferred_with_warning() {
+    fn destination_rule_subset_http_connection_pool_knobs_are_preserved() {
         use crate::config::types::H2UpgradePolicy;
-        // codex round-1 Finding 4 (+ F5.1 final knob): top-level
-        // h2UpgradePolicy/maxRetries/http1MaxPendingRequests are APPLIED (no
-        // warning), but the SAME fields inside a subset's trafficPolicy are NOT
-        // applied (subset -> SubsetTrafficPolicy carries no connectionPool.http),
-        // so they must warn (and be dropped from the subset overlay), matching
-        // reality.
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -17225,7 +17178,7 @@ extensionProviders:
                     "subsets": [{
                         "name": "v1",
                         "labels": {"version": "v1"},
-                        // Subset: ignored, must warn + drop.
+                        // Subset: preserved for cold-path precedence resolution.
                         "trafficPolicy": {
                             "connectionPool": {"http": {
                                 "h2UpgradePolicy": "DO_NOT_UPGRADE",
@@ -17240,15 +17193,10 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        // Subset-scoped warnings present for ALL THREE fields.
         for field in ["h2UpgradePolicy", "maxRetries", "http1MaxPendingRequests"] {
             assert!(
-                result.warnings.iter().any(|w| {
-                    w.contains("subsets[].trafficPolicy.connectionPool.http")
-                        && w.contains(field)
-                        && w.contains("not applied for subsets")
-                }),
-                "expected a subset-scoped deferral warning for {field}; warnings = {:?}",
+                !result.warnings.iter().any(|warning| warning.contains(field)),
+                "applied subset field {field} must not emit a deferral warning: {:?}",
                 result.warnings
             );
         }
@@ -17266,26 +17214,22 @@ extensionProviders:
         assert_eq!(top.max_retries, Some(4));
         assert_eq!(top.http1_max_pending_requests, Some(32));
 
-        // Subset fields are DROPPED (not applied), so the subset's HTTP overlay
-        // carries none (and with only the deferred fields set, no overlay).
-        let subset = &dr.subsets[0];
-        assert!(
-            subset
-                .traffic_policy
-                .as_ref()
-                .and_then(|tp| tp.connection_pool_http.as_ref())
-                .is_none(),
-            "subset connectionPool.http with only the deferred fields must not \
-             synthesize an overlay: {:?}",
-            subset.traffic_policy
+        let subset = dr.subsets[0]
+            .traffic_policy
+            .as_ref()
+            .and_then(|tp| tp.connection_pool_http.as_ref())
+            .expect("subset HTTP overlay preserved");
+        assert_eq!(
+            subset.h2_upgrade_policy,
+            Some(H2UpgradePolicy::DoNotUpgrade)
         );
+        assert_eq!(subset.max_retries, Some(9));
+        assert_eq!(subset.http1_max_pending_requests, Some(16));
     }
 
     #[test]
     fn destination_rule_subset_invalid_h2_upgrade_policy_still_fails_closed() {
-        // Even though subset connectionPool.http is deferred, a malformed value
-        // must still fail closed at translate time (validation runs in every
-        // scope), not be silently accepted-then-dropped.
+        // A malformed subset value fails closed at translate time.
         let err = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -17305,7 +17249,8 @@ extensionProviders:
         .expect_err("invalid subset h2UpgradePolicy must fail closed");
         assert!(
             err.to_string().contains("h2UpgradePolicy")
-                && err.to_string().contains("not a valid value"),
+                && err.to_string().contains("not a valid value")
+                && !err.to_string().contains("NOPE"),
             "unexpected: {err}"
         );
     }
@@ -17327,7 +17272,8 @@ extensionProviders:
         .expect_err("unknown h2UpgradePolicy must fail closed");
         assert!(
             err.to_string().contains("h2UpgradePolicy")
-                && err.to_string().contains("not a valid value"),
+                && err.to_string().contains("not a valid value")
+                && !err.to_string().contains("MAYBE"),
             "unexpected: {err}"
         );
     }
@@ -17369,7 +17315,8 @@ extensionProviders:
         )
         .expect_err("negative maxRetries must fail");
         assert!(
-            err.to_string().contains("maxRetries must be positive"),
+            err.to_string().contains("maxRetries must be positive")
+                && !err.to_string().contains("-1"),
             "unexpected: {err}"
         );
     }

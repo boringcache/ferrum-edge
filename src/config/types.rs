@@ -469,6 +469,20 @@ pub struct SubsetTrafficPolicy {
     /// precedence over the DestinationRule's top-level `connectTimeout`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_timeout_ms: Option<u64>,
+    /// Plain-HTTP backend upgrade policy inherited by subset-bound proxies.
+    /// An explicit `portLevelSettings.connectionPool.http.h2UpgradePolicy`
+    /// remains the more-specific tier and wins for that destination port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_upgrade_policy: Option<H2UpgradePolicy>,
+    /// Per-request retry-count cap for this subset. This never creates a retry
+    /// policy; it only caps an existing [`RetryConfig`] after target selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    /// Maximum concurrent in-flight HTTP/1.1 requests admitted for this subset
+    /// and destination. The limiter key includes the selected subset name so
+    /// sibling subsets cannot consume one another's allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http1_max_pending_requests: Option<u32>,
     /// Per-subset passive health (Istio `subsets[].trafficPolicy.outlierDetection`),
     /// already resolved from the Istio outlier shape. The ejection *thresholds*
     /// (consecutive errors, interval, base-ejection time, min-health) are
@@ -777,19 +791,14 @@ impl ResolvedPortOverride {
             && self.http1_max_pending_requests.is_none()
     }
 
-    /// Field-by-field seed of the `connectionPool.http` fields from a
-    /// service-discovery TOP-LEVEL fallback overlay onto this (per-port) entry.
+    /// Field-by-field seed of inherited `connectionPool.http` fields from the
+    /// proxy fallback onto this explicit per-port entry.
     ///
     /// For each supported `connectionPool.http` field, the per-port value wins
     /// when set; otherwise the fallback's value is inherited. This mirrors
-    /// Ferrum's documented NON-SD apply-time field-level merge exactly: there,
-    /// the top-level
-    /// `connectionPool.http` is fanned onto the port slot FIRST and a partial
-    /// per-port `portLevelSettings.connectionPool.http` then overlays only the
-    /// fields it sets (see `apply_connection_pool_http_to_port_override` in
-    /// `src/modes/mesh/mod.rs`). SD upstreams cannot fan out at apply time, so
-    /// the top-level overlay is carried separately on
-    /// `Proxy.dispatch_port_override_fallback` and merged HERE at dispatch — so
+    /// Ferrum's documented field-level merge. Inherited top-level/subset values
+    /// are carried separately on `Proxy.dispatch_port_override_fallback` and
+    /// merged HERE at dispatch, so
     /// an unrelated per-port field (e.g. `connectTimeout`/`tls`) no longer wipes
     /// an inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`.
     ///
@@ -812,15 +821,36 @@ impl ResolvedPortOverride {
             .http1_max_pending_requests
             .or(fallback.http1_max_pending_requests);
     }
+
+    /// Overlay the subset-inheritable HTTP connection-pool fields onto this
+    /// inherited fallback. This is a replacement at the subset tier: an
+    /// explicitly configured subset value wins over the top-level value.
+    /// Explicit per-port values are kept separately in
+    /// `Proxy.dispatch_port_overrides` and are merged ahead of this fallback at
+    /// dispatch, so the resulting precedence is port > subset > top-level.
+    pub fn overlay_subset_connection_pool_http(
+        &mut self,
+        subset: &ResolvedSubsetTrafficPolicy,
+    ) {
+        if let Some(policy) = subset.h2_upgrade_policy {
+            self.h2_upgrade_policy = Some(policy);
+        }
+        if let Some(max_retries) = subset.max_retries {
+            self.max_retries = Some(max_retries);
+        }
+        if let Some(pending) = subset.http1_max_pending_requests {
+            self.http1_max_pending_requests = Some(pending);
+        }
+    }
 }
 
-/// Project an upstream's service-discovery TOP-LEVEL `connectionPool.http`
-/// overlay (`Upstream.dispatch_port_override_fallback`) into the resolved
+/// Project an upstream's inherited TOP-LEVEL `connectionPool.http` overlay
+/// (`Upstream.dispatch_port_override_fallback`) into the resolved
 /// [`ResolvedPortOverride`] shape carried on a referencing `Proxy`
 /// (`Proxy.dispatch_port_override_fallback`).
 ///
-/// Returns `None` for the common non-SD case (no top-level overlay) and for an
-/// overlay that resolves empty. Shared by config-build projection
+/// Returns `None` when no inherited overlay exists or it resolves empty. Shared
+/// by config-build projection
 /// ([`GatewayConfig::resolve_dispatch_port_overrides`]) and the route-override
 /// path (`apply_route_overrides_inner` in `src/plugins/mod.rs`) so a route that
 /// swaps the destination upstream recomputes (or clears) the fallback exactly
@@ -829,7 +859,8 @@ impl ResolvedPortOverride {
 pub(crate) fn dispatch_port_override_fallback_from_upstream(
     upstream: &Upstream,
 ) -> Option<ResolvedPortOverride> {
-    // TOP-LEVEL `connectionPool.http` overlay ONLY.
+    // TOP-LEVEL `connectionPool.http` overlay ONLY. Proxy-specific subset
+    // inheritance is applied later by `resolve_dispatch_port_overrides`.
     // An explicit per-port `portLevelSettings` still WINS via the dispatch-time
     // per-port lookup in `resolve_effective_proxy_for_target`: discovered mesh
     // targets carry their owning declared Service port in
@@ -866,13 +897,12 @@ pub struct SubsetDefinition {
 /// Same pattern as [`ResolvedPortOverride`]: the upstream owns the mesh-derived
 /// policy ([`SubsetTrafficPolicy`]) and the gateway pre-computes the resolved
 /// view at cold-path apply so request dispatch never re-derives the
-/// DestinationRule TLS overlay. Currently carries only `tls`; future fields
-/// (subset-scoped connectionPool, outlierDetection, etc.) live here too.
+/// DestinationRule TLS or HTTP connection-pool overlay.
 ///
-/// Stored on [`Upstream::resolved_subset_tls`] keyed by subset name and
-/// projected onto `Proxy.resolved_tls` by
-/// [`GatewayConfig::resolve_upstream_tls`] when a proxy's `upstream_subset`
-/// selects a subset that carries a TLS override.
+/// Stored on [`Upstream::resolved_subset_tls`] keyed by subset name. TLS is
+/// projected by [`GatewayConfig::resolve_upstream_tls`]; HTTP connection-pool
+/// fields are projected by [`GatewayConfig::resolve_dispatch_port_overrides`]
+/// when a proxy's `upstream_subset` selects the entry.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedSubsetTrafficPolicy {
     /// Subset-resolved backend TLS posture. `Some` when the subset's
@@ -893,25 +923,40 @@ pub struct ResolvedSubsetTrafficPolicy {
     /// applies only when a single dispatch port is resolvable pre-selection;
     /// for subset dispatch on a multi-port upstream the subset cap governs.
     pub passive_health_check: Option<PassiveHealthCheck>,
+    /// Subset-scoped plain-HTTP H2 upgrade posture.
+    pub h2_upgrade_policy: Option<H2UpgradePolicy>,
+    /// Subset-scoped per-request retry-count cap.
+    pub max_retries: Option<u32>,
+    /// Subset-scoped concurrent in-flight HTTP/1.1 cap.
+    pub http1_max_pending_requests: Option<u32>,
 }
 
 impl ResolvedSubsetTrafficPolicy {
-    /// Build from a fully-resolved subset TLS and/or passive-health overlay.
-    /// Returns `None` when neither is present (so callers can skip inserting
-    /// empty entries into [`Upstream::resolved_subset_tls`]).
+    /// Build from the fully resolved subset overlays. Returns `None` only when
+    /// every carried field is absent, so callers can skip empty entries.
     pub fn new(
         tls: Option<BackendTlsConfig>,
         passive_health_check: Option<PassiveHealthCheck>,
+        h2_upgrade_policy: Option<H2UpgradePolicy>,
+        max_retries: Option<u32>,
+        http1_max_pending_requests: Option<u32>,
     ) -> Option<Self> {
         let resolved = Self {
             tls,
             passive_health_check,
+            h2_upgrade_policy,
+            max_retries,
+            http1_max_pending_requests,
         };
         (!resolved.is_empty()).then_some(resolved)
     }
 
     fn is_empty(&self) -> bool {
-        self.tls.is_none() && self.passive_health_check.is_none()
+        self.tls.is_none()
+            && self.passive_health_check.is_none()
+            && self.h2_upgrade_policy.is_none()
+            && self.max_retries.is_none()
+            && self.http1_max_pending_requests.is_none()
     }
 }
 
@@ -1485,19 +1530,16 @@ pub struct Upstream {
     /// `Upstream.subsets[].traffic_policy.tls`.
     #[serde(skip)]
     pub resolved_subset_tls: HashMap<String, ResolvedSubsetTrafficPolicy>,
-    /// Top-level (non-`portLevelSettings`) DestinationRule `connectionPool.http`
-    /// overlay for a **service-discovery** upstream.
+    /// Inherited (non-`portLevelSettings`) DestinationRule
+    /// `connectionPool.http` overlay.
     ///
-    /// Non-SD upstreams fan the top-level `connectionPool.http` block out onto
-    /// every served `port_overrides` entry at apply time. SD upstreams cannot —
-    /// their target ports are resolved at runtime, not at apply — so the
-    /// top-level overlay is captured here instead and applied by the
-    /// LB-**selected** target port at dispatch. `resolve_dispatch_port_overrides`
-    /// projects this onto `Proxy.dispatch_port_override_fallback`, which the
-    /// HTTP-family dispatch resolvers (`resolve_effective_proxy_for_target` /
-    /// `cap_proxy_retry_for_target`) consult only when the selected port has no
-    /// explicit per-port override — so an explicit `portLevelSettings` entry
-    /// still wins. Not serialized — derived from the matching DestinationRule.
+    /// This carries the top-level block for service-discovery upstreams and the
+    /// three subset-inheritable fields (`h2UpgradePolicy`, `maxRetries`, and
+    /// `http1MaxPendingRequests`) for every upstream. During proxy projection a
+    /// selected subset overlays those three fields onto this base. Dispatch
+    /// merges an explicit per-port entry first, then this inherited fallback,
+    /// giving exact `port-level > subset-level > top-level` field precedence.
+    /// Not serialized — derived from the matching DestinationRule.
     #[serde(default, skip)]
     pub dispatch_port_override_fallback: Option<UpstreamPortOverride>,
     /// ID of the `ApiSpec` that created this upstream via the spec-import admin API.
@@ -2090,20 +2132,20 @@ pub struct Proxy {
     /// `apply_destination_rules` has written into `Upstream.port_overrides`.
     #[serde(skip)]
     pub dispatch_port_overrides: Option<HashMap<u16, ResolvedPortOverride>>,
-    /// Top-level (non-`portLevelSettings`) DestinationRule `connectionPool.http`
-    /// overlay for a **service-discovery** upstream, projected from
+    /// Inherited (non-`portLevelSettings`) DestinationRule
+    /// `connectionPool.http` overlay, projected from
     /// `Upstream.dispatch_port_override_fallback` by
     /// `GatewayConfig::resolve_dispatch_port_overrides()`.
     ///
-    /// SD upstreams have no apply-time port set to fan the top-level overlay
-    /// onto (targets resolve at runtime), so `dispatch_port_overrides` is empty
-    /// for the discovered ports. The HTTP-family dispatch resolvers
+    /// Service-discovery upstreams use this because target ports resolve at
+    /// runtime. All upstreams also use it for the subset-inheritable fields,
+    /// after the selected subset has overlaid the top-level values. The
+    /// HTTP-family dispatch resolvers
     /// (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
     /// fall back to this overlay when the LB-selected target port has no
     /// explicit per-port override — so an explicit `portLevelSettings` entry for
-    /// that port still wins. `None` for the common (non-SD, or SD without a
-    /// top-level `connectionPool.http`) case, so the hot path skips it with a
-    /// single field read. `#[serde(skip)]` (derived-only) like
+    /// that port still wins. `None` when no inherited field applies, so the hot
+    /// path skips it with a single field read. `#[serde(skip)]` (derived-only) like
     /// `dispatch_port_overrides`; DB/file loaders start it `None`.
     #[serde(skip)]
     pub dispatch_port_override_fallback: Option<ResolvedPortOverride>,
@@ -3884,11 +3926,10 @@ impl GatewayConfig {
             .filter(|(_, m)| !m.is_empty())
             .collect();
 
-        // Service-discovery top-level `connectionPool.http` fallback, applied by
-        // the LB-selected port at dispatch when that port has no explicit
-        // per-port override. Keyed by (namespace, upstream id), separate from
-        // the per-port map above so an explicit `portLevelSettings` entry
-        // still wins.
+        // Inherited top-level `connectionPool.http` fallback. The three fields
+        // supported at subset scope are overlaid per proxy below, after its
+        // `upstream_subset` is known. The per-port map stays separate and is
+        // consulted first at dispatch, preserving port > subset > top-level.
         let fallback_by_upstream: HashMap<(&str, &str), ResolvedPortOverride> = self
             .upstreams
             .iter()
@@ -3898,14 +3939,47 @@ impl GatewayConfig {
             })
             .collect();
 
+        let subset_policy_by_upstream: HashMap<(&str, &str, &str), &ResolvedSubsetTrafficPolicy> =
+            self.upstreams
+                .iter()
+                .flat_map(|upstream| {
+                    upstream.resolved_subset_tls.iter().map(move |(name, policy)| {
+                        (
+                            (
+                                upstream.namespace.as_str(),
+                                upstream.id.as_str(),
+                                name.as_str(),
+                            ),
+                            policy,
+                        )
+                    })
+                })
+                .collect();
+
         for proxy in &mut self.proxies {
             let key = proxy
                 .upstream_id
                 .as_deref()
                 .map(|uid| (proxy.namespace.as_str(), uid));
             proxy.dispatch_port_overrides = key.and_then(|key| by_upstream.get(&key)).cloned();
-            proxy.dispatch_port_override_fallback =
-                key.and_then(|key| fallback_by_upstream.get(&key)).cloned();
+            let mut inherited = key.and_then(|key| fallback_by_upstream.get(&key)).cloned();
+            let subset_policy = proxy.upstream_subset.as_deref().and_then(|subset| {
+                key.and_then(|(namespace, upstream_id)| {
+                    subset_policy_by_upstream
+                        .get(&(namespace, upstream_id, subset))
+                        .copied()
+                })
+            });
+            if let Some(subset_policy) = subset_policy
+                && (subset_policy.h2_upgrade_policy.is_some()
+                    || subset_policy.max_retries.is_some()
+                    || subset_policy.http1_max_pending_requests.is_some())
+            {
+                inherited
+                    .get_or_insert_with(ResolvedPortOverride::default)
+                    .overlay_subset_connection_pool_http(subset_policy);
+            }
+            proxy.dispatch_port_override_fallback = inherited;
         }
     }
 
@@ -8485,8 +8559,8 @@ impl Upstream {
     /// Reject mesh-PROJECTED fields that an OPERATOR must not set directly.
     ///
     /// `port_overrides`, `source_locality`, `locality_lb_strict`,
-    /// `locality_lb_setting`, and the `tls`, `connect_timeout_ms`, and
-    /// `passive_health_check` fields nested under `subsets[].traffic_policy` are
+    /// `locality_lb_setting`, and the mesh-derived fields nested under
+    /// `subsets[].traffic_policy` are
     /// all populated by the mesh slice-apply layer (from DestinationRules / the
     /// workload locality / `FERRUM_MESH_LOCALITY_LB_STRICT`), NOT by operators.
     /// The top-level projected fields are not persisted by the SQL / MongoDB
@@ -8566,6 +8640,20 @@ impl Upstream {
                          DestinationRule and cannot be set directly via the admin API — express \
                          subset connection-pool policy as a DestinationRule"
                     ));
+                }
+                for (field, configured) in [
+                    ("h2_upgrade_policy", policy.h2_upgrade_policy.is_some()),
+                    ("max_retries", policy.max_retries.is_some()),
+                    (
+                        "http1_max_pending_requests",
+                        policy.http1_max_pending_requests.is_some(),
+                    ),
+                ] {
+                    if configured {
+                        errors.push(format!(
+                            "{field_prefix}.{field} is projected from a mesh DestinationRule and cannot be set directly via the admin API — express subset HTTP connection-pool policy as a DestinationRule"
+                        ));
+                    }
                 }
                 if policy.passive_health_check.is_some() {
                     errors.push(format!(

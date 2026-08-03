@@ -139,6 +139,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Applied DestinationRule subset-scoped
+  `connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}`
+  with per-port > selected-subset > top-level precedence, target-rotation-safe
+  dispatch resolution, transport/pool isolation, and subset-keyed RAII H1
+  admission (issues #3228, #3240, #3241, and #3242).
+
 - Durable `api_chargeback_sink` ClickHouse requests now pin
   `wait_for_async_insert=1` whenever the setting is omitted, even when Ferrum
   also omits `async_insert`. This prevents a ClickHouse user/profile default

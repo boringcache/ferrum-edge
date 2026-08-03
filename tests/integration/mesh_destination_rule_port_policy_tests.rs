@@ -501,7 +501,7 @@ fn destination_rule_top_level_max_connections_skips_phantom_ports() {
 // ── T1-C: connectionPool.http per-port projection ───────────────────────
 
 #[test]
-fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
+fn destination_rule_top_level_connection_pool_http_projects_inherited_fields() {
     use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
 
     // Single target on port 8080. A top-level `trafficPolicy.connectionPool.http`
@@ -523,7 +523,8 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
                         max_requests_per_connection: Some(75),
                         idle_timeout_ms: Some(45_000),
                         http2_max_requests: Some(250),
-                        // F5.1: the two newly-projected knobs also fan out.
+                        // Subset-inheritable fields remain in the fallback so
+                        // the apply layer can preserve their precedence tier.
                         h2_upgrade_policy: Some(
                             ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade,
                         ),
@@ -552,11 +553,9 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
     );
     assert_eq!(port_override.http_idle_timeout_ms, Some(45_000));
     assert_eq!(port_override.h2_max_concurrent_streams, Some(250));
-    assert_eq!(
-        port_override.h2_upgrade_policy,
-        Some(ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade)
-    );
-    assert_eq!(port_override.max_retries, Some(2));
+    assert!(port_override.h2_upgrade_policy.is_none());
+    assert!(port_override.max_retries.is_none());
+    assert!(port_override.http1_max_pending_requests.is_none());
 
     // Dispatch projection: the per-port overlay reaches every referencing
     // proxy via `resolve_dispatch_port_overrides`.
@@ -571,11 +570,20 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
     );
     assert_eq!(dispatch_override.http_idle_timeout_ms, Some(45_000));
     assert_eq!(dispatch_override.h2_max_concurrent_streams, Some(250));
+    assert!(dispatch_override.h2_upgrade_policy.is_none());
+    assert!(dispatch_override.max_retries.is_none());
+    assert!(dispatch_override.http1_max_pending_requests.is_none());
+
+    let inherited = prepared.proxies[0]
+        .dispatch_port_override_fallback
+        .as_ref()
+        .expect("top-level subset-inheritable fields project as a fallback");
     assert_eq!(
-        dispatch_override.h2_upgrade_policy,
+        inherited.h2_upgrade_policy,
         Some(ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade)
     );
-    assert_eq!(dispatch_override.max_retries, Some(2));
+    assert_eq!(inherited.max_retries, Some(2));
+    assert_eq!(inherited.http1_max_pending_requests, Some(128));
 }
 
 #[test]
@@ -945,6 +953,195 @@ fn destination_rule_port_level_explicit_default_clears_inherited_h2_upgrade_poli
         dispatch_override.h2_upgrade_policy,
         Some(H2UpgradePolicy::Default)
     );
+}
+
+#[test]
+fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_removal() {
+    use ferrum_edge::config::types::H2UpgradePolicy;
+    use ferrum_edge::modes::mesh::config::{MeshConnectionPoolHttp, MeshSubset};
+
+    let build = |v1_http: Option<MeshConnectionPoolHttp>,
+                 v2_http: Option<MeshConnectionPoolHttp>| {
+        let mut stable = proxy();
+        stable.id = "reviews-stable".to_string();
+        stable.upstream_subset = Some("v1".to_string());
+        let mut canary = proxy();
+        canary.id = "reviews-canary".to_string();
+        canary.upstream_subset = Some("v2".to_string());
+        let mut unmatched = proxy();
+        unmatched.id = "reviews-unmatched".to_string();
+
+        let mut port_level_settings = HashMap::new();
+        port_level_settings.insert(
+            8080,
+            MeshTrafficPolicy {
+                connection_pool_http: Some(MeshConnectionPoolHttp {
+                    h2_upgrade_policy: Some(H2UpgradePolicy::Default),
+                    ..MeshConnectionPoolHttp::default()
+                }),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        let subsets = [("v1", v1_http), ("v2", v2_http)]
+            .into_iter()
+            .map(|(name, http)| MeshSubset {
+                name: name.to_string(),
+                labels: HashMap::from([("version".to_string(), name.to_string())]),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connection_pool_http: http,
+                    ..MeshTrafficPolicy::default()
+                }),
+            })
+            .collect();
+        let mut config = GatewayConfig {
+            proxies: vec![stable, canary, unmatched],
+            upstreams: vec![upstream()],
+            mesh: Some(Box::new(MeshConfig {
+                destination_rules: vec![MeshDestinationRule {
+                    name: "reviews-dr".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connection_pool_http: Some(MeshConnectionPoolHttp {
+                            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+                            max_retries: Some(9),
+                            http1_max_pending_requests: Some(90),
+                            ..MeshConnectionPoolHttp::default()
+                        }),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings,
+                    subsets,
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        config.normalize_fields();
+        prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config")
+    };
+
+    let initial = build(
+        Some(MeshConnectionPoolHttp {
+            h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+            max_retries: Some(2),
+            http1_max_pending_requests: Some(1),
+            ..MeshConnectionPoolHttp::default()
+        }),
+        Some(MeshConnectionPoolHttp {
+            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+            max_retries: Some(5),
+            http1_max_pending_requests: Some(4),
+            ..MeshConnectionPoolHttp::default()
+        }),
+    );
+
+    fn inherited<'a>(
+        config: &'a GatewayConfig,
+        id: &str,
+    ) -> &'a ferrum_edge::config::types::ResolvedPortOverride {
+        config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.id == id)
+            .and_then(|proxy| proxy.dispatch_port_override_fallback.as_ref())
+            .expect("inherited HTTP policy")
+    }
+    let stable = inherited(&initial, "reviews-stable");
+    assert_eq!(stable.h2_upgrade_policy, Some(H2UpgradePolicy::DoNotUpgrade));
+    assert_eq!(stable.max_retries, Some(2));
+    assert_eq!(stable.http1_max_pending_requests, Some(1));
+
+    let canary = inherited(&initial, "reviews-canary");
+    assert_eq!(canary.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
+    assert_eq!(canary.max_retries, Some(5));
+    assert_eq!(canary.http1_max_pending_requests, Some(4));
+
+    let unmatched = inherited(&initial, "reviews-unmatched");
+    assert_eq!(unmatched.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
+    assert_eq!(unmatched.max_retries, Some(9));
+    assert_eq!(unmatched.http1_max_pending_requests, Some(90));
+
+    for proxy in &initial.proxies {
+        let port = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&8080))
+            .expect("explicit port override");
+        assert_eq!(
+            port.h2_upgrade_policy,
+            Some(H2UpgradePolicy::Default),
+            "explicit port-level policy is the highest-precedence tier"
+        );
+    }
+
+    let updated = build(
+        Some(MeshConnectionPoolHttp {
+            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+            max_retries: Some(7),
+            http1_max_pending_requests: Some(6),
+            ..MeshConnectionPoolHttp::default()
+        }),
+        Some(MeshConnectionPoolHttp {
+            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+            max_retries: Some(5),
+            http1_max_pending_requests: Some(4),
+            ..MeshConnectionPoolHttp::default()
+        }),
+    );
+    let updated_stable = inherited(&updated, "reviews-stable");
+    assert_eq!(updated_stable.max_retries, Some(7));
+    assert_eq!(updated_stable.http1_max_pending_requests, Some(6));
+    assert_eq!(stable.max_retries, Some(2), "old snapshot stays coherent");
+
+    let removed = build(None, None);
+    for id in ["reviews-stable", "reviews-canary", "reviews-unmatched"] {
+        let fallback = inherited(&removed, id);
+        assert_eq!(fallback.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
+        assert_eq!(fallback.max_retries, Some(9));
+        assert_eq!(fallback.http1_max_pending_requests, Some(90));
+    }
+}
+
+#[test]
+fn destination_rule_subset_http_zero_values_fail_closed_with_field_paths() {
+    use ferrum_edge::modes::mesh::config::{MeshConnectionPoolHttp, MeshSubset};
+
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connection_pool_http: Some(MeshConnectionPoolHttp {
+                            max_retries: Some(0),
+                            http1_max_pending_requests: Some(0),
+                            ..MeshConnectionPoolHttp::default()
+                        }),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let error = prepare_gateway_config_for_mesh(config, &runtime())
+        .expect_err("invalid subset HTTP caps must reject the whole snapshot")
+        .to_string();
+    assert!(error.contains("subsets[0]"));
+    assert!(error.contains("maxRetries must be positive"));
+    assert!(error.contains("http1MaxPendingRequests must be positive"));
 }
 
 // `resolve_effective_proxy_for_target` is `pub(crate)`, so the per-field

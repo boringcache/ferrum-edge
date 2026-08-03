@@ -1548,6 +1548,7 @@ async fn subset_only_passive_policy_recovers_via_entry_deadline() {
         ResolvedSubsetTrafficPolicy {
             tls: None,
             passive_health_check: Some(subset_passive.clone()),
+            ..Default::default()
         },
     );
 

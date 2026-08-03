@@ -783,6 +783,7 @@ fn resolve_upstream_tls_falls_back_when_subset_overlay_is_empty_or_missing() {
                 ..BackendTlsConfig::default_verify()
             }),
             passive_health_check: None,
+            ..Default::default()
         },
     );
     upstream

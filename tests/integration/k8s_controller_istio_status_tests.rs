@@ -648,16 +648,10 @@ fn root_namespace_peer_authentication_resolves_to_mesh_wide_scope() {
     assert_eq!(detail["translation"]["scope"].as_str(), Some("MeshWide"),);
 }
 
-/// DestinationRule deferred-fields tracking. `maxRequestsPerConnection` is
-/// universally deferred because close-after-N backend requests are unsupported;
-/// this test focuses on the other deferred case: a `connectionPool.http` knob
-/// set inside a `subsets[].trafficPolicy` (the subset apply path builds a
-/// `SubsetTrafficPolicy` that carries no `connectionPool.http`). It uses a
-/// subset-scoped `http1MaxPendingRequests` to confirm the deferred-fields detail
-/// block + message still surface that case so operators know Ferrum parsed it but
-/// does not apply it for subsets — while the TOP-LEVEL value is applied (not deferred).
+/// Successfully applied subset HTTP connection-pool fields must not be reported
+/// as deferred in either the detail block or condition message.
 #[test]
-fn destination_rule_deferred_fields_listed_in_detail() {
+fn destination_rule_applied_subset_http_fields_are_not_deferred() {
     let obj = object(
         "networking.istio.io/v1",
         "DestinationRule",
@@ -671,7 +665,7 @@ fn destination_rule_deferred_fields_listed_in_detail() {
             "subsets": [{
                 "name": "v1",
                 "labels": { "version": "v1" },
-                // Subset: ignored — must be surfaced as deferred.
+                // Subset: applied — must NOT be surfaced as deferred.
                 "trafficPolicy": {
                     "connectionPool": { "http": { "http1MaxPendingRequests": 64 } }
                 }
@@ -686,12 +680,9 @@ fn destination_rule_deferred_fields_listed_in_detail() {
         .iter()
         .filter_map(Value::as_str)
         .collect();
-    // The subset-scoped knob is surfaced (tagged subset-scoped).
     assert!(
-        deferred
-            .iter()
-            .any(|f| f.contains("subsets[]") && f.contains("http1MaxPendingRequests")),
-        "subset-scoped http1MaxPendingRequests must be deferred; got: {deferred:?}"
+        deferred.is_empty(),
+        "applied top-level and subset http1MaxPendingRequests must not be deferred: {deferred:?}"
     );
     // The top-level (applied) value must NOT appear as deferred.
     assert!(
@@ -707,7 +698,7 @@ fn destination_rule_deferred_fields_listed_in_detail() {
         .as_str()
         .unwrap();
     assert!(
-        message.contains("deferred fields"),
-        "message should mention deferred fields, got: {message}"
+        !message.contains("deferred fields"),
+        "message must not claim applied fields are deferred: {message}"
     );
 }

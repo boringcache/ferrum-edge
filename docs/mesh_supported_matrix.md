@@ -201,10 +201,9 @@ ledger unless they change the support contract.
 | Deferral | Issue | Doc anchor |
 |---|---|---|
 | EgressGateway UDP `ServiceEntry` materialization (HTTP/TCP stream egress exists; UDP ports still skipped) | [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) | `docs/mesh.md` Egress Gateway / ServiceEntry materialization |
-| Subset-scoped DestinationRule HTTP connection-pool policy (`h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`) | [#3228](https://github.com/ferrum-edge/ferrum-edge/issues/3228) / [#3240](https://github.com/ferrum-edge/ferrum-edge/issues/3240)–[#3242](https://github.com/ferrum-edge/ferrum-edge/issues/3242) | `docs/mesh.md` DestinationRule deferred_fields / subset `connectionPool.http` |
 | Multicluster poller-driven partition / last-good-retention live gate | [#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331) | `docs/mesh_multicluster_federation_runbook.md` Harness |
 
-Completed historical rows (do **not** re-list as open): Ambient UDP capture producer + privileged live source-capture e2e (#2013 / #2038); VirtualService `tls[]` SNI passthrough L4 routing; remote-discovery JWT audience binding (#2475); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
+Completed historical rows (do **not** re-list as open): Ambient UDP capture producer + privileged live source-capture e2e (#2013 / #2038); VirtualService `tls[]` SNI passthrough L4 routing; remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
 
 ## How a feature graduates
 

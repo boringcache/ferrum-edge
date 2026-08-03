@@ -37,7 +37,6 @@ Current mesh HBONE/DNS perf status lives in
 
 | Residual | Issue(s) | Notes |
 |---|---|---|
-| Subset-scoped Istio HTTP connection-pool policy | [#3228](https://github.com/ferrum-edge/ferrum-edge/issues/3228) / [#3240](https://github.com/ferrum-edge/ferrum-edge/issues/3240)–[#3242](https://github.com/ferrum-edge/ferrum-edge/issues/3242) | `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests` inside subsets |
 | EgressGateway UDP `ServiceEntry` materialization | [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) | HTTP/TCP stream egress exists; UDP ports still skipped |
 | `ai_stream_router` `google_gemini` adapter | [#3299](https://github.com/ferrum-edge/ferrum-edge/issues/3299) | Config accepted; construction fails closed until implemented |
 | AI semantic-firewall token windows | [#3302](https://github.com/ferrum-edge/ferrum-edge/issues/3302) | `streaming.window: tokens` rejected |
