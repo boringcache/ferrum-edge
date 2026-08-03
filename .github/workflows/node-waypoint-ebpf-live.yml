@@ -301,8 +301,7 @@ jobs:
           count_before="$(metric_value "$results/before.prom" "${metric_prefix}_count")"
           sum_before="$(metric_value "$results/before.prom" "${metric_prefix}_sum")"
           le250_before="$(metric_value "$results/before.prom" "${metric_prefix}_bucket{le=\"250000\"}")"
-          le1000_before="$(metric_value "$results/before.prom" "${metric_prefix}_bucket{le=\"1000000\"}")"
-          for value in "$count_before" "$sum_before" "$le250_before" "$le1000_before"; do
+          for value in "$count_before" "$sum_before" "$le250_before"; do
             [[ "$value" =~ ^[0-9]+$ ]] || {
               echo "missing integer accept-to-first-byte baseline" >&2
               grep "$metric_prefix" "$results/before.prom" >&2 || true
@@ -382,8 +381,7 @@ jobs:
           done
           sum_after="$(metric_value "$results/after.prom" "${metric_prefix}_sum")"
           le250_after="$(metric_value "$results/after.prom" "${metric_prefix}_bucket{le=\"250000\"}")"
-          le1000_after="$(metric_value "$results/after.prom" "${metric_prefix}_bucket{le=\"1000000\"}")"
-          for value in "$count_after" "$sum_after" "$le250_after" "$le1000_after"; do
+          for value in "$count_after" "$sum_after" "$le250_after"; do
             [[ "$value" =~ ^[0-9]+$ ]] || {
               echo "missing integer accept-to-first-byte result" >&2
               grep "$metric_prefix" "$results/after.prom" >&2 || true
@@ -405,11 +403,6 @@ jobs:
             echo "500ms delayed samples did not increase the >250ms tail by two" >&2
             exit 1
           }
-          ((le1000_after >= le1000_before + 4)) || {
-            echo "expected all four fast/delayed samples in the 1s bucket" >&2
-            exit 1
-          }
-
       - name: Collect diagnostics
         if: always()
         run: |

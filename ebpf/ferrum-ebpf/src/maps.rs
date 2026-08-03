@@ -183,7 +183,8 @@ pub static FERRUM_SOCK_OPS_CONNECT_TS: LruHashMap<u64, u64> =
 /// SK_SKB stream parser. A SOCKHASH gives the parser the actual accepted
 /// socket, so tuple, listener, and redirect-layer reuse cannot alias samples.
 /// The kernel removes closed sockets from a sockhash automatically; the BPF
-/// programs also delete entries on first byte and terminal close.
+/// userspace ringbuf consumer deletes entries after first byte so removal never
+/// tries to stop an SK_SKB parser from inside its own callback.
 #[map]
 pub static FERRUM_ACCEPT_FIRST_BYTE_SOCKETS: SockHash<u64> =
     SockHash::with_max_entries(ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES, 0);
@@ -194,17 +195,3 @@ pub static FERRUM_ACCEPT_FIRST_BYTE_SOCKETS: SockHash<u64> =
 #[map]
 pub static FERRUM_ACCEPT_FIRST_BYTE_STATE: LruHashMap<u64, AcceptFirstByteState> =
     LruHashMap::with_max_entries(ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES, 0);
-
-#[inline(always)]
-pub fn remove_accept_first_byte_socket(cookie: &u64) {
-    // Aya's eBPF SockHash wrapper intentionally exposes update/redirect only.
-    // A sockhash is still a normal deletable BPF map, so use the helper at the
-    // map symbol directly. This removes the SK_SKB hook after the first byte
-    // instead of charging every later chunk a correlation lookup.
-    unsafe {
-        let _ = aya_ebpf::helpers::bpf_map_delete_elem(
-            core::ptr::addr_of!(FERRUM_ACCEPT_FIRST_BYTE_SOCKETS) as *mut _,
-            cookie as *const _ as *const _,
-        );
-    }
-}

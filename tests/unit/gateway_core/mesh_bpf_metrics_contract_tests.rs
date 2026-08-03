@@ -114,7 +114,10 @@ fn abi_drop_reason_and_rst_decode_contract() {
     first_byte.value = 42;
     assert_eq!(
         SockOpsEvent::from_record(first_byte),
-        Some(SockOpsEvent::AcceptToFirstByteLatency { us: 42 })
+        Some(SockOpsEvent::AcceptToFirstByteLatency {
+            us: 42,
+            socket_cookie: 0,
+        })
     );
 
     for (raw, expected) in [

@@ -15,11 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   socket in a bounded SOCKHASH; an SK_SKB stream parser consumes the first
   non-empty inbound application-data callback only after the existing orig-dst
   bridge confirms capture. Socket-cookie identity, delete-wins/BPF_EXIST phase
-  transitions, close/first-data cleanup, LRU eviction, one-hour monotonic age
-  validation, and reload generation isolation prevent tuple/listener reuse, raced handoff,
-  stale state, and `ktime` wrap from fabricating samples. The metric has fixed
-  microsecond buckets with saturating count/bucket counters, drops sum overflow,
-  and adds no per-flow labels (#3309).
+  transitions, deferred userspace SOCKHASH removal after the parser/verdict
+  callback returns, kernel close cleanup, LRU eviction, one-hour monotonic age
+  validation, and reload generation isolation prevent tuple/listener reuse,
+  callback-lock recursion, raced handoff, stale state, and `ktime` wrap from
+  fabricating samples. The metric has fixed microsecond buckets with saturating
+  count/bucket counters, drops sum overflow, and adds no per-flow labels (#3309).
 
 - Audited admin mutations are durable **before they run** (issue #2421).
   The admin write gate fsyncs a pre-mutation audit intent — a stable event id

@@ -95,7 +95,7 @@ use crate::maps::{
     FERRUM_ACCEPT_COOKIE_BY_TUPLE4, FERRUM_ACCEPT_COOKIE_BY_TUPLE6,
     FERRUM_ACCEPT_FIRST_BYTE_SOCKETS, FERRUM_ACCEPT_FIRST_BYTE_STATE, FERRUM_CAPTURE_CONFIG,
     FERRUM_ORIG_DST4, FERRUM_ORIG_DST6, FERRUM_ORIG_DST_BY_TUPLE4,
-    FERRUM_ORIG_DST_BY_TUPLE6, FERRUM_SOCK_OPS_CONNECT_TS, remove_accept_first_byte_socket,
+    FERRUM_ORIG_DST_BY_TUPLE6, FERRUM_SOCK_OPS_CONNECT_TS,
 };
 use crate::sock_ops_emit::emit;
 
@@ -548,7 +548,10 @@ fn confirm_accept_first_byte(cookie: u64) {
 fn cleanup_accept_first_byte_on_close(ctx: &SockOpsContext) {
     let cookie = socket_cookie(ctx);
     let _ = FERRUM_ACCEPT_FIRST_BYTE_STATE.remove(&cookie);
-    remove_accept_first_byte_socket(&cookie);
+    // The kernel unlinks closed sockets from SockHash maps. Do not explicitly
+    // delete here: map deletion stops the attached SK_SKB callbacks by taking
+    // the socket callback write lock, which must never be attempted from a BPF
+    // callback on that same socket.
 }
 
 #[inline(always)]

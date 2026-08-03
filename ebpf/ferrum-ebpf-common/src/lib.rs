@@ -671,6 +671,29 @@ pub struct SockOpsRecord {
     pub value: u64,
 }
 
+impl SockOpsRecord {
+    /// Build an accept-to-first-byte record without increasing the hot-path
+    /// ringbuf record size. The direction and drop-reason fields are unused by
+    /// this event variant, so they carry the low/high halves of the accepted
+    /// socket cookie. Userspace uses the cookie only to remove the SK_SKB hook
+    /// after the parser and verdict have returned.
+    pub const fn accept_to_first_byte_latency(value: u64, socket_cookie: u64) -> Self {
+        Self {
+            event_type: SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY,
+            direction: socket_cookie as u32,
+            drop_reason: (socket_cookie >> 32) as u32,
+            _pad: 0,
+            value,
+        }
+    }
+
+    /// Recover the accepted socket cookie carried by an
+    /// `SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY` record.
+    pub const fn accepted_socket_cookie(self) -> u64 {
+        (self.direction as u64) | ((self.drop_reason as u64) << 32)
+    }
+}
+
 /// Per-accepted-socket correlation state shared by SOCK_OPS and SK_SKB.
 ///
 /// `accepted_ns` is sampled at `BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB`.
@@ -1056,6 +1079,10 @@ mod tests {
         // SockOpsRecord: four u32 (16) + one u64 (8) = 24 bytes, 8-byte aligned.
         assert_eq!(mem::size_of::<SockOpsRecord>(), 24);
         assert_eq!(mem::align_of::<SockOpsRecord>(), 8);
+        let first_byte =
+            SockOpsRecord::accept_to_first_byte_latency(42, 0x0123_4567_89ab_cdef);
+        assert_eq!(first_byte.value, 42);
+        assert_eq!(first_byte.accepted_socket_cookie(), 0x0123_4567_89ab_cdef);
         assert_eq!(mem::size_of::<AcceptFirstByteState>(), 16);
         assert_eq!(mem::align_of::<AcceptFirstByteState>(), 8);
     }

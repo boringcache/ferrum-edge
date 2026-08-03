@@ -97,6 +97,12 @@ pub const BPF_SOCK_OPS_EVENTS_PIN_PATH: &str = "/sys/fs/bpf/ferrum/sock_ops_even
 /// Pinned path for the SOCK_OPS dropped-events counter array.
 pub const BPF_SOCK_OPS_STATS_PIN_PATH: &str = "/sys/fs/bpf/ferrum/sock_ops_stats";
 
+/// Pinned path for the accepted-socket SockHash. The mesh-proxy ringbuf
+/// consumer removes an entry only after the first-byte parser/verdict callback
+/// has returned, avoiding callback-lock recursion inside the kernel.
+pub const BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH: &str =
+    "/sys/fs/bpf/ferrum/accept_first_byte_sockets";
+
 /// Pinned path for the IPv4 original-destination map. Node-agent loads + pins;
 /// the node-waypoint mesh-proxy opens by path through the orig-dst bridge
 /// (GAP-1b) to recover per-socket source identity. Both sides agree on the
@@ -919,9 +925,9 @@ pub trait EbpfBackend: Send + Sync {
     fn cleanup_all(&mut self) -> Result<(), String>;
 
     /// Attach the SOCK_OPS program to the cgroup root and pin the event
-    /// ringbuf + stats map at the well-known paths
-    /// (`BPF_SOCK_OPS_EVENTS_PIN_PATH`, `BPF_SOCK_OPS_STATS_PIN_PATH`) so
-    /// the mesh-proxy can open them by path.
+    /// ringbuf, stats map, and first-byte SockHash at their well-known paths
+    /// so the mesh-proxy can drain metrics and defer hook removal until after
+    /// the kernel callback returns.
     ///
     /// The caller decides whether failure is fatal. In NodeWaypoint mode this
     /// link is part of source-identity recovery, so startup refuses readiness

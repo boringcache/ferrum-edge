@@ -16,7 +16,9 @@
 //!      draining all available records on each wakeup.
 //!   2. Decodes each record via [`SockOpsEvent::from_record_bytes`] and
 //!      hands it to [`SockOpsConsumer::handle_event`].
-//!   3. Polls the per-CPU dropped-events counter
+//!   3. Removes a first-data socket from the pinned SockHash only after its
+//!      parser/verdict callback has returned.
+//!   4. Polls the per-CPU dropped-events counter
 //!      ([`BPF_SOCK_OPS_STATS_PIN_PATH`](crate::ebpf::BPF_SOCK_OPS_STATS_PIN_PATH))
 //!      after each drain. When the sum advances, the consumer is in an
 //!      overrun regime; [`SockOpsConsumer::record_overrun`] handles the
@@ -75,6 +77,7 @@ pub enum SockOpsEvent {
     },
     AcceptToFirstByteLatency {
         us: u64,
+        socket_cookie: u64,
     },
     DropReason(BpfDropReason),
 }
@@ -111,7 +114,10 @@ impl SockOpsEvent {
             }),
             SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY => Some(Self::SynToAckLatency { us: record.value }),
             SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY => {
-                Some(Self::AcceptToFirstByteLatency { us: record.value })
+                Some(Self::AcceptToFirstByteLatency {
+                    us: record.value,
+                    socket_cookie: record.accepted_socket_cookie(),
+                })
             }
             SOCK_OPS_EVENT_DROP_REASON => Some(Self::DropReason(drop_reason?)),
             _ => None,
@@ -175,7 +181,7 @@ impl SockOpsConsumer {
             SockOpsEvent::Fin { direction } => self.metrics.record_fin(direction),
             SockOpsEvent::RttSample { srtt_us } => self.metrics.record_srtt_sample(srtt_us),
             SockOpsEvent::SynToAckLatency { us } => self.metrics.record_syn_to_ack(us),
-            SockOpsEvent::AcceptToFirstByteLatency { us } => {
+            SockOpsEvent::AcceptToFirstByteLatency { us, .. } => {
                 self.metrics.record_accept_to_first_byte(us)
             }
             SockOpsEvent::DropReason(reason) => self.metrics.record_drop(reason),
@@ -278,7 +284,7 @@ pub mod production {
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use aya::maps::{Map, MapData, PerCpuArray, RingBuf};
+    use aya::maps::{Map, MapData, PerCpuArray, RingBuf, SockHash};
     use ferrum_ebpf_common::{SOCK_OPS_STATS_EVENTS_DROPPED, SockOpsRecord};
     use tokio::io::Interest;
     use tokio::io::unix::AsyncFd;
@@ -288,7 +294,10 @@ pub mod production {
         PollOutcome, SOCK_OPS_RECOVERY_THRESHOLD, SockOpsConsumer, SockOpsEvent,
         seed_dropped_baseline,
     };
-    use crate::ebpf::{BPF_SOCK_OPS_EVENTS_PIN_PATH, BPF_SOCK_OPS_STATS_PIN_PATH};
+    use crate::ebpf::{
+        BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH, BPF_SOCK_OPS_EVENTS_PIN_PATH,
+        BPF_SOCK_OPS_STATS_PIN_PATH,
+    };
 
     static MALFORMED_SOCK_OPS_RECORD_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -308,13 +317,14 @@ pub mod production {
         // and the plugin emits zeros forever until mesh-proxy itself
         // restarts. Backoff races against `shutdown_rx` so SIGTERM during
         // the wait still drains promptly.
-        let (mut ring_buf, mut stats) = match wait_for_pinned_maps(&mut shutdown_rx).await {
-            WaitOutcome::Found(pair) => pair,
-            WaitOutcome::Shutdown => {
-                info!("SOCK_OPS ringbuf consumer shutting down before maps were pinned");
-                return Ok(());
-            }
-        };
+        let (mut ring_buf, mut stats, mut first_byte_sockets) =
+            match wait_for_pinned_maps(&mut shutdown_rx).await {
+                WaitOutcome::Found(maps) => maps,
+                WaitOutcome::Shutdown => {
+                    info!("SOCK_OPS ringbuf consumer shutting down before maps were pinned");
+                    return Ok(());
+                }
+            };
 
         let raw_fd = ring_buf.as_raw_fd();
         let mut async_fd = AsyncFd::with_interest(RingBufFd(raw_fd), Interest::READABLE)
@@ -374,10 +384,12 @@ pub mod production {
                         drop(async_fd);
                         drop(ring_buf);
                         drop(stats);
+                        drop(first_byte_sockets);
                         match wait_for_pinned_maps(&mut shutdown_rx).await {
-                            WaitOutcome::Found((new_rb, new_stats)) => {
+                            WaitOutcome::Found((new_rb, new_stats, new_first_byte_sockets)) => {
                                 ring_buf = new_rb;
                                 stats = new_stats;
+                                first_byte_sockets = new_first_byte_sockets;
                                 let new_fd = ring_buf.as_raw_fd();
                                 async_fd = AsyncFd::with_interest(
                                     RingBufFd(new_fd),
@@ -409,7 +421,11 @@ pub mod production {
                 }
                 guard = async_fd.readable() => {
                     let mut guard = guard.map_err(|e| anyhow::anyhow!("SOCK_OPS AsyncFd readable failed: {e}"))?;
-                    let events_handled = drain_ringbuf(&mut ring_buf, &consumer);
+                    let events_handled = drain_ringbuf(
+                        &mut ring_buf,
+                        &mut first_byte_sockets,
+                        &consumer,
+                    );
 
                     let now_dropped_total = read_dropped_total(&stats);
                     let outcome = if now_dropped_total > last_dropped_total {
@@ -458,8 +474,14 @@ pub mod production {
     }
 
     /// Outcome of waiting for the SOCK_OPS pinned maps to appear.
+    type PinnedSockOpsMaps = (
+        RingBuf<MapData>,
+        PerCpuArray<MapData, u64>,
+        SockHash<MapData, u64>,
+    );
+
     enum WaitOutcome {
-        Found((RingBuf<MapData>, PerCpuArray<MapData, u64>)),
+        Found(PinnedSockOpsMaps),
         Shutdown,
     }
 
@@ -506,7 +528,7 @@ pub mod production {
     /// Variant of `open_pinned_maps` that returns silently on "pin not
     /// present" (used by the retry loop), but still emits a warn for hard
     /// errors (type mismatch on pinned map).
-    fn open_pinned_maps_quiet() -> Option<(RingBuf<MapData>, PerCpuArray<MapData, u64>)> {
+    fn open_pinned_maps_quiet() -> Option<PinnedSockOpsMaps> {
         let events_map = MapData::from_pin(BPF_SOCK_OPS_EVENTS_PIN_PATH).ok()?;
         let ring_buf = match RingBuf::try_from(Map::RingBuf(events_map)) {
             Ok(rb) => rb,
@@ -535,10 +557,23 @@ pub mod production {
             }
         };
 
-        Some((ring_buf, stats))
+        let sockets_map = MapData::from_pin(BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH).ok()?;
+        let first_byte_sockets = match SockHash::try_from(Map::SockHash(sockets_map)) {
+            Ok(map) => map,
+            Err(e) => {
+                warn!(
+                    pin_path = BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH,
+                    error = %e,
+                    "Pinned accept-first-byte map is not a SockHash; refusing to attach consumer"
+                );
+                return None;
+            }
+        };
+
+        Some((ring_buf, stats, first_byte_sockets))
     }
 
-    fn open_pinned_maps() -> Option<(RingBuf<MapData>, PerCpuArray<MapData, u64>)> {
+    fn open_pinned_maps() -> Option<PinnedSockOpsMaps> {
         let events_map = match MapData::from_pin(BPF_SOCK_OPS_EVENTS_PIN_PATH) {
             Ok(m) => m,
             Err(e) => {
@@ -592,7 +627,30 @@ pub mod production {
             }
         };
 
-        Some((ring_buf, stats))
+        let sockets_map = match MapData::from_pin(BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    pin_path = BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH,
+                    error = %e,
+                    "Pinned accept-first-byte SockHash missing; deferred hook removal disabled"
+                );
+                return None;
+            }
+        };
+        let first_byte_sockets = match SockHash::try_from(Map::SockHash(sockets_map)) {
+            Ok(map) => map,
+            Err(e) => {
+                warn!(
+                    pin_path = BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH,
+                    error = %e,
+                    "Pinned accept-first-byte map is not a SockHash; refusing to attach consumer"
+                );
+                return None;
+            }
+        };
+
+        Some((ring_buf, stats, first_byte_sockets))
     }
 
     /// Drain pending ringbuf items and return the count of valid events
@@ -600,7 +658,11 @@ pub mod production {
     /// a spurious wakeup with zero events must NOT advance
     /// `consecutive_drained` (which would falsely trigger recovery while
     /// the kernel is still dropping events on another CPU).
-    fn drain_ringbuf(ring_buf: &mut RingBuf<MapData>, consumer: &SockOpsConsumer) -> u32 {
+    fn drain_ringbuf(
+        ring_buf: &mut RingBuf<MapData>,
+        first_byte_sockets: &mut SockHash<MapData, u64>,
+        consumer: &SockOpsConsumer,
+    ) -> u32 {
         let mut events_handled: u32 = 0;
         while let Some(item) = ring_buf.next() {
             let bytes: &[u8] = &item;
@@ -614,6 +676,18 @@ pub mod production {
             }
             match SockOpsEvent::from_record_bytes(bytes) {
                 Some(event) => {
+                    if let SockOpsEvent::AcceptToFirstByteLatency {
+                        socket_cookie, ..
+                    } = event
+                    {
+                        // This runs in userspace only after the kernel parser
+                        // and paired verdict returned. Removing the SockHash
+                        // entry inside either callback would recurse from the
+                        // socket callback read lock into its write lock.
+                        if socket_cookie != 0 {
+                            let _ = first_byte_sockets.remove(&socket_cookie);
+                        }
+                    }
                     consumer.handle_event(event);
                     events_handled = events_handled.saturating_add(1);
                 }
@@ -680,7 +754,10 @@ mod tests {
         });
         consumer.handle_event(SockOpsEvent::RttSample { srtt_us: 250 });
         consumer.handle_event(SockOpsEvent::SynToAckLatency { us: 60 });
-        consumer.handle_event(SockOpsEvent::AcceptToFirstByteLatency { us: 800 });
+        consumer.handle_event(SockOpsEvent::AcceptToFirstByteLatency {
+            us: 800,
+            socket_cookie: 1,
+        });
         consumer.handle_event(SockOpsEvent::DropReason(BpfDropReason::BypassUidHit));
 
         let s = snap(&consumer);
@@ -705,9 +782,9 @@ mod tests {
             SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT, SOCK_OPS_DROP_BYPASS_UID_HIT,
             SOCK_OPS_DROP_EXCLUDE_CIDR_HIT, SOCK_OPS_DROP_EXCLUDE_PORT_HIT,
             SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR, SOCK_OPS_EVENT_ACCEPT_ESTABLISHED,
-            SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY, SOCK_OPS_EVENT_CONNECT,
-            SOCK_OPS_EVENT_DROP_REASON, SOCK_OPS_EVENT_FIN, SOCK_OPS_EVENT_RST,
-            SOCK_OPS_EVENT_RTT_SAMPLE, SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, SockOpsRecord,
+            SOCK_OPS_EVENT_CONNECT, SOCK_OPS_EVENT_DROP_REASON, SOCK_OPS_EVENT_FIN,
+            SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE, SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY,
+            SockOpsRecord,
         };
 
         fn rec(event: u32, direction: u32, drop_reason: u32, value: u64) -> SockOpsRecord {
@@ -751,14 +828,14 @@ mod tests {
             SockOpsEvent::from_record(rec(SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, 0, 0, 60)),
             Some(SockOpsEvent::SynToAckLatency { us: 60 })
         );
+        let first_byte =
+            SockOpsRecord::accept_to_first_byte_latency(800, 0x0123_4567_89ab_cdef);
         assert_eq!(
-            SockOpsEvent::from_record(rec(
-                SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY,
-                0,
-                0,
-                800,
-            )),
-            Some(SockOpsEvent::AcceptToFirstByteLatency { us: 800 })
+            SockOpsEvent::from_record(first_byte),
+            Some(SockOpsEvent::AcceptToFirstByteLatency {
+                us: 800,
+                socket_cookie: 0x0123_4567_89ab_cdef,
+            })
         );
 
         for (raw, expected) in [
