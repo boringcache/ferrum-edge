@@ -629,6 +629,33 @@ pub fn check_external_secret_sources_enforced(configured: Vec<&'static str>) -> 
     ))
 }
 
+/// Refuse a typed remote-provider URI before its SDK client is constructed.
+///
+/// This complements [`check_external_secret_sources`]: TLS material sources can
+/// arrive through config files, the admin API, or a resolved `_FILE` value and
+/// therefore need enforcement at the common URI-loading boundary too.
+pub fn check_external_secret_uri_scheme(scheme: &'static str) -> Result<(), String> {
+    if !super::is_enforcing() {
+        return Ok(());
+    }
+    check_external_secret_uri_scheme_enforced(scheme)
+}
+
+/// The enforced half of [`check_external_secret_uri_scheme`].
+pub fn check_external_secret_uri_scheme_enforced(scheme: &'static str) -> Result<(), String> {
+    if !matches!(scheme, "vault" | "aws" | "azure" | "gcp") {
+        return Ok(());
+    }
+
+    Err(format!(
+        "external secret provider URI scheme `{scheme}` is configured. Its SDK resolves secrets \
+         over its own TLS stack, which Ferrum cannot route through the selected `{}` module, so \
+         it is refused while FIPS mode is enforced. Supply the material directly or through a \
+         local file backed by an operator-validated delivery mechanism. See docs/fips.md.",
+        super::SUPPORTED_PROVIDER_ID
+    ))
+}
+
 /// Remote-provider suffixes present on at least one `FERRUM_*` variable.
 ///
 /// Iterates `vars_os` rather than `vars`, which panics on a non-Unicode name or
