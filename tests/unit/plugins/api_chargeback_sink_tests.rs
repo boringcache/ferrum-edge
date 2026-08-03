@@ -27,8 +27,7 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
     spool_decompression_limit_for_tests, spool_index_entry_bytes_for_tests,
     spool_split_worklist_max_entries_for_tests, spool_streaming_limits_for_tests,
-    write_private_file_atomically_for_tests,
-    write_private_file_atomically_with_fault_for_tests,
+    write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
 };
 #[cfg(unix)]
 use ferrum_edge::plugins::api_chargeback_sink::{
@@ -7656,7 +7655,10 @@ fn streaming_reader_rejects_a_directory_descriptor_as_non_regular() {
     let error = probe_streaming_replay_path_swap_for_tests(&directory, &replacement, ceiling)
         .expect_err("a directory descriptor must fail before streaming preflight");
 
-    assert!(error.contains("not a regular file"), "unexpected error: {error}");
+    assert!(
+        error.contains("not a regular file"),
+        "unexpected error: {error}"
+    );
     assert_eq!(ceiling.used(), 0);
 }
 
@@ -7673,10 +7675,9 @@ fn namespace_coordination_lock_rejects_initial_non_files() {
     )
     .unwrap();
     fs::create_dir_all(directory_root.join(".spool-quota.lock")).unwrap();
-    let directory_error = match SpoolManager::for_tests(
-        spool_settings(directory_temp.path(), 1024 * 1024),
-        "node-a",
-    ) {
+    let directory_error =
+        match SpoolManager::for_tests(spool_settings(directory_temp.path(), 1024 * 1024), "node-a")
+    {
         Ok(_) => panic!("a directory must never become the namespace coordination lock"),
         Err(error) => error,
     };
@@ -7694,10 +7695,8 @@ fn namespace_coordination_lock_rejects_initial_non_files() {
     let lock_c = CString::new(lock.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(lock_c.as_ptr(), 0o600) }, 0);
 
-    let error = match SpoolManager::for_tests(
-        spool_settings(temp.path(), 1024 * 1024),
-        "node-a",
-    ) {
+    let error = match SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a")
+    {
         Ok(_) => panic!("a FIFO must never become the namespace coordination lock"),
         Err(error) => error,
     };
@@ -7893,7 +7892,10 @@ async fn streaming_replay_defers_when_the_second_batch_index_is_starved() {
         error.contains("ceiling") || error.contains("deferred"),
         "unexpected second-index refusal: {error}"
     );
-    assert!(source.exists(), "an index refusal must restore the source claim");
+    assert!(
+        source.exists(),
+        "an index refusal must restore the source claim"
+    );
     assert_eq!(ceiling.used(), 0);
 }
 
@@ -7954,8 +7956,14 @@ async fn dead_letter_publish_refuses_a_final_planted_after_writer_open() {
             || error.contains("directory"),
         "unexpected post-open publish refusal: {error}"
     );
-    assert!(source.exists(), "the complete source claim must be restored");
-    assert!(payload_final.is_dir(), "the planted final is never replaced");
+    assert!(
+        source.exists(),
+        "the complete source claim must be restored"
+    );
+    assert!(
+        payload_final.is_dir(),
+        "the planted final is never replaced"
+    );
 }
 
 #[tokio::test]
@@ -7993,7 +8001,10 @@ async fn dead_letter_handoff_preserves_evidence_when_the_source_path_becomes_a_d
         error.contains("failed to remove replay source"),
         "unexpected source-removal refusal: {error}"
     );
-    assert!(source.is_dir(), "claim release restores the planted path without deleting it");
+    assert!(
+        source.is_dir(),
+        "claim release restores the planted path without deleting it"
+    );
     let displaced_bytes = fs::read(&displaced).unwrap();
     assert!(
         String::from_utf8_lossy(&displaced_bytes).contains("evt-dead-letter-source-race"),
