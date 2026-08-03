@@ -117,6 +117,8 @@ pub fn tls_store_instance_id_from_env() -> Option<String> {
 /// PostgreSQL and MySQL. Callers must never log or echo it — the value may
 /// embed credentials. `Debug` redacts the URL for the same reason.
 #[derive(Clone, PartialEq, Eq)]
+// Public custom-plugin API; the binary test target may compile without opt-in plugins.
+#[allow(dead_code)]
 pub struct EffectiveSqlBackend {
     pub db_type: String,
     pub effective_url: String,
@@ -881,6 +883,8 @@ fn resolve_tls_source_override(
 /// Resolve the same source-over-path contract through the process-wide
 /// conf-aware resolver for consumers that do not hold the `ConfFile` used by
 /// `EnvConfig::from_env_with_conf`.
+// Used by the public SQL-backend resolver when an opt-in plugin is compiled.
+#[allow(dead_code)]
 fn resolve_cached_tls_source_override(source_key: &str, path_key: &str) -> Option<String> {
     let path_value = crate::config::conf_file::resolve_ferrum_var(path_key);
     match crate::config::conf_file::resolve_ferrum_var(source_key) {
@@ -1791,6 +1795,13 @@ pub struct EnvConfig {
     /// aggregate cap to fit one huge response would hand the memory bound back
     /// to whoever picks the response. Default: 268435456 (256 MiB).
     pub response_buffer_max_total_bytes: usize,
+    /// Aggregate ceiling (bytes) on the working set retained while governed
+    /// compressed requests are decoded for final request-body policy
+    /// inspection. This is deliberately separate from the response-buffer
+    /// budget and is floored at the worst-case peak for one stacked request
+    /// decode. A request that cannot reserve capacity fails closed before its
+    /// encoded body can bypass inspection. Default: 268435456 (256 MiB).
+    pub request_decode_max_total_bytes: usize,
     /// Cutoff (bytes) below which response bodies with a known Content-Length
     /// are eagerly buffered into a single allocation instead of streamed
     /// frame-by-frame. For small JSON API responses the single `bytes().await`
@@ -1955,6 +1966,12 @@ pub struct EnvConfig {
     /// indefinitely by count). Non-zero values must be in `1..=10_000_000`.
     /// Newest events win under deterministic `(ts, id)` ordering.
     pub audit_retention_max_rows: Option<u64>,
+    /// Durable audit delivery pipeline settings (issue #2421): spool root,
+    /// unavailability policy, and the bounded queue / spool / retry budgets.
+    /// Installed process-wide by `crate::admin::audit::initialize` before mode
+    /// dispatch, so a `fail_closed` deployment refuses to start with an
+    /// unusable spool rather than discovering it on the first mutation.
+    pub admin_audit_pipeline: crate::admin::audit::AuditPipelineConfig,
     /// Require admin JWTs to carry an `ns` claim authorizing the
     /// `X-Ferrum-Namespace` value on namespace-scoped admin routes.
     /// Mirrors `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` on the gRPC plane.
@@ -2150,6 +2167,21 @@ pub struct EnvConfig {
     pub adaptive_buffer_default_size: usize,
     /// Default batch limit when no data recorded yet. Default: 6000.
     pub adaptive_batch_limit_default: usize,
+
+    // FIPS deployment mode
+    /// Requested FIPS posture: "off" (default) or "enforce".
+    ///
+    /// This is the *runtime request*. Whether the build can satisfy it is a
+    /// separate question answered by `crate::fips::BUILD_CAPABLE`; an enforce
+    /// request on a build without the AWS-LC FIPS provider profile fails
+    /// closed at bootstrap rather than downgrading. See `docs/fips.md`.
+    pub fips_mode: String,
+    /// Validated-module integration the operator requires
+    /// (default: `aws-lc-fips`, the only integration Ferrum supports).
+    ///
+    /// Pinning it means a future build that changed integrations cannot
+    /// silently satisfy an existing FIPS deployment contract.
+    pub fips_required_provider: String,
 
     // TLS Hardening
     /// Minimum TLS version: "1.2" or "1.3" (default: "1.2")
@@ -2783,6 +2815,8 @@ impl Default for EnvConfig {
                 crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES,
             response_buffer_max_total_bytes:
                 crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES,
+            request_decode_max_total_bytes:
+                crate::proxy::response_buffer_budget::DEFAULT_REQUEST_DECODE_TOTAL_BYTES,
             response_buffer_cutoff_bytes: 65_536,
             h2_coalesce_target_bytes: 131_072,
             max_url_length_bytes: 8_192,
@@ -2829,6 +2863,7 @@ impl Default for EnvConfig {
             admin_audit_enabled: false,
             audit_retention_days: None,
             audit_retention_max_rows: Some(crate::admin::audit::AUDIT_RETENTION_MAX_ROWS_DEFAULT),
+            admin_audit_pipeline: crate::admin::audit::AuditPipelineConfig::default(),
             admin_require_namespace_claim: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
@@ -2870,6 +2905,8 @@ impl Default for EnvConfig {
             adaptive_buffer_max_size: 262_144,
             adaptive_buffer_default_size: 65_536,
             adaptive_batch_limit_default: 6_000,
+            fips_mode: "off".into(),
+            fips_required_provider: crate::fips::SUPPORTED_PROVIDER_ID.into(),
             tls_min_version: "1.2".into(),
             tls_max_version: "1.3".into(),
             tls_cipher_suites: None,
@@ -3035,6 +3072,18 @@ impl EnvConfig {
             audit_retention_days: Option<u64> = "FERRUM_AUDIT_RETENTION_DAYS";
             audit_retention_max_rows: u64 = "FERRUM_AUDIT_RETENTION_MAX_ROWS"
                 => crate::admin::audit::AUDIT_RETENTION_MAX_ROWS_DEFAULT;
+            admin_audit_spool_dir: String = "FERRUM_ADMIN_AUDIT_SPOOL_DIR"
+                => crate::admin::audit::AUDIT_SPOOL_DIR_DEFAULT.to_string();
+            admin_audit_unavailable_policy: String = "FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY"
+                => crate::admin::audit::AuditUnavailablePolicy::FailOpen.as_str().to_string();
+            admin_audit_queue_capacity: usize = "FERRUM_ADMIN_AUDIT_QUEUE_CAPACITY"
+                => crate::admin::audit::AUDIT_QUEUE_CAPACITY_DEFAULT;
+            admin_audit_spool_max_records: u64 = "FERRUM_ADMIN_AUDIT_SPOOL_MAX_RECORDS"
+                => crate::admin::audit::AUDIT_SPOOL_MAX_RECORDS_DEFAULT;
+            admin_audit_retained_max_records: u64 = "FERRUM_ADMIN_AUDIT_RETAINED_MAX_RECORDS"
+                => crate::admin::audit::AUDIT_RETAINED_MAX_RECORDS_DEFAULT;
+            admin_audit_max_delivery_attempts: u32 = "FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS"
+                => crate::admin::audit::AUDIT_MAX_DELIVERY_ATTEMPTS_DEFAULT;
             admin_require_namespace_claim: bool = "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM" => false;
         }
         let audit_retention_policy = crate::admin::audit::AuditRetentionPolicy::from_parts(
@@ -3043,6 +3092,16 @@ impl EnvConfig {
         )?;
         let audit_retention_days = audit_retention_policy.retention_days;
         let audit_retention_max_rows = audit_retention_policy.max_rows_per_namespace;
+        // An empty spool directory explicitly opts out of durable delivery.
+        // `AuditPipelineConfig::validate` rejects that combination under
+        // `fail_closed`, so opting out can never silently weaken a deployment
+        // that asked to fail closed.
+        let admin_audit_spool_dir = {
+            let trimmed = admin_audit_spool_dir.trim();
+            (!trimmed.is_empty()).then(|| std::path::PathBuf::from(trimmed))
+        };
+        let admin_audit_unavailable_policy =
+            crate::admin::audit::AuditUnavailablePolicy::parse(&admin_audit_unavailable_policy)?;
 
         env_config! {
             conf = conf, mode = &mode;
@@ -3082,6 +3141,27 @@ impl EnvConfig {
             mongo_server_selection_timeout_seconds: Option<u64> = "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS";
             mongo_connect_timeout_seconds: Option<u64> = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS";
         }
+        // Durable audit pipeline (issue #2421). Built here because every
+        // durable record is bound to a non-secret audit-destination identity
+        // derived from the backend type, the namespace, and a digest of the
+        // *redacted* connection URL, so a reconfigured gateway can never replay
+        // another deployment's audit evidence into the wrong database. The
+        // connection secret itself is neither stored nor logged.
+        let admin_audit_pipeline = crate::admin::audit::AuditPipelineConfig {
+            enabled: admin_audit_enabled,
+            spool_dir: admin_audit_spool_dir,
+            policy: admin_audit_unavailable_policy,
+            destination: crate::admin::audit::audit_destination_identity(
+                db_type.as_deref(),
+                db_url.as_deref(),
+                &namespace,
+            ),
+            queue_capacity: admin_audit_queue_capacity,
+            spool_max_records: admin_audit_spool_max_records,
+            retained_max_records: admin_audit_retained_max_records,
+            max_delivery_attempts: admin_audit_max_delivery_attempts,
+        };
+        admin_audit_pipeline.validate()?;
         if resolve_var(conf, "FERRUM_DB_POLL_INTERVAL")
             .as_deref()
             .is_some_and(|raw| raw.trim() == "0")
@@ -3245,6 +3325,7 @@ impl EnvConfig {
             max_response_body_size_bytes: usize = "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES" => 10_485_760usize;
             response_buffer_fallback_max_bytes: usize = "FERRUM_RESPONSE_BUFFER_FALLBACK_MAX_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES;
             response_buffer_max_total_bytes: usize = "FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES;
+            request_decode_max_total_bytes: usize = "FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_REQUEST_DECODE_TOTAL_BYTES;
             response_buffer_cutoff_bytes: usize = "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES" => 65_536usize;
             h2_coalesce_target_bytes: usize = "FERRUM_H2_COALESCE_TARGET_BYTES" => 131_072usize, clamp(16_384usize, 1_048_576usize);
             max_url_length_bytes: usize = "FERRUM_MAX_URL_LENGTH_BYTES" => 8_192usize;
@@ -3337,6 +3418,8 @@ impl EnvConfig {
             adaptive_buffer_max_size: usize = "FERRUM_ADAPTIVE_BUFFER_MAX_SIZE" => 262_144usize, clamp(1024usize, 1_048_576usize);
             adaptive_buffer_default_size: usize = "FERRUM_ADAPTIVE_BUFFER_DEFAULT_SIZE" => 65_536usize, clamp(1024usize, 1_048_576usize);
             adaptive_batch_limit_default: usize = "FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT" => 6_000usize, max(1usize);
+            fips_mode: String = "FERRUM_FIPS_MODE" => "off".to_string();
+            fips_required_provider: String = "FERRUM_FIPS_REQUIRED_PROVIDER" => crate::fips::SUPPORTED_PROVIDER_ID.to_string();
             tls_min_version: String = "FERRUM_TLS_MIN_VERSION" => "1.2".to_string();
             tls_max_version: String = "FERRUM_TLS_MAX_VERSION" => "1.3".to_string();
             tls_cipher_suites: Option<String> = "FERRUM_TLS_CIPHER_SUITES";
@@ -3911,6 +3994,7 @@ impl EnvConfig {
             max_response_body_size_bytes,
             response_buffer_fallback_max_bytes,
             response_buffer_max_total_bytes,
+            request_decode_max_total_bytes,
             response_buffer_cutoff_bytes,
             h2_coalesce_target_bytes,
             max_url_length_bytes,
@@ -3958,6 +4042,7 @@ impl EnvConfig {
             admin_audit_enabled,
             audit_retention_days,
             audit_retention_max_rows,
+            admin_audit_pipeline,
             admin_require_namespace_claim,
             admin_tls_no_verify,
             enable_http3,
@@ -3993,6 +4078,8 @@ impl EnvConfig {
             adaptive_buffer_max_size,
             adaptive_buffer_default_size,
             adaptive_batch_limit_default,
+            fips_mode,
+            fips_required_provider,
             tls_min_version,
             tls_max_version,
             tls_cipher_suites,
@@ -4607,6 +4694,8 @@ impl EnvConfig {
     ///
     /// MongoDB is rejected because callers need a SQL pool. Errors never include
     /// the raw database URL or credentials.
+    // Public custom-plugin API; not every binary artifact opts a SQL consumer in.
+    #[allow(dead_code)]
     pub fn resolve_effective_sql_backend() -> Result<EffectiveSqlBackend, String> {
         use env_config_macro::EnvValue;
 
@@ -4642,6 +4731,8 @@ impl EnvConfig {
     /// Prefer [`Self::resolve_effective_sql_backend`] when loading from the
     /// process environment / `ferrum.conf`. This method is useful for tests that
     /// construct a partial [`EnvConfig`] without opening a network connection.
+    // Public custom-plugin API and external-test helper.
+    #[allow(dead_code)]
     pub fn effective_sql_backend(&self) -> Result<EffectiveSqlBackend, String> {
         let db_type = self
             .db_type
@@ -5273,6 +5364,26 @@ impl EnvConfig {
                     .to_string(),
             );
         }
+
+        // ── FIPS deployment mode ────────────────────────────────────────
+        //
+        // Two steps, in this order:
+        //
+        // 1. Parse the request. A malformed value is a configuration error, not
+        //    a silent downgrade to non-FIPS.
+        // 2. Reconcile it with the provider bootstrap already installed. The
+        //    process-default crypto provider is chosen before `ferrum.conf` can
+        //    be read, so a request that reaches Ferrum only through the
+        //    settings file arrives too late to select the AWS-LC FIPS provider
+        //    profile;
+        //    `verify_resolved_mode` fails closed rather than serving under a
+        //    provider chosen from a stale view of the request.
+        //
+        // The FIPS policy checks themselves then run against the fully resolved
+        // configuration, so `validate` and startup reach the same verdict.
+        let fips_mode = crate::fips::FipsMode::parse(&self.fips_mode)?;
+        crate::fips::verify_resolved_mode(fips_mode)?;
+        crate::fips::policy::check_env_config(self)?;
 
         // Validate TLS version settings
         match self.tls_min_version.as_str() {

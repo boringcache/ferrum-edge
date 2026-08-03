@@ -87,10 +87,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::fips::approved::Sha256;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use ferrum_ebpf_common::{OrigDst4, OrigDst6};
-use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
@@ -1403,6 +1403,7 @@ mod tests {
                 namespace: Some(namespace.to_string()),
             },
             service_name: service_name.to_string(),
+            service_namespace: None,
             addresses: Vec::new(),
             ports: Vec::new(),
             trust_domain: TrustDomain::new("td").expect("td"),

@@ -16,6 +16,37 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::task::JoinHandle;
 
+/// Bind a provider-neutral Quinn client endpoint.
+///
+/// Quinn's `Endpoint::client` convenience constructor is not exposed by its
+/// `rustls-aws-lc-rs-fips` feature, even though `EndpointConfig::default()` is.
+/// Use the same explicit constructor as the production HTTP/3 path so this
+/// scaffolding compiles under both Ferrum crypto profiles.
+pub fn bind_quinn_client_endpoint(addr: SocketAddr) -> std::io::Result<Endpoint> {
+    let socket = std::net::UdpSocket::bind(addr)?;
+    socket.set_nonblocking(true)?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| std::io::Error::other("quinn requires a Tokio runtime"))?;
+    Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
+}
+
+/// Bind a provider-neutral Quinn server endpoint for integration fixtures.
+pub fn bind_quinn_server_endpoint(
+    config: quinn::ServerConfig,
+    addr: SocketAddr,
+) -> std::io::Result<Endpoint> {
+    let socket = std::net::UdpSocket::bind(addr)?;
+    socket.set_nonblocking(true)?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| std::io::Error::other("quinn requires a Tokio runtime"))?;
+    Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(config),
+        socket,
+        runtime,
+    )
+}
+
 /// An H3 client that skips TLS verification. Symmetric with Phase 1's
 /// [`Http1Client::insecure`].
 pub struct Http3Client {
@@ -98,7 +129,7 @@ impl Http3Client {
 
         // Bind ephemeral local UDP. quinn picks an IPv4 endpoint by default
         // which matches the gateway's IPv4 bind in test mode.
-        let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+        let mut endpoint = bind_quinn_client_endpoint(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
         endpoint.set_default_client_config(client_config);
         Ok(Self { endpoint })
     }

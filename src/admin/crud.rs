@@ -959,7 +959,7 @@ async fn persist_undecodable_delete_repair<R: AdminResource>(
                 "undecodable_row_repair": true,
             })),
         );
-        if let Err(error) = audit::record(state.admin_audit_enabled, success_db, event) {
+        if let Err(error) = audit::record(state.admin_audit_enabled, success_db, event).await {
             super::log_audit_enqueue_failure(&error);
         }
     }
@@ -1085,7 +1085,7 @@ async fn persist_delete_to_settlement<R: AdminResource>(
             &namespace,
             audit::delete_diff(R::audit_body(&recovery.previous)),
         );
-        if let Err(error) = audit::record(state.admin_audit_enabled, success_db, event) {
+        if let Err(error) = audit::record(state.admin_audit_enabled, success_db, event).await {
             super::log_audit_enqueue_failure(&error);
         }
     }
@@ -1125,7 +1125,7 @@ async fn finish_write_success<R: AdminResource>(
         namespace,
         diff,
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db, event) {
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
         super::log_audit_enqueue_failure(&error);
     }
 }
@@ -2148,24 +2148,25 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             // Issue #2997: the target row exists but cannot be decoded. Skip
             // namespace-snapshot recovery (that load fails for the same row) and
             // delete by id so admin remains the in-band repair path.
-            let persistence = match tokio::spawn(persist_undecodable_delete_repair::<R>(
-                OwnedWriteSettlementContext {
-                    db: db_arc.clone(),
-                    namespace: namespace.to_string(),
-                    guard: namespace_config_admission_guard.take(),
-                    http_client: super::plugin_validation_http_client(state),
-                    state: state.clone(),
-                    actor: actor.clone(),
-                },
-                id.to_string(),
-            ))
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => Err(anyhow::anyhow!(
-                    "namespace undecodable-row delete persistence task failed: {error}"
-                )),
-            };
+            let persistence =
+                match audit::spawn_with_request_slot(persist_undecodable_delete_repair::<R>(
+                    OwnedWriteSettlementContext {
+                        db: db_arc.clone(),
+                        namespace: namespace.to_string(),
+                        guard: namespace_config_admission_guard.take(),
+                        http_client: super::plugin_validation_http_client(state),
+                        state: state.clone(),
+                        actor: actor.clone(),
+                    },
+                    id.to_string(),
+                ))
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::anyhow!(
+                        "namespace undecodable-row delete persistence task failed: {error}"
+                    )),
+                };
             return match persistence {
                 Ok(true) => Ok(super::empty_response(StatusCode::NO_CONTENT)),
                 Ok(false) => Ok(not_found_response::<R>()),
@@ -2202,7 +2203,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         return Ok(map_after_validate_error::<R>(error));
     }
 
-    let persistence = match tokio::spawn(persist_delete_to_settlement(
+    let persistence = match audit::spawn_with_request_slot(persist_delete_to_settlement(
         OwnedWriteSettlementContext {
             db: db_arc.clone(),
             namespace: namespace.to_string(),
@@ -4981,7 +4982,7 @@ async fn handle_write<R: AdminResource>(
 
     match action {
         WriteAction::Create => {
-            let persistence = match tokio::spawn(persist_create_to_settlement(
+            let persistence = match audit::spawn_with_request_slot(persist_create_to_settlement(
                 OwnedWriteSettlementContext {
                     db: db_arc.clone(),
                     namespace: namespace.to_string(),
@@ -5005,25 +5006,26 @@ async fn handle_write<R: AdminResource>(
         }
         WriteAction::Update { id } => {
             if undecodable_update_repair {
-                let persistence = match tokio::spawn(persist_undecodable_update_repair(
-                    OwnedWriteSettlementContext {
-                        db: db_arc.clone(),
-                        namespace: namespace.to_string(),
-                        guard: namespace_config_admission_guard.take(),
-                        http_client: super::plugin_validation_http_client(state),
-                        state: state.clone(),
-                        actor: actor.clone(),
-                    },
-                    id.to_string(),
-                    resource.clone(),
-                ))
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => Err(anyhow::anyhow!(
-                        "namespace undecodable-row update persistence task failed: {error}"
-                    )),
-                };
+                let persistence =
+                    match audit::spawn_with_request_slot(persist_undecodable_update_repair(
+                        OwnedWriteSettlementContext {
+                            db: db_arc.clone(),
+                            namespace: namespace.to_string(),
+                            guard: namespace_config_admission_guard.take(),
+                            http_client: super::plugin_validation_http_client(state),
+                            state: state.clone(),
+                            actor: actor.clone(),
+                        },
+                        id.to_string(),
+                        resource.clone(),
+                    ))
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => Err(anyhow::anyhow!(
+                            "namespace undecodable-row update persistence task failed: {error}"
+                        )),
+                    };
                 match persistence {
                     Ok(false) => return Ok(not_found_response::<R>()),
                     Ok(true) => {}
@@ -5036,26 +5038,27 @@ async fn handle_write<R: AdminResource>(
                         &json!({"error": "Update persistence is missing the prior resource"}),
                     ));
                 };
-                let persistence = match tokio::spawn(persist_update_to_settlement(
-                    OwnedWriteSettlementContext {
-                        db: db_arc.clone(),
-                        namespace: namespace.to_string(),
-                        guard: namespace_config_admission_guard.take(),
-                        http_client: super::plugin_validation_http_client(state),
-                        state: state.clone(),
-                        actor: actor.clone(),
-                    },
-                    id.to_string(),
-                    resource.clone(),
-                    previous,
-                ))
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => Err(anyhow::anyhow!(
-                        "namespace update persistence task failed: {error}"
-                    )),
-                };
+                let persistence =
+                    match audit::spawn_with_request_slot(persist_update_to_settlement(
+                        OwnedWriteSettlementContext {
+                            db: db_arc.clone(),
+                            namespace: namespace.to_string(),
+                            guard: namespace_config_admission_guard.take(),
+                            http_client: super::plugin_validation_http_client(state),
+                            state: state.clone(),
+                            actor: actor.clone(),
+                        },
+                        id.to_string(),
+                        resource.clone(),
+                        previous,
+                    ))
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => Err(anyhow::anyhow!(
+                            "namespace update persistence task failed: {error}"
+                        )),
+                    };
                 // The row vanished between the precheck and the write (concurrent
                 // delete). The backend recorded no change — report not-found
                 // rather than a phantom success (issue #2122 DB-M4).

@@ -145,6 +145,7 @@ fn workload(
             namespace: Some(namespace.to_string()),
         },
         service_name: service_name.to_string(),
+        service_namespace: None,
         addresses: Vec::new(),
         ports: Vec::new(),
         trust_domain: TrustDomain::new("cluster.local").expect("valid trust domain"),
@@ -362,6 +363,7 @@ async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
             namespace: Some("team-a".to_string()),
         },
         service_name: "api".to_string(),
+        service_namespace: None,
         addresses: Vec::new(),
         ports: Vec::new(),
         trust_domain: TrustDomain::new("cluster.local").expect("valid trust domain"),
@@ -452,6 +454,7 @@ mod node_waypoint_capture_inventory {
                 namespace: Some(namespace.to_string()),
             },
             service_name: name.to_string(),
+            service_namespace: None,
             addresses: vec![address.to_string()],
             ports: vec![WorkloadPort {
                 port: APP_PORT,

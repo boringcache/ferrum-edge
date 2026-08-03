@@ -4852,31 +4852,33 @@ async fn exact_value_telemetry_decorators_declare_only_what_they_write() {
         "ownership must not be claimed when the header is not configured to be written"
     );
 
-    let limiter = create_plugin(
-        "ai_rate_limiter",
+    // Ownership keys are instance-scoped (`ai_ratelimit_limit#<id>`) so two
+    // composed budgets cannot collide (GHSA-wh4p-pmxm-3784). Seed THIS
+    // limiter's key rather than the unscoped legacy name.
+    let limiter = ferrum_edge::plugins::ai_rate_limiter::AiRateLimiter::new(
         &json!({"token_limit": 1000, "window_seconds": 60, "expose_headers": true}),
+        ferrum_edge::plugins::PluginHttpClient::default(),
     )
-    .unwrap()
     .unwrap();
     assert!(
         !limiter.owns_deadline_response_header(&ctx, "x-ai-ratelimit-limit"),
         "without the metadata this request produced no header to own"
     );
     let mut ctx_with_metadata = create_test_context();
-    ctx_with_metadata
-        .metadata
-        .insert("ai_ratelimit_limit".to_string(), "1000".to_string());
+    ctx_with_metadata.metadata.insert(
+        limiter.metadata_key_for_test("ai_ratelimit_limit"),
+        "1000".to_string(),
+    );
     assert!(limiter.owns_deadline_response_header(&ctx_with_metadata, "x-ai-ratelimit-limit"));
     assert!(
         !limiter.owns_deadline_response_header(&ctx_with_metadata, "x-ai-ratelimit-remaining"),
         "only the metadata keys actually populated are owned"
     );
 
-    let limiter_hidden = create_plugin(
-        "ai_rate_limiter",
+    let limiter_hidden = ferrum_edge::plugins::ai_rate_limiter::AiRateLimiter::new(
         &json!({"token_limit": 1000, "window_seconds": 60, "expose_headers": false}),
+        ferrum_edge::plugins::PluginHttpClient::default(),
     )
-    .unwrap()
     .unwrap();
     assert!(
         !limiter_hidden.owns_deadline_response_header(&ctx_with_metadata, "x-ai-ratelimit-limit"),

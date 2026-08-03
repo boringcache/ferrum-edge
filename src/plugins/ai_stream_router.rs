@@ -2031,9 +2031,17 @@ impl Plugin for AiStreamRouter {
         if !self.enabled || ctx.method != "POST" {
             return false;
         }
-        ctx.headers
-            .get("content-type")
-            .is_some_and(|ct| is_json_content_type(ct))
+        // Once any router instance has claimed the request, its final model and
+        // destination policy must run with RequestContext even if a later
+        // header transformer temporarily relabels the body as non-JSON. The
+        // final backend-header policy restores the provider's JSON contract,
+        // so allowing the mutable Content-Type to suppress buffering/context
+        // here would skip the claim owner's final revalidation.
+        ctx.has_ai_stream_router_claim()
+            || ctx
+                .headers
+                .get("content-type")
+                .is_some_and(|ct| is_json_content_type(ct))
     }
 
     fn requires_response_stream_hooks(&self) -> bool {

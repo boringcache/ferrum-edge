@@ -632,6 +632,14 @@ impl TrustBundleKeyDocument {
                 self.algorithm.trim()
             )
         })?;
+        if crate::fips::is_enforcing()
+            && !crate::fips::policy::is_approved_jwt_algorithm(self.algorithm.as_str())
+        {
+            return Err(format!(
+                "CP/DP trust bundle '{origin}': key '{kid}' declares a JWS algorithm outside \
+                 Ferrum's approved set while FIPS mode is enforced"
+            ));
+        }
 
         let mut namespaces = HashSet::with_capacity(self.namespaces.len());
         for raw in &self.namespaces {

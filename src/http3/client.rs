@@ -3154,7 +3154,7 @@ impl Http3Client {
     ///
     /// The `tls_config` must have ALPN protocols set (typically `b"h3"` for HTTP/3).
     /// The crypto provider must be installed before calling this function
-    /// (typically once at application startup via `rustls::crypto::ring::default_provider().install_default()`).
+    /// (typically once at application startup via `crate::fips::base_crypto_provider().install_default()`).
     ///
     /// The optional `h3_config` provides QUIC transport tuning parameters
     /// (stream/connection window sizes, send window). When `None`, uses
@@ -3188,8 +3188,17 @@ impl Http3Client {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
 
-        // Bind to any available local UDP port
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+        // Bind to any available local UDP port. Quinn's `Endpoint::client`
+        // convenience constructor is gated on its `ring` or non-FIPS
+        // `aws-lc-rs` feature. The validated provider uses the distinct
+        // `aws-lc-rs-fips` feature, so construct the same endpoint explicitly
+        // without compiling a second provider merely to expose the helper.
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        socket.set_nonblocking(true)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow::anyhow!("HTTP/3 client requires a Tokio runtime"))?;
+        let mut endpoint =
+            quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
         endpoint.set_default_client_config(client_config);
 
         Ok(Self { endpoint })
@@ -3727,7 +3736,7 @@ mod h3_pool_health_tests {
         // "ring" provider is installed wholesale by the gateway main; in
         // unit tests several test mods may race to install — `_ = ...`
         // ignores the "already installed" return.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crate::fips::base_crypto_provider().install_default();
     }
 
     fn issue_cert() -> (
@@ -3771,7 +3780,18 @@ mod h3_pool_health_tests {
             .expect("quic server config");
         let server_config = ServerConfig::with_crypto(Arc::new(quic_server));
 
-        Endpoint::server(server_config, addr).expect("server endpoint")
+        let socket = std::net::UdpSocket::bind(addr).expect("bind server UDP socket");
+        socket
+            .set_nonblocking(true)
+            .expect("set server UDP socket nonblocking");
+        let runtime = quinn::default_runtime().expect("Tokio runtime");
+        Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )
+        .expect("server endpoint")
     }
 
     fn make_client_endpoint() -> Endpoint {
@@ -3830,7 +3850,12 @@ mod h3_pool_health_tests {
             .expect("quic client config");
         let client_config = ClientConfig::new(Arc::new(quic_client));
 
-        let mut endpoint = Endpoint::client("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind client UDP socket");
+        socket
+            .set_nonblocking(true)
+            .expect("set client UDP socket nonblocking");
+        let runtime = quinn::default_runtime().expect("Tokio runtime");
+        let mut endpoint = Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
             .expect("client endpoint");
         endpoint.set_default_client_config(client_config);
         endpoint

@@ -55,8 +55,8 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
 
+use crate::fips::approved::Sha256;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use sha2::{Digest as _, Sha256};
 
 /// Why the bounded scanner refused to vouch for a document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

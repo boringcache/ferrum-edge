@@ -5517,7 +5517,7 @@ impl SpoolOwner {
 /// Length prefixes keep two different tuples from colliding by shifting text
 /// across a field boundary (`db="a", table="bc"` versus `db="ab", table="c"`).
 fn spool_owner_digest(fields: &[&str]) -> String {
-    use sha2::{Digest, Sha256};
+    use crate::fips::approved::Sha256;
     let mut hasher = Sha256::new();
     hasher.update(SPOOL_OWNER_DIGEST_DOMAIN);
     hasher.update(u64::from(SPOOL_FORMAT_VERSION).to_be_bytes());
@@ -5772,7 +5772,7 @@ impl Drop for LiveSpoolPathGuard {
 }
 
 fn short_spool_hash(input: &str) -> String {
-    use sha2::{Digest, Sha256};
+    use crate::fips::approved::Sha256;
     let digest = Sha256::digest(input.as_bytes());
     hex::encode(&digest[..16])
 }

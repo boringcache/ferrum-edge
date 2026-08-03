@@ -2158,6 +2158,12 @@ pub async fn run(
         env_config.admin_max_connections,
         env_config.admin_max_connections_per_ip,
     ));
+    // Start durable audit delivery now (issue #2421): discovery, adoption of
+    // records abandoned by a prior process generation, and replay must not wait
+    // for a later mutation to lazily spawn the worker. A process that receives
+    // no new mutations still has to drain the backlog it inherited.
+    crate::admin::audit::start_delivery(env_config.admin_audit_enabled, db.clone());
+
     let admin_state = AdminState {
         db: Some(db.clone()),
         jwt_manager,
@@ -3633,6 +3639,16 @@ pub async fn run(
         background_handles.push(handle);
     }
     crate::modes::file::join_background_handles(background_handles, Duration::from_secs(5)).await;
+
+    // Drain accepted audit events while the database Arc is still alive (issue
+    // #2421). Bounded by the graceful-shutdown drain budget: anything still
+    // undelivered when the deadline expires stays in the durable spool and is
+    // replayed by the next process. Explicit memory-only mode instead accounts
+    // any deadline loss and latches degraded health.
+    crate::admin::audit::shutdown(Duration::from_secs(
+        env_config.shutdown_drain_seconds.clamp(5, 60),
+    ))
+    .await;
 
     // A listener failure is the more direct operational signal, so it wins the
     // exit code; a controller-task panic or early exit is surfaced only when

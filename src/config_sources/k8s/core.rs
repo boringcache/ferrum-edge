@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::fips::approved::Sha256;
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
@@ -161,11 +161,14 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
 
     let mut workload_refs_by_service: HashMap<K8sServiceKey, Vec<String>> = HashMap::new();
     for workload in &acc.mesh.workloads {
-        if let Some(key) =
-            K8sServiceKey::new(workload.namespace.clone(), workload.service_name.clone())
-        {
+        if let Some(key) = K8sServiceKey::new(
+            workload.attached_service_namespace().to_string(),
+            workload.service_name.clone(),
+        ) {
             // Keep duplicate SPIFFE IDs: replicated pods can share one service
             // account identity while still requiring distinct WorkloadRefs.
+            // Cross-namespace WorkloadEntry attachments resolve against the
+            // stamped service_namespace (authoritative Service identity).
             workload_refs_by_service
                 .entry(key)
                 .or_default()
@@ -492,7 +495,7 @@ fn secret_data_decodes_to_valid_tls_pair(cert_value: &str, key_value: &str) -> b
     let Some(key) = secret_data_decodes_to_private_key(key_value) else {
         return false;
     };
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let provider = std::sync::Arc::new(crate::fips::base_crypto_provider());
     rustls::sign::CertifiedKey::from_der(certs, key, &provider).is_ok()
 }
 
@@ -739,6 +742,7 @@ fn workload_from_pod(
             namespace: Some(pod.namespace.clone()),
         },
         service_name: service_key.name.clone(),
+        service_namespace: None,
         addresses,
         ports: pod.ports.clone(),
         trust_domain: acc.options.trust_domain.clone(),
@@ -775,6 +779,7 @@ fn identity_only_workload_from_pod(
             namespace: Some(pod.namespace.clone()),
         },
         service_name: pod.name.clone(),
+        service_namespace: None,
         // Identity-only pods feed node-waypoint source identity and scoped
         // authz. They are not Service backends, so keep them out of direct
         // Pod-IP routing and outbound registries.

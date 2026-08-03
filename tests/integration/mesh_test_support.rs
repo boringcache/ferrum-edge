@@ -127,6 +127,7 @@ pub fn workload_for(
             namespace: Some(namespace.to_string()),
         },
         service_name: name.to_string(),
+        service_namespace: None,
         addresses: addresses.into_iter().map(|s| s.to_string()).collect(),
         ports: vec![WorkloadPort {
             port: 8080,

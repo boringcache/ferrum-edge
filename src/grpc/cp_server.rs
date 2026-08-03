@@ -1468,7 +1468,7 @@ impl CpGrpcServer {
         let config_json = match Self::config_json_for_dp(config) {
             Ok(json) => json,
             Err(e) => {
-                error!("Failed to serialize config for broadcast: {}", e);
+                error!("Refusing to publish configuration to data planes: {}", e);
                 return;
             }
         };
@@ -1595,13 +1595,28 @@ impl CpGrpcServer {
         }
     }
 
-    fn config_json_for_dp(config: &GatewayConfig) -> Result<String, serde_json::Error> {
+    /// Serialize a namespace-filtered snapshot for distribution to a DP.
+    ///
+    /// This is the single funnel every full-snapshot publication path uses
+    /// (initial `Subscribe` snapshot, broadcast update, recovery snapshot,
+    /// `GetFullConfig`), which is why the FIPS gateway-document gate lives
+    /// here: a document a FIPS data plane could not start with must not be
+    /// distributed to one either. The gate is inert when FIPS mode is off, so
+    /// ordinary CP behaviour is unchanged.
+    ///
+    /// Incremental deltas are deliberately not gated here — they carry
+    /// individual resources rather than a `GatewayConfig` — but the DP applies
+    /// every delta through `ProxyState::update_config`, which runs the same
+    /// policy and keeps the last known-good config on rejection.
+    fn config_json_for_dp(config: &GatewayConfig) -> Result<String, String> {
+        crate::fips::policy::check_gateway_config(config)
+            .map_err(|error| format!("FIPS policy rejected the configuration: {error}"))?;
         let mut snapshot = config.clone();
         // Trust bundles travel exclusively through `ConfigUpdate.trust_bundles_json`.
         // Keeping them out of the regular GatewayConfig JSON preserves compatibility
         // with older DPs whose `GatewayConfig` deserializer denies unknown fields.
         snapshot.trust_bundles = None;
-        serde_json::to_string(&snapshot)
+        serde_json::to_string(&snapshot).map_err(|error| error.to_string())
     }
 }
 
@@ -1817,7 +1832,7 @@ impl ConfigSync for CpGrpcServer {
         let filtered =
             Self::filter_config_to_namespace_for_scope(config.as_ref(), &dp_namespace, &self.scope);
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
-            error!("Failed to serialize config in subscribe: {}", e);
+            error!("Refusing to publish configuration in subscribe: {}", e);
             Status::internal("Failed to serialize configuration")
         })?;
         let trust_bundles_json = Self::trust_bundles_json(filtered.trust_bundles.as_deref())
@@ -1995,7 +2010,10 @@ impl ConfigSync for CpGrpcServer {
             &self.scope,
         );
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
-            error!("Failed to serialize config in get_full_config: {}", e);
+            error!(
+                "Refusing to publish configuration in get_full_config: {}",
+                e
+            );
             Status::internal("Failed to serialize configuration")
         })?;
         let trust_bundles_json = Self::trust_bundles_json(filtered.trust_bundles.as_deref())
@@ -2829,6 +2847,7 @@ mod tests {
                 namespace: Some("clients".to_string()),
             },
             service_name: "client".to_string(),
+            service_namespace: None,
             addresses: vec!["10.2.0.11".to_string()],
             ports: Vec::new(),
             trust_domain: TrustDomain::new("cluster.local").expect("source trust domain"),
@@ -2849,6 +2868,7 @@ mod tests {
                 namespace: Some("default".to_string()),
             },
             service_name: "reviews".to_string(),
+            service_namespace: None,
             addresses: vec!["10.2.0.12".to_string()],
             ports: Vec::new(),
             trust_domain: TrustDomain::new("cluster.local").expect("destination trust domain"),
@@ -3018,6 +3038,7 @@ mod tests {
                     namespace: Some(namespace.to_string()),
                 },
                 service_name: service_name.to_string(),
+                service_namespace: None,
                 addresses: vec![address.to_string()],
                 ports: Vec::new(),
                 trust_domain: TrustDomain::new("test.local")
@@ -3131,6 +3152,7 @@ mod tests {
                 namespace: Some(namespace.to_string()),
             },
             service_name: name.to_string(),
+            service_namespace: None,
             addresses: vec![address.to_string()],
             ports: Vec::new(),
             trust_domain: TrustDomain::new("test.local")

@@ -98,6 +98,15 @@ pub(crate) async fn validate_plugin_file_dependencies_off_thread(
 pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) -> Vec<String> {
     let mut errors = Vec::new();
 
+    // FIPS gateway-document admission must be part of the same rejecting
+    // contract used by database full loads and CP full/delta composition.
+    // Otherwise CP could publish a resource through an incremental partition
+    // that the same process would refuse at startup. The wrapper is inert when
+    // FIPS mode is off, preserving the ordinary validation contract.
+    if let Err(error) = crate::fips::policy::check_gateway_config(config) {
+        errors.push(format!("FIPS policy: {error}"));
+    }
+
     // Reject malformed identity before any runtime cache encodes
     // `(namespace, id)` into a delimiter-separated key. Admin input validates
     // these fields before persistence, but full loads must also treat database
