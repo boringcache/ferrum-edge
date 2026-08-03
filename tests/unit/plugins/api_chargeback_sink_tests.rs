@@ -3412,7 +3412,7 @@ async fn dead_letter_payload_admits_each_append_before_exceeding_spool_quota() {
     mount_status_sequence(&server, &[400]).await;
 
     let event = sample_event("evt-dead-letter-quota");
-    let encoded = serialize_json_each_row(&[event.clone()]).unwrap();
+    let encoded = serialize_json_each_row(std::slice::from_ref(&event)).unwrap();
     let max_bytes = encoded.len() as u64;
     let temp = tempfile::tempdir().unwrap();
     let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
