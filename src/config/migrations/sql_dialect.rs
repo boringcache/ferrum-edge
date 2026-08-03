@@ -916,6 +916,8 @@ impl V001SqlBuilder {
                 server_urls LONGTEXT NOT NULL,
                 operation_count INTEGER NOT NULL DEFAULT 0,
                 resource_hash VARCHAR(64) NOT NULL DEFAULT '',
+                external_ref_snapshot LONGBLOB NULL,
+                external_ref_digest VARCHAR(64) COLLATE utf8mb4_0900_bin NULL,
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL,
                 CONSTRAINT fk_api_specs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
@@ -944,6 +946,8 @@ impl V001SqlBuilder {
                 server_urls TEXT NOT NULL DEFAULT '[]',
                 operation_count INTEGER NOT NULL DEFAULT 0,
                 resource_hash TEXT NOT NULL DEFAULT '',
+                external_ref_snapshot BLOB NULL,
+                external_ref_digest TEXT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
@@ -972,6 +976,8 @@ impl V001SqlBuilder {
                 server_urls TEXT NOT NULL DEFAULT '[]',
                 operation_count INTEGER NOT NULL DEFAULT 0,
                 resource_hash TEXT NOT NULL DEFAULT '',
+                external_ref_snapshot BYTEA NULL,
+                external_ref_digest TEXT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )

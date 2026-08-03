@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::admin::api_specs::bounded_yaml::parse_yaml_to_json;
 use crate::admin::api_specs::extractor::MAX_SOURCE_DOCUMENT_NODES;
 use crate::admin::api_specs::{
-    ExtractError, ExtractedBundle, SpecFormat, extract, hash_resource_bundle,
+    ExtractError, ExtractedBundle, SpecFormat, extract_with_external_refs, hash_resource_bundle,
 };
 use crate::admin::audit::{self, AuditActor};
 use crate::admin::spec_codec;
@@ -2466,6 +2466,15 @@ fn build_spec_row(
     let content_hash = spec_codec::sha256_hex(body);
     let resource_hash = hash_resource_bundle(bundle)
         .map_err(|e| ApiSpecError::Internal(format!("resource hash failed: {e}")))?;
+    let (external_ref_snapshot, external_ref_digest) = match &metadata.external_ref_snapshot {
+        Some(snapshot) => {
+            let bytes = snapshot.gzip_bytes().map_err(|e| {
+                ApiSpecError::Internal(format!("external_ref_snapshot compress failed: {e}"))
+            })?;
+            (Some(bytes), Some(snapshot.snapshot_digest.clone()))
+        }
+        None => (None, None),
+    };
     let now = Utc::now();
     Ok(ApiSpec {
         id,
@@ -2488,6 +2497,8 @@ fn build_spec_row(
         server_urls: metadata.server_urls.clone(),
         operation_count: metadata.operation_count,
         resource_hash,
+        external_ref_snapshot,
+        external_ref_digest,
         created_at: now,
         updated_at: now,
     })
@@ -2901,6 +2912,7 @@ async fn extract_admitted(
     body: &[u8],
     declared_format: Option<SpecFormat>,
     namespace: &str,
+    state: &AdminState,
 ) -> Result<(ExtractedBundle, crate::admin::api_specs::SpecMetadata), ApiSpecError> {
     // INVARIANT: `SPEC_EXTRACTION_SLOTS` is a process-lifetime static that is
     // never closed, so `acquire` cannot fail here. Fail closed rather than
@@ -2908,7 +2920,14 @@ async fn extract_admitted(
     let _permit = SPEC_EXTRACTION_SLOTS.acquire().await.map_err(|_| {
         ApiSpecError::AdmissionUnavailable("spec extraction admission unavailable".to_string())
     })?;
-    extract(body, declared_format, namespace).map_err(ApiSpecError::Extract)
+    extract_with_external_refs(
+        body,
+        declared_format,
+        namespace,
+        state.external_ref_policy.as_ref(),
+        state.external_ref_loader.as_ref(),
+    )
+    .map_err(ApiSpecError::Extract)
 }
 
 pub async fn handle_post_api_spec(
@@ -2936,7 +2955,7 @@ pub async fn handle_post_api_spec(
     };
 
     // Extract resources from the spec body.
-    let (mut bundle, metadata) = match extract_admitted(&body, declared_format, namespace).await {
+    let (mut bundle, metadata) = match extract_admitted(&body, declared_format, namespace, state).await {
         Ok(v) => v,
         Err(e) => return Ok(error_response(e)),
     };
@@ -3107,7 +3126,7 @@ pub async fn handle_put_api_spec(
     };
 
     // Extract resources from the spec body.
-    let (mut bundle, metadata) = match extract_admitted(&body, declared_format, namespace).await {
+    let (mut bundle, metadata) = match extract_admitted(&body, declared_format, namespace, state).await {
         Ok(v) => v,
         Err(e) => return Ok(error_response(e)),
     };

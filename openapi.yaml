@@ -5391,7 +5391,16 @@ paths:
           auto-generate a proxy-scoped `openapi_validator` plugin from the
           document's request/response schemas and media types. Local `$ref`s are resolved
           into plugin config; external `$ref`s are rejected with
-          `UnsupportedExternalRef`.
+          `UnsupportedExternalRef` unless both the process gate
+          (`FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED`) and the per-spec
+          `x-ferrum-external-refs` extension opt in. Absent process policy
+          still yields `UnsupportedExternalRef` (fail-closed).
+        - **`x-ferrum-external-refs`** (optional) — `true` or an object
+          (`enabled`, optional `document_base`, optional `allowed_origins`)
+          to opt this document into external / cross-document `$ref`
+          resolution when the process gate is also enabled. Admitted
+          external documents are snapshotted at import (`external_ref_digest`
+          / stored snapshot bytes); runtime validation never re-fetches.
 
         **Forbidden**: `x-ferrum-consumers` is rejected — use `POST /consumers`
         separately. Plugin `config` values must not contain credential or
@@ -12965,8 +12974,11 @@ components:
       properties:
         section_version:
           type: string
-          description: Section contract version
-          example: "1"
+          description: |
+            Section contract version. Current exports use `"2"` (optional
+            external-`$ref` snapshot fields). Restore also accepts `"1"`
+            (no snapshot fields).
+          example: "2"
         items:
           type: array
           items:
@@ -13043,6 +13055,19 @@ components:
           type: string
           pattern: "^$|^[0-9a-f]{64}$"
           description: Empty for legacy records or lowercase hex SHA-256 of the generated resource bundle
+        external_ref_snapshot_base64:
+          type: string
+          description: |
+            Optional standard Base64 of the gzip-compressed external-`$ref`
+            admission snapshot (section version `"2"`+). Omitted on version
+            `"1"` backups and when external refs were not enabled for the
+            import. Do not log this field.
+        external_ref_digest:
+          type: string
+          description: |
+            Optional aggregate digest of the external-`$ref` admission
+            snapshot. Present together with `external_ref_snapshot_base64`
+            when external refs were admitted.
         created_at:
           type: string
           format: date-time
@@ -26225,6 +26250,12 @@ components:
         content_hash:
           type: string
           description: Lowercase hex SHA-256 digest of the uncompressed spec content. Used as ETag value.
+        external_ref_digest:
+          type: [string, "null"]
+          description: |
+            Aggregate digest of the external-`$ref` admission snapshot when
+            external refs were enabled for this import; omitted/`null`
+            otherwise. Snapshot bytes stay internal (storage/backup only).
         content_encoding:
           type: string
           enum: [gzip]
@@ -26387,7 +26418,7 @@ components:
             - `PluginContainsCredentials` — a plugin's `config` contains a forbidden key (`credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, or `consumers`)
             - `ProxyUpstreamIdMismatch` — `x-ferrum-proxy.upstream_id` conflicts with the `id` of the inline `x-ferrum-upstream`
             - `InvalidTagName` — a `tags[].name` contains a forbidden character (`"`, `%`, `_`, or `\`) that would break the SQL `has_tag` LIKE filter
-            - `UnsupportedExternalRef` — `x-ferrum-validate` references an external `$ref`; only local refs are resolved into generated plugin config
+            - `UnsupportedExternalRef` — an external / cross-document `$ref` was encountered while process policy and/or `x-ferrum-external-refs` leave resolution disabled (fail-closed default); only local refs are resolved into generated plugin config when external refs stay off
             - `SchemaReference` — a local schema `$id`, `$anchor`, URI fragment, or `$ref` is malformed, duplicated, or unresolved
             - `SchemaTooDeep` — `x-ferrum-validate` schema refs exceed the resolver depth limit
             - `SchemaReferenceCycle` — a local `$ref` chain re-enters a target that is still being

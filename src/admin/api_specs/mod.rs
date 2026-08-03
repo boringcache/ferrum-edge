@@ -4,11 +4,18 @@
 
 pub mod bounded_yaml;
 pub mod extractor;
+pub mod external_refs;
 pub mod handlers;
 
 pub use extractor::{
     ExtractError, ExtractedBundle, SpecFormat, SpecMetadata, extract,
-    extract_declared_proxy_plugin_association_ids, hash_resource_bundle,
+    extract_declared_proxy_plugin_association_ids, extract_with_external_refs,
+    hash_resource_bundle,
+};
+pub use external_refs::{
+    DefaultExternalDocumentLoader, EffectiveExternalRefPolicy, ExternalDocumentLoader,
+    ExternalRefProcessPolicy, ExternalRefSnapshot, ExternalRefSpecExtension,
+    MapExternalDocumentLoader, load_external_documents, parse_external_ref_extension,
 };
 
 /// Recover the proxy/plugin associations explicitly declared by a stored API

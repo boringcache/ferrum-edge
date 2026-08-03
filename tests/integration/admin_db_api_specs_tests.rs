@@ -178,6 +178,8 @@ fn make_spec(id: &str, proxy_id: &str, namespace: &str, content: &[u8]) -> ApiSp
         server_urls: vec![],
         operation_count: 0,
         resource_hash: String::new(),
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -2894,6 +2896,8 @@ fn make_spec_with_metadata(
         server_urls: meta.server_urls.clone(),
         operation_count: meta.operation_count,
         resource_hash,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -2938,6 +2942,8 @@ fn make_spec_from_openapi_body(
         server_urls: meta.server_urls.clone(),
         operation_count: meta.operation_count,
         resource_hash,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -3073,6 +3079,8 @@ async fn submit_truncates_long_description_at_4kib() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -3153,6 +3161,8 @@ async fn swagger_2_0_server_urls_constructed_from_schemes_host_basepath() {
         server_urls: meta.server_urls.clone(),
         operation_count: 0,
         resource_hash,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -3229,6 +3239,8 @@ async fn replace_with_unchanged_resources_skips_proxy_write() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash: resource_hash1.clone(),
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -3294,6 +3306,8 @@ async fn replace_with_unchanged_resources_skips_proxy_write() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash: resource_hash2,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: spec1.created_at,
         updated_at: now2,
     };
@@ -3375,6 +3389,8 @@ async fn replace_with_changed_resources_updates_proxy() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash: resource_hash1.clone(),
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -3433,6 +3449,8 @@ async fn replace_with_changed_resources_updates_proxy() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash: resource_hash2,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: spec1.created_at,
         updated_at: now2,
     };
@@ -3569,6 +3587,8 @@ async fn list_filter_spec_version_prefix() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash: rh32,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };

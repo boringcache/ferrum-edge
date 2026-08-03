@@ -12,7 +12,7 @@ use crate::config::types::{
 /// Bump when the section shape or restore semantics change in a
 /// non-backward-compatible way. Older backups that omit the section entirely
 /// remain restorable via the explicit deletion-confirmation preflight.
-pub(crate) const API_SPECS_BACKUP_SECTION_VERSION: &str = "1";
+pub(crate) const API_SPECS_BACKUP_SECTION_VERSION: &str = "2";
 
 /// Stable client text when `resources=` contains an unsupported token.
 /// Never echoes the rejected token.
@@ -246,6 +246,13 @@ pub(crate) struct ApiSpecBackupItem {
     pub(crate) operation_count: u32,
     #[serde(default)]
     pub(crate) resource_hash: String,
+    /// Optional Base64 of gzip-compressed external-`$ref` admission snapshot
+    /// (section version `"2"`+). Absent on version `"1"` backups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_ref_snapshot_base64: Option<String>,
+    /// Aggregate digest of the external-`$ref` admission snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_ref_digest: Option<String>,
     pub(crate) created_at: chrono::DateTime<chrono::Utc>,
     pub(crate) updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -278,6 +285,10 @@ impl ApiSpecBackupItem {
             server_urls: spec.server_urls.clone(),
             operation_count: spec.operation_count,
             resource_hash: spec.resource_hash.clone(),
+            external_ref_snapshot_base64: spec.external_ref_snapshot.as_ref().map(|bytes| {
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            }),
+            external_ref_digest: spec.external_ref_digest.clone(),
             created_at: spec.created_at,
             updated_at: spec.updated_at,
         }
@@ -292,6 +303,19 @@ impl ApiSpecBackupItem {
                     self.id
                 )
             })?;
+        let external_ref_snapshot = match &self.external_ref_snapshot_base64 {
+            Some(encoded) => Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded.as_bytes())
+                    .map_err(|error| {
+                        format!(
+                            "api_spec '{}': invalid external_ref_snapshot_base64: {error}",
+                            self.id
+                        )
+                    })?,
+            ),
+            None => None,
+        };
         Ok(ApiSpec {
             id: self.id.clone(),
             namespace: self.namespace.clone(),
@@ -313,6 +337,8 @@ impl ApiSpecBackupItem {
             server_urls: self.server_urls.clone(),
             operation_count: self.operation_count,
             resource_hash: self.resource_hash.clone(),
+            external_ref_snapshot,
+            external_ref_digest: self.external_ref_digest.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
@@ -400,7 +426,8 @@ pub(crate) fn validate_restore_api_specs_section_with_total_limit(
     max_total_spec_bytes: usize,
 ) -> Result<Vec<ApiSpec>, Vec<String>> {
     let mut errors = Vec::new();
-    if section.section_version != API_SPECS_BACKUP_SECTION_VERSION {
+    if section.section_version != "1" && section.section_version != API_SPECS_BACKUP_SECTION_VERSION
+    {
         errors.push("Unsupported api_specs.section_version".to_string());
         return Err(errors);
     }
@@ -1063,6 +1090,8 @@ mod tests {
             server_urls: vec![],
             operation_count: 0,
             resource_hash: "abc".to_string(),
+            external_ref_snapshot: None,
+            external_ref_digest: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1129,6 +1158,8 @@ mod tests {
             server_urls: vec![],
             operation_count: 0,
             resource_hash: "a".repeat(64),
+            external_ref_snapshot_base64: None,
+            external_ref_digest: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

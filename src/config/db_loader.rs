@@ -7796,6 +7796,7 @@ impl DatabaseStore {
             sqlx::query(&self.q("UPDATE api_specs SET \
                  spec_content = ?, content_encoding = ?, content_hash = ?, \
                  uncompressed_size = ?, resource_hash = ?, \
+                 external_ref_snapshot = ?, external_ref_digest = ?, \
                  spec_format = ?, spec_version = ?, title = ?, info_version = ?, \
                  description = ?, contact_name = ?, contact_email = ?, \
                  license_name = ?, license_identifier = ?, \
@@ -7807,6 +7808,8 @@ impl DatabaseStore {
             .bind(&spec.content_hash)
             .bind(spec.uncompressed_size as i64)
             .bind(&spec.resource_hash)
+            .bind(&spec.external_ref_snapshot)
+            .bind(&spec.external_ref_digest)
             .bind(spec_format_str)
             .bind(&spec.spec_version)
             .bind(&spec.title)
@@ -8159,6 +8162,7 @@ impl DatabaseStore {
              description = ?, contact_name = ?, contact_email = ?, \
              license_name = ?, license_identifier = ?, \
              tags = ?, server_urls = ?, operation_count = ?, resource_hash = ?, \
+             external_ref_snapshot = ?, external_ref_digest = ?, \
              updated_at = ? \
              WHERE namespace = ? AND id = ?"))
         .bind(&spec.proxy_id)
@@ -8179,6 +8183,8 @@ impl DatabaseStore {
         .bind(&server_urls_json)
         .bind(spec.operation_count as i64)
         .bind(&spec.resource_hash)
+        .bind(&spec.external_ref_snapshot)
+        .bind(&spec.external_ref_digest)
         .bind(spec.updated_at.to_rfc3339())
         .bind(&spec.namespace)
         .bind(&spec.id)
@@ -8418,8 +8424,9 @@ impl DatabaseStore {
               content_encoding, uncompressed_size, content_hash, title, info_version, \
               description, contact_name, contact_email, license_name, license_identifier, \
               tags, server_urls, operation_count, resource_hash, \
+              external_ref_snapshot, external_ref_digest, \
               created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
         .bind(&spec.id)
         .bind(&spec.namespace)
         .bind(&spec.proxy_id)
@@ -8440,6 +8447,8 @@ impl DatabaseStore {
         .bind(&server_urls_json)
         .bind(spec.operation_count as i64)
         .bind(&spec.resource_hash)
+        .bind(&spec.external_ref_snapshot)
+        .bind(&spec.external_ref_digest)
         .bind(spec.created_at.to_rfc3339())
         .bind(spec.updated_at.to_rfc3339())
         .execute(&mut **tx)
@@ -8631,7 +8640,7 @@ impl DatabaseStore {
              content_encoding, uncompressed_size, content_hash, title, \
              info_version, description, contact_name, contact_email, \
              license_name, license_identifier, tags, server_urls, \
-             operation_count, created_at, updated_at \
+             operation_count, external_ref_digest, created_at, updated_at \
              FROM api_specs WHERE {where_clause} \
              ORDER BY {order_col} {order_dir} LIMIT ? OFFSET ?"
         ));
@@ -10662,6 +10671,12 @@ fn row_to_api_spec_with_content(
     let resource_hash: String = row
         .try_get::<String, _>("resource_hash")
         .unwrap_or_default();
+    let external_ref_snapshot: Option<Vec<u8>> = row
+        .try_get::<Option<Vec<u8>>, _>("external_ref_snapshot")
+        .unwrap_or(None);
+    let external_ref_digest: Option<String> = row
+        .try_get::<Option<String>, _>("external_ref_digest")
+        .unwrap_or(None);
 
     Ok(ApiSpec {
         id: row.try_get("id")?,
@@ -10686,6 +10701,8 @@ fn row_to_api_spec_with_content(
         server_urls,
         operation_count,
         resource_hash,
+        external_ref_snapshot,
+        external_ref_digest,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })

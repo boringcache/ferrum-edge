@@ -2464,6 +2464,13 @@ pub struct ApiSpec {
     /// metadata timestamps. Used to short-circuit idempotent PUT writes.
     #[serde(default)]
     pub resource_hash: String,
+    /// Gzip-compressed immutable external-`$ref` admission snapshot bytes.
+    /// Present when external-ref resolution was enabled for this import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref_snapshot: Option<Vec<u8>>,
+    /// Aggregate digest of the external-`$ref` admission snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref_digest: Option<String>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]

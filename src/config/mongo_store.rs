@@ -5418,6 +5418,20 @@ mod inner {
                 bytes: spec.spec_content.clone(),
             }),
         );
+        match &spec.external_ref_snapshot {
+            Some(bytes) => {
+                doc.insert(
+                    "external_ref_snapshot",
+                    Bson::Binary(Binary {
+                        subtype: BinarySubtype::Generic,
+                        bytes: bytes.clone(),
+                    }),
+                );
+            }
+            None => {
+                doc.remove("external_ref_snapshot");
+            }
+        }
         Ok(doc)
     }
 
@@ -5497,6 +5511,33 @@ mod inner {
             }
             None => anyhow::bail!("api_specs.spec_content missing"),
         };
+        let external_ref_snapshot = match doc.remove("external_ref_snapshot") {
+            Some(Bson::Binary(binary)) => Some(binary.bytes),
+            Some(Bson::Null) | None => None,
+            Some(Bson::Array(values)) => {
+                let mut bytes = Vec::with_capacity(values.len());
+                for value in values {
+                    let byte = match value {
+                        Bson::Int32(v) if (0..=u8::MAX as i32).contains(&v) => v as u8,
+                        Bson::Int64(v) if (0..=u8::MAX as i64).contains(&v) => v as u8,
+                        other => {
+                            anyhow::bail!(
+                                "api_specs.external_ref_snapshot array contains non-byte value: {:?}",
+                                other
+                            );
+                        }
+                    };
+                    bytes.push(byte);
+                }
+                Some(bytes)
+            }
+            Some(other) => {
+                anyhow::bail!(
+                    "api_specs.external_ref_snapshot has unexpected BSON type: {:?}",
+                    other
+                );
+            }
+        };
 
         // Let serde populate the rest of the struct, then restore the bytes
         // from the BSON Binary above. This avoids materializing a huge BSON
@@ -5504,6 +5545,7 @@ mod inner {
         doc.insert("spec_content", Bson::Array(Vec::new()));
         let mut spec: ApiSpec = mongodb::bson::from_document(doc)?;
         spec.spec_content = spec_content;
+        spec.external_ref_snapshot = external_ref_snapshot;
         Ok(spec)
     }
 
@@ -11705,7 +11747,7 @@ mod inner {
                 .sort(doc! { sort_field: sort_dir })
                 .skip(mongo_skip)
                 .limit(mongo_limit)
-                .projection(doc! { "spec_content": 0, "resource_hash": 0 })
+                .projection(doc! { "spec_content": 0, "resource_hash": 0, "external_ref_snapshot": 0 })
                 .build();
             let api_specs = self.api_specs();
             let mut cursor = api_specs.find(filter_doc).with_options(options).await?;
@@ -13400,6 +13442,8 @@ mod inner {
                 server_urls: vec!["https://api.example.com".to_string()],
                 operation_count: 3,
                 resource_hash: "b".repeat(64),
+                external_ref_snapshot: None,
+                external_ref_digest: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -13440,6 +13484,8 @@ mod inner {
                 server_urls: vec!["https://api.example.com".to_string()],
                 operation_count: 7,
                 resource_hash: "d".repeat(64),
+                external_ref_snapshot: None,
+                external_ref_digest: None,
                 created_at: now,
                 updated_at: now,
             };
