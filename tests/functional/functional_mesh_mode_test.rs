@@ -3160,8 +3160,8 @@ fn cross_namespace_workload_entry_inbound_slice(
 /// Service in another namespace, then drive one authorized inbound request for
 /// the attached Service FQDN and one for the identity-namespace decoy FQDN.
 /// Spawn/bind flakes retry with fresh ports; the two Host observations do not.
-async fn drive_cross_namespace_workload_entry_inbound(
-) -> Result<(u16, String, u16, String, String), String> {
+async fn drive_cross_namespace_workload_entry_inbound()
+-> Result<(u16, String, u16, String, String), String> {
     ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
     let server_spiffe = "spiffe://cluster.local/ns/vms/sa/reviews-vm";
     let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
@@ -3284,7 +3284,7 @@ async fn drive_cross_namespace_workload_entry_inbound(
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_sidecar_inbound_routes_cross_namespace_workload_entry_via_attached_service()
-{
+ {
     let (attached_status, attached_body, decoy_status, decoy_body, logs) =
         drive_cross_namespace_workload_entry_inbound()
             .await
