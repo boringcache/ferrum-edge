@@ -28,8 +28,8 @@
 #![allow(clippy::bool_assert_comparison)]
 
 use crate::scaffolding::backends::{
-    H3Step, H3TlsConfig, QuicRefuser, ScriptedH3Backend, ScriptedTlsBackend, TcpStep, TlsConfig,
-    tls_backend_without_quic_with_ok_response,
+    H2Step, H3Step, H3TlsConfig, MatchHeaders, QuicRefuser, ScriptedH2Backend, ScriptedH3Backend,
+    ScriptedTlsBackend, TcpStep, TlsConfig,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GetOptions, Http2Client, Http3Client};
@@ -37,6 +37,30 @@ use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::{reserve_colocated_tcp_udp, reserve_port};
 use serde_json::{Value, json};
 use std::time::Duration;
+
+/// Spawn a protocol-honest H2-only TLS responder for capability probes,
+/// reqwest warmup, and H3 cross-protocol bridge requests.
+fn spawn_h2_bridge_backend(
+    listener: tokio::net::TcpListener,
+    cert: &str,
+    key: &str,
+    body: &'static [u8],
+) -> ScriptedH2Backend {
+    ScriptedH2Backend::builder_tls(listener, cert, key)
+        .expect("h2 tls bridge builder")
+        .repeat_script(true)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: bytes::Bytes::from_static(body),
+            end_stream: true,
+        })
+        .spawn()
+        .expect("spawn h2 tls bridge backend")
+}
 
 /// Build a frontend TLS cert + CA PEMs and write them to the harness temp
 /// dir. Returns `(ca_pem, cert_path, key_path)` as strings.
@@ -333,7 +357,7 @@ async fn spawn_h3_harness_with_explicit_https_port_and_config(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Test 1 — TCP+TLS backend advertising h2+http/1.1, no UDP listener.
+// Test 1 — H2/TLS backend with no UDP listener.
 // Capability probe must classify h3 = Unsupported, h2_tls = Supported.
 // ────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -343,10 +367,10 @@ async fn h3_probe_classifies_backend_without_quic_as_h3_unsupported() {
     let (cert, key) = ca.valid().expect("leaf");
     let reservation = reserve_port().await.expect("backend port");
     let backend_port = reservation.port;
-    // Script the TCP+TLS side to reply 200 so the H2 probe + cross-protocol
-    // bridge both work; leave UDP unbound (no QUIC listener).
+    // Keep a real H2/TLS server available for the H2 probe, reqwest warmup,
+    // and cross-protocol bridge; leave UDP unbound (no QUIC listener).
     let _backend =
-        tls_backend_without_quic_with_ok_response(reservation.into_listener(), cert, key);
+        spawn_h2_bridge_backend(reservation.into_listener(), &cert, &key, b"ok");
 
     let (harness, _ca_pem, https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
@@ -373,14 +397,9 @@ async fn h3_probe_classifies_backend_without_quic_as_h3_unsupported() {
         matches!(h3_class, "unsupported" | "unknown"),
         "expected h3=unsupported/unknown for backend without QUIC listener; got {h3_class}; entry: {entry:#?}"
     );
-    // Full H2 candidate establishment waits for peer SETTINGS. This scripted
-    // backend advertises ALPN h2 but speaks HTTP/1.1 afterward, so the probe
-    // may leave h2_tls as `unknown` rather than a false `supported` from the
-    // client-preface-only handshake. Either value still forces the
-    // cross-protocol bridge for the H3 request below.
-    assert!(
-        matches!(h2_class, "supported" | "unknown"),
-        "expected h2_tls=supported/unknown for backend advertising h2 in ALPN; entry: {entry:#?}"
+    assert_eq!(
+        h2_class, "supported",
+        "expected h2_tls=supported for the H2/TLS backend; entry: {entry:#?}"
     );
 
     // Fire an H3 request — the gateway should dispatch it through the
@@ -515,20 +534,10 @@ async fn h3_backend_connection_close_mid_request_downgrades_capability() {
         .expect("colocated tcp/udp");
     let backend_port = tcp_res.port;
 
-    // TCP+TLS side: always answers 200 so the cross-protocol bridge works
+    // H2/TLS side: always answers 200 so the cross-protocol bridge works
     // on the second request.
-    let _tcp_backend = ScriptedTlsBackend::builder(
-        tcp_res.into_listener(),
-        TlsConfig::new(cert.clone(), key.clone())
-            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
-    )
-    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
-    .step(TcpStep::Write(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec(),
-    ))
-    .step(TcpStep::Drop)
-    .spawn()
-    .expect("spawn tls");
+    let _tcp_backend =
+        spawn_h2_bridge_backend(tcp_res.into_listener(), &cert, &key, b"hello");
 
     // UDP side: accept handshake (lets the probe succeed) + accept stream
     // + close the connection. Once the probe completes, the gateway caches
@@ -3931,19 +3940,8 @@ async fn h3_frontend_mid_body_stream_reset_downgrades_and_bridges() {
         .expect("colocated tcp/udp");
     let backend_port = tcp_res.port;
 
-    let tcp_backend = ScriptedTlsBackend::builder(
-        tcp_res.into_listener(),
-        TlsConfig::new(cert.clone(), key.clone())
-            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
-    )
-    .repeat_each_connection()
-    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
-    .step(TcpStep::Write(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nbridged".to_vec(),
-    ))
-    .step(TcpStep::Drop)
-    .spawn()
-    .expect("spawn tls");
+    let tcp_backend =
+        spawn_h2_bridge_backend(tcp_res.into_listener(), &cert, &key, b"bridged");
 
     let prefix = bytes::Bytes::from_static(b"partial-");
     let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
@@ -4106,19 +4104,7 @@ async fn h3_frontend_retry_rotation_bridges_to_h2_only_target() {
 
     let (tcp_a, udp_a) = reserve_colocated_tcp_udp().await.expect("target A ports");
     let target_a_port = tcp_a.port;
-    let _tcp_a = ScriptedTlsBackend::builder(
-        tcp_a.into_listener(),
-        TlsConfig::new(cert.clone(), key.clone())
-            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
-    )
-    .repeat_each_connection()
-    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
-    .step(TcpStep::Write(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
-    ))
-    .step(TcpStep::Drop)
-    .spawn()
-    .expect("spawn A tls");
+    let _tcp_a = spawn_h2_bridge_backend(tcp_a.into_listener(), &cert, &key, b"ok");
 
     let h3_a_tls = H3TlsConfig::new(cert.clone(), key.clone());
     let h3_a = ScriptedH3Backend::builder(udp_a.into_socket(), h3_a_tls)
@@ -4135,19 +4121,8 @@ async fn h3_frontend_retry_rotation_bridges_to_h2_only_target() {
 
     let tcp_b = reserve_port().await.expect("target B port");
     let target_b_port = tcp_b.port;
-    let tcp_b_backend = ScriptedTlsBackend::builder(
-        tcp_b.into_listener(),
-        TlsConfig::new(cert.clone(), key.clone())
-            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
-    )
-    .repeat_each_connection()
-    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
-    .step(TcpStep::Write(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfrom-b!".to_vec(),
-    ))
-    .step(TcpStep::Drop)
-    .spawn()
-    .expect("spawn B tls");
+    let tcp_b_backend =
+        spawn_h2_bridge_backend(tcp_b.into_listener(), &cert, &key, b"from-b!");
 
     let yaml = json!({
         "version": "1",
@@ -4221,7 +4196,7 @@ async fn h3_frontend_retry_rotation_bridges_to_h2_only_target() {
         "warmup must classify A=h3-supported and B=h3-(unsupported|unknown) before the request"
     );
 
-    let b_baseline = tcp_b_backend.accepted_connections();
+    let b_baseline = tcp_b_backend.received_streams().await.len();
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!("https://127.0.0.1:{https_port}/api/mixed");
     let resp = client.get(&url).await.expect("mixed-capability response");
@@ -4234,10 +4209,12 @@ async fn h3_frontend_retry_rotation_bridges_to_h2_only_target() {
         resp.body_text()
     );
     assert_eq!(resp.body_text(), "from-b!");
+    let b_streams = tcp_b_backend.received_streams().await;
     assert!(
-        tcp_b_backend.accepted_connections() > b_baseline,
-        "retry must have reached B over TCP; baseline={b_baseline} now={}",
-        tcp_b_backend.accepted_connections()
+        b_streams[b_baseline..]
+            .iter()
+            .any(|stream| stream.path == "/mixed"),
+        "retry must have reached H2 target B; baseline={b_baseline} streams={b_streams:?}"
     );
     let a_paths: Vec<_> = h3_a
         .received_requests()
