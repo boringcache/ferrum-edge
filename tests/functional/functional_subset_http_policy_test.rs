@@ -14,12 +14,13 @@ use crate::scaffolding::{
 };
 
 use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
-use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::config::types::{GatewayConfig, H2UpgradePolicy};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::modes::file::ServeOptions;
 use ferrum_edge::modes::mesh::{
     MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
 };
+use ferrum_edge::proxy::build_backend_url_with_target;
 use http::StatusCode;
 use serde_json::json;
 use std::collections::HashMap;
@@ -64,7 +65,9 @@ async fn functional_subset_http_h2_upgrade_policy_is_observable_at_backend() {
     .spawn()
     .expect("spawn h1 tls backend");
 
-    // v2 Upgrade must take direct-H2 against this H2-only TLS fixture.
+    // v2 Upgrade must negotiate H2 against this H2-only TLS fixture. The
+    // default nonzero body limits keep this request on reqwest, whose ALPN is
+    // still H2-capable because the selected subset does not force HTTP/1.1.
     let h2_backend = ScriptedH2Backend::builder_tls(h2_res.into_listener(), &cert, &key)
         .expect("h2 tls builder")
         .repeat_script(true)
@@ -80,9 +83,19 @@ async fn functional_subset_http_h2_upgrade_policy_is_observable_at_backend() {
         .spawn()
         .expect("spawn h2 tls backend");
 
-    let gateway = start_subset_gateway(subset_https_dual_backend_config(h1_port, h2_port))
-        .await
-        .expect("start subset h2 gateway");
+    let gateway = start_subset_gateway(
+        subset_https_dual_backend_config(h1_port, h2_port),
+        ExpectedSubsetPreparation {
+            v1_h2_policy: H2UpgradePolicy::DoNotUpgrade,
+            v2_h2_policy: H2UpgradePolicy::Upgrade,
+            v1_port: h1_port,
+            v2_port: h2_port,
+            backend_scheme: "https",
+            verify_server_cert: false,
+        },
+    )
+    .await
+    .expect("start subset h2 gateway");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -157,9 +170,19 @@ async fn functional_subset_http_max_retries_caps_live_attempts() {
     ])
     .await;
 
-    let gateway = start_subset_gateway(subset_http_retry_config(backend_port))
-        .await
-        .expect("start subset retry gateway");
+    let gateway = start_subset_gateway(
+        subset_http_retry_config(backend_port),
+        ExpectedSubsetPreparation {
+            v1_h2_policy: H2UpgradePolicy::DoNotUpgrade,
+            v2_h2_policy: H2UpgradePolicy::DoNotUpgrade,
+            v1_port: backend_port,
+            v2_port: backend_port,
+            backend_scheme: "http",
+            verify_server_cert: true,
+        },
+    )
+    .await
+    .expect("start subset retry gateway");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -226,9 +249,19 @@ async fn functional_subset_http_max_retries_caps_live_attempts() {
 async fn functional_subset_http1_pending_admission_is_subset_isolated() {
     let (backend_port, hits, first_hit_rx, release, shutdown_tx, backend_task) =
         spawn_holding_backend().await;
-    let gateway = start_subset_gateway(subset_http_pending_config(backend_port))
-        .await
-        .expect("start subset pending gateway");
+    let gateway = start_subset_gateway(
+        subset_http_pending_config(backend_port),
+        ExpectedSubsetPreparation {
+            v1_h2_policy: H2UpgradePolicy::DoNotUpgrade,
+            v2_h2_policy: H2UpgradePolicy::DoNotUpgrade,
+            v1_port: backend_port,
+            v2_port: backend_port,
+            backend_scheme: "http",
+            verify_server_cert: true,
+        },
+    )
+    .await
+    .expect("start subset pending gateway");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(0)
@@ -348,8 +381,19 @@ impl RunningGateway {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ExpectedSubsetPreparation {
+    v1_h2_policy: H2UpgradePolicy,
+    v2_h2_policy: H2UpgradePolicy,
+    v1_port: u16,
+    v2_port: u16,
+    backend_scheme: &'static str,
+    verify_server_cert: bool,
+}
+
 async fn start_subset_gateway(
     config: GatewayConfig,
+    expected: ExpectedSubsetPreparation,
 ) -> Result<RunningGateway, Box<dyn std::error::Error + Send + Sync>> {
     let http = reserve_port().await?;
     let admin = reserve_port().await?;
@@ -376,20 +420,7 @@ async fn start_subset_gateway(
             format!("mesh preparation failed: {e}").into()
         },
     )?;
-    assert!(
-        prepared.proxies.iter().any(|proxy| {
-            proxy.upstream_subset.as_deref() == Some("v1")
-                && proxy
-                    .dispatch_port_override_fallback
-                    .as_ref()
-                    .is_some_and(|fallback| {
-                        fallback.http1_max_pending_requests == Some(1)
-                            || fallback.max_retries == Some(1)
-                            || fallback.h2_upgrade_policy.is_some()
-                    })
-        }),
-        "selected subset HTTP policy was not projected onto the v1 proxy fallback"
-    );
+    assert_subset_preparation(&prepared, expected);
 
     let jwt_manager = JwtManager::new(JwtConfig {
         secret: JWT_SECRET.to_string(),
@@ -422,6 +453,103 @@ async fn start_subset_gateway(
         shutdown_tx,
         join,
     })
+}
+
+fn assert_subset_preparation(config: &GatewayConfig, expected: ExpectedSubsetPreparation) {
+    let upstream = config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == UPSTREAM_ID)
+        .expect("prepared subset upstream");
+    assert_eq!(
+        upstream.backend_tls_verify_server_cert, expected.verify_server_cert,
+        "fixture TLS verification must be configured on the owning upstream"
+    );
+
+    for (subset, expected_policy, expected_port, expected_retries, expected_pending) in [
+        (
+            "v1",
+            expected.v1_h2_policy,
+            expected.v1_port,
+            1,
+            1,
+        ),
+        (
+            "v2",
+            expected.v2_h2_policy,
+            expected.v2_port,
+            3,
+            50,
+        ),
+    ] {
+        let proxy = config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.upstream_subset.as_deref() == Some(subset))
+            .unwrap_or_else(|| panic!("prepared {subset} proxy"));
+        let fallback = proxy
+            .dispatch_port_override_fallback
+            .as_ref()
+            .unwrap_or_else(|| panic!("prepared {subset} subset fallback"));
+        assert_eq!(
+            fallback.h2_upgrade_policy,
+            Some(expected_policy),
+            "prepared {subset} must carry its exact selected-subset h2UpgradePolicy"
+        );
+        assert_eq!(
+            fallback.max_retries,
+            Some(expected_retries),
+            "prepared {subset} must carry its exact selected-subset maxRetries"
+        );
+        assert_eq!(
+            fallback.http1_max_pending_requests,
+            Some(expected_pending),
+            "prepared {subset} must carry its exact selected-subset http1MaxPendingRequests"
+        );
+        assert_eq!(
+            proxy.backend_port, expected_port,
+            "prepared {subset} proxy template must not retain a stale backend port"
+        );
+        assert_eq!(
+            proxy.resolved_tls.verify_server_cert, expected.verify_server_cert,
+            "prepared {subset} must inherit TLS verification from its upstream"
+        );
+
+        let target = upstream
+            .targets
+            .iter()
+            .find(|target| target.tags.get("version").map(String::as_str) == Some(subset))
+            .unwrap_or_else(|| panic!("prepared {subset} target"));
+        assert_eq!(
+            target.port, expected_port,
+            "prepared {subset} target must dial the expected fixture port"
+        );
+        assert_eq!(
+            target.dispatch_policy_port(),
+            expected_port,
+            "prepared {subset} target policy port must match its dial port"
+        );
+
+        let request_path = format!("/{subset}/probe");
+        let strip_len = proxy.listen_path.as_deref().map(str::len).unwrap_or(0);
+        let backend_url = build_backend_url_with_target(
+            proxy,
+            &request_path,
+            "",
+            &target.host,
+            target.port,
+            strip_len,
+            target.path.as_deref(),
+        );
+        assert_eq!(
+            backend_url,
+            format!(
+                "{}://127.0.0.1:{}/probe",
+                expected.backend_scheme, expected_port
+            ),
+            "prepared {subset} backend URL must use the selected target dial port"
+        );
+    }
 }
 
 fn mesh_runtime_config() -> MeshRuntimeConfig {
@@ -496,18 +624,28 @@ fn subset_https_dual_backend_config(h1_port: u16, h2_port: u16) -> GatewayConfig
         None,
         false,
     );
-    // Point v2 targets at the H2-only fixture; v1 keeps the H1 fixture port.
+    // Upstream-backed proxies inherit TLS posture from the upstream, not their
+    // route template. These synthetic certificates are intentionally trusted by
+    // this fixture only; production defaults remain fail-closed.
     for upstream in &mut config.upstreams {
+        upstream.backend_tls_verify_server_cert = false;
         for target in &mut upstream.targets {
             if target.tags.get("version").map(String::as_str) == Some("v2") {
                 target.port = h2_port;
             }
         }
     }
-    // Dual-backend H2 coverage only needs the subset-bound proxies.
-    config
-        .proxies
-        .retain(|proxy| proxy.upstream_subset.is_some());
+    // Keep the route templates aligned with the subset-selected dial targets so
+    // preparation assertions cannot pass while a stale template port hides a
+    // target-rebasing defect.
+    config.proxies.retain_mut(|proxy| {
+        match proxy.upstream_subset.as_deref() {
+            Some("v1") => proxy.backend_port = h1_port,
+            Some("v2") => proxy.backend_port = h2_port,
+            _ => return false,
+        }
+        true
+    });
     config
 }
 
@@ -590,7 +728,6 @@ fn subset_policy_config(
             "backend_scheme": backend_scheme,
             "backend_host": "127.0.0.1",
             "backend_port": backend_port,
-            "backend_tls_verify_server_cert": false,
             "strip_listen_path": true,
             "upstream_id": UPSTREAM_ID,
             "pool_enable_http2": !force_h1_pool
