@@ -27,9 +27,8 @@ use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_de
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, RetryConfig, Upstream,
     backend_tls_sni_direct_h2_conflict_messages, first_effective_mesh_transport_conflict_with_mesh,
-    mesh_transport_retry_conflict_message, proxy_for_sni_direct_h2_admission, proxy_retry_is_effective,
-    proxy_with_resolved_port_caps,
-    validate_resource_id,
+    mesh_transport_retry_conflict_message, proxy_for_sni_direct_h2_admission,
+    proxy_retry_is_effective, proxy_with_resolved_port_caps, validate_resource_id,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 

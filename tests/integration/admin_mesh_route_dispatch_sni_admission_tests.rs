@@ -207,7 +207,8 @@ fn global_mesh_route_dispatch(id: &str, destination_upstream: &str) -> Value {
 }
 
 async fn seed_plain_and_sni_upstreams(base_url: &str, token: &str) {
-    let (status, body) = admin_post(base_url, "/upstreams", token, &plain_upstream("plain-up")).await;
+    let (status, body) =
+        admin_post(base_url, "/upstreams", token, &plain_upstream("plain-up")).await;
     assert_eq!(status, 201, "plain upstream seed failed: {body:?}");
     let (status, body) = admin_post(base_url, "/upstreams", token, &sni_upstream("sni-up")).await;
     assert_eq!(status, 201, "SNI upstream seed failed: {body:?}");
@@ -239,7 +240,10 @@ async fn mesh_route_dispatch_plugin_write_rejects_sni_override_with_associated_b
         }],
     });
     let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
-    assert_eq!(status, 201, "proxy + buffering plugin seed failed: {body:?}");
+    assert_eq!(
+        status, 201,
+        "proxy + buffering plugin seed failed: {body:?}"
+    );
 
     let (status, body) = admin_post(
         &base_url,
@@ -263,7 +267,8 @@ async fn mesh_route_dispatch_plugin_write_rejects_sni_override_with_associated_b
 }
 
 #[tokio::test]
-async fn mesh_route_dispatch_plugin_write_admits_sni_override_when_local_non_buffering_shadows_global() {
+async fn mesh_route_dispatch_plugin_write_admits_sni_override_when_local_non_buffering_shadows_global()
+{
     let tc = TestConfig::default();
     let (state, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
@@ -290,7 +295,10 @@ async fn mesh_route_dispatch_plugin_write_admits_sni_override_when_local_non_buf
         }),
     )
     .await;
-    assert_eq!(status, 201, "global buffering compression seed failed: {body:?}");
+    assert_eq!(
+        status, 201,
+        "global buffering compression seed failed: {body:?}"
+    );
 
     let batch = json!({
         "proxies": [

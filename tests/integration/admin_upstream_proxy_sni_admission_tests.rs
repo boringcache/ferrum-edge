@@ -240,7 +240,8 @@ async fn seed_plain_upstream_with_associated_buffering(
     proxy_id: &str,
     plugin_id: &str,
 ) {
-    let (status, body) = admin_post(base_url, "/upstreams", token, &plain_upstream(upstream_id)).await;
+    let (status, body) =
+        admin_post(base_url, "/upstreams", token, &plain_upstream(upstream_id)).await;
     assert_eq!(status, 201, "plain upstream seed failed: {body:?}");
 
     let batch = json!({
@@ -257,7 +258,10 @@ async fn seed_plain_upstream_with_associated_buffering(
         }],
     });
     let (status, body) = admin_post(base_url, "/batch", token, &batch).await;
-    assert_eq!(status, 201, "proxy + buffering plugin seed failed: {body:?}");
+    assert_eq!(
+        status, 201,
+        "proxy + buffering plugin seed failed: {body:?}"
+    );
 }
 
 #[tokio::test]
@@ -268,7 +272,11 @@ async fn upstream_write_rejects_sni_when_associated_buffering_and_cached_config_
     let token = make_token(&tc);
 
     seed_plain_upstream_with_associated_buffering(
-        &base_url, &token, "plain-up", "p-sni", "grpc-web-1",
+        &base_url,
+        &token,
+        "plain-up",
+        "p-sni",
+        "grpc-web-1",
     )
     .await;
 
@@ -290,7 +298,11 @@ async fn upstream_write_rejects_sni_when_associated_buffering_and_cached_config_
     let token = make_token(&tc);
 
     seed_plain_upstream_with_associated_buffering(
-        &base_url, &token, "plain-up", "p-sni", "grpc-web-1",
+        &base_url,
+        &token,
+        "plain-up",
+        "p-sni",
+        "grpc-web-1",
     )
     .await;
 
@@ -314,7 +326,11 @@ async fn proxy_write_rejects_sni_upstream_when_associated_buffering_and_cached_c
     // Proxy-scoped plugin configs require the proxy to exist first, so seed the
     // buffering association against a plain upstream, then retarget onto SNI.
     seed_plain_upstream_with_associated_buffering(
-        &base_url, &token, "plain-up", "p-sni", "grpc-web-1",
+        &base_url,
+        &token,
+        "plain-up",
+        "p-sni",
+        "grpc-web-1",
     )
     .await;
 
@@ -339,7 +355,11 @@ async fn proxy_write_rejects_sni_upstream_when_associated_buffering_and_cached_c
     let token = make_token(&tc);
 
     seed_plain_upstream_with_associated_buffering(
-        &base_url, &token, "plain-up", "p-sni", "grpc-web-1",
+        &base_url,
+        &token,
+        "plain-up",
+        "p-sni",
+        "grpc-web-1",
     )
     .await;
 

@@ -67,7 +67,7 @@ async fn functional_subset_http_h2_upgrade_policy_is_observable_at_backend() {
     // v2 Upgrade must take direct-H2 against this H2-only TLS fixture.
     let h2_backend = ScriptedH2Backend::builder_tls(h2_res.into_listener(), &cert, &key)
         .expect("h2 tls builder")
-        .repeat_script()
+        .repeat_script(true)
         .step(H2Step::ExpectHeaders(MatchHeaders::any()))
         .step(H2Step::RespondHeaders(vec![
             (":status", "200".into()),
@@ -90,7 +90,9 @@ async fn functional_subset_http_h2_upgrade_policy_is_observable_at_backend() {
 
     let v1 = timeout(
         Duration::from_secs(10),
-        client.get(format!("http://127.0.0.1:{}/v1/probe", gateway.http_port)).send(),
+        client
+            .get(format!("http://127.0.0.1:{}/v1/probe", gateway.http_port))
+            .send(),
     )
     .await
     .expect("v1 request timed out")
@@ -115,12 +117,18 @@ async fn functional_subset_http_h2_upgrade_policy_is_observable_at_backend() {
 
     let v2 = timeout(
         Duration::from_secs(10),
-        client.get(format!("http://127.0.0.1:{}/v2/probe", gateway.http_port)).send(),
+        client
+            .get(format!("http://127.0.0.1:{}/v2/probe", gateway.http_port))
+            .send(),
     )
     .await
     .expect("v2 request timed out")
     .expect("v2 request");
-    assert_eq!(v2.status(), StatusCode::OK, "v2 Upgrade must succeed over H2");
+    assert_eq!(
+        v2.status(),
+        StatusCode::OK,
+        "v2 Upgrade must succeed over H2"
+    );
     assert!(
         h2_backend.handshakes_completed() >= 1,
         "v2 success must have completed an H2 TLS handshake"
@@ -292,7 +300,11 @@ async fn functional_subset_http1_pending_admission_is_subset_isolated() {
 
     release.release();
     let held = hold.await.expect("held task join");
-    assert_eq!(held.status(), StatusCode::OK, "held v1 request must complete");
+    assert_eq!(
+        held.status(),
+        StatusCode::OK,
+        "held v1 request must complete"
+    );
 
     let after = timeout(
         Duration::from_secs(10),
