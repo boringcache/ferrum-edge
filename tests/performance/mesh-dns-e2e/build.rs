@@ -38,6 +38,7 @@ package ferrum;
 
 service MeshConfigSync {
   rpc MeshSubscribe(MeshSubscribeRequest) returns (stream MeshConfigUpdate);
+  rpc ReportMeshSliceStatus(MeshSliceStatusReport) returns (MeshSliceStatusResponse);
 }
 
 message MeshSubscribeRequest {
@@ -56,4 +57,11 @@ message MeshConfigUpdate {
   string ferrum_version = 4;
   bool heartbeat = 5;
 }
+
+message MeshSliceStatusReport {
+  string version = 1;
+  string error_message = 2;
+}
+
+message MeshSliceStatusResponse {}
 "#;

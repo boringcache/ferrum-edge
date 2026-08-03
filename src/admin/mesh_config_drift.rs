@@ -15,8 +15,9 @@
 //!     slice version, so the overlay needs its own surface.
 //!
 //! Cross-checking the DP's view against the CP's "latest published" notion
-//! (Option B in the plan) is a follow-on — that needs a CP-side endpoint
-//! or external tooling to walk DPs in parallel.
+//! is available on the control plane via JWT-authenticated
+//! `GET /mesh/slice-drift` (issue #3265), which reports per-authenticated-DP
+//! desired / sent / acknowledged / rejected slice versions.
 //!
 //! See [docs/mesh.md](../../../docs/mesh.md) "Config drift introspection"
 //! for the operator playbook.

@@ -3005,6 +3005,8 @@ paths:
         slice version per connected DP would let external tooling diff
         what the CP thinks each DP should have against what each DP
         reports here, without having to walk every DP in lock-step.
+        Superseded by `GET /mesh/slice-drift` on the control plane
+        (issue #3265).
       tags: [Mesh Config Drift]
       security:
         - bearerAuth: []
@@ -3409,6 +3411,79 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           description: No active mesh runtime state (not in mesh mode)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /mesh/slice-drift:
+    get:
+      operationId: getMeshSliceDrift
+      summary: Inspect CP-side per-DP mesh slice convergence and drift
+      description: |
+        Control-plane only (issue #3265). Returns per-authenticated local
+        MeshSubscribe identity the versions the CP desired, last sent,
+        last acknowledged, and last rejected (with age and a bounded
+        redacted NACK reason). Identity is the JWT `sub` bound at
+        subscribe time — caller-supplied display fields are never trusted.
+
+        Returns 404 outside CP mode. Returns 200 with an empty
+        `data_planes` list when CP mode is active but no local mesh DP
+        has subscribed yet. Disconnected rows are retained for 300s;
+        the registry hard-caps at 4096 identities.
+      tags: [Mesh Config Drift]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: CP-side mesh slice drift snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshSliceDriftResponse"
+              examples:
+                converged:
+                  summary: One converged DP
+                  value:
+                    mode: cp
+                    generated_at: "2026-08-02T16:00:00Z"
+                    summary:
+                      tracked: 1
+                      connected: 1
+                      converged: 1
+                      drifted: 0
+                      rejecting: 0
+                      pending: 0
+                      disconnected: 0
+                    data_planes:
+                      - node_id: mesh-dp-a
+                        namespace: ferrum
+                        connected: true
+                        session_connected_at: "2026-08-02T15:59:00Z"
+                        desired:
+                          version: "v2"
+                          at: "2026-08-02T15:59:30Z"
+                          age_seconds: 30
+                        sent:
+                          version: "v2"
+                          at: "2026-08-02T15:59:30Z"
+                          age_seconds: 30
+                        acknowledged:
+                          version: "v2"
+                          at: "2026-08-02T15:59:31Z"
+                          age_seconds: 29
+                        convergence: converged
+                        drift:
+                          desired_vs_sent: false
+                          desired_vs_acknowledged: false
+                          sent_vs_acknowledged: false
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Not in control-plane mode, or drift tracker not wired
           content:
             application/json:
               schema:
@@ -25834,6 +25909,98 @@ components:
           type: string
           format: date-time
           description: When the last config update was broadcast to this mesh node
+
+    MeshSliceDriftResponse:
+      type: object
+      required: [mode, generated_at, summary, data_planes]
+      description: >
+        Control-plane per-authenticated-DP mesh slice convergence snapshot
+        (issue #3265).
+      properties:
+        mode:
+          type: string
+          enum: [cp]
+        generated_at:
+          type: string
+          format: date-time
+        summary:
+          $ref: "#/components/schemas/MeshSliceDriftSummary"
+        data_planes:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeshSliceDriftEntry"
+
+    MeshSliceDriftSummary:
+      type: object
+      required: [tracked, connected, converged, drifted, rejecting, pending, disconnected]
+      properties:
+        tracked: { type: integer, minimum: 0 }
+        connected: { type: integer, minimum: 0 }
+        converged: { type: integer, minimum: 0 }
+        drifted: { type: integer, minimum: 0 }
+        rejecting: { type: integer, minimum: 0 }
+        pending: { type: integer, minimum: 0 }
+        disconnected: { type: integer, minimum: 0 }
+
+    MeshSliceDriftEntry:
+      type: object
+      required: [node_id, namespace, connected, session_connected_at, convergence, drift]
+      properties:
+        node_id:
+          type: string
+          description: Authenticated JWT subject for the mesh DP
+        namespace:
+          type: string
+        connected:
+          type: boolean
+        session_connected_at:
+          type: string
+          format: date-time
+        disconnected_at:
+          type: string
+          format: date-time
+        desired:
+          $ref: "#/components/schemas/MeshSliceVersionStamp"
+        sent:
+          $ref: "#/components/schemas/MeshSliceVersionStamp"
+        acknowledged:
+          $ref: "#/components/schemas/MeshSliceVersionStamp"
+        rejected:
+          $ref: "#/components/schemas/MeshSliceRejectedStamp"
+        convergence:
+          type: string
+          enum: [converged, drifted, rejecting, pending, disconnected]
+        drift:
+          $ref: "#/components/schemas/MeshSliceDriftFlags"
+
+    MeshSliceVersionStamp:
+      type: object
+      required: [version, at, age_seconds]
+      properties:
+        version: { type: string }
+        at: { type: string, format: date-time }
+        age_seconds: { type: integer, format: int64, minimum: 0 }
+
+    MeshSliceRejectedStamp:
+      type: object
+      required: [version, at, age_seconds, reason]
+      properties:
+        version: { type: string }
+        at: { type: string, format: date-time }
+        age_seconds: { type: integer, format: int64, minimum: 0 }
+        reason:
+          type: string
+          description: >
+            Control-character-stripped, at most 64 characters, optionally
+            suffixed with `(truncated)`. Never credentials.
+
+    MeshSliceDriftFlags:
+      type: object
+      required: [desired_vs_sent, desired_vs_acknowledged, sent_vs_acknowledged]
+      properties:
+        desired_vs_sent: { type: boolean }
+        desired_vs_acknowledged: { type: boolean }
+        sent_vs_acknowledged: { type: boolean }
 
     ConnectedDpNode:
       type: object

@@ -12,6 +12,11 @@ service ConfigSync {
 service MeshConfigSync {
   // Mesh data planes subscribe to their canonical per-workload mesh slice.
   rpc MeshSubscribe(MeshSubscribeRequest) returns (stream MeshConfigUpdate);
+  // Data plane reports ACK/NACK for a previously delivered mesh slice version
+  // (issue #3265). Identity is the authenticated JWT `sub` only — the report
+  // carries no caller-trusted node identity field. Ordinary local-mesh
+  // audience tokens are required; remote-discovery tokens are refused.
+  rpc ReportMeshSliceStatus(MeshSliceStatusReport) returns (MeshSliceStatusResponse);
 }
 
 message SubscribeRequest {
@@ -189,3 +194,24 @@ message MeshConfigUpdate {
   // config store.
   uint64 config_sequence = 7;
 }
+
+// DP → CP apply/reject report for a MeshSubscribe-delivered slice version.
+//
+// CONSUMER CONTRACT (enforced fail-closed by the control plane):
+//   * Authenticated JWT `sub` is the sole node identity; there is no
+//     caller-supplied node_id field by design.
+//   * `version` MUST be non-empty and at most 256 characters.
+//   * Empty `error_message` is an ACK. Non-empty `error_message` is a NACK;
+//     the CP sanitises the reason (control characters stripped, truncated to
+//     64 characters) before retaining or exposing it.
+//   * The reporter MUST present the ordinary local mesh subscribe audience
+//     (`ferrum-mesh-subscribe:local`). Remote-discovery tokens are refused.
+message MeshSliceStatusReport {
+  // Slice version being acknowledged or rejected.
+  string version = 1;
+  // Empty = ACK. Non-empty = NACK diagnostic (CP-sanitised, never echoed raw).
+  string error_message = 2;
+}
+
+// Empty success acknowledgement for ReportMeshSliceStatus.
+message MeshSliceStatusResponse {}

@@ -173,6 +173,15 @@ impl MeshConfigSync for StaticMeshControlPlane {
         let stream = stream::once(async move { Ok(update) }).chain(heartbeats);
         Ok(Response::new(Box::pin(stream)))
     }
+
+    async fn report_mesh_slice_status(
+        &self,
+        _request: Request<ferrum_edge::grpc::proto::MeshSliceStatusReport>,
+    ) -> Result<Response<ferrum_edge::grpc::proto::MeshSliceStatusResponse>, Status> {
+        Ok(Response::new(
+            ferrum_edge::grpc::proto::MeshSliceStatusResponse {},
+        ))
+    }
 }
 
 struct MeshCpHandle {

@@ -3,6 +3,9 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::Serialize;
+use std::sync::Arc;
+
+use super::mesh_slice_drift::MeshSliceDriftRegistry;
 
 pub const MESH_NODE_REGISTRY_STALE_TTL_SECONDS: i64 = 300;
 pub const MESH_NODE_REGISTRY_REAPER_INTERVAL: std::time::Duration =
@@ -22,16 +25,41 @@ pub struct MeshNodeInfo {
     pub last_update_at: DateTime<Utc>,
 }
 
+/// Online mesh subscribers plus the optional CP-side slice-drift tracker
+/// (issue #3265). Drift is shared with [`super::mesh_server::MeshGrpcServer`]
+/// so broadcasts can advance `desired` without threading a second handle
+/// through every publish site.
 #[derive(Default)]
 pub struct MeshNodeRegistry {
     nodes: DashMap<String, MeshNodeInfo>,
+    drift: Option<Arc<MeshSliceDriftRegistry>>,
 }
 
 impl MeshNodeRegistry {
     pub fn new() -> Self {
         Self {
             nodes: DashMap::new(),
+            drift: None,
         }
+    }
+
+    /// Attach the CP slice-drift registry. Idempotent replacement is fine;
+    /// production wiring attaches once at CP startup.
+    pub fn with_drift(mut self, drift: Arc<MeshSliceDriftRegistry>) -> Self {
+        self.drift = Some(drift);
+        self
+    }
+
+    pub fn set_drift(&mut self, drift: Arc<MeshSliceDriftRegistry>) {
+        self.drift = Some(drift);
+    }
+
+    pub fn drift(&self) -> Option<&MeshSliceDriftRegistry> {
+        self.drift.as_deref()
+    }
+
+    pub fn drift_arc(&self) -> Option<Arc<MeshSliceDriftRegistry>> {
+        self.drift.clone()
     }
 
     pub fn insert(&self, info: MeshNodeInfo) {

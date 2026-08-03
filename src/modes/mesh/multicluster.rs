@@ -4544,6 +4544,7 @@ mod tests {
                     request.extensions().get(),
                 )
                 .map_err(|(status, _)| status)?;
+                // Identity is verified; the stub does not track CP-side drift.
             }
 
             let slice_update = MeshConfigUpdate {
@@ -4600,6 +4601,13 @@ mod tests {
             };
             let stream: Self::MeshSubscribeStream = Box::pin(tokio_stream::iter(items));
             Ok(Response::new(stream))
+        }
+
+        async fn report_mesh_slice_status(
+            &self,
+            _request: Request<crate::grpc::proto::MeshSliceStatusReport>,
+        ) -> Result<Response<crate::grpc::proto::MeshSliceStatusResponse>, Status> {
+            Ok(Response::new(crate::grpc::proto::MeshSliceStatusResponse {}))
         }
     }
 

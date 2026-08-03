@@ -17,13 +17,16 @@ use tracing::{error, info, warn};
 
 use super::auth::{
     AllowedNamespaces, AudienceRejectReason, GrpcAudiencePolicy, MESH_LOCAL_SUBSCRIBE_AUDIENCE,
-    remote_discovery_audience, verify_grpc_jwt_metadata_with_audience,
+    VerifiedGrpcIdentity, remote_discovery_audience, verify_grpc_jwt_metadata_with_audience,
 };
 use super::cp_server::{CpGrpcServer, CpScope, DEFAULT_CP_DP_JWT_ISSUER};
 use super::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
 use super::mesh_registry::{MeshNodeInfo, MeshNodeRegistry};
+use super::mesh_slice_drift::{MeshSliceDriftAdmitError, MeshSliceDriftRegistry};
 use super::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
-use super::proto::{MeshConfigUpdate, MeshSubscribeRequest};
+use super::proto::{
+    MeshConfigUpdate, MeshSliceStatusReport, MeshSliceStatusResponse, MeshSubscribeRequest,
+};
 use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::{GatewayConfig, default_namespace};
@@ -43,6 +46,7 @@ pub enum MeshConfigBroadcast {
 struct TrackedMeshStream<S> {
     inner: Pin<Box<S>>,
     registry: Arc<MeshNodeRegistry>,
+    drift: Arc<MeshSliceDriftRegistry>,
     node_id: String,
     connected_at: DateTime<Utc>,
 }
@@ -51,6 +55,8 @@ impl<S> Drop for TrackedMeshStream<S> {
     fn drop(&mut self) {
         self.registry
             .remove_if_stale(&self.node_id, self.connected_at);
+        self.drift
+            .mark_disconnected(&self.node_id, self.connected_at);
         info!("Mesh node '{}' disconnected (stream dropped)", self.node_id);
     }
 }
@@ -109,6 +115,8 @@ pub struct MeshGrpcServer {
     /// Precomputed at build time into the full expected `aud` string so the
     /// per-subscription check is a borrow + compare, never a `format!`.
     expected_remote_discovery_audience: Option<String>,
+    /// CP-side per-DP desired/sent/ack/nack tracker (issue #3265).
+    drift: Arc<MeshSliceDriftRegistry>,
 }
 
 pub struct MeshGrpcServerBuilder {
@@ -116,6 +124,7 @@ pub struct MeshGrpcServerBuilder {
     verifier: Arc<CpDpVerifier>,
     channel_capacity: usize,
     registry: Arc<MeshNodeRegistry>,
+    drift: Arc<MeshSliceDriftRegistry>,
     expected_issuer: String,
     namespace: String,
     scope: CpScope,
@@ -134,6 +143,7 @@ impl MeshGrpcServerBuilder {
             verifier: Arc::new(CpDpVerifier::SharedSecret(jwt_secret)),
             channel_capacity: 128,
             registry: Arc::new(MeshNodeRegistry::new()),
+            drift: Arc::new(MeshSliceDriftRegistry::new()),
             expected_issuer: DEFAULT_CP_DP_JWT_ISSUER.to_string(),
             namespace: default_namespace(),
             scope: CpScope::Single(default_namespace()),
@@ -153,6 +163,11 @@ impl MeshGrpcServerBuilder {
 
     pub fn registry(mut self, registry: Arc<MeshNodeRegistry>) -> Self {
         self.registry = registry;
+        self
+    }
+
+    pub fn drift(mut self, drift: Arc<MeshSliceDriftRegistry>) -> Self {
+        self.drift = drift;
         self
     }
 
@@ -225,6 +240,7 @@ impl MeshGrpcServerBuilder {
                 expected_issuer: self.expected_issuer,
                 mesh_update_tx: tx,
                 registry: self.registry,
+                drift: self.drift,
                 namespace: self.namespace,
                 scope: self.scope,
                 require_ns_claim: self.require_ns_claim,
@@ -350,7 +366,7 @@ impl MeshGrpcServer {
         metadata: &tonic::metadata::MetadataMap,
         extensions: &tonic::Extensions,
         remote_discovery: bool,
-    ) -> Result<AllowedNamespaces, (Status, Option<AudienceRejectReason>)> {
+    ) -> Result<VerifiedGrpcIdentity, (Status, Option<AudienceRejectReason>)> {
         verify_grpc_jwt_metadata_with_audience(
             metadata,
             &self.verifier,
@@ -358,6 +374,10 @@ impl MeshGrpcServer {
             self.audience_policy_for(remote_discovery),
             extensions.get::<CpGrpcConnectInfo>(),
         )
+    }
+
+    pub fn drift_registry(&self) -> Arc<MeshSliceDriftRegistry> {
+        self.drift.clone()
     }
 
     fn filter_config_for_request(
@@ -507,6 +527,10 @@ impl MeshGrpcServer {
         config: Arc<GatewayConfig>,
         registry: &MeshNodeRegistry,
     ) {
+        let version = config.loaded_at.to_rfc3339();
+        if let Some(drift) = registry.drift() {
+            drift.set_desired_all(&version, Utc::now());
+        }
         let _ = tx.send(MeshConfigBroadcast::Full(config));
         registry.touch_all();
     }
@@ -517,6 +541,9 @@ impl MeshGrpcServer {
         version: &str,
         registry: &MeshNodeRegistry,
     ) {
+        if let Some(drift) = registry.drift() {
+            drift.set_desired_all(version, Utc::now());
+        }
         let _ = tx.send(MeshConfigBroadcast::Delta {
             result: Box::new(result),
             version: version.to_string(),
@@ -535,12 +562,12 @@ impl MeshConfigSync for MeshGrpcServer {
         request: Request<MeshSubscribeRequest>,
     ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
         let remote_discovery = request.get_ref().remote_discovery;
-        let allowed = match self.verify_jwt_metadata(
+        let identity = match self.verify_jwt_metadata(
             request.metadata(),
             request.extensions(),
             remote_discovery,
         ) {
-            Ok(allowed) => allowed,
+            Ok(identity) => identity,
             Err((status, audience_reason)) => {
                 let req = request.get_ref();
                 if let Some(reason) = audience_reason {
@@ -575,10 +602,11 @@ impl MeshConfigSync for MeshGrpcServer {
                 return Err(status);
             }
         };
+        let allowed = &identity.allowed_namespaces;
 
         let inner = request.into_inner();
         CpGrpcServer::check_version_compatibility(&inner.ferrum_version)?;
-        if let Err(status) = self.check_namespace(&inner.namespace, &allowed) {
+        if let Err(status) = self.check_namespace(&inner.namespace, allowed) {
             CpGrpcServer::audit_tenant_subscription(
                 "MeshConfigSync.MeshSubscribe",
                 &inner.node_id,
@@ -593,9 +621,25 @@ impl MeshConfigSync for MeshGrpcServer {
                 "MeshSubscribe node_id is required",
             ));
         }
+        // Authenticated identity wins: the request node_id is display/scope
+        // input only when it matches JWT `sub`. A mismatch fails closed so a
+        // stolen token cannot register under a forged registry key.
+        if inner.node_id.trim() != identity.subject {
+            CpGrpcServer::audit_tenant_subscription(
+                "MeshConfigSync.MeshSubscribe",
+                &identity.subject,
+                &inner.namespace,
+                "failure",
+                "node_id does not match authenticated subject",
+            );
+            return Err(Status::permission_denied(
+                "MeshSubscribe node_id must match the authenticated JWT subject",
+            ));
+        }
+        let node_id = identity.subject.clone();
         CpGrpcServer::audit_tenant_subscription(
             "MeshConfigSync.MeshSubscribe",
-            &inner.node_id,
+            &node_id,
             &inner.namespace,
             "success",
             "",
@@ -603,7 +647,7 @@ impl MeshConfigSync for MeshGrpcServer {
 
         info!(
             "Mesh node '{}' (v{}) subscribed for mesh config (namespace='{}')",
-            inner.node_id, inner.ferrum_version, inner.namespace
+            node_id, inner.ferrum_version, inner.namespace
         );
 
         let waypoint_name = if inner.waypoint_name.trim().is_empty() {
@@ -611,7 +655,6 @@ impl MeshConfigSync for MeshGrpcServer {
         } else {
             Some(inner.waypoint_name.clone())
         };
-        let node_id = inner.node_id;
         let node_version = inner.ferrum_version;
         let node_namespace = inner.namespace;
         let bearer_namespaces = allowed.effective_namespaces().cloned();
@@ -648,13 +691,37 @@ impl MeshConfigSync for MeshGrpcServer {
             ))
         })?;
         let initial_slice = MeshSlice::from_gateway_config(&initial_config, slice_request.clone());
+        let initial_version = initial_slice.version.clone();
         let initial = Self::build_mesh_config_update_from_slice(initial_slice.clone())?;
 
         let now = Utc::now();
+        // Remote-discovery one-shots are not long-lived DPs and must not
+        // inflate the CP drift registry. Admit drift capacity BEFORE registering
+        // the online mesh-node row so a cardinality refusal cannot leave a
+        // dangling /cluster entry without a stream.
+        if !remote_discovery {
+            self.drift
+                .open_session(
+                    &node_id,
+                    &node_namespace,
+                    now,
+                    Some(initial_version.as_str()),
+                )
+                .map_err(|err| {
+                    Status::resource_exhausted(format!(
+                        "{} ({})",
+                        err.as_status_message(),
+                        err.field_name()
+                    ))
+                })?;
+            let _ = self
+                .drift
+                .record_sent(&node_id, now, &initial_version, now);
+        }
         self.registry.insert(MeshNodeInfo {
             node_id: node_id.clone(),
             version: node_version,
-            namespace: node_namespace,
+            namespace: node_namespace.clone(),
             connected_at: now,
             last_heartbeat_at: now,
             last_update_at: now,
@@ -666,6 +733,10 @@ impl MeshConfigSync for MeshGrpcServer {
         let stream_slice_request = slice_request.clone();
         let stream_scope = self.scope.clone();
         let stream_bearer_namespaces = bearer_namespaces;
+        let stream_drift = self.drift.clone();
+        let stream_node_id = node_id.clone();
+        let stream_connected_at = now;
+        let track_drift = !remote_discovery;
         let stream = BroadcastStream::new(rx).filter_map(move |result| {
             let slice_request = stream_slice_request.clone();
             match result {
@@ -684,6 +755,21 @@ impl MeshConfigSync for MeshGrpcServer {
                         &previous_slice,
                     ) {
                         Ok((next_slice, Some(mesh_update))) => {
+                            if track_drift {
+                                let sent_at = Utc::now();
+                                let _ = stream_drift.set_desired_for_node(
+                                    &stream_node_id,
+                                    stream_connected_at,
+                                    &mesh_update.version,
+                                    sent_at,
+                                );
+                                let _ = stream_drift.record_sent(
+                                    &stream_node_id,
+                                    stream_connected_at,
+                                    &mesh_update.version,
+                                    sent_at,
+                                );
+                            }
                             stream_config = config;
                             previous_slice = next_slice;
                             Some(Ok(mesh_update))
@@ -705,8 +791,23 @@ impl MeshConfigSync for MeshGrpcServer {
                         stream_bearer_namespaces.as_ref(),
                     ) {
                         Ok((next_slice, maybe_update)) => {
-                            if maybe_update.is_some() {
+                            if let Some(ref mesh_update) = maybe_update {
                                 previous_slice = next_slice;
+                                if track_drift {
+                                    let sent_at = Utc::now();
+                                    let _ = stream_drift.set_desired_for_node(
+                                        &stream_node_id,
+                                        stream_connected_at,
+                                        &mesh_update.version,
+                                        sent_at,
+                                    );
+                                    let _ = stream_drift.record_sent(
+                                        &stream_node_id,
+                                        stream_connected_at,
+                                        &mesh_update.version,
+                                        sent_at,
+                                    );
+                                }
                             }
                             maybe_update.map(Ok)
                         }
@@ -740,6 +841,21 @@ impl MeshConfigSync for MeshGrpcServer {
                         &previous_slice,
                     ) {
                         Ok((next_slice, Some(update))) => {
+                            if track_drift {
+                                let sent_at = Utc::now();
+                                let _ = stream_drift.set_desired_for_node(
+                                    &stream_node_id,
+                                    stream_connected_at,
+                                    &update.version,
+                                    sent_at,
+                                );
+                                let _ = stream_drift.record_sent(
+                                    &stream_node_id,
+                                    stream_connected_at,
+                                    &update.version,
+                                    sent_at,
+                                );
+                            }
                             stream_config = current_config;
                             previous_slice = next_slice;
                             Some(Ok(update))
@@ -770,10 +886,72 @@ impl MeshConfigSync for MeshGrpcServer {
         let tracked = TrackedMeshStream {
             inner: Box::pin(combined),
             registry: self.registry.clone(),
+            drift: self.drift.clone(),
             node_id,
             connected_at: now,
         };
         Ok(Response::new(Box::pin(tracked)))
+    }
+
+    async fn report_mesh_slice_status(
+        &self,
+        request: Request<MeshSliceStatusReport>,
+    ) -> Result<Response<MeshSliceStatusResponse>, Status> {
+        // Status reports are local-mesh only. Remote-discovery tokens must not
+        // mutate another cluster's drift registry.
+        let identity = match self.verify_jwt_metadata(request.metadata(), request.extensions(), false)
+        {
+            Ok(identity) => identity,
+            Err((status, audience_reason)) => {
+                if let Some(reason) = audience_reason {
+                    crate::plugins::mesh::prometheus_helpers::increment_mesh_subscribe_audience_rejection(
+                        "local",
+                        reason.as_metric_label(),
+                    );
+                    warn!(
+                        audit.event = "mesh_slice_status_audience_rejected",
+                        surface = "MeshConfigSync.ReportMeshSliceStatus",
+                        reason = reason.as_metric_label(),
+                        "Refused ReportMeshSliceStatus: JWT audience does not match local mesh purpose"
+                    );
+                }
+                return Err(status);
+            }
+        };
+
+        let report = request.into_inner();
+        let error_message = if report.error_message.trim().is_empty() {
+            None
+        } else {
+            Some(report.error_message.as_str())
+        };
+        self.drift
+            .record_status(
+                &identity.subject,
+                &report.version,
+                error_message,
+                Utc::now(),
+            )
+            .map_err(|err| match err {
+                MeshSliceDriftAdmitError::UnknownNode => {
+                    Status::failed_precondition(err.as_status_message())
+                }
+                MeshSliceDriftAdmitError::EmptyVersion
+                | MeshSliceDriftAdmitError::VersionTooLong
+                | MeshSliceDriftAdmitError::EmptyNodeId
+                | MeshSliceDriftAdmitError::EmptyNamespace => {
+                    Status::invalid_argument(format!(
+                        "{} (field={})",
+                        err.as_status_message(),
+                        err.field_name()
+                    ))
+                }
+                MeshSliceDriftAdmitError::CardinalityExceeded => {
+                    Status::resource_exhausted(err.as_status_message())
+                }
+            })?;
+
+        Ok(Response::new(MeshSliceStatusResponse {}))
     }
 }
 

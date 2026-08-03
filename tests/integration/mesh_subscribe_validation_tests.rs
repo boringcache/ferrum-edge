@@ -346,6 +346,15 @@ impl MeshConfigSync for ScriptedMeshCp {
         let stream: Self::MeshSubscribeStream = Box::pin(scripted.chain(held_open));
         Ok(Response::new(stream))
     }
+
+    async fn report_mesh_slice_status(
+        &self,
+        _request: Request<ferrum_edge::grpc::proto::MeshSliceStatusReport>,
+    ) -> Result<Response<ferrum_edge::grpc::proto::MeshSliceStatusResponse>, Status> {
+        Ok(Response::new(
+            ferrum_edge::grpc::proto::MeshSliceStatusResponse {},
+        ))
+    }
 }
 
 struct CpHandle {

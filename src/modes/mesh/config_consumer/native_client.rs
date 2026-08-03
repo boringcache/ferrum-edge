@@ -17,7 +17,7 @@ use super::update_validation::{
 use crate::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
-use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
+use crate::grpc::proto::{MeshConfigUpdate, MeshSliceStatusReport, MeshSubscribeRequest};
 use crate::modes::mesh::revision::MeshRevisionRejection;
 use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall};
 use crate::modes::mesh::slice::MeshSlice;
@@ -243,6 +243,9 @@ async fn connect_mesh_subscribe(
             Ok(req)
         })
         .max_decoding_message_size(MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE);
+    // Clone before subscribe so apply/reject can report ACK/NACK on the same
+    // authenticated channel without tearing down the stream (issue #3265).
+    let mut status_client = client.clone();
 
     info!(
         node_id = %config.node_id,
@@ -282,11 +285,38 @@ async fn connect_mesh_subscribe(
                     version = %slice.version,
                     "Applied native MeshSubscribe update"
                 );
+                let report = MeshSliceStatusReport {
+                    version: slice.version.clone(),
+                    error_message: String::new(),
+                };
+                if let Err(err) = status_client.report_mesh_slice_status(report).await {
+                    warn!(
+                        version = %slice.version,
+                        error = %err,
+                        "Failed to report mesh slice ACK to control plane"
+                    );
+                }
             }
             Ok(None) => {
                 tracing::debug!("Received native MeshSubscribe heartbeat");
             }
             Err(rejection) => {
+                // Best-effort NACK so the CP drift surface can show why this
+                // DP is not converging. Reporting must not mask the stream
+                // disposition below.
+                if !update.heartbeat && !update.version.trim().is_empty() {
+                    let report = MeshSliceStatusReport {
+                        version: update.version.clone(),
+                        error_message: rejection.reason_label().to_string(),
+                    };
+                    if let Err(err) = status_client.report_mesh_slice_status(report).await {
+                        warn!(
+                            version = %update.version,
+                            error = %err,
+                            "Failed to report mesh slice NACK to control plane"
+                        );
+                    }
+                }
                 // The rejection site already emitted the reason-labelled metric
                 // and the sanitized diagnostic; last-good state is untouched
                 // either way. A response that is not bound to this subscription

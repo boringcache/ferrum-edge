@@ -2055,7 +2055,10 @@ pub async fn run(
     // tokens with the same `iss` value and advertise the same namespace, or
     // the CP rejects them before streaming any config.
     let dp_registry = Arc::new(crate::grpc::cp_server::DpNodeRegistry::new());
-    let mesh_registry = Arc::new(crate::grpc::mesh_registry::MeshNodeRegistry::new());
+    let mesh_slice_drift = Arc::new(crate::grpc::mesh_slice_drift::MeshSliceDriftRegistry::new());
+    let mesh_registry = Arc::new(
+        crate::grpc::mesh_registry::MeshNodeRegistry::new().with_drift(mesh_slice_drift.clone()),
+    );
     let (grpc_server, update_tx) = CpGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
         .channel_capacity(env_config.cp_broadcast_channel_capacity)
         .registry(dp_registry.clone())
@@ -2070,6 +2073,7 @@ pub async fn run(
         MeshGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
             .channel_capacity(env_config.cp_broadcast_channel_capacity)
             .registry(mesh_registry.clone())
+            .drift(mesh_slice_drift.clone())
             .verifier(cp_dp_verifier.clone())
             .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
             .namespace(env_config.namespace.clone())
@@ -3504,6 +3508,7 @@ pub async fn run(
 
     let mesh_registry_reaper_handle = {
         let registry = mesh_registry.clone();
+        let drift = mesh_slice_drift.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(MESH_NODE_REGISTRY_REAPER_INTERVAL);
@@ -3512,14 +3517,27 @@ pub async fn run(
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        let now = chrono::Utc::now();
                         let removed = registry.remove_stale_heartbeats(
-                            chrono::Utc::now(),
+                            now,
                             mesh_node_registry_stale_ttl(),
                         );
                         if removed > 0 {
                             warn!(
                                 removed,
                                 "Removed stale mesh nodes after heartbeat timeout"
+                            );
+                        }
+                        let drift_removed = drift.reap_expired(
+                            now,
+                            chrono::Duration::seconds(
+                                crate::grpc::mesh_slice_drift::MESH_SLICE_DRIFT_RETENTION_SECONDS,
+                            ),
+                        );
+                        if drift_removed > 0 {
+                            warn!(
+                                removed = drift_removed,
+                                "Removed expired mesh slice-drift rows after retention timeout"
                             );
                         }
                     }

@@ -196,6 +196,7 @@ Where to look, and what to expect, when the mesh data plane misbehaves. All slic
 | Endpoint | Purpose | Diagnose |
 |---|---|---|
 | `GET /mesh/config-drift` (`?include_overlay=false`) | Per-DP "where is this DP vs the CP's last push" — `slice.last_received_at`, `version`, per-kind `resources` counts, `fingerprint`, `source_protocol`/`source_cp_url`, RTDS `runtime_overlay`, and (xDS mode) the `convergence` block (per-type versions, missing required types). | Stuck DP (stale `last_received_at`), split-brain (fingerprint divergence), cross-cluster endpoint discovery (workload/service resource counts), RTDS drift, wedged xDS warming (non-empty `convergence.missing_required_types`). |
+| `GET /mesh/slice-drift` (CP mode) | CP-side desired / sent / acknowledged / rejected slice versions per authenticated local MeshSubscribe identity (issue #3265). | Stuck/partitioned/rejecting DPs after a successful CP reconciliation; pair with each DP's `/mesh/config-drift`. |
 | `GET /mesh/federation` | Trust-bundle federation snapshot: per-trust-domain `bundle_age_seconds` + authority counts. | Stale / missing federated bundles for cross-cluster mTLS. |
 | `GET /mesh/remote-clusters` | Multicluster east-west discovery: `discovered` remote clusters (per-cluster workload/service counts + fetch age) and the `configured` remote clusters from the accepted slice (each with a `discovered` flag). | Which remote cluster is contributing endpoints; configured-but-unreachable clusters (`configured` present, `discovered: false`). |
 | `GET /mesh/runtime-overlay` | Live RTDS overlay (fault percentages, transformer gates, log level). | RTDS knob propagation. |
@@ -1499,7 +1500,17 @@ Operator playbook:
 - **Spot RTDS drift**: compare `runtime_overlay.keys` and `runtime_overlay.fingerprint` across DPs. Missing keys point to subscription or layer merge issues; matching keys with different fingerprints mean a same-key runtime value diverged.
 - **Spot a wedged xDS DP**: when `convergence.converged` is `false` with a non-empty `convergence.missing_required_types` on a starting DP, the first slice is blocked waiting on those types — cross-check `ferrum_xds_first_slice_nacks_total` for a malformed required resource (NACK loop) versus a CP that is simply not sending that type (no NACKs, type stays missing).
 
-A CP-side endpoint that reports what slice version the CP last published to each connected DP (so external tooling can diff "what the CP thinks each DP should have" against "what each DP reports here") is future work; this endpoint covers the DP-local half of the drift picture.
+A CP-side endpoint that reports what slice version the CP last published to each connected DP (so external tooling can diff "what the CP thinks each DP should have" against "what each DP reports here") is available as JWT-authenticated `GET /mesh/slice-drift` on the control plane (issue #3265). That surface tracks per-authenticated-DP **desired**, **sent**, **acknowledged**, and **rejected** version watermarks (with age and a bounded redacted NACK reason). Pair it with this DP-local endpoint: walk `/mesh/slice-drift` on the CP and `/mesh/config-drift` on each DP.
+
+### CP `GET /mesh/slice-drift` contract
+
+- **Mode**: control-plane only (`404` elsewhere). `200` with an empty `data_planes` list when no local mesh DP has subscribed yet.
+- **Identity**: JWT `sub` bound at `MeshSubscribe` time (`node_id` must equal `sub`). Remote-discovery subscriptions are not tracked. Do not trust caller-supplied display fields as identity.
+- **Watermarks**: `desired` / `sent` / `acknowledged` each carry `version`, `at`, and `age_seconds` (clamped ≥ 0). `rejected` adds a control-character-stripped, 64-character-bounded `reason`.
+- **Convergence**: `converged` | `drifted` | `rejecting` | `pending` | `disconnected`, plus boolean `drift.desired_vs_sent` / `desired_vs_acknowledged` / `sent_vs_acknowledged`.
+- **Lifecycle**: replacement sessions use `session_connected_at` generation guards; disconnect retains the row for 300s; registry hard-caps at 4096 identities (evicts oldest disconnected, otherwise refuses).
+- **ACK path**: DPs call `MeshConfigSync.ReportMeshSliceStatus` (local-mesh audience). Empty `error_message` = ACK; non-empty = NACK.
+- **Metrics**: closed-set `ferrum_mesh_slice_drift_data_planes{state=…}` and `ferrum_mesh_slice_drift_tracked_data_planes` only — never per-DP / per-version / per-reason labels.
 
 ## Authoritative Config Revisions And Stale-Fallback Rejection
 

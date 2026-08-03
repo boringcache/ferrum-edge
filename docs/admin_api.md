@@ -1282,6 +1282,16 @@ Field semantics:
 
 `services` are returned in slice order. The payload exposes service names, namespaces, ports, and workload counts, but no request bodies, credentials, or backend TLS material.
 
+## Mesh Slice Drift (CP mode)
+
+`GET /mesh/slice-drift` is JWT-authenticated and **control-plane only** (issue #3265). It reports per-authenticated mesh data plane desired / sent / acknowledged / rejected slice-version watermarks so operators can spot stuck, partitioned, or repeatedly rejecting DPs after a successful CP reconciliation.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/slice-drift
+```
+
+Returns `404` outside CP mode. Returns `200` with an empty `data_planes` list when CP mode is active but no local `MeshSubscribe` DP has connected yet. Pair with each DP's `GET /mesh/config-drift` for the DP-local applied fingerprint. See [docs/mesh.md](mesh.md#cp-get-meshslice-drift-contract) for field semantics, retention, and ACK/NACK wiring.
+
 ## Mesh Service Graph (mesh mode)
 
 `GET /mesh/service-graph` returns the live HTTP-family mesh service graph aggregated from the auto-injected `workload_metrics` plugin. It is JWT-authenticated and contains only identity, workload, protocol, and RED-counter metadata; request bodies, headers, and credentials are never stored.
