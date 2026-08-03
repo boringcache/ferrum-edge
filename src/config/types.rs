@@ -846,23 +846,26 @@ impl ResolvedPortOverride {
 /// [`ResolvedPortOverride`] shape carried on a referencing `Proxy`
 /// (`Proxy.dispatch_port_override_fallback`).
 ///
-/// Returns `None` when no inherited overlay exists or it resolves empty. Shared
-/// by config-build projection
-/// ([`GatewayConfig::resolve_dispatch_port_overrides`]) and the route-override
-/// path (`apply_route_overrides_inner` in `src/plugins/mod.rs`) so a route that
-/// swaps the destination upstream recomputes (or clears) the fallback exactly
-/// like `dispatch_port_overrides`, never leaking one upstream's overlay onto a
+/// Returns `None` when no inherited overlay exists or it resolves empty. This is
+/// the top-level tier only — callers that know the exact effective selected
+/// subset must use
+/// [`dispatch_port_override_fallback_for_selected_subset`] so subset HTTP fields
+/// overlay with the same precedence as
+/// [`GatewayConfig::resolve_dispatch_port_overrides`].
+///
+/// Shared by config-build projection and the route-override path
+/// (`apply_route_overrides_inner` in `src/plugins/mod.rs`) so a route that swaps
+/// the destination upstream recomputes (or clears) the fallback exactly like
+/// `dispatch_port_overrides`, never leaking one upstream's overlay onto a
 /// different destination.
 pub(crate) fn dispatch_port_override_fallback_from_upstream(
     upstream: &Upstream,
 ) -> Option<ResolvedPortOverride> {
-    // TOP-LEVEL `connectionPool.http` overlay ONLY. Proxy-specific subset
-    // inheritance is applied later by `resolve_dispatch_port_overrides`.
-    // An explicit per-port `portLevelSettings` still WINS via the dispatch-time
-    // per-port lookup in `resolve_effective_proxy_for_target`: discovered mesh
-    // targets carry their owning declared Service port in
-    // `UpstreamTarget.service_port_policy_key`, while ordinary targets key by
-    // their resolved dial port.
+    // TOP-LEVEL `connectionPool.http` overlay ONLY. An explicit per-port
+    // `portLevelSettings` still WINS via the dispatch-time per-port lookup in
+    // `resolve_effective_proxy_for_target`: discovered mesh targets carry their
+    // owning declared Service port in `UpstreamTarget.service_port_policy_key`,
+    // while ordinary targets key by their resolved dial port.
     // We deliberately do NOT fold the upstream's `port_overrides` into this fallback:
     // a multi-port upstream would cross-leak one port's `connectionPool.http` onto a
     // different port (codex r3). Immediate route-rebuild on a DR-only edit remains
@@ -872,6 +875,30 @@ pub(crate) fn dispatch_port_override_fallback_from_upstream(
         .dispatch_port_override_fallback
         .as_ref()
         .and_then(ResolvedPortOverride::from_upstream_override)
+}
+
+/// Build the inherited dispatch-policy fallback for one exact selected subset:
+/// top-level `connectionPool.http` first, then the selected subset's
+/// [`ResolvedSubsetTrafficPolicy`] overlay. Precedence matches
+/// [`GatewayConfig::resolve_dispatch_port_overrides`]: explicit per-port >
+/// selected subset > top-level. Does not mutate the shared upstream and never
+/// consults a sibling subset.
+pub(crate) fn dispatch_port_override_fallback_for_selected_subset(
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+) -> Option<ResolvedPortOverride> {
+    let mut inherited = dispatch_port_override_fallback_from_upstream(upstream);
+    let subset_policy = selected_subset.and_then(|subset| upstream.resolved_subset_tls.get(subset));
+    if let Some(subset_policy) = subset_policy
+        && (subset_policy.h2_upgrade_policy.is_some()
+            || subset_policy.max_retries.is_some()
+            || subset_policy.http1_max_pending_requests.is_some())
+    {
+        inherited
+            .get_or_insert_with(ResolvedPortOverride::default)
+            .overlay_subset_connection_pool_http(subset_policy);
+    }
+    inherited
 }
 
 /// A named subset of upstream targets identified by label selectors.
@@ -3146,11 +3173,12 @@ pub(crate) fn first_effective_mesh_transport_conflict_with_mesh(
         })
 }
 
-/// Project a single referenced upstream's per-port / top-level retry caps onto a
-/// throwaway proxy clone so the per-resource admission paths
+/// Project a single referenced upstream's per-port / top-level / selected-subset
+/// retry caps onto a throwaway proxy clone so the per-resource admission paths
 /// (`Proxy::after_validate`, API-spec import, batch import) model the same
 /// `cap_proxy_retry_for_target` cap the runtime applies before deciding whether
-/// retry disables HBONE/SVID-mTLS dispatch.
+/// retry disables HBONE/SVID-mTLS dispatch, and so backend-TLS-SNI / direct-H2
+/// admission sees the same effective `h2UpgradePolicy` the dispatch path does.
 ///
 /// `Proxy.dispatch_port_overrides` / `Proxy.dispatch_port_override_fallback` are
 /// `#[serde(skip)]` DR-derived projections that only
@@ -3159,8 +3187,14 @@ pub(crate) fn first_effective_mesh_transport_conflict_with_mesh(
 /// both fields `None`, so without this projection
 /// [`retry_is_effective_for_mesh_target`] cannot see a `maxRetries = 0` cap on the
 /// mesh port and would over-reject a config the runtime serves correctly. Mirrors
-/// the per-upstream projection in `resolve_dispatch_port_overrides`.
-pub(crate) fn proxy_with_resolved_port_caps(proxy: &Proxy, upstream: &Upstream) -> Proxy {
+/// the per-upstream projection in `resolve_dispatch_port_overrides`, including the
+/// exact effective selected subset (which may differ from `proxy.upstream_subset`
+/// on a route-override destination).
+pub(crate) fn proxy_with_resolved_port_caps(
+    proxy: &Proxy,
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+) -> Proxy {
     let mut resolved = proxy.clone();
     resolved.dispatch_port_overrides = if upstream.port_overrides.is_empty() {
         None
@@ -3175,8 +3209,250 @@ pub(crate) fn proxy_with_resolved_port_caps(proxy: &Proxy, upstream: &Upstream) 
         (!ports.is_empty()).then_some(ports)
     };
     resolved.dispatch_port_override_fallback =
-        dispatch_port_override_fallback_from_upstream(upstream);
+        dispatch_port_override_fallback_for_selected_subset(upstream, selected_subset);
     resolved
+}
+
+#[cfg(test)]
+mod subset_admission_projection_tests {
+    use super::*;
+
+    fn mesh_upstream_with_subsets() -> Upstream {
+        let mut upstream = Upstream {
+            id: "mesh-upstream".into(),
+            namespace: default_namespace(),
+            name: None,
+            targets: vec![
+                UpstreamTarget {
+                    host: "v1.local".into(),
+                    port: 8080,
+                    service_port_policy_key: None,
+                    weight: 100,
+                    tags: HashMap::from([
+                        ("version".to_string(), "v1".to_string()),
+                        ("mesh.hbone".to_string(), "true".to_string()),
+                    ]),
+                    locality: None,
+                    path: None,
+                },
+                UpstreamTarget {
+                    host: "v2.local".into(),
+                    port: 8080,
+                    service_port_policy_key: None,
+                    weight: 100,
+                    tags: HashMap::from([
+                        ("version".to_string(), "v2".to_string()),
+                        ("mesh.hbone".to_string(), "true".to_string()),
+                    ]),
+                    locality: None,
+                    path: None,
+                },
+            ],
+            algorithm: Default::default(),
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            subsets: Some(vec![
+                SubsetDefinition {
+                    name: "v1".into(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: None,
+                },
+                SubsetDefinition {
+                    name: "v2".into(),
+                    labels: HashMap::from([("version".to_string(), "v2".to_string())]),
+                    traffic_policy: None,
+                },
+            ]),
+            port_overrides: HashMap::new(),
+            source_locality: None,
+            locality_lb_strict: false,
+            locality_lb_setting: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            backend_tls_sni: None,
+            backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: Some(UpstreamPortOverride {
+                h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+                max_retries: Some(5),
+                http1_max_pending_requests: Some(90),
+                ..UpstreamPortOverride::default()
+            }),
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        upstream.resolved_subset_tls.insert(
+            "v1".into(),
+            ResolvedSubsetTrafficPolicy {
+                tls: None,
+                passive_health_check: None,
+                h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+                // Admin/admission may still see a projected zero from a prior
+                // generation or hand-built upstream; preserve positive DR
+                // validation elsewhere and only exercise the overlay here.
+                max_retries: Some(0),
+                http1_max_pending_requests: Some(1),
+            },
+        );
+        upstream.resolved_subset_tls.insert(
+            "v2".into(),
+            ResolvedSubsetTrafficPolicy {
+                tls: None,
+                passive_health_check: None,
+                h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+                max_retries: Some(3),
+                http1_max_pending_requests: Some(4),
+            },
+        );
+        upstream
+    }
+
+    fn bare_proxy(upstream_id: &str, subset: Option<&str>) -> Proxy {
+        Proxy {
+            id: "p1".into(),
+            namespace: default_namespace(),
+            name: None,
+            hosts: vec![],
+            listen_path: Some("/api".into()),
+            backend_scheme: Some(BackendScheme::Http),
+            dispatch_kind: DispatchKind::HttpPool,
+            backend_host: "127.0.0.1".into(),
+            backend_port: 8080,
+            backend_path: None,
+            strip_listen_path: true,
+            preserve_host_header: false,
+            backend_connect_timeout_ms: 5_000,
+            backend_read_timeout_ms: 30_000,
+            backend_write_timeout_ms: 30_000,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            resolved_tls: BackendTlsConfig::default(),
+            dispatch_port_overrides: None,
+            dispatch_port_override_fallback: None,
+            dns_override: None,
+            dns_cache_ttl_seconds: None,
+            auth_mode: AuthMode::Single,
+            plugins: vec![],
+            pool_idle_timeout_seconds: None,
+            pool_enable_http_keep_alive: None,
+            pool_enable_http2: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
+            pool_http2_initial_stream_window_size: None,
+            pool_http2_initial_connection_window_size: None,
+            pool_http2_adaptive_window: None,
+            pool_http2_max_frame_size: None,
+            pool_http2_max_concurrent_streams: None,
+            pool_http3_connections_per_backend: None,
+            h2_upgrade_policy: None,
+            pool_max_requests_per_connection: None,
+            pool_http1_max_pending_requests: None,
+            pool_tcp_keepalive_seconds: None,
+            upstream_id: Some(upstream_id.into()),
+            upstream_subset: subset.map(str::to_string),
+            api_spec_id: None,
+            circuit_breaker: None,
+            retry: Some(RetryConfig::default()),
+            response_body_mode: Default::default(),
+            listen_port: None,
+            frontend_tls: false,
+            passthrough: false,
+            udp_idle_timeout_seconds: 60,
+            tcp_idle_timeout_seconds: Some(300),
+            websocket_idle_timeout_seconds: None,
+            allowed_methods: None,
+            allowed_ws_origins: vec![],
+            udp_max_response_amplification_factor: None,
+            stream_proxy_protocol: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn selected_subset_admission_overlays_http_policy_like_runtime() {
+        let upstream = mesh_upstream_with_subsets();
+        let proxy = bare_proxy("mesh-upstream", Some("v1"));
+        let projected = proxy_with_resolved_port_caps(&proxy, &upstream, Some("v1"));
+        let fallback = projected
+            .dispatch_port_override_fallback
+            .as_ref()
+            .expect("selected subset must produce an inherited fallback");
+        assert_eq!(
+            fallback.h2_upgrade_policy,
+            Some(H2UpgradePolicy::DoNotUpgrade)
+        );
+        assert_eq!(fallback.max_retries, Some(0));
+        assert_eq!(fallback.http1_max_pending_requests, Some(1));
+        assert!(
+            !retry_is_effective_for_mesh_target(
+                &projected,
+                proxy.retry.as_ref(),
+                None,
+                &MeshTransportConflict {
+                    transport: "mesh.hbone",
+                    detail: "target 'v1.local:8080'".into(),
+                    port: Some(8080),
+                },
+            ),
+            "subset maxRetries=0 must disarm retry exactly as runtime projection does"
+        );
+    }
+
+    #[test]
+    fn route_override_selected_subset_does_not_leak_proxy_default_subset() {
+        let upstream = mesh_upstream_with_subsets();
+        let proxy = bare_proxy("mesh-upstream", Some("v1"));
+        // Override destinations whose upstream differs clear the subset; the
+        // helper must build top-level-only inheritance for that exact selection.
+        let projected = proxy_with_resolved_port_caps(&proxy, &upstream, None);
+        let fallback = projected
+            .dispatch_port_override_fallback
+            .as_ref()
+            .expect("top-level fallback");
+        assert_eq!(fallback.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
+        assert_eq!(fallback.max_retries, Some(5));
+        assert_eq!(fallback.http1_max_pending_requests, Some(90));
+        assert!(
+            retry_is_effective_for_mesh_target(
+                &projected,
+                proxy.retry.as_ref(),
+                None,
+                &MeshTransportConflict {
+                    transport: "mesh.hbone",
+                    detail: "target 'v2.local:8080'".into(),
+                    port: Some(8080),
+                },
+            ),
+            "cleared override subset must not inherit the proxy-default v1 zero-cap"
+        );
+    }
+
+    #[test]
+    fn sibling_subset_admission_does_not_receive_selected_subset_overlay() {
+        let upstream = mesh_upstream_with_subsets();
+        let proxy = bare_proxy("mesh-upstream", Some("v2"));
+        let projected = proxy_with_resolved_port_caps(&proxy, &upstream, Some("v2"));
+        let fallback = projected
+            .dispatch_port_override_fallback
+            .as_ref()
+            .expect("v2 fallback");
+        assert_eq!(fallback.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
+        assert_eq!(fallback.max_retries, Some(3));
+        assert_eq!(fallback.http1_max_pending_requests, Some(4));
+        assert_ne!(fallback.max_retries, Some(0));
+        assert_ne!(
+            fallback.h2_upgrade_policy,
+            Some(H2UpgradePolicy::DoNotUpgrade)
+        );
+    }
 }
 
 /// A mesh-transport requirement that conflicts with an effective retry policy.
@@ -3924,37 +4200,15 @@ impl GatewayConfig {
             .collect();
 
         // Inherited top-level `connectionPool.http` fallback. The three fields
-        // supported at subset scope are overlaid per proxy below, after its
-        // `upstream_subset` is known. The per-port map stays separate and is
-        // consulted first at dispatch, preserving port > subset > top-level.
-        let fallback_by_upstream: HashMap<(&str, &str), ResolvedPortOverride> = self
+        // supported at subset scope are overlaid per proxy via the shared
+        // selected-subset helper so admission and runtime stay aligned. The
+        // per-port map stays separate and is consulted first at dispatch,
+        // preserving port > subset > top-level.
+        let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
             .upstreams
             .iter()
-            .filter_map(|u| {
-                dispatch_port_override_fallback_from_upstream(u)
-                    .map(|resolved| ((u.namespace.as_str(), u.id.as_str()), resolved))
-            })
+            .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
             .collect();
-
-        let subset_policy_by_upstream: HashMap<(&str, &str, &str), &ResolvedSubsetTrafficPolicy> =
-            self.upstreams
-                .iter()
-                .flat_map(|upstream| {
-                    upstream
-                        .resolved_subset_tls
-                        .iter()
-                        .map(move |(name, policy)| {
-                            (
-                                (
-                                    upstream.namespace.as_str(),
-                                    upstream.id.as_str(),
-                                    name.as_str(),
-                                ),
-                                policy,
-                            )
-                        })
-                })
-                .collect();
 
         for proxy in &mut self.proxies {
             let key = proxy
@@ -3962,24 +4216,14 @@ impl GatewayConfig {
                 .as_deref()
                 .map(|uid| (proxy.namespace.as_str(), uid));
             proxy.dispatch_port_overrides = key.and_then(|key| by_upstream.get(&key)).cloned();
-            let mut inherited = key.and_then(|key| fallback_by_upstream.get(&key)).cloned();
-            let subset_policy = proxy.upstream_subset.as_deref().and_then(|subset| {
-                key.and_then(|(namespace, upstream_id)| {
-                    subset_policy_by_upstream
-                        .get(&(namespace, upstream_id, subset))
-                        .copied()
+            proxy.dispatch_port_override_fallback = key.and_then(|key| {
+                upstream_by_key.get(&key).and_then(|upstream| {
+                    dispatch_port_override_fallback_for_selected_subset(
+                        upstream,
+                        proxy.upstream_subset.as_deref(),
+                    )
                 })
             });
-            if let Some(subset_policy) = subset_policy
-                && (subset_policy.h2_upgrade_policy.is_some()
-                    || subset_policy.max_retries.is_some()
-                    || subset_policy.http1_max_pending_requests.is_some())
-            {
-                inherited
-                    .get_or_insert_with(ResolvedPortOverride::default)
-                    .overlay_subset_connection_pool_http(subset_policy);
-            }
-            proxy.dispatch_port_override_fallback = inherited;
         }
     }
 
@@ -4532,7 +4776,11 @@ impl GatewayConfig {
                         // upstream (`apply_route_overrides_inner`), so the per-port
                         // retry cap must come from that upstream, not the proxy's
                         // default-upstream-derived caps.
-                        &proxy_with_resolved_port_caps(proxy, upstream),
+                        &proxy_with_resolved_port_caps(
+                            proxy,
+                            upstream,
+                            override_dest.selected_subset.as_deref(),
+                        ),
                         upstream,
                         override_dest.selected_subset.as_deref(),
                         override_dest.effective_retry.as_ref(),

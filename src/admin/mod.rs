@@ -4764,7 +4764,11 @@ async fn validate_batch_route_override_conflicts(
             if let Some(upstream) = resolved
                 && let Some(conflict) =
                     crate::config::types::first_effective_mesh_transport_conflict_with_mesh(
-                        &crate::config::types::proxy_with_resolved_port_caps(proxy, &upstream),
+                        &crate::config::types::proxy_with_resolved_port_caps(
+                            proxy,
+                            &upstream,
+                            selected_subset,
+                        ),
                         &upstream,
                         selected_subset,
                         effective_retry.as_ref(),
@@ -6703,8 +6707,12 @@ async fn handle_batch_create(
                         // `#[serde(skip)]` `dispatch_port_overrides` resolved;
                         // derive them from the referenced upstream so a
                         // `maxRetries = 0` mesh-port cap is honored as the runtime
-                        // applies it.
-                        &crate::config::types::proxy_with_resolved_port_caps(proxy, &upstream),
+                        // applies it, including the exact selected subset overlay.
+                        &crate::config::types::proxy_with_resolved_port_caps(
+                            proxy,
+                            &upstream,
+                            proxy.upstream_subset.as_deref(),
+                        ),
                         &upstream,
                         proxy.upstream_subset.as_deref(),
                         proxy.retry.as_ref(),

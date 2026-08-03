@@ -2751,7 +2751,7 @@ async fn evaluate_mesh_route_dispatch_rules_for_proxy(
                 // destination upstream, so derive the temporary proxy's port caps
                 // from it before checking effectiveness.
                 if let Some(conflict) = first_effective_mesh_transport_conflict_with_mesh(
-                    &proxy_with_resolved_port_caps(proxy, &upstream),
+                    &proxy_with_resolved_port_caps(proxy, &upstream, selected_subset),
                     &upstream,
                     selected_subset,
                     effective_retry.as_ref(),
@@ -3263,7 +3263,11 @@ impl AdminResource for Upstream {
                     // `dispatch_port_overrides`, so derive its per-port retry caps
                     // from the edited upstream definition (`resource`).
                     if let Some(conflict) = first_effective_mesh_transport_conflict_with_mesh(
-                        &proxy_with_resolved_port_caps(&proxy, resource),
+                        &proxy_with_resolved_port_caps(
+                            &proxy,
+                            resource,
+                            proxy.upstream_subset.as_deref(),
+                        ),
                         resource,
                         proxy.upstream_subset.as_deref(),
                         proxy.retry.as_ref(),
@@ -3280,7 +3284,11 @@ impl AdminResource for Upstream {
                     // Reverse write order for issue #2954: adding SNI onto an
                     // upstream that a retry / buffering / http2-disabled proxy
                     // already targets must fail closed at admission.
-                    let mut admission_proxy = proxy_with_resolved_port_caps(&proxy, resource);
+                    let mut admission_proxy = proxy_with_resolved_port_caps(
+                        &proxy,
+                        resource,
+                        proxy.upstream_subset.as_deref(),
+                    );
                     admission_proxy.resolved_tls =
                         crate::config::types::BackendTlsConfig::from_upstream(resource);
                     if let Some(subset_name) = proxy.upstream_subset.as_deref()
@@ -3320,7 +3328,11 @@ impl AdminResource for Upstream {
                         continue;
                     }
                     if let Some(conflict) = first_effective_mesh_transport_conflict_with_mesh(
-                        &proxy_with_resolved_port_caps(&proxy, resource),
+                        &proxy_with_resolved_port_caps(
+                            &proxy,
+                            resource,
+                            override_dest.selected_subset.as_deref(),
+                        ),
                         resource,
                         override_dest.selected_subset.as_deref(),
                         override_dest.effective_retry.as_ref(),
@@ -4381,7 +4393,11 @@ impl AdminResource for Proxy {
                     // them from the referenced upstream first (the full-config path
                     // gets them via `resolve_dispatch_port_overrides`).
                     if let Some(conflict) = first_effective_mesh_transport_conflict_with_mesh(
-                        &proxy_with_resolved_port_caps(resource, &upstream),
+                        &proxy_with_resolved_port_caps(
+                            resource,
+                            &upstream,
+                            resource.upstream_subset.as_deref(),
+                        ),
                         &upstream,
                         resource.upstream_subset.as_deref(),
                         resource.retry.as_ref(),
@@ -4400,7 +4416,11 @@ impl AdminResource for Proxy {
                     // Plain-HTTPS SNI overrides require direct-H2. Reject retry /
                     // body-buffering / pool_enable_http2=false combinations at
                     // admission (issue #2954), matching full-config validate.
-                    let mut admission_proxy = proxy_with_resolved_port_caps(resource, &upstream);
+                    let mut admission_proxy = proxy_with_resolved_port_caps(
+                        resource,
+                        &upstream,
+                        resource.upstream_subset.as_deref(),
+                    );
                     admission_proxy.resolved_tls =
                         crate::config::types::BackendTlsConfig::from_upstream(&upstream);
                     if let Some(subset_name) = resource.upstream_subset.as_deref()
@@ -4450,7 +4470,11 @@ impl AdminResource for Proxy {
             match db.get_upstream(namespace, &override_dest.upstream_id).await {
                 Ok(Some(upstream)) => {
                     if let Some(conflict) = first_effective_mesh_transport_conflict_with_mesh(
-                        &proxy_with_resolved_port_caps(resource, &upstream),
+                        &proxy_with_resolved_port_caps(
+                            resource,
+                            &upstream,
+                            override_dest.selected_subset.as_deref(),
+                        ),
                         &upstream,
                         override_dest.selected_subset.as_deref(),
                         override_dest.effective_retry.as_ref(),

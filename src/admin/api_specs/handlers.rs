@@ -2024,7 +2024,11 @@ async fn validate_bundle(
                 // the runtime applies it.
                 if let Some(conflict) =
                     crate::config::types::first_effective_mesh_transport_conflict_with_mesh(
-                        &crate::config::types::proxy_with_resolved_port_caps(proxy, &upstream),
+                        &crate::config::types::proxy_with_resolved_port_caps(
+                            proxy,
+                            &upstream,
+                            proxy.upstream_subset.as_deref(),
+                        ),
                         &upstream,
                         proxy.upstream_subset.as_deref(),
                         proxy.retry.as_ref(),
@@ -2429,7 +2433,11 @@ async fn validate_bundle_route_override_conflicts(
             if let Some(upstream) = resolved
                 && let Some(conflict) =
                     crate::config::types::first_effective_mesh_transport_conflict_with_mesh(
-                        &crate::config::types::proxy_with_resolved_port_caps(proxy, &upstream),
+                        &crate::config::types::proxy_with_resolved_port_caps(
+                            proxy,
+                            &upstream,
+                            selected_subset,
+                        ),
                         &upstream,
                         selected_subset,
                         effective_retry.as_ref(),
