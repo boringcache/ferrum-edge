@@ -563,10 +563,7 @@ fn desired_tracks_projected_content_for_connected_and_retained_disconnected_rows
         .unwrap();
 
     let related = projected_config(1, vec![service("api-v2", "ferrum")]);
-    assert_eq!(
-        registry.reconcile_desired(&related, at(1)),
-        Ok(1)
-    );
+    assert_eq!(registry.reconcile_desired(&related, at(1)), Ok(1));
     assert_eq!(
         registry.snapshot().data_planes[0]
             .desired
@@ -598,23 +595,14 @@ fn desired_tracks_projected_content_for_connected_and_retained_disconnected_rows
         "disconnect closes the publish-before-drop race from current config"
     );
     let no_op = projected_config(2, vec![service("api-v2", "ferrum")]);
-    assert_eq!(
-        registry.reconcile_desired(&no_op, at(2)),
-        Ok(0)
-    );
+    assert_eq!(registry.reconcile_desired(&no_op, at(2)), Ok(0));
     let unrelated = projected_config(
         3,
         vec![service("api-v2", "ferrum"), service("other", "other")],
     );
-    assert_eq!(
-        registry.reconcile_desired(&unrelated, at(3)),
-        Ok(0)
-    );
+    assert_eq!(registry.reconcile_desired(&unrelated, at(3)), Ok(0));
     let next_related = projected_config(4, vec![service("api-v3", "ferrum")]);
-    assert_eq!(
-        registry.reconcile_desired(&next_related, at(4)),
-        Ok(1)
-    );
+    assert_eq!(registry.reconcile_desired(&next_related, at(4)), Ok(1));
     let entry = &registry.snapshot().data_planes[0];
     assert_eq!(
         entry.desired.as_ref().unwrap().version,
