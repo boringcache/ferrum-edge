@@ -17195,7 +17195,10 @@ extensionProviders:
 
         for field in ["h2UpgradePolicy", "maxRetries", "http1MaxPendingRequests"] {
             assert!(
-                !result.warnings.iter().any(|warning| warning.contains(field)),
+                !result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(field)),
                 "applied subset field {field} must not emit a deferral warning: {:?}",
                 result.warnings
             );

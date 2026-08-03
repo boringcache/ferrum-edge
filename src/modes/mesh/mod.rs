@@ -7066,10 +7066,7 @@ fn apply_destination_rules(
                     }
                     for port in &upstream_policy_ports {
                         let override_slot = upstream.port_overrides.entry(*port).or_default();
-                        apply_non_subset_connection_pool_http_to_port_override(
-                            override_slot,
-                            http,
-                        );
+                        apply_non_subset_connection_pool_http_to_port_override(override_slot, http);
                     }
                 }
             }
@@ -7466,8 +7463,7 @@ fn resolve_subset_traffic_policy(
             let passive = tp.and_then(|tp| tp.passive_health_check.clone());
             let h2_upgrade_policy = tp.and_then(|tp| tp.h2_upgrade_policy);
             let max_retries = tp.and_then(|tp| tp.max_retries);
-            let http1_max_pending_requests =
-                tp.and_then(|tp| tp.http1_max_pending_requests);
+            let http1_max_pending_requests = tp.and_then(|tp| tp.http1_max_pending_requests);
             if let Some(resolved) = ResolvedSubsetTrafficPolicy::new(
                 resolved_tls,
                 passive,

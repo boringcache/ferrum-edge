@@ -1048,7 +1048,10 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
             .expect("inherited HTTP policy")
     }
     let stable = inherited(&initial, "reviews-stable");
-    assert_eq!(stable.h2_upgrade_policy, Some(H2UpgradePolicy::DoNotUpgrade));
+    assert_eq!(
+        stable.h2_upgrade_policy,
+        Some(H2UpgradePolicy::DoNotUpgrade)
+    );
     assert_eq!(stable.max_retries, Some(2));
     assert_eq!(stable.http1_max_pending_requests, Some(1));
 

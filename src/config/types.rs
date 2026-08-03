@@ -828,10 +828,7 @@ impl ResolvedPortOverride {
     /// Explicit per-port values are kept separately in
     /// `Proxy.dispatch_port_overrides` and are merged ahead of this fallback at
     /// dispatch, so the resulting precedence is port > subset > top-level.
-    pub fn overlay_subset_connection_pool_http(
-        &mut self,
-        subset: &ResolvedSubsetTrafficPolicy,
-    ) {
+    pub fn overlay_subset_connection_pool_http(&mut self, subset: &ResolvedSubsetTrafficPolicy) {
         if let Some(policy) = subset.h2_upgrade_policy {
             self.h2_upgrade_policy = Some(policy);
         }
@@ -3943,16 +3940,19 @@ impl GatewayConfig {
             self.upstreams
                 .iter()
                 .flat_map(|upstream| {
-                    upstream.resolved_subset_tls.iter().map(move |(name, policy)| {
-                        (
+                    upstream
+                        .resolved_subset_tls
+                        .iter()
+                        .map(move |(name, policy)| {
                             (
-                                upstream.namespace.as_str(),
-                                upstream.id.as_str(),
-                                name.as_str(),
-                            ),
-                            policy,
-                        )
-                    })
+                                (
+                                    upstream.namespace.as_str(),
+                                    upstream.id.as_str(),
+                                    name.as_str(),
+                                ),
+                                policy,
+                            )
+                        })
                 })
                 .collect();
 

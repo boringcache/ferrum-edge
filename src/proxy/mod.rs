@@ -51160,11 +51160,10 @@ mod tests {
         // not a retry-policy enabler).
         let mut inner = (*proxy_with_max_retries_override(None)).clone();
         inner.upstream_subset = Some("stable".to_string());
-        inner.dispatch_port_override_fallback =
-            Some(crate::config::types::ResolvedPortOverride {
-                max_retries: Some(3),
-                ..Default::default()
-            });
+        inner.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            max_retries: Some(3),
+            ..Default::default()
+        });
         let proxy = Arc::new(inner);
         assert!(proxy.retry.is_none());
         let target = target_for_test(8080);
@@ -51456,6 +51455,7 @@ mod tests {
 
     #[test]
     fn resolve_effective_proxy_reapplies_selected_subset_http_policy_after_rotation() {
+        use crate::config::types::H2UpgradePolicy;
         let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
         proxy.upstream_subset = Some("stable".to_string());
         proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
@@ -51477,10 +51477,7 @@ mod tests {
                 "the selected subset's H1 cap follows every rotated target"
             );
             assert_eq!(
-                resolve_backend_http1_max_pending_requests(
-                    &proxy,
-                    target.dispatch_policy_port()
-                ),
+                resolve_backend_http1_max_pending_requests(&proxy, target.dispatch_policy_port()),
                 Some(3)
             );
         }

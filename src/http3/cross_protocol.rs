@@ -1311,15 +1311,12 @@ where
             .filter(|_| {
                 crate::proxy::reqwest_dispatch_is_http1_only(state, dispatch_proxy, current_target)
             });
-    match state
-        .backend_pending_limit
-        .try_acquire_for_subset(
-            effective_host,
-            dispatch_port,
-            dispatch_proxy.upstream_subset.as_deref(),
-            pending_cap,
-        )
-    {
+    match state.backend_pending_limit.try_acquire_for_subset(
+        effective_host,
+        dispatch_port,
+        dispatch_proxy.upstream_subset.as_deref(),
+        pending_cap,
+    ) {
         Ok(slot) => Ok(Ok(slot)),
         Err(limit) => {
             warn!(
