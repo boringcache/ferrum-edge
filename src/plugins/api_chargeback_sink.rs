@@ -8208,9 +8208,7 @@ impl DeadLetterPayloadWriter {
         // protected files leave no room, the temp is dropped and the source is
         // restored for a later/operator-assisted attempt.
         spool.evict_until_can_admit(0)?;
-        if let Err(error) = (spool.fs_ops.rename)(&self.temp_path, &self.final_path) {
-            return Err(error);
-        }
+        (spool.fs_ops.rename)(&self.temp_path, &self.final_path)?;
         (spool.fs_ops.after_rename)(&self.final_path);
         #[cfg(unix)]
         {
@@ -8703,8 +8701,7 @@ impl StreamingSpoolReader {
             // by the decoder before it can allocate past this charged amount.
             let window_bytes = usize::try_from(decoded_limit)
                 .unwrap_or(usize::MAX)
-                .max(1 << 10)
-                .min(SPOOL_ZSTD_WINDOW_MAX_BYTES)
+                .clamp(1 << 10, SPOOL_ZSTD_WINDOW_MAX_BYTES)
                 .next_power_of_two();
             let window_log = usize::BITS - window_bytes.leading_zeros() - 1;
             (decoded_limit, window_bytes, window_log)
@@ -9001,69 +8998,21 @@ fn open_spool_file_no_follow(path: &Path) -> Result<File, String> {
     })
 }
 
-/// One decoded spool artifact plus its line index, both charged to the
-/// retained-byte ceiling for exactly as long as they are held.
+/// One decoded spool artifact retained by the decode-only external test helper.
 ///
-/// Rows are never copied out of `text`: chunking, 413 splits, and retries all
-/// address lines by `(start, end)` byte range into the single decoded buffer.
-/// A 256 MiB artifact therefore produces one decoded representation, not one
-/// per worklist level.
+/// Production replay uses [`StreamingSpoolReader`] and never materializes this
+/// artifact-wide representation.
 struct ReservedSpoolArtifact {
     text: String,
-    lines: Vec<(usize, usize)>,
     /// Charge on the decoded buffer. Reserved before the file is read, shrunk
     /// to the buffer's real allocation, released on drop.
     _text_reservation: ProcessByteReservation,
-    /// Charge on the line index. Reserved before the index is allocated.
-    _index_reservation: ProcessByteReservation,
 }
 
 impl ReservedSpoolArtifact {
-    fn line_count(&self) -> usize {
-        self.lines.len()
-    }
-
-    /// Borrow one indexed line. Never panics: an out-of-range or non-boundary
-    /// index is a fixed-label error rather than a slice panic.
-    fn line(&self, index: usize) -> Result<&str, String> {
-        let (start, end) = *self.lines.get(index).ok_or_else(|| {
-            format!("{PLUGIN_NAME}: spool replay line index {index} is out of range")
-        })?;
-        self.text.get(start..end).ok_or_else(|| {
-            format!("{PLUGIN_NAME}: spool replay line index {index} is not a character boundary")
-        })
-    }
-
     #[allow(dead_code)] // used by the external decode test helper
     fn into_text(self) -> String {
         self.text
-    }
-}
-
-/// Visit every non-empty JSONEachRow line of `text` as a `(start, end)` byte
-/// range, matching `str::lines` framing (`\n` separated, trailing `\r`
-/// stripped) without allocating a single row copy.
-fn for_each_spool_line(text: &str, mut visit: impl FnMut(usize, usize)) {
-    let bytes = text.as_bytes();
-    let mut start = 0usize;
-    while let Some(rest) = bytes.get(start..) {
-        let separator = match rest.iter().position(|byte| *byte == b'\n') {
-            Some(offset) => start.saturating_add(offset),
-            None => bytes.len(),
-        };
-        let mut end = separator;
-        if end > start && bytes.get(end.saturating_sub(1)) == Some(&b'\r') {
-            end -= 1;
-        }
-        if let Some(line) = text.get(start..end)
-            && !line.trim().is_empty()
-        {
-            visit(start, end);
-        }
-        if separator >= bytes.len() {
-            break;
-        }
-        start = separator.saturating_add(1);
     }
 }
 
@@ -9150,33 +9099,9 @@ fn decode_spool_artifact(
     // allocation, so `capacity` is the true retained size.
     text_reservation.shrink_to(text.capacity());
 
-    let mut line_count = 0usize;
-    for_each_spool_line(&text, |_, _| line_count = line_count.saturating_add(1));
-    let index_bytes = line_count
-        .checked_mul(SPOOL_INDEX_ENTRY_BYTES)
-        .ok_or_else(|| {
-            SpoolDecodeError::Unreadable(format!(
-                "{PLUGIN_NAME}: spool file '{}' line index byte bound overflowed",
-                path.display()
-            ))
-        })?;
-    let index_reservation = ceiling.try_acquire(index_bytes).ok_or_else(|| {
-        SpoolDecodeError::CeilingExhausted(format!(
-            "{PLUGIN_NAME}: spool replay deferred for '{}': {}",
-            path.display(),
-            PayloadMaterializationError::CeilingExhausted.reason()
-        ))
-    })?;
-    // `with_capacity` plus exactly `line_count` pushes never grows past the
-    // reserved allocation.
-    let mut lines: Vec<(usize, usize)> = Vec::with_capacity(line_count);
-    for_each_spool_line(&text, |start, end| lines.push((start, end)));
-
     Ok(ReservedSpoolArtifact {
         text,
-        lines,
         _text_reservation: text_reservation,
-        _index_reservation: index_reservation,
     })
 }
 
