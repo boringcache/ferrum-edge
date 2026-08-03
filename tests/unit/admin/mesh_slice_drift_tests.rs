@@ -361,7 +361,7 @@ fn projected_digest_recursively_canonicalizes_nested_maps() {
     registry.mark_disconnected("dp-a", &token, at(0));
 
     assert_eq!(
-        registry.reconcile_disconnected_desired(&reordered_config, at(1)),
+        registry.reconcile_desired(&reordered_config, at(1)),
         Ok(0),
         "content-equal reordered maps must not advance desired"
     );
@@ -374,7 +374,7 @@ fn projected_digest_recursively_canonicalizes_nested_maps() {
         first_slice.version
     );
     assert_eq!(
-        registry.reconcile_disconnected_desired(&changed_config, at(2)),
+        registry.reconcile_desired(&changed_config, at(2)),
         Ok(1),
         "semantic changes must advance desired"
     );
@@ -564,8 +564,8 @@ fn desired_tracks_projected_content_for_connected_and_retained_disconnected_rows
 
     let related = projected_config(1, vec![service("api-v2", "ferrum")]);
     assert_eq!(
-        registry.reconcile_disconnected_desired(&related, at(1)),
-        Ok(0)
+        registry.reconcile_desired(&related, at(1)),
+        Ok(1)
     );
     assert_eq!(
         registry.snapshot().data_planes[0]
@@ -573,9 +573,16 @@ fn desired_tracks_projected_content_for_connected_and_retained_disconnected_rows
             .as_ref()
             .unwrap()
             .version,
-        initial_slice.version,
-        "connected rows advance only when their stream emits the projection"
+        related.loaded_at.to_rfc3339(),
+        "publication advances desired even when a connected stream is backpressured"
     );
+    let connected = &registry.snapshot().data_planes[0];
+    assert_eq!(
+        connected.sent.as_ref().unwrap().version,
+        initial_slice.version
+    );
+    assert_eq!(connected.convergence, MeshSliceConvergenceState::Drifted);
+    assert!(connected.drift.desired_vs_sent);
 
     let current_config = ArcSwap::from_pointee(related.clone());
     registry
@@ -592,7 +599,7 @@ fn desired_tracks_projected_content_for_connected_and_retained_disconnected_rows
     );
     let no_op = projected_config(2, vec![service("api-v2", "ferrum")]);
     assert_eq!(
-        registry.reconcile_disconnected_desired(&no_op, at(2)),
+        registry.reconcile_desired(&no_op, at(2)),
         Ok(0)
     );
     let unrelated = projected_config(
@@ -600,12 +607,12 @@ fn desired_tracks_projected_content_for_connected_and_retained_disconnected_rows
         vec![service("api-v2", "ferrum"), service("other", "other")],
     );
     assert_eq!(
-        registry.reconcile_disconnected_desired(&unrelated, at(3)),
+        registry.reconcile_desired(&unrelated, at(3)),
         Ok(0)
     );
     let next_related = projected_config(4, vec![service("api-v3", "ferrum")]);
     assert_eq!(
-        registry.reconcile_disconnected_desired(&next_related, at(4)),
+        registry.reconcile_desired(&next_related, at(4)),
         Ok(1)
     );
     let entry = &registry.snapshot().data_planes[0];

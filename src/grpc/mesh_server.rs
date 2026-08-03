@@ -550,11 +550,11 @@ impl MeshGrpcServer {
         registry: &MeshNodeRegistry,
     ) {
         if let Some(drift) = registry.drift()
-            && let Err(error) = drift.reconcile_disconnected_desired(config.as_ref(), Utc::now())
+            && let Err(error) = drift.reconcile_desired(config.as_ref(), Utc::now())
         {
             warn!(
                 field = error.field_name(),
-                "Failed to reconcile disconnected mesh slice desired state"
+                "Failed to reconcile mesh slice desired state"
             );
         }
         let _ = tx.send(MeshConfigBroadcast::Full(config));
@@ -569,11 +569,11 @@ impl MeshGrpcServer {
         registry: &MeshNodeRegistry,
     ) {
         if let Some(drift) = registry.drift()
-            && let Err(error) = drift.reconcile_disconnected_desired(config.as_ref(), Utc::now())
+            && let Err(error) = drift.reconcile_desired(config.as_ref(), Utc::now())
         {
             warn!(
                 field = error.field_name(),
-                "Failed to reconcile disconnected mesh slice desired state"
+                "Failed to reconcile mesh slice desired state"
             );
         }
         let _ = tx.send(MeshConfigBroadcast::Delta {

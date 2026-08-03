@@ -70,7 +70,7 @@ pub const MESH_SLICE_DRIFT_REJECTION_REASON: &str = "reported_rejection";
 const _: () = assert!(MESH_SLICE_DRIFT_REJECTION_REASON.len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
 const _: () = assert!("unspecified".len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
 
-/// Bound the subscription selector retained for disconnected projection.
+/// Bound the retained subscription selector used for publication-time projection.
 const MESH_SLICE_DRIFT_MAX_PROJECTION_LABELS: usize = 256;
 const MESH_SLICE_DRIFT_MAX_PROJECTION_NAMESPACES: usize = 256;
 const MESH_SLICE_DRIFT_MAX_PROJECTION_BYTES: usize = 64 * 1024;
@@ -199,9 +199,9 @@ struct LiveEntry {
     rejected_reason: Option<String>,
     /// Opaque, per-stream generation. Never published or logged.
     session_token: String,
-    /// Retained only so disconnected rows can compare their actual projected
-    /// slice on a later CP publication. The content digest excludes the
-    /// observability-only version and ordering revision.
+    /// Retained so every row can compare its actual projected slice at CP
+    /// publication time, independently of stream polling. The content digest
+    /// excludes the observability-only version and ordering revision.
     projection: Option<ProjectionContext>,
     desired_content_digest: Option<[u8; 32]>,
 }
@@ -444,8 +444,9 @@ impl MeshSliceDriftRegistry {
     }
 
     /// Record the actual projected slice sent on the matching opaque session.
-    /// Desired and sent advance atomically from the same slice so publication
-    /// can never expose a synthetic global desired version.
+    /// Desired advances independently at publication time, before the stream
+    /// is polled, so a connected subscriber stalled by gRPC backpressure still
+    /// exposes desired-vs-sent drift instead of appearing converged forever.
     pub fn record_projected_sent(
         &self,
         node_id: &str,
@@ -453,8 +454,7 @@ impl MeshSliceDriftRegistry {
         slice: &MeshSlice,
         at: DateTime<Utc>,
     ) -> Result<(), MeshSliceDriftAdmitError> {
-        let digest = slice_content_digest(slice)?;
-        self.record_sent_inner(node_id, session_token, &slice.version, Some(digest), at)
+        self.record_sent_inner(node_id, session_token, &slice.version, at)
     }
 
     /// Record a sent version for focused registry tests/callers that do not
@@ -468,7 +468,7 @@ impl MeshSliceDriftRegistry {
         version: &str,
         at: DateTime<Utc>,
     ) -> Result<(), MeshSliceDriftAdmitError> {
-        self.record_sent_inner(node_id, session_token, version, None, at)
+        self.record_sent_inner(node_id, session_token, version, at)
     }
 
     fn record_sent_inner(
@@ -476,7 +476,6 @@ impl MeshSliceDriftRegistry {
         node_id: &str,
         session_token: &str,
         version: &str,
-        digest: Option<[u8; 32]>,
         at: DateTime<Utc>,
     ) -> Result<(), MeshSliceDriftAdmitError> {
         validate_version(version)?;
@@ -486,13 +485,8 @@ impl MeshSliceDriftRegistry {
             .get_mut(node_id)
             .ok_or(MeshSliceDriftAdmitError::UnknownNode)?;
         validate_live_session(entry, session_token)?;
-        entry.desired_version = Some(version.to_string());
-        entry.desired_at = Some(at);
         entry.sent_version = Some(version.to_string());
         entry.sent_at = Some(at);
-        if let Some(digest) = digest {
-            entry.desired_content_digest = Some(digest);
-        }
         if entry.rejected_version.as_deref() == Some(version) {
             entry.rejected_version = None;
             entry.rejected_at = None;
@@ -502,11 +496,13 @@ impl MeshSliceDriftRegistry {
         Ok(())
     }
 
-    /// Recompute only retained-disconnected projections from the actual
-    /// published config. A version-only/no-op reload or unrelated namespace
-    /// mutation leaves desired untouched because the content digest ignores
-    /// `MeshSlice.version` and `revision`, matching `MeshSlice::content_eq`.
-    pub fn reconcile_disconnected_desired(
+    /// Recompute every retained projection from the actual published config.
+    /// This runs before broadcast delivery so desired remains authoritative
+    /// even when a connected stream is not being polled. A version-only/no-op
+    /// reload or unrelated namespace mutation leaves desired untouched because
+    /// the content digest ignores `MeshSlice.version` and `revision`, matching
+    /// `MeshSlice::content_eq`.
+    pub fn reconcile_desired(
         &self,
         config: &GatewayConfig,
         at: DateTime<Utc>,
@@ -514,9 +510,6 @@ impl MeshSliceDriftRegistry {
         let mut state = self.lock_state()?;
         let mut changed = 0usize;
         for entry in state.entries.values_mut() {
-            if entry.connected {
-                continue;
-            }
             if reconcile_entry_desired(entry, config, at)? {
                 changed += 1;
             }
