@@ -94,6 +94,54 @@ fn workload_entry(namespace: &str, service_host: &str, address: &str) -> K8sObje
     )
 }
 
+fn ready_service_pod(namespace: &str) -> K8sObject {
+    let mut pod = object(
+        "v1",
+        "Pod",
+        "reviews-v1",
+        namespace,
+        json!({
+            "serviceAccountName": "reviews",
+            "nodeName": "node-a",
+            "containers": [{
+                "ports": [{"name": "http", "containerPort": 9080, "protocol": "TCP"}]
+            }]
+        }),
+    );
+    pod.metadata
+        .labels
+        .insert("app".to_string(), "reviews".to_string());
+    pod.status = json!({
+        "phase": "Running",
+        "podIP": "10.1.0.10",
+        "conditions": [{"type": "Ready", "status": "True"}]
+    });
+    pod
+}
+
+fn service_endpoint_slice(namespace: &str) -> K8sObject {
+    let mut slice = object(
+        "discovery.k8s.io/v1",
+        "EndpointSlice",
+        "reviews-abc",
+        namespace,
+        json!({
+            "addressType": "IPv4",
+            "endpoints": [{
+                "addresses": ["10.1.0.10"],
+                "targetRef": {"kind": "Pod", "name": "reviews-v1", "namespace": namespace},
+                "conditions": {"ready": true}
+            }],
+            "ports": [{"name": "http", "port": 9080}]
+        }),
+    );
+    slice.metadata.labels.insert(
+        "kubernetes.io/service-name".to_string(),
+        "reviews".to_string(),
+    );
+    slice
+}
+
 #[test]
 fn same_namespace_workload_entry_still_attaches_without_reference_grant() {
     let result = translate_k8s_objects(
@@ -400,6 +448,41 @@ fn watcher_ordering_workload_entry_before_grant_then_succeeds() {
         .find(|workload| workload.addresses.iter().any(|a| a == "10.9.0.5"))
         .expect("workload");
     assert_eq!(workload.service_namespace.as_deref(), Some("prod"));
+}
+
+#[test]
+fn full_inventory_order_cannot_widen_explicit_cross_namespace_membership() {
+    // Informer snapshots have no kind ordering. Put the WorkloadEntry before
+    // both admission dependencies and include a selectable Pod/EndpointSlice:
+    // the accepted explicit attachment must still suppress auto-derived Pod
+    // membership for the target Service.
+    let result = translate_k8s_objects(
+        &[
+            workload_entry("vms", "reviews.prod.svc.cluster.local", "10.9.0.5"),
+            ready_service_pod("prod"),
+            service_endpoint_slice("prod"),
+            reference_grant("vms", "prod", "reviews"),
+            service("reviews", "prod"),
+        ],
+        options(),
+    )
+    .expect("complete shuffled inventory must attach deterministically");
+
+    let mesh = result.config.mesh.expect("mesh");
+    let service = mesh
+        .services
+        .iter()
+        .find(|service| service.namespace == "prod" && service.name == "reviews")
+        .expect("target service");
+    assert_eq!(
+        service.workloads.len(),
+        1,
+        "explicit WorkloadEntry ownership must not widen to the selectable Pod"
+    );
+    assert_eq!(
+        service.workloads[0].spiffe_id.as_str(),
+        "spiffe://cluster.local/ns/vms/sa/reviews-vm"
+    );
 }
 
 #[test]

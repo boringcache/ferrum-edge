@@ -961,12 +961,24 @@ where
             core::collect(&mut acc, object)?;
         } else if mesh_config::is_istio_mesh_config_map(&acc.options, object) {
             mesh_config::collect(&mut acc, object)?;
-        } else if acc.options.pod_discovery_enabled && object.kind == "WorkloadEntry" {
-            collect_explicit_workload_service(&mut acc, object);
         } else if acc.options.pod_discovery_enabled && object.kind == "ServiceEntry" {
             collect_explicit_service_entry_keys(&mut acc, object);
         } else if acc.options.pod_discovery_enabled && core::is_core_resource_kind(&object.kind) {
             core::collect(&mut acc, object)?;
+        }
+    }
+
+    // WorkloadEntry cross-namespace attachment admission depends on the full
+    // ReferenceGrant and Service indexes. Collect explicit-service ownership in
+    // a separate pass so informer/list order cannot make pod auto-discovery
+    // widen an otherwise identical accepted inventory.
+    if acc.options.pod_discovery_enabled {
+        for object in &included_objects {
+            if object.kind == "WorkloadEntry"
+                && includes_object_namespace(&acc.options, object)
+            {
+                collect_explicit_workload_service(&mut acc, object);
+            }
         }
     }
 
