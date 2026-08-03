@@ -6989,9 +6989,7 @@ async fn test_gemini_2xx_content_type_lifecycle_fail_closed() {
 #[tokio::test]
 async fn test_gemini_malformed_candidate_fields_fail_closed() {
     // Present-but-malformed index must not fall back to positional index.
-    let bad_index = concat!(
-        "data: {\"candidates\":[{\"index\":\"0\",\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}\n\n",
-    );
+    let bad_index = "data: {\"candidates\":[{\"index\":\"0\",\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}\n\n";
     let out = run_gemini_normalizer(4096, bad_index, "text/event-stream").await;
     assert!(out.contains("upstream_error"), "{out}");
     assert!(out.contains("malformed index"), "{out}");
@@ -6999,27 +6997,21 @@ async fn test_gemini_malformed_candidate_fields_fail_closed() {
     assert!(!out.contains("\"index\":\"0\""), "{out}");
 
     // Present-but-malformed finishReason must not be treated as absent.
-    let bad_finish = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":1}]}\n\n",
-    );
+    let bad_finish = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":1}]}\n\n";
     let out = run_gemini_normalizer(4096, bad_finish, "text/event-stream").await;
     assert!(out.contains("upstream_error"), "{out}");
     assert!(out.contains("malformed finishReason"), "{out}");
     assert!(!out.contains("\"finish_reason\""), "{out}");
 
     // Present-but-non-string role must not be treated as absent/model.
-    let bad_role = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":1,\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}\n\n",
-    );
+    let bad_role = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":1,\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}\n\n";
     let out = run_gemini_normalizer(4096, bad_role, "text/event-stream").await;
     assert!(out.contains("upstream_error"), "{out}");
     assert!(out.contains("content role that was not model"), "{out}");
     assert!(!out.contains("\"content\":\"x\""), "{out}");
 
     // Representable text plus additional unrepresentable fields must fail closed.
-    let extra_fields = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"keep\",\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"QUJD\"}}]},\"finishReason\":\"STOP\"}]}\n\n",
-    );
+    let extra_fields = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"keep\",\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"QUJD\"}}]},\"finishReason\":\"STOP\"}]}\n\n";
     let out = run_gemini_normalizer(4096, extra_fields, "text/event-stream").await;
     assert!(out.contains("upstream_error"), "{out}");
     assert!(out.contains("unrepresentable additional fields"), "{out}");
@@ -7031,18 +7023,14 @@ async fn test_gemini_malformed_candidate_fields_fail_closed() {
     assert!(!out.contains("QUJD"), "{out}");
 
     // Missing index still uses the documented positional fallback.
-    let missing_index = concat!(
-        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"fallback\"}]},\"finishReason\":\"STOP\"}]}\n\n",
-    );
+    let missing_index = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"fallback\"}]},\"finishReason\":\"STOP\"}]}\n\n";
     let out = run_gemini_normalizer(4096, missing_index, "text/event-stream").await;
     assert!(out.contains("\"content\":\"fallback\""), "{out}");
     assert!(out.contains("\"index\":0"), "{out}");
     assert!(!out.contains("upstream_error"), "{out}");
 
     // Empty-object metadata-only exception remains accepted.
-    let empty_meta = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{},{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n",
-    );
+    let empty_meta = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{},{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n";
     let out = run_gemini_normalizer(4096, empty_meta, "text/event-stream").await;
     assert!(out.contains("\"content\":\"ok\""), "{out}");
     assert!(!out.contains("upstream_error"), "{out}");
@@ -7081,16 +7069,14 @@ async fn test_gemini_json_array_stream_normalized() {
 
 #[tokio::test]
 async fn test_gemini_multi_candidate_and_safety_block() {
-    let multi = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"A\"}]},\"finishReason\":\"STOP\"},{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"B\"}]},\"finishReason\":\"STOP\"}]}\n\n",
-    );
+    let multi = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"A\"}]},\"finishReason\":\"STOP\"},{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"B\"}]},\"finishReason\":\"STOP\"}]}\n\n";
     let out = run_gemini_normalizer(4096, multi, "text/event-stream").await;
     assert!(out.contains("\"index\":0"), "{out}");
     assert!(out.contains("\"index\":1"), "{out}");
     assert!(out.contains("\"content\":\"A\""), "{out}");
     assert!(out.contains("\"content\":\"B\""), "{out}");
 
-    let blocked = concat!("data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n",);
+    let blocked = "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n";
     let blocked_out = run_gemini_normalizer(4096, blocked, "text/event-stream").await;
     assert!(
         blocked_out.contains("\"finish_reason\":\"content_filter\""),
@@ -7163,9 +7149,7 @@ async fn test_gemini_post_finish_candidate_data_fails_closed() {
 #[tokio::test]
 async fn test_gemini_unrepresentable_parts_and_duplicate_indexes_fail_closed() {
     // Empty-object parts are the sole metadata-only exception.
-    let empty_ok = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{},{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n",
-    );
+    let empty_ok = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{},{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n";
     let empty_out = run_gemini_normalizer(4096, empty_ok, "text/event-stream").await;
     assert!(empty_out.contains("\"content\":\"ok\""), "{empty_out}");
     assert!(
@@ -7237,9 +7221,7 @@ async fn test_gemini_unrepresentable_parts_and_duplicate_indexes_fail_closed() {
 
 #[tokio::test]
 async fn test_gemini_function_call_and_tool_choice_none_fail_closed() {
-    let tools = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"x\"}}}]},\"finishReason\":\"STOP\"}]}\n\n",
-    );
+    let tools = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"x\"}}}]},\"finishReason\":\"STOP\"}]}\n\n";
     let out = run_gemini_normalizer(4096, tools, "text/event-stream").await;
     assert!(out.contains("\"tool_calls\""), "{out}");
     assert!(out.contains("\"name\":\"lookup\""), "{out}");
@@ -7289,9 +7271,7 @@ async fn test_gemini_provider_error_and_premature_eof_fail_closed() {
         out.len()
     );
 
-    let partial = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
-    );
+    let partial = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"partial\"}]}}]}\n\n";
     let partial_out = run_gemini_normalizer(4096, partial, "text/event-stream").await;
     assert!(partial_out.contains("upstream_error"), "{partial_out}");
     assert!(
@@ -7591,9 +7571,7 @@ async fn test_gemini_multi_event_tool_calls_get_distinct_ids_and_indexes() {
 #[tokio::test]
 async fn test_gemini_usage_metadata_fail_closed_and_valid_shapes() {
     // Non-object usageMetadata fails closed and never echoes the value.
-    let non_object = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":\"PROMPT_LEAK_sk-gemini-secret\"}\n\n",
-    );
+    let non_object = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":\"PROMPT_LEAK_sk-gemini-secret\"}\n\n";
     let non_object_out = run_gemini_normalizer(4096, non_object, "text/event-stream").await;
     assert!(
         non_object_out.contains("upstream_error"),
@@ -7614,9 +7592,7 @@ async fn test_gemini_usage_metadata_fail_closed_and_valid_shapes() {
 
     // Malformed preferred candidatesTokenCount must not fall back to a valid
     // completionTokenCount alternate, and must not echo the bad value.
-    let preferred_vs_alt = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":\"HOSTILE_FALLBACK_42\",\"completionTokenCount\":7,\"totalTokenCount\":10}}\n\n",
-    );
+    let preferred_vs_alt = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":\"HOSTILE_FALLBACK_42\",\"completionTokenCount\":7,\"totalTokenCount\":10}}\n\n";
     let preferred_out = run_gemini_normalizer(4096, preferred_vs_alt, "text/event-stream").await;
     assert!(preferred_out.contains("upstream_error"), "{preferred_out}");
     assert!(
@@ -7634,21 +7610,15 @@ async fn test_gemini_usage_metadata_fail_closed_and_valid_shapes() {
     // normalizer publishes checked prompt+completion totals).
     for (body, field) in [
         (
-            concat!(
-                "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":-1,\"candidatesTokenCount\":1,\"totalTokenCount\":0}}\n\n",
-            ),
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":-1,\"candidatesTokenCount\":1,\"totalTokenCount\":0}}\n\n",
             "promptTokenCount",
         ),
         (
-            concat!(
-                "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"completionTokenCount\":1.5,\"totalTokenCount\":2}}\n\n",
-            ),
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"completionTokenCount\":1.5,\"totalTokenCount\":2}}\n\n",
             "completionTokenCount",
         ),
         (
-            concat!(
-                "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":true}}\n\n",
-            ),
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":true}}\n\n",
             "totalTokenCount",
         ),
     ] {
@@ -7663,9 +7633,7 @@ async fn test_gemini_usage_metadata_fail_closed_and_valid_shapes() {
 
     // Valid usage still publishes OpenAI-shaped counts; omission still yields no
     // usage chunk; completionTokenCount alternate works when preferred is absent.
-    let valid = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":4,\"totalTokenCount\":15}}\n\n",
-    );
+    let valid = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":4,\"totalTokenCount\":15}}\n\n";
     let valid_out = run_gemini_normalizer(4096, valid, "text/event-stream").await;
     assert!(valid_out.contains("\"prompt_tokens\":11"), "{valid_out}");
     assert!(valid_out.contains("\"completion_tokens\":4"), "{valid_out}");
@@ -7675,9 +7643,7 @@ async fn test_gemini_usage_metadata_fail_closed_and_valid_shapes() {
         "{valid_out}"
     );
 
-    let omitted = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n",
-    );
+    let omitted = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n";
     let omitted_out = run_gemini_normalizer(4096, omitted, "text/event-stream").await;
     assert!(
         omitted_out.contains("\"finish_reason\":\"stop\""),
@@ -7688,9 +7654,7 @@ async fn test_gemini_usage_metadata_fail_closed_and_valid_shapes() {
         "omitted usageMetadata must not invent usage: {omitted_out}"
     );
 
-    let alternate_only = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"completionTokenCount\":9}}\n\n",
-    );
+    let alternate_only = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"completionTokenCount\":9}}\n\n";
     let alt_out = run_gemini_normalizer(4096, alternate_only, "text/event-stream").await;
     assert!(alt_out.contains("\"prompt_tokens\":2"), "{alt_out}");
     assert!(alt_out.contains("\"completion_tokens\":9"), "{alt_out}");
@@ -7700,9 +7664,7 @@ async fn test_gemini_usage_metadata_fail_closed_and_valid_shapes() {
 #[tokio::test]
 async fn test_provider_usage_u64_overflow_fails_closed_without_wrapped_total() {
     // Gemini path.
-    let gemini = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":18446744073709551615,\"candidatesTokenCount\":1,\"totalTokenCount\":0}}\n\n",
-    );
+    let gemini = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":18446744073709551615,\"candidatesTokenCount\":1,\"totalTokenCount\":0}}\n\n";
     let gemini_out = run_gemini_normalizer(4096, gemini, "text/event-stream").await;
     assert!(gemini_out.contains("upstream_error"), "{gemini_out}");
     assert!(
@@ -8249,9 +8211,7 @@ async fn test_gemini_finish_reasons_and_prompt_feedback_matrix() {
         assert!(out.trim_end().ends_with("data: [DONE]"), "{reason}: {out}");
     }
 
-    let unsupported = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"TOTALLY_NEW\"}]}\n\n",
-    );
+    let unsupported = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"TOTALLY_NEW\"}]}\n\n";
     let out = run_gemini_normalizer(4096, unsupported, "text/event-stream").await;
     assert!(out.contains("upstream_error"), "{out}");
     assert!(out.contains("unsupported Gemini finishReason"), "{out}");
@@ -8336,9 +8296,7 @@ async fn test_gemini_hostile_framing_identity_and_parts_fail_closed() {
     );
 
     // JSON value with escaped quotes still frames correctly.
-    let escaped = concat!(
-        "{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"say \\\"hi\\\"\"}]},\"finishReason\":\"STOP\"}]}",
-    );
+    let escaped = "{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"say \\\"hi\\\"\"}]},\"finishReason\":\"STOP\"}]}";
     let esc_out = run_gemini_normalizer(3, escaped, "application/json").await;
     assert!(
         esc_out.contains("say \\\"hi\\\"") || esc_out.contains("say \"hi\""),
@@ -8363,9 +8321,9 @@ async fn test_gemini_hostile_framing_identity_and_parts_fail_closed() {
         "B".repeat(300_000)
     );
     let deep_json = format!(
-        "data: {}{}\n\n",
+        "data: {}1{}\n\n",
         "{\"a\":".repeat(MAX_SSE_EVENT_JSON_DEPTH + 2),
-        format!("1{}", "}".repeat(MAX_SSE_EVENT_JSON_DEPTH + 2))
+        "}".repeat(MAX_SSE_EVENT_JSON_DEPTH + 2)
     );
     let hostile: [(&str, &str); 13] = [
         (
@@ -8433,8 +8391,7 @@ async fn test_gemini_hostile_framing_identity_and_parts_fail_closed() {
     }
 
     // Finish-only candidate (no content) remains valid.
-    let finish_only =
-        concat!("data: {\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n",);
+    let finish_only = "data: {\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n";
     let fo = run_gemini_normalizer(4096, finish_only, "text/event-stream").await;
     assert!(fo.contains("\"finish_reason\":\"stop\""), "{fo}");
     assert!(!fo.contains("upstream_error"), "{fo}");
