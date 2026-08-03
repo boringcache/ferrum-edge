@@ -27,7 +27,8 @@ use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_de
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, RetryConfig, Upstream,
     backend_tls_sni_direct_h2_conflict_messages, first_effective_mesh_transport_conflict_with_mesh,
-    mesh_transport_retry_conflict_message, proxy_retry_is_effective, proxy_with_resolved_port_caps,
+    mesh_transport_retry_conflict_message, proxy_for_sni_direct_h2_admission, proxy_retry_is_effective,
+    proxy_with_resolved_port_caps,
     validate_resource_id,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
@@ -2499,6 +2500,7 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
                     &proxy,
                     &override_rules,
                     mesh_model,
+                    &[],
                     &mut errors,
                 )
                 .await
@@ -2538,6 +2540,7 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
                             proxy,
                             &override_rules,
                             mesh_model,
+                            &[],
                             &mut errors,
                         )
                         .await
@@ -2658,6 +2661,7 @@ async fn validate_unshadowed_globals_for_plugin(
                 proxy,
                 &global_override_rules,
                 mesh_model,
+                &[],
                 &mut errors,
             )
             .await
@@ -2703,15 +2707,18 @@ async fn proxy_shadows_global_mesh_route_dispatch_excluding(
 
 /// Evaluate one proxy against a set of upstream-overriding `mesh_route_dispatch`
 /// rules, pushing a retry/mesh-transport conflict message for each override that
-/// would 502 at runtime. A rule conflicts when its EFFECTIVE retry (the rule's
-/// `retry` / `retry_disabled`, else the proxy's base `retry`) stays effective for
-/// the override upstream's mesh target after the proxy's per-port retry cap.
+/// would 502 at runtime, and screening each destination for backend-TLS-SNI /
+/// direct-H2 conflicts (including effective `h2UpgradePolicy: DO_NOT_UPGRADE`).
+/// A rule's mesh-transport check uses its EFFECTIVE retry (the rule's `retry` /
+/// `retry_disabled`, else the proxy's base `retry`) after the proxy's per-port
+/// retry cap.
 async fn evaluate_mesh_route_dispatch_rules_for_proxy(
     db: &dyn DatabaseBackend,
     namespace: &str,
     proxy: &Proxy,
     override_rules: &[&crate::plugins::mesh_route_dispatch::RouteRule],
     mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
+    plugin_configs: &[PluginConfig],
     errors: &mut Vec<String>,
 ) -> DbResult<()> {
     for rule in override_rules {
@@ -2722,11 +2729,13 @@ async fn evaluate_mesh_route_dispatch_rules_for_proxy(
         // untouched is covered by the proxy/upstream default-target checks. But a
         // same-upstream rule that adds or disables retry still has the runtime
         // overwrite `proxy.retry` via `route_override_retry` before dispatch, so
-        // it must be evaluated here too.
+        // it must be evaluated here too. SNI admission still runs for every
+        // distinct override destination (including same-upstream rules that only
+        // change retry), because DO_NOT_UPGRADE / buffering conflicts do not
+        // require an effective retry policy.
         let rule_changes_retry = rule.retry.is_some() || rule.retry_disabled;
-        if override_uid == proxy.upstream_id.as_deref().unwrap_or("") && !rule_changes_retry {
-            continue;
-        }
+        let same_upstream_untouched =
+            override_uid == proxy.upstream_id.as_deref().unwrap_or("") && !rule_changes_retry;
         let effective_retry = if rule.retry.is_some() {
             rule.retry.clone()
         } else if rule.retry_disabled {
@@ -2734,10 +2743,6 @@ async fn evaluate_mesh_route_dispatch_rules_for_proxy(
         } else {
             proxy.retry.clone()
         };
-        // Cheap pre-filter before the upstream fetch.
-        if !proxy_retry_is_effective(effective_retry.as_ref(), proxy.allowed_methods.as_deref()) {
-            continue;
-        }
         // Runtime preserves `proxy.upstream_subset` only for a same-upstream rule;
         // a different-upstream override drops it.
         let selected_subset = if override_uid == proxy.upstream_id.as_deref().unwrap_or("") {
@@ -2747,21 +2752,41 @@ async fn evaluate_mesh_route_dispatch_rules_for_proxy(
         };
         match db.get_upstream(namespace, override_uid).await {
             Ok(Some(upstream)) => {
-                // Runtime recomputes the per-port retry cap from the OVERRIDE
-                // destination upstream, so derive the temporary proxy's port caps
-                // from it before checking effectiveness.
-                if let Some(conflict) = first_effective_mesh_transport_conflict_with_mesh(
-                    &proxy_with_resolved_port_caps(proxy, &upstream, selected_subset),
-                    &upstream,
-                    selected_subset,
-                    effective_retry.as_ref(),
-                    proxy.allowed_methods.as_deref(),
-                    mesh_model,
-                ) {
-                    errors.push(mesh_transport_retry_conflict_message(
-                        &proxy.id,
-                        override_uid,
-                        &conflict,
+                if !same_upstream_untouched
+                    && proxy_retry_is_effective(
+                        effective_retry.as_ref(),
+                        proxy.allowed_methods.as_deref(),
+                    )
+                {
+                    // Runtime recomputes the per-port retry cap from the OVERRIDE
+                    // destination upstream, so derive the temporary proxy's port
+                    // caps from it before checking effectiveness.
+                    if let Some(conflict) = first_effective_mesh_transport_conflict_with_mesh(
+                        &proxy_with_resolved_port_caps(proxy, &upstream, selected_subset),
+                        &upstream,
+                        selected_subset,
+                        effective_retry.as_ref(),
+                        proxy.allowed_methods.as_deref(),
+                        mesh_model,
+                    ) {
+                        errors.push(mesh_transport_retry_conflict_message(
+                            &proxy.id,
+                            override_uid,
+                            &conflict,
+                        ));
+                    }
+                }
+                if !same_upstream_untouched {
+                    let admission_proxy = proxy_for_sni_direct_h2_admission(
+                        proxy,
+                        &upstream,
+                        selected_subset,
+                        effective_retry.clone(),
+                    );
+                    errors.extend(backend_tls_sni_direct_h2_conflict_messages(
+                        &admission_proxy,
+                        Some(&upstream),
+                        plugin_configs,
                     ));
                 }
             }
@@ -3282,25 +3307,14 @@ impl AdminResource for Upstream {
                     }
 
                     // Reverse write order for issue #2954: adding SNI onto an
-                    // upstream that a retry / buffering / http2-disabled proxy
-                    // already targets must fail closed at admission.
-                    let mut admission_proxy = proxy_with_resolved_port_caps(
+                    // upstream that a retry / buffering / http2-disabled /
+                    // DO_NOT_UPGRADE proxy already targets must fail closed at
+                    // admission.
+                    let admission_proxy = proxy_for_sni_direct_h2_admission(
                         &proxy,
                         resource,
                         proxy.upstream_subset.as_deref(),
-                    );
-                    admission_proxy.resolved_tls =
-                        crate::config::types::BackendTlsConfig::from_upstream(resource);
-                    if let Some(subset_name) = proxy.upstream_subset.as_deref()
-                        && let Some(subset_tls) = resource
-                            .resolved_subset_tls
-                            .get(subset_name)
-                            .and_then(|resolved| resolved.tls.clone())
-                    {
-                        admission_proxy.resolved_tls = subset_tls;
-                    }
-                    admission_proxy.dispatch_kind = crate::config::types::DispatchKind::from(
-                        admission_proxy.effective_scheme(),
+                        proxy.retry.clone(),
                     );
                     let empty_plugins: &[PluginConfig] = &[];
                     let plugin_configs = cached_config
@@ -3345,6 +3359,25 @@ impl AdminResource for Upstream {
                             &conflict,
                         ));
                     }
+                    // Same reverse-write SNI gate for route-override destinations:
+                    // adding SNI onto an upstream a DO_NOT_UPGRADE / retry /
+                    // buffering override already targets must fail closed.
+                    let admission_proxy = proxy_for_sni_direct_h2_admission(
+                        &proxy,
+                        resource,
+                        override_dest.selected_subset.as_deref(),
+                        override_dest.effective_retry.clone(),
+                    );
+                    let empty_plugins: &[PluginConfig] = &[];
+                    let plugin_configs = cached_config
+                        .as_ref()
+                        .map(|config| config.plugin_configs.as_slice())
+                        .unwrap_or(empty_plugins);
+                    errors.extend(backend_tls_sni_direct_h2_conflict_messages(
+                        &admission_proxy,
+                        Some(resource),
+                        plugin_configs,
+                    ));
                 }
             }
 
@@ -4414,25 +4447,14 @@ impl AdminResource for Proxy {
                     }
 
                     // Plain-HTTPS SNI overrides require direct-H2. Reject retry /
-                    // body-buffering / pool_enable_http2=false combinations at
-                    // admission (issue #2954), matching full-config validate.
-                    let mut admission_proxy = proxy_with_resolved_port_caps(
+                    // body-buffering / pool_enable_http2=false / DO_NOT_UPGRADE
+                    // combinations at admission (issue #2954), matching full-config
+                    // validate.
+                    let admission_proxy = proxy_for_sni_direct_h2_admission(
                         resource,
                         &upstream,
                         resource.upstream_subset.as_deref(),
-                    );
-                    admission_proxy.resolved_tls =
-                        crate::config::types::BackendTlsConfig::from_upstream(&upstream);
-                    if let Some(subset_name) = resource.upstream_subset.as_deref()
-                        && let Some(subset_tls) = upstream
-                            .resolved_subset_tls
-                            .get(subset_name)
-                            .and_then(|resolved| resolved.tls.clone())
-                    {
-                        admission_proxy.resolved_tls = subset_tls;
-                    }
-                    admission_proxy.dispatch_kind = crate::config::types::DispatchKind::from(
-                        admission_proxy.effective_scheme(),
+                        resource.retry.clone(),
                     );
                     let empty_plugins: &[PluginConfig] = &[];
                     let plugin_configs = cached_config
@@ -4462,7 +4484,9 @@ impl AdminResource for Proxy {
         // global) can route matched traffic to a different upstream than
         // `proxy.upstream_id`. Reject when the override destination requires a
         // mesh transport AND the rule's EFFECTIVE retry (after per-port caps)
-        // stays on, mirroring the full-config check.
+        // stays on, mirroring the full-config check. Also reject when that
+        // destination's backend TLS SNI cannot use direct-H2 under the
+        // effective h2UpgradePolicy / retry / buffering posture.
         for override_dest in mesh_route_dispatch_override_destinations(db, namespace, resource)
             .await
             .map_err(AfterValidateError::Db)?
@@ -4488,6 +4512,25 @@ impl AdminResource for Proxy {
                                 &conflict,
                             ),
                         ]));
+                    }
+                    let admission_proxy = proxy_for_sni_direct_h2_admission(
+                        resource,
+                        &upstream,
+                        override_dest.selected_subset.as_deref(),
+                        override_dest.effective_retry.clone(),
+                    );
+                    let empty_plugins: &[PluginConfig] = &[];
+                    let plugin_configs = cached_config
+                        .as_ref()
+                        .map(|config| config.plugin_configs.as_slice())
+                        .unwrap_or(empty_plugins);
+                    let sni_errors = backend_tls_sni_direct_h2_conflict_messages(
+                        &admission_proxy,
+                        Some(&upstream),
+                        plugin_configs,
+                    );
+                    if !sni_errors.is_empty() {
+                        return Err(AfterValidateError::BadRequest(sni_errors));
                     }
                 }
                 // Missing / cross-namespace override upstreams are reported

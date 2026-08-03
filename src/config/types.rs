@@ -3213,248 +3213,6 @@ pub(crate) fn proxy_with_resolved_port_caps(
     resolved
 }
 
-#[cfg(test)]
-mod subset_admission_projection_tests {
-    use super::*;
-
-    fn mesh_upstream_with_subsets() -> Upstream {
-        let mut upstream = Upstream {
-            id: "mesh-upstream".into(),
-            namespace: default_namespace(),
-            name: None,
-            targets: vec![
-                UpstreamTarget {
-                    host: "v1.local".into(),
-                    port: 8080,
-                    service_port_policy_key: None,
-                    weight: 100,
-                    tags: HashMap::from([
-                        ("version".to_string(), "v1".to_string()),
-                        ("mesh.hbone".to_string(), "true".to_string()),
-                    ]),
-                    locality: None,
-                    path: None,
-                },
-                UpstreamTarget {
-                    host: "v2.local".into(),
-                    port: 8080,
-                    service_port_policy_key: None,
-                    weight: 100,
-                    tags: HashMap::from([
-                        ("version".to_string(), "v2".to_string()),
-                        ("mesh.hbone".to_string(), "true".to_string()),
-                    ]),
-                    locality: None,
-                    path: None,
-                },
-            ],
-            algorithm: Default::default(),
-            hash_on: None,
-            hash_on_cookie_config: None,
-            health_checks: None,
-            service_discovery: None,
-            subsets: Some(vec![
-                SubsetDefinition {
-                    name: "v1".into(),
-                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
-                    traffic_policy: None,
-                },
-                SubsetDefinition {
-                    name: "v2".into(),
-                    labels: HashMap::from([("version".to_string(), "v2".to_string())]),
-                    traffic_policy: None,
-                },
-            ]),
-            port_overrides: HashMap::new(),
-            source_locality: None,
-            locality_lb_strict: false,
-            locality_lb_setting: None,
-            backend_tls_client_cert_path: None,
-            backend_tls_client_key_path: None,
-            backend_tls_verify_server_cert: true,
-            backend_tls_server_ca_cert_path: None,
-            backend_tls_sni: None,
-            backend_tls_san_allow_list: Vec::new(),
-            resolved_subset_tls: HashMap::new(),
-            dispatch_port_override_fallback: Some(UpstreamPortOverride {
-                h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
-                max_retries: Some(5),
-                http1_max_pending_requests: Some(90),
-                ..UpstreamPortOverride::default()
-            }),
-            api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-        upstream.resolved_subset_tls.insert(
-            "v1".into(),
-            ResolvedSubsetTrafficPolicy {
-                tls: None,
-                passive_health_check: None,
-                h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
-                // Admin/admission may still see a projected zero from a prior
-                // generation or hand-built upstream; preserve positive DR
-                // validation elsewhere and only exercise the overlay here.
-                max_retries: Some(0),
-                http1_max_pending_requests: Some(1),
-            },
-        );
-        upstream.resolved_subset_tls.insert(
-            "v2".into(),
-            ResolvedSubsetTrafficPolicy {
-                tls: None,
-                passive_health_check: None,
-                h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
-                max_retries: Some(3),
-                http1_max_pending_requests: Some(4),
-            },
-        );
-        upstream
-    }
-
-    fn bare_proxy(upstream_id: &str, subset: Option<&str>) -> Proxy {
-        Proxy {
-            id: "p1".into(),
-            namespace: default_namespace(),
-            name: None,
-            hosts: vec![],
-            listen_path: Some("/api".into()),
-            backend_scheme: Some(BackendScheme::Http),
-            dispatch_kind: DispatchKind::HttpPool,
-            backend_host: "127.0.0.1".into(),
-            backend_port: 8080,
-            backend_path: None,
-            strip_listen_path: true,
-            preserve_host_header: false,
-            backend_connect_timeout_ms: 5_000,
-            backend_read_timeout_ms: 30_000,
-            backend_write_timeout_ms: 30_000,
-            backend_tls_client_cert_path: None,
-            backend_tls_client_key_path: None,
-            backend_tls_verify_server_cert: true,
-            backend_tls_server_ca_cert_path: None,
-            resolved_tls: BackendTlsConfig::default(),
-            dispatch_port_overrides: None,
-            dispatch_port_override_fallback: None,
-            dns_override: None,
-            dns_cache_ttl_seconds: None,
-            auth_mode: AuthMode::Single,
-            plugins: vec![],
-            pool_idle_timeout_seconds: None,
-            pool_enable_http_keep_alive: None,
-            pool_enable_http2: None,
-            pool_http2_keep_alive_interval_seconds: None,
-            pool_http2_keep_alive_timeout_seconds: None,
-            pool_http2_initial_stream_window_size: None,
-            pool_http2_initial_connection_window_size: None,
-            pool_http2_adaptive_window: None,
-            pool_http2_max_frame_size: None,
-            pool_http2_max_concurrent_streams: None,
-            pool_http3_connections_per_backend: None,
-            h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
-            pool_http1_max_pending_requests: None,
-            pool_tcp_keepalive_seconds: None,
-            upstream_id: Some(upstream_id.into()),
-            upstream_subset: subset.map(str::to_string),
-            api_spec_id: None,
-            circuit_breaker: None,
-            retry: Some(RetryConfig::default()),
-            response_body_mode: Default::default(),
-            listen_port: None,
-            frontend_tls: false,
-            passthrough: false,
-            udp_idle_timeout_seconds: 60,
-            tcp_idle_timeout_seconds: Some(300),
-            websocket_idle_timeout_seconds: None,
-            allowed_methods: None,
-            allowed_ws_origins: vec![],
-            udp_max_response_amplification_factor: None,
-            stream_proxy_protocol: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }
-    }
-
-    #[test]
-    fn selected_subset_admission_overlays_http_policy_like_runtime() {
-        let upstream = mesh_upstream_with_subsets();
-        let proxy = bare_proxy("mesh-upstream", Some("v1"));
-        let projected = proxy_with_resolved_port_caps(&proxy, &upstream, Some("v1"));
-        let fallback = projected
-            .dispatch_port_override_fallback
-            .as_ref()
-            .expect("selected subset must produce an inherited fallback");
-        assert_eq!(
-            fallback.h2_upgrade_policy,
-            Some(H2UpgradePolicy::DoNotUpgrade)
-        );
-        assert_eq!(fallback.max_retries, Some(0));
-        assert_eq!(fallback.http1_max_pending_requests, Some(1));
-        assert!(
-            !retry_is_effective_for_mesh_target(
-                &projected,
-                proxy.retry.as_ref(),
-                None,
-                &MeshTransportConflict {
-                    transport: "mesh.hbone",
-                    detail: "target 'v1.local:8080'".into(),
-                    port: Some(8080),
-                },
-            ),
-            "subset maxRetries=0 must disarm retry exactly as runtime projection does"
-        );
-    }
-
-    #[test]
-    fn route_override_selected_subset_does_not_leak_proxy_default_subset() {
-        let upstream = mesh_upstream_with_subsets();
-        let proxy = bare_proxy("mesh-upstream", Some("v1"));
-        // Override destinations whose upstream differs clear the subset; the
-        // helper must build top-level-only inheritance for that exact selection.
-        let projected = proxy_with_resolved_port_caps(&proxy, &upstream, None);
-        let fallback = projected
-            .dispatch_port_override_fallback
-            .as_ref()
-            .expect("top-level fallback");
-        assert_eq!(fallback.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
-        assert_eq!(fallback.max_retries, Some(5));
-        assert_eq!(fallback.http1_max_pending_requests, Some(90));
-        assert!(
-            retry_is_effective_for_mesh_target(
-                &projected,
-                proxy.retry.as_ref(),
-                None,
-                &MeshTransportConflict {
-                    transport: "mesh.hbone",
-                    detail: "target 'v2.local:8080'".into(),
-                    port: Some(8080),
-                },
-            ),
-            "cleared override subset must not inherit the proxy-default v1 zero-cap"
-        );
-    }
-
-    #[test]
-    fn sibling_subset_admission_does_not_receive_selected_subset_overlay() {
-        let upstream = mesh_upstream_with_subsets();
-        let proxy = bare_proxy("mesh-upstream", Some("v2"));
-        let projected = proxy_with_resolved_port_caps(&proxy, &upstream, Some("v2"));
-        let fallback = projected
-            .dispatch_port_override_fallback
-            .as_ref()
-            .expect("v2 fallback");
-        assert_eq!(fallback.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
-        assert_eq!(fallback.max_retries, Some(3));
-        assert_eq!(fallback.http1_max_pending_requests, Some(4));
-        assert_ne!(fallback.max_retries, Some(0));
-        assert_ne!(
-            fallback.h2_upgrade_policy,
-            Some(H2UpgradePolicy::DoNotUpgrade)
-        );
-    }
-}
-
 /// A mesh-transport requirement that conflicts with an effective retry policy.
 pub(crate) struct MeshTransportConflict {
     /// The conflicting transport tag (`"mesh.hbone"` / `"mesh.mtls"`).
@@ -3579,14 +3337,26 @@ fn screen_plugin_config_for_sni_buffering(
     }
 }
 
+/// Whether a backend TLS SNI override applies proxy-wide or only on one
+/// DestinationRule policy port.
+#[derive(Debug, Clone, Copy)]
+enum SniPolicyScope {
+    ProxyWide,
+    Port(u16),
+}
+
 /// Source description for a backend TLS SNI override that forces direct-H2.
 fn proxy_plain_https_sni_sources<'a>(
     proxy: &'a Proxy,
     upstream: Option<&'a Upstream>,
-) -> Vec<(&'a str, String)> {
+) -> Vec<(&'a str, String, SniPolicyScope)> {
     let mut sources = Vec::new();
     if let Some(sni) = proxy.resolved_tls.sni.as_deref() {
-        sources.push((sni, "resolved backend TLS SNI".to_string()));
+        sources.push((
+            sni,
+            "resolved backend TLS SNI".to_string(),
+            SniPolicyScope::ProxyWide,
+        ));
     }
     if let Some(overrides) = proxy.dispatch_port_overrides.as_ref() {
         for (port, ovr) in overrides {
@@ -3594,6 +3364,7 @@ fn proxy_plain_https_sni_sources<'a>(
                 sources.push((
                     sni,
                     format!("DestinationRule per-port TLS SNI on port {port}"),
+                    SniPolicyScope::Port(*port),
                 ));
             }
         }
@@ -3605,22 +3376,148 @@ fn proxy_plain_https_sni_sources<'a>(
                 sources.push((
                     sni,
                     format!("DestinationRule per-port TLS SNI on port {port}"),
+                    SniPolicyScope::Port(*port),
                 ));
             }
         }
         if let Some(sni) = upstream.backend_tls_sni.as_deref()
             && proxy.resolved_tls.sni.is_none()
         {
-            sources.push((sni, "upstream backend_tls_sni".to_string()));
+            sources.push((
+                sni,
+                "upstream backend_tls_sni".to_string(),
+                SniPolicyScope::ProxyWide,
+            ));
         }
     }
     sources
 }
 
+/// Effective `h2UpgradePolicy` for one policy port, mirroring
+/// [`crate::proxy::resolve_effective_proxy_for_target`] field precedence:
+/// explicit per-port (including `DEFAULT` clearing an inherited value) >
+/// selected-subset/top-level fallback > `Proxy.h2_upgrade_policy`.
+fn effective_h2_upgrade_policy_for_sni(
+    proxy: &Proxy,
+    upstream: Option<&Upstream>,
+    port: Option<u16>,
+) -> Option<H2UpgradePolicy> {
+    let per_port = port.and_then(|policy_port| {
+        proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&policy_port))
+            .and_then(|ovr| ovr.h2_upgrade_policy)
+            .or_else(|| {
+                upstream
+                    .and_then(|u| u.port_overrides.get(&policy_port))
+                    .and_then(|ovr| ovr.h2_upgrade_policy)
+            })
+    });
+    let inherited = proxy
+        .dispatch_port_override_fallback
+        .as_ref()
+        .and_then(|fallback| fallback.h2_upgrade_policy)
+        .or(proxy.h2_upgrade_policy);
+    per_port.or(inherited)
+}
+
+/// Policy ports a proxy-wide backend TLS SNI override can dial through.
+/// Prefer concrete upstream targets so a more-specific per-port
+/// `UPGRADE`/`DEFAULT` clearing an inherited `DO_NOT_UPGRADE` does not
+/// false-reject when no selectable target still inherits force-H1.
+fn policy_ports_for_proxy_wide_sni(proxy: &Proxy, upstream: Option<&Upstream>) -> Vec<u16> {
+    if let Some(upstream) = upstream
+        && !upstream.targets.is_empty()
+    {
+        let mut ports: Vec<u16> = upstream
+            .targets
+            .iter()
+            .map(UpstreamTarget::dispatch_policy_port)
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        return ports;
+    }
+    let mut ports = Vec::new();
+    if let Some(overrides) = proxy.dispatch_port_overrides.as_ref() {
+        ports.extend(overrides.keys().copied());
+    } else if let Some(upstream) = upstream {
+        ports.extend(upstream.port_overrides.keys().copied());
+    }
+    if ports.is_empty() {
+        ports.push(proxy.backend_port);
+    } else {
+        ports.sort_unstable();
+        ports.dedup();
+    }
+    ports
+}
+
+fn h2_upgrade_policy_forces_http1(policy: Option<H2UpgradePolicy>) -> bool {
+    matches!(policy, Some(H2UpgradePolicy::DoNotUpgrade))
+}
+
+/// Whether the effective `h2UpgradePolicy` for this SNI scope forces HTTP/1.1
+/// and therefore makes the direct-H2 SNI route impossible.
+fn sni_scope_conflicts_with_h2_upgrade_policy(
+    proxy: &Proxy,
+    upstream: Option<&Upstream>,
+    scope: SniPolicyScope,
+) -> bool {
+    match scope {
+        SniPolicyScope::Port(port) => h2_upgrade_policy_forces_http1(
+            effective_h2_upgrade_policy_for_sni(proxy, upstream, Some(port)),
+        ),
+        SniPolicyScope::ProxyWide => {
+            let ports = policy_ports_for_proxy_wide_sni(proxy, upstream);
+            ports.iter().any(|port| {
+                h2_upgrade_policy_forces_http1(effective_h2_upgrade_policy_for_sni(
+                    proxy,
+                    upstream,
+                    Some(*port),
+                ))
+            })
+        }
+    }
+}
+
+/// Build a throwaway proxy for backend-TLS-SNI / direct-H2 admission against
+/// one exact `(upstream, selected_subset)` destination. Projects the same
+/// dispatch-port / subset HTTP fallback and resolved TLS the runtime uses
+/// before the SNI gate, and installs the effective retry for that destination.
+pub(crate) fn proxy_for_sni_direct_h2_admission(
+    proxy: &Proxy,
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+    effective_retry: Option<RetryConfig>,
+) -> Proxy {
+    let mut admission = proxy_with_resolved_port_caps(proxy, upstream, selected_subset);
+    admission.retry = effective_retry;
+    admission.resolved_tls = BackendTlsConfig::from_upstream(upstream);
+    if let Some(subset_name) = selected_subset
+        && let Some(subset_tls) = upstream
+            .resolved_subset_tls
+            .get(subset_name)
+            .and_then(|resolved| resolved.tls.clone())
+    {
+        admission.resolved_tls = subset_tls;
+    }
+    admission.dispatch_kind = DispatchKind::from(admission.effective_scheme());
+    admission
+}
+
 /// Reject plain-HTTPS proxies whose backend TLS SNI override cannot dispatch
 /// on the direct-H2 pool (retry body replay, request-body buffering plugins,
-/// or `pool_enable_http2: false`). Covers proxy-level and DestinationRule
-/// per-port TLS overlays so `validate` catches guaranteed total outages.
+/// `pool_enable_http2: false`, or effective `h2UpgradePolicy: DO_NOT_UPGRADE`).
+/// Covers proxy-level and DestinationRule per-port TLS overlays so `validate`
+/// catches guaranteed total outages.
+///
+/// Effective `h2UpgradePolicy` mirrors
+/// [`crate::proxy::resolve_effective_proxy_for_target`]: explicit per-port >
+/// selected subset > top-level. Only scopes whose effective policy forces H1
+/// are rejected; a more-specific `UPGRADE`/`DEFAULT` port is not false-rejected
+/// by an inherited `DO_NOT_UPGRADE`.
 ///
 /// The buffering leg is derived from the runtime
 /// [`crate::plugins::Plugin::requires_request_body_buffering`] answer of a
@@ -3645,7 +3542,7 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
     }
     let sni_desc = sources
         .iter()
-        .map(|(sni, source)| format!("'{sni}' ({source})"))
+        .map(|(sni, source, _)| format!("'{sni}' ({source})"))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -3654,6 +3551,20 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
         errors.push(format!(
             "Proxy '{}' sets backend TLS SNI override ({sni_desc}) but pool_enable_http2 is false; \
              plain HTTPS SNI overrides require the direct HTTP/2 backend pool",
+            proxy.id
+        ));
+    }
+    let h2_policy_conflict_desc = sources
+        .iter()
+        .filter(|(_, _, scope)| sni_scope_conflicts_with_h2_upgrade_policy(proxy, upstream, *scope))
+        .map(|(sni, source, _)| format!("'{sni}' ({source})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !h2_policy_conflict_desc.is_empty() {
+        errors.push(format!(
+            "Proxy '{}' sets backend TLS SNI override ({h2_policy_conflict_desc}) but \
+             h2UpgradePolicy is DO_NOT_UPGRADE; plain HTTPS SNI overrides require the \
+             direct HTTP/2 backend pool",
             proxy.id
         ));
     }
@@ -4708,8 +4619,9 @@ impl GatewayConfig {
     ///
     /// Plain-HTTPS proxies with a backend TLS SNI override are likewise screened
     /// for combinations that cannot use the direct-H2 pool (effective retry,
-    /// request-body-buffering plugins, `pool_enable_http2: false`), including
-    /// DestinationRule per-port TLS overlays (issue #2954).
+    /// request-body-buffering plugins, `pool_enable_http2: false`, effective
+    /// `h2UpgradePolicy: DO_NOT_UPGRADE`), including DestinationRule per-port
+    /// TLS overlays and `mesh_route_dispatch` override destinations (issue #2954).
     pub fn validate_upstream_references(&self) -> Result<(), Vec<String>> {
         // Upstream references are namespace-local. A bare-id index would accept
         // a dangling same-namespace reference whenever another tenant owns
@@ -4770,7 +4682,9 @@ impl GatewayConfig {
             for override_dest in self.mesh_route_dispatch_override_destinations(proxy) {
                 if let Some(upstream) = upstreams_by_key
                     .get(&(proxy.namespace.as_str(), override_dest.upstream_id.as_str()))
-                    && let Some(required) = first_effective_mesh_transport_conflict_with_mesh(
+                    .copied()
+                {
+                    if let Some(required) = first_effective_mesh_transport_conflict_with_mesh(
                         // The runtime recomputes `dispatch_port_overrides` from the
                         // OVERRIDE destination upstream when a rule swaps the
                         // upstream (`apply_route_overrides_inner`), so the per-port
@@ -4786,20 +4700,36 @@ impl GatewayConfig {
                         override_dest.effective_retry.as_ref(),
                         proxy.allowed_methods.as_deref(),
                         self.mesh.as_deref(),
-                    )
-                {
-                    errors.push(mesh_transport_retry_conflict_message(
-                        &proxy.id,
-                        override_dest.upstream_id.as_str(),
-                        &required,
+                    ) {
+                        errors.push(mesh_transport_retry_conflict_message(
+                            &proxy.id,
+                            override_dest.upstream_id.as_str(),
+                            &required,
+                        ));
+                    }
+                    // Route overrides can also land matched traffic on an
+                    // upstream/subset whose backend TLS SNI cannot use direct-H2
+                    // under the effective h2UpgradePolicy / retry / buffering
+                    // posture. Screen the exact selected destination the same
+                    // way the default-upstream path does.
+                    let admission_proxy = proxy_for_sni_direct_h2_admission(
+                        proxy,
+                        upstream,
+                        override_dest.selected_subset.as_deref(),
+                        override_dest.effective_retry.clone(),
+                    );
+                    errors.extend(backend_tls_sni_direct_h2_conflict_messages(
+                        &admission_proxy,
+                        Some(upstream),
+                        &self.plugin_configs,
                     ));
                 }
             }
 
             // Backend TLS SNI on plain HTTPS requires direct-H2; reject
             // combinations that cannot dispatch (retry / body-buffering /
-            // pool_enable_http2=false), including DestinationRule per-port
-            // TLS overlays projected onto this proxy.
+            // pool_enable_http2=false / effective DO_NOT_UPGRADE), including
+            // DestinationRule per-port TLS overlays projected onto this proxy.
             let upstream = proxy.upstream_id.as_deref().and_then(|uid| {
                 upstreams_by_key
                     .get(&(proxy.namespace.as_str(), uid))

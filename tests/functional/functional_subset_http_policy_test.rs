@@ -27,12 +27,12 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, watch};
-use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::sync::{Notify, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::timeout;
 
 const NS: &str = "ferrum";
 const UPSTREAM_ID: &str = "subset-http-upstream";
@@ -88,17 +88,19 @@ async fn functional_subset_http_h2_upgrade_policy_is_observable_at_backend() {
         .build()
         .expect("http client");
 
-    let v1 = client
-        .get(format!("http://127.0.0.1:{}/v1/probe", gateway.http_port))
-        .send()
-        .await
-        .expect("v1 request");
-    assert_eq!(v1.status(), StatusCode::OK, "v1 DoNotUpgrade must succeed");
-    wait_for(
-        || async { h1_backend.handshakes_completed() >= 1 },
-        Duration::from_secs(5),
+    let v1 = timeout(
+        Duration::from_secs(10),
+        client.get(format!("http://127.0.0.1:{}/v1/probe", gateway.http_port)).send(),
     )
-    .await;
+    .await
+    .expect("v1 request timed out")
+    .expect("v1 request");
+    assert_eq!(v1.status(), StatusCode::OK, "v1 DoNotUpgrade must succeed");
+    // Successful completion already proves the H1 handshake/stream finished.
+    assert!(
+        h1_backend.handshakes_completed() >= 1,
+        "v1 success must have completed an H1 TLS handshake"
+    );
     let v1_alpn = h1_backend.last_alpn().await;
     assert_eq!(
         v1_alpn.as_deref(),
@@ -111,17 +113,18 @@ async fn functional_subset_http_h2_upgrade_policy_is_observable_at_backend() {
         "v1 traffic must not leak onto the H2-only sibling backend"
     );
 
-    let v2 = client
-        .get(format!("http://127.0.0.1:{}/v2/probe", gateway.http_port))
-        .send()
-        .await
-        .expect("v2 request");
-    assert_eq!(v2.status(), StatusCode::OK, "v2 Upgrade must succeed over H2");
-    wait_for(
-        || async { h2_backend.handshakes_completed() >= 1 },
-        Duration::from_secs(5),
+    let v2 = timeout(
+        Duration::from_secs(10),
+        client.get(format!("http://127.0.0.1:{}/v2/probe", gateway.http_port)).send(),
     )
-    .await;
+    .await
+    .expect("v2 request timed out")
+    .expect("v2 request");
+    assert_eq!(v2.status(), StatusCode::OK, "v2 Upgrade must succeed over H2");
+    assert!(
+        h2_backend.handshakes_completed() >= 1,
+        "v2 success must have completed an H2 TLS handshake"
+    );
     assert!(
         !h2_backend.received_streams().await.is_empty(),
         "selected subset v2 Upgrade must deliver an HTTP/2 stream to the backend"
@@ -136,7 +139,7 @@ async fn functional_subset_http_h2_upgrade_policy_is_observable_at_backend() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn functional_subset_http_max_retries_caps_live_attempts() {
     // v1 (cap 1): two 503s. unmatched (top-level cap 5): three 503s then 200.
-    let (backend_port, hits, scripts_done, backend_task) = spawn_status_script_backend(&[
+    let (backend_port, hits, shutdown_tx, backend_task) = spawn_status_script_backend(&[
         StatusCode::SERVICE_UNAVAILABLE,
         StatusCode::SERVICE_UNAVAILABLE,
         StatusCode::SERVICE_UNAVAILABLE,
@@ -154,11 +157,15 @@ async fn functional_subset_http_max_retries_caps_live_attempts() {
         .build()
         .expect("http client");
 
-    let v1 = client
-        .get(format!("http://127.0.0.1:{}/v1/retry", gateway.http_port))
-        .send()
-        .await
-        .expect("v1 retry request");
+    let v1 = timeout(
+        Duration::from_secs(15),
+        client
+            .get(format!("http://127.0.0.1:{}/v1/retry", gateway.http_port))
+            .send(),
+    )
+    .await
+    .expect("v1 retry timed out")
+    .expect("v1 retry request");
     // Subset v1 caps maxRetries to 1 → exactly two attempts; both 503 under the
     // script so the client sees the final failure rather than recovering.
     assert_eq!(
@@ -166,7 +173,6 @@ async fn functional_subset_http_max_retries_caps_live_attempts() {
         StatusCode::SERVICE_UNAVAILABLE,
         "v1 capped retries must exhaust after the subset cap"
     );
-    wait_for(|| async { hits.load(Ordering::SeqCst) >= 2 }, Duration::from_secs(5)).await;
     assert_eq!(
         hits.load(Ordering::SeqCst),
         2,
@@ -174,30 +180,34 @@ async fn functional_subset_http_max_retries_caps_live_attempts() {
     );
 
     hits.store(0, Ordering::SeqCst);
-    let unmatched = client
-        .get(format!(
-            "http://127.0.0.1:{}/unmatched/retry",
-            gateway.http_port
-        ))
-        .send()
-        .await
-        .expect("unmatched retry request");
+    let unmatched = timeout(
+        Duration::from_secs(15),
+        client
+            .get(format!(
+                "http://127.0.0.1:{}/unmatched/retry",
+                gateway.http_port
+            ))
+            .send(),
+    )
+    .await
+    .expect("unmatched retry timed out")
+    .expect("unmatched retry request");
     assert_eq!(
         unmatched.status(),
         StatusCode::OK,
         "unmatched top-level maxRetries=5 must recover within the larger budget"
     );
-    wait_for(|| async { hits.load(Ordering::SeqCst) >= 4 }, Duration::from_secs(5)).await;
     assert_eq!(
         hits.load(Ordering::SeqCst),
         4,
         "unmatched must not inherit the v1 subset cap of 1 (expects 3 failures + recovery)"
     );
 
-    scripts_done.store(true, Ordering::SeqCst);
+    let _ = shutdown_tx.send(true);
     gateway.shutdown().await;
-    match tokio::time::timeout(Duration::from_secs(5), backend_task).await {
-        Ok(Ok(())) => {}
+    match timeout(Duration::from_secs(5), backend_task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(err))) => panic!("status-script backend failed: {err}"),
         Ok(Err(join_err)) => panic!("status-script backend panicked: {join_err}"),
         Err(_) => panic!("status-script backend did not exit after shutdown"),
     }
@@ -206,7 +216,8 @@ async fn functional_subset_http_max_retries_caps_live_attempts() {
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn functional_subset_http1_pending_admission_is_subset_isolated() {
-    let (backend_port, hits, release, backend_task) = spawn_holding_backend().await;
+    let (backend_port, hits, first_hit_rx, release, shutdown_tx, backend_task) =
+        spawn_holding_backend().await;
     let gateway = start_subset_gateway(subset_http_pending_config(backend_port))
         .await
         .expect("start subset pending gateway");
@@ -219,19 +230,30 @@ async fn functional_subset_http1_pending_admission_is_subset_isolated() {
     let hold_url = format!("http://127.0.0.1:{}/v1/hold", gateway.http_port);
     let hold_client = client.clone();
     let hold = tokio::spawn(async move {
-        hold_client
-            .get(hold_url)
-            .send()
+        timeout(Duration::from_secs(15), hold_client.get(hold_url).send())
             .await
+            .expect("held v1 request timed out")
             .expect("held v1 request")
     });
-    wait_for(|| async { hits.load(Ordering::SeqCst) >= 1 }, Duration::from_secs(10)).await;
-
-    let shed = client
-        .get(format!("http://127.0.0.1:{}/v1/shed", gateway.http_port))
-        .send()
+    timeout(Duration::from_secs(10), first_hit_rx)
         .await
-        .expect("shed request");
+        .expect("first held backend hit timed out")
+        .expect("first-hit channel closed");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "first v1 request must be held at the backend before shed/sibling probes"
+    );
+
+    let shed = timeout(
+        Duration::from_secs(10),
+        client
+            .get(format!("http://127.0.0.1:{}/v1/shed", gateway.http_port))
+            .send(),
+    )
+    .await
+    .expect("shed request timed out")
+    .expect("shed request");
     assert_eq!(
         shed.status(),
         StatusCode::SERVICE_UNAVAILABLE,
@@ -248,35 +270,53 @@ async fn functional_subset_http1_pending_admission_is_subset_isolated() {
         "shed request must not reach the backend"
     );
 
-    let sibling = client
-        .get(format!("http://127.0.0.1:{}/v2/ok", gateway.http_port))
-        .send()
-        .await
-        .expect("sibling subset request");
+    let sibling = timeout(
+        Duration::from_secs(10),
+        client
+            .get(format!("http://127.0.0.1:{}/v2/ok", gateway.http_port))
+            .send(),
+    )
+    .await
+    .expect("sibling request timed out")
+    .expect("sibling subset request");
     assert_eq!(
         sibling.status(),
         StatusCode::OK,
         "sibling subset v2 must not share the v1 pending lane"
     );
-    wait_for(|| async { hits.load(Ordering::SeqCst) >= 2 }, Duration::from_secs(5)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "sibling request must reach the backend immediately while v1 is held"
+    );
 
     release.release();
     let held = hold.await.expect("held task join");
     assert_eq!(held.status(), StatusCode::OK, "held v1 request must complete");
 
-    let after = client
-        .get(format!("http://127.0.0.1:{}/v1/after", gateway.http_port))
-        .send()
-        .await
-        .expect("post-release v1 request");
+    let after = timeout(
+        Duration::from_secs(10),
+        client
+            .get(format!("http://127.0.0.1:{}/v1/after", gateway.http_port))
+            .send(),
+    )
+    .await
+    .expect("post-release request timed out")
+    .expect("post-release v1 request");
     assert_eq!(
         after.status(),
         StatusCode::OK,
         "pending permit must release after the held request completes"
     );
 
+    let _ = shutdown_tx.send(true);
     gateway.shutdown().await;
-    backend_task.abort();
+    match timeout(Duration::from_secs(5), backend_task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(err))) => panic!("holding backend failed: {err}"),
+        Ok(Err(join_err)) => panic!("holding backend panicked: {join_err}"),
+        Err(_) => panic!("holding backend did not exit after shutdown"),
+    }
 }
 
 struct RunningGateway {
@@ -288,7 +328,7 @@ struct RunningGateway {
 impl RunningGateway {
     async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
-        match tokio::time::timeout(Duration::from_secs(5), self.join).await {
+        match timeout(Duration::from_secs(5), self.join).await {
             Ok(Ok(())) => {}
             Ok(Err(join_err)) => panic!("subset gateway task panicked: {join_err}"),
             Err(_) => panic!("subset gateway shutdown timed out"),
@@ -647,71 +687,135 @@ impl ReleaseGate {
     }
 }
 
-async fn spawn_holding_backend() -> (u16, Arc<AtomicUsize>, Arc<ReleaseGate>, JoinHandle<()>) {
+type BackendTaskResult = Result<(), String>;
+
+async fn spawn_holding_backend() -> (
+    u16,
+    Arc<AtomicUsize>,
+    oneshot::Receiver<()>,
+    Arc<ReleaseGate>,
+    watch::Sender<bool>,
+    JoinHandle<BackendTaskResult>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind holding backend");
     let port = listener.local_addr().expect("backend addr").port();
     let hits = Arc::new(AtomicUsize::new(0));
+    let (first_hit_tx, first_hit_rx) = oneshot::channel();
     let release = Arc::new(ReleaseGate::new());
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let task_hits = Arc::clone(&hits);
     let task_release = Arc::clone(&release);
     let task = tokio::spawn(async move {
+        let mut children = JoinSet::new();
+        let mut hold_assigned = false;
+        let mut first_hit_tx = Some(first_hit_tx);
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                continue;
-            };
-            let hits = Arc::clone(&task_hits);
-            let release = Arc::clone(&task_release);
-            tokio::spawn(async move {
-                if let Err(err) = serve_held_http(stream, &hits, Some(release)).await {
-                    panic!("holding backend connection failed: {err}");
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
                 }
-            });
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.map_err(|e| format!("holding accept failed: {e}"))?;
+                    let hits = Arc::clone(&task_hits);
+                    let first_hit_tx = if !hold_assigned {
+                        hold_assigned = true;
+                        first_hit_tx.take()
+                    } else {
+                        None
+                    };
+                    let hold = if first_hit_tx.is_some() {
+                        Some(Arc::clone(&task_release))
+                    } else {
+                        None
+                    };
+                    children.spawn(async move {
+                        serve_held_http(stream, &hits, hold.as_ref(), first_hit_tx)
+                            .await
+                            .map_err(|e| format!("holding connection failed: {e}"))
+                    });
+                }
+                Some(joined) = children.join_next() => {
+                    match joined {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => return Err(err),
+                        Err(join_err) => {
+                            return Err(format!("holding connection task panicked: {join_err}"));
+                        }
+                    }
+                }
+            }
         }
+        while let Some(joined) = children.join_next().await {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(join_err) => {
+                    return Err(format!("holding connection task panicked: {join_err}"));
+                }
+            }
+        }
+        Ok(())
     });
-    (port, hits, release, task)
+    (port, hits, first_hit_rx, release, shutdown_tx, task)
 }
 
 async fn spawn_status_script_backend(
     statuses: &[StatusCode],
-) -> (u16, Arc<AtomicUsize>, Arc<AtomicBool>, JoinHandle<()>) {
+) -> (
+    u16,
+    Arc<AtomicUsize>,
+    watch::Sender<bool>,
+    JoinHandle<BackendTaskResult>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind status backend");
     let port = listener.local_addr().expect("backend addr").port();
     let hits = Arc::new(AtomicUsize::new(0));
-    let done = Arc::new(AtomicBool::new(false));
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let script: Vec<u16> = statuses.iter().map(|s| s.as_u16()).collect();
     let task_hits = Arc::clone(&hits);
-    let task_done = Arc::clone(&done);
     let task = tokio::spawn(async move {
+        // Sequential accept+serve is enough for the retry script and keeps
+        // every child error on the parent task result.
         let mut idx = 0usize;
-        while !task_done.load(Ordering::SeqCst) {
-            let accept = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
-            let Ok(Ok((stream, _))) = accept else {
-                continue;
-            };
-            let status = script.get(idx).copied().unwrap_or(200);
-            idx = idx.saturating_add(1);
-            let hits = Arc::clone(&task_hits);
-            tokio::spawn(async move {
-                if let Err(err) = serve_status_http(stream, &hits, status).await {
-                    panic!("status-script backend connection failed: {err}");
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
                 }
-            });
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.map_err(|e| format!("status accept failed: {e}"))?;
+                    let status = script.get(idx).copied().unwrap_or(200);
+                    idx = idx.saturating_add(1);
+                    serve_status_http(stream, &task_hits, status)
+                        .await
+                        .map_err(|e| format!("status connection failed: {e}"))?;
+                }
+            }
         }
+        Ok(())
     });
-    (port, hits, done, task)
+    (port, hits, shutdown_tx, task)
 }
 
 async fn serve_held_http(
     mut stream: TcpStream,
     hits: &AtomicUsize,
-    release: Option<Arc<ReleaseGate>>,
+    release: Option<&Arc<ReleaseGate>>,
+    first_hit_tx: Option<oneshot::Sender<()>>,
 ) -> std::io::Result<()> {
     read_headers(&mut stream).await?;
     hits.fetch_add(1, Ordering::SeqCst);
+    if let Some(tx) = first_hit_tx {
+        let _ = tx.send(());
+    }
     if let Some(release) = release {
         release.wait().await;
     }
@@ -743,7 +847,11 @@ async fn read_headers(stream: &mut TcpStream) -> std::io::Result<()> {
     let mut buf = vec![0; 8192];
     let mut read = 0;
     loop {
-        let n = stream.read(&mut buf[read..]).await?;
+        let n = timeout(Duration::from_secs(5), stream.read(&mut buf[read..]))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "header read timed out")
+            })??;
         if n == 0 {
             return Ok(());
         }
@@ -755,19 +863,4 @@ async fn read_headers(stream: &mut TcpStream) -> std::io::Result<()> {
             buf.resize(buf.len() * 2, 0);
         }
     }
-}
-
-async fn wait_for<F, Fut>(mut probe: F, timeout: Duration)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if probe().await {
-            return;
-        }
-        sleep(Duration::from_millis(25)).await;
-    }
-    panic!("condition not met within {timeout:?}");
 }
