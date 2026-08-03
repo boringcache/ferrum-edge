@@ -3392,14 +3392,18 @@ async fn prepare_mesh_request_body(
         }
     };
 
-    if retain_request_body
-        && buffered
-            .trailers
-            .as_ref()
-            .is_some_and(|trailers| !trailers.is_empty())
+    // Any buffered mesh path (retry retain *or* body-policy buffering) drops
+    // native inbound trailers from `MeshClientRequestBody::Replayable`, which
+    // only carries validated gRPC-Web staged trailers. Fail closed on non-empty
+    // native trailers rather than silently discarding them; empty/absent maps
+    // and the streaming intake arm above stay unchanged.
+    if buffered
+        .trailers
+        .as_ref()
+        .is_some_and(|trailers| !trailers.is_empty())
     {
         warn!(
-            "Refusing retry-enabled mesh dispatch with native request trailers: the generic intake path cannot validate them for replay"
+            "Refusing buffered mesh dispatch with native request trailers: the generic intake path cannot validate or forward them"
         );
         let is_grpc = headers
             .get("content-type")
@@ -44240,6 +44244,169 @@ mod tests {
             panic!("gRPC buffering refusal should be buffered");
         };
         assert!(body.is_empty(), "Trailers-Only refusal carries no body");
+    }
+
+    /// Body-policy buffering (no retries) must refuse non-empty native inbound
+    /// trailers before mesh dispatch rather than silently dropping them from
+    /// `MeshClientRequestBody::Replayable`.
+    #[tokio::test]
+    async fn prepare_mesh_request_body_refuses_native_trailers_without_retry_retain() {
+        let mut trailers = hyper::HeaderMap::new();
+        trailers.insert(
+            "x-native-request-trailer",
+            hyper::header::HeaderValue::from_static("must-not-drop"),
+        );
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/grpc".to_string());
+        let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let err = prepare_mesh_request_body(
+            ClientRequestBody::Buffered(BufferedClientRequestBody {
+                method: hyper::Method::POST,
+                headers: hyper::HeaderMap::new(),
+                body: b"payload".to_vec(),
+                trailers: Some(trailers),
+            }),
+            "POST",
+            &headers,
+            1024 * 1024,
+            1_000,
+            None,
+            &[],
+            None,
+            false, // stream_request_body — already buffered
+            true,  // request_body_prepared — skip plugin transforms
+            false, // retain_request_body — retries disabled; body policy forced buffering
+            &bytes_sent,
+            Some("127.0.0.1".to_string()),
+        )
+        .await
+        .expect_err("non-empty native trailers must fail closed before mesh dispatch");
+
+        assert_eq!(err.status_code, 200, "gRPC refusal uses Trailers-Only HTTP 200");
+        assert!(!err.connection_error);
+        assert_eq!(
+            err.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
+        assert_eq!(
+            err.headers.get("grpc-status").map(String::as_str),
+            Some("12")
+        );
+        assert_eq!(err.backend_resolved_ip.as_deref(), Some("127.0.0.1"));
+        let ResponseBody::Buffered(body) = err.body else {
+            panic!("native trailer refusal must be buffered");
+        };
+        assert!(body.is_empty(), "Trailers-Only refusal carries no body");
+        assert_eq!(
+            bytes_sent.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "refusal must happen before bytes-sent accounting / mesh dispatch"
+        );
+    }
+
+    /// Retry retain must keep the same fail-closed native-trailer refusal.
+    #[tokio::test]
+    async fn prepare_mesh_request_body_refuses_native_trailers_when_retry_retains_body() {
+        let mut trailers = hyper::HeaderMap::new();
+        trailers.insert(
+            "x-native-request-trailer",
+            hyper::header::HeaderValue::from_static("must-not-replay"),
+        );
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/grpc".to_string());
+        let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let err = prepare_mesh_request_body(
+            ClientRequestBody::Buffered(BufferedClientRequestBody {
+                method: hyper::Method::POST,
+                headers: hyper::HeaderMap::new(),
+                body: b"payload".to_vec(),
+                trailers: Some(trailers),
+            }),
+            "POST",
+            &headers,
+            1024 * 1024,
+            1_000,
+            None,
+            &[],
+            None,
+            false,
+            true,
+            true, // retain_request_body — retries configured
+            &bytes_sent,
+            Some("127.0.0.1".to_string()),
+        )
+        .await
+        .expect_err("retry-enabled mesh path must still refuse native trailers");
+
+        assert_eq!(err.status_code, 200);
+        assert!(!err.connection_error);
+        assert_eq!(
+            err.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
+        assert_eq!(
+            err.headers.get("grpc-status").map(String::as_str),
+            Some("12")
+        );
+    }
+
+    /// Empty native trailer maps are harmless, and validated gRPC-Web staged
+    /// trailers remain the Replayable representation.
+    #[tokio::test]
+    async fn prepare_mesh_request_body_keeps_staged_grpc_web_trailers() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/svc/Method".into());
+        let staged = BASE64.encode(
+            serde_json::to_vec(&[("x-grpc-web-trailer".to_string(), "kept".to_string())])
+                .expect("stage trailer json"),
+        );
+        ctx.metadata
+            .insert("grpc_web.request_trailers".to_string(), staged);
+        let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let (mesh_body, retained) = prepare_mesh_request_body(
+            ClientRequestBody::Buffered(BufferedClientRequestBody {
+                method: hyper::Method::POST,
+                headers: hyper::HeaderMap::new(),
+                body: b"payload".to_vec(),
+                trailers: Some(hyper::HeaderMap::new()),
+            }),
+            "POST",
+            &HashMap::new(),
+            1024 * 1024,
+            1_000,
+            None,
+            &[],
+            Some(&mut ctx),
+            false,
+            true,
+            false,
+            &bytes_sent,
+            None,
+        )
+        .await
+        .expect("empty native trailers must not block staged gRPC-Web trailers");
+
+        assert!(retained.is_none());
+        let MeshClientRequestBody::Replayable {
+            body,
+            trailers,
+            ..
+        } = mesh_body
+        else {
+            panic!("buffered mesh path must produce Replayable");
+        };
+        assert_eq!(&*body, b"payload");
+        let trailers = trailers.expect("staged gRPC-Web trailers must populate Replayable");
+        assert_eq!(
+            trailers
+                .get("x-grpc-web-trailer")
+                .and_then(|value| value.to_str().ok()),
+            Some("kept")
+        );
     }
 
     #[test]

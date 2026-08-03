@@ -392,6 +392,42 @@ fn mesh_retry_replays_finalized_bytes_without_rerunning_body_hooks() {
     assert!(!helper_body.contains("run_final_request_body_hooks("));
 }
 
+#[test]
+fn buffered_mesh_request_refuses_native_trailers_independent_of_retry_retain() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let helper = src
+        .find("async fn prepare_mesh_request_body(")
+        .expect("prepare_mesh_request_body not found");
+    let helper_tail = &src[helper..];
+    let end = helper_tail
+        .find("pub(crate) fn store_request_body_metadata(")
+        .expect("prepare_mesh_request_body end not found");
+    let helper_body = &helper_tail[..end];
+
+    assert!(
+        helper_body.contains("ClientRequestBody::Streaming(request) if stream_request_body =>"),
+        "streaming native requests must remain the unchanged fast path"
+    );
+    assert!(
+        helper_body.contains(
+            ".trailers\n        .as_ref()\n        .is_some_and(|trailers| !trailers.is_empty())"
+        ),
+        "buffered mesh path must refuse any non-empty native inbound trailers"
+    );
+    assert!(
+        !helper_body.contains("if retain_request_body\n        && buffered"),
+        "native trailer refusal must not be gated on retain_request_body / retries"
+    );
+    assert!(
+        helper_body.contains("ErrorClass::DispatchPolicyRejected"),
+        "native trailer refusal must stay health-neutral DispatchPolicyRejected"
+    );
+    assert!(
+        helper_body.contains("staged_request_trailers"),
+        "validated gRPC-Web staged trailers must still populate Replayable"
+    );
+}
+
 // --- classify_grpc_proxy_error tests ---
 
 #[test]
