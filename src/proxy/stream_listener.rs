@@ -549,10 +549,14 @@ mod bind_failure_snapshot_tests {
 /// during [`StreamListenerManager::reconcile`] and keyed by its
 /// `(namespace, id)` identity.
 struct DesiredStreamProxy {
+    /// Stable declaration priority captured before the desired-map erases
+    /// `GatewayConfig.proxies` order. Lower values resolve first.
+    declaration_order: usize,
     port: u16,
     scheme: BackendScheme,
     frontend_tls: bool,
     passthrough: bool,
+    stream_proxy_protocol: bool,
     /// Whether the proxy declares `hosts`; a lone passthrough proxy with hosts
     /// still needs SNI resolution so its host predicates are enforced.
     has_hosts: bool,
@@ -567,9 +571,10 @@ struct DesiredStreamProxy {
 /// `__sni_{port}`).
 struct DesiredStreamListener {
     /// Exact owning identity for this listener's representative proxy. For SNI
-    /// groups this is the first (sorted) candidate; per-connection resolution
-    /// picks the concrete tenant from [`Self::sni_ids`]. Never inferred and
-    /// never defaulted — it is carried from the config entry that produced it.
+    /// groups this is the first semantic-priority candidate; per-connection
+    /// resolution picks the concrete tenant from [`Self::sni_ids`]. Never
+    /// inferred and never defaulted — it is carried from the config entry that
+    /// produced it.
     identity: NamespacedResourceId,
     port: u16,
     scheme: BackendScheme,
@@ -1199,8 +1204,9 @@ impl StreamListenerManager {
             current_config
                 .proxies
                 .iter()
-                .filter(|p| p.dispatch_kind.is_stream())
-                .filter_map(|p| {
+                .enumerate()
+                .filter(|(_, p)| p.dispatch_kind.is_stream())
+                .filter_map(|(declaration_order, p)| {
                     p.listen_port.map(|port| {
                         // Passthrough proxies relay raw bytes and never build the
                         // cached backend TLS config, so they carry no reload key:
@@ -1221,10 +1227,12 @@ impl StreamListenerManager {
                         (
                             NamespacedResourceId::new(p.namespace.clone(), p.id.clone()),
                             DesiredStreamProxy {
+                                declaration_order,
                                 port,
                                 scheme: p.effective_scheme(),
                                 frontend_tls: p.frontend_tls,
                                 passthrough: p.passthrough,
+                                stream_proxy_protocol: p.stream_proxy_protocol.unwrap_or(false),
                                 has_hosts: !p.hosts.is_empty(),
                                 has_stream_match: p
                                     .stream_match
@@ -1236,6 +1244,21 @@ impl StreamListenerManager {
                     })
                 })
                 .collect();
+        let listener_candidates_compatible = |ids: &[NamespacedResourceId]| {
+            let Some(first) = ids.first().and_then(|id| desired.get(id)) else {
+                return false;
+            };
+            ids.iter().all(|id| {
+                desired.get(id).is_some_and(|entry| {
+                    entry.scheme == first.scheme
+                        && entry.frontend_tls == first.frontend_tls
+                        && entry.stream_proxy_protocol == first.stream_proxy_protocol
+                        && entry.backend_tls_reload_key == first.backend_tls_reload_key
+                })
+            })
+        };
+        let mut incompatible_shared_ids: std::collections::HashSet<NamespacedResourceId> =
+            std::collections::HashSet::new();
 
         // Detect passthrough port groups that must be resolved by SNI.
         // Multiple passthrough proxies sharing a port need one shared listener keyed by
@@ -1257,25 +1280,41 @@ impl StreamListenerManager {
                     .push(identity.clone());
             }
         }
+        for ids in passthrough_groups.values() {
+            if ids.len() > 1 && !listener_candidates_compatible(ids) {
+                incompatible_shared_ids.extend(ids.iter().cloned());
+            }
+        }
         passthrough_groups.retain(|_, ids| {
-            ids.len() > 1
-                || ids
-                    .iter()
-                    .any(|id| desired.get(id).is_some_and(|entry| entry.has_hosts))
+            listener_candidates_compatible(ids)
+                && (ids.len() > 1
+                    || ids
+                        .iter()
+                        .any(|id| desired.get(id).is_some_and(|entry| entry.has_hosts)))
         });
-        // Sort identities for stable comparison on reconcile.
+        // Preserve config/translator declaration order for semantic
+        // first-match-wins resolution. Identity is only a deterministic tie
+        // breaker for synthetic/hand-authored inputs that somehow share a
+        // declaration priority.
         for ids in passthrough_groups.values_mut() {
-            ids.sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
+            ids.sort_by(|a, b| {
+                let a_entry = desired.get(a);
+                let b_entry = desired.get(b);
+                a_entry
+                    .map(|entry| entry.declaration_order)
+                    .cmp(&b_entry.map(|entry| entry.declaration_order))
+                    .then_with(|| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)))
+            });
         }
 
-        // Non-passthrough TCP L4 match groups: multiple proxies on one port that
-        // carry stream_match predicates share one listener and resolve by
-        // trustworthy connection evidence (not SNI).
+        // Non-passthrough TCP L4 match groups: every compatible proxy on a port
+        // participates once at least one candidate is constrained. This keeps
+        // the single validated catch-all inside the shared listener instead of
+        // letting it collide with the constrained listener at bind time.
         let mut l4_match_groups: std::collections::HashMap<u16, Vec<NamespacedResourceId>> =
             std::collections::HashMap::new();
         for (identity, entry) in &desired {
             if !entry.passthrough
-                && entry.has_stream_match
                 && matches!(entry.scheme, BackendScheme::Tcp | BackendScheme::Tcps)
             {
                 l4_match_groups
@@ -1284,13 +1323,39 @@ impl StreamListenerManager {
                     .push(identity.clone());
             }
         }
+        for ids in l4_match_groups.values() {
+            let has_constrained = ids
+                .iter()
+                .any(|id| desired.get(id).is_some_and(|entry| entry.has_stream_match));
+            if ids.len() > 1 && has_constrained && !listener_candidates_compatible(ids) {
+                incompatible_shared_ids.extend(ids.iter().cloned());
+            }
+        }
         l4_match_groups.retain(|port, ids| {
-            // Only group when more than one candidate shares the port, or when
-            // a passthrough group does not already own this port.
-            ids.len() > 1 && !passthrough_groups.contains_key(port)
+            ids.len() > 1
+                && ids
+                    .iter()
+                    .any(|id| desired.get(id).is_some_and(|entry| entry.has_stream_match))
+                && listener_candidates_compatible(ids)
+                && !passthrough_groups.contains_key(port)
         });
         for ids in l4_match_groups.values_mut() {
-            ids.sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
+            ids.sort_by(|a, b| {
+                let a_entry = desired.get(a);
+                let b_entry = desired.get(b);
+                // A validated unconstrained candidate is the fallback and
+                // must never shadow a constrained arm, regardless of config
+                // or hash-map iteration order.
+                a_entry
+                    .map(|entry| !entry.has_stream_match)
+                    .cmp(&b_entry.map(|entry| !entry.has_stream_match))
+                    .then_with(|| {
+                        a_entry
+                            .map(|entry| entry.declaration_order)
+                            .cmp(&b_entry.map(|entry| entry.declaration_order))
+                    })
+                    .then_with(|| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)))
+            });
         }
 
         // Build the effective desired map: individual proxies + SNI/L4 group entries.
@@ -1300,7 +1365,19 @@ impl StreamListenerManager {
                 .values()
                 .chain(l4_match_groups.values())
                 .flatten()
+                .chain(incompatible_shared_ids.iter())
                 .collect();
+
+        for identity in &incompatible_shared_ids {
+            if let Some(entry) = desired.get(identity) {
+                degraded.push(StreamBindFailure::new(
+                    identity,
+                    entry.port,
+                    "Shared stream listener candidates disagree on pre-routing listener behavior; refusing the entire port",
+                    StreamListenerDegradation::BindFailed,
+                ));
+            }
+        }
 
         let mut effective_desired: std::collections::HashMap<String, DesiredStreamListener> =
             std::collections::HashMap::new();
@@ -1324,14 +1401,17 @@ impl StreamListenerManager {
         }
         for (port, ids) in &passthrough_groups {
             let key = format!("__sni_{}", port);
-            // Use the first proxy's scheme for the listener. `ids[0]` is also the
-            // listener's *representative* identity: the accept path re-resolves
-            // the concrete tenant per connection from `sni_ids`.
-            if let Some(entry) = desired.get(&ids[0]) {
+            // Use the first semantic-priority candidate as the listener's
+            // representative; the accept path re-resolves the concrete tenant
+            // per connection from `sni_ids`.
+            let Some(representative) = ids.first() else {
+                continue;
+            };
+            if let Some(entry) = desired.get(representative) {
                 effective_desired.insert(
                     key,
                     DesiredStreamListener {
-                        identity: ids[0].clone(),
+                        identity: representative.clone(),
                         port: entry.port,
                         scheme: entry.scheme,
                         frontend_tls: entry.frontend_tls,
@@ -1344,11 +1424,14 @@ impl StreamListenerManager {
         }
         for (port, ids) in &l4_match_groups {
             let key = format!("__l4_{}", port);
-            if let Some(entry) = desired.get(&ids[0]) {
+            let Some(representative) = ids.first() else {
+                continue;
+            };
+            if let Some(entry) = desired.get(representative) {
                 effective_desired.insert(
                     key,
                     DesiredStreamListener {
-                        identity: ids[0].clone(),
+                        identity: representative.clone(),
                         port: entry.port,
                         scheme: entry.scheme,
                         frontend_tls: entry.frontend_tls,
@@ -1432,8 +1515,8 @@ impl StreamListenerManager {
                 // SNI-group membership change on a shared passthrough
                 // port: the running listener captured the old candidate
                 // ID list at spawn, so it must be restarted. IDs are
-                // sorted at group construction, making this a stable
-                // comparison.
+                // semantically ordered at group construction, making this a
+                // stable comparison that preserves declaration priority.
                 || handle.sni_ids != *sni_ids;
             let backend_tls_changed = handle.backend_tls_reload_key != *backend_tls_reload_key;
 

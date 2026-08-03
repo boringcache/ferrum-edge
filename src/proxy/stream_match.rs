@@ -171,13 +171,17 @@ impl CompiledStreamMatch {
 }
 
 /// Pick the first candidate whose compiled stream_match accepts `evidence`.
-/// Candidates with no compiled matcher are treated as unconstrained (accept).
+/// Candidates with no configured matcher are treated as unconstrained; a
+/// configured-but-uncompiled matcher fails the whole shared group closed.
 /// Order is the caller-supplied candidate order (Istio first-match-wins).
 pub fn resolve_proxy_by_stream_match_in_epoch(
     candidates: &[crate::config::db_backend::NamespacedResourceId],
     evidence: &StreamMatchEvidence<'_>,
     epoch: &crate::request_epoch::RequestEpoch,
 ) -> Option<crate::config::db_backend::NamespacedResourceId> {
+    if has_configured_but_uncompiled_candidate(candidates, epoch) {
+        return None;
+    }
     for id in candidates {
         let Some(proxy) = epoch.proxy_by_namespaced_id(&id.namespace, &id.id) else {
             continue;
@@ -211,6 +215,9 @@ pub fn resolve_shared_stream_proxy_in_epoch(
     use_sni: bool,
 ) -> Option<crate::config::db_backend::NamespacedResourceId> {
     if use_sni {
+        if has_configured_but_uncompiled_candidate(candidates, epoch) {
+            return None;
+        }
         // Mirror SNI priority: exact, then wildcard, then catch-all — but only
         // among candidates that also satisfy stream_match.
         let mut exact: Option<crate::config::db_backend::NamespacedResourceId> = None;
@@ -266,6 +273,23 @@ pub fn resolve_shared_stream_proxy_in_epoch(
     } else {
         resolve_proxy_by_stream_match_in_epoch(candidates, evidence, epoch)
     }
+}
+
+fn has_configured_but_uncompiled_candidate(
+    candidates: &[crate::config::db_backend::NamespacedResourceId],
+    epoch: &crate::request_epoch::RequestEpoch,
+) -> bool {
+    candidates.iter().any(|id| {
+        epoch
+            .proxy_by_namespaced_id(&id.namespace, &id.id)
+            .is_some_and(|proxy| {
+                proxy
+                    .stream_match
+                    .as_ref()
+                    .is_some_and(|criteria| !criteria.is_empty())
+                    && proxy.compiled_stream_match.is_none()
+            })
+    })
 }
 
 impl CompiledStreamMatchArm {
@@ -379,6 +403,69 @@ impl SourceLabelLookup for std::collections::HashMap<String, String> {
     fn get(&self, key: &str) -> Option<&str> {
         self.get(key).map(String::as_str)
     }
+}
+
+/// Resolve source-label evidence without borrowing labels from an arbitrary
+/// same-service-account workload.
+///
+/// An exact NodeWaypoint policy scope wins because it was derived from the
+/// eBPF-resolved pod UID in the same slice generation as the authenticated
+/// identity. Otherwise a canonical source IP narrows same-SPIFFE workloads by
+/// their declared addresses. If ambiguity remains, labels are usable only when
+/// every remaining candidate has an identical label map; divergent replicas
+/// fail closed.
+pub fn trustworthy_source_labels<'a>(
+    workloads: &'a [crate::modes::mesh::config::Workload],
+    peer_spiffe: &str,
+    source_ip: Option<IpAddr>,
+    exact_node_waypoint_scope: Option<&'a crate::modes::mesh::runtime::PolicyScopeCache>,
+) -> Option<&'a std::collections::HashMap<String, String>> {
+    if let Some(scope) = exact_node_waypoint_scope {
+        return (scope.spiffe_id.as_str() == peer_spiffe).then_some(&scope.labels);
+    }
+
+    let canonical_source_ip = source_ip.map(crate::util::client_identity::canonical_ip);
+    if let Some(source_ip) = canonical_source_ip {
+        let by_address = workloads.iter().filter(|workload| {
+            workload.spiffe_id.as_str() == peer_spiffe
+                && workload.addresses.iter().any(|address| {
+                    parse_workload_ip(address).is_some_and(|candidate| candidate == source_ip)
+                })
+        });
+        if let Some(labels) = identical_candidate_labels(by_address) {
+            return Some(labels);
+        }
+    }
+
+    // The authenticated SPIFFE ID is trustworthy but may identify several
+    // replicas. Ambiguity is harmless only when every such workload proves the
+    // exact same labels; otherwise sourceLabels must deny.
+    identical_candidate_labels(
+        workloads
+            .iter()
+            .filter(|workload| workload.spiffe_id.as_str() == peer_spiffe),
+    )
+}
+
+fn identical_candidate_labels<'a>(
+    mut candidates: impl Iterator<Item = &'a crate::modes::mesh::config::Workload>,
+) -> Option<&'a std::collections::HashMap<String, String>> {
+    let first = candidates.next()?;
+    candidates
+        .all(|candidate| candidate.selector.labels == first.selector.labels)
+        .then_some(&first.selector.labels)
+}
+
+fn parse_workload_ip(address: &str) -> Option<IpAddr> {
+    let trimmed = address.trim();
+    let unbracketed = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    unbracketed
+        .parse::<IpAddr>()
+        .ok()
+        .map(crate::util::client_identity::canonical_ip)
 }
 
 /// Compare Istio gateway name spellings. `mesh` is exact. Named gateways compare

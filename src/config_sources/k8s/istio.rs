@@ -2539,19 +2539,10 @@ fn parse_l4_match_arm(
             out.push(canonical);
         }
         out
-    } else if !vs_gateways.is_empty() {
-        let mut out = Vec::with_capacity(vs_gateways.len());
-        for (i, raw) in vs_gateways.iter().enumerate() {
-            let canonical =
-                canonicalize_gateway_name(raw, &object.metadata.namespace).map_err(|e| {
-                    invalid_resource(object, format!("VirtualService spec.gateways[{i}]: {e}"))
-                })?;
-            out.push(canonical);
-        }
-        out
     } else {
-        // Istio default: omitted gateways means the reserved mesh scope.
-        vec![crate::proxy::stream_match::MESH_GATEWAY_TOKEN.to_string()]
+        // The top-level field was strictly parsed and canonicalized once by
+        // `parse_l4_virtual_service_gateways`; omission alone produced mesh.
+        vs_gateways.to_vec()
     };
 
     Ok(Some(arm))
@@ -2679,6 +2670,50 @@ fn virtual_service_l4_proxy_id(
         .replace(['/', '.'], "-")
 }
 
+/// Strictly parse top-level `spec.gateways` for the L4 translation path.
+/// Presence is materially different from omission: malformed, mixed, or empty
+/// values must never collapse to the empty result that means Istio's `mesh`
+/// default.
+fn parse_l4_virtual_service_gateways(
+    object: &K8sObject,
+) -> Result<Vec<String>, K8sTranslateError> {
+    use crate::proxy::stream_match::{MESH_GATEWAY_TOKEN, canonicalize_gateway_name};
+
+    let Some(value) = object.spec.get("gateways") else {
+        return Ok(vec![MESH_GATEWAY_TOKEN.to_string()]);
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(invalid_resource(
+            object,
+            "VirtualService spec.gateways must be a non-empty array of strings for L4 routing",
+        ));
+    };
+    if entries.is_empty() {
+        return Err(invalid_resource(
+            object,
+            "VirtualService spec.gateways must not be empty when set for L4 routing",
+        ));
+    }
+    let mut gateways = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(raw) = entry.as_str() else {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService spec.gateways[{index}] must be a string"),
+            ));
+        };
+        gateways.push(
+            canonicalize_gateway_name(raw, &object.metadata.namespace).map_err(|error| {
+                invalid_resource(
+                    object,
+                    format!("VirtualService spec.gateways[{index}]: {error}"),
+                )
+            })?,
+        );
+    }
+    Ok(gateways)
+}
+
 /// Translate VirtualService L4 routes into Ferrum stream proxies, reusing the
 /// same stream + SNI machinery as gateway / east-west passthrough:
 ///   - `spec.tls[]` → a **passthrough** TCP proxy keyed by SNI (`hosts =
@@ -2698,7 +2733,20 @@ fn virtual_service_l4_proxies(
 ) -> Result<Vec<Proxy>, K8sTranslateError> {
     let namespace = &object.metadata.namespace;
     let vs_name = &object.metadata.name;
-    let vs_gateways = string_array(&object.spec, "gateways");
+    let has_l4_routes = object
+        .spec
+        .get("tls")
+        .and_then(Value::as_array)
+        .is_some_and(|routes| !routes.is_empty())
+        || object
+            .spec
+            .get("tcp")
+            .and_then(Value::as_array)
+            .is_some_and(|routes| !routes.is_empty());
+    if !has_l4_routes {
+        return Ok(Vec::new());
+    }
+    let vs_gateways = parse_l4_virtual_service_gateways(object)?;
     let mut proxies = Vec::new();
 
     if let Some(blocks) = object.spec.get("tls").and_then(Value::as_array) {

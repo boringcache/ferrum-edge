@@ -2,10 +2,66 @@
 
 use ferrum_edge::proxy::stream_match::{
     CompiledStreamMatch, StreamMatchArm, StreamMatchCriteria, StreamMatchEvidence,
-    canonicalize_gateway_name, source_namespace_from_spiffe, trusted_stream_gateway_ref,
+    canonicalize_gateway_name, resolve_shared_stream_proxy_in_epoch, source_namespace_from_spiffe,
+    trusted_stream_gateway_ref, trustworthy_source_labels,
 };
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+
+fn workload(
+    address: &str,
+    labels: serde_json::Value,
+) -> ferrum_edge::modes::mesh::config::Workload {
+    serde_json::from_value(serde_json::json!({
+        "spiffe_id": "spiffe://cluster.local/ns/prod/sa/client",
+        "selector": {"labels": labels},
+        "service_name": "client",
+        "addresses": [address],
+        "trust_domain": "cluster.local",
+        "namespace": "prod"
+    }))
+    .unwrap()
+}
+
+fn passthrough_proxy(id: &str, criteria: StreamMatchCriteria) -> ferrum_edge::config::types::Proxy {
+    let mut proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(serde_json::json!({
+        "id": id,
+        "namespace": "default",
+        "hosts": ["secure.example.com"],
+        "backend_scheme": "tcp",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9443,
+        "listen_port": 8443,
+        "passthrough": true,
+        "stream_match": criteria
+    }))
+    .unwrap();
+    proxy.normalize_fields();
+    proxy
+}
+
+fn epoch_for(
+    proxies: Vec<ferrum_edge::config::types::Proxy>,
+) -> ferrum_edge::request_epoch::RequestEpochStore {
+    use ferrum_edge::config::types::GatewayConfig;
+    use ferrum_edge::consumer_index::ConsumerIndex;
+    use ferrum_edge::load_balancer::LoadBalancerCache;
+    use ferrum_edge::plugin_cache::PluginCache;
+
+    let config = GatewayConfig {
+        proxies,
+        ..Default::default()
+    };
+    let plugin_cache = PluginCache::new(&config).unwrap();
+    let consumer_index = ConsumerIndex::new(&config.consumers);
+    let load_balancer = LoadBalancerCache::new(&config);
+    ferrum_edge::request_epoch::RequestEpochStore::from_runtime_parts(
+        config,
+        &plugin_cache,
+        &consumer_index,
+        &load_balancer,
+    )
+}
 
 #[test]
 fn stream_match_criteria_round_trips_through_json() {
@@ -78,5 +134,153 @@ fn gateway_canonicalize_and_default_binding() {
     assert_eq!(
         source_namespace_from_spiffe("spiffe://cluster.local/ns/prod/sa/web").as_deref(),
         Some("prod")
+    );
+}
+
+#[test]
+fn shared_spiffe_divergent_labels_fail_closed_without_exact_evidence() {
+    let workloads = vec![
+        workload("10.0.0.1", serde_json::json!({"app": "billing"})),
+        workload("10.0.0.2", serde_json::json!({"app": "reporting"})),
+    ];
+    assert!(
+        trustworthy_source_labels(
+            &workloads,
+            "spiffe://cluster.local/ns/prod/sa/client",
+            None,
+            None,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn canonical_source_ip_selects_exact_shared_spiffe_workload() {
+    let workloads = vec![
+        workload("10.0.0.1", serde_json::json!({"app": "billing"})),
+        workload("10.0.0.2", serde_json::json!({"app": "reporting"})),
+    ];
+    let labels = trustworthy_source_labels(
+        &workloads,
+        "spiffe://cluster.local/ns/prod/sa/client",
+        Some("::ffff:10.0.0.2".parse().unwrap()),
+        None,
+    )
+    .unwrap();
+    assert_eq!(labels.get("app").map(String::as_str), Some("reporting"));
+}
+
+#[test]
+fn identical_shared_spiffe_replica_labels_are_safe_evidence() {
+    let workloads = vec![
+        workload("10.0.0.1", serde_json::json!({"app": "billing"})),
+        workload("10.0.0.2", serde_json::json!({"app": "billing"})),
+    ];
+    let labels = trustworthy_source_labels(
+        &workloads,
+        "spiffe://cluster.local/ns/prod/sa/client",
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(labels.get("app").map(String::as_str), Some("billing"));
+}
+
+#[test]
+fn exact_node_waypoint_scope_overrides_shared_spiffe_ambiguity() {
+    use ferrum_edge::identity::spiffe::SpiffeId;
+    use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+    use std::collections::HashMap;
+
+    let workloads = vec![
+        workload("10.0.0.1", serde_json::json!({"app": "billing"})),
+        workload("10.0.0.2", serde_json::json!({"app": "reporting"})),
+    ];
+    let scope = PolicyScopeCache::new(
+        SpiffeId::new("spiffe://cluster.local/ns/prod/sa/client").unwrap(),
+        "prod",
+        HashMap::from([("app".to_string(), "reporting".to_string())]),
+    );
+    let labels = trustworthy_source_labels(
+        &workloads,
+        "spiffe://cluster.local/ns/prod/sa/client",
+        None,
+        Some(&scope),
+    )
+    .unwrap();
+    assert_eq!(labels.get("app").map(String::as_str), Some("reporting"));
+}
+
+#[test]
+fn passthrough_same_sni_uses_semantic_candidate_order_with_double_digits() {
+    use ferrum_edge::config::db_backend::NamespacedResourceId;
+
+    let match_two = StreamMatchCriteria {
+        arms: vec![StreamMatchArm {
+            source_subnets: vec!["127.0.0.0/8".to_string()],
+            ..Default::default()
+        }],
+    };
+    let match_ten = StreamMatchCriteria {
+        arms: vec![StreamMatchArm {
+            source_subnets: vec!["127.0.0.1/32".to_string()],
+            ..Default::default()
+        }],
+    };
+    let epoch_store = epoch_for(vec![
+        passthrough_proxy("route-match-2", match_two),
+        passthrough_proxy("route-match-10", match_ten),
+    ]);
+    let epoch = epoch_store.load();
+    let candidates = vec![
+        NamespacedResourceId::new("default".to_string(), "route-match-2".to_string()),
+        NamespacedResourceId::new("default".to_string(), "route-match-10".to_string()),
+    ];
+    let evidence = StreamMatchEvidence {
+        source_ip: Some("127.0.0.1".parse().unwrap()),
+        ..Default::default()
+    };
+    let selected = resolve_shared_stream_proxy_in_epoch(
+        Some("secure.example.com"),
+        &candidates,
+        &evidence,
+        &epoch,
+        true,
+    )
+    .unwrap();
+    assert_eq!(selected.id, "route-match-2");
+}
+
+#[test]
+fn configured_but_uncompiled_passthrough_matcher_fails_closed() {
+    use ferrum_edge::config::db_backend::NamespacedResourceId;
+
+    let invalid = StreamMatchCriteria {
+        arms: vec![StreamMatchArm {
+            source_subnets: vec!["not-a-cidr".to_string()],
+            ..Default::default()
+        }],
+    };
+    let epoch_store = epoch_for(vec![
+        passthrough_proxy("invalid", invalid),
+        passthrough_proxy("fallback", StreamMatchCriteria::default()),
+    ]);
+    let epoch = epoch_store.load();
+    let candidates = vec![
+        NamespacedResourceId::new("default".to_string(), "invalid".to_string()),
+        NamespacedResourceId::new("default".to_string(), "fallback".to_string()),
+    ];
+    assert!(
+        resolve_shared_stream_proxy_in_epoch(
+            Some("secure.example.com"),
+            &candidates,
+            &StreamMatchEvidence {
+                source_ip: Some("127.0.0.1".parse().unwrap()),
+                ..Default::default()
+            },
+            &epoch,
+            true,
+        )
+        .is_none()
     );
 }

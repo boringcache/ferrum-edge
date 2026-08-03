@@ -13,11 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
   compile onto a shared precomputed `Proxy.stream_match` carrier and are
   evaluated from trustworthy connection/workload metadata before stream route
-  selection (issues #3246–#3250). AND semantics apply within one match arm; OR
-  across match candidates on a shared listen port. Missing identity, label,
-  subnet, or gateway evidence denies the requiring predicate; malformed label
-  keys/values, namespaces, gateway names, and CIDRs fail closed at translation
-  with field-specific `FerrumAccepted=False`/`Invalid` diagnostics. Istio
+  selection (issues #3246–#3250). Shared-SPIFFE label evidence is bound to an
+  exact pod/IP or identical-label replica set. AND semantics apply within one
+  match arm; OR across match candidates on a shared listen port. Missing
+  identity, label, subnet, or gateway evidence denies the requiring predicate;
+  malformed label keys/values, namespaces, gateway names, and CIDRs fail closed
+  at translation with field-specific `FerrumAccepted=False`/`Invalid`
+  diagnostics. Istio
   gateway scope defaults to the reserved `mesh` token; named-gateway data
   planes set `FERRUM_STREAM_GATEWAY_REF`. Existing SNI/port routing and
   weighted-split fail-closed behavior are preserved.

@@ -4975,7 +4975,10 @@ impl GatewayConfig {
             let all_passthrough = proxies_on_port.iter().all(|p| p.passthrough);
             let stream_match_group = proxies_on_port
                 .iter()
-                .all(|p| matches!(p.dispatch_kind, DispatchKind::TcpRaw | DispatchKind::TcpTls))
+                .all(|p| {
+                    !p.passthrough
+                        && matches!(p.dispatch_kind, DispatchKind::TcpRaw | DispatchKind::TcpTls)
+                })
                 && proxies_on_port
                     .iter()
                     .any(|p| p.stream_match.as_ref().is_some_and(|m| !m.is_empty()));
@@ -5012,6 +5015,51 @@ impl GatewayConfig {
                     port,
                     pp_enabled.join(", ")
                 ));
+            }
+
+            // A shared socket is constructed from one representative proxy,
+            // before route resolution can select a candidate. Every property
+            // consumed at that listener boundary must therefore agree. Do not
+            // let hash/config order choose which candidate's behavior wins.
+            let Some(representative) = proxies_on_port.first().copied() else {
+                continue;
+            };
+            let mixed_scheme = proxies_on_port
+                .iter()
+                .any(|p| p.effective_scheme() != representative.effective_scheme());
+            if mixed_scheme {
+                errors.push(format!(
+                    "Shared listen_port {} mixes backend schemes — every candidate must use the same tcp/tcps listener scheme",
+                    port
+                ));
+            }
+            let mixed_frontend_tls = proxies_on_port
+                .iter()
+                .any(|p| p.frontend_tls != representative.frontend_tls);
+            if mixed_frontend_tls {
+                errors.push(format!(
+                    "Shared listen_port {} mixes frontend_tls settings — every candidate must agree before route resolution",
+                    port
+                ));
+            }
+            if representative.effective_scheme() == BackendScheme::Tcps
+                && !representative.passthrough
+            {
+                let representative_tls = &representative.resolved_tls;
+                let mixed_backend_tls = proxies_on_port.iter().any(|p| {
+                    let tls = &p.resolved_tls;
+                    tls.verify_server_cert != representative_tls.verify_server_cert
+                        || tls.server_ca_cert_path != representative_tls.server_ca_cert_path
+                        || tls.client_cert_path != representative_tls.client_cert_path
+                        || tls.client_key_path != representative_tls.client_key_path
+                        || tls.san_allow_list != representative_tls.san_allow_list
+                });
+                if mixed_backend_tls {
+                    errors.push(format!(
+                        "Shared listen_port {} mixes backend TLS listener settings — every tcps candidate must use the same verifier and client identity sources",
+                        port
+                    ));
+                }
             }
 
             if stream_match_group && !all_passthrough {
@@ -6906,12 +6954,13 @@ impl Proxy {
             );
         }
 
-        // L4 stream match predicates are stream-proxy only and must compile.
+        // L4 stream match predicates are implemented by the TCP accept path
+        // only and must compile. Admitting them on UDP/DTLS would silently
+        // turn a configured matcher into an unconstrained datagram route.
         if let Some(criteria) = self.stream_match.as_ref() {
-            if !is_stream_proxy {
+            if !matches!(effective_scheme, BackendScheme::Tcp | BackendScheme::Tcps) {
                 errors.push(
-                    "stream_match is only valid for stream proxies (tcp, tcps, udp, dtls)"
-                        .to_string(),
+                    "stream_match is only valid for tcp/tcps stream proxies".to_string(),
                 );
             } else if !criteria.is_empty()
                 && let Err(e) = criteria.compile()

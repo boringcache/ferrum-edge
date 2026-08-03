@@ -2457,15 +2457,22 @@ async fn handle_tcp_connection_inner(
     let source_namespace_owned = peer_spiffe
         .as_deref()
         .and_then(super::stream_match::source_namespace_from_spiffe);
-    let source_labels_owned: Option<std::collections::HashMap<String, String>> =
-        peer_spiffe.as_deref().and_then(|spiffe| {
-            epoch.config.mesh.as_ref().and_then(|mesh| {
-                mesh.workloads
-                    .iter()
-                    .find(|w| w.spiffe_id.as_str() == spiffe)
-                    .map(|w| w.selector.labels.clone())
-            })
-        });
+    // The NodeWaypoint scope was derived from the exact eBPF-resolved pod UID;
+    // clone only its Arc so label evidence remains independent of later
+    // StreamConnectionContext mutation. Other topologies bind same-SPIFFE
+    // workloads by canonical source IP, accepting residual ambiguity only when
+    // every candidate proves identical labels.
+    let exact_node_waypoint_scope = stream_ctx.node_waypoint_policy_scope.clone();
+    let source_labels = peer_spiffe.as_deref().and_then(|spiffe| {
+        epoch.config.mesh.as_ref().and_then(|mesh| {
+            super::stream_match::trustworthy_source_labels(
+                &mesh.workloads,
+                spiffe,
+                source_ip,
+                exact_node_waypoint_scope.as_deref(),
+            )
+        })
+    });
 
     // Prefetch SNI (when needed) before constructing StreamMatchEvidence.
     // Evidence holds `Option<&dyn SourceLabelLookup>`, which is not Sync, so
@@ -2494,8 +2501,7 @@ async fn handle_tcp_connection_inner(
             source_ip,
             destination_ip: stream_ctx.destination_ip,
             source_namespace: source_namespace_owned.as_deref(),
-            source_labels: source_labels_owned
-                .as_ref()
+            source_labels: source_labels
                 .map(|labels| labels as &dyn super::stream_match::SourceLabelLookup),
             trusted_gateway_ref: stream_ctx.trusted_gateway_ref.as_deref(),
         };
@@ -2551,8 +2557,7 @@ async fn handle_tcp_connection_inner(
                 source_ip,
                 destination_ip: stream_ctx.destination_ip,
                 source_namespace: source_namespace_owned.as_deref(),
-                source_labels: source_labels_owned
-                    .as_ref()
+                source_labels: source_labels
                     .map(|labels| labels as &dyn super::stream_match::SourceLabelLookup),
                 trusted_gateway_ref: stream_ctx.trusted_gateway_ref.as_deref(),
             };

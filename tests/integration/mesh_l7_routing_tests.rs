@@ -2758,3 +2758,107 @@ fn mesh_tier3_l4_virtual_service_source_labels_materialize_stream_match() {
         "omitted gateways default to mesh"
     );
 }
+
+#[test]
+fn mesh_l4_virtual_service_top_level_gateways_is_strict() {
+    for invalid_gateways in [
+        serde_json::json!("mesh"),
+        serde_json::json!([]),
+        serde_json::json!(["mesh", 7]),
+    ] {
+        let error = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "gateways": invalid_gateways,
+                    "tcp": [{
+                        "match": [{"port": 3306}],
+                        "route": [{"destination": {
+                            "host": "mysql.default.svc.cluster.local",
+                            "port": {"number": 3306}
+                        }}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("present malformed spec.gateways must not default to mesh");
+        assert!(
+            format!("{error}").contains("spec.gateways"),
+            "field-specific diagnostic required: {error}"
+        );
+    }
+
+    let translated = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "gateways": ["ingress"],
+                "tcp": [{
+                    "match": [{"port": 3306}],
+                    "route": [{"destination": {
+                        "host": "mysql.default.svc.cluster.local",
+                        "port": {"number": 3306}
+                    }}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("valid top-level gateways translate");
+    let gateways = &translated
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_port == Some(3306))
+        .unwrap()
+        .stream_match
+        .as_ref()
+        .unwrap()
+        .arms[0]
+        .gateways;
+    assert_eq!(gateways, &["default/ingress".to_string()]);
+}
+
+#[test]
+fn mesh_l4_virtual_service_preserves_double_digit_match_declaration_order() {
+    let matches: Vec<Value> = (0..11)
+        .map(|index| {
+            serde_json::json!({
+                "port": 3306,
+                "sourceSubnets": [format!("10.{index}.0.0/16")]
+            })
+        })
+        .collect();
+    let translated = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "match": matches,
+                    "route": [{"destination": {
+                        "host": "mysql.default.svc.cluster.local",
+                        "port": {"number": 3306}
+                    }}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .unwrap();
+    let ids: Vec<&str> = translated
+        .config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.listen_port == Some(3306))
+        .map(|proxy| proxy.id.as_str())
+        .collect();
+    assert!(ids[2].ends_with("__0-2"), "declaration order changed: {ids:?}");
+    assert!(
+        ids[10].ends_with("__0-10"),
+        "double-digit match moved lexicographically: {ids:?}"
+    );
+}

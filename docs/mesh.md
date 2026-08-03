@@ -2783,13 +2783,13 @@ Optional L4 match predicates compile onto `Proxy.stream_match` (AND within one m
 
 | Predicate | Evidence | Deny-by-absence |
 |---|---|---|
-| `sourceLabels` | Peer workload labels from the mesh inventory keyed by authenticated peer SPIFFE | Yes |
+| `sourceLabels` | Labels from the exact NodeWaypoint pod scope, or from authenticated-peer-SPIFFE workloads narrowed by canonical socket source IP; unresolved replicas are accepted only when every candidate has identical labels | Yes |
 | `sourceNamespace` | Namespace segment of peer SPIFFE (`ns/<ns>/…`) | Yes |
 | `sourceSubnets` | Socket-peer / direct client IP (`source.ip`) | Yes |
 | `destinationSubnets` | `SO_ORIGINAL_DST` / capture original destination IP | Yes |
 | `gateways` | Listener-configured binding (`FERRUM_STREAM_GATEWAY_REF`, default `mesh`) — never inferred from wire data | Yes |
 
-Istio gateway semantics: omitted VS/`match.gateways` defaults to the reserved `mesh` token; match-level `gateways` override VS-level; short names qualify as `{vs-namespace}/{name}`. Named-gateway data planes must set `FERRUM_STREAM_GATEWAY_REF` to `namespace/name`. Invalid label keys/values, namespaces, gateway names, and CIDRs fail translation closed with field-specific diagnostics (`FerrumAccepted=False`/`Invalid`). **Weighted multi-destination splitting** remains rejected fail-closed. A `tls[]` match without `sniHosts`, or any L4 route without a resolvable destination port, also fails closed.
+Istio gateway semantics: omitted VS/`match.gateways` defaults to the reserved `mesh` token; match-level `gateways` override VS-level; short names qualify as `{vs-namespace}/{name}`. A present top-level `spec.gateways` must be a non-empty string array; malformed, mixed, or empty values reject the L4 resource instead of widening it to `mesh`. Named-gateway data planes must set `FERRUM_STREAM_GATEWAY_REF` to `namespace/name`. Invalid label keys/values, namespaces, gateway names, and CIDRs fail translation closed with field-specific diagnostics (`FerrumAccepted=False`/`Invalid`). **Weighted multi-destination splitting** remains rejected fail-closed. A `tls[]` match without `sniHosts`, or any L4 route without a resolvable destination port, also fails closed.
 
 ### Destination Port Resolution
 
