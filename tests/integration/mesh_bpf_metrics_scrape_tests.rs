@@ -190,6 +190,7 @@ async fn authenticated_metrics_includes_seeded_mesh_bpf_families() {
     state.record_connect();
     state.record_accept_established();
     state.record_srtt_sample(250);
+    state.record_accept_to_first_byte(2_500);
 
     let cfg = gateway_with_bpf_metrics(None);
     let dns_cache = DnsCache::new(DnsConfig::default());
@@ -256,6 +257,18 @@ async fn authenticated_metrics_includes_seeded_mesh_bpf_families() {
         )),
         "seeded srtt bucket missing from /metrics:\n{body}"
     );
+    assert!(
+        body.contains(&format!(
+            "# TYPE {DEFAULT_METRIC_PREFIX}_accept_to_first_byte_microseconds histogram"
+        )),
+        "accept-to-first-byte family must be a histogram:\n{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "{DEFAULT_METRIC_PREFIX}_accept_to_first_byte_microseconds_bucket{{le=\"2500\"}} 1"
+        )),
+        "seeded accept-to-first-byte bucket missing from /metrics:\n{body}"
+    );
     assert_single_tcp_events_family(&body, DEFAULT_METRIC_PREFIX);
 
     let _ = shutdown.send(true);
@@ -291,6 +304,7 @@ async fn authenticated_metrics_omits_mesh_bpf_when_plugin_absent() {
 async fn plugin_cache_reload_switches_exporter_atomically() {
     let state = BpfMetricsState::new();
     state.record_connect();
+    state.record_accept_to_first_byte(10_000);
 
     let dns_cache = DnsCache::new(DnsConfig::default());
     let (proxy_state, _handles) = ProxyState::new_with_bpf_metrics(
@@ -312,6 +326,9 @@ async fn plugin_cache_reload_switches_exporter_atomically() {
     assert!(rendered.contains(&format!(
         "{DEFAULT_METRIC_PREFIX}_tcp_events_total{{event=\"connect\"}} 1"
     )));
+    assert!(rendered.contains(&format!(
+        "{DEFAULT_METRIC_PREFIX}_accept_to_first_byte_microseconds_count 1"
+    )));
     assert_single_tcp_events_family(&rendered, DEFAULT_METRIC_PREFIX);
 
     // Prefix replacement keeps the shared BPF state Arc and emits exactly once.
@@ -328,6 +345,7 @@ async fn plugin_cache_reload_switches_exporter_atomically() {
     assert_eq!(exporter.prefix(), "tenantA_bpf");
     let rendered = exporter.render_prometheus();
     assert!(rendered.contains("tenantA_bpf_tcp_events_total{event=\"connect\"} 1"));
+    assert!(rendered.contains("tenantA_bpf_accept_to_first_byte_microseconds_count 1"));
     assert!(!rendered.contains("ferrum_mesh_bpf_tcp_events_total"));
     assert_single_tcp_events_family(&rendered, "tenantA_bpf");
 
@@ -354,6 +372,9 @@ async fn plugin_cache_reload_switches_exporter_atomically() {
         .render_prometheus();
     assert!(zero_body.contains(&format!(
         "{DEFAULT_METRIC_PREFIX}_tcp_events_total{{event=\"connect\"}} 0"
+    )));
+    assert!(zero_body.contains(&format!(
+        "{DEFAULT_METRIC_PREFIX}_accept_to_first_byte_microseconds_count 0"
     )));
     assert_single_tcp_events_family(&zero_body, DEFAULT_METRIC_PREFIX);
 

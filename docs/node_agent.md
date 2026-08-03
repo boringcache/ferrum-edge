@@ -37,6 +37,16 @@ The guard is armed strictly *after* `load_programs` returns `Ok`. A failure in `
 
 Both owners latch on the first cleanup, so the handoff can never double-clean, and both do their cleanup synchronously — there is no async teardown in `Drop` and no background cleanup task. Cleanup failures are surfaced as structured warnings; the original startup/runtime error is always the returned cause.
 
+Accept-to-first-byte observability follows the same generation boundary. The
+node-agent attaches SK_SKB stream parser/verdict programs to a bounded
+accepted-socket SOCKHASH and keeps timestamp/phase evidence in a 65,536-entry
+LRU map. First data and terminal close delete both entries; failed handoff
+deletes state immediately, and kernel socket close is a SOCKHASH backstop.
+`cleanup_all` drops the whole unpinned generation, so reload cannot correlate a
+new socket with stale evidence. In-flight samples across reload are omitted,
+not reconstructed. These hooks are observability-only and always pass traffic;
+capture identity and its fail-closed readiness contract remain authoritative.
+
 Ordering on the normal shutdown path is per-pod first, then node-global: enrolled pods are detached (dropping their registry entries and readiness markers) before `cleanup_all` tears down the shared maps and pins. The `Drop` safety net has no access to the pod table, so it performs the node-global `cleanup_all` only; it exists to guarantee the pins are released, not to substitute for an orderly shutdown.
 
 ## Pod Lifecycle Events
@@ -70,6 +80,14 @@ When node-agent mode starts its admin listener, `/metrics` includes:
 | `ferrum_node_agent_pod_annotation_updates_failed_total` | Mid-life `includeOutboundPorts` annotation changes that failed to re-apply (annotation parse error or BPF map write error). The pod retains its previous policy. Cgroup-id-unavailable retries (Pod object reached the watcher before kubelet finished creating the cgroup) are not counted here — they are retried on the next Apply event. |
 | `ferrum_node_agent_capture_state{state}` | Gauge. Exactly one state is `1`: `starting`, `ready`, `unavailable`, `partially_attached`, `identity_bridge_unavailable`, or `node_global_fallback`. Readiness is only reported after startup BPF maps/programs are loaded and, in NodeWaypoint mode, the SOCK_OPS identity bridge is attached. |
 | `ferrum_mesh_node_topology_degraded{reason}` | Gauge. `1` with `reason` ∈ {`kernel_too_old`,`cgroup_v1`,`bpffs_missing`,`ebpf_feature_disabled`,`capture_mode_not_ebpf`,`capture_unavailable`,`node_waypoint_sock_ops_unavailable`} when startup cannot provide the requested eBPF topology. `0` with `reason="none"` when the eBPF capture path is nominal. Cardinality is bounded per node (a single series at a time). |
+
+The NodeWaypoint proxy's authenticated `/metrics` additionally exposes
+`ferrum_mesh_bpf_accept_to_first_byte_microseconds`. It measures from the
+captured accepted socket's passive-established timestamp to its first non-empty
+inbound application-data buffer. The histogram has fixed microsecond buckets
+and no connection, address, port, namespace, identity, or cookie labels. See
+[BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for
+correlation, eviction, and missing-evidence behavior.
 
 ## eBPF build and capture (how to build the capture image)
 

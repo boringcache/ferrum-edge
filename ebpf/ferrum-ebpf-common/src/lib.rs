@@ -671,6 +671,77 @@ pub struct SockOpsRecord {
     pub value: u64,
 }
 
+/// Per-accepted-socket correlation state shared by SOCK_OPS and SK_SKB.
+///
+/// `accepted_ns` is sampled at `BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB`.
+/// Active-established confirmation replaces a pending value with BPF_EXIST;
+/// first data atomically deletes it and emits only when that delete succeeds.
+/// The socket cookie is the map key and remains authoritative for the socket
+/// lifetime; tuples are never used as the measurement identity.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcceptFirstByteState {
+    pub accepted_ns: u64,
+    pub phase: u32,
+    pub _pad: u32,
+}
+
+impl AcceptFirstByteState {
+    pub const fn pending(accepted_ns: u64) -> Self {
+        Self {
+            accepted_ns,
+            phase: ACCEPT_FIRST_BYTE_PHASE_PENDING,
+            _pad: 0,
+        }
+    }
+
+    pub const fn confirmed(accepted_ns: u64) -> Self {
+        Self {
+            accepted_ns,
+            phase: ACCEPT_FIRST_BYTE_PHASE_CONFIRMED,
+            _pad: 0,
+        }
+    }
+
+    /// Return a confirmed replacement only for a pending generation. The
+    /// kernel installs it with BPF_EXIST so concurrent first-data deletion
+    /// cannot be resurrected.
+    pub const fn confirm(self) -> Option<Self> {
+        if self.phase == ACCEPT_FIRST_BYTE_PHASE_PENDING {
+            Some(Self::confirmed(self.accepted_ns))
+        } else {
+            None
+        }
+    }
+
+    pub const fn is_confirmed(self) -> bool {
+        self.phase == ACCEPT_FIRST_BYTE_PHASE_CONFIRMED
+    }
+}
+
+pub const ACCEPT_FIRST_BYTE_PHASE_PENDING: u32 = 0;
+pub const ACCEPT_FIRST_BYTE_PHASE_CONFIRMED: u32 = 1;
+pub const ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES: u32 = 65_536;
+
+/// Correlation entries older than one hour are stale and never produce a
+/// sample. The maps are bounded independently; this age ceiling prevents a
+/// long-idle socket or corrupt timestamp from distorting the histogram.
+pub const ACCEPT_FIRST_BYTE_MAX_DELTA_NS: u64 = 3_600_000_000_000;
+
+/// Convert a monotonic accept/first-data timestamp pair to rounded-up
+/// microseconds. Reversed values (including `ktime` wrap), zero deltas, and
+/// stale/corrupt ages are rejected rather than saturated into a false sample.
+pub const fn accept_to_first_byte_us(accepted_ns: u64, first_data_ns: u64) -> Option<u64> {
+    if first_data_ns <= accepted_ns {
+        return None;
+    }
+    let delta_ns = first_data_ns - accepted_ns;
+    if delta_ns > ACCEPT_FIRST_BYTE_MAX_DELTA_NS {
+        return None;
+    }
+    Some((delta_ns + 999) / 1_000)
+}
+
 // `SockOpsRecord::event_type` discriminants. Matches the
 // `SockOpsEvent` enum on the userspace side.
 pub const SOCK_OPS_EVENT_CONNECT: u32 = 1;
@@ -679,8 +750,8 @@ pub const SOCK_OPS_EVENT_RST: u32 = 3;
 pub const SOCK_OPS_EVENT_FIN: u32 = 4;
 pub const SOCK_OPS_EVENT_RTT_SAMPLE: u32 = 5;
 pub const SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY: u32 = 6;
-/// Reserved discriminant. SOCK_OPS has no first-inbound-data-byte callback, so
-/// no kernel producer emits this value; userspace ignores it if observed.
+/// Produced by the SK_SKB first-application-data hook after the SOCK_OPS
+/// accept-side correlation state is confirmed.
 pub const SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY: u32 = 7;
 pub const SOCK_OPS_EVENT_DROP_REASON: u32 = 8;
 
@@ -917,6 +988,7 @@ mod userspace_pod {
         IncludePortsPolicy,
         CidrKey4,
         CidrKey6,
+        AcceptFirstByteState,
     );
 }
 
@@ -984,6 +1056,8 @@ mod tests {
         // SockOpsRecord: four u32 (16) + one u64 (8) = 24 bytes, 8-byte aligned.
         assert_eq!(mem::size_of::<SockOpsRecord>(), 24);
         assert_eq!(mem::align_of::<SockOpsRecord>(), 8);
+        assert_eq!(mem::size_of::<AcceptFirstByteState>(), 16);
+        assert_eq!(mem::align_of::<AcceptFirstByteState>(), 8);
     }
 
     #[test]
@@ -1000,6 +1074,7 @@ mod tests {
         assert_copy::<CidrKey6>();
         assert_copy::<IncludePortsPolicy>();
         assert_copy::<SockOpsRecord>();
+        assert_copy::<AcceptFirstByteState>();
         assert_copy::<WorkloadIdentity>();
     }
 
@@ -1068,8 +1143,8 @@ mod tests {
 
     #[test]
     fn sock_ops_event_discriminants_are_stable() {
-        // Wire ABI for the SOCK_OPS ringbuf. Discriminant 7 is reserved
-        // (accept-to-first-byte has no producer); 8 is drop-reason.
+        // Wire ABI for the BPF event ringbuf. Discriminant 7 is produced by
+        // SK_SKB accept-to-first-byte; 8 is drop-reason.
         assert_eq!(SOCK_OPS_EVENT_CONNECT, 1);
         assert_eq!(SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, 2);
         assert_eq!(SOCK_OPS_EVENT_RST, 3);

@@ -83,6 +83,12 @@ pub const BPF_MAP_SOCK_OPS_EVENTS: &str = "FERRUM_SOCK_OPS_EVENTS";
 /// ringbuf could not be reserved.
 pub const BPF_MAP_SOCK_OPS_STATS: &str = "FERRUM_SOCK_OPS_STATS";
 
+/// Bounded accepted-socket set carrying the SK_SKB first-data hook.
+pub const BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS: &str = "FERRUM_ACCEPT_FIRST_BYTE_SOCKETS";
+
+/// Accept timestamp/correlation phase keyed by accepted socket cookie.
+pub const BPF_MAP_ACCEPT_FIRST_BYTE_STATE: &str = "FERRUM_ACCEPT_FIRST_BYTE_STATE";
+
 /// Pinned path for the SOCK_OPS event ringbuf. Node-agent loads + pins;
 /// mesh-proxy opens by path. Both sides agree on the constant so no IPC is
 /// required.
@@ -102,6 +108,9 @@ pub const BPF_ORIG_DST6_PIN_PATH: &str = "/sys/fs/bpf/ferrum/orig_dst6";
 
 /// Program name of the SOCK_OPS kernel program in the ELF.
 pub const BPF_PROGRAM_SOCK_OPS: &str = "ferrum_sock_ops";
+
+pub const BPF_PROGRAM_FIRST_BYTE_PARSER: &str = "ferrum_first_byte_parser";
+pub const BPF_PROGRAM_FIRST_BYTE_VERDICT: &str = "ferrum_first_byte_verdict";
 
 /// Program name of the per-pod-veth direct-inbound guard classifier.
 pub const BPF_PROGRAM_TC_INBOUND: &str = "ferrum_tc_inbound";

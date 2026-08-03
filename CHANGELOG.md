@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- NodeWaypoint captured TCP observability now exports the bounded-cardinality
+  `ferrum_mesh_bpf_accept_to_first_byte_microseconds` histogram for IPv4 and
+  IPv6. SOCK_OPS timestamps passive establishment and enrolls the exact accepted
+  socket in a bounded SOCKHASH; an SK_SKB stream parser consumes the first
+  non-empty inbound application-data callback only after the existing orig-dst
+  bridge confirms capture. Socket-cookie identity, delete-wins/BPF_EXIST phase
+  transitions, close/first-data cleanup, LRU eviction, one-hour monotonic age
+  validation, and reload generation isolation prevent tuple/listener reuse, raced handoff,
+  stale state, and `ktime` wrap from fabricating samples. The metric has fixed
+  microsecond buckets with saturating count/bucket counters, drops sum overflow,
+  and adds no per-flow labels (#3309).
+
 - Audited admin mutations are durable **before they run** (issue #2421).
   The admin write gate fsyncs a pre-mutation audit intent — a stable event id
   plus the authenticated actor, method, sanitized path / namespace, canonical

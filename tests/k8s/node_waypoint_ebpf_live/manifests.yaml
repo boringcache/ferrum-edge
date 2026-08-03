@@ -62,6 +62,9 @@ spec:
         - name: curl
           image: curlimages/curl:8.10.1
           command: ["sh", "-c", "sleep 365d"]
+        - name: latency-client
+          image: python:3.12-alpine
+          command: ["sh", "-c", "sleep 365d"]
 ---
 apiVersion: apps/v1
 kind: Deployment

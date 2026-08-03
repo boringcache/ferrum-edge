@@ -71,26 +71,31 @@
 //!
 //! ## Accept-to-first-byte
 //!
-//! SOCK_OPS has no first-inbound-data-byte callback, so this program does **not**
-//! emit `SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY`. The discriminant remains
-//! reserved in the ABI; the public Prometheus surface omits that family until a
-//! verifier-safe producer exists.
+//! SOCK_OPS supplies the authoritative passive-established timestamp and
+//! accepted socket cookie, but has no first-data callback. It enrolls candidate
+//! accepted sockets in `FERRUM_ACCEPT_FIRST_BYTE_SOCKETS`; the SK_SKB stream
+//! parser observes the first non-empty receive buffer and emits the latency.
+//! Capture confirmation comes from the existing orig-dst active/passive bridge,
+//! so a same-port listener that did not receive a captured connection cannot
+//! produce a sample.
 
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::sock_ops;
 use aya_ebpf::programs::SockOpsContext;
 use aya_ebpf::EbpfContext;
 use ferrum_ebpf_common::{
-    sock_ops_peer_port_host_order, ConnTuple4, ConnTuple6, OrigDst4, OrigDst6, OrigDstKey,
-    SockOpsRecord, SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT,
+    AcceptFirstByteState, FERRUM_CAPTURE_CONFIG_KEY, sock_ops_peer_port_host_order, ConnTuple4,
+    ConnTuple6, OrigDst4, OrigDst6, OrigDstKey, SockOpsRecord, SOCK_OPS_DIRECTION_RECEIVED,
+    SOCK_OPS_DIRECTION_SENT,
     SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, SOCK_OPS_EVENT_CONNECT, SOCK_OPS_EVENT_FIN,
     SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE, SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY,
 };
 
 use crate::maps::{
-    FERRUM_ACCEPT_COOKIE_BY_TUPLE4, FERRUM_ACCEPT_COOKIE_BY_TUPLE6, FERRUM_ORIG_DST4,
-    FERRUM_ORIG_DST6, FERRUM_ORIG_DST_BY_TUPLE4, FERRUM_ORIG_DST_BY_TUPLE6,
-    FERRUM_SOCK_OPS_CONNECT_TS,
+    FERRUM_ACCEPT_COOKIE_BY_TUPLE4, FERRUM_ACCEPT_COOKIE_BY_TUPLE6,
+    FERRUM_ACCEPT_FIRST_BYTE_SOCKETS, FERRUM_ACCEPT_FIRST_BYTE_STATE, FERRUM_CAPTURE_CONFIG,
+    FERRUM_ORIG_DST4, FERRUM_ORIG_DST6, FERRUM_ORIG_DST_BY_TUPLE4,
+    FERRUM_ORIG_DST_BY_TUPLE6, FERRUM_SOCK_OPS_CONNECT_TS, remove_accept_first_byte_socket,
 };
 use crate::sock_ops_emit::emit;
 
@@ -167,12 +172,16 @@ fn handle_sock_ops(ctx: &SockOpsContext) {
             }
         }
         BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB => {
+            // Timestamp the callback boundary before bridge/map work so the
+            // metric interval begins at accept, not after correlation setup.
+            let accepted_ns = unsafe { bpf_ktime_get_ns() };
             // Server side accepted the connection; enable callbacks so we
             // capture FIN/RST/RTT for inbound connections too.
             let _ = ctx.set_cb_flags(ALL_SOCK_OPS_CB_FLAGS);
             // GAP-2M: re-stamp the orig-dst record under this accept-side
             // socket's cookie so the node-waypoint proxy can resolve it.
-            bridge_passive_established(ctx);
+            let capture_confirmed = bridge_passive_established(ctx);
+            track_accept_first_byte(ctx, capture_confirmed, accepted_ns);
             emit(SockOpsRecord {
                 event_type: SOCK_OPS_EVENT_ACCEPT_ESTABLISHED,
                 direction: 0,
@@ -197,6 +206,7 @@ fn handle_sock_ops(ctx: &SockOpsContext) {
             // pinned indefinitely on a low-churn node where the LRU never fills.
             if new_state == TCP_CLOSE {
                 cleanup_orig_dst_on_close(ctx);
+                cleanup_accept_first_byte_on_close(ctx);
             }
             emit_state_transition(old_state, new_state);
         }
@@ -298,6 +308,11 @@ const SK_OPS_REMOTE_IP4_OFF: usize = 24;
 const SK_OPS_LOCAL_IP4_OFF: usize = 28;
 const SK_OPS_REMOTE_PORT_OFF: usize = 64;
 const SK_OPS_LOCAL_PORT_OFF: usize = 68;
+// `bytes_received` counts application-data bytes and is 8-byte aligned at 168
+// in `struct bpf_sock_ops`. If non-zero at passive-established, data arrived
+// before the sockhash handoff and there is no sound first-byte timestamp.
+const SK_OPS_BYTES_RECEIVED_OFF: usize = 168;
+const BPF_EXIST: u64 = 2;
 
 // IPv6 address words. `struct bpf_sock_ops` lays them out immediately after the
 // v4 addresses: `__u32 remote_ip6[4]` at 32 (words 32/36/40/44) and
@@ -320,6 +335,13 @@ fn read_ctx_u32(ctx: &SockOpsContext, byte_off: usize) -> u32 {
     // Safety: `byte_off` is a valid `bpf_sock_ops` field offset (4-byte aligned,
     // within bounds); the verifier validates the ctx access at load time.
     unsafe { core::ptr::read_volatile((ctx.as_ptr() as *const u8).add(byte_off) as *const u32) }
+}
+
+#[inline(always)]
+fn read_ctx_u64(ctx: &SockOpsContext, byte_off: usize) -> u64 {
+    // Safety: `byte_off` is a valid, 8-byte-aligned `bpf_sock_ops` field. A
+    // single volatile load prevents LLVM from combining it with neighbors.
+    unsafe { core::ptr::read_volatile((ctx.as_ptr() as *const u8).add(byte_off) as *const u64) }
 }
 
 /// Read a 128-bit `bpf_sock_ops` IPv6 address as four independent `u32` ctx
@@ -370,6 +392,7 @@ fn bridge_active_established_v4(ctx: &SockOpsContext) {
         let _ = FERRUM_ORIG_DST_BY_TUPLE4.insert(&any_tuple, &orig, 0);
         if let Some(accept_cookie) = accept_cookie_for_tuple4(&tuple, &any_tuple) {
             stamp_accept_orig_dst4(accept_cookie, &orig);
+            confirm_accept_first_byte(accept_cookie);
             cleanup_tuple4(&tuple);
             cleanup_tuple4(&any_tuple);
         }
@@ -391,6 +414,7 @@ fn bridge_active_established_v6(ctx: &SockOpsContext) {
         let _ = FERRUM_ORIG_DST_BY_TUPLE6.insert(&any_tuple, &orig, 0);
         if let Some(accept_cookie) = accept_cookie_for_tuple6(&tuple, &any_tuple) {
             stamp_accept_orig_dst6(accept_cookie, &orig);
+            confirm_accept_first_byte(accept_cookie);
             cleanup_tuple6(&tuple);
             cleanup_tuple6(&any_tuple);
         }
@@ -405,16 +429,16 @@ fn bridge_active_established_v6(ctx: &SockOpsContext) {
 /// The tuple entry is consumed on a hit. Dispatches by address family; any
 /// non-IP family is ignored.
 #[inline(always)]
-fn bridge_passive_established(ctx: &SockOpsContext) {
+fn bridge_passive_established(ctx: &SockOpsContext) -> bool {
     match ctx.family() {
         AF_INET => bridge_passive_established_v4(ctx),
         AF_INET6 => bridge_passive_established_v6(ctx),
-        _ => {}
+        _ => false,
     }
 }
 
 #[inline(always)]
-fn bridge_passive_established_v4(ctx: &SockOpsContext) {
+fn bridge_passive_established_v4(ctx: &SockOpsContext) -> bool {
     let cookie = socket_cookie(ctx);
     // Passive side mirrors the active tuple: the remote socket addr/port is the
     // client, the local addr/port is the loopback server. The netns cookie is
@@ -426,9 +450,11 @@ fn bridge_passive_established_v4(ctx: &SockOpsContext) {
         stamp_accept_orig_dst4(cookie, &orig);
         cleanup_tuple4(&tuple);
         cleanup_tuple4(&any_tuple);
+        true
     } else {
         let _ = FERRUM_ACCEPT_COOKIE_BY_TUPLE4.insert(&tuple, &cookie, 0);
         let _ = FERRUM_ACCEPT_COOKIE_BY_TUPLE4.insert(&any_tuple, &cookie, 0);
+        false
     }
 }
 
@@ -437,7 +463,7 @@ fn bridge_passive_established_v4(ctx: &SockOpsContext) {
 /// in the same byte order, and re-stamps `FERRUM_ORIG_DST6` under the accept-side
 /// cookie. A miss leaves resolution fail-closed.
 #[inline(always)]
-fn bridge_passive_established_v6(ctx: &SockOpsContext) {
+fn bridge_passive_established_v6(ctx: &SockOpsContext) -> bool {
     let cookie = socket_cookie(ctx);
     let tuple = passive_tuple6(ctx);
     let any_tuple = tuple.any_netns();
@@ -445,10 +471,84 @@ fn bridge_passive_established_v6(ctx: &SockOpsContext) {
         stamp_accept_orig_dst6(cookie, &orig);
         cleanup_tuple6(&tuple);
         cleanup_tuple6(&any_tuple);
+        true
     } else {
         let _ = FERRUM_ACCEPT_COOKIE_BY_TUPLE6.insert(&tuple, &cookie, 0);
         let _ = FERRUM_ACCEPT_COOKIE_BY_TUPLE6.insert(&any_tuple, &cookie, 0);
+        false
     }
+}
+
+/// Enroll one accepted capture-listener socket for SK_SKB first-data
+/// observation. Port matching only bounds candidate enrollment; the orig-dst
+/// bridge must independently confirm the connection before it can emit.
+#[inline(always)]
+fn track_accept_first_byte(
+    ctx: &SockOpsContext,
+    capture_confirmed: bool,
+    accepted_ns: u64,
+) {
+    let Some(config) = (unsafe { FERRUM_CAPTURE_CONFIG.get(&FERRUM_CAPTURE_CONFIG_KEY) }) else {
+        return;
+    };
+    if read_ctx_u32(ctx, SK_OPS_LOCAL_PORT_OFF) != config.outbound_capture_port {
+        return;
+    }
+    if read_ctx_u64(ctx, SK_OPS_BYTES_RECEIVED_OFF) != 0 {
+        // TCP Fast Open or already-queued data predates enrollment. Sampling a
+        // later parser callback would fabricate the first-byte boundary.
+        return;
+    }
+
+    let cookie = socket_cookie(ctx);
+    let state = if capture_confirmed {
+        AcceptFirstByteState::confirmed(accepted_ns)
+    } else {
+        AcceptFirstByteState::pending(accepted_ns)
+    };
+    if FERRUM_ACCEPT_FIRST_BYTE_STATE
+        .insert(&cookie, &state, 0)
+        .is_err()
+    {
+        return;
+    }
+
+    // Safety: SockHash::update requires the live sock_ops context so the
+    // kernel retains this exact accepted socket, not a tuple-selected peer.
+    let sk_ops = unsafe {
+        &mut *(ctx.as_ptr() as *mut aya_ebpf::bindings::bpf_sock_ops)
+    };
+    let mut key = cookie;
+    if FERRUM_ACCEPT_FIRST_BYTE_SOCKETS
+        .update(&mut key, sk_ops, 0)
+        .is_err()
+    {
+        let _ = FERRUM_ACCEPT_FIRST_BYTE_STATE.remove(&cookie);
+    }
+}
+
+/// Confirm a passive-first candidate after the active orig-dst bridge proves
+/// it belongs to the captured connection. A first-data callback atomically
+/// deletes its state; BPF_EXIST makes a raced confirmation fail rather than
+/// recreate that terminal generation.
+#[inline(always)]
+fn confirm_accept_first_byte(cookie: u64) {
+    let Some(state) = (unsafe { FERRUM_ACCEPT_FIRST_BYTE_STATE.get(&cookie) }).copied() else {
+        return;
+    };
+    let Some(confirmed) = state.confirm() else {
+        return;
+    };
+    // BPF_EXIST (2) is load-bearing: first-data deletion wins over a raced
+    // confirmation and the terminal state can never be resurrected.
+    let _ = FERRUM_ACCEPT_FIRST_BYTE_STATE.insert(&cookie, &confirmed, BPF_EXIST);
+}
+
+#[inline(always)]
+fn cleanup_accept_first_byte_on_close(ctx: &SockOpsContext) {
+    let cookie = socket_cookie(ctx);
+    let _ = FERRUM_ACCEPT_FIRST_BYTE_STATE.remove(&cookie);
+    remove_accept_first_byte_socket(&cookie);
 }
 
 #[inline(always)]

@@ -1,10 +1,9 @@
 //! Userspace consumer for the SOCK_OPS ringbuf.
 //!
-//! The kernel-side `BPF_PROG_TYPE_SOCK_OPS` program emits one record per
-//! TCP-layer event (Connect, AcceptEstablished, Rst, FinSent/Received,
-//! RttSample) and the connect4/connect6 hooks emit one record per BPF
-//! drop-reason hit. Userspace polls the ringbuf, decodes the records, and
-//! updates the shared [`BpfMetricsState`].
+//! The kernel-side `BPF_PROG_TYPE_SOCK_OPS` program emits TCP lifecycle and
+//! handshake records, the SK_SKB parser emits captured accept-to-first-byte,
+//! and connect4/connect6 emit BPF drop-reason records. Userspace polls the
+//! shared ringbuf, decodes records, and updates [`BpfMetricsState`].
 //!
 //! ## Production wiring (GAP-3D)
 //!
@@ -36,7 +35,8 @@ use std::sync::Arc;
 use ferrum_ebpf_common::{
     SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT, SOCK_OPS_DROP_BYPASS_UID_HIT,
     SOCK_OPS_DROP_EXCLUDE_CIDR_HIT, SOCK_OPS_DROP_EXCLUDE_PORT_HIT,
-    SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR, SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, SOCK_OPS_EVENT_CONNECT,
+    SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR, SOCK_OPS_EVENT_ACCEPT_ESTABLISHED,
+    SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY, SOCK_OPS_EVENT_CONNECT,
     SOCK_OPS_EVENT_DROP_REASON, SOCK_OPS_EVENT_FIN, SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE,
     SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, SockOpsRecord,
 };
@@ -56,8 +56,7 @@ pub const SOCK_OPS_RECOVERY_THRESHOLD: u32 = 3;
 /// keyed by `event_type` plus a small payload. The userspace decoder maps
 /// those records into this shape so the counter logic stays decoupled
 /// from the BPF wire format. When the wire format evolves, only
-/// `SockOpsEvent::decode` (separate module, lands with the BPF program)
-/// has to change.
+/// [`SockOpsEvent::from_record`] has to change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SockOpsEvent {
     Connect,
@@ -72,6 +71,9 @@ pub enum SockOpsEvent {
         srtt_us: u64,
     },
     SynToAckLatency {
+        us: u64,
+    },
+    AcceptToFirstByteLatency {
         us: u64,
     },
     DropReason(BpfDropReason),
@@ -108,8 +110,9 @@ impl SockOpsEvent {
                 srtt_us: record.value,
             }),
             SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY => Some(Self::SynToAckLatency { us: record.value }),
-            // Accept-to-first-byte (discriminant 7) has no kernel producer;
-            // fall through to None so reserved records are ignored.
+            SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY => {
+                Some(Self::AcceptToFirstByteLatency { us: record.value })
+            }
             SOCK_OPS_EVENT_DROP_REASON => Some(Self::DropReason(drop_reason?)),
             _ => None,
         }
@@ -172,6 +175,9 @@ impl SockOpsConsumer {
             SockOpsEvent::Fin { direction } => self.metrics.record_fin(direction),
             SockOpsEvent::RttSample { srtt_us } => self.metrics.record_srtt_sample(srtt_us),
             SockOpsEvent::SynToAckLatency { us } => self.metrics.record_syn_to_ack(us),
+            SockOpsEvent::AcceptToFirstByteLatency { us } => {
+                self.metrics.record_accept_to_first_byte(us)
+            }
             SockOpsEvent::DropReason(reason) => self.metrics.record_drop(reason),
         }
     }
@@ -674,6 +680,7 @@ mod tests {
         });
         consumer.handle_event(SockOpsEvent::RttSample { srtt_us: 250 });
         consumer.handle_event(SockOpsEvent::SynToAckLatency { us: 60 });
+        consumer.handle_event(SockOpsEvent::AcceptToFirstByteLatency { us: 800 });
         consumer.handle_event(SockOpsEvent::DropReason(BpfDropReason::BypassUidHit));
 
         let s = snap(&consumer);
@@ -685,9 +692,11 @@ mod tests {
         assert_eq!(s.srtt_sample_us_sum, 250);
         assert_eq!(s.srtt_count, 1);
         assert_eq!(s.syn_to_ack_us_sum, 60);
+        assert_eq!(s.accept_to_first_byte_us_sum, 800);
+        assert_eq!(s.accept_to_first_byte_count, 1);
         assert_eq!(s.drop_bypass_uid_hit, 1);
         // Every handled event also bumps the consumed-events counter.
-        assert_eq!(s.ringbuf_events_consumed, 9);
+        assert_eq!(s.ringbuf_events_consumed, 10);
     }
 
     #[test]
@@ -742,10 +751,14 @@ mod tests {
             SockOpsEvent::from_record(rec(SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, 0, 0, 60)),
             Some(SockOpsEvent::SynToAckLatency { us: 60 })
         );
-        // Reserved accept-to-first-byte discriminant has no producer — ignored.
-        assert!(
-            SockOpsEvent::from_record(rec(SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY, 0, 0, 800))
-                .is_none()
+        assert_eq!(
+            SockOpsEvent::from_record(rec(
+                SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY,
+                0,
+                0,
+                800,
+            )),
+            Some(SockOpsEvent::AcceptToFirstByteLatency { us: 800 })
         );
 
         for (raw, expected) in [

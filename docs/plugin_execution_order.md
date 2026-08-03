@@ -14,7 +14,8 @@ documents that contract even though no request hook ever fires.
 
 `__mesh_bpf_metrics` is a reserved, mesh-auto-injected plugin (NodeWaypoint
 topology). Operators should not configure it directly; the mesh runtime injects
-it so the BPF SOCK_OPS event consumer can expose TCP-layer Prometheus counters.
+it so the BPF event consumer can expose TCP-layer Prometheus counters and
+SOCK_OPS+SK_SKB accept-to-first-application-byte latency.
 It declares all protocols so an accidental non-mesh attachment is not silently
 dropped, but it implements no request/response/stream hooks.
 
@@ -1240,7 +1241,7 @@ Given all built-in plugins enabled, the execution order is:
 | 78 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
 | 79 | `api_chargeback_sink` | 9351 | log, on_stream_disconnect, on_ws_disconnect |
 | 80 | `workload_metrics` | 9360 | on_request_received, before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
-| 81 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer) |
+| 81 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF event consumer) |
 | 82 | `transaction_log_schema` | 9999 | (config-only; no lifecycle hooks — priority retained for schema-registration inventory/order) |
 
 ### Config-only and reserved inventory rows
@@ -1251,7 +1252,7 @@ Given all built-in plugins enabled, the execution order is:
   priority value itself is not used for request-phase ordering because the instance
   is discarded after registry staging.
 - `__mesh_bpf_metrics` (9365) is reserved for NodeWaypoint mesh auto-injection. It is
-  a passive Prometheus surface fed by the BPF SOCK_OPS consumer and intentionally
+  a passive Prometheus surface fed by the BPF event consumer and intentionally
   overrides no lifecycle hooks.
 
 
@@ -1601,7 +1602,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `api_chargeback` | ✓ | ✓ | ✓ | ✓ | ✓ | In-memory charge accumulator for HTTP-family, WebSocket bandwidth, and stream sessions |
 | `api_chargeback_sink` | ✓ | ✓ | ✓ | ✓ | ✓ | Durable ClickHouse charge event/snapshot exporter |
 | `workload_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Adds Istio/GAMMA mesh identity labels to metadata |
-| `__mesh_bpf_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Reserved/auto-injected NodeWaypoint BPF SOCK_OPS Prometheus surface (counters + fixed latency histograms); no request hooks |
+| `__mesh_bpf_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Reserved/auto-injected NodeWaypoint BPF Prometheus surface (counters + fixed latency histograms); no request hooks |
 | `transaction_log_schema` | — | — | — | — | — | Config-only: registers named log schemas during cache rebuild; no protocol hooks (ordering priority 9999) |
 
 Protocol-filtered plugin lists are pre-computed in `PluginCache` at config reload time, so there is zero filtering cost on the hot path.
