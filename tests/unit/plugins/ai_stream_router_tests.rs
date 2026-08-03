@@ -3351,9 +3351,12 @@ async fn test_gzip_streaming_decode_rejects_amplification_bomb() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("bounded decoding inspector");
-    // Tiny gzip of highly compressible zeros expands past 1024:1 well before the
-    // absolute 8 MiB layer ceiling.
-    let zeros = vec![0u8; 2 * 1024 * 1024];
+    // Keep the decoded fixture at (not above) the absolute 8 MiB layer ceiling,
+    // while its gzip representation crosses the independent 1024:1 ratio. A
+    // 2 MiB zero buffer is only about 1015:1 with the hosted miniz backend, so
+    // it never exercises the amplification guard and made this test fail on its
+    // own precondition before reaching production code.
+    let zeros = vec![0u8; 8 * 1024 * 1024];
     let encoded = gzip_bytes(&zeros);
     assert!(
         encoded
