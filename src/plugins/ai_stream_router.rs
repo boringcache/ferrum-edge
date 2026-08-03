@@ -1152,9 +1152,10 @@ fn gemini_message_content_text(content: &Value) -> Result<String, String> {
                 "content[{index}] is not a Gemini-representable text part"
             ));
         }
-        let text = object.get("text").and_then(Value::as_str).ok_or_else(|| {
-            format!("content[{index}] text part is malformed")
-        })?;
+        let text = object
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("content[{index}] text part is malformed"))?;
         if text.is_empty() {
             continue;
         }
@@ -4979,10 +4980,7 @@ impl GeminiStreamNormalizer {
             .is_some_and(|state| state.finished)
     }
 
-    fn reject_post_finish_candidate(
-        &mut self,
-        out: &mut NormalizedSseOut,
-    ) -> bool {
+    fn reject_post_finish_candidate(&mut self, out: &mut NormalizedSseOut) -> bool {
         self.emit_upstream_error(
             "upstream provider sent Gemini candidate output after a terminal finishReason; stream terminated",
             out,
@@ -5681,9 +5679,11 @@ impl GeminiStreamNormalizer {
             }
             GeminiJsonArrayState::Inactive | GeminiJsonArrayState::Closed => {}
         }
-        if self.candidates.values().any(|state| {
-            state.emitted_client_visible && !state.finished
-        }) {
+        if self
+            .candidates
+            .values()
+            .any(|state| state.emitted_client_visible && !state.finished)
+        {
             self.emit_upstream_error(
                 "upstream provider closed the Gemini stream before every candidate reached a terminal finishReason",
                 out,

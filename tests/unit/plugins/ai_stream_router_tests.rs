@@ -6741,7 +6741,10 @@ async fn test_gemini_rejects_unrepresentable_message_content_at_claim() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 400);
-            assert!(body.contains("malformed") || body.contains("content"), "{body}");
+            assert!(
+                body.contains("malformed") || body.contains("content"),
+                "{body}"
+            );
         }
         other => panic!("malformed text part must reject: {other:?}"),
     }
@@ -6962,11 +6965,7 @@ async fn test_gemini_2xx_content_type_lifecycle_fail_closed() {
             plugin.after_proxy(&mut ctx, 400, &mut resp_headers).await,
             PluginResult::Continue
         ));
-        assert!(
-            plugin
-                .response_stream_inspector(&ctx, 400, None)
-                .is_none()
-        );
+        assert!(plugin.response_stream_inspector(&ctx, 400, None).is_none());
         assert!(
             plugin
                 .normalize_response_body_with_context(
@@ -7018,10 +7017,7 @@ async fn test_gemini_malformed_candidate_fields_fail_closed() {
     );
     let out = run_gemini_normalizer(4096, extra_fields, "text/event-stream").await;
     assert!(out.contains("upstream_error"), "{out}");
-    assert!(
-        out.contains("unrepresentable additional fields"),
-        "{out}"
-    );
+    assert!(out.contains("unrepresentable additional fields"), "{out}");
     assert!(
         !out.contains("\"content\":\"keep\""),
         "must not emit representable subset: {out}"
