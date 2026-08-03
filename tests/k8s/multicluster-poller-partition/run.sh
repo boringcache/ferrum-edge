@@ -124,6 +124,7 @@ run_wait_predicate() {
     projected_config_withdrawn) projected_config_withdrawn "$@" ;;
     proxy_activity_increased) proxy_activity_increased "$@" ;;
     state_matches) state_matches "$@" ;;
+    trust_state_matches) trust_state_matches "$@" ;;
     traffic_not_found) traffic_not_found "$@" ;;
     traffic_once) traffic_once "$@" ;;
     *) echo "unsupported wait predicate: $predicate" >&2; return 2 ;;
@@ -433,6 +434,13 @@ state_matches() {
       state-matches "$peer" "$discovered" "$trust_source" "$outbound" "$inbound"
 }
 
+trust_state_matches() {
+  local context="$1" token="$2" peer="$3" trust_source="$4" outbound="$5" inbound="$6"
+  admin_json "$context" "$token" | \
+    python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+      trust-state-matches "$peer" "$trust_source" "$outbound" "$inbound"
+}
+
 no_configured_state() {
   admin_json "$1" "$2" | \
     python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
@@ -644,13 +652,15 @@ scenario_endpoint_expiry() {
 
 scenario_trust_expiry() {
   set_proxy "$FED_AB" false; set_proxy "$FED_BA" false
-  wait_until "A trust stale eviction" 50 state_matches "$CONTEXT_A" "$JWT_A" cluster-b false none false false
-  wait_until "B trust stale eviction" 50 state_matches "$CONTEXT_B" "$JWT_B" cluster-a false none false false
+  # Trust and endpoint-discovery caches expire independently. Assert trust is
+  # inactive here; the exact 404 checks below prove effective route removal.
+  wait_until "A trust stale eviction" 50 trust_state_matches "$CONTEXT_A" "$JWT_A" cluster-b none false false
+  wait_until "B trust stale eviction" 50 trust_state_matches "$CONTEXT_B" "$JWT_B" cluster-a none false false
   wait_until "A trust fail closed with no-route reason" 15 traffic_not_found "$CONTEXT_A" echo-b
   wait_until "B trust fail closed with no-route reason" 15 traffic_not_found "$CONTEXT_B" echo-a
   capture_boundary "$CONTEXT_A" "$JWT_A" poller.trust.expired_fail_closed_recomputed
   record multicluster_poller.trust.expired_fail_closed pass "trust-window-12s-bidirectional-404-Not-Found" "poller.trust.expired_fail_closed_recomputed.{json,prom}"
-  record multicluster_poller.trust.inbound_outbound_recomputed pass "outbound=false-inbound=false-discovered=false" "poller.trust.expired_fail_closed_recomputed.json"
+  record multicluster_poller.trust.inbound_outbound_recomputed pass "trust-source=none-outbound=false-inbound=false-bidirectional-404-Not-Found" "poller.trust.expired_fail_closed_recomputed.json"
   set_proxy "$FED_AB" true; set_proxy "$FED_BA" true
   wait_until "A trust same-generation recovery" 60 state_matches "$CONTEXT_A" "$JWT_A" cluster-b true polled true true
   wait_until "B trust same-generation recovery" 60 state_matches "$CONTEXT_B" "$JWT_B" cluster-a true polled true true
