@@ -1238,7 +1238,11 @@ fn mock_hanging_status_probe_client(release: oneshot::Receiver<()>) -> Client {
         let release = release.clone();
         async move {
             assert_status_probe_list_request(&request);
-            if let Some(rx) = release.lock().expect("lock hang gate").take() {
+            // Drop the synchronous MutexGuard before awaiting so the tower
+            // service future remains Send and never holds a blocking lock
+            // across a suspension point.
+            let rx = { release.lock().expect("lock hang gate").take() };
+            if let Some(rx) = rx {
                 // Park until the sender is dropped or the outer timeout cancels
                 // this future — no spawn, no wall-clock sleep, no task leak.
                 let _ = rx.await;
