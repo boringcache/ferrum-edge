@@ -139,6 +139,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- DestinationRule-only create/update/removal now atomically republishes the
+  affected route table (and LB) before mesh status/revision reports the
+  generation programmed (#3243). `#[serde(skip)]` DR-derived proxy projections
+  (`dispatch_port_overrides`, `dispatch_port_override_fallback`, `resolved_tls`,
+  and mesh stream-relay dispatch maps) are compared even when serialized proxy
+  `updated_at` is unchanged — including the empty-`ConfigDelta` publish path —
+  so route-held `Arc<Proxy>` values cannot stay stale until an unrelated event.
 - Durable `api_chargeback_sink` ClickHouse requests now pin
   `wait_for_async_insert=1` whenever the setting is omitted, even when Ferrum
   also omits `async_insert`. This prevents a ClickHouse user/profile default
