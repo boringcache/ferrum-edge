@@ -4150,10 +4150,14 @@ mod tests {
             "grpc-timeout",
             hyper::header::HeaderValue::from_static("3S"),
         );
+        // The post-plugin materialized view must carry an unchanged client
+        // `grpc-timeout`; an empty `proxy_headers` represents a plugin removal,
+        // not passthrough of the pristine inbound header.
+        let proxy_headers = HashMap::from([("grpc-timeout".to_string(), "3S".to_string())]);
         assert_eq!(
             streaming_post_header_upload_timeout_ms_after_proxy_headers(
                 &request_headers,
-                &HashMap::new(),
+                &proxy_headers,
                 &proxy,
             ),
             Some(3_000),
