@@ -6523,9 +6523,10 @@ async fn test_gemini_claim_injects_alt_sse_and_goog_api_key() {
     );
     let effective =
         ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
-    assert!(
-        effective.contains("alt=sse"),
-        "committed backend query must include alt=sse, got {effective}"
+    assert_eq!(
+        effective,
+        "alt=sse",
+        "committed backend query must be exactly alt=sse, got {effective}"
     );
     assert_eq!(
         ctx.metadata
@@ -7315,6 +7316,7 @@ async fn test_gemini_malformed_and_oversized_events_fail_closed() {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert_bound_termination(&text, "oversized");
+            assert_eq!(text.matches("data: [DONE]").count(), 1, "{text}");
         }
         other => panic!("oversized complete event must terminate: {other:?}"),
     }
