@@ -1,23 +1,46 @@
 //! Unit coverage for CP-side mesh slice drift tracking (issue #3265).
 
+use std::sync::{Arc, Barrier};
+
+use arc_swap::ArcSwap;
 use chrono::{Duration, TimeZone, Utc};
+use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::grpc::cp_server::CpScope;
 use ferrum_edge::grpc::mesh_slice_drift::{
-    MESH_SLICE_DRIFT_MAX_ENTRIES, MESH_SLICE_DRIFT_MAX_REASON_CHARS, MeshSliceConvergenceState,
-    MeshSliceDriftAdmitError, MeshSliceDriftRegistry, sanitize_reason,
+    MESH_SLICE_DRIFT_MAX_ENTRIES, MESH_SLICE_DRIFT_MAX_REASON_BYTES,
+    MESH_SLICE_DRIFT_REJECTION_REASON, MeshSliceConvergenceState, MeshSliceDriftAdmitError,
+    MeshSliceDriftRegistry, sanitize_reason, validate_version,
 };
+use ferrum_edge::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+
+fn at(second: u32) -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, second)
+        .unwrap()
+}
+
+fn open(registry: &MeshSliceDriftRegistry, node_id: &str, when: chrono::DateTime<Utc>) -> String {
+    registry
+        .open_session(node_id, "ferrum", when, Some("v1"))
+        .expect("open")
+}
 
 #[test]
 fn desired_sent_ack_converges_and_drift_flags_clear() {
     let registry = MeshSliceDriftRegistry::new();
-    let connected_at = Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, 0).unwrap();
+    let connected_at = at(0);
+    let token = open(&registry, "dp-a", connected_at);
     registry
-        .open_session("dp-a", "ferrum", connected_at, Some("v1"))
-        .expect("open");
-    registry
-        .record_sent("dp-a", connected_at, "v1", connected_at)
+        .record_sent("dp-a", &token, "v1", connected_at)
         .expect("sent");
     registry
-        .record_status("dp-a", "v1", None, connected_at + Duration::seconds(1))
+        .record_status(
+            "dp-a",
+            &token,
+            "v1",
+            None,
+            connected_at + Duration::seconds(1),
+        )
         .expect("ack");
 
     let snap = registry.snapshot();
@@ -31,99 +54,145 @@ fn desired_sent_ack_converges_and_drift_flags_clear() {
 }
 
 #[test]
-fn desired_ahead_of_ack_marks_drifted() {
+fn reports_require_connected_current_session_and_current_sent_version() {
     let registry = MeshSliceDriftRegistry::new();
-    let connected_at = Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, 0).unwrap();
+    let first = at(0);
+    let second = at(1);
+    let first_token = open(&registry, "dp-a", first);
     registry
-        .open_session("dp-a", "ferrum", connected_at, Some("v1"))
+        .record_sent("dp-a", &first_token, "v1", first)
         .unwrap();
-    registry
-        .record_sent("dp-a", connected_at, "v1", connected_at)
-        .unwrap();
-    registry
-        .record_status("dp-a", "v1", None, connected_at)
-        .unwrap();
-    registry.set_desired_for_namespace("ferrum", "v2", connected_at + Duration::seconds(5));
 
-    let entry = &registry.snapshot().data_planes[0];
-    assert_eq!(entry.convergence, MeshSliceConvergenceState::Drifted);
-    assert!(entry.drift.desired_vs_sent);
-    assert!(entry.drift.desired_vs_acknowledged);
-}
-
-#[test]
-fn nack_reason_is_sanitized_and_marks_rejecting() {
-    let registry = MeshSliceDriftRegistry::new();
-    let connected_at = Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, 0).unwrap();
+    // Replacement can deliver the same version, so time/version alone cannot
+    // bind a delayed report. Only the new opaque token is authoritative.
+    let second_token = open(&registry, "dp-a", second);
     registry
-        .open_session("dp-a", "ferrum", connected_at, Some("v1"))
+        .record_sent("dp-a", &second_token, "v1", second)
         .unwrap();
-    let raw = format!(
-        "bad\nslice{}",
-        "x".repeat(MESH_SLICE_DRIFT_MAX_REASON_CHARS + 8)
+    assert_ne!(first_token, second_token);
+    assert_eq!(
+        registry
+            .record_status("dp-a", &first_token, "v1", None, second)
+            .expect_err("stale replacement report"),
+        MeshSliceDriftAdmitError::SessionMismatch
     );
-    registry
-        .record_status("dp-a", "v1", Some(&raw), connected_at)
-        .unwrap();
+    assert_eq!(
+        registry
+            .record_status("dp-a", &second_token, "v0", None, second)
+            .expect_err("not current sent version"),
+        MeshSliceDriftAdmitError::VersionMismatch
+    );
+    assert!(registry.snapshot().data_planes[0].acknowledged.is_none());
 
-    let entry = &registry.snapshot().data_planes[0];
-    assert_eq!(entry.convergence, MeshSliceConvergenceState::Rejecting);
-    let rejected = entry.rejected.as_ref().expect("rejected");
-    assert!(!rejected.reason.contains('\n'));
-    assert!(rejected.reason.contains("(truncated)"));
-    assert_eq!(sanitize_reason("\u{0000}"), "unspecified");
+    registry.mark_disconnected("dp-a", &second_token, second);
+    assert_eq!(
+        registry
+            .record_status("dp-a", &second_token, "v1", None, second)
+            .expect_err("disconnected report"),
+        MeshSliceDriftAdmitError::DisconnectedNode
+    );
 }
 
 #[test]
-fn replacement_session_and_stale_disconnect_are_generation_safe() {
+fn nack_reason_discards_caller_text_and_is_strictly_bounded() {
     let registry = MeshSliceDriftRegistry::new();
-    let first = Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, 0).unwrap();
-    let second = Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, 1).unwrap();
+    let connected_at = at(0);
+    let token = open(&registry, "dp-a", connected_at);
     registry
-        .open_session("dp-a", "ferrum", first, Some("v1"))
+        .record_sent("dp-a", &token, "v1", connected_at)
+        .unwrap();
+    let secret_bearing = "Bearer secret-token\npassword=hunter2\u{0000}";
+    registry
+        .record_status(
+            "dp-a",
+            &token,
+            "v1",
+            Some(secret_bearing),
+            connected_at,
+        )
+        .unwrap();
+
+    let rejected = registry.snapshot().data_planes[0]
+        .rejected
+        .clone()
+        .expect("rejected");
+    assert_eq!(rejected.reason, MESH_SLICE_DRIFT_REJECTION_REASON);
+    assert!(rejected.reason.len() <= MESH_SLICE_DRIFT_MAX_REASON_BYTES);
+    assert!(!rejected.reason.contains("secret"));
+    assert_eq!(sanitize_reason("\u{0000}"), MESH_SLICE_DRIFT_REJECTION_REASON);
+    assert_eq!(sanitize_reason("   "), MESH_SLICE_DRIFT_REJECTION_REASON);
+    assert_eq!(sanitize_reason(""), "unspecified");
+}
+
+#[test]
+fn version_validation_is_exact_control_safe_and_byte_bounded() {
+    assert_eq!(
+        validate_version(" v1").unwrap_err(),
+        MeshSliceDriftAdmitError::VersionHasSurroundingWhitespace
+    );
+    assert_eq!(
+        validate_version("v1 ").unwrap_err(),
+        MeshSliceDriftAdmitError::VersionHasSurroundingWhitespace
+    );
+    assert_eq!(
+        validate_version("v\u{007f}1").unwrap_err(),
+        MeshSliceDriftAdmitError::VersionHasControlCharacter
+    );
+    assert!(validate_version(&"x".repeat(256)).is_ok());
+    assert!(validate_version(&"é".repeat(128)).is_ok());
+    assert_eq!(
+        validate_version(&"é".repeat(129)).unwrap_err(),
+        MeshSliceDriftAdmitError::VersionTooLong
+    );
+    let oversized_whitespace = format!("{}v1{}", " ".repeat(4096), " ".repeat(4096));
+    assert_eq!(
+        validate_version(&oversized_whitespace).unwrap_err(),
+        MeshSliceDriftAdmitError::VersionTooLong
+    );
+}
+
+#[test]
+fn maintenance_republishes_advancing_ages_without_removal() {
+    let registry = MeshSliceDriftRegistry::new();
+    let connected_at = at(0);
+    let token = open(&registry, "dp-a", connected_at);
+    registry
+        .record_sent("dp-a", &token, "v1", connected_at)
         .unwrap();
     registry
-        .open_session("dp-a", "ferrum", second, Some("v2"))
+        .record_status("dp-a", &token, "v1", None, connected_at)
         .unwrap();
-    registry.mark_disconnected("dp-a", first);
+
+    let maintenance_at = connected_at + Duration::seconds(42);
+    assert_eq!(
+        registry.reap_expired(maintenance_at, Duration::seconds(300)),
+        0
+    );
+    let snapshot = registry.snapshot();
+    assert_eq!(snapshot.generated_at, maintenance_at);
+    assert_eq!(snapshot.data_planes[0].sent.as_ref().unwrap().age_seconds, 42);
+    assert_eq!(
+        snapshot.data_planes[0]
+            .acknowledged
+            .as_ref()
+            .unwrap()
+            .age_seconds,
+        42
+    );
+}
+
+#[test]
+fn disconnect_retention_and_reap_are_session_safe() {
+    let registry = MeshSliceDriftRegistry::new();
+    let connected_at = at(0);
+    let stale_token = open(&registry, "dp-a", connected_at);
+    let current_token = open(&registry, "dp-a", at(1));
+    registry.mark_disconnected("dp-a", &stale_token, at(1));
     assert!(registry.snapshot().data_planes[0].connected);
-
-    registry
-        .record_sent("dp-a", first, "v-stale", second)
-        .unwrap();
-    assert_eq!(
-        registry.snapshot().data_planes[0]
-            .sent
-            .as_ref()
-            .map(|s| s.version.as_str()),
-        None
-    );
-
-    registry.record_sent("dp-a", second, "v2", second).unwrap();
-    assert_eq!(
-        registry.snapshot().data_planes[0]
-            .sent
-            .as_ref()
-            .map(|s| s.version.as_str()),
-        Some("v2")
-    );
-}
-
-#[test]
-fn disconnect_retention_and_reap() {
-    let registry = MeshSliceDriftRegistry::new();
-    let connected_at = Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, 0).unwrap();
-    registry
-        .open_session("dp-a", "ferrum", connected_at, Some("v1"))
-        .unwrap();
-    registry.mark_disconnected("dp-a", connected_at);
-    assert_eq!(
-        registry.snapshot().data_planes[0].convergence,
-        MeshSliceConvergenceState::Disconnected
-    );
+    registry.mark_disconnected("dp-a", &current_token, at(1));
 
     let removed = registry.reap_expired(
-        connected_at + Duration::seconds(301),
+        connected_at + Duration::seconds(302),
         Duration::seconds(300),
     );
     assert_eq!(removed, 1);
@@ -131,79 +200,225 @@ fn disconnect_retention_and_reap() {
 }
 
 #[test]
-fn multiple_dps_and_cardinality_cap() {
-    let registry = MeshSliceDriftRegistry::new();
-    let base = Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, 0).unwrap();
-    for i in 0..3 {
-        registry
-            .open_session(&format!("dp-{i}"), "ferrum", base, Some("v1"))
-            .unwrap();
+fn hard_cardinality_cap_is_serialized_under_concurrent_admission() {
+    const CAP: usize = 8;
+    const CONTENDERS: usize = 32;
+    let registry = Arc::new(MeshSliceDriftRegistry::with_max_entries(CAP));
+    let barrier = Arc::new(Barrier::new(CONTENDERS));
+    let mut handles = Vec::new();
+    for index in 0..CONTENDERS {
+        let registry = registry.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            let node_id = format!("dp-{index}");
+            let admitted = registry.open_session(&node_id, "ferrum", at(0), Some("v1"));
+            if let Ok(token) = admitted.as_ref() {
+                registry
+                    .record_sent(&node_id, token, "v1", at(0))
+                    .expect("admitted send");
+                registry
+                    .record_status(&node_id, token, "v1", None, at(0))
+                    .expect("admitted ack");
+            }
+            admitted
+        }));
     }
-    assert_eq!(registry.snapshot().summary.tracked, 3);
-
-    // Fill to the hard cap with connected sessions (no disconnected victims).
-    for i in 3..MESH_SLICE_DRIFT_MAX_ENTRIES {
-        let at = base + Duration::seconds(i as i64);
-        registry
-            .open_session(&format!("fill-{i}"), "ferrum", at, Some("v1"))
-            .unwrap();
-    }
-    let err = registry
-        .open_session("overflow", "ferrum", base + Duration::hours(1), Some("v9"))
-        .expect_err("full connected registry");
-    assert_eq!(err, MeshSliceDriftAdmitError::CardinalityExceeded);
-
-    // Disconnect one row; the next insert should evict that victim.
-    registry.mark_disconnected("dp-0", base);
-    registry
-        .open_session("recovered", "ferrum", base + Duration::hours(2), Some("v9"))
-        .expect("evict disconnected");
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("admission thread"))
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), CAP);
+    assert_eq!(registry.len(), CAP);
     assert!(
-        registry
-            .snapshot()
-            .data_planes
+        results
             .iter()
-            .any(|e| e.node_id == "recovered")
+            .filter_map(|result| result.as_ref().err())
+            .all(|error| *error == MeshSliceDriftAdmitError::CardinalityExceeded)
+    );
+    let snapshot = registry.snapshot();
+    assert_eq!(snapshot.summary.tracked, CAP);
+    assert_eq!(snapshot.summary.converged, CAP);
+    assert_eq!(snapshot.data_planes.len(), CAP);
+}
+
+#[test]
+fn production_cap_evicts_only_a_disconnected_victim() {
+    let registry = MeshSliceDriftRegistry::new();
+    let base = at(0);
+    let mut first_token = None;
+    for index in 0..MESH_SLICE_DRIFT_MAX_ENTRIES {
+        let token = registry
+            .open_session(&format!("dp-{index}"), "ferrum", base, Some("v1"))
+            .unwrap();
+        if index == 0 {
+            first_token = Some(token);
+        }
+    }
+    assert_eq!(
+        registry
+            .open_session("overflow", "ferrum", base, Some("v1"))
+            .unwrap_err(),
+        MeshSliceDriftAdmitError::CardinalityExceeded
+    );
+    registry.mark_disconnected("dp-0", first_token.as_deref().unwrap(), base);
+    registry
+        .open_session("replacement", "ferrum", base, Some("v1"))
+        .expect("disconnected eviction");
+    assert_eq!(registry.len(), MESH_SLICE_DRIFT_MAX_ENTRIES);
+}
+
+fn service(name: &str, namespace: &str) -> MeshService {
+    MeshService {
+        cluster_ips: Vec::new(),
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: Vec::new(),
+        protocol_overrides: std::collections::HashMap::new(),
+    }
+}
+
+fn projected_config(second: u32, services: Vec<MeshService>) -> GatewayConfig {
+    GatewayConfig {
+        loaded_at: at(second),
+        mesh: Some(Box::new(MeshConfig {
+            services,
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    }
+}
+
+#[test]
+fn retained_projection_context_fails_closed_at_count_bounds() {
+    let registry = MeshSliceDriftRegistry::new();
+    let config = projected_config(0, Vec::new());
+    let mut request = MeshSliceRequest {
+        node_id: "dp-a".to_string(),
+        namespace: "ferrum".to_string(),
+        ..MeshSliceRequest::default()
+    };
+    for index in 0..257 {
+        request
+            .labels
+            .insert(format!("label-{index}"), "value".to_string());
+    }
+    let slice = MeshSlice::from_gateway_config(&config, request.clone());
+    assert_eq!(
+        registry
+            .open_projected_session(
+                "dp-a",
+                "ferrum",
+                at(0),
+                &slice,
+                request,
+                CpScope::Single("ferrum".to_string()),
+                None,
+            )
+            .unwrap_err(),
+        MeshSliceDriftAdmitError::ProjectionContextTooLarge
+    );
+
+    let request = MeshSliceRequest {
+        node_id: "dp-b".to_string(),
+        namespace: "ferrum".to_string(),
+        ..MeshSliceRequest::default()
+    };
+    let slice = MeshSlice::from_gateway_config(&config, request.clone());
+    let namespaces = (0..257).map(|index| format!("ns-{index}")).collect();
+    assert_eq!(
+        registry
+            .open_projected_session(
+                "dp-b",
+                "ferrum",
+                at(0),
+                &slice,
+                request,
+                CpScope::Set(namespaces),
+                None,
+            )
+            .unwrap_err(),
+        MeshSliceDriftAdmitError::ProjectionContextTooLarge
     );
 }
 
 #[test]
-fn malformed_status_fails_closed_with_field_diagnostics() {
+fn desired_tracks_projected_content_for_connected_and_retained_disconnected_rows() {
     let registry = MeshSliceDriftRegistry::new();
-    let err = registry
-        .record_status("missing", "", None, Utc::now())
-        .expect_err("empty version");
-    assert_eq!(err, MeshSliceDriftAdmitError::EmptyVersion);
-    assert_eq!(err.field_name(), "version");
-
-    let err = registry
-        .record_status("missing", "v1", None, Utc::now())
-        .expect_err("unknown");
-    assert_eq!(err, MeshSliceDriftAdmitError::UnknownNode);
-    assert_eq!(err.field_name(), "node_id");
-}
-
-#[test]
-fn reload_updates_desired_for_partitioned_dp() {
-    let registry = MeshSliceDriftRegistry::new();
-    let connected_at = Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, 0).unwrap();
-    registry
-        .open_session("dp-a", "ferrum", connected_at, Some("v1"))
+    let request = MeshSliceRequest {
+        node_id: "dp-a".to_string(),
+        namespace: "ferrum".to_string(),
+        ..MeshSliceRequest::default()
+    };
+    let initial_config = projected_config(0, vec![service("api", "ferrum")]);
+    let initial_slice = MeshSlice::from_gateway_config(&initial_config, request.clone());
+    let token = registry
+        .open_projected_session(
+            "dp-a",
+            "ferrum",
+            at(0),
+            &initial_slice,
+            request.clone(),
+            CpScope::Single("ferrum".to_string()),
+            None,
+        )
         .unwrap();
     registry
-        .record_sent("dp-a", connected_at, "v1", connected_at)
+        .record_projected_sent("dp-a", &token, &initial_slice, at(0))
         .unwrap();
     registry
-        .record_status("dp-a", "v1", None, connected_at)
+        .record_status("dp-a", &token, &initial_slice.version, None, at(0))
         .unwrap();
-    registry.mark_disconnected("dp-a", connected_at);
-    registry.set_desired_all("v-deleted", connected_at + Duration::seconds(10));
 
+    let related = projected_config(1, vec![service("api-v2", "ferrum")]);
+    assert_eq!(registry.reconcile_disconnected_desired(&related, at(1)), Ok(0));
+    assert_eq!(
+        registry.snapshot().data_planes[0]
+            .desired
+            .as_ref()
+            .unwrap()
+            .version,
+        initial_slice.version,
+        "connected rows advance only when their stream emits the projection"
+    );
+
+    let current_config = ArcSwap::from_pointee(related.clone());
+    registry
+        .mark_disconnected_with_config("dp-a", &token, &current_config, at(1))
+        .unwrap();
+    assert_eq!(
+        registry.snapshot().data_planes[0]
+            .desired
+            .as_ref()
+            .unwrap()
+            .version,
+        related.loaded_at.to_rfc3339(),
+        "disconnect closes the publish-before-drop race from current config"
+    );
+    let no_op = projected_config(2, vec![service("api-v2", "ferrum")]);
+    assert_eq!(registry.reconcile_disconnected_desired(&no_op, at(2)), Ok(0));
+    let unrelated = projected_config(
+        3,
+        vec![service("api-v2", "ferrum"), service("other", "other")],
+    );
+    assert_eq!(registry.reconcile_disconnected_desired(&unrelated, at(3)), Ok(0));
+    let next_related = projected_config(4, vec![service("api-v3", "ferrum")]);
+    assert_eq!(
+        registry.reconcile_disconnected_desired(&next_related, at(4)),
+        Ok(1)
+    );
     let entry = &registry.snapshot().data_planes[0];
     assert_eq!(
-        entry.desired.as_ref().map(|d| d.version.as_str()),
-        Some("v-deleted")
+        entry.desired.as_ref().unwrap().version,
+        next_related.loaded_at.to_rfc3339()
     );
+    assert_eq!(entry.sent.as_ref().unwrap().version, initial_slice.version);
     assert_eq!(entry.convergence, MeshSliceConvergenceState::Disconnected);
-    assert!(entry.drift.desired_vs_acknowledged);
+    assert!(entry.drift.desired_vs_sent);
 }

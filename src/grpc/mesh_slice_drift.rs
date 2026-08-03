@@ -16,12 +16,12 @@
 //! # Session semantics
 //!
 //! - **Subscribe / replacement**: a new session for the same identity replaces
-//!   the prior entry. Generation is `connected_at`; stale stream drops and
-//!   heartbeats must match that generation.
+//!   the prior entry and receives a fresh opaque token. Stale stream drops,
+//!   sends, and ACK/NACK reports must match that token.
 //! - **Duplicate concurrent streams**: last successful insert wins (same as
 //!   [`super::mesh_registry::MeshNodeRegistry`]).
 //! - **Send**: advances `sent` for the matching generation only.
-//! - **Desired**: advanced when the CP publishes a new scoped slice version.
+//! - **Desired**: advanced only when that DP's projected slice content changes.
 //! - **ACK / NACK**: recorded only for an existing identity; malformed reports
 //!   fail closed with field-specific diagnostics.
 //! - **Disconnect**: marks the entry disconnected but retains it until the
@@ -35,10 +35,16 @@
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use serde::Serialize;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
+
+use super::cp_server::{CpGrpcServer, CpScope};
+use crate::config::types::GatewayConfig;
+use crate::fips::approved::Sha256;
+use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
 /// Retention for disconnected DP drift rows (matches mesh node heartbeat TTL).
 pub const MESH_SLICE_DRIFT_RETENTION_SECONDS: i64 = 300;
@@ -47,11 +53,21 @@ pub const MESH_SLICE_DRIFT_RETENTION_SECONDS: i64 = 300;
 /// this; hostile reconnect storms cannot grow the map unboundedly.
 pub const MESH_SLICE_DRIFT_MAX_ENTRIES: usize = 4096;
 
-/// Max accepted slice-version string length (fail closed above this).
-pub const MESH_SLICE_DRIFT_MAX_VERSION_CHARS: usize = 256;
+/// Max accepted slice-version UTF-8 byte length (fail closed above this).
+pub const MESH_SLICE_DRIFT_MAX_VERSION_BYTES: usize = 256;
 
-/// Max retained rejection-reason characters after sanitisation.
-pub const MESH_SLICE_DRIFT_MAX_REASON_CHARS: usize = 64;
+/// Max retained rejection-reason UTF-8 byte length. Production currently
+/// retains only the fixed label below, never caller-supplied text.
+pub const MESH_SLICE_DRIFT_MAX_REASON_BYTES: usize = 64;
+
+/// Closed diagnostic retained for every NACK. The authenticated caller's raw
+/// error text may contain credentials and is deliberately discarded.
+pub const MESH_SLICE_DRIFT_REJECTION_REASON: &str = "reported_rejection";
+
+/// Bound the subscription selector retained for disconnected projection.
+const MESH_SLICE_DRIFT_MAX_PROJECTION_LABELS: usize = 256;
+const MESH_SLICE_DRIFT_MAX_PROJECTION_NAMESPACES: usize = 256;
+const MESH_SLICE_DRIFT_MAX_PROJECTION_BYTES: usize = 64 * 1024;
 
 /// Closed-set convergence classification for summary metrics / admin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -129,7 +145,7 @@ pub struct MeshSliceRejectedStamp {
     pub version: String,
     pub at: DateTime<Utc>,
     pub age_seconds: u64,
-    /// Control-character-stripped, length-bounded reason. Never credentials.
+    /// Closed, length-bounded reason label. Never caller-supplied text.
     pub reason: String,
 }
 
@@ -159,7 +175,7 @@ pub struct MeshSliceDriftSnapshot {
     pub summary: MeshSliceDriftSummary,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct LiveEntry {
     node_id: String,
     namespace: String,
@@ -175,6 +191,20 @@ struct LiveEntry {
     rejected_version: Option<String>,
     rejected_at: Option<DateTime<Utc>>,
     rejected_reason: Option<String>,
+    /// Opaque, per-stream generation. Never published or logged.
+    session_token: String,
+    /// Retained only so disconnected rows can compare their actual projected
+    /// slice on a later CP publication. The content digest excludes the
+    /// observability-only version and ordering revision.
+    projection: Option<ProjectionContext>,
+    desired_content_digest: Option<[u8; 32]>,
+}
+
+#[derive(Clone)]
+struct ProjectionContext {
+    request: MeshSliceRequest,
+    scope: CpScope,
+    bearer_namespaces: Option<HashSet<String>>,
 }
 
 /// Why a status report or subscribe was refused. Closed, compile-time set —
@@ -185,8 +215,16 @@ pub enum MeshSliceDriftAdmitError {
     EmptyNamespace,
     EmptyVersion,
     VersionTooLong,
+    VersionHasSurroundingWhitespace,
+    VersionHasControlCharacter,
     UnknownNode,
+    DisconnectedNode,
+    SessionMismatch,
+    VersionMismatch,
     CardinalityExceeded,
+    ProjectionContextTooLarge,
+    ProjectionFailed,
+    RegistryUnavailable,
 }
 
 impl MeshSliceDriftAdmitError {
@@ -195,13 +233,29 @@ impl MeshSliceDriftAdmitError {
             Self::EmptyNodeId => "authenticated node identity must not be empty",
             Self::EmptyNamespace => "mesh slice drift namespace must not be empty",
             Self::EmptyVersion => "mesh slice status version must not be empty",
-            Self::VersionTooLong => "mesh slice status version exceeds the maximum length",
+            Self::VersionTooLong => "mesh slice status version exceeds the 256-byte maximum",
+            Self::VersionHasSurroundingWhitespace => {
+                "mesh slice status version must not contain surrounding whitespace"
+            }
+            Self::VersionHasControlCharacter => {
+                "mesh slice status version must not contain control characters"
+            }
             Self::UnknownNode => {
                 "no mesh slice drift session exists for this authenticated identity"
+            }
+            Self::DisconnectedNode => "mesh slice drift session is not connected",
+            Self::SessionMismatch => "mesh slice status session token is stale or invalid",
+            Self::VersionMismatch => {
+                "mesh slice status version is not the current version sent on this session"
             }
             Self::CardinalityExceeded => {
                 "mesh slice drift registry is at capacity; disconnect idle data planes or raise retention reaping"
             }
+            Self::ProjectionContextTooLarge => {
+                "mesh subscription projection context exceeds the retained-state bound"
+            }
+            Self::ProjectionFailed => "mesh slice projection could not be represented",
+            Self::RegistryUnavailable => "mesh slice drift registry is unavailable",
         }
     }
 
@@ -211,8 +265,16 @@ impl MeshSliceDriftAdmitError {
             Self::EmptyNamespace => "namespace",
             Self::EmptyVersion => "version",
             Self::VersionTooLong => "version",
+            Self::VersionHasSurroundingWhitespace => "version",
+            Self::VersionHasControlCharacter => "version",
             Self::UnknownNode => "node_id",
+            Self::DisconnectedNode => "node_id",
+            Self::SessionMismatch => "session_token",
+            Self::VersionMismatch => "version",
             Self::CardinalityExceeded => "cardinality",
+            Self::ProjectionContextTooLarge => "subscription",
+            Self::ProjectionFailed => "projection",
+            Self::RegistryUnavailable => "registry",
         }
     }
 }
@@ -225,48 +287,128 @@ static DRIFT_SUMMARY_PENDING: AtomicU64 = AtomicU64::new(0);
 static DRIFT_SUMMARY_DISCONNECTED: AtomicU64 = AtomicU64::new(0);
 static DRIFT_SUMMARY_TRACKED: AtomicU64 = AtomicU64::new(0);
 
-/// Bounded per-authenticated-DP slice-version drift registry.
 #[derive(Default)]
+struct RegistryState {
+    entries: HashMap<String, LiveEntry>,
+}
+
+/// Bounded per-authenticated-DP slice-version drift registry. Every mutation,
+/// snapshot rebuild, and ArcSwap publication is serialized by `state`; admin
+/// and metrics reads remain lock-free through `snapshot`.
 pub struct MeshSliceDriftRegistry {
-    entries: DashMap<String, LiveEntry>,
+    state: Mutex<RegistryState>,
     snapshot: ArcSwap<MeshSliceDriftSnapshot>,
+    max_entries: usize,
+}
+
+impl Default for MeshSliceDriftRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MeshSliceDriftRegistry {
     pub fn new() -> Self {
         Self {
-            entries: DashMap::new(),
+            state: Mutex::new(RegistryState::default()),
             snapshot: ArcSwap::from_pointee(MeshSliceDriftSnapshot {
                 generated_at: Utc::now(),
                 data_planes: Vec::new(),
                 summary: MeshSliceDriftSummary::default(),
             }),
+            max_entries: MESH_SLICE_DRIFT_MAX_ENTRIES,
         }
     }
 
-    /// Open or replace a local mesh subscription session.
+    /// Construct a smaller bounded registry for deterministic concurrency
+    /// coverage. Production uses [`Self::new`] and the 4096-entry hard cap.
+    #[doc(hidden)]
+    pub fn with_max_entries(max_entries: usize) -> Self {
+        Self {
+            state: Mutex::new(RegistryState::default()),
+            snapshot: ArcSwap::from_pointee(MeshSliceDriftSnapshot {
+                generated_at: Utc::now(),
+                data_planes: Vec::new(),
+                summary: MeshSliceDriftSummary::default(),
+            }),
+            max_entries: max_entries.min(MESH_SLICE_DRIFT_MAX_ENTRIES),
+        }
+    }
+
+    /// Open or replace a local mesh subscription session without retaining a
+    /// projection. Intended for focused registry callers; production
+    /// MeshSubscribe uses [`Self::open_projected_session`].
     pub fn open_session(
         &self,
         node_id: &str,
         namespace: &str,
         connected_at: DateTime<Utc>,
         desired_version: Option<&str>,
-    ) -> Result<(), MeshSliceDriftAdmitError> {
+    ) -> Result<String, MeshSliceDriftAdmitError> {
+        self.open_session_inner(
+            node_id,
+            namespace,
+            connected_at,
+            desired_version,
+            None,
+            None,
+        )
+    }
+
+    /// Open or replace a production MeshSubscribe session while retaining the
+    /// bounded selector needed to keep a disconnected row's desired watermark
+    /// accurate across later CP publications.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_projected_session(
+        &self,
+        node_id: &str,
+        namespace: &str,
+        connected_at: DateTime<Utc>,
+        initial_slice: &MeshSlice,
+        request: MeshSliceRequest,
+        scope: CpScope,
+        bearer_namespaces: Option<HashSet<String>>,
+    ) -> Result<String, MeshSliceDriftAdmitError> {
+        validate_projection_context(&request, &scope, bearer_namespaces.as_ref())?;
+        let digest = slice_content_digest(initial_slice)?;
+        self.open_session_inner(
+            node_id,
+            namespace,
+            connected_at,
+            Some(initial_slice.version.as_str()),
+            Some(ProjectionContext {
+                request,
+                scope,
+                bearer_namespaces,
+            }),
+            Some(digest),
+        )
+    }
+
+    fn open_session_inner(
+        &self,
+        node_id: &str,
+        namespace: &str,
+        connected_at: DateTime<Utc>,
+        desired_version: Option<&str>,
+        projection: Option<ProjectionContext>,
+        desired_content_digest: Option<[u8; 32]>,
+    ) -> Result<String, MeshSliceDriftAdmitError> {
         let node_id = validate_identity(node_id)?;
         let namespace = validate_namespace(namespace)?;
         if let Some(version) = desired_version {
             validate_version(version)?;
         }
-
-        if !self.entries.contains_key(node_id)
-            && self.entries.len() >= MESH_SLICE_DRIFT_MAX_ENTRIES
-            && !self.evict_oldest_disconnected()
+        let session_token = Uuid::new_v4().simple().to_string();
+        let mut state = self.lock_state()?;
+        if !state.entries.contains_key(node_id)
+            && state.entries.len() >= self.max_entries
+            && !evict_oldest_disconnected(&mut state.entries)
         {
             return Err(MeshSliceDriftAdmitError::CardinalityExceeded);
         }
-
         let now = connected_at;
-        self.entries.insert(
+        state.entries.insert(
             node_id.to_string(),
             LiveEntry {
                 node_id: node_id.to_string(),
@@ -283,160 +425,193 @@ impl MeshSliceDriftRegistry {
                 rejected_version: None,
                 rejected_at: None,
                 rejected_reason: None,
+                session_token: session_token.clone(),
+                projection,
+                desired_content_digest,
             },
         );
-        self.refresh_snapshot(Utc::now());
-        Ok(())
+        self.refresh_snapshot_locked(&state, Utc::now());
+        Ok(session_token)
     }
 
-    /// Record that the CP pushed `version` on the matching session generation.
+    /// Record the actual projected slice sent on the matching opaque session.
+    /// Desired and sent advance atomically from the same slice so publication
+    /// can never expose a synthetic global desired version.
+    pub fn record_projected_sent(
+        &self,
+        node_id: &str,
+        session_token: &str,
+        slice: &MeshSlice,
+        at: DateTime<Utc>,
+    ) -> Result<(), MeshSliceDriftAdmitError> {
+        let digest = slice_content_digest(slice)?;
+        self.record_sent_inner(node_id, session_token, &slice.version, Some(digest), at)
+    }
+
+    /// Record a sent version for focused registry tests/callers that do not
+    /// retain a production projection.
     pub fn record_sent(
         &self,
         node_id: &str,
-        expected_connected_at: DateTime<Utc>,
+        session_token: &str,
         version: &str,
         at: DateTime<Utc>,
     ) -> Result<(), MeshSliceDriftAdmitError> {
-        validate_version(version)?;
-        let mut updated = false;
-        if let Some(mut entry) = self.entries.get_mut(node_id)
-            && entry.connected_at == expected_connected_at
-            && entry.connected
-        {
-            entry.sent_version = Some(version.to_string());
-            entry.sent_at = Some(at);
-            // A fresh send clears a prior rejection for this generation so a
-            // recovered DP is not permanently sticky-rejected after the CP
-            // republishes a fixed slice.
-            if entry.rejected_version.as_deref() == Some(version) {
-                entry.rejected_version = None;
-                entry.rejected_at = None;
-                entry.rejected_reason = None;
-            }
-            updated = true;
-        }
-        if updated {
-            self.refresh_snapshot(Utc::now());
-        }
-        Ok(())
+        self.record_sent_inner(node_id, session_token, version, None, at)
     }
 
-    /// Advance desired version for every tracked DP in `namespace` (connected
-    /// and retained-disconnected alike) so reload/delete reconciliation is
-    /// visible even while a DP is partitioned.
-    pub fn set_desired_for_namespace(&self, namespace: &str, version: &str, at: DateTime<Utc>) {
-        if validate_namespace(namespace).is_err() || validate_version(version).is_err() {
-            return;
-        }
-        let mut touched = false;
-        for mut entry in self.entries.iter_mut() {
-            if entry.namespace == namespace {
-                entry.desired_version = Some(version.to_string());
-                entry.desired_at = Some(at);
-                touched = true;
-            }
-        }
-        if touched {
-            self.refresh_snapshot(Utc::now());
-        }
-    }
-
-    /// Advance desired for every tracked identity (full CP publish).
-    pub fn set_desired_all(&self, version: &str, at: DateTime<Utc>) {
-        if validate_version(version).is_err() {
-            return;
-        }
-        if self.entries.is_empty() {
-            return;
-        }
-        for mut entry in self.entries.iter_mut() {
-            entry.desired_version = Some(version.to_string());
-            entry.desired_at = Some(at);
-        }
-        self.refresh_snapshot(Utc::now());
-    }
-
-    /// Advance desired for a single authenticated identity (initial push).
-    pub fn set_desired_for_node(
+    fn record_sent_inner(
         &self,
         node_id: &str,
-        expected_connected_at: DateTime<Utc>,
+        session_token: &str,
         version: &str,
+        digest: Option<[u8; 32]>,
         at: DateTime<Utc>,
     ) -> Result<(), MeshSliceDriftAdmitError> {
         validate_version(version)?;
-        let mut updated = false;
-        if let Some(mut entry) = self.entries.get_mut(node_id)
-            && entry.connected_at == expected_connected_at
-        {
-            entry.desired_version = Some(version.to_string());
-            entry.desired_at = Some(at);
-            updated = true;
+        let mut state = self.lock_state()?;
+        let entry = state
+            .entries
+            .get_mut(node_id)
+            .ok_or(MeshSliceDriftAdmitError::UnknownNode)?;
+        validate_live_session(entry, session_token)?;
+        entry.desired_version = Some(version.to_string());
+        entry.desired_at = Some(at);
+        entry.sent_version = Some(version.to_string());
+        entry.sent_at = Some(at);
+        if let Some(digest) = digest {
+            entry.desired_content_digest = Some(digest);
         }
-        if updated {
-            self.refresh_snapshot(Utc::now());
+        if entry.rejected_version.as_deref() == Some(version) {
+            entry.rejected_version = None;
+            entry.rejected_at = None;
+            entry.rejected_reason = None;
         }
+        self.refresh_snapshot_locked(&state, Utc::now());
         Ok(())
+    }
+
+    /// Recompute only retained-disconnected projections from the actual
+    /// published config. A version-only/no-op reload or unrelated namespace
+    /// mutation leaves desired untouched because the content digest ignores
+    /// `MeshSlice.version` and `revision`, matching `MeshSlice::content_eq`.
+    pub fn reconcile_disconnected_desired(
+        &self,
+        config: &GatewayConfig,
+        at: DateTime<Utc>,
+    ) -> Result<usize, MeshSliceDriftAdmitError> {
+        let mut state = self.lock_state()?;
+        let mut changed = 0usize;
+        for entry in state.entries.values_mut() {
+            if entry.connected {
+                continue;
+            }
+            if reconcile_entry_desired(entry, config, at)? {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.refresh_snapshot_locked(&state, at);
+        }
+        Ok(changed)
     }
 
     /// Record an ACK (`error_message` empty) or NACK (non-empty, sanitised).
     pub fn record_status(
         &self,
         node_id: &str,
+        session_token: &str,
         version: &str,
         error_message: Option<&str>,
         at: DateTime<Utc>,
     ) -> Result<(), MeshSliceDriftAdmitError> {
         let node_id = validate_identity(node_id)?;
         validate_version(version)?;
-        if !self.entries.contains_key(node_id) {
-            return Err(MeshSliceDriftAdmitError::UnknownNode);
+        let mut state = self.lock_state()?;
+        let entry = state
+            .entries
+            .get_mut(node_id)
+            .ok_or(MeshSliceDriftAdmitError::UnknownNode)?;
+        validate_live_session(entry, session_token)?;
+        if entry.sent_version.as_deref() != Some(version) {
+            return Err(MeshSliceDriftAdmitError::VersionMismatch);
         }
-        if let Some(mut entry) = self.entries.get_mut(node_id) {
-            match error_message {
-                None | Some("") => {
-                    entry.acknowledged_version = Some(version.to_string());
-                    entry.acknowledged_at = Some(at);
-                    // Successful ACK clears rejection sticky state when the
-                    // ACK covers the previously rejected version or any newer
-                    // apply — operators still see historical drift via versions.
-                    entry.rejected_version = None;
-                    entry.rejected_at = None;
-                    entry.rejected_reason = None;
-                }
-                Some(raw) => {
-                    entry.rejected_version = Some(version.to_string());
-                    entry.rejected_at = Some(at);
-                    entry.rejected_reason = Some(sanitize_reason(raw));
-                }
+        match error_message {
+            None | Some("") => {
+                entry.acknowledged_version = Some(version.to_string());
+                entry.acknowledged_at = Some(at);
+                entry.rejected_version = None;
+                entry.rejected_at = None;
+                entry.rejected_reason = None;
+            }
+            Some(raw) => {
+                entry.rejected_version = Some(version.to_string());
+                entry.rejected_at = Some(at);
+                entry.rejected_reason = Some(sanitize_reason(raw));
             }
         }
-        self.refresh_snapshot(Utc::now());
+        self.refresh_snapshot_locked(&state, Utc::now());
         Ok(())
     }
 
-    /// Mark a matching generation disconnected; retain until reaper expiry.
-    pub fn mark_disconnected(&self, node_id: &str, expected_connected_at: DateTime<Utc>) {
-        let now = Utc::now();
-        let mut updated = false;
-        if let Some(mut entry) = self.entries.get_mut(node_id)
-            && entry.connected_at == expected_connected_at
+    /// Mark a matching opaque session disconnected; retain until reaper expiry.
+    pub fn mark_disconnected(
+        &self,
+        node_id: &str,
+        session_token: &str,
+        now: DateTime<Utc>,
+    ) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if let Some(entry) = state.entries.get_mut(node_id)
+            && entry.session_token == session_token
             && entry.connected
         {
             entry.connected = false;
             entry.disconnected_at = Some(now);
-            updated = true;
+            self.refresh_snapshot_locked(&state, now);
         }
-        if updated {
-            self.refresh_snapshot(now);
+    }
+
+    /// Production disconnect path. Re-evaluating the projection while marking
+    /// the row closes the race where a config swap observes the session as
+    /// connected but the stream drops before it emits that update.
+    pub fn mark_disconnected_with_config(
+        &self,
+        node_id: &str,
+        session_token: &str,
+        config: &ArcSwap<GatewayConfig>,
+        now: DateTime<Utc>,
+    ) -> Result<(), MeshSliceDriftAdmitError> {
+        let mut state = self.lock_state()?;
+        let Some(entry) = state.entries.get_mut(node_id) else {
+            return Ok(());
+        };
+        if entry.session_token != session_token || !entry.connected {
+            return Ok(());
         }
+        entry.connected = false;
+        entry.disconnected_at = Some(now);
+        // Load while holding the same mutation lock used by publication
+        // reconciliation. If the config swaps first, this observes the new
+        // snapshot; if disconnect wins first, the later publication observes
+        // the now-disconnected row. Neither ordering can strand old desired
+        // content after a newer config was published.
+        let config = config.load_full();
+        let _ = reconcile_entry_desired(entry, config.as_ref(), now)?;
+        self.refresh_snapshot_locked(&state, now);
+        Ok(())
     }
 
     /// Remove expired disconnected rows. Returns how many were deleted.
     pub fn reap_expired(&self, now: DateTime<Utc>, retention: chrono::Duration) -> usize {
+        let Ok(mut state) = self.state.lock() else {
+            return 0;
+        };
         let stale_before = now - retention;
-        let before = self.entries.len();
-        self.entries.retain(|_, entry| {
+        let before = state.entries.len();
+        state.entries.retain(|_, entry| {
             if entry.connected {
                 return true;
             }
@@ -445,9 +620,11 @@ impl MeshSliceDriftRegistry {
                 None => false,
             }
         });
-        let removed = before.saturating_sub(self.entries.len());
-        if removed > 0 {
-            self.refresh_snapshot(now);
+        let removed = before.saturating_sub(state.entries.len());
+        // Maintenance also advances ages for stable non-empty rows. Empty
+        // snapshots need no periodic republish.
+        if removed > 0 || !state.entries.is_empty() {
+            self.refresh_snapshot_locked(&state, now);
         }
         removed
     }
@@ -458,41 +635,26 @@ impl MeshSliceDriftRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.snapshot.load().summary.tracked
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
-    fn evict_oldest_disconnected(&self) -> bool {
-        let mut oldest: Option<(String, DateTime<Utc>)> = None;
-        for entry in self.entries.iter() {
-            if !entry.connected
-                && let Some(at) = entry.disconnected_at
-            {
-                match &oldest {
-                    None => oldest = Some((entry.node_id.clone(), at)),
-                    Some((_, oldest_at)) if at < *oldest_at => {
-                        oldest = Some((entry.node_id.clone(), at));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if let Some((node_id, _)) = oldest {
-            self.entries.remove(&node_id);
-            true
-        } else {
-            false
-        }
+    fn lock_state(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, RegistryState>, MeshSliceDriftAdmitError> {
+        self.state
+            .lock()
+            .map_err(|_| MeshSliceDriftAdmitError::RegistryUnavailable)
     }
 
-    fn refresh_snapshot(&self, now: DateTime<Utc>) {
-        let mut data_planes: Vec<MeshSliceDriftEntry> = self
+    fn refresh_snapshot_locked(&self, state: &RegistryState, now: DateTime<Utc>) {
+        let mut data_planes: Vec<MeshSliceDriftEntry> = state
             .entries
-            .iter()
-            .map(|entry| publish_entry(entry.value(), now))
+            .values()
+            .map(|entry| publish_entry(entry, now))
             .collect();
         data_planes.sort_by(|a, b| {
             a.namespace
@@ -529,6 +691,53 @@ impl MeshSliceDriftRegistry {
             data_planes,
             summary,
         }));
+    }
+}
+
+fn reconcile_entry_desired(
+    entry: &mut LiveEntry,
+    config: &GatewayConfig,
+    at: DateTime<Utc>,
+) -> Result<bool, MeshSliceDriftAdmitError> {
+    let Some(projection) = entry.projection.as_ref() else {
+        return Ok(false);
+    };
+    let mut filtered = CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+        config,
+        &projection.request,
+        &projection.scope,
+        projection.bearer_namespaces.as_ref(),
+    );
+    filtered.normalize_fields();
+    filtered.normalize_mesh_fields();
+    let slice = MeshSlice::from_gateway_config(&filtered, projection.request.clone());
+    validate_version(&slice.version)?;
+    let digest = slice_content_digest(&slice)?;
+    if entry.desired_content_digest == Some(digest) {
+        return Ok(false);
+    }
+    entry.desired_content_digest = Some(digest);
+    entry.desired_version = Some(slice.version);
+    entry.desired_at = Some(at);
+    Ok(true)
+}
+
+fn evict_oldest_disconnected(entries: &mut HashMap<String, LiveEntry>) -> bool {
+    let oldest = entries
+        .values()
+        .filter_map(|entry| {
+            if entry.connected {
+                None
+            } else {
+                entry.disconnected_at.map(|at| (entry.node_id.clone(), at))
+            }
+        })
+        .min_by_key(|(_, at)| *at);
+    if let Some((node_id, _)) = oldest {
+        entries.remove(&node_id);
+        true
+    } else {
+        false
     }
 }
 
@@ -656,36 +865,104 @@ fn validate_namespace(namespace: &str) -> Result<&str, MeshSliceDriftAdmitError>
     Ok(trimmed)
 }
 
-fn validate_version(version: &str) -> Result<(), MeshSliceDriftAdmitError> {
-    let trimmed = version.trim();
-    if trimmed.is_empty() {
+/// Canonical mesh slice version admission shared by generated outbound slices
+/// and inbound ACK/NACK reports. Versions are exact opaque UTF-8 bytes: no
+/// trimming or normalization is permitted.
+pub fn validate_version(version: &str) -> Result<(), MeshSliceDriftAdmitError> {
+    if version.is_empty() {
         return Err(MeshSliceDriftAdmitError::EmptyVersion);
     }
-    if trimmed.chars().count() > MESH_SLICE_DRIFT_MAX_VERSION_CHARS {
+    if version.len() > MESH_SLICE_DRIFT_MAX_VERSION_BYTES {
         return Err(MeshSliceDriftAdmitError::VersionTooLong);
+    }
+    if version.trim() != version {
+        return Err(MeshSliceDriftAdmitError::VersionHasSurroundingWhitespace);
+    }
+    if version.chars().any(char::is_control) {
+        return Err(MeshSliceDriftAdmitError::VersionHasControlCharacter);
     }
     Ok(())
 }
 
-/// Control-character-stripped, length-bounded rejection reason for admin
-/// surfaces. Never retains credentials or unbounded caller text.
-pub fn sanitize_reason(raw: &str) -> String {
-    let mut rendered = String::new();
-    let mut truncated = false;
-    for (index, ch) in raw.chars().enumerate() {
-        if index >= MESH_SLICE_DRIFT_MAX_REASON_CHARS {
-            truncated = true;
-            break;
-        }
-        rendered.push(if ch.is_control() { '.' } else { ch });
+fn validate_live_session(
+    entry: &LiveEntry,
+    session_token: &str,
+) -> Result<(), MeshSliceDriftAdmitError> {
+    if !entry.connected {
+        return Err(MeshSliceDriftAdmitError::DisconnectedNode);
     }
-    if rendered.trim().is_empty() {
+    if session_token.len() != 32
+        || !session_token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || entry.session_token != session_token
+    {
+        return Err(MeshSliceDriftAdmitError::SessionMismatch);
+    }
+    Ok(())
+}
+
+fn validate_projection_context(
+    request: &MeshSliceRequest,
+    scope: &CpScope,
+    bearer_namespaces: Option<&HashSet<String>>,
+) -> Result<(), MeshSliceDriftAdmitError> {
+    let scope_namespace_count = match scope {
+        CpScope::Set(namespaces) => namespaces.len(),
+        CpScope::Single(_) | CpScope::All => 0,
+    };
+    if request.labels.len() > MESH_SLICE_DRIFT_MAX_PROJECTION_LABELS
+        || scope_namespace_count > MESH_SLICE_DRIFT_MAX_PROJECTION_NAMESPACES
+        || bearer_namespaces.is_some_and(|namespaces| {
+            namespaces.len() > MESH_SLICE_DRIFT_MAX_PROJECTION_NAMESPACES
+        })
+    {
+        return Err(MeshSliceDriftAdmitError::ProjectionContextTooLarge);
+    }
+    let mut bytes = request.node_id.len()
+        + request.namespace.len()
+        + request.workload_spiffe_id.as_deref().map_or(0, str::len)
+        + request.waypoint_name.as_deref().map_or(0, str::len)
+        + request.cluster_domain.len();
+    bytes = bytes.saturating_add(
+        request
+            .labels
+            .iter()
+            .map(|(key, value)| key.len().saturating_add(value.len()))
+            .sum::<usize>(),
+    );
+    bytes = bytes.saturating_add(match scope {
+        CpScope::Single(namespace) => namespace.len(),
+        CpScope::Set(namespaces) => namespaces.iter().map(String::len).sum(),
+        CpScope::All => 0,
+    });
+    bytes = bytes.saturating_add(
+        bearer_namespaces
+            .map(|namespaces| namespaces.iter().map(String::len).sum())
+            .unwrap_or(0),
+    );
+    if bytes > MESH_SLICE_DRIFT_MAX_PROJECTION_BYTES {
+        return Err(MeshSliceDriftAdmitError::ProjectionContextTooLarge);
+    }
+    Ok(())
+}
+
+fn slice_content_digest(slice: &MeshSlice) -> Result<[u8; 32], MeshSliceDriftAdmitError> {
+    let mut canonical = slice.clone();
+    canonical.version.clear();
+    canonical.revision = None;
+    serde_json::to_vec(&canonical)
+        .map(Sha256::digest)
+        .map_err(|_| MeshSliceDriftAdmitError::ProjectionFailed)
+}
+
+/// Conservative NACK diagnostic for admin surfaces. Raw authenticated-caller
+/// text is never retained: it may contain bearer tokens, credentials, or other
+/// secrets. The result is a fixed, control-safe, low-cardinality label whose
+/// total UTF-8 length is strictly below [`MESH_SLICE_DRIFT_MAX_REASON_BYTES`].
+pub fn sanitize_reason(raw: &str) -> String {
+    if raw.is_empty() {
         return "unspecified".to_string();
     }
-    if truncated {
-        rendered.push_str("(truncated)");
-    }
-    rendered
+    MESH_SLICE_DRIFT_REJECTION_REASON.to_string()
 }
 
 /// Render closed-set CP mesh slice convergence gauges into a Prometheus text

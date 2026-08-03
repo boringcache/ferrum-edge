@@ -200,7 +200,7 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
         "JWT sub / node_id mismatch must fail closed"
     );
 
-    let request = tonic::Request::new(MeshSubscribeRequest {
+    let subscribe = MeshSubscribeRequest {
         node_id: "mesh-dp-a".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
@@ -210,15 +210,21 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
-    });
-    let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
+    };
+    let mut stream = client
+        .mesh_subscribe(tonic::Request::new(subscribe.clone()))
+        .await
+        .unwrap()
+        .into_inner();
     let update = stream.message().await.unwrap().unwrap();
     assert!(!update.heartbeat);
+    assert!(!update.session_token.is_empty());
 
     client
         .report_mesh_slice_status(MeshSliceStatusReport {
             version: update.version.clone(),
             error_message: "slice_json_invalid".to_string(),
+            session_token: update.session_token.clone(),
         })
         .await
         .expect("nack");
@@ -231,9 +237,40 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
         .report_mesh_slice_status(MeshSliceStatusReport {
             version: update.version.clone(),
             error_message: String::new(),
+            session_token: update.session_token.clone(),
         })
         .await
         .expect("ack");
+
+    // A replacement stream can send the same version. The prior stream's
+    // delayed ACK must still be refused by its opaque generation token.
+    let mut replacement = client
+        .mesh_subscribe(tonic::Request::new(subscribe))
+        .await
+        .unwrap()
+        .into_inner();
+    let replacement_update = replacement.message().await.unwrap().unwrap();
+    assert_eq!(replacement_update.version, update.version);
+    assert_ne!(replacement_update.session_token, update.session_token);
+    assert!(
+        client
+            .report_mesh_slice_status(MeshSliceStatusReport {
+                version: update.version.clone(),
+                error_message: String::new(),
+                session_token: update.session_token.clone(),
+            })
+            .await
+            .is_err(),
+        "stale same-version session ACK must fail closed"
+    );
+    client
+        .report_mesh_slice_status(MeshSliceStatusReport {
+            version: replacement_update.version.clone(),
+            error_message: String::new(),
+            session_token: replacement_update.session_token.clone(),
+        })
+        .await
+        .expect("replacement ack");
 
     let body: Value = reqwest::Client::new()
         .get(format!("{admin_base}/mesh/slice-drift"))

@@ -109,6 +109,7 @@ fn update_for(slice: &MeshSlice) -> MeshConfigUpdate {
             .revision
             .as_ref()
             .map_or(0, |revision| revision.sequence),
+        session_token: "test-session".to_string(),
     }
 }
 

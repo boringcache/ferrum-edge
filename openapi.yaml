@@ -3426,9 +3426,16 @@ paths:
       description: |
         Control-plane only (issue #3265). Returns per-authenticated local
         MeshSubscribe identity the versions the CP desired, last sent,
-        last acknowledged, and last rejected (with age and a bounded
-        redacted NACK reason). Identity is the JWT `sub` bound at
+        last acknowledged, and last rejected (with age and a closed
+        redacted NACK label). Desired advances only when that DP's actual
+        projected slice content changes; version-only/no-op reloads and
+        unrelated namespaces do not manufacture drift. Identity is the JWT `sub` bound at
         subscribe time — caller-supplied display fields are never trusted.
+
+        ACK/NACK reports must bind the currently connected replacement
+        session's opaque wire token and current sent version. The token is
+        never returned by this endpoint, metrics, or logs. Caller-supplied
+        NACK text is discarded rather than retained.
 
         Returns 404 outside CP mode. Returns 200 with an empty
         `data_planes` list when CP mode is active but no local mesh DP
@@ -25977,7 +25984,10 @@ components:
       type: object
       required: [version, at, age_seconds]
       properties:
-        version: { type: string }
+        version:
+          type: string
+          maxLength: 256
+          description: Exact opaque version; runtime enforces a 256 UTF-8 byte cap, no controls, and no surrounding whitespace.
         at: { type: string, format: date-time }
         age_seconds: { type: integer, format: int64, minimum: 0 }
 
@@ -25985,14 +25995,17 @@ components:
       type: object
       required: [version, at, age_seconds, reason]
       properties:
-        version: { type: string }
+        version:
+          type: string
+          maxLength: 256
+          description: Exact opaque version; runtime enforces a 256 UTF-8 byte cap, no controls, and no surrounding whitespace.
         at: { type: string, format: date-time }
         age_seconds: { type: integer, format: int64, minimum: 0 }
         reason:
           type: string
-          description: >
-            Control-character-stripped, at most 64 characters, optionally
-            suffixed with `(truncated)`. Never credentials.
+          enum: [reported_rejection]
+          maxLength: 64
+          description: Fixed control-safe label. Caller-supplied NACK text is discarded and never retained.
 
     MeshSliceDriftFlags:
       type: object

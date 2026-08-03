@@ -1518,6 +1518,7 @@ pub(crate) fn publish_cp_incremental(
             mesh_update_tx,
             mesh_delta,
             version,
+            config_arc.load_full(),
             mesh_registry,
         );
         outcome

@@ -73,6 +73,9 @@ impl MeshConfigSync for StubMeshServer {
             mesh_slice_json,
             ferrum_version: self.ferrum_version.clone(),
             heartbeat: false,
+            config_authority: String::new(),
+            config_sequence: 0,
+            session_token: "mesh-dns-e2e-session".to_string(),
         };
 
         // Send the initial slice, then keep the stream alive so the gateway's

@@ -288,6 +288,7 @@ async fn connect_mesh_subscribe(
                 let report = MeshSliceStatusReport {
                     version: slice.version.clone(),
                     error_message: String::new(),
+                    session_token: update.session_token.clone(),
                 };
                 if let Err(err) = status_client.report_mesh_slice_status(report).await {
                     warn!(
@@ -308,6 +309,7 @@ async fn connect_mesh_subscribe(
                     let report = MeshSliceStatusReport {
                         version: update.version.clone(),
                         error_message: rejection.reason_label().to_string(),
+                        session_token: update.session_token.clone(),
                     };
                     if let Err(err) = status_client.report_mesh_slice_status(report).await {
                         warn!(
@@ -471,6 +473,7 @@ mod tests {
                 .revision
                 .as_ref()
                 .map_or(0, |revision| revision.sequence),
+            session_token: "test-session".to_string(),
         }
     }
 

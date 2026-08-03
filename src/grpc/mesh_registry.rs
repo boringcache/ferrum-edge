@@ -27,8 +27,8 @@ pub struct MeshNodeInfo {
 
 /// Online mesh subscribers plus the optional CP-side slice-drift tracker
 /// (issue #3265). Drift is shared with [`super::mesh_server::MeshGrpcServer`]
-/// so broadcasts can advance `desired` without threading a second handle
-/// through every publish site.
+/// so broadcasts can reconcile retained disconnected projections without
+/// threading a second handle through every publish site.
 #[derive(Default)]
 pub struct MeshNodeRegistry {
     nodes: DashMap<String, MeshNodeInfo>,
@@ -50,16 +50,8 @@ impl MeshNodeRegistry {
         self
     }
 
-    pub fn set_drift(&mut self, drift: Arc<MeshSliceDriftRegistry>) {
-        self.drift = Some(drift);
-    }
-
     pub fn drift(&self) -> Option<&MeshSliceDriftRegistry> {
         self.drift.as_deref()
-    }
-
-    pub fn drift_arc(&self) -> Option<Arc<MeshSliceDriftRegistry>> {
-        self.drift.clone()
     }
 
     pub fn insert(&self, info: MeshNodeInfo) {

@@ -4565,6 +4565,7 @@ mod tests {
                     .revision
                     .as_ref()
                     .map_or(0, |revision| revision.sequence),
+                session_token: String::new(),
             };
             let heartbeat = MeshConfigUpdate {
                 version: self.slice.version.clone(),
@@ -4574,6 +4575,7 @@ mod tests {
                 heartbeat: true,
                 config_authority: String::new(),
                 config_sequence: 0,
+                session_token: String::new(),
             };
 
             let items: Vec<Result<MeshConfigUpdate, Status>> = match self.behavior {
