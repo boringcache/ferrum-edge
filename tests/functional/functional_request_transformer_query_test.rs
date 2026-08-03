@@ -401,7 +401,7 @@ impl TransformerRetryHarness {
             .await
             .expect("proxy port ready");
 
-        let mut harness = Self { gateway, backend };
+        let harness = Self { gateway, backend };
         // Event-driven ownership proof: wait until *this* gateway dials *our*
         // backend (capability / warmup probe traffic is enough). A foreign
         // SO_REUSEPORT sharer would never dial this listener. Clear probe
