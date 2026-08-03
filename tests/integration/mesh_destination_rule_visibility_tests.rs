@@ -78,6 +78,7 @@ fn workload_in(namespace: &str, name: &str) -> Workload {
             .expect("valid spiffe id"),
         selector: Default::default(),
         service_name: name.to_string(),
+        service_namespace: None,
         addresses: Vec::new(),
         ports: Vec::new(),
         trust_domain: TrustDomain::new(TRUST_DOMAIN).expect("trust domain"),
