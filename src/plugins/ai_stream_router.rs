@@ -3250,19 +3250,30 @@ impl Plugin for AiStreamRouter {
         // authoritative (`GHSA-xhp5-hqj8-3mwg`); do not re-read them from
         // mutable metadata.
         let ceiling = ctx.retained_response_body_ceiling();
-        let header_encoding = match content_encoding_value(response_headers) {
-            Ok(encoding) => encoding,
-            Err(message) => return bounded_upstream_sse_error_body(&message, ceiling),
+        // Prefer the after_proxy-claimed coding; otherwise classify residual
+        // headers the same way so unsupported/hostile tokens never reach decode
+        // and never echo into the client envelope.
+        let encoding = if let Some(claimed) = ctx.metadata.get(META_PROVIDER_ENCODING) {
+            Some(claimed.as_str())
+        } else {
+            match classify_provider_content_encoding(response_headers) {
+                ProviderContentEncoding::Identity => None,
+                ProviderContentEncoding::Supported(coding) => Some(coding),
+                ProviderContentEncoding::Unsupported(internal) => {
+                    return bounded_upstream_sse_error_body(
+                        provider_content_encoding_client_message(&internal),
+                        ceiling,
+                    );
+                }
+            }
         };
-        let encoding = ctx
-            .metadata
-            .get(META_PROVIDER_ENCODING)
-            .map(String::as_str)
-            .or(header_encoding);
         let plaintext = match prepare_sse_bytes_for_normalization(body, encoding) {
             Ok(bytes) => bytes,
             Err(message) => {
-                return bounded_upstream_sse_error_body(&message, ceiling);
+                return bounded_upstream_sse_error_body(
+                    provider_content_encoding_client_message(&message),
+                    ceiling,
+                );
             }
         };
         normalize_provider_stream_buffered(
@@ -3342,11 +3353,9 @@ impl Plugin for AiStreamRouter {
                 repair_normalized_representation_headers(response_headers);
                 PluginResult::Continue
             }
-            ProviderContentEncoding::Unsupported(message) => openai_error_response(
+            ProviderContentEncoding::Unsupported(_) => openai_error_response(
                 502,
-                &format!(
-                    "Upstream provider stream used an unsupported Content-Encoding: {message}"
-                ),
+                UNSUPPORTED_PROVIDER_CONTENT_ENCODING_MESSAGE,
                 "upstream_error",
                 None,
                 Some("unsupported_content_encoding"),
@@ -3612,9 +3621,10 @@ fn upstream_sse_error_body(message: &str) -> Vec<u8> {
 
 /// [`upstream_sse_error_body`] under the response's retained ceiling.
 ///
-/// The envelope shape is fixed, but `message` is derived from upstream-supplied
-/// material (a rejected `Content-Encoding`, a decode diagnostic), so the whole
-/// body is SERIALIZED THROUGH the bounded sink rather than built as a complete
+/// The envelope shape is fixed. Client-visible `message` values for residual
+/// encoding rejection are fixed/redacted via
+/// [`provider_content_encoding_client_message`]; other upstream diagnostics are
+/// still serialized through the bounded sink rather than built as a complete
 /// `Vec` that a bounded copy would only measure afterwards: the JSON string is
 /// written by `serde_json` straight into the sink, which stops at the ceiling
 /// (GHSA-pwcm-6rh8-f2gh). `None` (leave the response alone) is the fail-closed
@@ -3676,9 +3686,9 @@ fn wrap_provider_normalizer(
     match encoding {
         Some("gzip") => Box::new(ContentDecodingNormalizer::gzip(engine)),
         Some("br") => Box::new(ContentDecodingNormalizer::brotli(engine)),
-        Some(other) => Box::new(ImmediateUpstreamErrorNormalizer::new(format!(
-            "unsupported content-encoding '{other}' for provider stream normalization"
-        ))),
+        Some(_) => Box::new(ImmediateUpstreamErrorNormalizer::new(
+            UNSUPPORTED_PROVIDER_CONTENT_ENCODING_MESSAGE.to_string(),
+        )),
         None => match engine {
             NormalizeEngine::Anthropic(inner) => Box::new(inner),
             NormalizeEngine::Gemini(inner) => Box::new(inner),
@@ -3738,6 +3748,39 @@ fn provider_stream_media_fail_closed_message(
         ),
         ProviderStreamMediaDecision::Normalize | ProviderStreamMediaDecision::PassThrough => None,
     }
+}
+
+/// Fixed-cardinality residual Content-Encoding diagnostic.
+///
+/// Never echoes the provider coding token or header parameters into a
+/// client-visible 502 / SSE envelope.
+const UNSUPPORTED_PROVIDER_CONTENT_ENCODING_MESSAGE: &str =
+    "Upstream provider stream used an unsupported Content-Encoding";
+
+/// Map an internal residual-encoding / decode diagnostic to a client-visible
+/// string without echoing untrusted coding tokens.
+///
+/// Structural diagnostics that never embed a coding token stay stable (the
+/// buffered envelope serialization contract depends on
+/// `multiple case-variant Content-Encoding headers`). Token-bearing rejection
+/// strings are replaced with [`UNSUPPORTED_PROVIDER_CONTENT_ENCODING_MESSAGE`].
+/// Trusted gzip/br decode-limit diagnostics pass through unchanged.
+fn provider_content_encoding_client_message(internal: &str) -> &str {
+    if internal == "multiple case-variant Content-Encoding headers" {
+        return internal;
+    }
+    if internal.starts_with("unsupported content-encoding")
+        || internal.contains("unsupported parameters")
+        || internal.contains("is not a valid HTTP token")
+        || internal.contains("contains an empty coding")
+        || internal.starts_with("multi-layer content-encoding")
+        || internal.starts_with("content-encoding has more than")
+        || internal == "content-encoding contains no coding members"
+        || internal == "identity content-encoding cannot be combined with other codings"
+    {
+        return UNSUPPORTED_PROVIDER_CONTENT_ENCODING_MESSAGE;
+    }
+    internal
 }
 
 /// Ensure Gemini streaming requests negotiate `alt=sse` when normalizing.
@@ -5681,26 +5724,20 @@ impl GeminiStreamNormalizer {
             }
             GeminiJsonArrayState::Inactive | GeminiJsonArrayState::Closed => {}
         }
-        if self
+        // Premature EOF contract is one stable redacted diagnostic whether the
+        // stream closed with zero candidates (e.g. `[]`) or with unfinished
+        // client-visible candidates — never echo provider payload bytes.
+        let unfinished_visible = self
             .candidates
             .values()
-            .any(|state| state.emitted_client_visible && !state.finished)
-        {
-            self.emit_upstream_error(
-                "upstream provider closed the Gemini stream before every candidate reached a terminal finishReason",
-                out,
-            );
-            self.finish(StreamTerminal::UpstreamFailure, out);
-            let _ = self.normalized_output_exceeded(out, true);
-            return;
-        }
-        if self.saw_successful_finish {
+            .any(|state| state.emitted_client_visible && !state.finished);
+        if self.saw_successful_finish && !unfinished_visible {
             self.finish(StreamTerminal::MessageStop, out);
             let _ = self.normalized_output_exceeded(out, true);
             return;
         }
         self.emit_upstream_error(
-            "upstream provider closed the Gemini stream before a terminal finishReason",
+            "upstream provider closed the Gemini stream before every candidate reached a terminal finishReason",
             out,
         );
         self.finish(StreamTerminal::UpstreamFailure, out);
@@ -6008,7 +6045,10 @@ impl ContentDecodingNormalizer {
     async fn fail_decode(&mut self, message: String) -> ResponseStreamAction {
         let mut out = NormalizedSseOut::unbounded();
         out.begin_call();
-        self.inner.emit_upstream_error(&message, &mut out);
+        self.inner.emit_upstream_error(
+            provider_content_encoding_client_message(&message),
+            &mut out,
+        );
         self.inner.finish_failure(&mut out);
         ResponseStreamAction::Terminate(Some(Bytes::from(out.take_call_bytes())))
     }
