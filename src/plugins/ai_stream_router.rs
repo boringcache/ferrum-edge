@@ -4045,8 +4045,10 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
         // Encoded working set is spent; drop it before driving the plaintext
         // normalizer so peak retention is decode output + normalized SSE, not
         // also the original wire bytes.
-        self.encoded.clear();
-        self.encoded.shrink_to_fit();
+        // `mem::take` drops the spent allocation immediately without asking
+        // the allocator to shrink a buffer this terminal inspector will never
+        // reuse.
+        drop(std::mem::take(&mut self.encoded));
         let mut out = Vec::new();
         if !decoded.is_empty() {
             match self.inner.on_chunk(&decoded).await {
