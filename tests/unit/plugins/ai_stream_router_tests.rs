@@ -6521,11 +6521,9 @@ async fn test_gemini_claim_injects_alt_sse_and_goog_api_key() {
         path.ends_with("/v1beta/models/gemini-1.5-flash:streamGenerateContent"),
         "route override must keep the streamGenerateContent model path, got {path}"
     );
-    let effective =
-        ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+    let effective = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
     assert_eq!(
-        effective,
-        "alt=sse",
+        effective, "alt=sse",
         "committed backend query must be exactly alt=sse, got {effective}"
     );
     assert_eq!(
