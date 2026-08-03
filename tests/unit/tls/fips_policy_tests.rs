@@ -35,9 +35,9 @@ fn plugin(name: &str, config: serde_json::Value) -> PluginConfig {
     }
 }
 
-fn consumer_with(basic_auth: serde_json::Value) -> Consumer {
+fn consumer_with(basicauth: serde_json::Value) -> Consumer {
     let mut credentials = std::collections::HashMap::new();
-    credentials.insert("basic_auth".to_string(), basic_auth);
+    credentials.insert("basicauth".to_string(), basicauth);
     Consumer {
         id: "consumer-1".to_string(),
         username: "alice".to_string(),
