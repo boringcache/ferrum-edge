@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -2696,7 +2696,24 @@ fn l4_route_destination(
             ),
         )
     })?;
-    Ok((host.to_string(), port))
+    // A short Istio destination is resolved relative to the VirtualService's
+    // namespace, not the namespace of a sidecar/gateway that consumes an
+    // exported route. Qualify recognized Kubernetes service forms before L4
+    // visibility projection changes `Proxy.namespace`; external hosts remain
+    // byte-for-byte unchanged.
+    let backend_host = service_host_components(
+        host,
+        &object.metadata.namespace,
+        &acc.options.cluster_domain,
+    )
+    .map(|(service, namespace)| {
+        format!(
+            "{service}.{namespace}.svc.{}",
+            acc.options.cluster_domain.trim_end_matches('.')
+        )
+    })
+    .unwrap_or_else(|| host.to_string());
+    Ok((backend_host, port))
 }
 
 fn virtual_service_l4_proxy_id(
@@ -2932,6 +2949,148 @@ fn expand_istio_sni_hosts(
     Ok(expanded)
 }
 
+fn l4_export_namespaces(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+) -> Result<(BTreeSet<String>, bool), K8sTranslateError> {
+    let Some(value) = object.spec.get("exportTo") else {
+        return Ok((acc.known_namespaces.iter().cloned().collect(), true));
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(invalid_resource(
+            object,
+            "VirtualService spec.exportTo must be an array of namespace strings",
+        ));
+    };
+    // Istio treats an omitted/empty exportTo as public. Keep that distinction
+    // from the mesh model's native empty-list convention at this boundary.
+    if entries.is_empty() {
+        return Ok((acc.known_namespaces.iter().cloned().collect(), true));
+    }
+    if entries.len() > crate::proxy::stream_match::MAX_STREAM_MATCH_GATEWAYS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService spec.exportTo must contain at most {} entries for L4 routing",
+                crate::proxy::stream_match::MAX_STREAM_MATCH_GATEWAYS
+            ),
+        ));
+    }
+    let mut namespaces = BTreeSet::new();
+    let mut public = false;
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(namespace) = entry.as_str() else {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService spec.exportTo[{index}] must be a string"),
+            ));
+        };
+        match namespace {
+            "*" => {
+                public = true;
+                namespaces.extend(acc.known_namespaces.iter().cloned());
+            }
+            "." => {
+                namespaces.insert(object.metadata.namespace.clone());
+            }
+            namespace => {
+                if crate::proxy::stream_match::validate_kubernetes_namespace(namespace).is_err()
+                {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "VirtualService spec.exportTo[{index}] is not a valid namespace"
+                        ),
+                    ));
+                }
+                namespaces.insert(namespace.to_string());
+            }
+        }
+    }
+    Ok((namespaces, public))
+}
+
+fn project_l4_proxy_visibility(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    proxies: Vec<Proxy>,
+) -> Result<Vec<Proxy>, K8sTranslateError> {
+    let (mut export_namespaces, public) = l4_export_namespaces(object, acc)?;
+    if public {
+        export_namespaces.insert(object.metadata.namespace.clone());
+        // A public VirtualService must reach a named gateway even when no
+        // other watched object happened to make that gateway namespace part of
+        // `known_namespaces` yet.
+        for gateway in proxies
+            .iter()
+            .filter_map(|proxy| proxy.stream_match.as_ref())
+            .flat_map(|criteria| criteria.arms.iter())
+            .flat_map(|arm| arm.gateways.iter())
+            .filter(|gateway| gateway.as_str() != crate::proxy::stream_match::MESH_GATEWAY_TOKEN)
+        {
+            if let Some((namespace, _)) = gateway.split_once('/') {
+                export_namespaces.insert(namespace.to_string());
+            }
+        }
+    }
+
+    let mut projected = Vec::new();
+    for proxy in proxies {
+        let Some(criteria) = proxy.stream_match.as_ref() else {
+            continue;
+        };
+        for namespace in &export_namespaces {
+            let mut criteria = criteria.clone();
+            let mut projected_arms = Vec::with_capacity(criteria.arms.len().saturating_mul(2));
+            for arm in criteria.arms.drain(..) {
+                if arm
+                    .gateways
+                    .iter()
+                    .any(|gateway| gateway == crate::proxy::stream_match::MESH_GATEWAY_TOKEN)
+                {
+                    let mut mesh_arm = arm.clone();
+                    mesh_arm.gateways =
+                        vec![crate::proxy::stream_match::MESH_GATEWAY_TOKEN.to_string()];
+                    projected_arms.push(mesh_arm);
+                }
+
+                let named_gateways: Vec<String> = arm
+                    .gateways
+                    .iter()
+                    .filter(|gateway| {
+                        gateway
+                            .split_once('/')
+                            .is_some_and(|(gateway_namespace, _)| gateway_namespace == namespace)
+                    })
+                    .cloned()
+                    .collect();
+                if !named_gateways.is_empty() {
+                    let mut gateway_arm = arm;
+                    gateway_arm.gateways = named_gateways;
+                    // Istio defines sourceLabels/sourceNamespace as workload
+                    // selectors, not runtime gateway predicates; match-level
+                    // gateways are explicitly independent of sourceLabels.
+                    // They remain enforced on the mesh arm above and are
+                    // removed only from this named-gateway projection.
+                    gateway_arm.source_labels.clear();
+                    gateway_arm.source_namespace = None;
+                    projected_arms.push(gateway_arm);
+                }
+            }
+            criteria.arms = projected_arms;
+            if criteria.arms.is_empty() {
+                continue;
+            }
+            let mut projected_proxy = proxy.clone();
+            projected_proxy.namespace = namespace.clone();
+            projected_proxy.stream_match = Some(criteria);
+            projected_proxy.compiled_stream_match = None;
+            projected.push(projected_proxy);
+        }
+    }
+    Ok(projected)
+}
+
 /// Translate VirtualService L4 routes into Ferrum stream proxies, reusing the
 /// same stream + SNI machinery as gateway / east-west passthrough:
 ///   - `spec.tls[]` → a **passthrough** TCP proxy keyed by SNI (`hosts =
@@ -3082,7 +3241,7 @@ fn virtual_service_l4_proxies(
         }
     }
 
-    Ok(proxies)
+    project_l4_proxy_visibility(object, acc, proxies)
 }
 
 fn virtual_service_routes(
@@ -10706,6 +10865,84 @@ extensionProviders:
         assert!(
             format!("{err}").contains("at most 64 total match candidates"),
             "got {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_l4_export_to_projects_runtime_namespace() {
+        let translated = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "exportTo": ["consumer"],
+                    "tcp": [{
+                        "match": [{"port": 3306, "gateways": ["mesh"]}],
+                        "route": [{"destination": {"host": "mysql", "port": {"number": 3306}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("explicit exportTo recipient receives the L4 proxy");
+        let proxies: Vec<&Proxy> = translated
+            .config
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.listen_port == Some(3306))
+            .collect();
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].namespace, "consumer");
+        assert_eq!(
+            proxies[0].backend_host,
+            "mysql.default.svc.cluster.local",
+            "short destinations remain relative to the VirtualService namespace"
+        );
+    }
+
+    #[test]
+    fn virtual_service_l4_public_export_reaches_named_gateway_namespace() {
+        let translated = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["secure.example.com"],
+                    "gateways": ["edge/ingress"],
+                    "tls": [{
+                        "match": [{
+                            "sniHosts": ["secure.example.com"],
+                            "sourceLabels": {"app": "client"},
+                            "sourceNamespace": "consumer"
+                        }],
+                        "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 443}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("default public export reaches the named gateway namespace");
+        let proxy = translated
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.listen_port == Some(443))
+            .expect("named-gateway TLS proxy");
+        assert_eq!(proxy.namespace, "edge");
+        assert_eq!(
+            proxy.stream_match.as_ref().unwrap().arms[0].gateways,
+            vec!["edge/ingress".to_string()]
+        );
+        assert!(
+            proxy.stream_match.as_ref().unwrap().arms[0]
+                .source_labels
+                .is_empty(),
+            "sourceLabels is a mesh workload selector, independent of named gateways"
+        );
+        assert!(
+            proxy.stream_match.as_ref().unwrap().arms[0]
+                .source_namespace
+                .is_none(),
+            "sourceNamespace is a mesh workload selector, independent of named gateways"
         );
     }
 

@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity, label, subnet, or gateway evidence denies the requiring predicate;
   candidates retain VirtualService declaration order, including an explicitly
   earlier catch-all that shadows later rules;
+  `exportTo` projects routes into eligible sidecar/named-gateway namespaces,
+  where workload selectors remain mesh-only and gateway selection stays
+  independent;
   malformed label keys/values, namespaces, gateway names, and CIDRs fail closed
   at translation with field-specific `FerrumAccepted=False`/`Invalid`
   diagnostics. Istio
