@@ -3697,17 +3697,139 @@ fn mesh_retry_mtls_server_config(svid: &GeneratedGatewaySvid) -> Arc<rustls::Ser
     Arc::new(config)
 }
 
-/// Hold one destination port for the failed application attempt and its retry.
+/// Classification of the first byte on a mesh-retry mTLS fixture connection.
 ///
 /// File-mode gateways still run an initial backend-capability refresh that dials
 /// plaintext backends with the HTTP/2 prior-knowledge preface (`PRI *…`, first
-/// byte `0x50`) even when `FERRUM_POOL_WARMUP_ENABLED=false`. Those probes must
-/// not masquerade as the secured mesh application attempt. This fixture:
-/// 1. discards h2c preface connections as preflight,
-/// 2. treats the first non-preface connection as the failed application attempt
-///    and records its first byte (must be TLS handshake `0x16`), then drops it,
-/// 3. accepts the next non-preface connection only when it also begins with
-///    `0x16`, prepends that byte, completes mTLS, and serves one gRPC request.
+/// byte `0x50` / `b'P'`) even when `FERRUM_POOL_WARMUP_ENABLED=false`. That same
+/// preface is also how a plaintext application attempt begins, so `b'P'` alone
+/// cannot prove a connection is harmless preflight. Classification therefore
+/// requires the fixture's application phase bit sampled at accept time:
+/// * preflight + `P` → discard as the known capability probe,
+/// * application phase + `P` → hard-fail (the mTLS bypass under test),
+/// * any other first byte → application record (must be TLS `0x16`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshRetryInboundFirstByte {
+    PreflightCapabilityProbe,
+    ApplicationPlaintextHttp2,
+    ApplicationRecord(u8),
+}
+
+fn classify_mesh_retry_inbound_first_byte(
+    first_byte: u8,
+    application_phase_armed_at_accept: bool,
+) -> MeshRetryInboundFirstByte {
+    if first_byte == b'P' {
+        if application_phase_armed_at_accept {
+            MeshRetryInboundFirstByte::ApplicationPlaintextHttp2
+        } else {
+            MeshRetryInboundFirstByte::PreflightCapabilityProbe
+        }
+    } else {
+        MeshRetryInboundFirstByte::ApplicationRecord(first_byte)
+    }
+}
+
+/// Pins the probe/application correlation boundary without running the live
+/// gateway fixture: `P` is preflight only before application-phase arming, and
+/// the same byte hard-fails afterward so a plaintext application attempt cannot
+/// be discarded as a capability probe.
+#[test]
+fn mesh_retry_mtls_first_byte_classification_is_phase_armed() {
+    assert_eq!(
+        classify_mesh_retry_inbound_first_byte(b'P', false),
+        MeshRetryInboundFirstByte::PreflightCapabilityProbe,
+        "preflight may discard the known h2c capability-probe preface"
+    );
+    assert_eq!(
+        classify_mesh_retry_inbound_first_byte(b'P', true),
+        MeshRetryInboundFirstByte::ApplicationPlaintextHttp2,
+        "post-arm plaintext HTTP/2 preface must hard-fail as the mTLS bypass"
+    );
+    assert_eq!(
+        classify_mesh_retry_inbound_first_byte(0x16, false),
+        MeshRetryInboundFirstByte::ApplicationRecord(0x16)
+    );
+    assert_eq!(
+        classify_mesh_retry_inbound_first_byte(0x16, true),
+        MeshRetryInboundFirstByte::ApplicationRecord(0x16)
+    );
+    assert_eq!(
+        classify_mesh_retry_inbound_first_byte(b'G', true),
+        MeshRetryInboundFirstByte::ApplicationRecord(b'G'),
+        "non-preface bytes are application records regardless of phase"
+    );
+}
+
+/// Source guard: the live mesh-retry mTLS fixture must phase-arm observation
+/// around the application request instead of unconditionally discarding every
+/// `P` connection (which would also mask a plaintext application attempt).
+#[test]
+fn mesh_retry_mtls_fixture_phase_arms_before_application_request() {
+    let backend = mesh_test_fn_body("start_mesh_retry_mtls_backend");
+    assert!(
+        backend.contains("classify_mesh_retry_inbound_first_byte("),
+        "fixture must classify first bytes through the phase-armed helper"
+    );
+    assert!(
+        backend.contains("MeshRetryInboundFirstByte::PreflightCapabilityProbe"),
+        "fixture must preserve preflight capability-probe discard"
+    );
+    assert!(
+        backend.contains("MeshRetryInboundFirstByte::ApplicationPlaintextHttp2"),
+        "fixture must hard-fail post-arm plaintext HTTP/2 prefaces"
+    );
+    assert!(
+        backend.contains("armed_at_accept"),
+        "fixture must sample application phase at accept time"
+    );
+    assert!(
+        backend.contains("successful secured retry must begin with a TLS handshake record"),
+        "fixture must keep the successful-retry TLS 0x16 assertion"
+    );
+    // Build the forbidden pattern from parts so this assertion's own source
+    // text does not trip the `include_str!` self-scan.
+    let unconditional_p_discard = ["if record_type[0] == b'", "P' {\n                drop(stream);\n                continue;"].concat();
+    assert!(
+        !backend.contains(&unconditional_p_discard),
+        "regression: unconditionally discarding every first-byte `P` connection \
+         masks a plaintext HTTP/2 application attempt as a capability probe"
+    );
+
+    let live = mesh_test_fn_body(
+        "functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers",
+    );
+    let arm = live
+        .find("arm_application_phase")
+        .expect("live fixture must arm application phase before the request");
+    let request = live
+        .find("grpc_mesh_retry_request(gateway.proxy_port, &payload, None)")
+        .expect("live fixture application request not found");
+    assert!(
+        arm < request,
+        "application phase must be armed before the secured mesh retry request"
+    );
+    assert!(
+        live.contains("0x16"),
+        "live fixture must keep the failed-attempt TLS handshake assertion"
+    );
+    assert!(
+        live.contains("application_hits.load(Ordering::SeqCst), 1"),
+        "live fixture must keep the single application-delivery assertion"
+    );
+}
+
+/// Hold one destination port for the failed application attempt and its retry.
+///
+/// The returned [`watch::Sender`] arms application-phase observation. Callers
+/// must arm it only after gateway readiness and immediately before the test's
+/// application request so startup h2c capability probes accepted in preflight
+/// can be discarded without also masking a post-arm plaintext application
+/// attempt. Once armed:
+/// 1. a first byte of `P` panics (plaintext HTTP/2 is the bypass under test),
+/// 2. the first application record is observed (must be TLS `0x16`) and dropped,
+/// 3. the next application record must also be `0x16`, is prepended, completes
+///    mTLS, and serves one gRPC request.
 ///
 /// Keeping the listener bound throughout removes the close/rebind race that
 /// would make a retry fixture timing-dependent.
@@ -3716,6 +3838,7 @@ async fn start_mesh_retry_mtls_backend(
     server_config: Arc<rustls::ServerConfig>,
     application_hits: Arc<AtomicUsize>,
 ) -> (
+    watch::Sender<bool>,
     oneshot::Receiver<u8>,
     oneshot::Receiver<MeshRetryBackendObservation>,
     tokio::task::JoinHandle<()>,
@@ -3772,6 +3895,7 @@ async fn start_mesh_retry_mtls_backend(
         }
     }
 
+    let (application_phase_tx, mut application_phase_rx) = watch::channel(false);
     let (first_record_tx, first_record_rx) = oneshot::channel();
     let (observation_tx, observation_rx) = oneshot::channel();
     let observation_tx = Arc::new(Mutex::new(Some(observation_tx)));
@@ -3783,27 +3907,46 @@ async fn start_mesh_retry_mtls_backend(
                     .await
                     .expect("mesh retry accept timed out")
                     .expect("accept mesh retry connection");
+            // Sample the phase at accept so a capability probe that connected
+            // during preflight stays preflight even if the test arms before the
+            // first byte is read.
+            let armed_at_accept = *application_phase_rx.borrow();
             let mut record_type = [0u8; 1];
             tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut record_type))
                 .await
                 .expect("mesh retry connection sent no bytes")
                 .expect("read mesh retry record type");
-            // Capability probes speak plaintext h2c prior-knowledge (`PRI *`).
-            if record_type[0] == b'P' {
-                drop(stream);
-                continue;
+            match classify_mesh_retry_inbound_first_byte(record_type[0], armed_at_accept) {
+                MeshRetryInboundFirstByte::PreflightCapabilityProbe => {
+                    drop(stream);
+                    continue;
+                }
+                MeshRetryInboundFirstByte::ApplicationPlaintextHttp2 => {
+                    panic!(
+                        "mesh retry fixture saw plaintext HTTP/2 preface after application \
+                         phase arming; this is the mTLS bypass under test, not a capability probe"
+                    );
+                }
+                MeshRetryInboundFirstByte::ApplicationRecord(record) => {
+                    if !armed_at_accept {
+                        application_phase_rx
+                            .wait_for(|armed| *armed)
+                            .await
+                            .expect("mesh retry application phase arm dropped");
+                    }
+                    if let Some(tx) = first_record_tx.take() {
+                        let _ = tx.send(record);
+                        // Failed application attempt: observe the TLS record, then
+                        // drop before handshake/request so the gateway retries once.
+                        drop(stream);
+                        continue;
+                    }
+                    break PrefixedTcpStream {
+                        prefix: Some(record),
+                        inner: stream,
+                    };
+                }
             }
-            if let Some(tx) = first_record_tx.take() {
-                let _ = tx.send(record_type[0]);
-                // Failed application attempt: observe the TLS record, then drop
-                // before handshake/request so the gateway retries once.
-                drop(stream);
-                continue;
-            }
-            break PrefixedTcpStream {
-                prefix: Some(record_type[0]),
-                inner: stream,
-            };
         };
 
         assert_eq!(
@@ -3905,7 +4048,12 @@ async fn start_mesh_retry_mtls_backend(
             panic!("mesh retry HTTP/2 server failed: {error}");
         }
     });
-    (first_record_rx, observation_rx, task)
+    (
+        application_phase_tx,
+        first_record_rx,
+        observation_rx,
+        task,
+    )
 }
 
 async fn grpc_mesh_retry_request(
@@ -4033,12 +4181,13 @@ async fn functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_
         .expect("mesh retry listener addr")
         .port();
     let application_hits = Arc::new(AtomicUsize::new(0));
-    let (first_record, observation, backend_task) = start_mesh_retry_mtls_backend(
-        listener,
-        mesh_retry_mtls_server_config(&svids.b),
-        Arc::clone(&application_hits),
-    )
-    .await;
+    let (arm_application_phase, first_record, observation, backend_task) =
+        start_mesh_retry_mtls_backend(
+            listener,
+            mesh_retry_mtls_server_config(&svids.b),
+            Arc::clone(&application_hits),
+        )
+        .await;
 
     let config = format!(
         r#"version: "1"
@@ -4089,6 +4238,13 @@ plugin_configs: []
         .await
         .expect("mesh retry gateway ready");
 
+    // Arm only after readiness and immediately before the application request so
+    // startup h2c capability probes remain preflight, while any post-arm
+    // plaintext `P` preface hard-fails as the mTLS bypass under test.
+    arm_application_phase
+        .send(true)
+        .expect("mesh retry backend application phase receiver dropped");
+
     let payload = grpc_framed_payload(b"mesh-replay-body");
     let response = grpc_mesh_retry_request(gateway.proxy_port, &payload, None)
         .await
@@ -4099,7 +4255,7 @@ plugin_configs: []
             .expect("first TLS observation timed out")
             .expect("first TLS observation sender dropped"),
         0x16,
-        "the failed application attempt (after skipping h2c capability probes) must be a TLS handshake record, never plaintext HTTP"
+        "the failed application attempt must be a TLS handshake record, never plaintext HTTP"
     );
     let observed = tokio::time::timeout(Duration::from_secs(2), observation)
         .await
