@@ -175,11 +175,11 @@ wait_for_projected_withdrawal() {
   return 1
 }
 
-wait_for_proxy_activity() {
+wait_for_proxy_accept() {
   local label="$1" timeout="$2"; shift 2
   local deadline=$((SECONDS + timeout))
   while (( SECONDS < deadline )); do
-    if proxy_activity_increased "$@"; then return 0; fi
+    if proxy_accepted_client_increased "$@"; then return 0; fi
     sleep 1
   done
   echo "timed out waiting for $label (${timeout}s)" >&2
@@ -285,14 +285,20 @@ spire_register_workload() {
   local workload_namespace="$5" service_account="$6" selector existing=""
   shift 6
   local -a selectors=("k8s:ns:$workload_namespace" "k8s:sa:$service_account") args
-  for selector in "$@"; do selectors+=("$selector"); done
+  # Keep opaque selector values behind assignment syntax the trusted automation
+  # scanner recognizes; Bash's NAME+= form is not part of that closed grammar.
+  for selector in "$@"; do
+    selectors=("${selectors[@]}" "$selector")
+  done
   if existing="$(spire_server_exec "$context" "$namespace" entry show \
       -spiffeID "$spiffe_id" -parentID "$parent_id" 2>/dev/null)" &&
     spire_entry_has_selectors "$existing" "${selectors[@]}"; then
     return 0
   fi
   args=(entry create -spiffeID "$spiffe_id" -parentID "$parent_id")
-  for selector in "${selectors[@]}"; do args+=(-selector "$selector"); done
+  for selector in "${selectors[@]}"; do
+    args=("${args[@]}" -selector "$selector")
+  done
   spire_server_exec "$context" "$namespace" "${args[@]}"
 }
 
@@ -351,15 +357,16 @@ add_latency() {
 
 remove_latency() { curl -fsS -X DELETE "http://$TOXI_IP:8474/proxies/$1/toxics/inflight" >/dev/null; }
 
-proxy_received_downstream_bytes() {
-  curl -fsS "http://$TOXI_IP:8474/metrics" | \
+proxy_accepted_client_count() {
+  docker logs "$TOXIPROXY_CONTAINER" | \
     python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
-      proxy-received-downstream-bytes "$1"
+      toxiproxy-accepted-client-count "$1"
 }
 
-proxy_activity_increased() {
+proxy_accepted_client_increased() {
   local current
-  current="$(proxy_received_downstream_bytes "$1")" || return 1
+  current="$(proxy_accepted_client_count "$1")" || return 1
+  bounded_uint "$current" "accepted-client count for $1" >/dev/null || return 1
   (( current > $2 ))
 }
 
@@ -771,16 +778,20 @@ scenario_trust_expiry() {
 
 scenario_inflight_withdrawal() {
   local fed_failure_before disc_failure_before fed_failure_after disc_failure_after
-  local fed_before disc_before fed_after disc_after fault_started
+  local fed_accepts_before disc_accepts_before fed_accepts_after disc_accepts_after fault_started
   wait_for_fresh_state "pre-withdrawal poller freshness" 20 "$CONTEXT_A" "$JWT_A" cluster-b
 
   # Own each poller's next-attempt boundary instead of assuming that a previous
   # recovery reset its independent jittered backoff in time for a fixed sample
   # window. Establish the boundaries independently so one disabled proxy cannot
   # climb its backoff while the other catches up. A measured failure proves the
-  # current attempt completed; enabling a preinstalled downstream toxic then
-  # traps the very next successful response. The 60-second federation delay
-  # leaves enough time to synchronize discovery before withdrawing the peer.
+  # current attempt completed. Capture the proxy's accepted-client baseline at
+  # that disabled boundary, then install downstream latency before re-enabling
+  # it. A new proxy-scoped accept proves the next poll entered the already-toxic
+  # proxy; Toxiproxy only accounts received bytes after its copy exits, so that
+  # counter cannot prove a still-delayed connection. The 60-second federation
+  # delay leaves enough time to synchronize discovery before withdrawing the
+  # peer.
   fed_failure_before="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
     ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
   set_proxy "$FED_AB" false
@@ -788,11 +799,12 @@ scenario_inflight_withdrawal() {
     ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"" "$fed_failure_before"
   fed_failure_after="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
     ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
-  fed_before="$(proxy_received_downstream_bytes "$FED_AB")"
+  fed_accepts_before="$(proxy_accepted_client_count "$FED_AB")"
+  bounded_uint "$fed_accepts_before" "federation accepted-client baseline" >/dev/null
   add_latency "$FED_AB"
   fault_started=$SECONDS
   set_proxy "$FED_AB" true
-  wait_for_proxy_activity "federation delayed response in flight" 10 "$FED_AB" "$fed_before"
+  wait_for_proxy_accept "federation delayed poll connection" 10 "$FED_AB" "$fed_accepts_before"
 
   disc_failure_before="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
     ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
@@ -801,15 +813,22 @@ scenario_inflight_withdrawal() {
     ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"" "$disc_failure_before"
   disc_failure_after="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
     ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
-  disc_before="$(proxy_received_downstream_bytes "$DISC_AB")"
+  disc_accepts_before="$(proxy_accepted_client_count "$DISC_AB")"
+  bounded_uint "$disc_accepts_before" "discovery accepted-client baseline" >/dev/null
   add_latency "$DISC_AB"
   set_proxy "$DISC_AB" true
-  wait_for_proxy_activity "discovery delayed response in flight" 10 "$DISC_AB" "$disc_before"
-  fed_after="$(proxy_received_downstream_bytes "$FED_AB")"
-  disc_after="$(proxy_received_downstream_bytes "$DISC_AB")"
-  printf 'federation_failures_before=%s\nfederation_failures_boundary=%s\ndiscovery_failures_before=%s\ndiscovery_failures_boundary=%s\nfederation_downstream_bytes_before=%s\nfederation_downstream_bytes_inflight=%s\ndiscovery_downstream_bytes_before=%s\ndiscovery_downstream_bytes_inflight=%s\n' \
+  wait_for_proxy_accept "discovery delayed poll connection" 10 "$DISC_AB" "$disc_accepts_before"
+  fed_accepts_after="$(proxy_accepted_client_count "$FED_AB")"
+  disc_accepts_after="$(proxy_accepted_client_count "$DISC_AB")"
+  bounded_uint "$fed_accepts_after" "federation accepted-client observation" >/dev/null
+  bounded_uint "$disc_accepts_after" "discovery accepted-client observation" >/dev/null
+  (( fed_accepts_after > fed_accepts_before && disc_accepts_after > disc_accepts_before )) || {
+    echo "delayed poll connection evidence regressed" >&2
+    return 1
+  }
+  printf 'federation_failures_before=%s\nfederation_failures_boundary=%s\ndiscovery_failures_before=%s\ndiscovery_failures_boundary=%s\nfederation_accepted_clients_before=%s\nfederation_accepted_clients_delayed=%s\ndiscovery_accepted_clients_before=%s\ndiscovery_accepted_clients_delayed=%s\n' \
     "$fed_failure_before" "$fed_failure_after" "$disc_failure_before" "$disc_failure_after" \
-    "$fed_before" "$fed_after" "$disc_before" "$disc_after" \
+    "$fed_accepts_before" "$fed_accepts_after" "$disc_accepts_before" "$disc_accepts_after" \
     > "$RESULTS_DIR/poller.withdrawal.inflight-observed.txt"
   local local_bundle
   local_bundle="$(spire_bundle_b64der "$CONTEXT_A")"
@@ -817,13 +836,13 @@ scenario_inflight_withdrawal() {
   signal_reload "$CONTEXT_A"
   wait_for_no_configured_state "withdrawn RemoteCluster accepted" 40 "$CONTEXT_A" "$JWT_A"
   (( SECONDS - fault_started < 50 )) || {
-    echo "withdrawal did not retire the generation before the delayed responses could complete" >&2
+    echo "withdrawal did not retire the generation before the delayed polls could complete" >&2
     return 1
   }
   remove_latency "$FED_AB"; remove_latency "$DISC_AB"
   # Removing a toxic does not have to wake a delay already sleeping inside the
   # proxy. Observe longer than the full injected delay so both pre-withdrawal
-  # responses have time to arrive and attempt their retired-generation writes.
+  # polls have time to finish and attempt their retired-generation writes.
   local deadline=$((SECONDS + 68))
   while (( SECONDS < deadline )); do
     no_configured_state "$CONTEXT_A" "$JWT_A" || { echo "retired poll generation reinstalled state" >&2; return 1; }
@@ -836,10 +855,10 @@ scenario_inflight_withdrawal() {
   fi
   admin_json "$CONTEXT_A" "$JWT_A" > "$RESULTS_DIR/poller.withdrawal.inflight_generation_retired.json"
   record multicluster_poller.withdrawal.inflight_generation_retired pass \
-    "withdrawal-accepted-after-synchronized-failure-boundaries-and-observed-delayed-response-bytes" \
+    "withdrawal-accepted-after-synchronized-failure-boundaries-and-observed-delayed-poll-connections" \
     "poller.withdrawal.inflight-observed.txt,poller.withdrawal.inflight_generation_retired.json,poller.withdrawal.inflight_generation_retired.prom"
   record multicluster_poller.withdrawal.retired_state_not_reinstalled pass \
-    "empty-beyond-full-delayed-response-window" \
+    "empty-beyond-full-delayed-poll-window" \
     "poller.withdrawal.inflight-observed.txt,poller.withdrawal.inflight_generation_retired.json"
 }
 

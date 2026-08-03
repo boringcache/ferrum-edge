@@ -17,6 +17,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+TOXIPROXY_ACCEPTED_CLIENT_FIELDS = frozenset(
+    {"level", "caller", "time", "name", "listen", "upstream", "client", "message"}
+)
+MAX_FIXTURE_COUNT = 999_999_999_999_999_999
+
+
 def timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -176,14 +182,48 @@ def prometheus_value(metric: str, selector: str) -> None:
     print(values[0] if values else 0)
 
 
-def proxy_received_downstream_bytes(proxy: str) -> None:
-    values = prometheus_samples(
-        "toxiproxy_proxy_received_bytes_total",
-        (f'proxy="{proxy}"', 'direction="downstream"'),
-    )
-    if not values:
-        raise SystemExit(f"missing downstream byte counter for proxy {proxy}")
-    print(sum(values))
+def toxiproxy_accepted_client_count(proxy: str) -> None:
+    if re.fullmatch(r"[a-z0-9-]{1,64}", proxy) is None:
+        raise SystemExit("invalid Toxiproxy fixture proxy name")
+
+    count = 0
+    for line_number, raw_line in enumerate(sys.stdin, start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise SystemExit(
+                f"malformed Toxiproxy JSON log record at line {line_number}"
+            ) from error
+        if not isinstance(record, dict):
+            raise SystemExit(
+                f"non-object Toxiproxy JSON log record at line {line_number}"
+            )
+        for required in ("level", "caller", "time", "message"):
+            if not isinstance(record.get(required), str) or not record[required]:
+                raise SystemExit(
+                    f"malformed Toxiproxy log envelope at line {line_number}"
+                )
+        if record["message"] != "Accepted client":
+            continue
+        if set(record) != TOXIPROXY_ACCEPTED_CLIENT_FIELDS:
+            raise SystemExit(
+                f"unexpected accepted-client log structure at line {line_number}"
+            )
+        if record["level"] != "info" or any(
+            not isinstance(record.get(field), str) or not record[field]
+            for field in ("name", "listen", "upstream", "client")
+        ):
+            raise SystemExit(
+                f"malformed accepted-client log record at line {line_number}"
+            )
+        if record["name"] == proxy:
+            if count == MAX_FIXTURE_COUNT:
+                raise SystemExit("Toxiproxy accepted-client count exceeds fixture bound")
+            count += 1
+    print(count)
 
 
 def mint_admin_jwt(secret: str) -> None:
@@ -376,8 +416,8 @@ def main(argv: list[str]) -> None:
         bundle_b64der()
     elif operation == "prometheus-value" and len(argv) == 4:
         prometheus_value(argv[2], argv[3])
-    elif operation == "proxy-received-downstream-bytes" and len(argv) == 3:
-        proxy_received_downstream_bytes(argv[2])
+    elif operation == "toxiproxy-accepted-client-count" and len(argv) == 3:
+        toxiproxy_accepted_client_count(argv[2])
     elif operation == "mint-admin-jwt" and len(argv) == 3:
         mint_admin_jwt(argv[2])
     elif operation == "proxy-count" and len(argv) == 2:
