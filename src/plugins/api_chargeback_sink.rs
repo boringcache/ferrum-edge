@@ -9359,10 +9359,10 @@ fn spool_decoder_next_decoded_total(
 }
 
 /// Slice one row's content out of the decoder's current input buffer.
-fn spool_decoder_row_content<'a>(
-    available: &'a [u8],
+fn spool_decoder_row_content(
+    available: &[u8],
     content_len: usize,
-) -> Result<&'a [u8], SpoolDecodeError> {
+) -> Result<&[u8], SpoolDecodeError> {
     available.get(..content_len).ok_or_else(|| {
         SpoolDecodeError::Unreadable(format!(
             "{PLUGIN_NAME}: spool decoder returned an invalid buffer range"
