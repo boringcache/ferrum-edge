@@ -140,6 +140,9 @@ Toxiproxy TCP passthrough. Discovery uses a private CA, client certificate,
 per-remote secret selected by `discovery_credential_ref`, and the peer's stable
 cluster audience; federation uses the same verified private CA. The test-only
 stale windows are 8 seconds for endpoints and 12 seconds for trust.
+The harness requires a pre-packaged runtime image and
+`FERRUM_SKIP_IMAGE_BUILD=1`; the hosted workflow packages the reviewed binary
+before invoking it, keeping repository build execution out of the fixture.
 
 The required `multicluster_poller.*` evidence names every retention, expiry,
 recovery, metric-parity, and in-flight-withdrawal boundary. For withdrawal, the

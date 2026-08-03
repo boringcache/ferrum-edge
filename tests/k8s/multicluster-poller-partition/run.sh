@@ -603,7 +603,10 @@ main() {
   export FERRUM_LIVE_REPO_ROOT="$ROOT_DIR"
   ferrum_live_assertions_init "$LIVE_ASSERTIONS_FILE" multicluster-poller-partition \
     "$(ferrum_live_git_commit)" "$LIVE_PLATFORM_PROFILE"
-  if [[ "${FERRUM_SKIP_IMAGE_BUILD:-0}" != 1 ]]; then docker build -t "$IMAGE" "$ROOT_DIR"; fi
+  [[ "${FERRUM_SKIP_IMAGE_BUILD:-0}" == 1 ]] || {
+    echo "poller fixture requires a pre-packaged runtime image; set FERRUM_SKIP_IMAGE_BUILD=1" >&2
+    return 1
+  }
   create_clusters_and_fault_layer
   generate_transport_material
   deploy_topology
