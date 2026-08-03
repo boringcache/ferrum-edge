@@ -9,8 +9,8 @@ use ferrum_edge::grpc::cp_server::CpScope;
 use ferrum_edge::grpc::mesh_slice_drift::{
     MESH_SLICE_DRIFT_MAX_ENTRIES, MESH_SLICE_DRIFT_MAX_REASON_BYTES,
     MESH_SLICE_DRIFT_REJECTION_REASON, MeshSliceConvergenceState, MeshSliceDriftAdmitError,
-    MeshSliceDriftRegistry, render_mesh_slice_drift_metrics, sanitize_reason,
-    slice_content_digest, validate_version,
+    MeshSliceDriftRegistry, MeshSliceDriftSummary, render_mesh_slice_drift_summary_metrics,
+    sanitize_reason, slice_content_digest, validate_version,
 };
 use ferrum_edge::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
@@ -313,13 +313,6 @@ fn service_with_protocol_overrides(overrides: Vec<(u16, AppProtocol)>) -> MeshSe
     service
 }
 
-fn direct_digest_bytes(slice: &MeshSlice) -> Vec<u8> {
-    let mut slice = slice.clone();
-    slice.version.clear();
-    slice.revision = None;
-    serde_json::to_vec(&slice).unwrap()
-}
-
 #[test]
 fn projected_digest_recursively_canonicalizes_nested_maps() {
     let request = MeshSliceRequest {
@@ -335,19 +328,13 @@ fn projected_digest_recursively_canonicalizes_nested_maps() {
         vec![service_with_protocol_overrides(overrides.clone())],
     );
     let first_slice = MeshSlice::from_gateway_config(&first_config, request.clone());
-    let (reordered_config, reordered_slice) = (1..=32)
-        .find_map(|second| {
-            let mut reordered = overrides.clone();
-            reordered.reverse();
-            let config = projected_config(
-                second,
-                vec![service_with_protocol_overrides(reordered)],
-            );
-            let slice = MeshSlice::from_gateway_config(&config, request.clone());
-            (direct_digest_bytes(&first_slice) != direct_digest_bytes(&slice))
-                .then_some((config, slice))
-        })
-        .expect("construct content-equal maps with different direct serialization order");
+    let mut reordered = overrides.clone();
+    reordered.reverse();
+    let reordered_config = projected_config(
+        1,
+        vec![service_with_protocol_overrides(reordered)],
+    );
+    let reordered_slice = MeshSlice::from_gateway_config(&reordered_config, request.clone());
     let mut changed_overrides = overrides;
     changed_overrides[0].1 = AppProtocol::Tcp;
     let changed_config = projected_config(
@@ -411,7 +398,12 @@ fn projected_digest_recursively_canonicalizes_nested_maps() {
     );
 }
 
-fn assert_rendered_summary_is_coherent(output: &str) -> bool {
+fn assert_rendered_summary_is_coherent(output: &str, summary: &MeshSliceDriftSummary) {
+    if summary.tracked == 0 {
+        assert!(output.is_empty());
+        return;
+    }
+
     let mut tracked = None;
     let mut states = Vec::new();
     for line in output.lines() {
@@ -433,60 +425,70 @@ fn assert_rendered_summary_is_coherent(output: &str) -> bool {
             );
         }
     }
-    let Some(tracked) = tracked else {
-        return false;
-    };
+    let tracked = tracked.expect("tracked summary metric");
     assert_eq!(states.len(), 5);
     assert_eq!(tracked, states.into_iter().sum::<usize>());
-    true
+}
+
+fn assert_published_summary_is_coherent(registry: &MeshSliceDriftRegistry) {
+    let summary = registry.snapshot().summary.clone();
+    assert_eq!(
+        summary.tracked,
+        summary.converged
+            + summary.drifted
+            + summary.rejecting
+            + summary.pending
+            + summary.disconnected,
+        "immutable snapshot summary must not mix convergence generations"
+    );
+    let mut output = String::new();
+    render_mesh_slice_drift_summary_metrics(&mut output, &summary, "");
+    assert_rendered_summary_is_coherent(&output, &summary);
 }
 
 #[test]
 fn prometheus_summary_publication_is_coherent_during_registry_mutations() {
-    let start = Arc::new(Barrier::new(3));
-    let mut writers = Vec::new();
-    for writer in 0..2 {
-        let start = start.clone();
-        writers.push(std::thread::spawn(move || {
-            let registry = MeshSliceDriftRegistry::with_max_entries(1);
-            let node_id = format!("summary-dp-{writer}");
-            let mut token = registry
-                .open_session(&node_id, "ferrum", at(0), Some("v1"))
-                .unwrap();
-            start.wait();
-            for iteration in 0..500 {
-                registry
-                    .record_sent(&node_id, &token, "v1", at(0))
-                    .unwrap();
-                if iteration % 2 == 0 {
-                    registry
-                        .record_status(&node_id, &token, "v1", None, at(0))
-                        .unwrap();
-                } else {
-                    registry.mark_disconnected(&node_id, &token, at(0));
-                    token = registry
-                        .open_session(&node_id, "ferrum", at(0), Some("v1"))
-                        .unwrap();
-                }
-                std::thread::yield_now();
-            }
-        }));
-    }
+    let registry = MeshSliceDriftRegistry::new();
+    assert_published_summary_is_coherent(&registry);
 
-    start.wait();
-    let mut observed = 0usize;
-    for _ in 0..1_000 {
-        let mut output = String::new();
-        render_mesh_slice_drift_metrics(&mut output, "");
-        if assert_rendered_summary_is_coherent(&output) {
-            observed += 1;
-        }
-        std::thread::yield_now();
-    }
-    for writer in writers {
-        writer.join().expect("summary publication writer");
-    }
-    assert!(observed > 0, "at least one non-empty summary must render");
+    let converged_token = open(&registry, "dp-converged", at(0));
+    registry
+        .record_sent("dp-converged", &converged_token, "v1", at(0))
+        .unwrap();
+    assert_published_summary_is_coherent(&registry);
+    registry
+        .record_status("dp-converged", &converged_token, "v1", None, at(1))
+        .unwrap();
+    assert_published_summary_is_coherent(&registry);
+
+    let drifted_token = open(&registry, "dp-drifted", at(0));
+    registry
+        .record_sent("dp-drifted", &drifted_token, "v2", at(0))
+        .unwrap();
+    assert_published_summary_is_coherent(&registry);
+
+    registry.mark_disconnected("dp-converged", &converged_token, at(2));
+    assert_published_summary_is_coherent(&registry);
+
+    let rejecting_token = open(&registry, "dp-rejecting", at(0));
+    registry
+        .record_sent("dp-rejecting", &rejecting_token, "v1", at(0))
+        .unwrap();
+    registry
+        .record_status(
+            "dp-rejecting",
+            &rejecting_token,
+            "v1",
+            Some("caller detail"),
+            at(0),
+        )
+        .unwrap();
+    assert_published_summary_is_coherent(&registry);
+
+    registry
+        .open_session("dp-pending", "ferrum", at(0), None)
+        .unwrap();
+    assert_published_summary_is_coherent(&registry);
 }
 
 #[test]

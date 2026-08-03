@@ -984,10 +984,11 @@ pub fn sanitize_reason(raw: &str) -> String {
     MESH_SLICE_DRIFT_REJECTION_REASON.to_string()
 }
 
-/// Render closed-set CP mesh slice convergence gauges into a Prometheus text
-/// exposition buffer. Label cardinality is fixed (`state` ∈ five values).
-pub fn render_mesh_slice_drift_metrics(output: &mut String, gateway_ns_label: &str) {
-    let summary = DRIFT_SUMMARY.load_full();
+fn append_mesh_slice_drift_summary_metrics(
+    output: &mut String,
+    summary: &MeshSliceDriftSummary,
+    gateway_ns_label: &str,
+) {
     let tracked = summary.tracked;
     // Only emit when the CP has ever tracked a DP (avoids noise on non-CP
     // processes that share the binary).
@@ -1033,4 +1034,23 @@ pub fn render_mesh_slice_drift_metrics(output: &mut String, gateway_ns_label: &s
             "ferrum_mesh_slice_drift_tracked_data_planes{{{label_body}}} {tracked}\n"
         ));
     }
+}
+
+/// Render closed-set CP mesh slice convergence gauges from one immutable
+/// summary. Production scrapes load the process-global summary published with
+/// each registry snapshot.
+#[doc(hidden)]
+pub fn render_mesh_slice_drift_summary_metrics(
+    output: &mut String,
+    summary: &MeshSliceDriftSummary,
+    gateway_ns_label: &str,
+) {
+    append_mesh_slice_drift_summary_metrics(output, summary, gateway_ns_label);
+}
+
+/// Render closed-set CP mesh slice convergence gauges into a Prometheus text
+/// exposition buffer. Label cardinality is fixed (`state` ∈ five values).
+pub fn render_mesh_slice_drift_metrics(output: &mut String, gateway_ns_label: &str) {
+    let summary = DRIFT_SUMMARY.load_full();
+    append_mesh_slice_drift_summary_metrics(output, &summary, gateway_ns_label);
 }
