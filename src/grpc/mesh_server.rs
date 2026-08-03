@@ -58,18 +58,18 @@ impl<S> Drop for TrackedMeshStream<S> {
     fn drop(&mut self) {
         self.registry
             .remove_if_stale(&self.node_id, self.connected_at);
-        if let Some(session_token) = self.session_token.as_deref() {
-            if let Err(error) = self.drift.mark_disconnected_with_config(
+        if let Some(session_token) = self.session_token.as_deref()
+            && let Err(error) = self.drift.mark_disconnected_with_config(
                 &self.node_id,
                 session_token,
                 self.config.as_ref(),
                 Utc::now(),
-            ) {
-                warn!(
-                    field = error.field_name(),
-                    "Failed to finalize disconnected mesh slice desired state"
-                );
-            }
+            )
+        {
+            warn!(
+                field = error.field_name(),
+                "Failed to finalize disconnected mesh slice desired state"
+            );
         }
         info!("Mesh node '{}' disconnected (stream dropped)", self.node_id);
     }
@@ -553,13 +553,14 @@ impl MeshGrpcServer {
         config: Arc<GatewayConfig>,
         registry: &MeshNodeRegistry,
     ) {
-        if let Some(drift) = registry.drift() {
-            if let Err(error) = drift.reconcile_disconnected_desired(config.as_ref(), Utc::now()) {
-                warn!(
-                    field = error.field_name(),
-                    "Failed to reconcile disconnected mesh slice desired state"
-                );
-            }
+        if let Some(drift) = registry.drift()
+            && let Err(error) =
+                drift.reconcile_disconnected_desired(config.as_ref(), Utc::now())
+        {
+            warn!(
+                field = error.field_name(),
+                "Failed to reconcile disconnected mesh slice desired state"
+            );
         }
         let _ = tx.send(MeshConfigBroadcast::Full(config));
         registry.touch_all();
@@ -572,13 +573,14 @@ impl MeshGrpcServer {
         config: Arc<GatewayConfig>,
         registry: &MeshNodeRegistry,
     ) {
-        if let Some(drift) = registry.drift() {
-            if let Err(error) = drift.reconcile_disconnected_desired(config.as_ref(), Utc::now()) {
-                warn!(
-                    field = error.field_name(),
-                    "Failed to reconcile disconnected mesh slice desired state"
-                );
-            }
+        if let Some(drift) = registry.drift()
+            && let Err(error) =
+                drift.reconcile_disconnected_desired(config.as_ref(), Utc::now())
+        {
+            warn!(
+                field = error.field_name(),
+                "Failed to reconcile disconnected mesh slice desired state"
+            );
         }
         let _ = tx.send(MeshConfigBroadcast::Delta {
             result: Box::new(result),
