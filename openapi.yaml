@@ -9897,6 +9897,15 @@ components:
           description: >-
             Source workload locality in `region/zone/subzone` form, projected
             by mesh slice apply. A direct operator value is rejected.
+        source_labels:
+          type: object
+          readOnly: true
+          additionalProperties:
+            type: string
+          description: >-
+            Source workload labels used for DestinationRule
+            `localityLbSetting.failoverPriority` ranking, projected by mesh
+            slice apply. A direct operator value is rejected.
         locality_lb_setting:
           oneOf:
             - $ref: "#/components/schemas/UpstreamLocalityLbSetting"

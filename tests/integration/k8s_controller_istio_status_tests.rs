@@ -758,10 +758,9 @@ fn destination_rule_failover_priority_status_reflects_outlier_activation() {
     }));
 
     let active = update_for(&updates, "DestinationRule", "priority-active");
-    assert!(
-        active.ferrum_detail.as_ref().unwrap()["translation"]
-            .get("deferred_fields")
-            .is_none(),
+    assert_eq!(
+        active.ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"],
+        json!([]),
         "applicable outlierDetection must activate failoverPriority without an inactive advisory"
     );
 }
