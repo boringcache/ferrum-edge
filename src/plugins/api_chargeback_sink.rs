@@ -182,8 +182,8 @@ const SPOOL_ZSTD_WINDOW_MAX_BYTES: usize = 1usize << SPOOL_ZSTD_WINDOW_LOG_MAX;
 /// Conservative fixed charge for zstd's decoder context and internal input /
 /// output buffers in addition to the separately bounded history window.
 const SPOOL_ZSTD_CODEC_OVERHEAD_BYTES: usize = 512 * 1024;
-/// Fixed reservation covering the per-status tally and the maximum-capacity
-/// safe outcome vector while both coexist during dead-letter finalization.
+/// Fixed reservation covering the per-status tally, one batch's rejected-row
+/// indices, and the maximum-capacity safe outcome vector while they coexist.
 const SPOOL_DEAD_LETTER_STATE_BYTES: usize = 64 * 1024;
 /// Hard bound for the payload-free dead-letter metadata JSON document.
 const SPOOL_MAX_DEAD_LETTER_META_BYTES: usize = 128 * 1024;
@@ -8064,6 +8064,7 @@ struct DeadLetterOutcomeMeta {
 const _: () = assert!(
     std::mem::size_of::<[usize; DEAD_LETTER_STATUS_SPAN]>()
         + ((DEAD_LETTER_STATUS_SPAN + 2) * std::mem::size_of::<DeadLetterOutcomeMeta>())
+        + (SPOOL_REPLAY_BATCH_MAX_ROWS * std::mem::size_of::<usize>())
         <= SPOOL_DEAD_LETTER_STATE_BYTES
 );
 
@@ -8139,31 +8140,67 @@ impl DeadLetterPayloadWriter {
         })
     }
 
-    fn append(&mut self, row: &[u8]) -> Result<(), String> {
+    fn append_batch(
+        &mut self,
+        spool: &SpoolManager,
+        batch: &StreamingReplayBatch,
+        row_indices: &[usize],
+    ) -> Result<(), String> {
+        let mut incoming_bytes = 0usize;
+        for (offset, row_index) in row_indices.iter().copied().enumerate() {
+            let row = batch.row(row_index)?;
+            let separator_bytes = usize::from(self.rows != 0 || offset != 0);
+            incoming_bytes = incoming_bytes
+                .checked_add(separator_bytes)
+                .and_then(|bytes| bytes.checked_add(row.len()))
+                .ok_or_else(|| {
+                    format!("{PLUGIN_NAME}: dead-letter payload append byte count overflowed")
+                })?;
+        }
+        let incoming_bytes = u64::try_from(incoming_bytes).map_err(|_| {
+            format!("{PLUGIN_NAME}: dead-letter payload append byte count is not addressable")
+        })?;
+        let _guard = spool
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool write lock poisoned"))?;
+        spool.assert_managed_path(&self.temp_path)?;
+        spool.assert_managed_path(&self.final_path)?;
+        // The live temp and authoritative source already appear in the owned
+        // inventory. Admit each bounded replay-batch append before writing it so
+        // a compressed source cannot temporarily expand an uncompressed
+        // rejected payload past the documented hard on-disk quota. Batching the
+        // admission also prevents an all-poison artifact from causing one full
+        // spool walk per hostile row.
+        spool.evict_until_can_admit(incoming_bytes)?;
         let file = self.file.as_mut().ok_or_else(|| {
             format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
         })?;
-        if self.rows != 0 {
-            file.write_all(b"\n").map_err(|error| {
-                format!("{PLUGIN_NAME}: failed to write dead-letter row separator: {error}")
+        for row_index in row_indices.iter().copied() {
+            let row = batch.row(row_index)?;
+            if self.rows != 0 {
+                file.write_all(b"\n").map_err(|error| {
+                    format!("{PLUGIN_NAME}: failed to write dead-letter row separator: {error}")
+                })?;
+                self.hasher.update(b"\n");
+                self.byte_len = self.byte_len.checked_add(1).ok_or_else(|| {
+                    format!("{PLUGIN_NAME}: dead-letter payload byte count overflowed")
+                })?;
+            }
+            file.write_all(row).map_err(|error| {
+                format!("{PLUGIN_NAME}: failed to write dead-letter row payload: {error}")
             })?;
-            self.hasher.update(b"\n");
-            self.byte_len = self.byte_len.checked_add(1).ok_or_else(|| {
-                format!("{PLUGIN_NAME}: dead-letter payload byte count overflowed")
+            self.hasher.update(row);
+            self.byte_len = self
+                .byte_len
+                .checked_add(row.len() as u64)
+                .ok_or_else(|| {
+                    format!("{PLUGIN_NAME}: dead-letter payload byte count overflowed")
+                })?;
+            self.rows = self.rows.checked_add(1).ok_or_else(|| {
+                format!("{PLUGIN_NAME}: dead-letter payload row count overflowed")
             })?;
         }
-        file.write_all(row).map_err(|error| {
-            format!("{PLUGIN_NAME}: failed to write dead-letter row payload: {error}")
-        })?;
-        self.hasher.update(row);
-        self.byte_len = self
-            .byte_len
-            .checked_add(row.len() as u64)
-            .ok_or_else(|| format!("{PLUGIN_NAME}: dead-letter payload byte count overflowed"))?;
-        self.rows = self
-            .rows
-            .checked_add(1)
-            .ok_or_else(|| format!("{PLUGIN_NAME}: dead-letter payload row count overflowed"))?;
         Ok(())
     }
 
@@ -8625,6 +8662,56 @@ impl StreamingReplayBatch {
     }
 }
 
+/// Stable identity captured from the file descriptor used for replay
+/// preflight. Replay opens a second descriptor only after the full validation
+/// pass and must prove that descriptor still names the same artifact.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SpoolFileIdentity {
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    modified_secs: i64,
+    #[cfg(unix)]
+    modified_nanos: i64,
+    #[cfg(unix)]
+    changed_secs: i64,
+    #[cfg(unix)]
+    changed_nanos: i64,
+    #[cfg(not(unix))]
+    modified: Option<SystemTime>,
+    #[cfg(not(unix))]
+    created: Option<SystemTime>,
+}
+
+impl SpoolFileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                len: metadata.len(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                modified_secs: metadata.mtime(),
+                modified_nanos: metadata.mtime_nsec(),
+                changed_secs: metadata.ctime(),
+                changed_nanos: metadata.ctime_nsec(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                created: metadata.created().ok(),
+            }
+        }
+    }
+}
+
 /// Charged streaming reader for one claimed spool artifact.
 ///
 /// No decoded artifact-wide buffer or row index exists. The only mutable row
@@ -8634,6 +8721,7 @@ impl StreamingReplayBatch {
 /// fail later.
 struct StreamingSpoolReader {
     reader: BufReader<Box<dyn Read + Send>>,
+    identity: SpoolFileIdentity,
     ceiling: &'static RetainedByteCeiling,
     decoded_limit: u64,
     decoded_bytes: u64,
@@ -8648,6 +8736,22 @@ struct StreamingSpoolReader {
 
 impl StreamingSpoolReader {
     fn open(path: &Path, ceiling: &'static RetainedByteCeiling) -> Result<Self, SpoolDecodeError> {
+        Self::open_with_identity(path, ceiling, None)
+    }
+
+    fn open_matching(
+        path: &Path,
+        ceiling: &'static RetainedByteCeiling,
+        expected: SpoolFileIdentity,
+    ) -> Result<Self, SpoolDecodeError> {
+        Self::open_with_identity(path, ceiling, Some(expected))
+    }
+
+    fn open_with_identity(
+        path: &Path,
+        ceiling: &'static RetainedByteCeiling,
+        expected: Option<SpoolFileIdentity>,
+    ) -> Result<Self, SpoolDecodeError> {
         let mut file = open_spool_file_no_follow(path).map_err(SpoolDecodeError::Unreadable)?;
         let metadata = file.metadata().map_err(|error| {
             SpoolDecodeError::Unreadable(format!(
@@ -8670,6 +8774,12 @@ impl StreamingSpoolReader {
                     path.display()
                 )));
             }
+        }
+        let identity = SpoolFileIdentity::from_metadata(&metadata);
+        if expected.is_some_and(|expected| expected != identity) {
+            return Err(SpoolDecodeError::Unreadable(format!(
+                "{PLUGIN_NAME}: spool artifact changed file identity after bounded preflight"
+            )));
         }
         let encoded_len = metadata.len();
         if encoded_len > SPOOL_MAX_ARTIFACT_BYTES {
@@ -8784,6 +8894,7 @@ impl StreamingSpoolReader {
 
         Ok(Self {
             reader: BufReader::with_capacity(SPOOL_REPLAY_READER_BYTES, decoded),
+            identity,
             ceiling,
             decoded_limit,
             decoded_bytes: 0,
@@ -8801,12 +8912,17 @@ impl StreamingSpoolReader {
         self.row_count
     }
 
+    fn identity(&self) -> SpoolFileIdentity {
+        self.identity
+    }
+
     /// Validate the complete decoded stream before the first HTTP request.
     ///
     /// This bounded preflight prevents a valid prefix from being delivered
     /// before a late compressed-bomb, row-count, row-length, UTF-8, or JSON
-    /// violation is discovered. Replay then reopens the immutable claimed path
-    /// and streams the already-validated rows in bounded batches.
+    /// violation is discovered. Replay then reopens the claimed path, verifies
+    /// that the new descriptor has the same file identity, and streams the
+    /// already-validated rows in bounded batches.
     fn validate_to_end(&mut self) -> Result<usize, SpoolDecodeError> {
         while self.read_row()? {
             self.row.clear();
@@ -9415,6 +9531,37 @@ pub fn probe_streaming_replay_batch_range_errors_for_tests(
         .body_range(0, 1)
         .expect_err("inverted batch byte ranges must fail closed");
     Ok([empty, out_of_range, inverted])
+}
+
+/// Replace a validated spool pathname before the replay open and return the
+/// fail-closed diagnostic. External tests use this to prove the two-pass reader
+/// cannot deliver a different same-shape artifact through a path swap.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn probe_streaming_replay_path_swap_for_tests(
+    path: &Path,
+    replacement: &Path,
+    ceiling: &'static RetainedByteCeiling,
+) -> Result<String, String> {
+    let mut preflight = StreamingSpoolReader::open(path, ceiling)
+        .map_err(SpoolDecodeError::into_message)?;
+    preflight
+        .validate_to_end()
+        .map_err(SpoolDecodeError::into_message)?;
+    let validated_identity = preflight.identity();
+    fs::rename(replacement, path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to replace preflight path in replay identity probe: {error}"
+        )
+    })?;
+    drop(preflight);
+    match StreamingSpoolReader::open_matching(path, ceiling, validated_identity) {
+        Err(SpoolDecodeError::Unreadable(error)) => Ok(error),
+        Err(SpoolDecodeError::CeilingExhausted(error)) => Err(error),
+        Ok(_) => Err(format!(
+            "{PLUGIN_NAME}: replay identity probe accepted a replaced spool artifact"
+        )),
+    }
 }
 
 /// Attempt to publish a dead-letter payload writer that never received a row.
@@ -10249,12 +10396,17 @@ async fn replay_spool_once(
                 continue;
             }
         };
+        let validated_identity = preflight.identity();
         drop(preflight);
         if line_count == 0 {
             spool.remove_delivered_claim(claim.path())?;
             continue;
         }
-        let mut reader = match StreamingSpoolReader::open(claim.path(), flush_config.ceiling) {
+        let mut reader = match StreamingSpoolReader::open_matching(
+            claim.path(),
+            flush_config.ceiling,
+            validated_identity,
+        ) {
             Ok(reader) => reader,
             Err(SpoolDecodeError::CeilingExhausted(error)) => {
                 let _guard = spool
@@ -10559,6 +10711,9 @@ async fn replay_stream_batch(
         })?;
     let mut stack = Vec::with_capacity(SPOOL_SPLIT_WORKLIST_MAX_ENTRIES);
     stack.push((0usize, batch.row_count()));
+    // Capacity is covered by the fixed dead-letter-state reservation and can
+    // never grow beyond this batch's hard 128-row ceiling.
+    let mut rejected_row_indices = Vec::with_capacity(batch.row_count());
     let mut attempts = 0usize;
     while let Some((start, end)) = stack.pop() {
         let Some(rows) = end.checked_sub(start).filter(|rows| *rows > 0) else {
@@ -10595,7 +10750,12 @@ async fn replay_stream_batch(
             DeliveryOutcome::PayloadTooLarge { .. } => {
                 if rows == 1 {
                     tally.record_payload_too_large(1);
-                    append_dead_letter_row(spool, claim.path(), batch, start, payload)?;
+                    if rejected_row_indices.len() >= batch.row_count() {
+                        return Err(ReplayStreamError::Retryable(format!(
+                            "{PLUGIN_NAME}: rejected-row index exceeded its reserved batch bound"
+                        )));
+                    }
+                    rejected_row_indices.push(start);
                 } else {
                     if stack.len().saturating_add(2) > SPOOL_SPLIT_WORKLIST_MAX_ENTRIES {
                         return Err(ReplayStreamError::Retryable(format!(
@@ -10611,7 +10771,12 @@ async fn replay_stream_batch(
             DeliveryOutcome::Permanent { status, .. } => {
                 if rows == 1 {
                     tally.record_permanent(status, 1);
-                    append_dead_letter_row(spool, claim.path(), batch, start, payload)?;
+                    if rejected_row_indices.len() >= batch.row_count() {
+                        return Err(ReplayStreamError::Retryable(format!(
+                            "{PLUGIN_NAME}: rejected-row index exceeded its reserved batch bound"
+                        )));
+                    }
+                    rejected_row_indices.push(start);
                 } else {
                     if stack.len().saturating_add(2) > SPOOL_SPLIT_WORKLIST_MAX_ENTRIES {
                         return Err(ReplayStreamError::Retryable(format!(
@@ -10625,22 +10790,31 @@ async fn replay_stream_batch(
             }
         }
     }
+    append_dead_letter_rows(
+        spool,
+        claim.path(),
+        batch,
+        &rejected_row_indices,
+        payload,
+    )?;
     Ok(())
 }
 
-fn append_dead_letter_row(
+fn append_dead_letter_rows(
     spool: &SpoolManager,
     source: &Path,
     batch: &StreamingReplayBatch,
-    row_index: usize,
+    row_indices: &[usize],
     payload: &mut Option<DeadLetterPayloadWriter>,
 ) -> Result<(), ReplayStreamError> {
+    if row_indices.is_empty() {
+        return Ok(());
+    }
     if payload.is_none() {
         *payload = Some(
             DeadLetterPayloadWriter::open(spool, source).map_err(ReplayStreamError::Retryable)?,
         );
     }
-    let row = batch.row(row_index).map_err(ReplayStreamError::Retryable)?;
     payload
         .as_mut()
         .ok_or_else(|| {
@@ -10648,7 +10822,7 @@ fn append_dead_letter_row(
                 "{PLUGIN_NAME}: dead-letter payload writer was not initialized"
             ))
         })?
-        .append(row)
+        .append_batch(spool, batch, row_indices)
         .map_err(ReplayStreamError::Retryable)
 }
 

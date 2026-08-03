@@ -28,6 +28,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     spool_streaming_limits_for_tests, write_private_file_atomically_for_tests,
     write_private_file_atomically_with_fault_for_tests,
 };
+#[cfg(unix)]
+use ferrum_edge::plugins::api_chargeback_sink::probe_streaming_replay_path_swap_for_tests;
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::utils::byte_budget::{
     RetainedByteCeiling, probe_preallocated_payload_capacity_guard_for_tests,
@@ -3073,6 +3075,83 @@ async fn dead_letter_payload_publish_refuses_symlink_and_restores_the_source_cla
             .unwrap()
             .file_type()
             .is_symlink()
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn dead_letter_payload_admits_each_append_before_exceeding_spool_quota() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+
+    let event = sample_event("evt-dead-letter-quota");
+    let encoded = serialize_json_each_row(&[event.clone()]).unwrap();
+    let max_bytes = encoded.len() as u64;
+    let temp = tempfile::tempdir().unwrap();
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = spool.write_events(&[event]).unwrap();
+    assert_eq!(fs::metadata(&source).unwrap().len(), max_bytes);
+    let namespace_root = spool.namespace_root_for_tests().to_path_buf();
+    let source_parent = source.parent().unwrap().to_path_buf();
+    let payload_name = dead_letter_payload_path(&source)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let observed_temp_bytes = Arc::new(AtomicU64::new(u64::MAX));
+    let observed_for_hook = Arc::clone(&observed_temp_bytes);
+    let _clear_hook = ClearSpoolWriteHookGuard;
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, root| {
+        if point != SpoolWriteHookPoint::QuotaInventoryTaken
+            || root != namespace_root.as_path()
+        {
+            return;
+        }
+        let temp_bytes = fs::read_dir(&source_parent)
+            .expect("dead-letter quota hook reads the spool day directory")
+            .filter_map(Result::ok)
+            .find_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                if name.starts_with(&format!("{payload_name}.write-"))
+                    && name.ends_with(".tmp")
+                {
+                    entry.metadata().ok().map(|metadata| metadata.len())
+                } else {
+                    None
+                }
+            })
+            .expect("dead-letter quota hook finds the live payload temp");
+        observed_for_hook.store(temp_bytes, Ordering::SeqCst);
+    })));
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("the uncompressed dead-letter copy must not exceed spool.max_bytes");
+    set_spool_write_hook_for_tests(None);
+
+    assert!(
+        error.contains("cannot fit within spool.max_bytes"),
+        "unexpected quota diagnostic: {error}"
+    );
+    assert!(
+        source.exists(),
+        "quota refusal must restore the authoritative replay source"
+    );
+    assert!(
+        !dead_letter_payload_path(&source).exists(),
+        "quota refusal must not publish a partial dead-letter payload"
+    );
+    let stats = spool.scan_stats().unwrap();
+    assert!(
+        stats.bytes <= max_bytes,
+        "dead-letter staging exceeded the hard spool quota: {stats:?}"
+    );
+    assert_eq!(
+        observed_temp_bytes.load(Ordering::SeqCst),
+        0,
+        "quota admission must run before the first rejected payload byte is written"
     );
 }
 
@@ -7146,6 +7225,26 @@ fn streaming_replay_batch_range_validation_fails_closed() {
     assert_eq!(ceiling.used(), 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn streaming_replay_refuses_a_path_swap_after_bounded_preflight() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.ndjson");
+    let replacement = temp.path().join("replacement.ndjson");
+    fs::write(&source, b"{\"event_id\":\"validated-row\"}\n").unwrap();
+    fs::write(&replacement, b"{\"event_id\":\"replaced-row!\"}\n").unwrap();
+    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+
+    let error = probe_streaming_replay_path_swap_for_tests(&source, &replacement, ceiling)
+        .expect("a replaced replay path must fail closed after preflight");
+
+    assert!(error.contains("changed file identity"), "{error}");
+    assert!(!error.contains("validated-row"), "{error}");
+    assert!(!error.contains("replaced-row"), "{error}");
+    assert_eq!(fs::read(&source).unwrap(), b"{\"event_id\":\"replaced-row!\"}\n");
+    assert_eq!(ceiling.used(), 0);
+}
+
 #[test]
 fn preallocated_payload_capacity_guard_refuses_undersized_reservations() {
     let ceiling = leaked_chargeback_test_ceiling(64 * 1024);
@@ -7557,12 +7656,31 @@ async fn spool_replay_continues_when_quarantine_rename_is_blocked() {
         .await
         .expect("a blocked quarantine must not abort the tick after the unreadable artifact");
     assert!(
-        source.exists(),
-        "an unquarantinable poison row remains for operator intervention"
+        !source.exists(),
+        "the unreadable artifact remains under its in-flight claim until prepare recovers it"
     );
+    let retained_claims: Vec<_> = spool
+        .list_owned_spool_files_for_tests()
+        .unwrap()
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".inflight"))
+        })
+        .collect();
+    assert_eq!(retained_claims.len(), 1);
+    assert_eq!(fs::read(&retained_claims[0]).unwrap(), b"{not-json}\n");
     assert!(
         !newer.exists(),
         "later valid artifacts must still replay after a quarantine failure"
+    );
+    spool
+        .prepare_live_storage_for_tests()
+        .expect("the next prepare restores an abandoned same-process claim");
+    assert!(
+        source.exists(),
+        "the unquarantinable poison row must return to its durable name for operator intervention"
     );
 }
 

@@ -579,11 +579,13 @@ fields are never logged.
   files can continue to replay.
 - Every encoded and decoded spool artifact is hard-capped at 256 MiB. Replay
   first performs a complete bounded streaming preflight, then reopens the claim
-  and streams at most one 4 MiB / 128-row batch. It never retains the whole
-  decoded file or an artifact-wide row index. A decoded row is capped at **1
-  MiB** and an artifact at **10,000 rows**; decoded bytes, row bytes, and row
-  count are checked before buffer growth or counter admission. UTF-8 and JSON
-  syntax are validated during preflight, before the first HTTP request. A
+  and verifies that its file identity, size, and modification metadata still
+  match the descriptor that was preflighted before streaming at most one 4 MiB
+  / 128-row batch. It never retains the whole decoded file or an artifact-wide
+  row index. A decoded row is capped at **1 MiB** and an artifact at **10,000
+  rows**; decoded bytes, row bytes, and row count are checked before buffer
+  growth or counter admission. UTF-8 and JSON syntax are validated during
+  preflight, before the first HTTP request. A
   `zstd` record written by this build carries its decoded size, while a foreign
   headerless archive falls back to at most 200x encoded bytes (floor 1 MiB).
   The decoder's accepted window is capped and charged before construction. A
@@ -612,6 +614,11 @@ fields are never logged.
   `chargeback_sink_spool_prepare_failures_total`) and mutates nothing.
 - Permanently rejected rows (and single-row 413 failures) are appended verbatim
   to one owner-only (`0600` on Unix) sibling `.rejected.ndjson` temp. The temp is
+  quota-admitted under the spool write lock before each bounded replay batch of
+  separators/rows is written, so an uncompressed rejected payload derived from
+  a compressed source never transiently exceeds `spool.max_bytes`. A quota
+  refusal removes the temp and restores the authoritative source for a
+  later/operator-assisted attempt. The completed temp is
   fsynced, atomically renamed, and directory-fsynced before the sibling
   `.rejected.meta` document is published; only then is the authoritative source
   removed. The metadata contains the payload filename, byte length, SHA-256,
@@ -695,10 +702,12 @@ sink under its managed namespace (after compression when `compression` is
   `*.ndjson.zst.rejected.ndjson`) and their safe metadata
   (`*.ndjson.rejected.meta` / `*.ndjson.zst.rejected.meta`)
 
-Pending writes are serialized/compressed and sized **before** quota admission.
-Admission holds the spool write lock with eviction so concurrent writers cannot
-over-admit. Existing owned bytes plus the incoming encoded file must stay within
-`max_bytes`; when space is short, the oldest **evictable** owned file is dropped
+Ordinary pending writes are serialized/compressed and sized **before** quota
+admission. The incrementally streamed dead-letter payload is admitted before
+each bounded replay-batch append. Admission holds the spool write lock with
+eviction so concurrent writers cannot over-admit. Existing owned bytes plus the
+incoming bytes must stay within `max_bytes`; when space is short, the oldest
+**evictable** owned file is dropped
 and `chargeback_sink_spool_drops_total` is incremented. If a single encoded batch
 still cannot fit after eviction (including on an empty spool, or when every
 retained file is an in-flight claim, a temp under an active write, or owned by
@@ -709,7 +718,8 @@ actively written, or foreign-owned record.
 
 Size `spool.max_bytes` for the longest ClickHouse outage you are willing to
 absorb, using **encoded** average event size (and headroom for retained
-`.corrupt` quarantine and `.rejected.meta` dead-letter files):
+`.corrupt` quarantine plus uncompressed `.rejected.ndjson` payload and
+`.rejected.meta` dead-letter files):
 
 ```text
 max_bytes >= peak_events_per_second * average_encoded_event_bytes * outage_seconds
