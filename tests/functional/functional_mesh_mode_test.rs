@@ -3789,7 +3789,11 @@ fn mesh_retry_mtls_fixture_phase_arms_before_application_request() {
     );
     // Build the forbidden pattern from parts so this assertion's own source
     // text does not trip the `include_str!` self-scan.
-    let unconditional_p_discard = ["if record_type[0] == b'", "P' {\n                drop(stream);\n                continue;"].concat();
+    let unconditional_p_discard = [
+        "if record_type[0] == b'",
+        "P' {\n                drop(stream);\n                continue;",
+    ]
+    .concat();
     assert!(
         !backend.contains(&unconditional_p_discard),
         "regression: unconditionally discarding every first-byte `P` connection \
@@ -3880,10 +3884,7 @@ async fn start_mesh_retry_mtls_backend(
             Pin::new(&mut self.inner).poll_write(cx, buf)
         }
 
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<(), IoError>> {
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
             Pin::new(&mut self.inner).poll_flush(cx)
         }
 
@@ -3902,11 +3903,10 @@ async fn start_mesh_retry_mtls_backend(
     let task = tokio::spawn(async move {
         let mut first_record_tx = Some(first_record_tx);
         let success = loop {
-            let (mut stream, _) =
-                tokio::time::timeout(Duration::from_secs(30), listener.accept())
-                    .await
-                    .expect("mesh retry accept timed out")
-                    .expect("accept mesh retry connection");
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
+                .await
+                .expect("mesh retry accept timed out")
+                .expect("accept mesh retry connection");
             // Sample the phase at accept so a capability probe that connected
             // during preflight stays preflight even if the test arms before the
             // first byte is read.
@@ -4048,12 +4048,7 @@ async fn start_mesh_retry_mtls_backend(
             panic!("mesh retry HTTP/2 server failed: {error}");
         }
     });
-    (
-        application_phase_tx,
-        first_record_rx,
-        observation_rx,
-        task,
-    )
+    (application_phase_tx, first_record_rx, observation_rx, task)
 }
 
 async fn grpc_mesh_retry_request(
