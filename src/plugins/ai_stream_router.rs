@@ -4037,11 +4037,13 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
         if self.inner.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
-        let decoded =
-            match prepare_sse_bytes_for_normalization(&self.encoded, Some(self.encoding.as_str())) {
-                Ok(bytes) => bytes.into_owned(),
-                Err(message) => return self.fail_decode(message).await,
-            };
+        let decoded = match prepare_sse_bytes_for_normalization(
+            &self.encoded,
+            Some(self.encoding.as_str()),
+        ) {
+            Ok(bytes) => bytes.into_owned(),
+            Err(message) => return self.fail_decode(message).await,
+        };
         // Encoded working set is spent; drop it before driving the plaintext
         // normalizer so peak retention is decode output + normalized SSE, not
         // also the original wire bytes.
