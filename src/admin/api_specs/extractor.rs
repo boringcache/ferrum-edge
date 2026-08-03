@@ -2724,7 +2724,8 @@ impl LocalSchemaResolver {
             {
                 if existing.root != ext.root {
                     return Err(schema_reference_error(
-                        "external $ref aliases resolved to inconsistent document content",
+                        "external $ref aliases resolved to inconsistent document content"
+                            .to_string(),
                     ));
                 }
                 if requested_key != &canonical_key
@@ -2809,7 +2810,7 @@ impl LocalSchemaResolver {
         if let Some(existing) = self.resource_roots.iter().find(|root| root.key == key) {
             if existing.doc_index != doc_index || !existing.pointer.is_empty() {
                 return Err(schema_reference_error(
-                    "external document URI resolves to multiple resources",
+                    "external document URI resolves to multiple resources".to_string(),
                 ));
             }
             return Ok(());
