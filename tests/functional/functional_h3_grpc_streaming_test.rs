@@ -367,6 +367,10 @@ async fn h3_grpc_streaming_forwards_sanitized_request_trailers() {
         http::HeaderValue::from_static("forged"),
     );
     request_trailers.insert(
+        "x-geo-country",
+        http::HeaderValue::from_static("XX"),
+    );
+    request_trailers.insert(
         "x-forwarded-for",
         http::HeaderValue::from_static("203.0.113.44"),
     );
@@ -411,7 +415,11 @@ async fn h3_grpc_streaming_forwards_sanitized_request_trailers() {
     assert!(
         request.trailers.iter().all(|(name, _)| !matches!(
             name.as_str(),
-            "x-consumer-username" | "x-forwarded-for" | "forwarded" | "authorization"
+            "x-consumer-username"
+                | "x-geo-country"
+                | "x-forwarded-for"
+                | "forwarded"
+                | "authorization"
         )),
         "client request trailers must not restate credentials or forge gateway identity"
     );

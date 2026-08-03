@@ -9645,6 +9645,10 @@ mod tests {
             body.contains("result = recv_half.recv_trailers() => result"),
             "the pump must forward H3 request trailers after request DATA EOF"
         );
+        assert!(
+            body.contains("sanitize_backend_request_trailers(&mut trailers)"),
+            "H3-to-H2 request trailers must pass through the shared backend-trailer sanitizer"
+        );
     }
 
     /// Regression guard: the H3 gRPC dispatch must forward gateway-trusted

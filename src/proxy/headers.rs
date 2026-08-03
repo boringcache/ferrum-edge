@@ -1957,6 +1957,8 @@ mod tests {
             "cookie",
             "x-api-key",
             "x-consumer-username",
+            "x-consumer-custom-id",
+            "x-geo-country",
             "x-ferrum-internal",
             "x-path-param-account",
             "grpc-timeout",
@@ -1971,6 +1973,61 @@ mod tests {
         assert!(!is_forbidden_backend_request_trailer_name(
             "x-request-checksum"
         ));
+    }
+
+    #[test]
+    fn sanitize_backend_request_trailers_strips_reserved_assertions_and_keeps_app_metadata() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.append(
+            "x-request-checksum",
+            http::HeaderValue::from_static("sha256:first"),
+        );
+        trailers.append(
+            "x-request-checksum",
+            http::HeaderValue::from_static("sha256:second"),
+        );
+        trailers.append(
+            "x-geo-country",
+            http::HeaderValue::from_static("attacker-first"),
+        );
+        trailers.append(
+            "x-geo-country",
+            http::HeaderValue::from_static("attacker-second"),
+        );
+        trailers.insert(
+            "x-consumer-username",
+            http::HeaderValue::from_static("forged"),
+        );
+        trailers.insert(
+            "authorization",
+            http::HeaderValue::from_static("Bearer forged"),
+        );
+        trailers.insert("connection", http::HeaderValue::from_static("close"));
+        trailers.insert(
+            "x-path-param-account",
+            http::HeaderValue::from_static("acct-1"),
+        );
+        // Malformed values must still be evaluated by name and stripped; a
+        // non-UTF8 reserved assertion cannot bypass the late trust boundary.
+        trailers.append(
+            "x-geo-country",
+            http::HeaderValue::from_bytes(&[0xff, 0xfe]).expect("raw header value"),
+        );
+
+        sanitize_backend_request_trailers(&mut trailers);
+
+        let checksums: Vec<_> = trailers
+            .get_all("x-request-checksum")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(checksums, ["sha256:first", "sha256:second"]);
+        assert!(!trailers.contains_key("x-geo-country"));
+        assert!(!trailers.contains_key("x-consumer-username"));
+        assert!(!trailers.contains_key("authorization"));
+        assert!(!trailers.contains_key("connection"));
+        assert!(!trailers.contains_key("x-path-param-account"));
+        assert_eq!(trailers.len(), 2);
     }
 
     #[test]

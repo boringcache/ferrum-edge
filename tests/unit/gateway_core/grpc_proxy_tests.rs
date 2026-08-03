@@ -1907,13 +1907,15 @@ async fn trailers_only_collapse_enforces_policy_and_preserves_terminal_metadata(
 // frontend error becomes a body error (backend RST) rather than a clean
 // END_STREAM the backend would mistake for a completed request.
 
-fn grpc_channel_body(
-    max_bytes: usize,
-) -> (
+/// Fixture returned by [`grpc_channel_body`]: pump sender, channel body under
+/// test, and the shared size-limit exceeded flag the body publishes.
+type GrpcChannelBodyFixture = (
     tokio::sync::mpsc::Sender<Result<http_body::Frame<bytes::Bytes>, ()>>,
     grpc_proxy::GrpcBody,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
+);
+
+fn grpc_channel_body(max_bytes: usize) -> GrpcChannelBodyFixture {
     let (tx, receiver) =
         tokio::sync::mpsc::channel::<Result<http_body::Frame<bytes::Bytes>, ()>>(8);
     let exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
