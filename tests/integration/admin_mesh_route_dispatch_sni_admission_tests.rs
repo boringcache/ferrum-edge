@@ -268,7 +268,7 @@ async fn mesh_route_dispatch_plugin_write_rejects_sni_override_with_associated_b
 
 #[tokio::test]
 async fn mesh_route_dispatch_plugin_write_admits_sni_override_when_local_non_buffering_shadows_global()
-{
+ {
     let tc = TestConfig::default();
     let (state, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
