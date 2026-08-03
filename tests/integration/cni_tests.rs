@@ -912,12 +912,16 @@ async fn ferrum_cni_binary_status_rejects_reserved_cni_dev_keys() {
 /// Missing node-agent socket maps to CNI STATUS code 50 without path echoing.
 #[tokio::test]
 async fn ferrum_cni_binary_status_unavailable_when_socket_missing() {
-    let output = tokio::task::spawn_blocking(|| {
+    let dir = tempdir().expect("tempdir");
+    let missing_socket = dir.path().join("missing-agent.sock");
+    let missing_socket_string = missing_socket.to_string_lossy().into_owned();
+    let requested_socket = missing_socket_string.clone();
+    let output = tokio::task::spawn_blocking(move || {
         run_ferrum_cni_status(serde_json::json!({
             "cniVersion": "1.1.0",
             "name": "ferrum-mesh-chain",
             "type": "ferrum-cni",
-            "ferrum": { "socketPath": "/tmp/ferrum-cni-status-missing.sock" }
+            "ferrum": { "socketPath": requested_socket }
         }))
     })
     .await
@@ -933,7 +937,7 @@ async fn ferrum_cni_binary_status_unavailable_when_socket_missing() {
         "unexpected payload: {payload}"
     );
     assert!(
-        !message.contains("/tmp/ferrum-cni-status-missing.sock"),
+        !message.contains(missing_socket_string.as_str()),
         "STATUS unavailable error must not echo the socket path: {message}"
     );
 }
