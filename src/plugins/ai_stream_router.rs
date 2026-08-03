@@ -66,8 +66,11 @@
 //!   are normalized to OpenAI `chat.completion.chunk` SSE. Content/role deltas,
 //!   multi-candidate indexes, finish/terminal state, usage metadata, safety /
 //!   prompt blocks, function calls + args, and provider error envelopes are
-//!   mapped under the same bounded fail-closed policy as Anthropic. The model
-//!   is URL-scoped via an optional `{model}` endpoint placeholder.
+//!   mapped under the same bounded fail-closed policy as Anthropic. Every
+//!   candidate that emitted client-visible output must reach a terminal
+//!   `finishReason` before clean EOF; post-finish candidate data and
+//!   unrepresentable content parts fail closed. The model is URL-scoped via an
+//!   optional `{model}` endpoint placeholder.
 //!
 //! ## Provider fallback is rejected, not stored
 //!
@@ -4593,6 +4596,9 @@ enum GeminiJsonArrayState {
 struct GeminiCandidateState {
     role_emitted: bool,
     next_tool_index: u32,
+    /// True once this candidate has emitted any client-visible OpenAI choice
+    /// delta (role, content, tool_calls, or a terminal finish_reason chunk).
+    emitted_client_visible: bool,
     finished: bool,
     saw_tool_call: bool,
 }
@@ -4605,6 +4611,16 @@ struct GeminiCandidateState {
 /// as the Anthropic normalizer. Malformed, oversized, or unrepresentable frames
 /// fail closed with field-specific diagnostics that never echo provider
 /// payloads, credentials, or tool-argument bodies.
+///
+/// Candidate lifecycle is fail-closed: every candidate that emitted
+/// client-visible output must reach a terminal `finishReason` before clean EOF
+/// succeeds, post-finish / duplicate-terminal candidate data is rejected, and
+/// duplicate candidate indexes within one provider event are rejected.
+/// Content parts are closed-shape: only `text` and `functionCall` map to OpenAI
+/// deltas. The sole metadata-only exception is an empty JSON object `{}` (no
+/// keys), which carries no provider output; any other non-empty part without a
+/// representable field (media, code, thought-only, scalars, unknowns) fails
+/// closed with a fixed-cardinality diagnostic.
 struct GeminiStreamNormalizer {
     buf: Vec<u8>,
     cursor: usize,
@@ -4785,8 +4801,34 @@ impl GeminiStreamNormalizer {
         if self.candidate_state(choice_index).role_emitted {
             return;
         }
-        self.candidate_state(choice_index).role_emitted = true;
+        let state = self.candidate_state(choice_index);
+        state.role_emitted = true;
+        state.emitted_client_visible = true;
         self.write_chunk_line(choice_index, json!({ "role": "assistant" }), None, out);
+    }
+
+    fn mark_candidate_finished_visible(&mut self, choice_index: u64) {
+        let state = self.candidate_state(choice_index);
+        state.finished = true;
+        state.emitted_client_visible = true;
+    }
+
+    fn candidate_already_finished(&self, choice_index: u64) -> bool {
+        self.candidates
+            .get(&choice_index)
+            .is_some_and(|state| state.finished)
+    }
+
+    fn reject_post_finish_candidate(
+        &mut self,
+        out: &mut NormalizedSseOut,
+    ) -> bool {
+        self.emit_upstream_error(
+            "upstream provider sent Gemini candidate output after a terminal finishReason; stream terminated",
+            out,
+        );
+        self.finish(StreamTerminal::UpstreamFailure, out);
+        true
     }
 
     fn detect_framing(&mut self) -> Result<(), &'static str> {
@@ -4963,6 +5005,7 @@ impl GeminiStreamNormalizer {
             Ok(Some(_)) => {
                 self.ensure_role(0, out);
                 self.write_chunk_line(0, json!({}), Some("content_filter"), out);
+                self.mark_candidate_finished_visible(0);
                 self.saw_successful_finish = true;
                 self.finish(StreamTerminal::MessageStop, out);
                 return true;
@@ -4988,6 +5031,7 @@ impl GeminiStreamNormalizer {
             return true;
         };
 
+        let mut seen_indexes: HashSet<u64> = HashSet::with_capacity(candidates.len());
         for (fallback_index, candidate) in candidates.iter().enumerate() {
             let Some(candidate) = candidate.as_object() else {
                 self.emit_upstream_error(
@@ -5001,51 +5045,61 @@ impl GeminiStreamNormalizer {
                 .get("index")
                 .and_then(Value::as_u64)
                 .unwrap_or(fallback_index as u64);
+            if !seen_indexes.insert(choice_index) {
+                self.emit_upstream_error(
+                    "upstream provider sent duplicate Gemini candidate indexes in one event; stream terminated",
+                    out,
+                );
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                return true;
+            }
 
-            if let Some(finish) = candidate.get("finishReason").and_then(Value::as_str) {
-                let base_finish = match map_gemini_finish_reason(finish) {
-                    Ok(mapped) => mapped,
+            if self.candidate_already_finished(choice_index) {
+                return self.reject_post_finish_candidate(out);
+            }
+
+            let finish_reason_raw = candidate.get("finishReason").and_then(Value::as_str);
+            let mapped_finish = match finish_reason_raw {
+                Some(finish) => match map_gemini_finish_reason(finish) {
+                    Ok(mapped) => Some(mapped),
                     Err(message) => {
                         self.emit_upstream_error(message, out);
                         self.finish(StreamTerminal::UpstreamFailure, out);
                         return true;
                     }
-                };
-                // Emit content/tool deltas before the finish chunk when present.
-                if let Err(message) = self.emit_candidate_parts(choice_index, candidate, out) {
-                    self.emit_upstream_error(message, out);
-                    self.finish(StreamTerminal::UpstreamFailure, out);
-                    return true;
-                }
-                let saw_tool_call = self.candidate_state(choice_index).saw_tool_call;
-                if self.candidate_state(choice_index).finished {
-                    continue;
-                }
-                self.candidate_state(choice_index).finished = true;
-                let finish_reason = if saw_tool_call {
-                    if base_finish != "stop" {
-                        self.emit_upstream_error(
-                            "upstream provider sent Gemini function calls with a non-STOP finishReason; stream terminated",
-                            out,
-                        );
-                        self.finish(StreamTerminal::UpstreamFailure, out);
-                        return true;
-                    }
-                    "tool_calls"
-                } else {
-                    base_finish
-                };
-                self.ensure_role(choice_index, out);
-                self.write_chunk_line(choice_index, json!({}), Some(finish_reason), out);
-                self.saw_successful_finish = true;
-                continue;
-            }
+                },
+                None => None,
+            };
 
+            // Emit content/tool deltas before the finish chunk when present.
+            // Post-finish / duplicate-terminal checks above keep this fail-closed.
             if let Err(message) = self.emit_candidate_parts(choice_index, candidate, out) {
                 self.emit_upstream_error(message, out);
                 self.finish(StreamTerminal::UpstreamFailure, out);
                 return true;
             }
+
+            let Some(base_finish) = mapped_finish else {
+                continue;
+            };
+            let saw_tool_call = self.candidate_state(choice_index).saw_tool_call;
+            let finish_reason = if saw_tool_call {
+                if base_finish != "stop" {
+                    self.emit_upstream_error(
+                        "upstream provider sent Gemini function calls with a non-STOP finishReason; stream terminated",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    return true;
+                }
+                "tool_calls"
+            } else {
+                base_finish
+            };
+            self.ensure_role(choice_index, out);
+            self.write_chunk_line(choice_index, json!({}), Some(finish_reason), out);
+            self.mark_candidate_finished_visible(choice_index);
+            self.saw_successful_finish = true;
         }
         false
     }
@@ -5072,15 +5126,25 @@ impl GeminiStreamNormalizer {
                 );
             }
         }
-        let Some(parts) = content.get("parts").and_then(Value::as_array) else {
-            return Ok(());
+        let parts = match content.get("parts") {
+            None => return Ok(()),
+            Some(value) => value.as_array().ok_or(
+                "upstream provider sent a Gemini content parts value that was not an array; stream terminated",
+            )?,
         };
         for part in parts {
-            match (
-                part.get("text").and_then(Value::as_str),
-                part.get("functionCall"),
-            ) {
-                (Some(text), None) => {
+            let Some(part_obj) = part.as_object() else {
+                return Err(
+                    "upstream provider sent a non-object Gemini content part; stream terminated",
+                );
+            };
+            match (part_obj.get("text"), part_obj.get("functionCall")) {
+                (Some(text_value), None) => {
+                    let Some(text) = text_value.as_str() else {
+                        return Err(
+                            "upstream provider sent a Gemini text part that was not a string; stream terminated",
+                        );
+                    };
                     if text.is_empty() {
                         continue;
                     }
@@ -5115,6 +5179,7 @@ impl GeminiStreamNormalizer {
                     let tool_index = {
                         let state = self.candidate_state(choice_index);
                         state.saw_tool_call = true;
+                        state.emitted_client_visible = true;
                         let idx = state.next_tool_index;
                         state.next_tool_index = state.next_tool_index.saturating_add(1);
                         idx
@@ -5140,8 +5205,14 @@ impl GeminiStreamNormalizer {
                         out,
                     );
                 }
+                (None, None) if part_obj.is_empty() => {
+                    // Sole metadata-only exception: an empty object carries no
+                    // provider output and cannot hide media/code/unknown parts.
+                }
                 (None, None) => {
-                    // thinking / inlineData / unknown parts: ignore for MVP.
+                    return Err(
+                        "upstream provider sent an unrepresentable Gemini content part; stream terminated",
+                    );
                 }
                 _ => {
                     return Err(
@@ -5421,6 +5492,17 @@ impl GeminiStreamNormalizer {
                 return;
             }
             GeminiJsonArrayState::Inactive | GeminiJsonArrayState::Closed => {}
+        }
+        if self.candidates.values().any(|state| {
+            state.emitted_client_visible && !state.finished
+        }) {
+            self.emit_upstream_error(
+                "upstream provider closed the Gemini stream before every candidate reached a terminal finishReason",
+                out,
+            );
+            self.finish(StreamTerminal::UpstreamFailure, out);
+            let _ = self.normalized_output_exceeded(out, true);
+            return;
         }
         if self.saw_successful_finish {
             self.finish(StreamTerminal::MessageStop, out);

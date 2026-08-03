@@ -6686,6 +6686,139 @@ async fn test_gemini_multi_candidate_and_safety_block() {
 }
 
 #[tokio::test]
+async fn test_gemini_multi_candidate_incomplete_eof_fails_closed() {
+    // One finished candidate must not make clean EOF succeed while another
+    // candidate already emitted client-visible content without finishReason.
+    let body = concat!(
+        "data: {\"candidates\":[",
+        "{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"},",
+        "{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"partial\"}]}}",
+        "]}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, body, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(
+        out.contains("every candidate reached a terminal finishReason"),
+        "{out}"
+    );
+    assert!(out.contains("\"content\":\"done\""), "{out}");
+    assert!(out.contains("\"content\":\"partial\""), "{out}");
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
+    // Must not look like a success-only terminal after the incomplete candidate.
+    assert!(
+        !out.contains("\"prompt_tokens\""),
+        "incomplete multi-candidate EOF must not publish success usage: {out}"
+    );
+}
+
+#[tokio::test]
+async fn test_gemini_post_finish_candidate_data_fails_closed() {
+    let late_content = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"early\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"late\"}]}}]}\n\n",
+    );
+    let late_out = run_gemini_normalizer(4096, late_content, "text/event-stream").await;
+    assert!(late_out.contains("upstream_error"), "{late_out}");
+    assert!(
+        late_out.contains("after a terminal finishReason"),
+        "{late_out}"
+    );
+    assert!(late_out.contains("\"content\":\"early\""), "{late_out}");
+    assert!(
+        !late_out.contains("\"content\":\"late\""),
+        "must not forward post-finish content: {late_out}"
+    );
+    assert_eq!(late_out.matches("data: [DONE]").count(), 1);
+
+    let duplicate_finish = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"once\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let dup_out = run_gemini_normalizer(4096, duplicate_finish, "text/event-stream").await;
+    assert!(dup_out.contains("upstream_error"), "{dup_out}");
+    assert!(
+        dup_out.contains("after a terminal finishReason"),
+        "{dup_out}"
+    );
+    assert_eq!(dup_out.matches("\"finish_reason\":\"stop\"").count(), 1);
+}
+
+#[tokio::test]
+async fn test_gemini_unrepresentable_parts_and_duplicate_indexes_fail_closed() {
+    // Empty-object parts are the sole metadata-only exception.
+    let empty_ok = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{},{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let empty_out = run_gemini_normalizer(4096, empty_ok, "text/event-stream").await;
+    assert!(empty_out.contains("\"content\":\"ok\""), "{empty_out}");
+    assert!(
+        empty_out.contains("\"finish_reason\":\"stop\""),
+        "{empty_out}"
+    );
+    assert!(
+        empty_out.trim_end().ends_with("data: [DONE]"),
+        "{empty_out}"
+    );
+
+    let hostile_parts = [
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[\"scalar\"]},\"finishReason\":\"STOP\"}]}\n\n",
+            "non-object",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[42]},\"finishReason\":\"STOP\"}]}\n\n",
+            "non-object",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"QUJD\"}}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "unrepresentable",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"executableCode\":{\"language\":\"PYTHON\",\"code\":\"print(1)\"}}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "unrepresentable",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"thought\":true}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "unrepresentable",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":123}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "text part that was not a string",
+        ),
+    ];
+    for (body, needle) in hostile_parts {
+        let out = run_gemini_normalizer(4096, body, "text/event-stream").await;
+        assert!(out.contains("upstream_error"), "body={body} out={out}");
+        assert!(
+            out.contains(needle),
+            "expected diagnostic containing {needle}: {out}"
+        );
+        assert!(
+            !out.contains("QUJD") && !out.contains("print(1)") && !out.contains("image/png"),
+            "must not echo provider part payloads: {out}"
+        );
+        assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+    }
+
+    let duplicate_indexes = concat!(
+        "data: {\"candidates\":[",
+        "{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"A\"}]},\"finishReason\":\"STOP\"},",
+        "{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"B\"}]},\"finishReason\":\"STOP\"}",
+        "]}\n\n",
+    );
+    let dup_idx_out = run_gemini_normalizer(4096, duplicate_indexes, "text/event-stream").await;
+    assert!(dup_idx_out.contains("upstream_error"), "{dup_idx_out}");
+    assert!(
+        dup_idx_out.contains("duplicate Gemini candidate indexes"),
+        "{dup_idx_out}"
+    );
+    assert!(
+        !dup_idx_out.contains("\"content\":\"B\""),
+        "must not process the colliding candidate: {dup_idx_out}"
+    );
+}
+
+#[tokio::test]
 async fn test_gemini_function_call_and_tool_choice_none_fail_closed() {
     let tools = concat!(
         "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"x\"}}}]},\"finishReason\":\"STOP\"}]}\n\n",
