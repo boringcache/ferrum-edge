@@ -1908,25 +1908,32 @@ async fn trailers_only_collapse_enforces_policy_and_preserves_terminal_metadata(
 // END_STREAM the backend would mistake for a completed request.
 
 /// Fixture returned by [`grpc_channel_body`]: pump sender, channel body under
-/// test, and the shared size-limit exceeded flag the body publishes.
+/// test, size/cancellation signals, and backend-forwarded DATA accounting.
 type GrpcChannelBodyFixture = (
     tokio::sync::mpsc::Sender<Result<http_body::Frame<bytes::Bytes>, ()>>,
     grpc_proxy::GrpcBody,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
 );
 
 fn grpc_channel_body(max_bytes: usize) -> GrpcChannelBodyFixture {
     let (tx, receiver) =
         tokio::sync::mpsc::channel::<Result<http_body::Frame<bytes::Bytes>, ()>>(8);
     let exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let forwarded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let body = grpc_proxy::GrpcBody::Channel {
         receiver,
         bytes_seen: 0,
         max_bytes,
         exceeded: std::sync::Arc::clone(&exceeded),
+        cancelled: std::sync::Arc::clone(&cancelled),
+        cancelled_terminal: false,
+        forwarded_bytes: std::sync::Arc::clone(&forwarded),
         upload_observer: None,
     };
-    (tx, body, exceeded)
+    (tx, body, exceeded, cancelled, forwarded)
 }
 
 #[tokio::test]
@@ -1934,7 +1941,7 @@ async fn grpc_channel_body_forwards_frames_in_order_then_clean_eof() {
     use http_body_util::BodyExt;
     use std::sync::atomic::Ordering;
 
-    let (tx, body, exceeded) = grpc_channel_body(0); // 0 = unlimited
+    let (tx, body, exceeded, _cancelled, forwarded) = grpc_channel_body(0); // 0 = unlimited
     let pump = tokio::spawn(async move {
         tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
             b"msg1",
@@ -1961,6 +1968,7 @@ async fn grpc_channel_body_forwards_frames_in_order_then_clean_eof() {
         !exceeded.load(Ordering::Relaxed),
         "size flag must stay clear when no limit is configured"
     );
+    assert_eq!(forwarded.load(Ordering::Relaxed), 8);
 }
 
 #[tokio::test]
@@ -1971,7 +1979,7 @@ async fn grpc_channel_body_enforces_size_limit_incrementally() {
     // 4-byte ceiling: the first 3-byte frame is under the limit; the second
     // pushes the running total to 6 and must trip the limit *mid-stream* (not
     // only after the whole body is collected).
-    let (tx, body, exceeded) = grpc_channel_body(4);
+    let (tx, body, exceeded, _cancelled, forwarded) = grpc_channel_body(4);
     let pump = tokio::spawn(async move {
         let _ = tx
             .send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
@@ -1999,6 +2007,7 @@ async fn grpc_channel_body_enforces_size_limit_incrementally() {
         exceeded.load(Ordering::Acquire),
         "overflow must set the shared `exceeded` flag so the dispatcher can map it to RESOURCE_EXHAUSTED"
     );
+    assert_eq!(forwarded.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]
@@ -2006,7 +2015,7 @@ async fn grpc_channel_body_propagates_frontend_error_as_body_error() {
     use http_body_util::BodyExt;
     use std::sync::atomic::Ordering;
 
-    let (tx, body, exceeded) = grpc_channel_body(0);
+    let (tx, body, exceeded, _cancelled, forwarded) = grpc_channel_body(0);
     let pump = tokio::spawn(async move {
         let _ = tx
             .send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
@@ -2027,13 +2036,14 @@ async fn grpc_channel_body_propagates_frontend_error_as_body_error() {
         !exceeded.load(Ordering::Relaxed),
         "a transport-level abort is not a size violation"
     );
+    assert_eq!(forwarded.load(Ordering::Relaxed), 7);
 }
 
 #[tokio::test]
 async fn grpc_channel_body_forwards_request_trailers_after_data() {
     use http_body_util::BodyExt;
 
-    let (tx, mut body, _exceeded) = grpc_channel_body(64);
+    let (tx, mut body, _exceeded, _cancelled, forwarded) = grpc_channel_body(64);
     let pump = tokio::spawn(async move {
         tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
             b"message",
@@ -2068,7 +2078,33 @@ async fn grpc_channel_body_forwards_request_trailers_after_data() {
         body.frame().await.is_none(),
         "trailers must terminate the body"
     );
+    assert_eq!(forwarded.load(std::sync::atomic::Ordering::Relaxed), 7);
     pump.await.unwrap();
+}
+
+#[tokio::test]
+async fn grpc_channel_body_cancellation_preempts_queued_data_with_error() {
+    use http_body_util::BodyExt;
+    use std::sync::atomic::Ordering;
+
+    let (tx, mut body, exceeded, cancelled, forwarded) = grpc_channel_body(64);
+    tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+        b"must-not-cross-after-cancel",
+    ))))
+    .await
+    .unwrap();
+    cancelled.store(true, Ordering::Release);
+
+    let error = body
+        .frame()
+        .await
+        .expect("cancellation frame")
+        .expect_err("cancellation must error the backend request body");
+    assert!(error.to_string().contains("cancelled before downstream EOF"));
+    assert!(body.frame().await.is_none());
+    assert!(!exceeded.load(Ordering::Acquire));
+    assert_eq!(forwarded.load(Ordering::Relaxed), 0);
+    drop(tx);
 }
 
 // ── gRPC mesh-transport dispatch classification (issue #2003) ───────────────

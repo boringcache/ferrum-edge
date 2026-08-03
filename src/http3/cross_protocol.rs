@@ -156,6 +156,34 @@ pub struct CrossProtocolOutcome {
     pub rejection_logged: bool,
 }
 
+/// Wake an H3 request pump if its owning bridge future is dropped before the
+/// ordinary cleanup path can notify and join it. Every pump wait races this
+/// notification, so cancellation cannot detach a task parked on request DATA,
+/// trailers, or bounded-channel backpressure.
+struct H3RequestPumpShutdownGuard {
+    shutdown: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl H3RequestPumpShutdownGuard {
+    fn new(shutdown: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            shutdown: Some(shutdown),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.shutdown = None;
+    }
+}
+
+impl Drop for H3RequestPumpShutdownGuard {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown.notify_one();
+        }
+    }
+}
+
 /// Per-dispatch coalescing tunables. Copied out of `ProxyState` once at
 /// dispatch entry so the streaming loop doesn't re-load env config per
 /// iteration.
@@ -5842,8 +5870,8 @@ pub(crate) async fn dispatch_grpc_streaming(
 
     // Backend admission runs on the FULL stream (a reject write needs the send
     // half and a clean recv halt) BEFORE we split — mirrors `dispatch_grpc`.
-    // `bytes_sent` is 0 here; the true request-byte count is tracked by the pump
-    // and read when the response completes.
+    // `bytes_sent` is 0 here; the channel body counts DATA actually yielded to
+    // hyper and the bridge reads that shared counter when the response completes.
     let backend_admission_start = Instant::now();
     let mut backend_admission_permits = match run_cross_protocol_backend_admission_or_reject(
         backend_admission_plugins,
@@ -5879,8 +5907,10 @@ pub(crate) async fn dispatch_grpc_streaming(
     // backend is RST rather than handed a truncated-but-clean END_STREAM.
     let capacity = state.env_config.http3_request_body_channel_capacity.max(1);
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<http_body::Frame<Bytes>, ()>>(capacity);
-    let request_bytes_seen = Arc::new(AtomicU64::new(0));
-    let pump_bytes = Arc::clone(&request_bytes_seen);
+    // Count only DATA frames the channel body actually yields to hyper. Bytes
+    // merely read from H3 but still queued when cancellation wins never reached
+    // the backend request and must not inflate TransactionSummary.bytes_sent.
+    let request_bytes_forwarded = Arc::new(AtomicU64::new(0));
     // Set by the pump when the H3 recv half errors (the client reset its upload).
     // The resulting backend RST must be recorded as a CLIENT abort, not a backend
     // fault (codex P2) — read in the dispatch Err arm below.
@@ -5888,6 +5918,11 @@ pub(crate) async fn dispatch_grpc_streaming(
     let pump_frontend_failed = Arc::clone(&frontend_upload_failed);
     let frontend_upload_malformed = Arc::new(AtomicBool::new(false));
     let pump_frontend_malformed = Arc::clone(&frontend_upload_malformed);
+    // The pump sets this when response-side completion/cancellation stops it
+    // before downstream request EOF. `GrpcBody::Channel` checks it before
+    // queued DATA so the backend upload is reset, never cleanly truncated.
+    let backend_upload_cancelled = Arc::new(AtomicBool::new(false));
+    let pump_backend_cancelled = Arc::clone(&backend_upload_cancelled);
     // Lets the response side terminate the pump promptly once the RPC is over
     // (e.g. a bidi server that sends its status before the client half-closes),
     // so the recv half is closed via STOP_SENDING(H3_NO_ERROR) instead of
@@ -5895,10 +5930,14 @@ pub(crate) async fn dispatch_grpc_streaming(
     let pump_shutdown = Arc::new(tokio::sync::Notify::new());
     let pump_shutdown_signal = Arc::clone(&pump_shutdown);
     let pump = tokio::spawn(async move {
+        let mut cancelled_before_eof = false;
         loop {
             tokio::select! {
                 biased;
-                _ = pump_shutdown_signal.notified() => break,
+                _ = pump_shutdown_signal.notified() => {
+                    cancelled_before_eof = true;
+                    break;
+                },
                 recv = recv_half.recv_data() => {
                     match recv {
                         Ok(Some(mut chunk)) => {
@@ -5909,7 +5948,6 @@ pub(crate) async fn dispatch_grpc_streaming(
                             // `Buf::copy_to_bytes` is zero-copy when the buffer is
                             // already `bytes::Bytes` (always true with h3-quinn).
                             let body_bytes = chunk.copy_to_bytes(len);
-                            pump_bytes.fetch_add(len as u64, Ordering::Relaxed);
                             // The send MUST stay cancellable (codex P1): on
                             // bounded-channel backpressure, a bidi backend that
                             // finished its response and stopped polling the request
@@ -5919,7 +5957,10 @@ pub(crate) async fn dispatch_grpc_streaming(
                             // select) could never unblock the awaited `pump`.
                             let send_result = tokio::select! {
                                 biased;
-                                _ = pump_shutdown_signal.notified() => break,
+                                _ = pump_shutdown_signal.notified() => {
+                                    cancelled_before_eof = true;
+                                    break;
+                                },
                                 res = tx.send(Ok(http_body::Frame::data(body_bytes))) => res,
                             };
                             if send_result.is_err() {
@@ -5935,7 +5976,10 @@ pub(crate) async fn dispatch_grpc_streaming(
                         Ok(None) => {
                             let trailer_result = tokio::select! {
                                 biased;
-                                _ = pump_shutdown_signal.notified() => break,
+                                _ = pump_shutdown_signal.notified() => {
+                                    cancelled_before_eof = true;
+                                    break;
+                                },
                                 result = recv_half.recv_trailers() => result,
                             };
                             match trailer_result {
@@ -5944,7 +5988,9 @@ pub(crate) async fn dispatch_grpc_streaming(
                                     if !trailers.is_empty() {
                                         tokio::select! {
                                             biased;
-                                            _ = pump_shutdown_signal.notified() => {}
+                                            _ = pump_shutdown_signal.notified() => {
+                                                cancelled_before_eof = true;
+                                            }
                                             _ = tx.send(Ok(http_body::Frame::trailers(
                                                 trailers,
                                             ))) => {}
@@ -5957,7 +6003,9 @@ pub(crate) async fn dispatch_grpc_streaming(
                                     pump_frontend_failed.store(true, Ordering::Release);
                                     tokio::select! {
                                         biased;
-                                        _ = pump_shutdown_signal.notified() => {}
+                                        _ = pump_shutdown_signal.notified() => {
+                                            cancelled_before_eof = true;
+                                        }
                                         _ = tx.send(Err(())) => {}
                                     }
                                 }
@@ -5973,7 +6021,9 @@ pub(crate) async fn dispatch_grpc_streaming(
                             pump_frontend_failed.store(true, Ordering::Release);
                             tokio::select! {
                                 biased;
-                                _ = pump_shutdown_signal.notified() => {}
+                                _ = pump_shutdown_signal.notified() => {
+                                    cancelled_before_eof = true;
+                                }
                                 _ = tx.send(Err(())) => {}
                             }
                             break;
@@ -5982,10 +6032,14 @@ pub(crate) async fn dispatch_grpc_streaming(
                 }
             }
         }
+        if cancelled_before_eof {
+            pump_backend_cancelled.store(true, Ordering::Release);
+        }
         // STOP_SENDING(H3_NO_ERROR): a bare recv-half drop surfaces as
         // RESET_STREAM(0x0) and makes clients log a spurious "Remote reset".
         crate::http3::stream_util::halt_request_body(&mut recv_half);
     });
+    let mut pump_shutdown_guard = H3RequestPumpShutdownGuard::new(Arc::clone(&pump_shutdown));
 
     // Dispatch with the channel-backed streaming body. No retry: the request
     // body is consumed on the wire. `hmap` already carries the canonical
@@ -6013,6 +6067,8 @@ pub(crate) async fn dispatch_grpc_streaming(
         &trusted_assertion_headers,
         effective_max_grpc_recv_size_bytes,
         Arc::clone(&body_size_exceeded),
+        backend_upload_cancelled,
+        Arc::clone(&request_bytes_forwarded),
         None,
         ctx.grpc_deadline_at(),
         &mut held_frontend_grpc_upload,
@@ -6024,7 +6080,7 @@ pub(crate) async fn dispatch_grpc_streaming(
 
     let outcome_result: Result<CrossProtocolOutcome, anyhow::Error> = match result {
         Ok(GrpcResponseKind::Streaming(streaming)) => {
-            let bytes_sent = request_bytes_seen.load(Ordering::Relaxed);
+            let bytes_sent = request_bytes_forwarded.load(Ordering::Relaxed);
             handle_h3_grpc_streaming_response(
                 &mut send_half,
                 streaming,
@@ -6053,7 +6109,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         // The channel entry always streams the response; a Buffered result is
         // unreachable, but handle it as an internal error rather than panicking.
         Ok(GrpcResponseKind::Buffered(_)) => {
-            let bytes_sent = request_bytes_seen.load(Ordering::Relaxed);
+            let bytes_sent = request_bytes_forwarded.load(Ordering::Relaxed);
             record_backend_outcome(
                 state,
                 proxy,
@@ -6092,7 +6148,7 @@ pub(crate) async fn dispatch_grpc_streaming(
             })
         }
         Err(err) => {
-            let bytes_sent = request_bytes_seen.load(Ordering::Relaxed);
+            let bytes_sent = request_bytes_forwarded.load(Ordering::Relaxed);
             let malformed_upload = frontend_upload_malformed.load(Ordering::Acquire);
             let (grpc_status_code, grpc_message): (u32, &str) = if malformed_upload {
                 (
@@ -6225,12 +6281,13 @@ pub(crate) async fn dispatch_grpc_streaming(
     // (codex P1), so the join cannot hang on a full channel.
     pump_shutdown.notify_one();
     let _ = pump.await;
+    pump_shutdown_guard.disarm();
 
     let mut outcome = outcome_result?;
     // Final upload byte count (codex P2): in bidi/client-streaming the pump can
     // forward request DATA while the response is streaming, so re-read after the
     // pump terminates rather than trusting the header-time snapshot.
-    outcome.bytes_sent = request_bytes_seen.load(Ordering::Relaxed);
+    outcome.bytes_sent = request_bytes_forwarded.load(Ordering::Relaxed);
     Ok(outcome)
 }
 

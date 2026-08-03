@@ -992,6 +992,53 @@ async fn h3_grpc_client_upload_cancellation_resets_backend_stream() {
     backend.assert_no_step_errors().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_grpc_response_cancellation_resets_open_backend_upload() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let ca = TestCa::new("h3-grpc-response-cancel-be").expect("ca");
+    let (be_cert, be_key) = ca.valid().expect("backend leaf");
+    let backend = ScriptedH2Backend::builder_tls(backend_listener, &be_cert, &be_key)
+        .expect("backend tls")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::ReadRequestData)
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc".into()),
+        ]))
+        .step(H2Step::AwaitTestSignal)
+        .step(H2Step::RespondData {
+            data: Bytes::from(grpc_frame(b"response-after-cancel")),
+            end_stream: false,
+        })
+        .step(H2Step::ExpectReset(Duration::from_secs(10)))
+        .spawn()
+        .expect("spawn backend");
+
+    let (_harness, https_port) = spawn_h3_grpc_gateway(backend_port, &[]).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/CancelResponse");
+    let mut stream = open_grpc_stream_with_retry(&client, &url).await;
+    stream.send_message(b"partial").await.expect("send message");
+
+    let (status, _) = stream.recv_response().await.expect("recv response");
+    assert_eq!(status.as_u16(), 200);
+    stream.cancel_response_download();
+    backend.release_test_signal();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while backend.stream_reset_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("response cancellation must reset the still-open H2 request upload");
+    backend.assert_no_step_errors().await;
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // 3. The max gRPC request size is enforced INCREMENTALLY while streaming (the
 //    H3 client sends no Content-Length, so the size ceiling is checked frame by

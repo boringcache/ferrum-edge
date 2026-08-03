@@ -722,6 +722,14 @@ impl Http3GrpcStream {
             .stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
     }
 
+    /// Cancel only the response-download direction while leaving the request
+    /// upload open. This models a client that stops consuming a streaming RPC
+    /// after response headers have arrived.
+    pub fn cancel_response_download(&mut self) {
+        self.stream
+            .stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+
     /// Half-close the request stream (send END_STREAM).
     pub async fn finish(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tokio::time::timeout(Duration::from_secs(15), self.stream.finish())
