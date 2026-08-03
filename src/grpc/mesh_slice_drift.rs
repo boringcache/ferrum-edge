@@ -553,12 +553,7 @@ impl MeshSliceDriftRegistry {
     }
 
     /// Mark a matching opaque session disconnected; retain until reaper expiry.
-    pub fn mark_disconnected(
-        &self,
-        node_id: &str,
-        session_token: &str,
-        now: DateTime<Utc>,
-    ) {
+    pub fn mark_disconnected(&self, node_id: &str, session_token: &str, now: DateTime<Utc>) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -904,9 +899,8 @@ fn validate_projection_context(
     };
     if request.labels.len() > MESH_SLICE_DRIFT_MAX_PROJECTION_LABELS
         || scope_namespace_count > MESH_SLICE_DRIFT_MAX_PROJECTION_NAMESPACES
-        || bearer_namespaces.is_some_and(|namespaces| {
-            namespaces.len() > MESH_SLICE_DRIFT_MAX_PROJECTION_NAMESPACES
-        })
+        || bearer_namespaces
+            .is_some_and(|namespaces| namespaces.len() > MESH_SLICE_DRIFT_MAX_PROJECTION_NAMESPACES)
     {
         return Err(MeshSliceDriftAdmitError::ProjectionContextTooLarge);
     }

@@ -22,9 +22,7 @@ use super::auth::{
 use super::cp_server::{CpGrpcServer, CpScope, DEFAULT_CP_DP_JWT_ISSUER};
 use super::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
 use super::mesh_registry::{MeshNodeInfo, MeshNodeRegistry};
-use super::mesh_slice_drift::{
-    MeshSliceDriftAdmitError, MeshSliceDriftRegistry, validate_version,
-};
+use super::mesh_slice_drift::{MeshSliceDriftAdmitError, MeshSliceDriftRegistry, validate_version};
 use super::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use super::proto::{
     MeshConfigUpdate, MeshSliceStatusReport, MeshSliceStatusResponse, MeshSubscribeRequest,
@@ -1400,7 +1398,7 @@ mod tests {
         // should survive, and no Sidecar resource is carried on the wire.
         let update =
             MeshGrpcServer::build_mesh_config_update_from_slice(slice.clone(), "test-session")
-            .expect("update builds");
+                .expect("update builds");
         let parsed: MeshSlice = serde_json::from_str(&update.mesh_slice_json)
             .expect("mesh slice round-trips through JSON");
         assert_eq!(parsed.services.len(), 1);

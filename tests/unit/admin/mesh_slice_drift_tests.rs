@@ -16,8 +16,7 @@ use ferrum_edge::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, Ser
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
 fn at(second: u32) -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, second)
-        .unwrap()
+    Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, second).unwrap()
 }
 
 fn open(registry: &MeshSliceDriftRegistry, node_id: &str, when: chrono::DateTime<Utc>) -> String {
@@ -104,13 +103,7 @@ fn nack_reason_discards_caller_text_and_is_strictly_bounded() {
         .unwrap();
     let secret_bearing = "Bearer secret-token\npassword=hunter2\u{0000}";
     registry
-        .record_status(
-            "dp-a",
-            &token,
-            "v1",
-            Some(secret_bearing),
-            connected_at,
-        )
+        .record_status("dp-a", &token, "v1", Some(secret_bearing), connected_at)
         .unwrap();
 
     let rejected = registry.snapshot().data_planes[0]
@@ -120,7 +113,10 @@ fn nack_reason_discards_caller_text_and_is_strictly_bounded() {
     assert_eq!(rejected.reason, MESH_SLICE_DRIFT_REJECTION_REASON);
     assert!(rejected.reason.len() <= MESH_SLICE_DRIFT_MAX_REASON_BYTES);
     assert!(!rejected.reason.contains("secret"));
-    assert_eq!(sanitize_reason("\u{0000}"), MESH_SLICE_DRIFT_REJECTION_REASON);
+    assert_eq!(
+        sanitize_reason("\u{0000}"),
+        MESH_SLICE_DRIFT_REJECTION_REASON
+    );
     assert_eq!(sanitize_reason("   "), MESH_SLICE_DRIFT_REJECTION_REASON);
     assert_eq!(sanitize_reason(""), "unspecified");
 }
@@ -171,7 +167,10 @@ fn maintenance_republishes_advancing_ages_without_removal() {
     );
     let snapshot = registry.snapshot();
     assert_eq!(snapshot.generated_at, maintenance_at);
-    assert_eq!(snapshot.data_planes[0].sent.as_ref().unwrap().age_seconds, 42);
+    assert_eq!(
+        snapshot.data_planes[0].sent.as_ref().unwrap().age_seconds,
+        42
+    );
     assert_eq!(
         snapshot.data_planes[0]
             .acknowledged
@@ -320,27 +319,18 @@ fn projected_digest_recursively_canonicalizes_nested_maps() {
         namespace: "ferrum".to_string(),
         ..MeshSliceRequest::default()
     };
-    let overrides: Vec<_> = (9000..9016)
-        .map(|port| (port, AppProtocol::Grpc))
-        .collect();
-    let first_config = projected_config(
-        0,
-        vec![service_with_protocol_overrides(overrides.clone())],
-    );
+    let overrides: Vec<_> = (9000..9016).map(|port| (port, AppProtocol::Grpc)).collect();
+    let first_config =
+        projected_config(0, vec![service_with_protocol_overrides(overrides.clone())]);
     let first_slice = MeshSlice::from_gateway_config(&first_config, request.clone());
     let mut reordered = overrides.clone();
     reordered.reverse();
-    let reordered_config = projected_config(
-        1,
-        vec![service_with_protocol_overrides(reordered)],
-    );
+    let reordered_config = projected_config(1, vec![service_with_protocol_overrides(reordered)]);
     let reordered_slice = MeshSlice::from_gateway_config(&reordered_config, request.clone());
     let mut changed_overrides = overrides;
     changed_overrides[0].1 = AppProtocol::Tcp;
-    let changed_config = projected_config(
-        33,
-        vec![service_with_protocol_overrides(changed_overrides)],
-    );
+    let changed_config =
+        projected_config(33, vec![service_with_protocol_overrides(changed_overrides)]);
     let changed_slice = MeshSlice::from_gateway_config(&changed_config, request.clone());
 
     assert!(first_slice.content_eq(&reordered_slice));
@@ -573,7 +563,10 @@ fn desired_tracks_projected_content_for_connected_and_retained_disconnected_rows
         .unwrap();
 
     let related = projected_config(1, vec![service("api-v2", "ferrum")]);
-    assert_eq!(registry.reconcile_disconnected_desired(&related, at(1)), Ok(0));
+    assert_eq!(
+        registry.reconcile_disconnected_desired(&related, at(1)),
+        Ok(0)
+    );
     assert_eq!(
         registry.snapshot().data_planes[0]
             .desired
@@ -598,12 +591,18 @@ fn desired_tracks_projected_content_for_connected_and_retained_disconnected_rows
         "disconnect closes the publish-before-drop race from current config"
     );
     let no_op = projected_config(2, vec![service("api-v2", "ferrum")]);
-    assert_eq!(registry.reconcile_disconnected_desired(&no_op, at(2)), Ok(0));
+    assert_eq!(
+        registry.reconcile_disconnected_desired(&no_op, at(2)),
+        Ok(0)
+    );
     let unrelated = projected_config(
         3,
         vec![service("api-v2", "ferrum"), service("other", "other")],
     );
-    assert_eq!(registry.reconcile_disconnected_desired(&unrelated, at(3)), Ok(0));
+    assert_eq!(
+        registry.reconcile_disconnected_desired(&unrelated, at(3)),
+        Ok(0)
+    );
     let next_related = projected_config(4, vec![service("api-v3", "ferrum")]);
     assert_eq!(
         registry.reconcile_disconnected_desired(&next_related, at(4)),
