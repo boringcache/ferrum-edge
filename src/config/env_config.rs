@@ -2348,6 +2348,31 @@ pub struct EnvConfig {
     /// Default: 25 MiB.
     pub admin_spec_max_body_size_mib: usize,
 
+    /// Master process gate for OpenAPI external `$ref` resolution on
+    /// `POST`/`PUT /api-specs`. Default `false` preserves fail-closed
+    /// `UnsupportedExternalRef` unless both this gate and the per-spec
+    /// `x-ferrum-external-refs` extension enable resolution.
+    pub admin_spec_external_refs_enabled: bool,
+    /// Absolute filesystem jail for `file:` / relative external `$ref` targets.
+    /// Empty disables file refs.
+    pub admin_spec_external_refs_file_root: String,
+    /// Comma-separated HTTPS origins allowed for network external `$ref`s.
+    pub admin_spec_external_refs_allowed_origins: String,
+    /// Comma-separated explicit HTTP origins (fixture/dev only).
+    pub admin_spec_external_refs_allow_http_origins: String,
+    pub admin_spec_external_refs_max_documents: usize,
+    pub admin_spec_external_refs_max_document_bytes: usize,
+    pub admin_spec_external_refs_max_aggregate_bytes: usize,
+    pub admin_spec_external_refs_max_refs: usize,
+    pub admin_spec_external_refs_max_uri_length: usize,
+    pub admin_spec_external_refs_max_redirects: usize,
+    pub admin_spec_external_refs_max_nesting: usize,
+    pub admin_spec_external_refs_connect_timeout_ms: u64,
+    pub admin_spec_external_refs_request_timeout_ms: u64,
+    pub admin_spec_external_refs_total_timeout_ms: u64,
+    /// Parsed external-`$ref` process policy (fail-closed on invalid env parts).
+    pub admin_spec_external_ref_policy: crate::admin::api_specs::ExternalRefProcessPolicy,
+
     /// Absolute deadline (seconds) for reading a **1 MiB** admin request body,
     /// applied to every admin body-collecting handler including the API-spec
     /// ones. A size cap alone does not bound *time*: a client that trickles one
@@ -2940,6 +2965,22 @@ impl Default for EnvConfig {
             admin_max_connections_per_ip: 0,
             admin_restore_max_body_size_mib: 100,
             admin_spec_max_body_size_mib: 25,
+            admin_spec_external_refs_enabled: false,
+            admin_spec_external_refs_file_root: String::new(),
+            admin_spec_external_refs_allowed_origins: String::new(),
+            admin_spec_external_refs_allow_http_origins: String::new(),
+            admin_spec_external_refs_max_documents: 32,
+            admin_spec_external_refs_max_document_bytes: 5_242_880,
+            admin_spec_external_refs_max_aggregate_bytes: 20_971_520,
+            admin_spec_external_refs_max_refs: 256,
+            admin_spec_external_refs_max_uri_length: 2048,
+            admin_spec_external_refs_max_redirects: 3,
+            admin_spec_external_refs_max_nesting: 16,
+            admin_spec_external_refs_connect_timeout_ms: 5000,
+            admin_spec_external_refs_request_timeout_ms: 15_000,
+            admin_spec_external_refs_total_timeout_ms: 60_000,
+            admin_spec_external_ref_policy:
+                crate::admin::api_specs::ExternalRefProcessPolicy::default(),
             admin_body_read_timeout_seconds: crate::admin::DEFAULT_ADMIN_BODY_READ_TIMEOUT_SECONDS,
             admin_http2_max_concurrent_streams:
                 crate::admin::DEFAULT_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS,
@@ -3483,6 +3524,20 @@ impl EnvConfig {
             admin_max_connections_per_ip: usize = "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP" => 0usize;
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
             admin_spec_max_body_size_mib: usize = "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB" => 25usize;
+            admin_spec_external_refs_enabled: bool = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED" => false;
+            admin_spec_external_refs_file_root: String = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_FILE_ROOT" => String::new();
+            admin_spec_external_refs_allowed_origins: String = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ALLOWED_ORIGINS" => String::new();
+            admin_spec_external_refs_allow_http_origins: String = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ALLOW_HTTP_ORIGINS" => String::new();
+            admin_spec_external_refs_max_documents: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_DOCUMENTS" => 32usize;
+            admin_spec_external_refs_max_document_bytes: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_DOCUMENT_BYTES" => 5_242_880usize;
+            admin_spec_external_refs_max_aggregate_bytes: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_AGGREGATE_BYTES" => 20_971_520usize;
+            admin_spec_external_refs_max_refs: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_REFS" => 256usize;
+            admin_spec_external_refs_max_uri_length: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_URI_LENGTH" => 2048usize;
+            admin_spec_external_refs_max_redirects: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_REDIRECTS" => 3usize;
+            admin_spec_external_refs_max_nesting: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_NESTING" => 16usize;
+            admin_spec_external_refs_connect_timeout_ms: u64 = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_CONNECT_TIMEOUT_MS" => 5000u64;
+            admin_spec_external_refs_request_timeout_ms: u64 = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_REQUEST_TIMEOUT_MS" => 15_000u64;
+            admin_spec_external_refs_total_timeout_ms: u64 = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_TOTAL_TIMEOUT_MS" => 60_000u64;
             admin_body_read_timeout_seconds: u64 = "FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS" => crate::admin::DEFAULT_ADMIN_BODY_READ_TIMEOUT_SECONDS;
             admin_http2_max_concurrent_streams: u32 = "FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS" => crate::admin::DEFAULT_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS, max(1u32);
             admin_http2_max_header_list_size_bytes: u32 = "FERRUM_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES" => crate::admin::DEFAULT_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES, max(1_024u32);
@@ -3857,6 +3912,32 @@ impl EnvConfig {
             backend_block_dangerous_ranges,
         )?;
 
+        // Fail closed on invalid external-$ref policy parts (empty budgets,
+        // non-absolute file root, malformed origins, etc.).
+        let admin_spec_external_ref_policy =
+            crate::admin::api_specs::ExternalRefProcessPolicy::from_env_parts(
+                admin_spec_external_refs_enabled,
+                crate::admin::api_specs::external_refs::ExternalRefEnvOrigins {
+                    file_root: &admin_spec_external_refs_file_root,
+                    allowed_origins: &admin_spec_external_refs_allowed_origins,
+                    allow_http_origins: &admin_spec_external_refs_allow_http_origins,
+                },
+                crate::admin::api_specs::external_refs::ExternalRefEnvBudgets {
+                    max_documents: admin_spec_external_refs_max_documents,
+                    max_document_bytes: admin_spec_external_refs_max_document_bytes,
+                    max_aggregate_bytes: admin_spec_external_refs_max_aggregate_bytes,
+                    max_refs: admin_spec_external_refs_max_refs,
+                    max_uri_length: admin_spec_external_refs_max_uri_length,
+                    max_redirects: admin_spec_external_refs_max_redirects,
+                    max_nesting: admin_spec_external_refs_max_nesting,
+                },
+                crate::admin::api_specs::external_refs::ExternalRefEnvTimeouts {
+                    connect_timeout_ms: admin_spec_external_refs_connect_timeout_ms,
+                    request_timeout_ms: admin_spec_external_refs_request_timeout_ms,
+                    total_timeout_ms: admin_spec_external_refs_total_timeout_ms,
+                },
+            )?;
+
         let mut config = Self {
             mode: mode.clone(),
             namespace,
@@ -4141,6 +4222,21 @@ impl EnvConfig {
             admin_max_connections_per_ip,
             admin_restore_max_body_size_mib,
             admin_spec_max_body_size_mib,
+            admin_spec_external_refs_enabled,
+            admin_spec_external_refs_file_root,
+            admin_spec_external_refs_allowed_origins,
+            admin_spec_external_refs_allow_http_origins,
+            admin_spec_external_refs_max_documents,
+            admin_spec_external_refs_max_document_bytes,
+            admin_spec_external_refs_max_aggregate_bytes,
+            admin_spec_external_refs_max_refs,
+            admin_spec_external_refs_max_uri_length,
+            admin_spec_external_refs_max_redirects,
+            admin_spec_external_refs_max_nesting,
+            admin_spec_external_refs_connect_timeout_ms,
+            admin_spec_external_refs_request_timeout_ms,
+            admin_spec_external_refs_total_timeout_ms,
+            admin_spec_external_ref_policy,
             admin_body_read_timeout_seconds,
             admin_http2_max_concurrent_streams,
             admin_http2_max_header_list_size_bytes,

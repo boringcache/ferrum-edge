@@ -328,6 +328,12 @@ async fn undecodable_consumer_row_keeps_admin_writable_for_in_band_repair() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_admin(state).await;
     let token = admin_token();
@@ -487,6 +493,12 @@ async fn undecodable_proxy_row_allows_delete_repair() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_admin(state).await;
     let token = admin_token();
@@ -582,6 +594,12 @@ async fn undecodable_consumer_row_allows_put_overwrite_repair() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_admin(state).await;
     let token = admin_token();
