@@ -7589,6 +7589,108 @@ async fn test_gemini_multi_event_tool_calls_get_distinct_ids_and_indexes() {
 }
 
 #[tokio::test]
+async fn test_gemini_usage_metadata_fail_closed_and_valid_shapes() {
+    // Non-object usageMetadata fails closed and never echoes the value.
+    let non_object = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":\"PROMPT_LEAK_sk-gemini-secret\"}\n\n",
+    );
+    let non_object_out = run_gemini_normalizer(4096, non_object, "text/event-stream").await;
+    assert!(non_object_out.contains("upstream_error"), "{non_object_out}");
+    assert!(
+        non_object_out.contains("usageMetadata") && non_object_out.contains("not an object"),
+        "{non_object_out}"
+    );
+    assert!(
+        !non_object_out.contains("PROMPT_LEAK") && !non_object_out.contains("sk-gemini-secret"),
+        "must not echo provider usageMetadata bytes: {non_object_out}"
+    );
+    assert!(
+        !non_object_out.contains("\"prompt_tokens\""),
+        "must not publish partial usage after non-object usageMetadata: {non_object_out}"
+    );
+
+    // Malformed preferred candidatesTokenCount must not fall back to a valid
+    // completionTokenCount alternate, and must not echo the bad value.
+    let preferred_vs_alt = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":\"HOSTILE_FALLBACK_42\",\"completionTokenCount\":7,\"totalTokenCount\":10}}\n\n",
+    );
+    let preferred_out = run_gemini_normalizer(4096, preferred_vs_alt, "text/event-stream").await;
+    assert!(preferred_out.contains("upstream_error"), "{preferred_out}");
+    assert!(
+        preferred_out.contains("candidatesTokenCount"),
+        "{preferred_out}"
+    );
+    assert!(
+        !preferred_out.contains("HOSTILE_FALLBACK") && !preferred_out.contains("\"completion_tokens\":7"),
+        "must not fall back to alternate or echo malformed preferred: {preferred_out}"
+    );
+
+    // Present malformed recognized count fields fail closed with field-specific
+    // diagnostics (including totalTokenCount, which is validated even when the
+    // normalizer publishes checked prompt+completion totals).
+    for (body, field) in [
+        (
+            concat!(
+                "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":-1,\"candidatesTokenCount\":1,\"totalTokenCount\":0}}\n\n",
+            ),
+            "promptTokenCount",
+        ),
+        (
+            concat!(
+                "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"completionTokenCount\":1.5,\"totalTokenCount\":2}}\n\n",
+            ),
+            "completionTokenCount",
+        ),
+        (
+            concat!(
+                "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":true}}\n\n",
+            ),
+            "totalTokenCount",
+        ),
+    ] {
+        let out = run_gemini_normalizer(4096, body, "text/event-stream").await;
+        assert!(out.contains("upstream_error"), "{field}: {out}");
+        assert!(out.contains(field), "{field}: {out}");
+        assert!(
+            !out.contains("\"prompt_tokens\"") && !out.contains("\"total_tokens\""),
+            "must not publish usage after malformed {field}: {out}"
+        );
+    }
+
+    // Valid usage still publishes OpenAI-shaped counts; omission still yields no
+    // usage chunk; completionTokenCount alternate works when preferred is absent.
+    let valid = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":4,\"totalTokenCount\":15}}\n\n",
+    );
+    let valid_out = run_gemini_normalizer(4096, valid, "text/event-stream").await;
+    assert!(valid_out.contains("\"prompt_tokens\":11"), "{valid_out}");
+    assert!(valid_out.contains("\"completion_tokens\":4"), "{valid_out}");
+    assert!(valid_out.contains("\"total_tokens\":15"), "{valid_out}");
+    assert!(valid_out.trim_end().ends_with("data: [DONE]"), "{valid_out}");
+
+    let omitted = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let omitted_out = run_gemini_normalizer(4096, omitted, "text/event-stream").await;
+    assert!(
+        omitted_out.contains("\"finish_reason\":\"stop\""),
+        "{omitted_out}"
+    );
+    assert!(
+        !omitted_out.contains("\"prompt_tokens\"") && !omitted_out.contains("\"usage\""),
+        "omitted usageMetadata must not invent usage: {omitted_out}"
+    );
+
+    let alternate_only = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"completionTokenCount\":9}}\n\n",
+    );
+    let alt_out = run_gemini_normalizer(4096, alternate_only, "text/event-stream").await;
+    assert!(alt_out.contains("\"prompt_tokens\":2"), "{alt_out}");
+    assert!(alt_out.contains("\"completion_tokens\":9"), "{alt_out}");
+    assert!(alt_out.contains("\"total_tokens\":11"), "{alt_out}");
+}
+
+#[tokio::test]
 async fn test_provider_usage_u64_overflow_fails_closed_without_wrapped_total() {
     // Gemini path.
     let gemini = concat!(
@@ -7603,6 +7705,10 @@ async fn test_provider_usage_u64_overflow_fails_closed_without_wrapped_total() {
     assert!(
         !gemini_out.contains("\"total_tokens\""),
         "must not publish wrapped totals: {gemini_out}"
+    );
+    assert!(
+        !gemini_out.contains("18446744073709551615"),
+        "must not echo provider usage counts: {gemini_out}"
     );
     assert!(
         gemini_out.trim_end().ends_with("data: [DONE]"),

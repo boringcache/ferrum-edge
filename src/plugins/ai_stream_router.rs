@@ -5147,15 +5147,17 @@ impl GeminiStreamNormalizer {
         }
 
         if let Some(usage) = event.get("usageMetadata") {
-            if let Some(p) = usage.get("promptTokenCount").and_then(Value::as_u64) {
-                self.prompt_tokens = Some(p);
-            }
-            if let Some(c) = usage
-                .get("candidatesTokenCount")
-                .or_else(|| usage.get("completionTokenCount"))
-                .and_then(Value::as_u64)
-            {
-                self.completion_tokens = Some(c);
+            match apply_gemini_usage_metadata(
+                usage,
+                &mut self.prompt_tokens,
+                &mut self.completion_tokens,
+            ) {
+                Ok(()) => {}
+                Err(message) => {
+                    self.emit_upstream_error(message, out);
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    return true;
+                }
             }
         }
 
@@ -5759,6 +5761,71 @@ fn truncate_provider_error_message(message: &str) -> String {
     let mut truncated = message.chars().take(MAX).collect::<String>();
     truncated.push('…');
     truncated
+}
+
+/// Fail-closed Gemini `usageMetadata` admission for the stream normalizer.
+///
+/// A present `usageMetadata` must be an object. Every present recognized count
+/// field (`promptTokenCount`, `candidatesTokenCount`, `completionTokenCount`,
+/// `totalTokenCount`) must be a JSON integer representable as `u64`. Omitted
+/// fields stay omitted. `candidatesTokenCount` is preferred over
+/// `completionTokenCount` when both are present and valid; a present malformed
+/// preferred field never falls through to the alternate. `totalTokenCount` is
+/// validated for shape only — published totals still come from checked
+/// `prompt + completion` addition at terminal usage emit.
+fn apply_gemini_usage_metadata(
+    usage: &Value,
+    prompt_tokens: &mut Option<u64>,
+    completion_tokens: &mut Option<u64>,
+) -> Result<(), &'static str> {
+    let Some(usage) = usage.as_object() else {
+        return Err(
+            "upstream provider sent Gemini usageMetadata that was not an object; stream terminated",
+        );
+    };
+
+    if let Some(prompt) = gemini_optional_usage_count(usage, "promptTokenCount")? {
+        *prompt_tokens = Some(prompt);
+    }
+
+    // Validate every present recognized completion-side field first so a
+    // malformed preferred key cannot silently fall back to the alternate.
+    let candidates = gemini_optional_usage_count(usage, "candidatesTokenCount")?;
+    let completion_alt = gemini_optional_usage_count(usage, "completionTokenCount")?;
+    // Documented / consumed shape: present totals must also be representable.
+    let _total = gemini_optional_usage_count(usage, "totalTokenCount")?;
+
+    if let Some(completion) = candidates.or(completion_alt) {
+        *completion_tokens = Some(completion);
+    }
+    Ok(())
+}
+
+fn gemini_optional_usage_count(
+    usage: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<u64>, &'static str> {
+    let Some(value) = usage.get(field) else {
+        return Ok(None);
+    };
+    match value.as_u64() {
+        Some(count) => Ok(Some(count)),
+        None => Err(match field {
+            "promptTokenCount" => {
+                "upstream provider sent a malformed Gemini usageMetadata.promptTokenCount; stream terminated"
+            }
+            "candidatesTokenCount" => {
+                "upstream provider sent a malformed Gemini usageMetadata.candidatesTokenCount; stream terminated"
+            }
+            "completionTokenCount" => {
+                "upstream provider sent a malformed Gemini usageMetadata.completionTokenCount; stream terminated"
+            }
+            "totalTokenCount" => {
+                "upstream provider sent a malformed Gemini usageMetadata.totalTokenCount; stream terminated"
+            }
+            _ => "upstream provider sent a malformed Gemini usageMetadata token count; stream terminated",
+        }),
+    }
 }
 
 fn gemini_prompt_block_reason(event: &Value) -> Result<Option<&'static str>, &'static str> {
