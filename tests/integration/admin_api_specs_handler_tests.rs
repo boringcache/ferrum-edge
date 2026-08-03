@@ -7023,13 +7023,11 @@ async fn external_ref_put_failure_and_delete_preserve_last_good_snapshot_lifecyc
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
     let mut state = make_admin_state(store.clone(), 25);
-    state.external_ref_policy = Arc::new(
-        ferrum_edge::admin::api_specs::ExternalRefProcessPolicy {
-            enabled: true,
-            allowed_origins: vec!["https://schemas.example.com:443".to_string()],
-            ..Default::default()
-        },
-    );
+    state.external_ref_policy = Arc::new(ferrum_edge::admin::api_specs::ExternalRefProcessPolicy {
+        enabled: true,
+        allowed_origins: vec!["https://schemas.example.com:443".to_string()],
+        ..Default::default()
+    });
     let mut loader = ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default();
     loader.fixtures.insert(
         FIRST_URI.to_string(),
@@ -7079,7 +7077,10 @@ async fn external_ref_put_failure_and_delete_preserve_last_good_snapshot_lifecyc
     )
     .expect("decode initial external snapshot");
     assert_eq!(initial_snapshot.documents.len(), 1);
-    assert_eq!(initial_snapshot.documents[0].document["required"], json!(["first"]));
+    assert_eq!(
+        initial_snapshot.documents[0].document["required"],
+        json!(["first"])
+    );
 
     let (put_status, put_body) = client
         .put_json(
@@ -7100,18 +7101,20 @@ async fn external_ref_put_failure_and_delete_preserve_last_good_snapshot_lifecyc
     assert_ne!(accepted.content_hash, initial.content_hash);
     assert_ne!(accepted.resource_hash, initial.resource_hash);
     assert_ne!(accepted.external_ref_digest, initial.external_ref_digest);
-    assert_ne!(accepted.external_ref_snapshot, initial.external_ref_snapshot);
+    assert_ne!(
+        accepted.external_ref_snapshot,
+        initial.external_ref_snapshot
+    );
     assert_eq!(accepted.created_at, initial.created_at);
     let accepted_snapshot_bytes = accepted
         .external_ref_snapshot
         .as_deref()
         .expect("accepted PUT must replace the persisted external snapshot");
-    let accepted_snapshot =
-        ferrum_edge::admin::api_specs::ExternalRefSnapshot::from_gzip_bytes(
-            accepted_snapshot_bytes,
-            1024 * 1024,
-        )
-        .expect("decode replaced external snapshot");
+    let accepted_snapshot = ferrum_edge::admin::api_specs::ExternalRefSnapshot::from_gzip_bytes(
+        accepted_snapshot_bytes,
+        1024 * 1024,
+    )
+    .expect("decode replaced external snapshot");
     assert_eq!(
         accepted_snapshot.snapshot_digest,
         accepted
@@ -7131,8 +7134,7 @@ async fn external_ref_put_failure_and_delete_preserve_last_good_snapshot_lifecyc
         .find(|plugin| plugin.plugin_name == "openapi_validator")
         .expect("accepted generation must include openapi_validator");
     assert_eq!(
-        accepted_validator.config["operations"][0]["responses"]["200"]["application/json"]
-            ["required"],
+        accepted_validator.config["operations"][0]["responses"]["200"]["application/json"]["required"],
         json!(["second"])
     );
 
