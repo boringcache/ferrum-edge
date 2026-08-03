@@ -297,9 +297,7 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
     let basic_before = facade_stats
         .basic_authorization_header
         .load(Ordering::SeqCst);
-    let post_secret_before = facade_stats
-        .post_client_secret_field
-        .load(Ordering::SeqCst);
+    let post_secret_before = facade_stats.post_client_secret_field.load(Ordering::SeqCst);
 
     let mut disc_ctx = bearer_ctx(&active);
     assert_eq!(
@@ -326,9 +324,7 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
         "client_secret_basic must present Authorization to the facade"
     );
     assert_eq!(
-        facade_stats
-            .post_client_secret_field
-            .load(Ordering::SeqCst),
+        facade_stats.post_client_secret_field.load(Ordering::SeqCst),
         post_secret_before,
         "client_secret_basic must not send a client_secret form field"
     );

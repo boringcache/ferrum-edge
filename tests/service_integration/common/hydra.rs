@@ -445,12 +445,12 @@ impl HydraContainer {
         let mut location = authorization_url.to_string();
         let expected_callback = Url::parse(expected_redirect_uri)
             .map_err(|e| format!("expected callback URL parse: {e}"))?;
-        let public_origin = Url::parse(&self.public_url)
-            .map_err(|e| format!("Hydra public URL parse: {e}"))?;
+        let public_origin =
+            Url::parse(&self.public_url).map_err(|e| format!("Hydra public URL parse: {e}"))?;
         let login_target =
             Url::parse(&self.login_url).map_err(|e| format!("Hydra login URL parse: {e}"))?;
-        let consent_target = Url::parse(&self.consent_url)
-            .map_err(|e| format!("Hydra consent URL parse: {e}"))?;
+        let consent_target =
+            Url::parse(&self.consent_url).map_err(|e| format!("Hydra consent URL parse: {e}"))?;
 
         // Cap redirect hops so a misconfigured fixture fails fast.
         for _ in 0..12 {

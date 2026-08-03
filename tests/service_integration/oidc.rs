@@ -532,11 +532,7 @@ async fn oidc_live_discovery_login_session_and_claims() {
     ));
     let ch = wait_for_browser_challenge(&wrong_iss_plugin).await;
     let cb = hydra
-        .complete_authorization_redirect(
-            &ch.location,
-            &client.redirect_uri,
-            &ch.state,
-        )
+        .complete_authorization_redirect(&ch.location, &client.redirect_uri, &ch.state)
         .await
         .expect("code for wrong-issuer plugin");
     let mut cb_ctx = html_ctx(REDIRECT_PATH);
@@ -559,11 +555,7 @@ async fn oidc_live_discovery_login_session_and_claims() {
     let wrong_aud_plugin = oidc_plugin(wrong_aud);
     let ch = wait_for_browser_challenge(&wrong_aud_plugin).await;
     let cb = hydra
-        .complete_authorization_redirect(
-            &ch.location,
-            &client.redirect_uri,
-            &ch.state,
-        )
+        .complete_authorization_redirect(&ch.location, &client.redirect_uri, &ch.state)
         .await
         .expect("code for wrong-audience plugin");
     let mut cb_ctx = html_ctx(REDIRECT_PATH);
@@ -605,11 +597,7 @@ async fn oidc_live_discovery_login_session_and_claims() {
     ));
     let ch = wait_for_browser_challenge(&wrong_sig_plugin).await;
     let cb = hydra
-        .complete_authorization_redirect(
-            &ch.location,
-            &client.redirect_uri,
-            &ch.state,
-        )
+        .complete_authorization_redirect(&ch.location, &client.redirect_uri, &ch.state)
         .await
         .expect("code for wrong-jwks plugin");
     let mut cb_ctx = html_ctx(REDIRECT_PATH);
