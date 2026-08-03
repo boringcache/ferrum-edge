@@ -8214,6 +8214,26 @@ struct PublishedDeadLetterPayload {
     path: PathBuf,
     byte_len: u64,
     sha256: String,
+    file: File,
+    identity: SpoolFileIdentity,
+}
+
+impl PublishedDeadLetterPayload {
+    /// Revalidate the durable payload immediately before the authoritative
+    /// replay claim is removed. Keeping the renamed descriptor pinned makes
+    /// this check about the file we actually wrote, not merely whatever a
+    /// same-UID actor has arranged for the published pathname to name.
+    fn revalidate(&mut self, spool: &SpoolManager) -> Result<(), String> {
+        spool.assert_managed_path(&self.path)?;
+        self.identity = verify_dead_letter_payload(
+            &mut self.file,
+            &self.path,
+            self.byte_len,
+            &self.sha256,
+            DeadLetterIdentityExpectation::Exact(self.identity),
+        )?;
+        Ok(())
+    }
 }
 
 /// Incremental private writer for the exact rejected JSONEachRow payloads.
@@ -8261,6 +8281,7 @@ impl DeadLetterPayloadWriter {
         let live = LiveSpoolPathGuard::new(temp_path.clone());
         #[cfg(unix)]
         let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)
@@ -8268,6 +8289,7 @@ impl DeadLetterPayloadWriter {
             .open(&temp_path);
         #[cfg(not(unix))]
         let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&temp_path);
@@ -8352,18 +8374,33 @@ impl DeadLetterPayloadWriter {
                 "{PLUGIN_NAME}: refusing to publish an empty dead-letter payload"
             ));
         }
-        let file = self.file.take().ok_or_else(|| {
-            format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
-        })?;
-        if let Err(error) = (spool.fs_ops.sync_file)(&file, &self.temp_path) {
-            drop(file);
-            return Err(error);
-        }
-        drop(file);
+        let expected_sha256 = hex::encode(self.hasher.clone().finalize());
+        let synced_identity = {
+            let file = self.file.as_mut().ok_or_else(|| {
+                format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
+            })?;
+            (spool.fs_ops.sync_file)(file, &self.temp_path)?;
+            dead_letter_payload_identity(file, &self.temp_path, self.byte_len)?
+        };
 
         let _guard = spool.lock_spool_mutation()?;
         spool.assert_managed_path(&self.temp_path)?;
         spool.assert_managed_path(&self.final_path)?;
+        // Before mutating any prior partial handoff, prove the live temp path
+        // still names the descriptor whose completed metadata we captured at
+        // fsync. This is a cheap fail-closed boundary; the exact streamed hash
+        // is repeated immediately before rename after quota work completes.
+        {
+            let file = self.file.as_mut().ok_or_else(|| {
+                format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
+            })?;
+            dead_letter_payload_identity_matching(
+                file,
+                &self.temp_path,
+                self.byte_len,
+                DeadLetterIdentityExpectation::Exact(synced_identity),
+            )?;
+        }
         // A prior attempt may have published the payload before metadata or
         // source removal failed. The still-present source is authoritative, so
         // discard that replaceable sibling before quota admission; otherwise
@@ -8384,8 +8421,43 @@ impl DeadLetterPayloadWriter {
         // protected files leave no room, the temp is dropped and the source is
         // restored for a later/operator-assisted attempt.
         spool.evict_until_can_admit(0)?;
+        let pre_rename_identity = {
+            let file = self.file.as_mut().ok_or_else(|| {
+                format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
+            })?;
+            verify_dead_letter_payload(
+                file,
+                &self.temp_path,
+                self.byte_len,
+                &expected_sha256,
+                DeadLetterIdentityExpectation::Exact(synced_identity),
+            )?
+        };
         (spool.fs_ops.rename)(&self.temp_path, &self.final_path)?;
         (spool.fs_ops.after_rename)(&self.final_path);
+        // Rename while the original descriptor remains open, then prove the
+        // published name resolves to that same node and still contains exactly
+        // the bytes hashed from the rejected rows. Rename may legitimately
+        // update inode metadata, so this first final-path check pins node
+        // identity and returns the new complete metadata snapshot.
+        let published_identity = {
+            let file = self.file.as_mut().ok_or_else(|| {
+                format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
+            })?;
+            match verify_dead_letter_payload(
+                file,
+                &self.final_path,
+                self.byte_len,
+                &expected_sha256,
+                DeadLetterIdentityExpectation::SameNode(pre_rename_identity),
+            ) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    remove_dead_letter_path_if_descriptor_matches(&self.final_path, file);
+                    return Err(error);
+                }
+            }
+        };
         #[cfg(unix)]
         {
             let parent = self.final_path.parent().ok_or_else(|| {
@@ -8394,30 +8466,237 @@ impl DeadLetterPayloadWriter {
             let dir = match (spool.fs_ops.open_dir)(parent) {
                 Ok(dir) => dir,
                 Err(error) => {
-                    let _ = fs::remove_file(&self.final_path);
+                    if let Some(file) = self.file.as_ref() {
+                        remove_dead_letter_path_if_descriptor_matches(&self.final_path, file);
+                    }
                     return Err(error);
                 }
             };
             if let Err(error) = (spool.fs_ops.sync_dir)(&dir, parent) {
-                let _ = fs::remove_file(&self.final_path);
+                if let Some(file) = self.file.as_ref() {
+                    remove_dead_letter_path_if_descriptor_matches(&self.final_path, file);
+                }
                 return Err(error);
             }
         }
         self._live.take();
-        let digest = self.hasher.clone().finalize();
+        let file = self.file.take().ok_or_else(|| {
+            format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
+        })?;
         Ok(PublishedDeadLetterPayload {
             path: self.final_path.clone(),
             byte_len: self.byte_len,
-            sha256: hex::encode(digest),
+            sha256: expected_sha256,
+            file,
+            identity: published_identity,
         })
     }
 }
 
 impl Drop for DeadLetterPayloadWriter {
     fn drop(&mut self) {
-        if self.file.take().is_some() || self.temp_path.exists() {
-            let _ = fs::remove_file(&self.temp_path);
+        if let Some(file) = self.file.take() {
+            remove_dead_letter_path_if_descriptor_matches(&self.temp_path, &file);
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DeadLetterIdentityExpectation {
+    Exact(SpoolFileIdentity),
+    SameNode(SpoolFileIdentity),
+}
+
+/// Validate the descriptor and pathname shape without reading the payload.
+///
+/// Unix exposes stable device/inode and link-count metadata, so a hard link or
+/// pathname replacement is rejected directly. Other platforms use the full
+/// portable metadata snapshot here and the exact streamed digest at every
+/// publication boundary below; a replacement with different bytes can never
+/// satisfy the handoff even where `std` exposes no inode/link-count primitive.
+fn dead_letter_payload_identity(
+    file: &File,
+    path: &Path,
+    expected_len: u64,
+) -> Result<SpoolFileIdentity, String> {
+    dead_letter_payload_identity_inner(file, path, expected_len, None)
+}
+
+fn dead_letter_payload_identity_matching(
+    file: &File,
+    path: &Path,
+    expected_len: u64,
+    expectation: DeadLetterIdentityExpectation,
+) -> Result<SpoolFileIdentity, String> {
+    dead_letter_payload_identity_inner(file, path, expected_len, Some(expectation))
+}
+
+fn dead_letter_payload_identity_inner(
+    file: &File,
+    path: &Path,
+    expected_len: u64,
+    expectation: Option<DeadLetterIdentityExpectation>,
+) -> Result<SpoolFileIdentity, String> {
+    let descriptor_metadata = file.metadata().map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to stat open dead-letter payload '{}': {error}",
+            path.display()
+        )
+    })?;
+    validate_dead_letter_payload_metadata(path, &descriptor_metadata, expected_len)?;
+    let descriptor_identity = SpoolFileIdentity::from_metadata(&descriptor_metadata);
+    match expectation {
+        Some(DeadLetterIdentityExpectation::Exact(expected))
+            if descriptor_identity != expected =>
+        {
+            return Err(format!(
+                "{PLUGIN_NAME}: dead-letter payload metadata changed before durable publication"
+            ));
+        }
+        Some(DeadLetterIdentityExpectation::SameNode(expected))
+            if !descriptor_identity.same_file_node(&expected) =>
+        {
+            return Err(format!(
+                "{PLUGIN_NAME}: dead-letter payload changed file identity during durable publication"
+            ));
+        }
+        _ => {}
+    }
+
+    let path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to stat dead-letter payload path '{}': {error}",
+            path.display()
+        )
+    })?;
+    validate_dead_letter_payload_metadata(path, &path_metadata, expected_len)?;
+    let path_identity = SpoolFileIdentity::from_metadata(&path_metadata);
+    if !descriptor_identity.same_file_node(&path_identity) {
+        return Err(format!(
+            "{PLUGIN_NAME}: dead-letter payload path '{}' does not name the opened writer file",
+            path.display()
+        ));
+    }
+    Ok(descriptor_identity)
+}
+
+fn validate_dead_letter_payload_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    expected_len: u64,
+) -> Result<(), String> {
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{PLUGIN_NAME}: dead-letter payload '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() != expected_len {
+        return Err(format!(
+            "{PLUGIN_NAME}: dead-letter payload byte length changed before durable publication"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(format!(
+                "{PLUGIN_NAME}: dead-letter payload '{}' must have exactly one hard link",
+                path.display()
+            ));
+        }
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(format!(
+                "{PLUGIN_NAME}: dead-letter payload '{}' does not have owner-only 0600 access",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Stream the pinned descriptor through a fixed-size buffer and require both
+/// its exact rejected-row digest and a stable descriptor/path metadata snapshot
+/// across the read. No artifact-wide verification allocation is introduced.
+fn verify_dead_letter_payload(
+    file: &mut File,
+    path: &Path,
+    expected_len: u64,
+    expected_sha256: &str,
+    expectation: DeadLetterIdentityExpectation,
+) -> Result<SpoolFileIdentity, String> {
+    let before = dead_letter_payload_identity_matching(
+        file,
+        path,
+        expected_len,
+        expectation,
+    )?;
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to seek dead-letter payload '{}' for verification: {error}",
+            path.display()
+        )
+    })?;
+    let mut hasher = crate::fips::approved::Sha256::new();
+    let mut verified_len = 0u64;
+    let mut buffer = [0u8; SPOOL_DECODE_CHUNK_BYTES];
+    loop {
+        let read = match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: failed to read dead-letter payload '{}' for verification: {error}",
+                    path.display()
+                ));
+            }
+        };
+        verified_len = verified_len.checked_add(read as u64).ok_or_else(|| {
+            format!("{PLUGIN_NAME}: dead-letter payload verification length overflowed")
+        })?;
+        let bytes = buffer.get(..read).ok_or_else(|| {
+            format!("{PLUGIN_NAME}: dead-letter payload verification range is invalid")
+        })?;
+        hasher.update(bytes);
+    }
+    if verified_len != expected_len || hex::encode(hasher.finalize()) != expected_sha256 {
+        return Err(format!(
+            "{PLUGIN_NAME}: dead-letter payload content changed before durable publication"
+        ));
+    }
+    dead_letter_payload_identity_matching(
+        file,
+        path,
+        expected_len,
+        DeadLetterIdentityExpectation::Exact(before),
+    )
+}
+
+/// Best-effort rollback may unlink only a path that still resolves to the open
+/// writer descriptor. A planted replacement is left untouched for operator
+/// inspection while the authoritative source remains replayable.
+fn remove_dead_letter_path_if_descriptor_matches(path: &Path, file: &File) {
+    let Ok(descriptor_metadata) = file.metadata() else {
+        return;
+    };
+    let Ok(path_metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !descriptor_metadata.file_type().is_file() || !path_metadata.file_type().is_file() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if descriptor_metadata.nlink() != 1 || path_metadata.nlink() != 1 {
+            return;
+        }
+    }
+    let descriptor_identity = SpoolFileIdentity::from_metadata(&descriptor_metadata);
+    let path_identity = SpoolFileIdentity::from_metadata(&path_metadata);
+    if descriptor_identity.same_file_node(&path_identity) {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -8897,12 +9176,11 @@ impl SpoolFileIdentity {
         }
     }
 
-    /// Lock-domain equality for the namespace coordination inode.
-    ///
-    /// Replacement is a different device/inode at the coordination path.
-    /// Metadata mutations on the pinned inode (mode repair, empty-file touch)
-    /// are not a second lock domain.
-    fn same_coordination_inode(&self, other: &Self) -> bool {
+    /// File-node equality where the platform exposes a stable device/inode.
+    /// Non-Unix targets conservatively require the complete portable metadata
+    /// snapshot to match and pair this with exact streamed content checks at
+    /// dead-letter publication boundaries.
+    fn same_file_node(&self, other: &Self) -> bool {
         #[cfg(unix)]
         {
             self.device == other.device && self.inode == other.inode
@@ -8911,6 +9189,15 @@ impl SpoolFileIdentity {
         {
             self == other
         }
+    }
+
+    /// Lock-domain equality for the namespace coordination inode.
+    ///
+    /// Replacement is a different device/inode at the coordination path.
+    /// Metadata mutations on the pinned inode (mode repair, empty-file touch)
+    /// are not a second lock domain.
+    fn same_coordination_inode(&self, other: &Self) -> bool {
+        self.same_file_node(other)
     }
 }
 
@@ -11183,7 +11470,7 @@ fn finalize_replayed_spool_file(
             payload.rows
         ));
     }
-    let published_payload = payload.publish(spool)?;
+    let mut published_payload = payload.publish(spool)?;
     let payload_file = published_payload
         .path
         .file_name()
@@ -11197,12 +11484,13 @@ fn finalize_replayed_spool_file(
         quarantined_at_unix: unix_timestamp_seconds(),
         payload_file,
         payload_bytes: published_payload.byte_len,
-        payload_sha256: published_payload.sha256,
+        payload_sha256: published_payload.sha256.clone(),
     };
     let meta_path = write_dead_letter_meta(spool, file, &meta)?;
     {
         let _guard = spool.lock_spool_mutation()?;
         spool.assert_managed_path(file)?;
+        published_payload.revalidate(spool)?;
         fs::remove_file(file).map_err(|error| {
             format!(
                 "{PLUGIN_NAME}: failed to remove replay source after durable dead-letter handoff '{}': {error}",

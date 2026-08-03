@@ -7965,6 +7965,105 @@ async fn dead_letter_publish_refuses_a_final_planted_after_writer_open() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn dead_letter_publish_refuses_a_completed_temp_path_replacement() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let event = sample_event("evt-dead-letter-temp-replacement");
+    let expected_payload = serialize_json_each_row(std::slice::from_ref(&event)).unwrap();
+    let source = spool.write_events(&[event]).unwrap();
+    let namespace_root = spool.namespace_root_for_tests().to_path_buf();
+    let source_parent = source.parent().unwrap().to_path_buf();
+    let payload_final = dead_letter_payload_path(&source);
+    let payload_name = payload_final
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let displaced_writer = temp.path().join("displaced-dead-letter-writer");
+    let displaced_for_hook = displaced_writer.clone();
+    let hostile_payload = b"hostile-planted-dead-letter".to_vec();
+    let hostile_for_hook = hostile_payload.clone();
+    let planted_temp = Arc::new(Mutex::new(None));
+    let planted_for_hook = Arc::clone(&planted_temp);
+    let replaced = Arc::new(AtomicBool::new(false));
+    let replaced_for_hook = Arc::clone(&replaced);
+    let _clear_hook = ClearSpoolWriteHookGuard;
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, root| {
+        if point != SpoolWriteHookPoint::BeforeNamespaceLock
+            || root != namespace_root.as_path()
+            || replaced_for_hook.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let completed_temp = fs::read_dir(&source_parent)
+            .expect("dead-letter replacement hook reads the spool day")
+            .filter_map(Result::ok)
+            .find_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                let metadata = entry.metadata().ok()?;
+                (name.starts_with(&format!("{payload_name}.write-"))
+                    && name.ends_with(".tmp")
+                    && metadata.len() > 0)
+                    .then_some(entry.path())
+            });
+        let Some(completed_temp) = completed_temp else {
+            return;
+        };
+        fs::rename(&completed_temp, &displaced_for_hook)
+            .expect("the race preserves the completed writer inode outside the managed path");
+        fs::write(&completed_temp, &hostile_for_hook)
+            .expect("the race plants hostile bytes at the predictable temp path");
+        *planted_for_hook.lock().expect("planted temp path") = Some(completed_temp);
+        replaced_for_hook.store(true, Ordering::SeqCst);
+    })));
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("a replaced completed dead-letter temp must fail publication");
+    set_spool_write_hook_for_tests(None);
+
+    assert!(replaced.load(Ordering::SeqCst));
+    assert!(
+        error.contains("metadata changed")
+            || error.contains("does not name the opened writer file")
+            || error.contains("file identity"),
+        "unexpected completed-temp replacement refusal: {error}"
+    );
+    assert!(
+        source.exists(),
+        "the authoritative source must remain replayable"
+    );
+    assert!(
+        !payload_final.exists(),
+        "hostile temp bytes must never be accepted as the dead-letter payload"
+    );
+    assert!(
+        !dead_letter_meta_path(&source).exists(),
+        "metadata must not publish for a rejected payload identity"
+    );
+    assert_eq!(
+        fs::read_to_string(&displaced_writer).unwrap(),
+        expected_payload,
+        "the displaced original descriptor target must not be modified"
+    );
+    let planted_temp = planted_temp
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the hostile temp path was recorded");
+    assert_eq!(
+        fs::read(planted_temp).unwrap(),
+        hostile_payload,
+        "the planted replacement must not be removed or rewritten"
+    );
+}
+
 #[tokio::test]
 async fn dead_letter_handoff_preserves_evidence_when_the_source_path_becomes_a_directory() {
     let server = MockServer::start().await;
