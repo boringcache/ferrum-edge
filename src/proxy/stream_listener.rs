@@ -1817,7 +1817,6 @@ impl StreamListenerManager {
                 let listener_udp_metrics = Some(metrics.clone());
                 let global_shutdown_for_listener = global_shutdown.clone();
                 let mesh_outbound_enforcement = self.mesh_outbound_enforcement.clone();
-                let stream_gateway_ref = self.stream_gateway_ref.clone();
                 let bind_failures = Arc::clone(&self.bind_failures);
                 let async_bind_failures = Arc::clone(&self.async_bind_failures);
                 let async_failure_tx = async_failure_tx.clone();
@@ -1947,6 +1946,7 @@ impl StreamListenerManager {
                 let record_mesh_mtls_metric = self.record_mesh_mtls_metric;
                 let global_shutdown_for_listener = global_shutdown.clone();
                 let mesh_outbound_enforcement = self.mesh_outbound_enforcement.clone();
+                let stream_gateway_ref = self.stream_gateway_ref.clone();
                 // Snapshot the node-waypoint resolver slot once per listener
                 // spawn. `None` outside NodeWaypoint topology; when present the
                 // accept loop resolves each connection's source pod identity to
