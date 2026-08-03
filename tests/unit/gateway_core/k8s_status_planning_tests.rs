@@ -447,7 +447,7 @@ fn mixed_kind_candidates_enter_shared_window_within_ceil_bound() {
 fn translation_reuse_preserves_gateway_status_parity() {
     let objects = base_objects_with_routes(3);
     let conflicts = gateway_api_route_conflicts(&objects, &options());
-    let baseline = plan_gateway_api_status_updates(&objects, options(), &conflicts);
+    let mut baseline = plan_gateway_api_status_updates(&objects, options(), &conflicts);
 
     let (translation, errors) =
         ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips(
@@ -464,7 +464,14 @@ fn translation_reuse_preserves_gateway_status_parity() {
         Some(&reuse),
         StatusPlanBudget::unlimited(0),
     );
-    assert_eq!(reused.updates, baseline);
+    let mut reused_updates = reused.updates;
+    for update in &mut baseline {
+        update.status = status_without_last_transition_time(&update.status);
+    }
+    for update in &mut reused_updates {
+        update.status = status_without_last_transition_time(&update.status);
+    }
+    assert_eq!(reused_updates, baseline);
     assert!(Arc::strong_count(&reuse.translation) >= 1);
 }
 
@@ -716,9 +723,11 @@ fn mixed_valid_invalid_and_rotating_windows_preserve_status_parity() {
     assert_eq!(seen.len(), unlimited.len());
     for update in &unlimited {
         let key = (update.kind.clone(), update.name.clone());
+        let expected = status_without_last_transition_time(&update.status);
+        let actual = seen.get(&key).map(status_without_last_transition_time);
         assert_eq!(
-            seen.get(&key),
-            Some(&update.status),
+            actual.as_ref(),
+            Some(&expected),
             "rotating-window parity mismatch for {}/{}",
             update.kind,
             update.name
