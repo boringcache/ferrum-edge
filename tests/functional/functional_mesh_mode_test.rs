@@ -3045,6 +3045,268 @@ async fn functional_mesh_sidecar_inbound_denies_unauthorized_peer() {
     );
 }
 
+/// Live slice for issue #3244: a WorkloadEntry whose SPIFFE/identity stays in
+/// `vms` while `service_namespace` stamps an authorized attachment to
+/// `prod/reviews`. A same-name decoy Service in `vms` also lists the workload
+/// SPIFFE so a regression that keys inbound hosts by the identity namespace
+/// would incorrectly admit `reviews.vms...`.
+fn cross_namespace_workload_entry_inbound_slice(
+    node_id: &str,
+    server_spiffe: &str,
+    client_spiffe: &str,
+    backend_port: u16,
+) -> MeshSlice {
+    let server_id = SpiffeId::new(server_spiffe).expect("server SPIFFE id");
+    let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+    let http_port = WorkloadPort {
+        port: backend_port,
+        protocol: AppProtocol::Http,
+        name: Some("http".to_string()),
+    };
+    let workload = Workload {
+        spiffe_id: server_id.clone(),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+            namespace: Some("vms".to_string()),
+        },
+        service_name: "reviews".to_string(),
+        service_namespace: Some("prod".to_string()),
+        addresses: vec!["127.0.0.1".to_string()],
+        ports: vec![http_port],
+        trust_domain: trust_domain.clone(),
+        namespace: "vms".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("reviews-vm".to_string()),
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    let attached_service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "reviews".to_string(),
+        namespace: "prod".to_string(),
+        ports: vec![ServicePort {
+            port: backend_port,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![WorkloadRef {
+            spiffe_id: server_id.clone(),
+        }],
+        protocol_overrides: HashMap::new(),
+    };
+    // Decoy: same service name in the WorkloadEntry identity namespace. Membership
+    // includes the workload SPIFFE so a wrong-namespace host match would be a
+    // real confused-deputy regression rather than an empty-membership miss.
+    let decoy_identity_namespace_service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "reviews".to_string(),
+        namespace: "vms".to_string(),
+        ports: vec![ServicePort {
+            port: backend_port,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![WorkloadRef {
+            spiffe_id: server_id,
+        }],
+        protocol_overrides: HashMap::new(),
+    };
+    let policy = MeshPolicy {
+        name: "allow-client".to_string(),
+        namespace: "vms".to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(client_spiffe.to_string()),
+                namespace_pattern: None,
+                trust_domain: Some(trust_domain),
+                trust_domain_pattern: None,
+            }],
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    };
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "vms".to_string(),
+        version: Utc::now().to_rfc3339(),
+        workloads: vec![workload],
+        services: vec![attached_service, decoy_identity_namespace_service],
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: "vms".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        mesh_policies: vec![policy],
+        ..MeshSlice::default()
+    }
+}
+
+/// Spawn a production sidecar whose local WorkloadEntry is attached to a
+/// Service in another namespace, then drive one authorized inbound request for
+/// the attached Service FQDN and one for the identity-namespace decoy FQDN.
+/// Spawn/bind flakes retry with fresh ports; the two Host observations do not.
+async fn drive_cross_namespace_workload_entry_inbound(
+) -> Result<(u16, String, u16, String, String), String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let server_spiffe = "spiffe://cluster.local/ns/vms/sa/reviews-vm";
+    let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
+    let attached_host = "reviews.prod.svc.cluster.local";
+    let decoy_host = "reviews.vms.svc.cluster.local";
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-we-xns-inbound-{attempt}");
+        let temp = TempDir::new().map_err(|e| format!("temp dir: {e}"))?;
+        let peers = generate_mesh_peer_svids(temp.path(), server_spiffe, client_spiffe);
+        let backend_port = start_echo_backend().await;
+
+        let cp = start_static_mesh_cp(cross_namespace_workload_entry_inbound_slice(
+            &node_id,
+            server_spiffe,
+            client_spiffe,
+            backend_port,
+        ))
+        .await;
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    // Subscription/identity namespace is the WorkloadEntry's own
+                    // namespace; the attached Service lives in `prod`.
+                    ("FERRUM_NAMESPACE", "vms".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        let readiness = wait_for_gateway_listener(&mut child, inbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
+            last_failure = format!(
+                "attempt {attempt}: {}\n{}",
+                readiness.describe(
+                    "cross-namespace WorkloadEntry inbound listener",
+                    inbound_port,
+                ),
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let attached = mesh_inbound_http_get(
+            inbound_port,
+            &peers.ca_pem,
+            server_spiffe,
+            Some((&peers.client_cert_pem, &peers.client_key_pem)),
+            attached_host,
+            "/",
+        )
+        .await;
+        let decoy = mesh_inbound_http_get(
+            inbound_port,
+            &peers.ca_pem,
+            server_spiffe,
+            Some((&peers.client_cert_pem, &peers.client_key_pem)),
+            decoy_host,
+            "/",
+        )
+        .await;
+
+        if let Some(exited) =
+            exited_gateway_diagnostic(&mut [("cross-namespace WorkloadEntry gateway", &mut child)])
+        {
+            last_failure = format!("attempt {attempt}: {exited}\n{}", captured_output(&temp));
+            kill_child(&mut child);
+            cp.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        let attached = attached.map_err(|e| {
+            format!("attached Service host GET ({attached_host}) failed: {e}\n{output}")
+        })?;
+        let decoy = decoy.map_err(|e| {
+            format!("identity-namespace decoy host GET ({decoy_host}) failed: {e}\n{output}")
+        })?;
+        return Ok((attached.0, attached.1, decoy.0, decoy.1, output));
+    }
+
+    Err(format!(
+        "cross-namespace WorkloadEntry inbound gateway never bound after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+/// Issue #3244 live datapath: an authorized peer reaches a WorkloadEntry
+/// backend only through the attached cross-namespace Service identity
+/// (`reviews.prod...`). The same-name Service in the WorkloadEntry identity
+/// namespace (`reviews.vms...`) must not be routable to that backend.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_inbound_routes_cross_namespace_workload_entry_via_attached_service()
+{
+    let (attached_status, attached_body, decoy_status, decoy_body, logs) =
+        drive_cross_namespace_workload_entry_inbound()
+            .await
+            .expect("cross-namespace WorkloadEntry inbound drive");
+    assert_eq!(
+        attached_status, 200,
+        "Host reviews.prod.svc.cluster.local must reach the WorkloadEntry backend through the \
+         attached Service namespace; body: {attached_body:?}\n{logs}"
+    );
+    assert!(
+        attached_body.contains("backend-ok"),
+        "attached Service response must carry the WorkloadEntry backend body: {attached_body:?}\n{logs}"
+    );
+    assert!(
+        !(decoy_status == 200 && decoy_body.contains("backend-ok")),
+        "Host reviews.vms.svc.cluster.local must NOT reach the WorkloadEntry backend via the \
+         identity-namespace decoy Service; status={decoy_status} body={decoy_body:?}\n{logs}"
+    );
+}
+
 /// A multi-port slice for the INBOUND disambiguation keystone: the local
 /// `echo` service declares TWO HTTP service ports (8080 / 9090) whose numeric
 /// targetPorts point at two distinguishable loopback backends. The inbound
