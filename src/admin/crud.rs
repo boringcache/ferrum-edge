@@ -2417,6 +2417,49 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
     Ok(errors)
 }
 
+/// Load every plugin config in `namespace` and build the exact post-write view
+/// for a PluginConfig create/update/disable: replace the persisted `(namespace,
+/// id)` with `candidate`, or append it when new.
+///
+/// Backend-TLS-SNI / direct-H2 admission for `mesh_route_dispatch` route
+/// overrides must see the same effective plugins PluginCache would after this
+/// write (associations, globals, enabled/shadow). Do not trust a potentially
+/// stale GatewayConfig cache, and never silently fall back to an empty list on
+/// DB failure — that would skip request-body-buffering conflicts.
+async fn load_candidate_plugin_configs_for_write(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    candidate: &PluginConfig,
+) -> Result<Vec<PluginConfig>, AfterValidateError> {
+    let mut plugins = Vec::new();
+    let mut offset = 0_i64;
+    const PAGE_SIZE: i64 = 1_000;
+    loop {
+        let page = db
+            .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        let items_len = page.items.len() as i64;
+        plugins.extend(page.items);
+        if items_len == 0 {
+            break;
+        }
+        offset += items_len;
+        if offset >= page.total {
+            break;
+        }
+    }
+    if let Some(existing) = plugins
+        .iter_mut()
+        .find(|plugin| plugin.namespace == candidate.namespace && plugin.id == candidate.id)
+    {
+        *existing = candidate.clone();
+    } else {
+        plugins.push(candidate.clone());
+    }
+    Ok(plugins)
+}
+
 /// Reject a `mesh_route_dispatch` plugin write that would route a retry-enabled
 /// proxy's matched traffic to an upstream requiring a mesh transport
 /// (`mesh.hbone` / `mesh.mtls`). At runtime effective retry forces that transport
@@ -2449,11 +2492,14 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
             plugin_config.scope,
             PluginScope::Proxy | PluginScope::ProxyGroup
         ) {
+            let plugin_configs =
+                load_candidate_plugin_configs_for_write(db, namespace, plugin_config).await?;
             return validate_unshadowed_globals_for_plugin(
                 db,
                 namespace,
                 plugin_config,
                 mesh_model,
+                &plugin_configs,
             )
             .await;
         }
@@ -2475,6 +2521,10 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
     if override_rules.is_empty() {
         return Ok(Vec::new());
     }
+
+    // Exact post-write plugin view for SNI / request-body-buffering admission.
+    let plugin_configs =
+        load_candidate_plugin_configs_for_write(db, namespace, plugin_config).await?;
 
     let mut errors = Vec::new();
     match plugin_config.scope {
@@ -2500,7 +2550,7 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
                     &proxy,
                     &override_rules,
                     mesh_model,
-                    &[],
+                    &plugin_configs,
                     &mut errors,
                 )
                 .await
@@ -2540,7 +2590,7 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
                             proxy,
                             &override_rules,
                             mesh_model,
-                            &[],
+                            &plugin_configs,
                             &mut errors,
                         )
                         .await
@@ -2577,40 +2627,28 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
 /// as the old enabled `mesh_route_dispatch`; the shadow recomputation deliberately
 /// ignores `plugin_config.id` (the instance being unshadowed) while still honoring
 /// any OTHER enabled `mesh_route_dispatch` the proxy attaches.
+///
+/// `plugin_configs` must be the exact post-write candidate view (see
+/// [`load_candidate_plugin_configs_for_write`]) so SNI / request-body-buffering
+/// admission observes the same effective plugins as PluginCache after the write.
 async fn validate_unshadowed_globals_for_plugin(
     db: &dyn DatabaseBackend,
     namespace: &str,
     plugin_config: &PluginConfig,
     mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
+    plugin_configs: &[PluginConfig],
 ) -> Result<Vec<String>, AfterValidateError> {
-    // Collect the override rules of every enabled global `mesh_route_dispatch`.
-    // Parsed configs are kept owned so the borrowed rule slice stays valid.
+    // Collect the override rules of every enabled global `mesh_route_dispatch`
+    // from the candidate post-write view. Parsed configs are kept owned so the
+    // borrowed rule slice stays valid.
     let mut global_dispatch_configs: Vec<MeshRouteDispatchConfig> = Vec::new();
-    {
-        let mut offset = 0_i64;
-        const PAGE_SIZE: i64 = 1_000;
-        loop {
-            let page = db
-                .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
-                .await
-                .map_err(AfterValidateError::Db)?;
-            let items_len = page.items.len() as i64;
-            for plugin in &page.items {
-                if plugin.scope == PluginScope::Global
-                    && plugin.enabled
-                    && plugin.plugin_name == "mesh_route_dispatch"
-                    && let Ok(dispatch) = MeshRouteDispatchConfig::from_value(&plugin.config)
-                {
-                    global_dispatch_configs.push(dispatch);
-                }
-            }
-            if items_len == 0 {
-                break;
-            }
-            offset += items_len;
-            if offset >= page.total {
-                break;
-            }
+    for plugin in plugin_configs {
+        if plugin.scope == PluginScope::Global
+            && plugin.enabled
+            && plugin.plugin_name == "mesh_route_dispatch"
+            && let Ok(dispatch) = MeshRouteDispatchConfig::from_value(&plugin.config)
+        {
+            global_dispatch_configs.push(dispatch);
         }
     }
     let global_override_rules: Vec<&crate::plugins::mesh_route_dispatch::RouteRule> =
@@ -2661,7 +2699,7 @@ async fn validate_unshadowed_globals_for_plugin(
                 proxy,
                 &global_override_rules,
                 mesh_model,
-                &[],
+                plugin_configs,
                 &mut errors,
             )
             .await
