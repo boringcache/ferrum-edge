@@ -2324,8 +2324,9 @@ async fn test_active_health_check_tcp_probe() {
 
     // Reserve the healthy backend continuously so concurrent functional tests
     // cannot steal a hard-coded port before its spawned server binds. Reserve a
-    // second distinct ephemeral port and release it only after both values are
-    // captured; the TCP probe should observe connection refusal there.
+    // second distinct ephemeral port through gateway startup so the harness
+    // cannot allocate it for another listener. Releasing that reservation
+    // below gives the TCP probe a deterministic refused target.
     let healthy_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("reserve healthy TCP-probe backend");
@@ -2334,7 +2335,6 @@ async fn test_active_health_check_tcp_probe() {
         .await
         .expect("reserve unavailable TCP-probe target");
     let unavailable_port = unavailable_reservation.local_addr().unwrap().port();
-    drop(unavailable_reservation);
 
     let config = format!(
         r#"
@@ -2384,6 +2384,7 @@ plugin_configs: []
 
     let (mut gateway, proxy_port, _admin_port) =
         start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    drop(unavailable_reservation);
 
     let client = reqwest::Client::new();
 
