@@ -39973,7 +39973,7 @@ async fn proxy_to_backend_http3(
     };
 
     let request_body = match client_request_body {
-        ClientRequestBody::Buffered(buffered) => (*buffered).body,
+        ClientRequestBody::Buffered(buffered) => buffered.body,
         ClientRequestBody::Streaming(original_req) => {
             let (_parts, body) = (*original_req).into_parts();
             if effective_max_request_body_size_bytes > 0 {
