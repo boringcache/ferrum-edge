@@ -5823,7 +5823,9 @@ fn gemini_optional_usage_count(
             "totalTokenCount" => {
                 "upstream provider sent a malformed Gemini usageMetadata.totalTokenCount; stream terminated"
             }
-            _ => "upstream provider sent a malformed Gemini usageMetadata token count; stream terminated",
+            _ => {
+                "upstream provider sent a malformed Gemini usageMetadata token count; stream terminated"
+            }
         }),
     }
 }

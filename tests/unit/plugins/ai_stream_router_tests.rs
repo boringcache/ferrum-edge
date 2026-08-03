@@ -7595,7 +7595,10 @@ async fn test_gemini_usage_metadata_fail_closed_and_valid_shapes() {
         "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":\"PROMPT_LEAK_sk-gemini-secret\"}\n\n",
     );
     let non_object_out = run_gemini_normalizer(4096, non_object, "text/event-stream").await;
-    assert!(non_object_out.contains("upstream_error"), "{non_object_out}");
+    assert!(
+        non_object_out.contains("upstream_error"),
+        "{non_object_out}"
+    );
     assert!(
         non_object_out.contains("usageMetadata") && non_object_out.contains("not an object"),
         "{non_object_out}"
@@ -7621,7 +7624,8 @@ async fn test_gemini_usage_metadata_fail_closed_and_valid_shapes() {
         "{preferred_out}"
     );
     assert!(
-        !preferred_out.contains("HOSTILE_FALLBACK") && !preferred_out.contains("\"completion_tokens\":7"),
+        !preferred_out.contains("HOSTILE_FALLBACK")
+            && !preferred_out.contains("\"completion_tokens\":7"),
         "must not fall back to alternate or echo malformed preferred: {preferred_out}"
     );
 
@@ -7666,7 +7670,10 @@ async fn test_gemini_usage_metadata_fail_closed_and_valid_shapes() {
     assert!(valid_out.contains("\"prompt_tokens\":11"), "{valid_out}");
     assert!(valid_out.contains("\"completion_tokens\":4"), "{valid_out}");
     assert!(valid_out.contains("\"total_tokens\":15"), "{valid_out}");
-    assert!(valid_out.trim_end().ends_with("data: [DONE]"), "{valid_out}");
+    assert!(
+        valid_out.trim_end().ends_with("data: [DONE]"),
+        "{valid_out}"
+    );
 
     let omitted = concat!(
         "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n",
