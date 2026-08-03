@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import decimal
 import hashlib
 import hmac
 import json
+import re
 import sys
 import time
 import uuid
@@ -85,6 +88,102 @@ def require(path: Path, required: list[str]) -> None:
 
 def read_stdin_json() -> object:
     return json.load(sys.stdin)
+
+
+def running_spire_nodes() -> None:
+    nodes: set[str] = set()
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) != 2:
+            raise SystemExit("malformed SPIRE agent pod row")
+        phase, node = fields
+        if phase == "Running":
+            nodes.add(node)
+    for node in sorted(nodes):
+        print(node)
+
+
+def bundle_b64der() -> None:
+    begin = "-----BEGIN CERTIFICATE-----"
+    end = "-----END CERTIFICATE-----"
+    authorities: list[str] = []
+    encoded: list[str] | None = None
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == begin:
+            if encoded is not None:
+                raise SystemExit("nested certificate in SPIRE bundle")
+            encoded = []
+        elif line == end:
+            if not encoded:
+                raise SystemExit("empty certificate in SPIRE bundle")
+            try:
+                der = base64.b64decode("".join(encoded), validate=True)
+            except (ValueError, binascii.Error) as error:
+                raise SystemExit("invalid certificate encoding in SPIRE bundle") from error
+            if not der:
+                raise SystemExit("empty DER certificate in SPIRE bundle")
+            authorities.append(base64.b64encode(der).decode())
+            encoded = None
+        elif encoded is None:
+            raise SystemExit("unexpected content outside SPIRE certificate")
+        elif re.fullmatch(r"[A-Za-z0-9+/=]+", line) is None:
+            raise SystemExit("invalid certificate line in SPIRE bundle")
+        else:
+            encoded.append(line)
+    if encoded is not None:
+        raise SystemExit("unterminated certificate in SPIRE bundle")
+    if not authorities:
+        raise SystemExit("SPIRE bundle contains no certificates")
+    print(*authorities, sep="\n")
+
+
+def prometheus_uint(value: str, label: str) -> int:
+    try:
+        parsed = decimal.Decimal(value)
+    except decimal.InvalidOperation as error:
+        raise SystemExit(f"invalid Prometheus value for {label}") from error
+    if not parsed.is_finite() or parsed < 0 or parsed != parsed.to_integral_value():
+        raise SystemExit(f"non-integer Prometheus value for {label}")
+    return int(parsed)
+
+
+def prometheus_samples(metric: str, selectors: tuple[str, ...]) -> list[int]:
+    values: list[int] = []
+    prefix = metric + "{"
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line.startswith(prefix) or not all(
+            selector in line for selector in selectors
+        ):
+            continue
+        fields = line.rsplit(None, 1)
+        if len(fields) != 2:
+            raise SystemExit(f"malformed Prometheus sample for {metric}")
+        values.append(prometheus_uint(fields[1], metric))
+    return values
+
+
+def prometheus_value(metric: str, selector: str) -> None:
+    values = prometheus_samples(metric, (selector,))
+    if len(values) > 1:
+        raise SystemExit(f"duplicate Prometheus samples for {metric}")
+    print(values[0] if values else 0)
+
+
+def proxy_received_downstream_bytes(proxy: str) -> None:
+    values = prometheus_samples(
+        "toxiproxy_proxy_received_bytes_total",
+        (f'proxy="{proxy}"', 'direction="downstream"'),
+    )
+    if not values:
+        raise SystemExit(f"missing downstream byte counter for proxy {proxy}")
+    print(sum(values))
 
 
 def mint_admin_jwt(secret: str) -> None:
@@ -271,7 +370,15 @@ def main(argv: list[str]) -> None:
     if len(argv) < 2:
         raise SystemExit("fixture helper operation is required")
     operation = argv[1]
-    if operation == "mint-admin-jwt" and len(argv) == 3:
+    if operation == "running-spire-nodes" and len(argv) == 2:
+        running_spire_nodes()
+    elif operation == "bundle-b64der" and len(argv) == 2:
+        bundle_b64der()
+    elif operation == "prometheus-value" and len(argv) == 4:
+        prometheus_value(argv[2], argv[3])
+    elif operation == "proxy-received-downstream-bytes" and len(argv) == 3:
+        proxy_received_downstream_bytes(argv[2])
+    elif operation == "mint-admin-jwt" and len(argv) == 3:
         mint_admin_jwt(argv[2])
     elif operation == "proxy-count" and len(argv) == 2:
         payload = read_stdin_json()

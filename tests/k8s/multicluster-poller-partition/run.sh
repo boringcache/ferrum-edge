@@ -85,7 +85,7 @@ cleanup() {
 trap cleanup EXIT
 
 preflight() {
-  for command in docker kind kubectl curl python3 openssl awk sed; do need "$command"; done
+  for command in docker kind kubectl curl python3 openssl sed; do need "$command"; done
   docker info >/dev/null
   [[ "${FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE:-}" == true ]] || {
     echo "set FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true" >&2; exit 1;
@@ -186,6 +186,17 @@ wait_for_proxy_activity() {
   return 1
 }
 
+wait_for_metric_increase() {
+  local label="$1" timeout="$2"; shift 2
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if metric_increased "$@"; then return 0; fi
+    sleep 1
+  done
+  echo "timed out waiting for $label (${timeout}s)" >&2
+  return 1
+}
+
 wait_for_no_configured_state() {
   local label="$1" timeout="$2"; shift 2
   local deadline=$((SECONDS + timeout))
@@ -223,7 +234,8 @@ spire_wait_ready() {
 spire_agent_nodes() {
   kubectl --context "$1" -n "$2" get pod -l app=spire-agent \
     -o jsonpath='{range .items[*]}{.status.phase}{"\t"}{.spec.nodeName}{"\n"}{end}' |
-    awk '$1 == "Running" && length($2) > 0 {print $2}' | sort -u
+    python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+      running-spire-nodes
 }
 
 spire_server_pod() {
@@ -286,7 +298,8 @@ spire_register_workload() {
 
 spire_bundle_b64der() {
   spire_server_exec "$1" "$SPIRE_NS" bundle show -format pem 2>/dev/null |
-    awk '/BEGIN CERTIFICATE/{cap=1;buf="";next}/END CERTIFICATE/{if(cap)print buf;cap=0;next}cap{gsub(/[[:space:]]/,"");buf=buf substr($0,1)}'
+    python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+      bundle-b64der
 }
 
 mint_admin_jwt() {
@@ -339,13 +352,9 @@ add_latency() {
 remove_latency() { curl -fsS -X DELETE "http://$TOXI_IP:8474/proxies/$1/toxics/inflight" >/dev/null; }
 
 proxy_received_downstream_bytes() {
-  curl -fsS "http://$TOXI_IP:8474/metrics" | awk -v proxy="$1" '
-    /toxiproxy_proxy_received_bytes_total/ &&
-      index($0,"proxy=\"" proxy "\"") &&
-      index($0,"direction=\"downstream\"") {
-        v=$NF+0; sum+=v; found=1
-      }
-    END {if(!found) exit 2; printf "%.0f\n",sum}'
+  curl -fsS "http://$TOXI_IP:8474/metrics" | \
+    python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+      proxy-received-downstream-bytes "$1"
 }
 
 proxy_activity_increased() {
@@ -542,16 +551,15 @@ traffic_not_found() {
 
 metric_value() {
   local context="$1" token="$2" metric="$3" selector="$4"
-  metrics "$context" "$token" | awk -v metric="$metric" -v selector="$selector" '
-    index($0,metric "{")==1 && index($0,selector) && !found {value=$NF; found=1}
-    END {print found ? value : 0}'
+  metrics "$context" "$token" | \
+    python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+      prometheus-value "$metric" "$selector"
 }
 
 metric_file_value() {
   local file="$1" metric="$2" selector="$3"
-  awk -v metric="$metric" -v selector="$selector" '
-    index($0,metric "{")==1 && index($0,selector) && !found {value=$NF; found=1}
-    END {print found ? value : 0}' "$file"
+  python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+    prometheus-value "$metric" "$selector" < "$file"
 }
 
 bounded_uint() {
@@ -571,6 +579,18 @@ metric_file_uint_value() {
   local value metric="$2"
   value="$(metric_file_value "$@")" || return 1
   bounded_uint "$value" "$metric"
+}
+
+metric_uint_value() {
+  local value metric="$3"
+  value="$(metric_value "$@")" || return 1
+  bounded_uint "$value" "$metric"
+}
+
+metric_increased() {
+  local current
+  current="$(metric_uint_value "$1" "$2" "$3" "$4")" || return 1
+  (( current > $5 ))
 }
 
 ages_between() {
@@ -750,13 +770,47 @@ scenario_trust_expiry() {
 }
 
 scenario_inflight_withdrawal() {
-  local fed_before disc_before fault_started
+  local fed_failure_before disc_failure_before fed_failure_after disc_failure_after
+  local fed_before disc_before fed_after disc_after fault_started
+  wait_for_fresh_state "pre-withdrawal poller freshness" 20 "$CONTEXT_A" "$JWT_A" cluster-b
+
+  # Own each poller's next-attempt boundary instead of assuming that a previous
+  # recovery reset its independent jittered backoff in time for a fixed sample
+  # window. Establish the boundaries independently so one disabled proxy cannot
+  # climb its backoff while the other catches up. A measured failure proves the
+  # current attempt completed; enabling a preinstalled downstream toxic then
+  # traps the very next successful response. The 60-second federation delay
+  # leaves enough time to synchronize discovery before withdrawing the peer.
+  fed_failure_before="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
+    ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
+  disc_failure_before="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
+    ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
+  set_proxy "$FED_AB" false
+  wait_for_metric_increase "federation poll failure boundary" 10 "$CONTEXT_A" "$JWT_A" \
+    ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"" "$fed_failure_before"
+  fed_failure_after="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
+    ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
   fed_before="$(proxy_received_downstream_bytes "$FED_AB")"
-  disc_before="$(proxy_received_downstream_bytes "$DISC_AB")"
-  add_latency "$FED_AB"; add_latency "$DISC_AB"
+  add_latency "$FED_AB"
   fault_started=$SECONDS
-  wait_for_proxy_activity "federation poll in flight" 20 "$FED_AB" "$fed_before"
-  wait_for_proxy_activity "discovery poll in flight" 20 "$DISC_AB" "$disc_before"
+  set_proxy "$FED_AB" true
+  wait_for_proxy_activity "federation delayed response in flight" 10 "$FED_AB" "$fed_before"
+
+  set_proxy "$DISC_AB" false
+  wait_for_metric_increase "discovery poll failure boundary" 10 "$CONTEXT_A" "$JWT_A" \
+    ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"" "$disc_failure_before"
+  disc_failure_after="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
+    ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
+  disc_before="$(proxy_received_downstream_bytes "$DISC_AB")"
+  add_latency "$DISC_AB"
+  set_proxy "$DISC_AB" true
+  wait_for_proxy_activity "discovery delayed response in flight" 10 "$DISC_AB" "$disc_before"
+  fed_after="$(proxy_received_downstream_bytes "$FED_AB")"
+  disc_after="$(proxy_received_downstream_bytes "$DISC_AB")"
+  printf 'federation_failures_before=%s\nfederation_failures_boundary=%s\ndiscovery_failures_before=%s\ndiscovery_failures_boundary=%s\nfederation_downstream_bytes_before=%s\nfederation_downstream_bytes_inflight=%s\ndiscovery_downstream_bytes_before=%s\ndiscovery_downstream_bytes_inflight=%s\n' \
+    "$fed_failure_before" "$fed_failure_after" "$disc_failure_before" "$disc_failure_after" \
+    "$fed_before" "$fed_after" "$disc_before" "$disc_after" \
+    > "$RESULTS_DIR/poller.withdrawal.inflight-observed.txt"
   local local_bundle
   local_bundle="$(spire_bundle_b64der "$CONTEXT_A")"
   apply_mesh_config "$CONTEXT_A" cluster-a "$TD_A" echo-a region-a "$local_bundle" ""
@@ -781,8 +835,12 @@ scenario_inflight_withdrawal() {
     echo "withdrawn peer retained freshness metrics" >&2; return 1
   fi
   admin_json "$CONTEXT_A" "$JWT_A" > "$RESULTS_DIR/poller.withdrawal.inflight_generation_retired.json"
-  record multicluster_poller.withdrawal.inflight_generation_retired pass "withdrawal-accepted-after-observed-inflight-bytes" "poller.withdrawal.inflight_generation_retired.{json,prom}"
-  record multicluster_poller.withdrawal.retired_state_not_reinstalled pass "empty-beyond-full-delayed-response-window" "poller.withdrawal.inflight_generation_retired.json"
+  record multicluster_poller.withdrawal.inflight_generation_retired pass \
+    "withdrawal-accepted-after-synchronized-failure-boundaries-and-observed-delayed-response-bytes" \
+    "poller.withdrawal.inflight-observed.txt,poller.withdrawal.inflight_generation_retired.json,poller.withdrawal.inflight_generation_retired.prom"
+  record multicluster_poller.withdrawal.retired_state_not_reinstalled pass \
+    "empty-beyond-full-delayed-response-window" \
+    "poller.withdrawal.inflight-observed.txt,poller.withdrawal.inflight_generation_retired.json"
 }
 
 collect_diagnostics() {
