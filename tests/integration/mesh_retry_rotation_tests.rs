@@ -13,6 +13,9 @@ use ferrum_edge::config::types::GatewayConfig;
 fn retry_rotation_preserves_the_selected_targets_secure_mesh_transport() {
     let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
         "version": "1",
+        "proxies": [],
+        "consumers": [],
+        "plugin_configs": [],
         "upstreams": [{
             "id": "mesh-retry",
             "algorithm": "round_robin",

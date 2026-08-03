@@ -3663,7 +3663,7 @@ struct MeshRetryBackendObservation {
     repeated: Vec<Vec<u8>>,
     repeated_bin: Vec<Vec<u8>>,
     te: Option<Vec<u8>>,
-    content_length: Option<Vec<u8>>,
+    content_lengths: Vec<Vec<u8>>,
     x_forwarded_for: Option<Vec<u8>>,
     x_forwarded_proto: Option<Vec<u8>>,
     baggage: Option<Vec<u8>>,
@@ -3990,10 +3990,12 @@ async fn start_mesh_retry_mtls_backend(
                     .headers()
                     .get("te")
                     .map(|value| value.as_bytes().to_vec());
-                let content_length = req
+                let content_lengths: Vec<Vec<u8>> = req
                     .headers()
-                    .get("content-length")
-                    .map(|value| value.as_bytes().to_vec());
+                    .get_all("content-length")
+                    .iter()
+                    .map(|value| value.as_bytes().to_vec())
+                    .collect();
                 let x_forwarded_for = req
                     .headers()
                     .get("x-forwarded-for")
@@ -4014,7 +4016,7 @@ async fn start_mesh_retry_mtls_backend(
                         repeated,
                         repeated_bin,
                         te,
-                        content_length,
+                        content_lengths,
                         x_forwarded_for,
                         x_forwarded_proto,
                         baggage,
@@ -4278,10 +4280,23 @@ plugin_configs: []
         "unchanged repeated binary metadata must retain separate field lines"
     );
     assert_eq!(observed.te.as_deref(), Some(b"trailers".as_slice()));
+    // The client's `content-length` field line is stripped with the rest of the
+    // backend-request framing headers; hyper then regenerates a single
+    // authoritative value from the replay body's exact size hint. Assert the
+    // regenerated framing rather than its absence: a replayed client value would
+    // survive as a second field line, and a stale value would disagree with the
+    // bytes the backend actually received.
     assert!(
-        observed.content_length.is_none(),
-        "HTTP/2 mesh dispatch must regenerate framing instead of replaying Content-Length"
+        observed.content_lengths.len() <= 1,
+        "HTTP/2 mesh dispatch must not replay the client Content-Length: {observed:?}"
     );
+    if let Some(value) = observed.content_lengths.first() {
+        assert_eq!(
+            value.as_slice(),
+            payload.len().to_string().as_bytes(),
+            "regenerated Content-Length must match the replayed body length"
+        );
+    }
     assert!(
         observed
             .x_forwarded_for

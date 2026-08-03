@@ -221,12 +221,43 @@ fn h3_grpc_bridge_preserves_trusted_geo_assertion_on_both_dispatch_paths() {
         helper.contains("key.eq_ignore_ascii_case(\"x-geo-country\")"),
         "the H3 gRPC assertion bridge must retain the authoritative geo result"
     );
+    // Every H3-to-gRPC dispatch path folds its prebuilt backend header map
+    // through `merge_proxy_headers_for_prebuilt_h3_grpc`, which is the single
+    // place the trusted assertion overlay is applied. Guard both halves of that
+    // contract: one overlay site inside the shared helper, and no dispatch path
+    // that builds its merge view without it.
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("cross_protocol production source section");
+
     assert_eq!(
-        source
+        helper
             .matches("trusted_plugin_assertion_proxy_headers(proxy_headers)")
             .count(),
+        1,
+        "the trusted assertion overlay must be applied in exactly one shared merge helper"
+    );
+    assert_eq!(
+        production
+            .matches("trusted_plugin_assertion_proxy_headers(proxy_headers)")
+            .count(),
+        1,
+        "no H3-to-gRPC dispatch may apply the trusted assertion map outside the shared helper"
+    );
+    assert_eq!(
+        production
+            .matches("merge_proxy_headers_for_prebuilt_h3_grpc(&initial_hmap, proxy_headers)")
+            .count(),
+        1,
+        "the buffered H3-to-gRPC dispatch must build its merge view through the shared helper"
+    );
+    assert_eq!(
+        production
+            .matches("merge_proxy_headers_for_prebuilt_h3_grpc(&hmap, proxy_headers)")
+            .count(),
         2,
-        "both buffered and streaming H3-to-gRPC dispatches must use the trusted assertion map"
+        "both streaming H3-to-gRPC dispatches must build their merge view through the shared helper"
     );
 }
 
