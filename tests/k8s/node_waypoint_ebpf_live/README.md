@@ -56,11 +56,7 @@ assertor rejection), and
 cross-node Service allow).
 On dual-stack clusters it also requires the IPv6 pod-netns ready
 markers, IPv6 Service allow/deny behavior, and an IPv6 direct Pod-IP bypass
-guard. The hosted workflow then measures the same-node ambient proxy's
-`ferrum_mesh_bpf_accept_to_first_byte_microseconds` histogram with IPv4 and
-IPv6 sockets. It reuses one client tuple for close-before-data generations and
-requires no sample, then requires separate fast and 500 ms-delayed first bytes
-to move the expected fixed buckets and aggregate sum/count.
+guard.
 
 The chart render preflight and live install both verify the production identity
 profile: `ambient.spire.enabled=true` must mount the SPIRE Agent Workload API
