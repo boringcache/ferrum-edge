@@ -2417,19 +2417,17 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
     Ok(errors)
 }
 
-/// Load every plugin config in `namespace` and build the exact post-write view
-/// for a PluginConfig create/update/disable: replace the persisted `(namespace,
-/// id)` with `candidate`, or append it when new.
+/// Load every plugin config currently persisted in `namespace` (paginated).
 ///
-/// Backend-TLS-SNI / direct-H2 admission for `mesh_route_dispatch` route
-/// overrides must see the same effective plugins PluginCache would after this
-/// write (associations, globals, enabled/shadow). Do not trust a potentially
-/// stale GatewayConfig cache, and never silently fall back to an empty list on
-/// DB failure — that would skip request-body-buffering conflicts.
-async fn load_candidate_plugin_configs_for_write(
+/// Backend-TLS-SNI / direct-H2 admission on reverse writes (Upstream / Proxy
+/// `after_validate`, and the candidate overlay used by plugin writes) must see
+/// the same effective plugins PluginCache would after a successful DB write
+/// (associations, globals, enabled/shadow). Do not trust a potentially stale
+/// GatewayConfig cache, and never silently fall back to an empty list on DB
+/// failure — that would skip request-body-buffering conflicts.
+async fn load_namespace_plugin_configs(
     db: &dyn DatabaseBackend,
     namespace: &str,
-    candidate: &PluginConfig,
 ) -> Result<Vec<PluginConfig>, AfterValidateError> {
     let mut plugins = Vec::new();
     let mut offset = 0_i64;
@@ -2449,6 +2447,24 @@ async fn load_candidate_plugin_configs_for_write(
             break;
         }
     }
+    Ok(plugins)
+}
+
+/// Load every plugin config in `namespace` and build the exact post-write view
+/// for a PluginConfig create/update/disable: replace the persisted `(namespace,
+/// id)` with `candidate`, or append it when new.
+///
+/// Backend-TLS-SNI / direct-H2 admission for `mesh_route_dispatch` route
+/// overrides must see the same effective plugins PluginCache would after this
+/// write (associations, globals, enabled/shadow). Do not trust a potentially
+/// stale GatewayConfig cache, and never silently fall back to an empty list on
+/// DB failure — that would skip request-body-buffering conflicts.
+async fn load_candidate_plugin_configs_for_write(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    candidate: &PluginConfig,
+) -> Result<Vec<PluginConfig>, AfterValidateError> {
+    let mut plugins = load_namespace_plugin_configs(db, namespace).await?;
     if let Some(existing) = plugins
         .iter_mut()
         .find(|plugin| plugin.namespace == candidate.namespace && plugin.id == candidate.id)
@@ -3285,10 +3301,17 @@ impl AdminResource for Upstream {
         _existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
+        // Mesh transport tags live on the GatewayConfig mesh model, which is
+        // not represented by the DB plugin-config list. Keep that lookup
+        // cache-backed; SNI / buffering admission below uses the DB instead.
         let cached_config = state.cached_gateway_config();
         let mesh_model = cached_config
             .as_ref()
             .and_then(|config| config.mesh.as_deref());
+        // Authoritative plugin view for reverse-write SNI / direct-H2 gates:
+        // load once per Upstream write (not per proxy / route-override loop).
+        // Never fall back to a stale/empty GatewayConfig cache here.
+        let plugin_configs = load_namespace_plugin_configs(db, namespace).await?;
         let subset_names: HashSet<&str> = resource
             .subsets
             .as_deref()
@@ -3354,15 +3377,10 @@ impl AdminResource for Upstream {
                         proxy.upstream_subset.as_deref(),
                         proxy.retry.clone(),
                     );
-                    let empty_plugins: &[PluginConfig] = &[];
-                    let plugin_configs = cached_config
-                        .as_ref()
-                        .map(|config| config.plugin_configs.as_slice())
-                        .unwrap_or(empty_plugins);
                     errors.extend(backend_tls_sni_direct_h2_conflict_messages(
                         &admission_proxy,
                         Some(resource),
-                        plugin_configs,
+                        &plugin_configs,
                     ));
                 }
 
@@ -3406,15 +3424,10 @@ impl AdminResource for Upstream {
                         override_dest.selected_subset.as_deref(),
                         override_dest.effective_retry.clone(),
                     );
-                    let empty_plugins: &[PluginConfig] = &[];
-                    let plugin_configs = cached_config
-                        .as_ref()
-                        .map(|config| config.plugin_configs.as_slice())
-                        .unwrap_or(empty_plugins);
                     errors.extend(backend_tls_sni_direct_h2_conflict_messages(
                         &admission_proxy,
                         Some(resource),
-                        plugin_configs,
+                        &plugin_configs,
                     ));
                 }
             }
@@ -4419,10 +4432,18 @@ impl AdminResource for Proxy {
         existing: Option<&Self>,
         ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
+        // Mesh transport tags live on the GatewayConfig mesh model, which is
+        // not represented by the DB plugin-config list. Keep that lookup
+        // cache-backed; SNI / buffering admission below uses the DB instead.
         let cached_config = state.cached_gateway_config();
         let mesh_model = cached_config
             .as_ref()
             .and_then(|config| config.mesh.as_deref());
+        // Authoritative plugin view for reverse-write SNI / direct-H2 gates:
+        // load once per Proxy write (covers default upstream and every
+        // route-override destination). Never fall back to a stale/empty
+        // GatewayConfig cache here.
+        let plugin_configs = load_namespace_plugin_configs(db, namespace).await?;
         if let Some(upstream_id) = resource.upstream_id.as_deref() {
             // Namespace-predicated lookup: an upstream in another namespace
             // reports as missing (cross-namespace references are equally
@@ -4494,15 +4515,10 @@ impl AdminResource for Proxy {
                         resource.upstream_subset.as_deref(),
                         resource.retry.clone(),
                     );
-                    let empty_plugins: &[PluginConfig] = &[];
-                    let plugin_configs = cached_config
-                        .as_ref()
-                        .map(|config| config.plugin_configs.as_slice())
-                        .unwrap_or(empty_plugins);
                     let sni_errors = backend_tls_sni_direct_h2_conflict_messages(
                         &admission_proxy,
                         Some(&upstream),
-                        plugin_configs,
+                        &plugin_configs,
                     );
                     if !sni_errors.is_empty() {
                         return Err(AfterValidateError::BadRequest(sni_errors));
@@ -4557,15 +4573,10 @@ impl AdminResource for Proxy {
                         override_dest.selected_subset.as_deref(),
                         override_dest.effective_retry.clone(),
                     );
-                    let empty_plugins: &[PluginConfig] = &[];
-                    let plugin_configs = cached_config
-                        .as_ref()
-                        .map(|config| config.plugin_configs.as_slice())
-                        .unwrap_or(empty_plugins);
                     let sni_errors = backend_tls_sni_direct_h2_conflict_messages(
                         &admission_proxy,
                         Some(&upstream),
-                        plugin_configs,
+                        &plugin_configs,
                     );
                     if !sni_errors.is_empty() {
                         return Err(AfterValidateError::BadRequest(sni_errors));
