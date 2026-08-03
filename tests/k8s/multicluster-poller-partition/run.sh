@@ -3,8 +3,15 @@ set -euo pipefail
 
 # Real two-CP/two-DP poller partition gate. All state transitions are observed
 # through active bounded polling; the only sleeps are polling-loop cadences.
+#
+# Capturing assignments are spelled `VAR="$( cmd ... )"` with a space after the
+# opening `$(`. The trusted Cross build policy scans a quote-stripped rendering
+# of this file, where `VAR="$(cmd "$arg" ...)"` collapses to `VAR=$(cmd arg ...)`
+# and `VAR=$(cmd` parses as an assignment word, promoting the following argument
+# into an executable slot. The space keeps the substitution's command word in the
+# executable slot it actually occupies. Do not remove it.
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+ROOT_DIR="$( cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 FIXTURE_DIR="$ROOT_DIR/tests/k8s/multicluster-poller-partition"
 MANIFESTS="$FIXTURE_DIR/manifests.yaml"
 SPIRE_MANIFESTS="$FIXTURE_DIR/spire-manifests.yaml"
@@ -230,7 +237,7 @@ spire_server_pod() {
 spire_server_exec() {
   local context="$1" namespace="$2" pod
   shift 2
-  pod="$(spire_server_pod "$context" "$namespace")"
+  pod="$( spire_server_pod "$context" "$namespace")"
   [[ -n "$pod" ]] || { echo "no spire-server pod found in namespace $namespace" >&2; return 1; }
   kubectl --context "$context" -n "$namespace" exec "$pod" -- \
     /opt/spire/bin/spire-server "$@" -socketPath /run/spire/server.sock
@@ -249,7 +256,7 @@ spire_parent_id_for_node() {
   local attempts="${FERRUM_SPIRE_AGENT_PARENT_ID_ATTEMPTS:-30}"
   local sleep_seconds="${FERRUM_SPIRE_AGENT_PARENT_ID_SLEEP_SECONDS:-2}"
   local node_uid parent_id attempt
-  node_uid="$(kubectl --context "$context" get node "$node_name" -o jsonpath='{.metadata.uid}')"
+  node_uid="$( kubectl --context "$context" get node "$node_name" -o jsonpath='{.metadata.uid}')"
   [[ -n "$node_uid" ]] || { echo "node $node_name has no Kubernetes UID" >&2; return 1; }
   parent_id="spiffe://$trust_domain/spire/agent/k8s_psat/$trust_domain/$node_uid"
   for ((attempt = 1; attempt <= attempts; attempt++)); do
@@ -277,7 +284,7 @@ spire_register_workload() {
   }
   ns_selector="k8s:ns:$workload_namespace"
   sa_selector="k8s:sa:$service_account"
-  if existing="$(spire_server_exec "$context" "$namespace" entry show \
+  if existing="$( spire_server_exec "$context" "$namespace" entry show \
       -spiffeID "$spiffe_id" -parentID "$parent_id" 2>/dev/null)" &&
     spire_entry_has_selectors "$existing" \
       "$ns_selector" "$sa_selector" "$node_selector"; then
@@ -308,13 +315,13 @@ create_clusters_and_fault_layer() {
   kind create cluster --name "$CLUSTER_B" --wait 180s
   kind load docker-image "$IMAGE" --name "$CLUSTER_A"
   kind load docker-image "$IMAGE" --name "$CLUSTER_B"
-  NODE_A="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER_A-control-plane")"
-  NODE_B="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER_B-control-plane")"
+  NODE_A="$( docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER_A-control-plane")"
+  NODE_B="$( docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER_B-control-plane")"
   [[ -n "$NODE_A" && -n "$NODE_B" ]] || { echo "kind node IP discovery failed" >&2; return 1; }
 
   docker run -d --name "$TOXIPROXY_CONTAINER" --network kind "$TOXIPROXY_IMAGE" \
     -host=0.0.0.0 -proxy-metrics >/dev/null
-  TOXI_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$TOXIPROXY_CONTAINER")"
+  TOXI_IP="$( docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$TOXIPROXY_CONTAINER")"
   [[ -n "$TOXI_IP" ]] || { echo "Toxiproxy IP discovery failed" >&2; return 1; }
   wait_for_curl "Toxiproxy API" 30 -fsS "http://$TOXI_IP:8474/version" >/dev/null
 
@@ -323,7 +330,7 @@ create_clusters_and_fault_layer() {
   create_proxy "$FED_BA" "$FED_BA_PORT" "$NODE_A:32443"
   create_proxy "$DISC_BA" "$DISC_BA_PORT" "$NODE_A:32551"
   local count
-  count="$(curl -fsS "http://$TOXI_IP:8474/proxies" | \
+  count="$( curl -fsS "http://$TOXI_IP:8474/proxies" | \
     python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py proxy-count)"
   [[ "$count" == 4 ]] || { echo "Toxiproxy fixture startup incomplete: $count/4 proxies" >&2; return 1; }
 }
@@ -355,7 +362,7 @@ proxy_accepted_client_count() {
 
 proxy_accepted_client_increased() {
   local current
-  current="$(proxy_accepted_client_count "$1")" || return 1
+  current="$( proxy_accepted_client_count "$1")" || return 1
   bounded_uint "$current" "accepted-client count for $1" >/dev/null || return 1
   (( current > $2 ))
 }
@@ -380,7 +387,7 @@ generate_transport_material() {
 register_spire_workload() {
   local context="$1" td="$2" node parent
   while IFS= read -r node; do
-    parent="$(spire_parent_id_for_node "$context" "$SPIRE_NS" "$td" "$node")"
+    parent="$( spire_parent_id_for_node "$context" "$SPIRE_NS" "$td" "$node")"
     spire_register_workload "$context" "$SPIRE_NS" \
       "spiffe://$td/ns/$NS/sa/mesh-dp" "$parent" "$NS" mesh-dp "k8s:node-name:$node"
   done < <(spire_agent_nodes "$context" "$SPIRE_NS")
@@ -398,7 +405,7 @@ apply_support_material() {
     --from-literal=admin-jwt-secret="$ADMIN_SECRET" --from-literal=discovery-jwt-secret="$local_secret" \
     --from-literal=remote-discovery-credentials="{\"peer\":\"$peer_secret\"}" \
     --dry-run=client -o yaml | kubectl --context "$context" apply -f -
-  bundle="$(spire_bundle_b64der "$context")"
+  bundle="$( spire_bundle_b64der "$context")"
   [[ -n "$bundle" ]] || { echo "empty SPIRE bundle for $cluster" >&2; return 1; }
   python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
     bundle-json "$td" "$bundle" > "$ARTIFACT_DIR/bundle-$cluster.json"
@@ -411,9 +418,9 @@ render_mesh_config() {
   local context="$1" local_cluster="$2" local_td="$3" local_service="$4" local_region="$5"
   local peer_cluster="$6" peer_td="$7" peer_service="$8" peer_node="$9" fed_port="${10}" disc_port="${11}"
   local peer_context="${12}" local_bundle peer_bundle remote_block
-  local_bundle="$(spire_bundle_b64der "$context")"
-  peer_bundle="$(spire_bundle_b64der "$peer_context")"
-  remote_block="$(cat <<YAML
+  local_bundle="$( spire_bundle_b64der "$context")"
+  peer_bundle="$( spire_bundle_b64der "$peer_context")"
+  remote_block="$( cat <<YAML
   multi_cluster:
     local_cluster: $local_cluster
     remote_clusters:
@@ -453,7 +460,7 @@ apply_mesh_config() {
       fi
     done <<<"$peer_bundle"
   fi
-  kubectl --context "$context" -n "$NS" create configmap mesh-config --from-literal=mesh.yaml="$(cat <<YAML
+  kubectl --context "$context" -n "$NS" create configmap mesh-config --from-literal=mesh.yaml="$( cat <<YAML
 mesh:
   workloads:
     - spiffe_id: spiffe://$local_td/ns/$NS/sa/mesh-dp
@@ -524,7 +531,7 @@ no_configured_state() {
 
 traffic_once() {
   local context="$1" service="$2" expected="$3" response status body
-  response="$(kubectl --context "$context" -n "$NS" exec deploy/echo -c probe -- \
+  response="$( kubectl --context "$context" -n "$NS" exec deploy/echo -c probe -- \
     curl -sS -m 5 -w $'\n%{http_code}' -H "Host: $service.$NS.svc.cluster.local" \
       http://127.0.0.1:15001/)" || return 1
   status="${response##*$'\n'}"
@@ -537,7 +544,7 @@ traffic_fails() { ! traffic_once "$1" "$2" "$3"; }
 
 traffic_not_found() {
   local context="$1" service="$2" response status body
-  response="$(kubectl --context "$context" -n "$NS" exec deploy/echo -c probe -- \
+  response="$( kubectl --context "$context" -n "$NS" exec deploy/echo -c probe -- \
     curl -sS -m 5 -w $'\n%{http_code}' -H "Host: $service.$NS.svc.cluster.local" \
       http://127.0.0.1:15001/)" || return 1
   status="${response##*$'\n'}"
@@ -574,19 +581,19 @@ bounded_uint() {
 
 metric_file_uint_value() {
   local value metric="$2"
-  value="$(metric_file_value "$@")" || return 1
+  value="$( metric_file_value "$@")" || return 1
   bounded_uint "$value" "$metric"
 }
 
 metric_uint_value() {
   local value metric="$3"
-  value="$(metric_value "$@")" || return 1
+  value="$( metric_value "$@")" || return 1
   bounded_uint "$value" "$metric"
 }
 
 metric_increased() {
   local current
-  current="$(metric_uint_value "$1" "$2" "$3" "$4")" || return 1
+  current="$( metric_uint_value "$1" "$2" "$3" "$4")" || return 1
   (( current > $5 ))
 }
 
@@ -606,7 +613,7 @@ admin_ages() {
 
 ages_increased_below_stale() {
   local ages trust_age endpoint_age
-  ages="$(admin_ages "$1" "$2" "$3")" || return 1
+  ages="$( admin_ages "$1" "$2" "$3")" || return 1
   read -r trust_age endpoint_age <<<"$ages"
   (( trust_age >= 3 && endpoint_age >= 3 &&
      trust_age > INITIAL_TRUST_AGE && endpoint_age > INITIAL_ENDPOINT_AGE &&
@@ -628,14 +635,14 @@ assert_metric_admin_parity() {
 
 projected_config_withdrawn() {
   local config
-  config="$(kubectl --context "$1" -n "$NS" exec deploy/echo -c signal -- \
+  config="$( kubectl --context "$1" -n "$NS" exec deploy/echo -c signal -- \
     cat /mesh/mesh.yaml)" || return 1
   ! grep -q remote_clusters <<<"$config"
 }
 
 signal_reload() {
   local context="$1" pod pid
-  pod="$(kubectl --context "$context" -n "$NS" --request-timeout=10s \
+  pod="$( kubectl --context "$context" -n "$NS" --request-timeout=10s \
     get pod -l app=echo --field-selector=status.phase=Running \
       -o jsonpath='{.items[0].metadata.name}')" || return 1
   [[ -n "$pod" ]] || { echo "no running echo pod found for ConfigMap refresh" >&2; return 1; }
@@ -645,7 +652,7 @@ signal_reload() {
     annotate pod "$pod" \
       "ferrum-edge.io/projected-config-refresh=withdrawal-$SECONDS" --overwrite
   wait_for_projected_withdrawal "projected withdrawn mesh config" 30 "$context"
-  pid="$(kubectl --context "$context" -n "$NS" exec deploy/echo -c signal -- \
+  pid="$( kubectl --context "$context" -n "$NS" exec deploy/echo -c signal -- \
     pidof ferrum-edge)" || return 1
   [[ "$pid" =~ ^[0-9]+$ ]] || { echo "invalid ferrum-edge pid" >&2; return 1; }
   kubectl --context "$context" -n "$NS" exec deploy/echo -c signal -- \
@@ -659,30 +666,30 @@ deploy_topology() {
   spire_wait_ready "$CONTEXT_B" "$SPIRE_NS" 5m
   register_spire_workload "$CONTEXT_A" "$TD_A"
   register_spire_workload "$CONTEXT_B" "$TD_B"
-  ADMIN_SECRET="$(openssl rand -hex 32)"
+  ADMIN_SECRET="$( openssl rand -hex 32)"
   local secret_a secret_b
-  secret_a="$(openssl rand -hex 32)"; secret_b="$(openssl rand -hex 32)"
+  secret_a="$( openssl rand -hex 32)"; secret_b="$( openssl rand -hex 32)"
   apply_support_material "$CONTEXT_A" "$TD_A" cluster-a "$secret_a" "$secret_b"
   apply_support_material "$CONTEXT_B" "$TD_B" cluster-b "$secret_b" "$secret_a"
   render_mesh_config "$CONTEXT_A" cluster-a "$TD_A" echo-a region-a cluster-b "$TD_B" echo-b "$NODE_B" "$FED_AB_PORT" "$DISC_AB_PORT" "$CONTEXT_B"
   render_mesh_config "$CONTEXT_B" cluster-b "$TD_B" echo-b region-b cluster-a "$TD_A" echo-a "$NODE_A" "$FED_BA_PORT" "$DISC_BA_PORT" "$CONTEXT_A"
   apply_manifest "$CONTEXT_A" "$TD_A" cluster-a echo-a echo-a region-a
   apply_manifest "$CONTEXT_B" "$TD_B" cluster-b echo-b echo-b region-b
-  JWT_A="$(mint_admin_jwt)"; JWT_B="$(mint_admin_jwt)"
+  JWT_A="$( mint_admin_jwt)"; JWT_B="$( mint_admin_jwt)"
 }
 
 scenario_initial() {
   wait_for_state "A initial polled trust and endpoints" 90 "$CONTEXT_A" "$JWT_A" cluster-b true polled true true
   wait_for_state "B initial polled trust and endpoints" 90 "$CONTEXT_B" "$JWT_B" cluster-a true polled true true
   wait_for_fresh_state "A initial cache freshness" 20 "$CONTEXT_A" "$JWT_A" cluster-b
-  INITIAL_FEDERATION_SUCCESS_AT="$(metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_federation_last_success_timestamp_seconds "trust_domain=\"$TD_B\"")"
-  INITIAL_DISCOVERY_SUCCESSES="$(metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_remote_discovery_poll_successes_total "cluster=\"cluster-b\"")"
+  INITIAL_FEDERATION_SUCCESS_AT="$( metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_federation_last_success_timestamp_seconds "trust_domain=\"$TD_B\"")"
+  INITIAL_DISCOVERY_SUCCESSES="$( metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_remote_discovery_poll_successes_total "cluster=\"cluster-b\"")"
   wait_for_traffic "A to B initial traffic" 60 "$CONTEXT_A" echo-b echo-b
   wait_for_traffic "B to A initial traffic" 60 "$CONTEXT_B" echo-a echo-a
   capture_boundary "$CONTEXT_A" "$JWT_A" poller.initial.polled_trust_endpoints_installed
   local initial_metrics="$RESULTS_DIR/poller.initial.polled_trust_endpoints_installed.prom"
-  INITIAL_FEDERATION_FAILURES="$(metric_file_uint_value "$initial_metrics" ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
-  INITIAL_DISCOVERY_FAILURES="$(metric_file_uint_value "$initial_metrics" ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
+  INITIAL_FEDERATION_FAILURES="$( metric_file_uint_value "$initial_metrics" ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
+  INITIAL_DISCOVERY_FAILURES="$( metric_file_uint_value "$initial_metrics" ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
   record multicluster_poller.initial.polled_trust_endpoints_installed pass "both-directions-polled-and-200" "poller.initial.polled_trust_endpoints_installed.{json,prom}"
 }
 
@@ -700,7 +707,7 @@ scenario_transient() {
   admin_json "$CONTEXT_A" "$JWT_A" > "$transient_json"
   metrics "$CONTEXT_A" "$JWT_A" > "$transient_metrics"
   set_all_proxies true
-  snapshot_ages="$(python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+  snapshot_ages="$( python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
     admin-ages cluster-b < "$transient_json")"
   read -r snapshot_trust_age snapshot_endpoint_age <<<"$snapshot_ages"
   (( snapshot_trust_age >= 3 && snapshot_endpoint_age >= 3 &&
@@ -710,8 +717,8 @@ scenario_transient() {
     echo "transient cache snapshot escaped stale bounds: trust=$snapshot_trust_age endpoint=$snapshot_endpoint_age" >&2
     return 1
   }
-  ff="$(metric_file_uint_value "$transient_metrics" ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
-  df="$(metric_file_uint_value "$transient_metrics" ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
+  ff="$( metric_file_uint_value "$transient_metrics" ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
+  df="$( metric_file_uint_value "$transient_metrics" ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
   (( ff >= INITIAL_FEDERATION_FAILURES && df >= INITIAL_DISCOVERY_FAILURES )) || {
     echo "failure counter regressed over partition boundary" >&2; return 1;
   }
@@ -727,8 +734,8 @@ scenario_transient() {
   wait_for_fresh_state "same-generation transient recovery" 40 "$CONTEXT_A" "$JWT_A" cluster-b
   wait_for_fresh_state "same-generation reverse recovery" 40 "$CONTEXT_B" "$JWT_B" cluster-a
   local recovered_federation_at recovered_discovery_successes
-  recovered_federation_at="$(metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_federation_last_success_timestamp_seconds "trust_domain=\"$TD_B\"")"
-  recovered_discovery_successes="$(metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_remote_discovery_poll_successes_total "cluster=\"cluster-b\"")"
+  recovered_federation_at="$( metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_federation_last_success_timestamp_seconds "trust_domain=\"$TD_B\"")"
+  recovered_discovery_successes="$( metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_remote_discovery_poll_successes_total "cluster=\"cluster-b\"")"
   (( recovered_federation_at > INITIAL_FEDERATION_SUCCESS_AT && recovered_discovery_successes > INITIAL_DISCOVERY_SUCCESSES )) || {
     echo "poll recovery metrics did not advance" >&2; return 1;
   }
@@ -791,34 +798,34 @@ scenario_inflight_withdrawal() {
   # counter cannot prove a still-delayed connection. The 60-second federation
   # delay leaves enough time to synchronize discovery before withdrawing the
   # peer.
-  fed_failure_before="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
+  fed_failure_before="$( metric_uint_value "$CONTEXT_A" "$JWT_A" \
     ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
   set_proxy "$FED_AB" false
   wait_for_metric_increase "federation poll failure boundary" 10 "$CONTEXT_A" "$JWT_A" \
     ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"" "$fed_failure_before"
-  fed_failure_after="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
+  fed_failure_after="$( metric_uint_value "$CONTEXT_A" "$JWT_A" \
     ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
-  fed_accepts_before="$(proxy_accepted_client_count "$FED_AB")"
+  fed_accepts_before="$( proxy_accepted_client_count "$FED_AB")"
   bounded_uint "$fed_accepts_before" "federation accepted-client baseline" >/dev/null
   add_latency "$FED_AB"
   fault_started=$SECONDS
   set_proxy "$FED_AB" true
   wait_for_proxy_accept "federation delayed poll connection" 10 "$FED_AB" "$fed_accepts_before"
 
-  disc_failure_before="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
+  disc_failure_before="$( metric_uint_value "$CONTEXT_A" "$JWT_A" \
     ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
   set_proxy "$DISC_AB" false
   wait_for_metric_increase "discovery poll failure boundary" 10 "$CONTEXT_A" "$JWT_A" \
     ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"" "$disc_failure_before"
-  disc_failure_after="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
+  disc_failure_after="$( metric_uint_value "$CONTEXT_A" "$JWT_A" \
     ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
-  disc_accepts_before="$(proxy_accepted_client_count "$DISC_AB")"
+  disc_accepts_before="$( proxy_accepted_client_count "$DISC_AB")"
   bounded_uint "$disc_accepts_before" "discovery accepted-client baseline" >/dev/null
   add_latency "$DISC_AB"
   set_proxy "$DISC_AB" true
   wait_for_proxy_accept "discovery delayed poll connection" 10 "$DISC_AB" "$disc_accepts_before"
-  fed_accepts_after="$(proxy_accepted_client_count "$FED_AB")"
-  disc_accepts_after="$(proxy_accepted_client_count "$DISC_AB")"
+  fed_accepts_after="$( proxy_accepted_client_count "$FED_AB")"
+  disc_accepts_after="$( proxy_accepted_client_count "$DISC_AB")"
   bounded_uint "$fed_accepts_after" "federation accepted-client observation" >/dev/null
   bounded_uint "$disc_accepts_after" "discovery accepted-client observation" >/dev/null
   (( fed_accepts_after > fed_accepts_before && disc_accepts_after > disc_accepts_before )) || {
@@ -830,7 +837,7 @@ scenario_inflight_withdrawal() {
     "$fed_accepts_before" "$fed_accepts_after" "$disc_accepts_before" "$disc_accepts_after" \
     > "$RESULTS_DIR/poller.withdrawal.inflight-observed.txt"
   local local_bundle
-  local_bundle="$(spire_bundle_b64der "$CONTEXT_A")"
+  local_bundle="$( spire_bundle_b64der "$CONTEXT_A")"
   apply_mesh_config "$CONTEXT_A" cluster-a "$TD_A" echo-a region-a "$local_bundle" ""
   signal_reload "$CONTEXT_A"
   wait_for_no_configured_state "withdrawn RemoteCluster accepted" 40 "$CONTEXT_A" "$JWT_A"
