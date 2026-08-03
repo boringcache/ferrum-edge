@@ -16,7 +16,7 @@ capabilities:
     owner: mesh
     exclusions:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
-      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery is Beta and remains excluded from this sidecar GA contract.
 
   - id: mesh.destination_rule.tcp_max_connections
     display_name: DestinationRule TCP max connections
@@ -40,7 +40,7 @@ capabilities:
     owner: mesh
     exclusions:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
-      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery is Beta and remains excluded from this sidecar GA contract.
 
   - id: mesh.virtual_service.cors_policy
     display_name: VirtualService HTTP CORS policy
@@ -63,7 +63,7 @@ capabilities:
     owner: mesh
     exclusions:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
-      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery is Beta and remains excluded from this sidecar GA contract.
 
   - id: mesh.peer_authentication.strict_mtls
     display_name: PeerAuthentication STRICT inbound mTLS
@@ -82,7 +82,7 @@ capabilities:
     owner: mesh
     exclusions:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
-      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery is Beta and remains excluded from this sidecar GA contract.
 
   - id: mesh.authorization_policy.allow_deny_enforcement
     display_name: AuthorizationPolicy ALLOW/DENY enforcement
@@ -106,7 +106,7 @@ capabilities:
     owner: mesh
     exclusions:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
-      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery is Beta and remains excluded from this sidecar GA contract.
 
   - id: mesh.identity.spire_svid_issuance
     display_name: SPIFFE identity plumbing (SPIRE Agent CA)
@@ -141,7 +141,7 @@ capabilities:
     owner: mesh
     exclusions:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
-      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery is Beta and remains excluded from this sidecar GA contract.
       - Internal self-signed CA (FERRUM_MESH_CA_BACKEND=internal) remains Dev-only and is excluded.
 
   - id: mesh.request_authentication.jwt_validation
@@ -162,7 +162,7 @@ capabilities:
     owner: mesh
     exclusions:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
-      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery is Beta and remains excluded from this sidecar GA contract.
 
   - id: mesh.config_transport.native_subscribe
     display_name: Native MeshSubscribe config transport
@@ -195,14 +195,14 @@ capabilities:
     owner: mesh
     exclusions:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
-      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery is Beta and remains excluded from this sidecar GA contract.
       - The xDS ADS transport is a separate surface and is not covered by this row.
       - The live fixture exercises the transport over in-cluster plaintext h2c with JWT auth (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true); CP-DP gRPC TLS is an orthogonal, documented deployment knob not exercised by this row.
 
   # ── Multicluster federation (issue #2459) ────────────────────────────────
   # Live-proven two-cluster SPIRE federation + east-west SNI datapath. Poller-
-  # driven cross-cluster endpoint discovery remains Experimental and is
-  # excluded from every row below.
+  # driven cross-cluster endpoint discovery is Beta and remains excluded from
+  # every GA row below.
 
   - id: mesh.multicluster.spire_trust_federation
     display_name: Multicluster SPIRE trust federation
@@ -224,8 +224,8 @@ capabilities:
     docs_anchor: docs/mesh.md#trust-federation
     owner: mesh
     exclusions:
-      - Cross-cluster endpoint discovery (poller-driven) remains Experimental.
-      - Network-partition / last-good retention live coverage remains deferred (#3331).
+      - Cross-cluster endpoint discovery (poller-driven) is Beta.
+      - Poller partition / last-good retention is covered by the separate Beta live gate.
 
   - id: mesh.multicluster.eastwest_authenticated_datapath
     display_name: Multicluster east-west authenticated datapath
@@ -247,7 +247,7 @@ capabilities:
     docs_anchor: docs/mesh.md#east-west-gateways
     owner: mesh
     exclusions:
-      - Cross-cluster endpoint discovery (poller-driven) remains Experimental.
+      - Cross-cluster endpoint discovery (poller-driven) is Beta.
       - Ambient cross-cluster gRPC remains fail-closed; this row covers Sidecar HTTP east-west.
 
   - id: mesh.multicluster.untrusted_peer_rejected
@@ -265,7 +265,7 @@ capabilities:
     docs_anchor: docs/mesh.md#authorization
     owner: mesh
     exclusions:
-      - Cross-cluster endpoint discovery (poller-driven) remains Experimental.
+      - Cross-cluster endpoint discovery (poller-driven) is Beta.
 
   - id: mesh.multicluster.trust_revocation_recovery
     display_name: Multicluster trust revocation and recovery
@@ -283,8 +283,8 @@ capabilities:
     docs_anchor: docs/mesh.md#trust-federation
     owner: mesh
     exclusions:
-      - Cross-cluster endpoint discovery (poller-driven) remains Experimental.
-      - Network-partition / last-good retention live coverage remains deferred (#3331).
+      - Cross-cluster endpoint discovery (poller-driven) is Beta.
+      - Poller partition / last-good retention is covered by the separate Beta live gate.
 
   - id: mesh.multicluster.endpoint_failure_recovery
     display_name: Multicluster destination endpoint failure and recovery
@@ -302,4 +302,4 @@ capabilities:
     docs_anchor: docs/mesh.md#multi-cluster
     owner: mesh
     exclusions:
-      - Cross-cluster endpoint discovery (poller-driven) remains Experimental.
+      - Cross-cluster endpoint discovery (poller-driven) is Beta.

@@ -8,8 +8,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MANIFESTS="$ROOT_DIR/tests/k8s/multicluster-poller-partition/manifests.yaml"
 RESULTS_DIR="${FERRUM_POLLER_RESULTS_DIR:-$ROOT_DIR/target/multicluster-poller-partition}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/.context/multicluster-poller-partition}"
-source "$ROOT_DIR/tests/k8s/lib/live_assertions.sh"
-source "$ROOT_DIR/tests/k8s/lib/spire.sh"
+source ./tests/k8s/lib/live_assertions.sh
+source ./tests/k8s/lib/spire.sh
 
 CLUSTER_A="${CLUSTER_A:-ferrum-poller-a}"
 CLUSTER_B="${CLUSTER_B:-ferrum-poller-b}"
@@ -377,7 +377,8 @@ traffic_not_found() {
 metric_value() {
   local context="$1" token="$2" metric="$3" selector="$4"
   metrics "$context" "$token" | awk -v metric="$metric" -v selector="$selector" '
-    index($0,metric "{")==1 && index($0,selector){print $NF; found=1; exit} END{if(!found) print 0}'
+    index($0,metric "{")==1 && index($0,selector) && !found {value=$NF; found=1}
+    END {print found ? value : 0}'
 }
 
 failure_counters_positive() {
