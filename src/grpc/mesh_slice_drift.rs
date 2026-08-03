@@ -636,11 +636,13 @@ impl MeshSliceDriftRegistry {
     }
 
     /// Number of identities in the latest immutable registry snapshot.
+    #[allow(dead_code)] // Public library API exercised by external test targets.
     pub fn len(&self) -> usize {
         self.snapshot.load().summary.tracked
     }
 
     /// Whether the latest immutable registry snapshot tracks no identities.
+    #[allow(dead_code)] // Public library API exercised by external test targets.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
