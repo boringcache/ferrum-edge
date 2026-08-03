@@ -111,7 +111,7 @@ pub enum CniOwnershipStoreError {
 }
 
 impl CniOwnershipStoreError {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Path => "cni ownership store path is invalid",
             Self::Symlink => "cni ownership store refuses symlinked durable state",
