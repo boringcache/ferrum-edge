@@ -7677,10 +7677,10 @@ fn namespace_coordination_lock_rejects_initial_non_files() {
     fs::create_dir_all(directory_root.join(".spool-quota.lock")).unwrap();
     let directory_error =
         match SpoolManager::for_tests(spool_settings(directory_temp.path(), 1024 * 1024), "node-a")
-    {
-        Ok(_) => panic!("a directory must never become the namespace coordination lock"),
-        Err(error) => error,
-    };
+        {
+            Ok(_) => panic!("a directory must never become the namespace coordination lock"),
+            Err(error) => error,
+        };
     assert!(
         directory_error.contains("securely open") || directory_error.contains("directory"),
         "unexpected initial directory refusal: {directory_error}"
@@ -7695,8 +7695,7 @@ fn namespace_coordination_lock_rejects_initial_non_files() {
     let lock_c = CString::new(lock.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(lock_c.as_ptr(), 0o600) }, 0);
 
-    let error = match SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a")
-    {
+    let error = match SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a") {
         Ok(_) => panic!("a FIFO must never become the namespace coordination lock"),
         Err(error) => error,
     };
