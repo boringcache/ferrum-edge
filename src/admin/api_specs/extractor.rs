@@ -3776,8 +3776,12 @@ struct RefComposition<'a, 'b> {
 /// Compose a Schema Object `$ref` with its adjacent keywords without letting an
 /// adjacent keyword overwrite a referenced assertion (GHSA-rf4j-rhmf-8whm).
 ///
-/// - Identifier and annotation keywords stay on the wrapper; they assert
-///   nothing, so keeping them in place preserves both meaning and `$id` scope.
+/// - A bare `$id` / `id` beside `$ref` only rebases that reference. After the
+///   target is materialized the identifier is dropped rather than wrapping the
+///   target in `allOf`, so referenced assertions stay at the schema root.
+/// - Other identifier and annotation keywords stay on the wrapper; they assert
+///   nothing, so keeping them in place preserves both meaning and `$id` scope
+///   when further URI-reference or annotation siblings remain.
 /// - OpenAPI 3.1+ (JSON Schema 2020-12): `$ref` is an applicator and adjacent
 ///   assertions are independent, so the pair becomes
 ///   `{<annotations>, allOf: [<referenced schema>, {<adjacent assertions>}]}`,
@@ -3842,6 +3846,21 @@ fn compose_schema_ref_siblings(
     }
 
     if wrapper_fields.is_empty() && assertions.is_empty() {
+        return Ok(resolved_target);
+    }
+
+    // A bare `$id` / `id` beside `$ref` only rebases that reference during
+    // resolution (2020-12 §8.2.1). Once the target is materialized there is no
+    // remaining URI-reference sibling that needs the wrapper resource identity,
+    // and wrapping the target in `allOf` solely to retain `$id` buries
+    // referenced assertions (for example `required`) under `allOf[0]` — which
+    // breaks the generated validator-config contract external-ref tests pin at
+    // the schema root. Annotation or assertion siblings still need the wrapper.
+    if assertions.is_empty()
+        && wrapper_fields
+            .keys()
+            .all(|key| matches!(key.as_str(), "$id" | "id"))
+    {
         return Ok(resolved_target);
     }
 

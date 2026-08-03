@@ -89,13 +89,18 @@ async fn load_production_http(
         allowed_origins: Vec::new(),
     };
     let policy = EffectiveExternalRefPolicy::compose(&process, Some(&extension))?;
-    let deadline = Instant::now() + process.total_timeout;
+    let total_timeout = process.total_timeout;
     let loader = DefaultExternalDocumentLoader {
         egress: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         dns_cache: None,
         fixtures: Default::default(),
     };
+    // Arm the total deadline at the blocking load boundary. Computing it before
+    // `spawn_blocking` schedules lets coverage-induced worker delay burn the
+    // budget before dial, so the client times out without ever reaching the
+    // live non-responding peer the fixture is meant to prove.
     tokio::task::spawn_blocking(move || {
+        let deadline = Instant::now() + total_timeout;
         let uri = Url::parse(&uri)
             .map_err(|_| ExtractError::SchemaReference("invalid test URI".to_string()))?;
         loader.load(&uri, &policy, deadline)
@@ -413,6 +418,10 @@ fn query_bearing_and_queryless_schema_resources_remain_distinct() {
 
 #[test]
 fn nested_relative_bases_resolve_against_containing_document() {
+    // Parent is retrieved from a deeper path than the Wrapper `$id`. The
+    // sibling `$ref` must join against that `$id` (…/nest/wrapper.json), not
+    // the retrieval URI (…/deep/nest/parent.json); otherwise `../leaf.json`
+    // would miss the loaded leaf document.
     let parent = br#"{
   "components": {
     "schemas": {
@@ -434,7 +443,7 @@ fn nested_relative_bases_resolve_against_containing_document() {
 }"#;
     let mut loader = MapExternalDocumentLoader::default();
     loader.docs.insert(
-        "https://schemas.example.com/nest/parent.json".to_string(),
+        "https://schemas.example.com/deep/nest/parent.json".to_string(),
         parent.to_vec(),
     );
     loader.docs.insert(
@@ -458,7 +467,7 @@ fn nested_relative_bases_resolve_against_containing_document() {
             "content": {{
               "application/json": {{
                 "schema": {{
-                  "$ref": "https://schemas.example.com/nest/parent.json#/components/schemas/Wrapper"
+                  "$ref": "https://schemas.example.com/deep/nest/parent.json#/components/schemas/Wrapper"
                 }}
               }}
             }}
