@@ -15926,9 +15926,7 @@ mod tests {
     #[test]
     fn sidecar_l4_source_selectors_materialize_from_local_workload_without_peer_spiffe() {
         let runtime = MeshRuntimeConfig {
-            workload_spiffe_id: Some(
-                "spiffe://cluster.local/ns/default/sa/client".to_string(),
-            ),
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
             ..test_mesh_runtime_config()
         };
         let slice = sidecar_l4_slice(BTreeMap::from([
@@ -15949,10 +15947,7 @@ mod tests {
         assert!(arm.source_labels.is_empty());
         assert!(arm.source_namespace.is_none());
         assert_eq!(arm.source_subnets, vec!["10.0.0.0/8".to_string()]);
-        assert_eq!(
-            arm.destination_subnets,
-            vec!["192.168.0.0/16".to_string()]
-        );
+        assert_eq!(arm.destination_subnets, vec!["192.168.0.0/16".to_string()]);
         assert_eq!(arm.gateways, vec!["mesh".to_string()]);
         assert!(l4[0].compiled_stream_match.is_some());
     }
@@ -15960,15 +15955,11 @@ mod tests {
     #[test]
     fn sidecar_l4_nonmatching_or_ambiguous_local_selectors_fall_through_in_order() {
         let runtime = MeshRuntimeConfig {
-            workload_spiffe_id: Some(
-                "spiffe://cluster.local/ns/default/sa/client".to_string(),
-            ),
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
             ..test_mesh_runtime_config()
         };
-        let nonmatching = sidecar_l4_slice(BTreeMap::from([(
-            "app".to_string(),
-            "other".to_string(),
-        )]));
+        let nonmatching =
+            sidecar_l4_slice(BTreeMap::from([("app".to_string(), "other".to_string())]));
         let prepared = gateway_config_from_mesh_slice(&nonmatching, &runtime, None, None)
             .expect("nonmatching selector falls through");
         let l4: Vec<_> = prepared
@@ -15979,12 +15970,10 @@ mod tests {
         assert_eq!(l4.len(), 1);
         assert_eq!(l4[0].id, "istio-vs-l4_tcp__default__db__1-0");
 
-        let mut namespace_mismatch = sidecar_l4_slice(BTreeMap::from([(
-            "app".to_string(),
-            "billing".to_string(),
-        )]));
-        namespace_mismatch.virtual_service_l4_proxies[0]["stream_match"]["arms"][0]
-            ["source_namespace"] = serde_json::json!("other");
+        let mut namespace_mismatch =
+            sidecar_l4_slice(BTreeMap::from([("app".to_string(), "billing".to_string())]));
+        namespace_mismatch.virtual_service_l4_proxies[0]["stream_match"]["arms"][0]["source_namespace"] =
+            serde_json::json!("other");
         let prepared = gateway_config_from_mesh_slice(&namespace_mismatch, &runtime, None, None)
             .expect("nonmatching namespace falls through");
         let l4: Vec<_> = prepared
@@ -16017,19 +16006,13 @@ mod tests {
     #[test]
     fn sidecar_l4_slice_update_and_delete_withdraw_local_selector_state() {
         let runtime = MeshRuntimeConfig {
-            workload_spiffe_id: Some(
-                "spiffe://cluster.local/ns/default/sa/client".to_string(),
-            ),
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
             ..test_mesh_runtime_config()
         };
-        let matching = sidecar_l4_slice(BTreeMap::from([(
-            "app".to_string(),
-            "billing".to_string(),
-        )]));
-        let mut updated = sidecar_l4_slice(BTreeMap::from([(
-            "app".to_string(),
-            "other".to_string(),
-        )]));
+        let matching =
+            sidecar_l4_slice(BTreeMap::from([("app".to_string(), "billing".to_string())]));
+        let mut updated =
+            sidecar_l4_slice(BTreeMap::from([("app".to_string(), "other".to_string())]));
         assert!(!matching.content_eq(&updated));
         let prepared = gateway_config_from_mesh_slice(&updated, &runtime, None, None)
             .expect("updated selector state prepares");
@@ -16056,15 +16039,10 @@ mod tests {
     fn non_sidecar_l4_source_selectors_remain_runtime_evidence_predicates() {
         let runtime = MeshRuntimeConfig {
             topology: MeshTopology::NodeWaypoint,
-            workload_spiffe_id: Some(
-                "spiffe://cluster.local/ns/default/sa/client".to_string(),
-            ),
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
             ..test_mesh_runtime_config()
         };
-        let slice = sidecar_l4_slice(BTreeMap::from([(
-            "app".to_string(),
-            "billing".to_string(),
-        )]));
+        let slice = sidecar_l4_slice(BTreeMap::from([("app".to_string(), "billing".to_string())]));
         let prepared = gateway_config_from_mesh_slice(&slice, &runtime, None, None)
             .expect("NodeWaypoint slice keeps runtime selectors");
         let first = prepared

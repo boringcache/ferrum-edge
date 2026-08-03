@@ -2820,11 +2820,7 @@ fn virtual_service_l4_candidate_count(object: &K8sObject) -> Result<usize, K8sTr
                             format!("VirtualService {kind}[].match must be an array"),
                         ));
                     };
-                    if matches.is_empty() {
-                        1
-                    } else {
-                        matches.len()
-                    }
+                    if matches.is_empty() { 1 } else { matches.len() }
                 }
                 None => 1,
             };
@@ -2889,10 +2885,9 @@ fn parse_l4_hosts(
                 ),
             ));
         }
-        let valid_virtual_service_scope = allow_global_wildcard
-            && (host == "*" || host.parse::<std::net::IpAddr>().is_ok());
-        if !valid_virtual_service_scope
-            && crate::config::types::validate_host_entry(host).is_err()
+        let valid_virtual_service_scope =
+            allow_global_wildcard && (host == "*" || host.parse::<std::net::IpAddr>().is_ok());
+        if !valid_virtual_service_scope && crate::config::types::validate_host_entry(host).is_err()
         {
             return Err(invalid_resource(
                 object,
@@ -2997,13 +2992,10 @@ fn l4_export_namespaces(
                 namespaces.insert(object.metadata.namespace.clone());
             }
             namespace => {
-                if crate::proxy::stream_match::validate_kubernetes_namespace(namespace).is_err()
-                {
+                if crate::proxy::stream_match::validate_kubernetes_namespace(namespace).is_err() {
                     return Err(invalid_resource(
                         object,
-                        format!(
-                            "VirtualService spec.exportTo[{index}] is not a valid namespace"
-                        ),
+                        format!("VirtualService spec.exportTo[{index}] is not a valid namespace"),
                     ));
                 }
                 namespaces.insert(namespace.to_string());
@@ -3136,12 +3128,8 @@ fn virtual_service_l4_proxies(
                 })?;
             for (mi, m) in matches.iter().enumerate() {
                 let stream_arm = parse_l4_match_arm(object, m, "tls", &vs_gateways)?;
-                let sni_hosts = parse_l4_hosts(
-                    object,
-                    m.get("sniHosts"),
-                    "tls[].match.sniHosts",
-                    false,
-                )?;
+                let sni_hosts =
+                    parse_l4_hosts(object, m.get("sniHosts"), "tls[].match.sniHosts", false)?;
                 for (index, sni_host) in sni_hosts.iter().enumerate() {
                     if !vs_hosts.iter().any(|vs_host| {
                         sni_host_is_subset_of_virtual_service_host(sni_host, vs_host)
@@ -10914,8 +10902,7 @@ extensionProviders:
         assert_eq!(proxies.len(), 1);
         assert_eq!(proxies[0].namespace, "consumer");
         assert_eq!(
-            proxies[0].backend_host,
-            "mysql.default.svc.cluster.local",
+            proxies[0].backend_host, "mysql.default.svc.cluster.local",
             "short destinations remain relative to the VirtualService namespace"
         );
     }

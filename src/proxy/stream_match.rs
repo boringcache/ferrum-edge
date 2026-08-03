@@ -296,8 +296,7 @@ pub fn resolve_shared_stream_proxy_in_epoch(
             return candidates.iter().find_map(|id| {
                 let proxy = epoch.proxy_by_namespaced_id(&id.namespace, &id.id)?;
                 let matcher = proxy.compiled_stream_match.as_ref()?;
-                (matcher.matches(evidence) && proxy_matches_sni(proxy, sni))
-                    .then(|| id.clone())
+                (matcher.matches(evidence) && proxy_matches_sni(proxy, sni)).then(|| id.clone())
             });
         }
         // Mirror SNI priority: exact, then wildcard, then catch-all — but only
@@ -365,9 +364,10 @@ fn proxy_matches_sni(proxy: &crate::config::types::Proxy, sni: Option<&str>) -> 
     let Some(hostname) = sni else {
         return false;
     };
-    proxy.hosts.iter().any(|host| {
-        host == hostname || crate::config::types::wildcard_matches(host, hostname)
-    })
+    proxy
+        .hosts
+        .iter()
+        .any(|host| host == hostname || crate::config::types::wildcard_matches(host, hostname))
 }
 
 fn has_configured_but_uncompiled_candidate(

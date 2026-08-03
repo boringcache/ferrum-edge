@@ -265,9 +265,7 @@ impl MeshSliceCarrier {
             }
             MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
             MeshSliceCarrier::LabelsAmbiguous(_) => FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL,
-            MeshSliceCarrier::VirtualServiceL4Proxies(_) => {
-                FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL
-            }
+            MeshSliceCarrier::VirtualServiceL4Proxies(_) => FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
             MeshSliceCarrier::VirtualServiceCorsPolicies(_) => {
                 FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL
