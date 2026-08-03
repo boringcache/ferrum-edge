@@ -214,6 +214,7 @@ impl HydraContainer {
         let client = self.client.clone();
         let stats = Arc::new(IntrospectionFacadeStats::default());
         let stats_accept = Arc::clone(&stats);
+        let facade_origin_accept = facade_origin.clone();
 
         tokio::spawn(async move {
             loop {
@@ -223,7 +224,7 @@ impl HydraContainer {
                 let client = client.clone();
                 let admin_introspect = admin_introspect.clone();
                 let public_discovery = public_discovery.clone();
-                let facade_origin = facade_origin.clone();
+                let facade_origin = facade_origin_accept.clone();
                 let stats = Arc::clone(&stats_accept);
                 tokio::spawn(async move {
                     let _ = handle_introspection_facade_connection(
