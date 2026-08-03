@@ -290,13 +290,13 @@ async fn test_reconcile_starts_single_hosted_passthrough_as_sni_listener() {
 }
 
 #[tokio::test]
-async fn shared_l4_catchall_is_grouped_and_resolves_after_constrained_candidate() {
+async fn shared_l4_catchall_is_grouped_and_preserves_declaration_order() {
     let frontend_port = ephemeral_port().await;
     let constrained_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let catchall_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 
-    // Put the catch-all first deliberately. Runtime planning must still group
-    // it on the shared socket and place it after constrained candidates.
+    // Put the catch-all first deliberately. Runtime planning must group it on
+    // the shared socket without changing VirtualService first-match order.
     let mut catchall = create_stream_proxy("catchall", BackendScheme::Tcp, frontend_port);
     catchall.backend_port = catchall_backend.local_addr().unwrap().port();
     let mut constrained = create_stream_proxy("constrained", BackendScheme::Tcp, frontend_port);
@@ -335,7 +335,7 @@ async fn shared_l4_catchall_is_grouped_and_resolves_after_constrained_candidate(
     })
     .await
     .unwrap();
-    assert_eq!(selected, "constrained");
+    assert_eq!(selected, "catchall");
     manager.shutdown_all().await;
 }
 

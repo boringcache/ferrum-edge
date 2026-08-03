@@ -843,6 +843,22 @@ fn test_passthrough_port_sharing_overlapping_hosts_rejected() {
 }
 
 #[test]
+fn test_passthrough_overlapping_hosts_with_l4_match_preserve_order() {
+    let mut first = make_stream_proxy("pt-first", BackendScheme::Tcp, 8444);
+    first.passthrough = true;
+    first.hosts = vec!["*.example.com".to_string()];
+    add_stream_match(&mut first);
+
+    let mut second = make_stream_proxy("pt-second", BackendScheme::Tcp, 8444);
+    second.passthrough = true;
+    second.hosts = vec!["secure.example.com".to_string()];
+    add_stream_match(&mut second);
+
+    let config = test_config(vec![first, second]);
+    assert!(config.validate_stream_proxies().is_ok());
+}
+
+#[test]
 fn test_passthrough_port_sharing_mixed_stream_proxy_protocol_rejected() {
     // The PROXY header is parsed before the TLS ClientHello, so SNI-based
     // proxy resolution cannot vary the decision per proxy: every proxy

@@ -10282,8 +10282,8 @@ fn row_to_proxy_inner(
             .map(|v| v != 0),
         stream_match: match optional_utf8_text_column(row, "stream_match")? {
             Some(s) => Some(
-                serde_json::from_str::<StreamMatchCriteria>(&s).map_err(|e| {
-                    anyhow::anyhow!("Proxy {}: failed to parse stream_match JSON: {}", pid, e)
+                serde_json::from_str::<StreamMatchCriteria>(&s).map_err(|_| {
+                    anyhow::anyhow!("Proxy {}: failed to parse stream_match JSON", pid)
                 })?,
             ),
             None => None,

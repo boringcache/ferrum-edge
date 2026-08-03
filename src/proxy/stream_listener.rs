@@ -1420,17 +1420,14 @@ impl StreamListenerManager {
             ids.sort_by(|a, b| {
                 let a_entry = desired.get(a);
                 let b_entry = desired.get(b);
-                // A validated unconstrained candidate is the fallback and
-                // must never shadow a constrained arm, regardless of config
-                // or hash-map iteration order.
+                // VirtualService tcp[] rules are evaluated in declaration
+                // order. An unconstrained rule is normally authored last, but
+                // if it is authored first it intentionally shadows later
+                // rules; silently moving it behind constrained candidates
+                // changes Istio's first-match semantics.
                 a_entry
-                    .map(|entry| !entry.has_stream_match)
-                    .cmp(&b_entry.map(|entry| !entry.has_stream_match))
-                    .then_with(|| {
-                        a_entry
-                            .map(|entry| entry.declaration_order)
-                            .cmp(&b_entry.map(|entry| entry.declaration_order))
-                    })
+                    .map(|entry| entry.declaration_order)
+                    .cmp(&b_entry.map(|entry| entry.declaration_order))
                     .then_with(|| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)))
             });
         }

@@ -7644,9 +7644,10 @@ components:
           items:
             $ref: "#/components/schemas/StreamMatchArm"
           description: |
-            OR-ordered match arms. Declaration order is semantic; constrained
-            candidates are evaluated before an unconstrained proxy sharing the
-            listener. Empty means no additional L4 matcher.
+            OR-ordered match arms. Declaration order is semantic both within
+            this list and across proxies sharing a stream listener; an earlier
+            unconstrained candidate shadows later candidates. Empty means no
+            additional L4 matcher.
 
     StreamMatchArm:
       type: object

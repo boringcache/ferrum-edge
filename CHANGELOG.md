@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact pod/IP or identical-label replica set. AND semantics apply within one
   match arm; OR across match candidates on a shared listen port. Missing
   identity, label, subnet, or gateway evidence denies the requiring predicate;
+  candidates retain VirtualService declaration order, including an explicitly
+  earlier catch-all that shadows later rules;
   malformed label keys/values, namespaces, gateway names, and CIDRs fail closed
   at translation with field-specific `FerrumAccepted=False`/`Invalid`
   diagnostics. Istio

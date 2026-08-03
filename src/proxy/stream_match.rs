@@ -176,7 +176,8 @@ fn compile_cidr_list(entries: &[String], field: &str) -> Result<CidrSet, String>
             ));
         }
     }
-    CidrSet::parse_strict(&entries.join(",")).map_err(|e| format!("{field}: {e}"))
+    CidrSet::parse_strict(&entries.join(","))
+        .map_err(|_| format!("{field} contains an invalid CIDR or IP entry"))
 }
 
 /// Hot-path matcher compiled at config load / normalize time.
@@ -267,6 +268,30 @@ pub fn resolve_shared_stream_proxy_in_epoch(
         if has_configured_but_uncompiled_candidate(candidates, epoch) {
             return None;
         }
+        // VirtualService TLS candidates always carry a non-empty matcher (at
+        // minimum their effective gateway selector). For those candidates the
+        // route list itself is ordered: the first rule whose SNI AND L4
+        // predicates match wins. Generic passthrough proxies without an L4
+        // matcher retain Ferrum's historical exact > wildcard > catch-all SNI
+        // tiers below.
+        let ordered_l4_candidates = candidates.iter().all(|id| {
+            epoch
+                .proxy_by_namespaced_id(&id.namespace, &id.id)
+                .is_some_and(|proxy| {
+                    proxy
+                        .stream_match
+                        .as_ref()
+                        .is_some_and(|criteria| !criteria.is_empty())
+                })
+        });
+        if ordered_l4_candidates {
+            return candidates.iter().find_map(|id| {
+                let proxy = epoch.proxy_by_namespaced_id(&id.namespace, &id.id)?;
+                let matcher = proxy.compiled_stream_match.as_ref()?;
+                (matcher.matches(evidence) && proxy_matches_sni(proxy, sni))
+                    .then(|| id.clone())
+            });
+        }
         // Mirror SNI priority: exact, then wildcard, then catch-all — but only
         // among candidates that also satisfy stream_match.
         let mut exact: Option<crate::config::db_backend::NamespacedResourceId> = None;
@@ -322,6 +347,19 @@ pub fn resolve_shared_stream_proxy_in_epoch(
     } else {
         resolve_proxy_by_stream_match_in_epoch(candidates, evidence, epoch)
     }
+}
+
+#[inline]
+fn proxy_matches_sni(proxy: &crate::config::types::Proxy, sni: Option<&str>) -> bool {
+    if proxy.hosts.is_empty() {
+        return true;
+    }
+    let Some(hostname) = sni else {
+        return false;
+    };
+    proxy.hosts.iter().any(|host| {
+        host == hostname || crate::config::types::wildcard_matches(host, hostname)
+    })
 }
 
 fn has_configured_but_uncompiled_candidate(
@@ -666,9 +704,20 @@ fn valid_kubernetes_label_name(value: &str) -> bool {
 
 /// Extract the source namespace from a peer SPIFFE ID string when present.
 pub fn source_namespace_from_spiffe(spiffe: &str) -> Option<String> {
-    SpiffeId::new(spiffe)
-        .ok()
-        .and_then(|id| id.namespace().map(str::to_owned))
+    let id = SpiffeId::new(spiffe).ok()?;
+    let mut segments = id.path_segments();
+    let namespace = match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some("ns"), Some(namespace), Some("sa"), Some(_service_account), None) => namespace,
+        _ => return None,
+    };
+    validate_kubernetes_namespace(namespace).ok()?;
+    Some(namespace.to_owned())
 }
 
 #[cfg(test)]

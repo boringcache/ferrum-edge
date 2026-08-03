@@ -23,11 +23,15 @@ fn workload(
     .unwrap()
 }
 
-fn passthrough_proxy(id: &str, criteria: StreamMatchCriteria) -> ferrum_edge::config::types::Proxy {
+fn passthrough_proxy_with_hosts(
+    id: &str,
+    hosts: &[&str],
+    criteria: StreamMatchCriteria,
+) -> ferrum_edge::config::types::Proxy {
     let mut proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(serde_json::json!({
         "id": id,
         "namespace": "default",
-        "hosts": ["secure.example.com"],
+        "hosts": hosts,
         "backend_scheme": "tcp",
         "backend_host": "127.0.0.1",
         "backend_port": 9443,
@@ -38,6 +42,10 @@ fn passthrough_proxy(id: &str, criteria: StreamMatchCriteria) -> ferrum_edge::co
     .unwrap();
     proxy.normalize_fields();
     proxy
+}
+
+fn passthrough_proxy(id: &str, criteria: StreamMatchCriteria) -> ferrum_edge::config::types::Proxy {
+    passthrough_proxy_with_hosts(id, &["secure.example.com"], criteria)
 }
 
 fn epoch_for(
@@ -247,6 +255,59 @@ fn passthrough_same_sni_uses_semantic_candidate_order_with_double_digits() {
     )
     .unwrap();
     assert_eq!(selected.id, "route-match-2");
+}
+
+#[test]
+fn virtual_service_tls_order_precedes_generic_sni_specificity() {
+    use ferrum_edge::config::db_backend::NamespacedResourceId;
+
+    let criteria = || StreamMatchCriteria {
+        arms: vec![StreamMatchArm {
+            gateways: vec!["mesh".to_string()],
+            ..Default::default()
+        }],
+    };
+    let epoch_store = epoch_for(vec![
+        passthrough_proxy_with_hosts("earlier-wildcard", &["*.example.com"], criteria()),
+        passthrough_proxy_with_hosts("later-exact", &["secure.example.com"], criteria()),
+    ]);
+    let epoch = epoch_store.load();
+    let candidates = vec![
+        NamespacedResourceId::new("default".to_string(), "earlier-wildcard".to_string()),
+        NamespacedResourceId::new("default".to_string(), "later-exact".to_string()),
+    ];
+    let selected = resolve_shared_stream_proxy_in_epoch(
+        Some("secure.example.com"),
+        &candidates,
+        &StreamMatchEvidence {
+            trusted_gateway_ref: Some("mesh"),
+            ..Default::default()
+        },
+        &epoch,
+        true,
+    )
+    .unwrap();
+    assert_eq!(selected.id, "earlier-wildcard");
+}
+
+#[test]
+fn source_namespace_requires_canonical_unambiguous_istio_spiffe_path() {
+    assert_eq!(
+        source_namespace_from_spiffe("spiffe://cluster.local/ns/prod/sa/client").as_deref(),
+        Some("prod")
+    );
+    assert_eq!(
+        source_namespace_from_spiffe("spiffe://cluster.local/prefix/ns/prod/sa/client"),
+        None
+    );
+    assert_eq!(
+        source_namespace_from_spiffe("spiffe://cluster.local/ns/prod/ns/other/sa/client"),
+        None
+    );
+    assert_eq!(
+        source_namespace_from_spiffe("spiffe://cluster.local/ns/prod/workload/client"),
+        None
+    );
 }
 
 #[test]

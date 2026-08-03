@@ -5081,8 +5081,11 @@ impl GatewayConfig {
             }
 
             // Passthrough SNI groups: at most one empty-hosts catch-all, and
-            // host overlap is forbidden unless the overlapping proxies carry
-            // distinct non-empty stream_match criteria (SNI + L4 AND).
+            // host overlap is forbidden unless both overlapping proxies carry
+            // non-empty stream_match criteria (SNI + L4 AND). In that ordered
+            // route form, equal criteria are valid too: Istio keeps the later
+            // duplicate as an ineffective rule rather than rejecting the
+            // VirtualService, and declaration order resolves it safely.
             let catch_all_count = proxies_on_port
                 .iter()
                 .filter(|p| p.hosts.is_empty())
@@ -5101,13 +5104,14 @@ impl GatewayConfig {
                     }
                     let a_match = a.stream_match.as_ref().filter(|m| !m.is_empty());
                     let b_match = b.stream_match.as_ref().filter(|m| !m.is_empty());
-                    if a_match.is_some() && b_match.is_some() && a_match != b_match {
-                        // Distinct L4 predicates discriminate the same SNI.
+                    if a_match.is_some() && b_match.is_some() {
+                        // Ordered L4 predicates (equal or distinct) make the
+                        // first matching SNI candidate deterministic.
                         continue;
                     }
                     errors.push(format!(
                         "Passthrough proxies '{}' and '{}' on port {} have overlapping hosts — \
-                         each SNI hostname must route to exactly one proxy (or distinct stream_match criteria)",
+                         each SNI hostname must route to exactly one matcher-free proxy (or ordered stream_match criteria)",
                         a.id, b.id, port
                     ));
                 }

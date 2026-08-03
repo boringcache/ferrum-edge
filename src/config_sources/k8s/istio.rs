@@ -2625,10 +2625,10 @@ fn parse_l4_cidr_list(
                 ),
             ));
         }
-        crate::util::cidr::CidrSet::parse_strict(raw).map_err(|e| {
+        crate::util::cidr::CidrSet::parse_strict(raw).map_err(|_| {
             invalid_resource(
                 object,
-                format!("VirtualService {kind}[] match.{field}[{i}]: {e}"),
+                format!("VirtualService {kind}[] match.{field}[{i}] is not a valid CIDR or IP"),
             )
         })?;
         out.push(raw.to_string());
@@ -2775,6 +2775,163 @@ fn parse_l4_virtual_service_gateways(object: &K8sObject) -> Result<Vec<String>, 
     Ok(gateways)
 }
 
+/// Count every materialized L4 match candidate before allocating proxies or
+/// compiling matchers. A VirtualService route list is ordered as one semantic
+/// unit, so the serialized matcher-arm bound also caps the number of generated
+/// candidates an untrusted CRD can place on shared listeners.
+fn virtual_service_l4_candidate_count(object: &K8sObject) -> Result<usize, K8sTranslateError> {
+    let mut total = 0usize;
+    for kind in ["tls", "tcp"] {
+        let Some(value) = object.spec.get(kind) else {
+            continue;
+        };
+        let Some(blocks) = value.as_array() else {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService spec.{kind} must be an array"),
+            ));
+        };
+        for block in blocks {
+            let count = match block.get("match") {
+                Some(matches) => {
+                    let Some(matches) = matches.as_array() else {
+                        return Err(invalid_resource(
+                            object,
+                            format!("VirtualService {kind}[].match must be an array"),
+                        ));
+                    };
+                    if matches.is_empty() {
+                        1
+                    } else {
+                        matches.len()
+                    }
+                }
+                None => 1,
+            };
+            total = total.checked_add(count).ok_or_else(|| {
+                invalid_resource(object, "VirtualService L4 match candidate count overflow")
+            })?;
+            if total > crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService tcp[]/tls[] may contain at most {} total match candidates",
+                        crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn parse_l4_hosts(
+    object: &K8sObject,
+    value: Option<&Value>,
+    field: &str,
+    allow_global_wildcard: bool,
+) -> Result<Vec<String>, K8sTranslateError> {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return Err(invalid_resource(
+            object,
+            format!("VirtualService {field} must be a non-empty array of hostnames"),
+        ));
+    };
+    if entries.is_empty() {
+        return Err(invalid_resource(
+            object,
+            format!("VirtualService {field} must not be empty"),
+        ));
+    }
+    if entries.len() > crate::config::types::MAX_HOSTS_PER_PROXY {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService {field} must contain at most {} entries",
+                crate::config::types::MAX_HOSTS_PER_PROXY
+            ),
+        ));
+    }
+    let mut hosts = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(host) = entry.as_str() else {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {field}[{index}] must be a string"),
+            ));
+        };
+        if host.len() > crate::config::types::MAX_HOST_LENGTH {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {field}[{index}] must be at most {} characters",
+                    crate::config::types::MAX_HOST_LENGTH
+                ),
+            ));
+        }
+        let valid_virtual_service_scope = allow_global_wildcard
+            && (host == "*" || host.parse::<std::net::IpAddr>().is_ok());
+        if !valid_virtual_service_scope
+            && crate::config::types::validate_host_entry(host).is_err()
+        {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {field}[{index}] is not a valid hostname"),
+            ));
+        }
+        hosts.push(host.to_string());
+    }
+    Ok(hosts)
+}
+
+fn sni_host_is_subset_of_virtual_service_host(sni_host: &str, vs_host: &str) -> bool {
+    if vs_host == "*" || sni_host == vs_host {
+        return true;
+    }
+    match (sni_host.strip_prefix("*."), vs_host.strip_prefix("*.")) {
+        (None, Some(vs_suffix)) => {
+            sni_host == vs_suffix || sni_host.ends_with(&format!(".{vs_suffix}"))
+        }
+        (Some(sni_suffix), Some(vs_suffix)) => {
+            sni_suffix == vs_suffix || sni_suffix.ends_with(&format!(".{vs_suffix}"))
+        }
+        _ => false,
+    }
+}
+
+fn expand_istio_sni_hosts(
+    object: &K8sObject,
+    sni_hosts: Vec<String>,
+) -> Result<Vec<String>, K8sTranslateError> {
+    let expanded_len = sni_hosts
+        .iter()
+        .try_fold(0usize, |count, host| {
+            count.checked_add(1 + usize::from(host.starts_with("*.")))
+        })
+        .ok_or_else(|| invalid_resource(object, "VirtualService SNI host count overflow"))?;
+    if expanded_len > crate::config::types::MAX_HOSTS_PER_PROXY {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService tls[].match.sniHosts expands to more than {} runtime entries",
+                crate::config::types::MAX_HOSTS_PER_PROXY
+            ),
+        ));
+    }
+    let mut expanded = Vec::with_capacity(expanded_len);
+    for host in sni_hosts {
+        if let Some(suffix) = host.strip_prefix("*.") {
+            // Istio's TLS wildcard includes the suffix apex, whereas Ferrum's
+            // generic stream wildcard intentionally does not. Carry the apex
+            // explicitly so VirtualService semantics remain exact without
+            // changing hand-authored passthrough routing.
+            expanded.push(suffix.to_string());
+        }
+        expanded.push(host);
+    }
+    Ok(expanded)
+}
+
 /// Translate VirtualService L4 routes into Ferrum stream proxies, reusing the
 /// same stream + SNI machinery as gateway / east-west passthrough:
 ///   - `spec.tls[]` → a **passthrough** TCP proxy keyed by SNI (`hosts =
@@ -2794,21 +2951,13 @@ fn virtual_service_l4_proxies(
 ) -> Result<Vec<Proxy>, K8sTranslateError> {
     let namespace = &object.metadata.namespace;
     let vs_name = &object.metadata.name;
-    let has_l4_routes = object
-        .spec
-        .get("tls")
-        .and_then(Value::as_array)
-        .is_some_and(|routes| !routes.is_empty())
-        || object
-            .spec
-            .get("tcp")
-            .and_then(Value::as_array)
-            .is_some_and(|routes| !routes.is_empty());
-    if !has_l4_routes {
+    let candidate_count = virtual_service_l4_candidate_count(object)?;
+    if candidate_count == 0 {
         return Ok(Vec::new());
     }
+    let vs_hosts = parse_l4_hosts(object, object.spec.get("hosts"), "spec.hosts", true)?;
     let vs_gateways = parse_l4_virtual_service_gateways(object)?;
-    let mut proxies = Vec::new();
+    let mut proxies = Vec::with_capacity(candidate_count);
 
     if let Some(blocks) = object.spec.get("tls").and_then(Value::as_array) {
         for (bi, block) in blocks.iter().enumerate() {
@@ -2825,13 +2974,25 @@ fn virtual_service_l4_proxies(
                 })?;
             for (mi, m) in matches.iter().enumerate() {
                 let stream_arm = parse_l4_match_arm(object, m, "tls", &vs_gateways)?;
-                let sni_hosts = string_array(m, "sniHosts");
-                if sni_hosts.is_empty() {
-                    return Err(invalid_resource(
-                        object,
-                        "VirtualService tls[] match requires sniHosts for SNI routing",
-                    ));
+                let sni_hosts = parse_l4_hosts(
+                    object,
+                    m.get("sniHosts"),
+                    "tls[].match.sniHosts",
+                    false,
+                )?;
+                for (index, sni_host) in sni_hosts.iter().enumerate() {
+                    if !vs_hosts.iter().any(|vs_host| {
+                        sni_host_is_subset_of_virtual_service_host(sni_host, vs_host)
+                    }) {
+                        return Err(invalid_resource(
+                            object,
+                            format!(
+                                "VirtualService tls[].match.sniHosts[{index}] must be a subset of spec.hosts"
+                            ),
+                        ));
+                    }
                 }
+                let sni_hosts = expand_istio_sni_hosts(object, sni_hosts)?;
                 let listen_port = optional_port_field(object, m.get("port"), "tls[].match.port")?
                     .unwrap_or(backend_port);
                 let mut proxy = super::proxy_for_route(super::RouteProxySpec {
@@ -10391,6 +10552,10 @@ extensionProviders:
         )
         .expect_err("bad CIDR must fail closed");
         assert!(format!("{err}").contains("sourceSubnets"), "got {err}");
+        assert!(
+            !format!("{err}").contains("999.0.0.0"),
+            "diagnostic must not echo the rejected operand: {err}"
+        );
     }
 
     #[test]
@@ -10466,6 +10631,82 @@ extensionProviders:
         assert_eq!(proxy.hosts, vec!["secure.example.com".to_string()]);
         assert_eq!(proxy.backend_host, "backend.default.svc.cluster.local");
         assert_eq!(proxy.backend_port, 443);
+    }
+
+    #[test]
+    fn virtual_service_tls_sni_hosts_must_be_subset_of_virtual_service_hosts() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["*.example.com"],
+                    "tls": [{
+                        "match": [{"sniHosts": ["secure.other.test"]}],
+                        "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 443}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("out-of-scope SNI must not widen the VirtualService host binding");
+        assert!(
+            format!("{err}").contains("must be a subset of spec.hosts"),
+            "got {err}"
+        );
+
+        let translated = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["*.example.com"],
+                    "tls": [{
+                        "match": [{"sniHosts": ["*.internal.example.com"]}],
+                        "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 443}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("a narrower wildcard SNI is within the VirtualService host");
+        let proxy = translated
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.listen_port == Some(443))
+            .expect("TLS proxy");
+        assert_eq!(
+            proxy.hosts,
+            vec![
+                "internal.example.com".to_string(),
+                "*.internal.example.com".to_string()
+            ],
+            "Istio wildcard SNI includes its suffix apex"
+        );
+    }
+
+    #[test]
+    fn virtual_service_l4_total_candidate_bound_is_checked_before_materialization() {
+        let matches = (0..=crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS)
+            .map(|_| serde_json::json!({"port": 3306}))
+            .collect::<Vec<_>>();
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "tcp": [{
+                        "match": matches,
+                        "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("an unbounded shared-listener candidate list must fail closed");
+        assert!(
+            format!("{err}").contains("at most 64 total match candidates"),
+            "got {err}"
+        );
     }
 
     #[test]

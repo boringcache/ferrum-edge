@@ -2526,8 +2526,7 @@ async fn handle_tcp_connection_inner(
             .ok_or_else(|| {
                 if shared_port_uses_sni {
                     anyhow::anyhow!(
-                        "No matching passthrough proxy for SNI {:?} on port {}",
-                        shared_port_sni,
+                        "No matching passthrough proxy for connection on port {}",
                         stream_ctx.listen_port
                     )
                 } else {
