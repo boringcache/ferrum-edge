@@ -41,8 +41,9 @@ Accept-to-first-byte observability follows the same generation boundary. The
 node-agent attaches SK_SKB stream parser/verdict programs to a bounded
 accepted-socket SOCKHASH and keeps timestamp/phase evidence in a 65,536-entry
 LRU map. First data deletes the correlation state and emits the socket cookie;
-the mesh-proxy ringbuf consumer then removes the SOCKHASH entry after the
-parser/verdict callback has returned. Terminal close deletes state and the
+the mesh-proxy ringbuf consumer then queues the SOCKHASH entry for removal after
+a bounded 250 ms parser/verdict grace period. That userspace queue is also
+capped at 65,536 entries. Terminal close deletes state and the
 kernel unlinks the closed socket from the SOCKHASH. If the ringbuf is full, the
 pass-only hook remains until close rather than risking callback-lock recursion.
 Failed handoff deletes state immediately.

@@ -111,10 +111,10 @@ CI today."
 - **Experimental.** `NodeWaypoint` sidecarless capture (IPv4 and IPv6 capture
   paths gated by a privileged live job; secured node-to-node transport,
   production SPIRE, stale source-IP reuse, and inbound direct-pod enforcement
-  are live-gated; the same job proves bounded-cardinality captured TCP
-  accept-to-first-application-byte latency for IPv4/IPv6, including delayed
-  data, close-before-data, and reused client tuples; the production identity
-  profile now covers Workload API SVID
+  are live-gated; the job verifier-loads and attaches the IPv4/IPv6 captured-TCP
+  first-byte hooks while the hosted Rust suites cover timestamp rejection,
+  lifecycle bounds, ABI decoding, and the Prometheus histogram contract; the
+  production identity profile now covers Workload API SVID
   issuance, plaintext/no-client-SVID HBONE rejection, forged assertor rejection,
   SPIRE Agent plus NodeWaypoint restart recovery; the ADR observability
   counter-movement assertion IDs

@@ -7,11 +7,13 @@
 
 use ferrum_ebpf_common::{
     ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES, ACCEPT_FIRST_BYTE_MAX_DELTA_NS,
-    ACCEPT_FIRST_BYTE_PHASE_CONFIRMED, ACCEPT_FIRST_BYTE_PHASE_PENDING, AcceptFirstByteState,
-    SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT, SOCK_OPS_DROP_BYPASS_UID_HIT,
-    SOCK_OPS_DROP_EXCLUDE_CIDR_HIT, SOCK_OPS_DROP_EXCLUDE_PORT_HIT,
-    SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR, SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY,
-    SOCK_OPS_EVENT_DROP_REASON, SOCK_OPS_EVENT_RST, SockOpsRecord, accept_to_first_byte_us,
+    ACCEPT_FIRST_BYTE_PHASE_CONFIRMED, ACCEPT_FIRST_BYTE_PHASE_ENROLLING,
+    ACCEPT_FIRST_BYTE_PHASE_ENROLLING_CONFIRMED, ACCEPT_FIRST_BYTE_PHASE_PENDING,
+    AcceptFirstByteState, SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT,
+    SOCK_OPS_DROP_BYPASS_UID_HIT, SOCK_OPS_DROP_EXCLUDE_CIDR_HIT,
+    SOCK_OPS_DROP_EXCLUDE_PORT_HIT, SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR,
+    SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY, SOCK_OPS_EVENT_DROP_REASON, SOCK_OPS_EVENT_RST,
+    SockOpsRecord, accept_to_first_byte_us,
 };
 use ferrum_edge::ebpf::bpf_metrics::{
     BPF_LATENCY_BUCKET_BOUNDS_US, BPF_LATENCY_BUCKET_LE_LABELS, BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT,
@@ -144,7 +146,10 @@ fn abi_drop_reason_and_rst_decode_contract() {
 
 #[test]
 fn accept_first_byte_timestamp_and_phase_contract_rejects_false_evidence() {
-    assert_eq!(AcceptFirstByteState::pending(10).phase, ACCEPT_FIRST_BYTE_PHASE_PENDING);
+    assert_eq!(
+        AcceptFirstByteState::pending(10).phase,
+        ACCEPT_FIRST_BYTE_PHASE_PENDING
+    );
     assert_eq!(
         AcceptFirstByteState::confirmed(10).phase,
         ACCEPT_FIRST_BYTE_PHASE_CONFIRMED
@@ -172,6 +177,30 @@ fn accept_first_byte_timestamp_and_phase_contract_rejects_false_evidence() {
 #[test]
 fn accept_first_byte_lifecycle_is_bounded_and_terminal() {
     assert_eq!(ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES, 65_536);
+
+    let enrolling = AcceptFirstByteState::enrolling(123);
+    assert_eq!(enrolling.phase, ACCEPT_FIRST_BYTE_PHASE_ENROLLING);
+    assert!(!enrolling.is_confirmed());
+    let enrolling_confirmed = enrolling
+        .confirm()
+        .expect("capture proof is retained during enrollment");
+    assert_eq!(
+        enrolling_confirmed.phase,
+        ACCEPT_FIRST_BYTE_PHASE_ENROLLING_CONFIRMED
+    );
+    assert!(!enrolling_confirmed.is_confirmed());
+    assert_eq!(
+        enrolling_confirmed.arm_after_enrollment(false),
+        Some(AcceptFirstByteState::confirmed(123))
+    );
+    assert_eq!(
+        enrolling.arm_after_enrollment(false),
+        Some(AcceptFirstByteState::pending(123))
+    );
+    assert_eq!(
+        enrolling.arm_after_enrollment(true),
+        Some(AcceptFirstByteState::confirmed(123))
+    );
 
     let pending = AcceptFirstByteState::pending(123);
     let confirmed = pending.confirm().expect("pending state confirms");
@@ -258,8 +287,7 @@ fn accept_first_byte_count_and_bucket_saturate_without_wrap() {
     assert_eq!(snap.accept_to_first_byte_us_sum, 0);
 
     let bucket_saturated = BpfMetricsState::new();
-    bucket_saturated.accept_to_first_byte_bucket_exclusive[0]
-        .store(u64::MAX, Ordering::Relaxed);
+    bucket_saturated.accept_to_first_byte_bucket_exclusive[0].store(u64::MAX, Ordering::Relaxed);
     bucket_saturated.record_accept_to_first_byte(100);
     let snap = bucket_saturated.snapshot();
     assert_eq!(snap.accept_to_first_byte_count, 0);

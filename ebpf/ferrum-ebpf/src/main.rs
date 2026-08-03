@@ -22,9 +22,9 @@
 
 mod connect4;
 mod connect6;
+mod first_byte;
 mod getpeername4;
 mod getpeername6;
-mod first_byte;
 mod maps;
 mod sock_ops;
 mod sock_ops_emit;

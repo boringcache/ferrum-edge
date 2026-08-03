@@ -113,12 +113,10 @@ impl SockOpsEvent {
                 srtt_us: record.value,
             }),
             SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY => Some(Self::SynToAckLatency { us: record.value }),
-            SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY => {
-                Some(Self::AcceptToFirstByteLatency {
-                    us: record.value,
-                    socket_cookie: record.accepted_socket_cookie(),
-                })
-            }
+            SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY => Some(Self::AcceptToFirstByteLatency {
+                us: record.value,
+                socket_cookie: record.accepted_socket_cookie(),
+            }),
             SOCK_OPS_EVENT_DROP_REASON => Some(Self::DropReason(drop_reason?)),
             _ => None,
         }
@@ -287,7 +285,9 @@ pub mod production {
     use std::time::{Duration, Instant};
 
     use aya::maps::{Map, MapData, PerCpuArray, RingBuf, SockHash};
-    use ferrum_ebpf_common::{SOCK_OPS_STATS_EVENTS_DROPPED, SockOpsRecord};
+    use ferrum_ebpf_common::{
+        ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES, SOCK_OPS_STATS_EVENTS_DROPPED, SockOpsRecord,
+    };
     use tokio::io::Interest;
     use tokio::io::unix::AsyncFd;
     use tracing::{debug, info, warn};
@@ -304,6 +304,7 @@ pub mod production {
     static MALFORMED_SOCK_OPS_RECORD_WARNED: AtomicBool = AtomicBool::new(false);
     const FIRST_BYTE_HOOK_REMOVAL_GRACE: Duration = Duration::from_millis(250);
     const FIRST_BYTE_HOOK_CLEANUP_INTERVAL: Duration = Duration::from_millis(50);
+    const FIRST_BYTE_HOOK_REMOVAL_QUEUE_CAP: usize = ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES as usize;
 
     /// Run the consumer until the shutdown signal fires or an unrecoverable
     /// error is observed. Spawn via `tokio::spawn(run_pinned_consumer(...))`.
@@ -692,10 +693,7 @@ pub mod production {
             }
             match SockOpsEvent::from_record_bytes(bytes) {
                 Some(event) => {
-                    if let SockOpsEvent::AcceptToFirstByteLatency {
-                        socket_cookie, ..
-                    } = event
-                    {
+                    if let SockOpsEvent::AcceptToFirstByteLatency { socket_cookie, .. } = event {
                         // Ringbuf submission happens inside the stream parser,
                         // so readiness does not prove that the parser and its
                         // paired verdict have returned. Deleting immediately
@@ -703,12 +701,11 @@ pub mod production {
                         // removal behind a bounded grace period; correlation
                         // state was already consumed in-kernel, so no duplicate
                         // sample can be emitted while the hook remains attached.
-                        if socket_cookie != 0 {
-                            pending_first_byte_removals.push_back((
-                                Instant::now() + FIRST_BYTE_HOOK_REMOVAL_GRACE,
-                                socket_cookie,
-                            ));
-                        }
+                        queue_first_byte_removal(
+                            pending_first_byte_removals,
+                            socket_cookie,
+                            Instant::now(),
+                        );
                     }
                     consumer.handle_event(event);
                     events_handled = events_handled.saturating_add(1);
@@ -724,12 +721,29 @@ pub mod production {
         events_handled
     }
 
+    fn queue_first_byte_removal(
+        pending: &mut VecDeque<(Instant, u64)>,
+        socket_cookie: u64,
+        now: Instant,
+    ) {
+        // Socket close remains the kernel cleanup backstop. Refuse excess
+        // userspace retention rather than letting a continuously-drained
+        // ringbuf grow this grace queue without bound under rapid close/churn.
+        if socket_cookie == 0 || pending.len() >= FIRST_BYTE_HOOK_REMOVAL_QUEUE_CAP {
+            return;
+        }
+        pending.push_back((now + FIRST_BYTE_HOOK_REMOVAL_GRACE, socket_cookie));
+    }
+
     fn drain_due_first_byte_removals(
         first_byte_sockets: &mut SockHash<MapData, u64>,
         pending: &mut VecDeque<(Instant, u64)>,
         now: Instant,
     ) {
-        while pending.front().is_some_and(|(deadline, _)| *deadline <= now) {
+        while pending
+            .front()
+            .is_some_and(|(deadline, _)| *deadline <= now)
+        {
             let Some((_, socket_cookie)) = pending.pop_front() else {
                 break;
             };
@@ -764,6 +778,28 @@ pub mod production {
                 );
                 0
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn first_byte_removal_queue_is_hard_bounded() {
+            let mut pending = VecDeque::new();
+            let now = Instant::now();
+            for cookie in 1..=(FIRST_BYTE_HOOK_REMOVAL_QUEUE_CAP as u64 + 1) {
+                queue_first_byte_removal(&mut pending, cookie, now);
+            }
+            queue_first_byte_removal(&mut pending, 0, now);
+
+            assert_eq!(pending.len(), FIRST_BYTE_HOOK_REMOVAL_QUEUE_CAP);
+            assert_eq!(pending.front().map(|(_, cookie)| *cookie), Some(1));
+            assert_eq!(
+                pending.back().map(|(_, cookie)| *cookie),
+                Some(FIRST_BYTE_HOOK_REMOVAL_QUEUE_CAP as u64)
+            );
         }
     }
 }
@@ -863,8 +899,7 @@ mod tests {
             SockOpsEvent::from_record(rec(SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, 0, 0, 60)),
             Some(SockOpsEvent::SynToAckLatency { us: 60 })
         );
-        let first_byte =
-            SockOpsRecord::accept_to_first_byte_latency(800, 0x0123_4567_89ab_cdef);
+        let first_byte = SockOpsRecord::accept_to_first_byte_latency(800, 0x0123_4567_89ab_cdef);
         assert_eq!(
             SockOpsEvent::from_record(first_byte),
             Some(SockOpsEvent::AcceptToFirstByteLatency {

@@ -8,11 +8,11 @@
 //! parser and the paired verdict return. The verdict program always returns
 //! SK_PASS; no payload byte is read, copied, logged, or modified.
 
-use aya_ebpf::EbpfContext;
 use aya_ebpf::helpers::{bpf_get_socket_cookie, bpf_ktime_get_ns};
 use aya_ebpf::macros::{stream_parser, stream_verdict};
 use aya_ebpf::programs::SkBuffContext;
-use ferrum_ebpf_common::{SockOpsRecord, accept_to_first_byte_us};
+use aya_ebpf::EbpfContext;
+use ferrum_ebpf_common::{accept_to_first_byte_us, SockOpsRecord};
 
 use crate::maps::FERRUM_ACCEPT_FIRST_BYTE_STATE;
 use crate::sock_ops_emit::emit;

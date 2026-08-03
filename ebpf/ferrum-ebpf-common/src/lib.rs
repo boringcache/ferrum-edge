@@ -697,8 +697,11 @@ impl SockOpsRecord {
 /// Per-accepted-socket correlation state shared by SOCK_OPS and SK_SKB.
 ///
 /// `accepted_ns` is sampled at `BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB`.
-/// Active-established confirmation replaces a pending value with BPF_EXIST;
-/// first data atomically deletes it and emits only when that delete succeeds.
+/// Enrollment starts in a non-emitting phase. Active-established confirmation
+/// records whether capture was proven during that handoff, then the enrolling
+/// callback arms pending/confirmed state with BPF_EXIST only after its second
+/// `bytes_received` check. First data atomically deletes state and emits only
+/// when that delete succeeds for an armed confirmed generation.
 /// The socket cookie is the map key and remains authoritative for the socket
 /// lifetime; tuples are never used as the measurement identity.
 #[repr(C)]
@@ -710,6 +713,14 @@ pub struct AcceptFirstByteState {
 }
 
 impl AcceptFirstByteState {
+    pub const fn enrolling(accepted_ns: u64) -> Self {
+        Self {
+            accepted_ns,
+            phase: ACCEPT_FIRST_BYTE_PHASE_ENROLLING,
+            _pad: 0,
+        }
+    }
+
     pub const fn pending(accepted_ns: u64) -> Self {
         Self {
             accepted_ns,
@@ -726,14 +737,37 @@ impl AcceptFirstByteState {
         }
     }
 
-    /// Return a confirmed replacement only for a pending generation. The
-    /// kernel installs it with BPF_EXIST so concurrent first-data deletion
-    /// cannot be resurrected.
+    /// Record capture confirmation without arming an enrolling generation.
+    /// The kernel installs the replacement with BPF_EXIST so concurrent
+    /// first-data deletion cannot be resurrected.
     pub const fn confirm(self) -> Option<Self> {
-        if self.phase == ACCEPT_FIRST_BYTE_PHASE_PENDING {
-            Some(Self::confirmed(self.accepted_ns))
-        } else {
-            None
+        match self.phase {
+            ACCEPT_FIRST_BYTE_PHASE_PENDING => Some(Self::confirmed(self.accepted_ns)),
+            ACCEPT_FIRST_BYTE_PHASE_ENROLLING => Some(Self {
+                accepted_ns: self.accepted_ns,
+                phase: ACCEPT_FIRST_BYTE_PHASE_ENROLLING_CONFIRMED,
+                _pad: 0,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Arm a handoff only after the enrolling callback has verified that no
+    /// application data arrived across the SockHash update. Confirmation may
+    /// have come from either side of the active/passive bridge while enrollment
+    /// was in progress.
+    pub const fn arm_after_enrollment(self, capture_confirmed: bool) -> Option<Self> {
+        match self.phase {
+            ACCEPT_FIRST_BYTE_PHASE_ENROLLING_CONFIRMED
+            | ACCEPT_FIRST_BYTE_PHASE_CONFIRMED => Some(Self::confirmed(self.accepted_ns)),
+            ACCEPT_FIRST_BYTE_PHASE_ENROLLING | ACCEPT_FIRST_BYTE_PHASE_PENDING => {
+                if capture_confirmed {
+                    Some(Self::confirmed(self.accepted_ns))
+                } else {
+                    Some(Self::pending(self.accepted_ns))
+                }
+            }
+            _ => None,
         }
     }
 
@@ -744,6 +778,8 @@ impl AcceptFirstByteState {
 
 pub const ACCEPT_FIRST_BYTE_PHASE_PENDING: u32 = 0;
 pub const ACCEPT_FIRST_BYTE_PHASE_CONFIRMED: u32 = 1;
+pub const ACCEPT_FIRST_BYTE_PHASE_ENROLLING: u32 = 2;
+pub const ACCEPT_FIRST_BYTE_PHASE_ENROLLING_CONFIRMED: u32 = 3;
 pub const ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES: u32 = 65_536;
 
 /// Correlation entries older than one hour are stale and never produce a
@@ -1079,8 +1115,7 @@ mod tests {
         // SockOpsRecord: four u32 (16) + one u64 (8) = 24 bytes, 8-byte aligned.
         assert_eq!(mem::size_of::<SockOpsRecord>(), 24);
         assert_eq!(mem::align_of::<SockOpsRecord>(), 8);
-        let first_byte =
-            SockOpsRecord::accept_to_first_byte_latency(42, 0x0123_4567_89ab_cdef);
+        let first_byte = SockOpsRecord::accept_to_first_byte_latency(42, 0x0123_4567_89ab_cdef);
         assert_eq!(first_byte.value, 42);
         assert_eq!(first_byte.accepted_socket_cookie(), 0x0123_4567_89ab_cdef);
         assert_eq!(mem::size_of::<AcceptFirstByteState>(), 16);

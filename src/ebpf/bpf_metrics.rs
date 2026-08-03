@@ -278,9 +278,7 @@ impl BpfMetricsState {
             syn_to_ack_us_sum: self.syn_to_ack_us_sum.load(Ordering::Relaxed),
             syn_to_ack_count: self.syn_to_ack_count.load(Ordering::Relaxed),
             syn_to_ack_bucket_exclusive: load_exclusive_buckets(&self.syn_to_ack_bucket_exclusive),
-            accept_to_first_byte_us_sum: self
-                .accept_to_first_byte_us_sum
-                .load(Ordering::Relaxed),
+            accept_to_first_byte_us_sum: self.accept_to_first_byte_us_sum.load(Ordering::Relaxed),
             accept_to_first_byte_count: self.accept_to_first_byte_count.load(Ordering::Relaxed),
             accept_to_first_byte_bucket_exclusive: load_exclusive_buckets(
                 &self.accept_to_first_byte_bucket_exclusive,
@@ -313,9 +311,7 @@ fn observe_latency(
         return;
     }
     let bucket = &exclusive[bpf_latency_exclusive_bucket_index(us)];
-    if count.load(Ordering::Relaxed) == u64::MAX
-        || bucket.load(Ordering::Relaxed) == u64::MAX
-    {
+    if count.load(Ordering::Relaxed) == u64::MAX || bucket.load(Ordering::Relaxed) == u64::MAX {
         return;
     }
     loop {

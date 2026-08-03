@@ -16,11 +16,11 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsFd;
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
+use aya::maps::SockHash;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::programs::sock_ops::SockOpsLinkId;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::maps::SockHash;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::programs::tc::{SchedClassifierLink, SchedClassifierLinkId};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -39,11 +39,11 @@ use tracing::{debug, info, warn};
 use super::maps::BpfMaps;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::{
-    BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH, BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS,
-    BPF_MAP_ORIG_DST4, BPF_MAP_ORIG_DST6, BPF_MAP_SOCK_OPS_EVENTS, BPF_MAP_SOCK_OPS_STATS,
-    BPF_ORIG_DST4_PIN_PATH, BPF_ORIG_DST6_PIN_PATH, BPF_PROGRAM_FIRST_BYTE_PARSER,
-    BPF_PROGRAM_FIRST_BYTE_VERDICT, BPF_PROGRAM_SOCK_OPS, BPF_SOCK_OPS_EVENTS_PIN_PATH,
-    BPF_SOCK_OPS_STATS_PIN_PATH, EbpfBackend, IncludePortsPolicy, PodInfo, TcAttachDirection,
+    BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH, BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS, BPF_MAP_ORIG_DST4,
+    BPF_MAP_ORIG_DST6, BPF_MAP_SOCK_OPS_EVENTS, BPF_MAP_SOCK_OPS_STATS, BPF_ORIG_DST4_PIN_PATH,
+    BPF_ORIG_DST6_PIN_PATH, BPF_PROGRAM_FIRST_BYTE_PARSER, BPF_PROGRAM_FIRST_BYTE_VERDICT,
+    BPF_PROGRAM_SOCK_OPS, BPF_SOCK_OPS_EVENTS_PIN_PATH, BPF_SOCK_OPS_STATS_PIN_PATH, EbpfBackend,
+    IncludePortsPolicy, PodInfo, TcAttachDirection,
 };
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use ferrum_ebpf_common::{BpfCaptureConfig, SOCK_OPS_RINGBUF_DEFAULT_BYTES};
@@ -776,15 +776,11 @@ fn attach_first_byte_hooks(bpf: &mut Ebpf) -> Result<(), String> {
     }
 
     let map_fd = {
-        let sockets = SockHash::<_, u64>::try_from(
-            bpf.map(BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS)
-                .ok_or_else(|| {
-                    format!("BPF map '{BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS}' not found")
-                })?,
-        )
-        .map_err(|e| {
-            format!("'{BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS}' is not a SockHash: {e}")
-        })?;
+        let sockets =
+            SockHash::<_, u64>::try_from(bpf.map(BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS).ok_or_else(
+                || format!("BPF map '{BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS}' not found"),
+            )?)
+            .map_err(|e| format!("'{BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS}' is not a SockHash: {e}"))?;
         sockets
             .fd()
             .try_clone()
@@ -906,13 +902,17 @@ fn pin_sock_ops_maps(bpf: &mut Ebpf) -> Result<(), String> {
             parent.display()
         ));
     }
-    pin_map_at(bpf, BPF_MAP_SOCK_OPS_EVENTS, BPF_SOCK_OPS_EVENTS_PIN_PATH)?;
+    // Publish the events ringbuf last: its inode is the consumer's generation
+    // commit marker. Replacing it first would let a concurrent re-open pair a
+    // new ringbuf with the previous stats/SockHash generation, so first-byte
+    // cleanup would target a map that the new producer does not use.
     pin_map_at(bpf, BPF_MAP_SOCK_OPS_STATS, BPF_SOCK_OPS_STATS_PIN_PATH)?;
     pin_map_at(
         bpf,
         BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS,
         BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH,
     )?;
+    pin_map_at(bpf, BPF_MAP_SOCK_OPS_EVENTS, BPF_SOCK_OPS_EVENTS_PIN_PATH)?;
     Ok(())
 }
 

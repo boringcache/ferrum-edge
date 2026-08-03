@@ -84,18 +84,18 @@ use aya_ebpf::macros::sock_ops;
 use aya_ebpf::programs::SockOpsContext;
 use aya_ebpf::EbpfContext;
 use ferrum_ebpf_common::{
-    AcceptFirstByteState, FERRUM_CAPTURE_CONFIG_KEY, sock_ops_peer_port_host_order, ConnTuple4,
-    ConnTuple6, OrigDst4, OrigDst6, OrigDstKey, SockOpsRecord, SOCK_OPS_DIRECTION_RECEIVED,
-    SOCK_OPS_DIRECTION_SENT,
-    SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, SOCK_OPS_EVENT_CONNECT, SOCK_OPS_EVENT_FIN,
-    SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE, SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY,
+    sock_ops_peer_port_host_order, AcceptFirstByteState, ConnTuple4, ConnTuple6, OrigDst4,
+    OrigDst6, OrigDstKey, SockOpsRecord, FERRUM_CAPTURE_CONFIG_KEY, SOCK_OPS_DIRECTION_RECEIVED,
+    SOCK_OPS_DIRECTION_SENT, SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, SOCK_OPS_EVENT_CONNECT,
+    SOCK_OPS_EVENT_FIN, SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE,
+    SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY,
 };
 
 use crate::maps::{
     FERRUM_ACCEPT_COOKIE_BY_TUPLE4, FERRUM_ACCEPT_COOKIE_BY_TUPLE6,
     FERRUM_ACCEPT_FIRST_BYTE_SOCKETS, FERRUM_ACCEPT_FIRST_BYTE_STATE, FERRUM_CAPTURE_CONFIG,
-    FERRUM_ORIG_DST4, FERRUM_ORIG_DST6, FERRUM_ORIG_DST_BY_TUPLE4,
-    FERRUM_ORIG_DST_BY_TUPLE6, FERRUM_SOCK_OPS_CONNECT_TS,
+    FERRUM_ORIG_DST4, FERRUM_ORIG_DST6, FERRUM_ORIG_DST_BY_TUPLE4, FERRUM_ORIG_DST_BY_TUPLE6,
+    FERRUM_SOCK_OPS_CONNECT_TS,
 };
 use crate::sock_ops_emit::emit;
 
@@ -483,11 +483,7 @@ fn bridge_passive_established_v6(ctx: &SockOpsContext) -> bool {
 /// observation. Port matching only bounds candidate enrollment; the orig-dst
 /// bridge must independently confirm the connection before it can emit.
 #[inline(always)]
-fn track_accept_first_byte(
-    ctx: &SockOpsContext,
-    capture_confirmed: bool,
-    accepted_ns: u64,
-) {
+fn track_accept_first_byte(ctx: &SockOpsContext, capture_confirmed: bool, accepted_ns: u64) {
     let Some(config) = (unsafe { FERRUM_CAPTURE_CONFIG.get(&FERRUM_CAPTURE_CONFIG_KEY) }) else {
         return;
     };
@@ -501,11 +497,13 @@ fn track_accept_first_byte(
     }
 
     let cookie = socket_cookie(ctx);
-    let state = if capture_confirmed {
-        AcceptFirstByteState::confirmed(accepted_ns)
-    } else {
-        AcceptFirstByteState::pending(accepted_ns)
-    };
+    // Publish non-emitting enrollment state first. The post-enrollment
+    // bytes_received check below must run before any bridge-confirmed candidate
+    // becomes eligible to emit, otherwise data arriving between the pre-check
+    // and SockHash update could be mistaken for the first byte observed by the
+    // hook. A concurrent active-side confirmation records an enrolling-confirmed
+    // phase but does not arm emission before the second check.
+    let state = AcceptFirstByteState::enrolling(accepted_ns);
     if FERRUM_ACCEPT_FIRST_BYTE_STATE
         .insert(&cookie, &state, 0)
         .is_err()
@@ -515,22 +513,41 @@ fn track_accept_first_byte(
 
     // Safety: SockHash::update requires the live sock_ops context so the
     // kernel retains this exact accepted socket, not a tuple-selected peer.
-    let sk_ops = unsafe {
-        &mut *(ctx.as_ptr() as *mut aya_ebpf::bindings::bpf_sock_ops)
-    };
+    let sk_ops = unsafe { &mut *(ctx.as_ptr() as *mut aya_ebpf::bindings::bpf_sock_ops) };
     let mut key = cookie;
     if FERRUM_ACCEPT_FIRST_BYTE_SOCKETS
         .update(&mut key, sk_ops, 0)
         .is_err()
     {
         let _ = FERRUM_ACCEPT_FIRST_BYTE_STATE.remove(&cookie);
+        return;
     }
+
+    // Close the check-to-enrollment race. Deleting only correlation state here
+    // makes already-arrived data fail closed without attempting
+    // callback-recursive SockHash removal.
+    if read_ctx_u64(ctx, SK_OPS_BYTES_RECEIVED_OFF) != 0 {
+        let _ = FERRUM_ACCEPT_FIRST_BYTE_STATE.remove(&cookie);
+        return;
+    }
+
+    let Some(state) = (unsafe { FERRUM_ACCEPT_FIRST_BYTE_STATE.get(&cookie) }).copied() else {
+        return;
+    };
+    let Some(armed) = state.arm_after_enrollment(capture_confirmed) else {
+        let _ = FERRUM_ACCEPT_FIRST_BYTE_STATE.remove(&cookie);
+        return;
+    };
+    // BPF_EXIST preserves delete-wins if first data or close raced enrollment.
+    let _ = FERRUM_ACCEPT_FIRST_BYTE_STATE.insert(&cookie, &armed, BPF_EXIST);
 }
 
 /// Confirm a passive-first candidate after the active orig-dst bridge proves
-/// it belongs to the captured connection. A first-data callback atomically
-/// deletes its state; BPF_EXIST makes a raced confirmation fail rather than
-/// recreate that terminal generation.
+/// it belongs to the captured connection. During SockHash enrollment this only
+/// records proof in a non-emitting phase; the enrolling callback arms it after
+/// the second bytes-received check. A first-data callback atomically deletes
+/// state, and BPF_EXIST makes a raced confirmation fail rather than recreate
+/// that terminal generation.
 #[inline(always)]
 fn confirm_accept_first_byte(cookie: u64) {
     let Some(state) = (unsafe { FERRUM_ACCEPT_FIRST_BYTE_STATE.get(&cookie) }).copied() else {
