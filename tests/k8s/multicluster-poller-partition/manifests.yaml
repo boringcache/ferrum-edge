@@ -1,0 +1,361 @@
+# Poller-driven multicluster partition fixture. run.sh substitutes every
+# __PLACEHOLDER__ and creates the referenced Secrets/ConfigMaps first.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: __NAMESPACE__
+  labels:
+    ferrum.io/mesh: enabled
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mesh-dp
+  namespace: __NAMESPACE__
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-cp
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-cp
+    namespace: __NAMESPACE__
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+spec:
+  type: NodePort
+  selector:
+    app: ferrum-cp
+  ports:
+    - name: grpc-tls
+      port: 50051
+      targetPort: 50051
+      nodePort: 32551
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ferrum-cp
+  template:
+    metadata:
+      labels:
+        app: ferrum-cp
+    spec:
+      serviceAccountName: ferrum-cp
+      securityContext:
+        fsGroup: 1337
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: grpc-tls
+              containerPort: 50051
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 90
+          env:
+            - name: FERRUM_MODE
+              value: cp
+            - name: FERRUM_NAMESPACE
+              value: __NAMESPACE__
+            - name: FERRUM_DB_TYPE
+              value: sqlite
+            - name: FERRUM_DB_URL
+              value: sqlite:/data/ferrum.db?mode=rwc
+            - name: FERRUM_ADMIN_JWT_SECRET
+              valueFrom:
+                secretKeyRef: {name: poller-secrets, key: admin-jwt-secret}
+            - name: FERRUM_CP_DP_GRPC_JWT_SECRET
+              valueFrom:
+                secretKeyRef: {name: poller-secrets, key: discovery-jwt-secret}
+            - name: FERRUM_MESH_CLUSTER_AUDIENCE
+              value: __CLUSTER_NAME__
+            - name: FERRUM_CP_GRPC_LISTEN_ADDR
+              value: 0.0.0.0:50051
+            - name: FERRUM_CP_GRPC_TLS_CERT_PATH
+              value: /transport/server.pem
+            - name: FERRUM_CP_GRPC_TLS_KEY_PATH
+              value: /transport/server-key.pem
+            - name: FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH
+              value: /transport/ca.pem
+            - name: FERRUM_K8S_CONTROLLER_ENABLED
+              value: "true"
+            - name: FERRUM_K8S_POD_DISCOVERY_ENABLED
+              value: "true"
+            - name: FERRUM_K8S_WATCH_ISTIO_CRDS
+              value: "false"
+            - name: FERRUM_K8S_WATCH_GATEWAY_API_CRDS
+              value: "false"
+            - name: FERRUM_K8S_WATCH_MESH_CONFIG
+              value: "false"
+            - name: FERRUM_K8S_TRUST_DOMAIN
+              value: __TRUST_DOMAIN__
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: transport, mountPath: /transport, readOnly: true}
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: transport
+          secret:
+            secretName: poller-transport
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: federation-bundle
+  namespace: __NAMESPACE__
+spec:
+  type: NodePort
+  selector:
+    app: federation-bundle
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+      nodePort: 32443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: federation-bundle
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: federation-bundle
+  template:
+    metadata:
+      labels:
+        app: federation-bundle
+    spec:
+      containers:
+        - name: bundle
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: https, containerPort: 8443}
+          readinessProbe:
+            tcpSocket: {port: 8443}
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 60
+          command: ["python", "-u", "-c"]
+          args:
+            - |
+              import http.server, ssl
+              class Handler(http.server.BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      if self.path != "/bundle":
+                          self.send_error(404); return
+                      body = open("/bundle/bundle.json", "rb").read()
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers(); self.wfile.write(body)
+                  def log_message(self, *_): pass
+              server = http.server.ThreadingHTTPServer(("0.0.0.0", 8443), Handler)
+              context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+              context.load_cert_chain("/transport/server.pem", "/transport/server-key.pem")
+              server.socket = context.wrap_socket(server.socket, server_side=True)
+              server.serve_forever()
+          volumeMounts:
+            - {name: transport, mountPath: /transport, readOnly: true}
+            - {name: bundle, mountPath: /bundle, readOnly: true}
+      volumes:
+        - name: transport
+          secret: {secretName: poller-transport}
+        - name: bundle
+          configMap: {name: federation-bundle}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: __ECHO_SERVICE__
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: echo
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      appProtocol: http
+---
+# This NodePort is the fixture's east-west target. It reaches the real Ferrum
+# STRICT inbound listener, which authenticates the peer with polled trust.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mesh-inbound
+  namespace: __NAMESPACE__
+spec:
+  type: NodePort
+  selector:
+    app: echo
+  ports:
+    - name: mesh-mtls
+      port: 15006
+      targetPort: 15006
+      nodePort: 31506
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo
+  template:
+    metadata:
+      labels:
+        app: echo
+        ferrum.io/mesh: enabled
+        topology.kubernetes.io/region: __REGION__
+        topology.kubernetes.io/zone: zone-1
+    spec:
+      serviceAccountName: mesh-dp
+      shareProcessNamespace: true
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - {name: outbound, containerPort: 15001}
+            - {name: inbound, containerPort: 15006}
+            - {name: admin, containerPort: 15020}
+          readinessProbe:
+            tcpSocket: {port: 15020}
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 90
+          env:
+            - {name: FERRUM_MODE, value: mesh}
+            - {name: FERRUM_NAMESPACE, value: __NAMESPACE__}
+            - {name: FERRUM_MESH_TOPOLOGY, value: sidecar}
+            - {name: FERRUM_MESH_CONFIG_PROTOCOL, value: file}
+            - {name: FERRUM_MESH_FILE_CONFIG_PATH, value: /mesh/mesh.yaml}
+            - {name: FERRUM_MESH_PRODUCTION_MODE, value: "true"}
+            - {name: FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED, value: "true"}
+            - {name: FERRUM_MESH_CA_BACKEND, value: spire_agent}
+            - {name: FERRUM_MESH_SPIRE_AGENT_SOCKET, value: /run/spire/sockets/agent.sock}
+            - {name: FERRUM_MESH_WORKLOAD_SPIFFE_ID, value: "spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/mesh-dp"}
+            - {name: FERRUM_ADMIN_HTTP_PORT, value: "15020"}
+            - name: FERRUM_ADMIN_JWT_SECRET
+              valueFrom:
+                secretKeyRef: {name: poller-secrets, key: admin-jwt-secret}
+            - {name: FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS, value: "2"}
+            - {name: FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS, value: "3"}
+            - {name: FERRUM_MESH_FEDERATION_MAX_STALE_SECONDS, value: "12"}
+            - {name: FERRUM_MESH_FEDERATION_FAIL_OPEN, value: "false"}
+            - {name: FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS, value: "2"}
+            - {name: FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS, value: "8"}
+            - {name: FERRUM_MESH_LOCALITY_LB_STRICT, value: "true"}
+            - {name: FERRUM_TLS_CA_BUNDLE_PATH, value: /transport/ca.pem}
+            - {name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH, value: /transport/ca.pem}
+            - {name: FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH, value: /transport/client.pem}
+            - {name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH, value: /transport/client-key.pem}
+            - name: FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS
+              valueFrom:
+                secretKeyRef: {name: poller-secrets, key: remote-discovery-credentials}
+            - {name: FERRUM_POOL_WARMUP_ENABLED, value: "false"}
+            - {name: FERRUM_LOG_LEVEL, value: info}
+          volumeMounts:
+            - {name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true}
+            - {name: mesh-config, mountPath: /mesh, readOnly: true}
+            - {name: transport, mountPath: /transport, readOnly: true}
+        - name: app
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {containerPort: 8080}
+          readinessProbe:
+            tcpSocket: {port: 8080}
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 60
+          command: ["python", "-u", "-c"]
+          args:
+            - |
+              import http.server
+              body = b"__ECHO_BODY__\n"
+              class Handler(http.server.BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      self.send_response(200)
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers(); self.wfile.write(body)
+                  def log_message(self, *_): pass
+              http.server.ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+        - name: probe
+          image: curlimages/curl:8.12.1
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "trap : TERM INT; while :; do wait; done"]
+        - name: signal
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "trap : TERM INT; while :; do wait; done"]
+          volumeMounts:
+            - {name: mesh-config, mountPath: /mesh, readOnly: true}
+      volumes:
+        - name: spire-agent-socket
+          hostPath: {path: /run/spire/sockets, type: DirectoryOrCreate}
+        - name: mesh-config
+          configMap: {name: mesh-config}
+        - name: transport
+          secret: {secretName: poller-transport}

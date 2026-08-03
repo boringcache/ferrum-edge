@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A required two-control-plane/two-data-plane multicluster poller gate now uses
+  verified TLS/mTLS, audience-bound per-remote credentials, and four independent
+  Toxiproxy links to live-verify last-good retention, independent trust/endpoint
+  expiry, fail-closed traffic, same-generation recovery, bounded/redacted metric
+  parity, and in-flight `RemoteCluster` retirement without stale reinstall.
 - Audited admin mutations are durable **before they run** (issue #2421).
   The admin write gate fsyncs a pre-mutation audit intent — a stable event id
   plus the authenticated actor, method, sanitized path / namespace, canonical

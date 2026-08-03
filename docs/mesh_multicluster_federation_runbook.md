@@ -14,6 +14,7 @@ Docker/kind install report.
 | Mode | Entry | Workflow / job |
 |---|---|---|
 | Live datapath (SPIRE-federated two kind clusters, bidirectional traffic + negatives + Stage-3 failure injection; fail-closed required-assertion gate) | `tests/k8s/multicluster-federation/run.sh` | `.github/workflows/multicluster-federation-live.yml` — path-filtered on PRs, force-run on every `main` push / `workflow_dispatch` (requires `FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true`) |
+| Poller partition / last-good retention (two Ferrum CP/DP deployments, verified TLS/mTLS, bound per-remote JWTs, four independent Toxiproxy links) | `tests/k8s/multicluster-poller-partition/run.sh` | `.github/workflows/multicluster-poller-partition-live.yml` — dedicated required `Multicluster Poller Partition Live` gate |
 | Deploy-only smoke (rollouts, no traffic) | same script with `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1` | Legacy path-filtered `Mesh Multicluster Federation` CI job; a packaging/rollout check, not the authoritative datapath/release gate |
 
 In-process federation/discovery unit and integration coverage remains necessary
@@ -21,9 +22,9 @@ but is not a substitute for the two-cluster harness. Preflight requires
 `docker`, `kind`, `kubectl`, `curl`, and `python3`; a skipped local run is not
 validation evidence.
 
-**Residual:** poller-driven partition / last-good-retention live coverage is
-still owed — the current file-config fixture does not run federation/remote
-discovery pollers ([#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331)).
+The static federation suite remains the GA east-west datapath gate. The
+separate poller suite supplies the churn/retention evidence without changing or
+weakening that established contract.
 
 Remediation that made federation activation bidirectional and observable
 (effective trust-bundle set for outbound mTLS and inbound SPIFFE verification;
@@ -55,12 +56,15 @@ gateway SVID, `MultiClusterConfig.remote_clusters[]` entry for the peer, peer
 | Root rotation with overlap | Traffic continues while old and new roots overlap; status `trust_bundle_age_seconds` refreshes after poll. |
 | Root removal after overlap | Traffic signed by the removed root fails after the new polled bundle is active. |
 | Invalid bundle delivery | Invalid remote bundle is rejected; last-good bundle remains active; age increases; poll-failure metrics/logs identify the endpoint. |
-| Prolonged federation disconnection | Last-good bundle is preserved until expiry policy is defined by operators; alert on stale bundle age. |
+| Prolonged federation disconnection | Last-good bundle is preserved through `FERRUM_MESH_FEDERATION_MAX_STALE_SECONDS`; after that exact boundary trust is withdrawn, inbound/outbound trust is recomputed, and traffic fails closed. |
 | Endpoint addition | Remote endpoint appears under `discovered`, service/workload counts increase, and the local LB can fail over to it. |
 | Endpoint removal | Removed remote endpoint disappears after a successful discovery poll or cluster removal; stale endpoints are evicted on accepted config/trust withdrawal. |
 | Local-first routing | With source locality present, local endpoints are preferred while healthy. |
 | Remote failover | When local endpoints are unavailable, traffic fails over to remote endpoints. |
 | Network partition / DNS failure / latency | Pollers back off and keep last-good bundles/endpoints; status age increases; recovery refreshes age and data. |
+| Endpoint stale boundary | At `FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS`, endpoints and freshness metrics are withdrawn independently while polled trust remains active; the live poll generation can reinstall them after recovery without a fresh slice. |
+| Trust stale boundary | At `FERRUM_MESH_FEDERATION_MAX_STALE_SECONDS`, trust and dependent remote endpoints are withdrawn; both inbound and outbound trust become inactive until the same live poll generation recovers. |
+| RemoteCluster withdrawal during a poll | Accepted withdrawal retires both generations immediately. A response already in flight cannot reinstall the trust bundle, endpoint target, or freshness series. |
 | Stale CP data | Received-but-rejected slices do not affect poller membership or discovered status; accepted last-good slice continues serving. |
 | CP restart | DPs retain last-good slice and reconnect; status shows stale slice age during outage. |
 | Gateway restart | Gateway restarts with no partial trust state; it bootstraps according to fail-open/fail-closed policy and then converges from CP/poller data. |
@@ -123,6 +127,26 @@ The scheduled harness entry point is:
 ```bash
 tests/k8s/multicluster-federation/run.sh
 ```
+
+The independent poller lifecycle entry point is:
+
+```bash
+tests/k8s/multicluster-poller-partition/run.sh
+```
+
+It uses two real Ferrum CPs and DPs. Each DP polls the peer's native
+`MeshSubscribe` endpoint and HTTPS trust-bundle endpoint through a separate
+Toxiproxy TCP passthrough. Discovery uses a private CA, client certificate,
+per-remote secret selected by `discovery_credential_ref`, and the peer's stable
+cluster audience; federation uses the same verified private CA. The test-only
+stale windows are 8 seconds for endpoints and 12 seconds for trust.
+
+The required `multicluster_poller.*` evidence names every retention, expiry,
+recovery, metric-parity, and in-flight-withdrawal boundary. Conditions are
+actively polled with bounded deadlines. The fixture refuses shared cluster or
+fault-container names, and GitHub-hosted runs include `run_id`/`run_attempt` in
+all names. Diagnostics omit Secrets and ConfigMaps, redact proxy upstreams,
+and retain only admin summaries, metrics, events, and bounded logs.
 
 It runs in two modes:
 
@@ -198,7 +222,6 @@ as validation evidence. The live mode also runs two Stage-3 failure-injection
 scenarios (gated): peer-trust revocation (drop the federated bundle from the dest
 slice + reload → A→B fails closed → restore → recover) and dest endpoint
 black-hole (scale `svc` to 0 → A→B fails fast → scale up + re-render gateway →
-recover). Network-partition / last-good retention is deferred (#3331): it is a
-federation/remote-discovery POLLER property, which this static file-config
-fixture does not run (it needs a separate poller-driven fixture; kind also has no
-NetworkPolicy enforcement for a clean in-cluster partition).
+recover). Network-partition / last-good retention is intentionally not asserted
+by this static fixture. The separate Toxiproxy-backed poller fixture above owns
+that contract; neither suite relies on kind NetworkPolicy enforcement.

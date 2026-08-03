@@ -165,6 +165,21 @@ DEDICATED_REQUIRED_CHECKS = {
             "--required-namespace multicluster.",
         },
     },
+    ".github/workflows/multicluster-poller-partition-live.yml": {
+        "job": "gate",
+        "name": "Multicluster Poller Partition Live",
+        "needs": {"multicluster-poller-partition-live"},
+        "contract": {
+            "LIVE_RESULT",
+            'if [ "$LIVE_RESULT" != success ]',
+            "name: multicluster-poller-partition-results",
+            "--suite multicluster-poller-partition",
+            "--platform-profile kind-spire-toxiproxy-multicluster-pollers",
+            "--required-namespace multicluster_poller.",
+            "multicluster_poller.withdrawal.inflight_generation_retired",
+            "multicluster_poller.withdrawal.retired_state_not_reinstalled",
+        },
+    },
 }
 
 # The artifact validator is only a gate if it is reached with a SHA-pinned
@@ -208,6 +223,9 @@ DEDICATED_WORKFLOW_NAMES = {
     ".github/workflows/multicluster-federation-live.yml": (
         "Multicluster Federation Live Datapath"
     ),
+    ".github/workflows/multicluster-poller-partition-live.yml": (
+        "Multicluster Poller Partition Live"
+    ),
 }
 
 # Every required status check owner must trigger on merge_group. Without that
@@ -220,6 +238,9 @@ REQUIRED_MERGE_GROUP_WORKFLOWS = {
     ".github/workflows/cross-build-policy.yml": "Trusted Cross Build Policy",
     ".github/workflows/multicluster-federation-live.yml": (
         "Multicluster Federation Live"
+    ),
+    ".github/workflows/multicluster-poller-partition-live.yml": (
+        "Multicluster Poller Partition Live"
     ),
 }
 

@@ -1,0 +1,133 @@
+name: Multicluster Poller Partition Live
+
+on:
+  workflow_dispatch:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+concurrency:
+  group: multicluster-poller-${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FERRUM_IMAGE_REPOSITORY: ferrum-edge
+  FERRUM_IMAGE_TAG: multicluster-poller-partition
+  CLUSTER_A: ferrum-poller-a-${{ github.run_id }}-${{ github.run_attempt }}
+  CLUSTER_B: ferrum-poller-b-${{ github.run_id }}-${{ github.run_attempt }}
+  TOXIPROXY_CONTAINER: ferrum-poller-toxi-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  multicluster-poller-partition-live:
+    name: Poller partition and last-good retention
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+
+    steps:
+      - name: Validate merge-queue base identity
+        if: github.event_name == 'merge_group'
+        env:
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "merge_group base_sha missing or malformed" >&2
+            exit 1
+          fi
+
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: ci-multicluster-poller-partition-live
+
+      - name: Build runtime binary
+        run: cargo build --profile pr-build --bin ferrum-edge
+
+      - name: Package runtime image
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/pr-build/ferrum-edge
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}
+
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-kubernetes-tools
+
+      - name: Run poller-driven partition topology
+        env:
+          FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE: "true"
+          FERRUM_SKIP_IMAGE_BUILD: "1"
+          FERRUM_POLLER_RESULTS_DIR: ${{ github.workspace }}/target/multicluster-poller-partition
+        run: tests/k8s/multicluster-poller-partition/run.sh
+
+      - name: Upload redacted live evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: multicluster-poller-partition-results
+          path: target/multicluster-poller-partition
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce deterministic cleanup
+        if: always()
+        run: |
+          set +e
+          docker rm -f "$TOXIPROXY_CONTAINER"
+          kind delete cluster --name "$CLUSTER_A"
+          kind delete cluster --name "$CLUSTER_B"
+
+  gate:
+    name: Multicluster Poller Partition Live
+    if: always()
+    needs: multicluster-poller-partition-live
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require the hosted fixture to pass
+        env:
+          LIVE_RESULT: ${{ needs.multicluster-poller-partition-live.result }}
+        run: |
+          if [ "$LIVE_RESULT" != success ]; then
+            echo "poller partition fixture result: $LIVE_RESULT" >&2
+            exit 1
+          fi
+
+      - name: Checkout validator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Download emitted evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          name: multicluster-poller-partition-results
+          path: multicluster-poller-partition-artifact
+
+      - name: Validate exact poller boundary contract
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          python3 .github/scripts/validate_live_assertions.py --self-test
+          python3 .github/scripts/validate_live_assertions.py \
+            --artifact multicluster-poller-partition-artifact/live-assertions.json \
+            --suite multicluster-poller-partition \
+            --platform-profile kind-spire-toxiproxy-multicluster-pollers \
+            --commit "$EXPECTED_COMMIT" \
+            --max-age-seconds 21600 \
+            --required-namespace multicluster_poller. \
+            --require multicluster_poller.initial.polled_trust_endpoints_installed \
+            --require multicluster_poller.transient.last_good_retained \
+            --require multicluster_poller.transient.cache_age_increased \
+            --require multicluster_poller.endpoint.expired_fail_closed \
+            --require multicluster_poller.endpoint.remote_target_removed \
+            --require multicluster_poller.endpoint.recovered_same_generation \
+            --require multicluster_poller.trust.expired_fail_closed \
+            --require multicluster_poller.trust.inbound_outbound_recomputed \
+            --require multicluster_poller.trust.recovered_same_generation \
+            --require multicluster_poller.metrics.failure_backoff_recovery_bounded \
+            --require multicluster_poller.metrics.admin_status_parity \
+            --require multicluster_poller.withdrawal.inflight_generation_retired \
+            --require multicluster_poller.withdrawal.retired_state_not_reinstalled
