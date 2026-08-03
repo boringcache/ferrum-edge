@@ -7876,7 +7876,10 @@ async fn test_gemini_legacy_function_call_and_tool_result_shapes() {
         parsed["systemInstruction"]["parts"][0]["text"],
         json!("sys-a\nsys-b")
     );
-    assert_eq!(parsed["contents"][0]["parts"][0]["text"], json!("ask\nmore"));
+    assert_eq!(
+        parsed["contents"][0]["parts"][0]["text"],
+        json!("ask\nmore")
+    );
     assert_eq!(
         parsed["contents"][1]["parts"][0]["functionCall"]["name"],
         json!("lookup")
@@ -8151,14 +8154,15 @@ async fn test_gemini_alt_sse_query_merge_variants() {
             plugin.before_proxy(&mut ctx, &mut headers).await,
             PluginResult::Continue
         ));
-        let effective =
-            ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+        let effective = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
         assert!(
             effective.contains("client=1") && effective.contains("keep=yes"),
             "{effective}"
         );
         assert!(
-            effective.split('&').any(|p| p.eq_ignore_ascii_case("alt=sse")),
+            effective
+                .split('&')
+                .any(|p| p.eq_ignore_ascii_case("alt=sse")),
             "must append alt=sse: {effective}"
         );
     }
@@ -8318,7 +8322,10 @@ async fn test_gemini_hostile_framing_identity_and_parts_fail_closed() {
     // Unrecognized framing first byte.
     let out = run_gemini_normalizer(4096, "not-sse-or-json", "application/json").await;
     assert!(out.contains("upstream_error"), "{out}");
-    assert!(out.contains("unrecognized Gemini/Vertex stream framing"), "{out}");
+    assert!(
+        out.contains("unrecognized Gemini/Vertex stream framing"),
+        "{out}"
+    );
 
     // Empty JSON array is a complete no-candidate stream → premature EOF.
     let empty_arr = run_gemini_normalizer(4096, "[]", "application/json").await;
@@ -8333,7 +8340,10 @@ async fn test_gemini_hostile_framing_identity_and_parts_fail_closed() {
         "{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"say \\\"hi\\\"\"}]},\"finishReason\":\"STOP\"}]}",
     );
     let esc_out = run_gemini_normalizer(3, escaped, "application/json").await;
-    assert!(esc_out.contains("say \\\"hi\\\"") || esc_out.contains("say \"hi\""), "{esc_out}");
+    assert!(
+        esc_out.contains("say \\\"hi\\\"") || esc_out.contains("say \"hi\""),
+        "{esc_out}"
+    );
     assert!(esc_out.contains("\"finish_reason\":\"stop\""), "{esc_out}");
 
     // SSE comments / event-name-only / provider [DONE] are ignored; content still normalizes.
@@ -8402,7 +8412,10 @@ async fn test_gemini_hostile_framing_identity_and_parts_fail_closed() {
             "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{}}}]},\"finishReason\":\"SAFETY\"}]}\n\n",
             "function calls with a non-STOP finishReason",
         ),
-        (oversized_args.as_str(), "oversized Gemini functionCall args"),
+        (
+            oversized_args.as_str(),
+            "oversized Gemini functionCall args",
+        ),
         (deep_json.as_str(), "excessive JSON nesting"),
     ];
     for (body, needle) in hostile {
@@ -8420,9 +8433,8 @@ async fn test_gemini_hostile_framing_identity_and_parts_fail_closed() {
     }
 
     // Finish-only candidate (no content) remains valid.
-    let finish_only = concat!(
-        "data: {\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n",
-    );
+    let finish_only =
+        concat!("data: {\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n",);
     let fo = run_gemini_normalizer(4096, finish_only, "text/event-stream").await;
     assert!(fo.contains("\"finish_reason\":\"stop\""), "{fo}");
     assert!(!fo.contains("upstream_error"), "{fo}");
@@ -8513,7 +8525,10 @@ async fn test_gemini_gzip_brotli_and_buffered_normalization() {
                     || body.contains("unsupported_content_encoding"),
                 "{body}"
             );
-            assert!(!body.contains("zstd"), "must not echo encoding token: {body}");
+            assert!(
+                !body.contains("zstd"),
+                "must not echo encoding token: {body}"
+            );
         }
     }
 
