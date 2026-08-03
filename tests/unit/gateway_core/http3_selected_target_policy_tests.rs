@@ -962,3 +962,25 @@ fn h3_flavor_aware_reject_metrics_match_the_http_wire_status() {
         );
     }
 }
+
+#[test]
+fn h3_cross_protocol_http1_admission_uses_selected_subset_lane() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let pending_gate = source
+        .find("let pending_cap =")
+        .expect("H3-to-plain pending gate");
+    let gate_tail = &source[pending_gate..];
+    let acquisition = gate_tail
+        .find(".try_acquire_for_subset(")
+        .expect("subset-keyed H1 admission");
+    let acquisition_tail = &gate_tail[acquisition..];
+    let acquisition_end = acquisition_tail
+        .find("pending_cap,")
+        .expect("pending cap argument");
+    let acquisition_call = &acquisition_tail[..acquisition_end];
+
+    assert!(
+        acquisition_call.contains("dispatch_proxy.upstream_subset.as_deref()"),
+        "the H3-to-plain bridge must not collapse selected subsets into the unmatched H1 admission lane"
+    );
+}

@@ -1313,7 +1313,12 @@ where
             });
     match state
         .backend_pending_limit
-        .try_acquire(effective_host, dispatch_port, pending_cap)
+        .try_acquire_for_subset(
+            effective_host,
+            dispatch_port,
+            dispatch_proxy.upstream_subset.as_deref(),
+            pending_cap,
+        )
     {
         Ok(slot) => Ok(Ok(slot)),
         Err(limit) => {
