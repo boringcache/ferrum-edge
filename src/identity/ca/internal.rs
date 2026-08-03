@@ -438,8 +438,8 @@ fn ca_issue_error_marks_unhealthy(error: &CaError) -> bool {
 /// `rcgen` would otherwise add a sign-extension byte. We also avoid the
 /// all-zero serial.
 fn rand_u64() -> u64 {
-    use ring::rand::SecureRandom;
-    let rng = ring::rand::SystemRandom::new();
+    use crate::fips::backend::rand::SecureRandom;
+    let rng = crate::fips::backend::rand::SystemRandom::new();
     let mut buf = [0u8; 8];
     if rng.fill(&mut buf).is_ok() {
         buf[0] &= 0x7f;

@@ -855,15 +855,14 @@ fn build_client_config(
 
     let verifier = crate::tls::build_server_verifier_with_crls(root_store, &crls)
         .map_err(|_| SmtpFailure::TlsSetup)?;
-    // Pin the ring provider explicitly so the channel does not depend on a
-    // globally installed default (unit tests build channels without startup).
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|_| SmtpFailure::TlsSetup)?
-    .with_webpki_verifier(verifier)
-    .with_no_client_auth();
+    // Pin the build-selected provider explicitly so the channel does not depend
+    // on a globally installed default (unit tests build channels without startup).
+    let config =
+        rustls::ClientConfig::builder_with_provider(Arc::new(crate::fips::base_crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|_| SmtpFailure::TlsSetup)?
+            .with_webpki_verifier(verifier)
+            .with_no_client_auth();
     Ok(Arc::new(config))
 }
 

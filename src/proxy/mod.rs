@@ -3335,9 +3335,9 @@ pub(crate) fn store_request_body_metadata(
     if needs_body_digests
         && (ctx.request_body_sha256.is_none() || ctx.request_body_sha512.is_none())
     {
-        use sha2::{Digest, Sha256, Sha512};
-        ctx.request_body_sha256 = Some(Sha256::digest(body).into());
-        ctx.request_body_sha512 = Some(Sha512::digest(body).into());
+        use crate::fips::approved::{Sha256, Sha512};
+        ctx.request_body_sha256 = Some(Sha256::digest(body));
+        ctx.request_body_sha512 = Some(Sha512::digest(body));
     }
 }
 
@@ -9272,6 +9272,19 @@ impl ProxyState {
         // fully BEFORE swap" guard must live inside the swap function so a
         // future caller (e.g. an admin "import config" handler) cannot
         // publish an invalid config to the hot path.
+        // FIPS gateway-document admission (issue #3510).
+        //
+        // This is the common swap boundary for file-mode SIGHUP reload,
+        // database poll application, and DP snapshot/delta application, so
+        // gating here means a document that could not start the gateway also
+        // cannot be hot-loaded into it. Rejection returns before any cache is
+        // rebuilt or swapped, so the last known-good config stays published.
+        // The check is inert when FIPS mode is off.
+        if let Err(error) = crate::fips::policy::check_gateway_config(&new_config) {
+            error!("Config reload rejected — FIPS policy: {}", error);
+            return ConfigApplyOutcome::rejected_one(format!("FIPS policy: {error}"));
+        }
+
         if let Err(errors) = self.validate_full_config_with_mesh_ids(&new_config, trusted_mesh_ids)
         {
             for msg in &errors {
@@ -9925,6 +9938,15 @@ impl ProxyState {
             &self.gateway_svid_bundle,
             &self.env_config.namespace,
         );
+        // `apply_incremental` publishes through a separate request-epoch path
+        // rather than delegating to `update_config`, so it needs the same FIPS
+        // document gate explicitly. Reject before any cache is staged or the
+        // epoch is swapped; database and CP/DP deltas then retain the last
+        // known-good configuration exactly like full reloads.
+        if let Err(error) = crate::fips::policy::check_gateway_config(&new_config) {
+            error!("Incremental config rejected — FIPS policy: {}", error);
+            return ConfigApplyOutcome::rejected_one(format!("FIPS policy: {error}"));
+        }
         if let Err(errors) = self.validate_full_config(&new_config) {
             return ConfigApplyOutcome::rejected(errors);
         }
@@ -35202,8 +35224,8 @@ pub(crate) fn build_sticky_cookie_header(
     target: &UpstreamTarget,
     config: &crate::config::types::HashOnCookieConfig,
 ) -> String {
+    use crate::fips::approved::Sha256;
     use crate::load_balancer::target_host_port_key;
-    use sha2::{Digest, Sha256};
 
     let raw = target_host_port_key(target);
     let value = hex::encode(Sha256::digest(raw.as_bytes()));

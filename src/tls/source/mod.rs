@@ -7,9 +7,9 @@
 
 pub mod subscription;
 
+use crate::fips::approved::Sha256;
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -660,6 +660,13 @@ fn load_secret_material(
     uri: &CertSourceUri,
     fallback_kind: MaterialKind,
 ) -> Result<MaterializedMaterial, MaterialError> {
+    crate::fips::policy::check_external_secret_uri_scheme(uri.scheme.as_str()).map_err(
+        |details| MaterialError::InvalidSource {
+            source_id: uri.redacted_source_id(),
+            details,
+        },
+    )?;
+
     if !secret_scheme_supported_in_build(uri.scheme) {
         return Err(MaterialError::UnsupportedScheme {
             scheme: uri.scheme.as_str(),

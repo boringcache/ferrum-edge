@@ -238,6 +238,49 @@ impl PluginTlsPosture {
         Self::FailClosedCaBundle { source_id, reason }
     }
 
+    /// Reduce a builder to a posture that can complete no request.
+    ///
+    /// Reached only when [`crate::fips::ensure_internal_client_crypto_provider`]
+    /// reports that the installed process-default rustls provider is not the
+    /// FIPS-approved one an enforcing process requires. There is no safe client
+    /// to hand back at that point and no error channel to return through —
+    /// these constructors are infallible by design — so the client is made
+    /// inert instead: an empty trust store means no server certificate can be
+    /// verified, and `https_only` means no plaintext fallback is attempted
+    /// either. Every outbound call then fails closed with a transport error,
+    /// which is the same shape callers already handle for an unreachable sink.
+    ///
+    /// This is applied *instead of* [`Self::apply`], never after it, and that
+    /// ordering is load-bearing rather than stylistic. `tls_certs_only`
+    /// **extends** the builder's root set — it does not replace it — so calling
+    /// it with an empty list after `CustomCaBundle` already pushed the
+    /// operator's roots leaves those roots in place and the "inert" client can
+    /// still verify and reach any peer under that CA. `SkipVerification` is
+    /// worse: it sets `danger_accept_invalid_certs(true)`, which nothing here
+    /// clears, so the client would accept every certificate and complete every
+    /// request. Certificate verification is therefore re-asserted explicitly
+    /// too, so a future reordering cannot silently reopen either hole.
+    fn apply_inert_crypto_posture(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        builder
+            .tls_danger_accept_invalid_certs(false)
+            .https_only(true)
+            .tls_certs_only(Vec::<reqwest::Certificate>::new())
+    }
+
+    /// Apply the configured posture, or the inert one when the process-default
+    /// crypto provider is not the approved provider this process requires.
+    fn apply_or_inert(
+        &self,
+        builder: reqwest::ClientBuilder,
+        inert: bool,
+    ) -> reqwest::ClientBuilder {
+        if inert {
+            Self::apply_inert_crypto_posture(builder)
+        } else {
+            self.apply(builder)
+        }
+    }
+
     fn apply(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
         match self {
             Self::PlatformRoots => builder,
@@ -292,6 +335,8 @@ fn build_dns_cached_fallback_client(
     tls_posture: &PluginTlsPosture,
     http2_prior_knowledge: bool,
 ) -> reqwest::Client {
+    let crypto_provider = crate::fips::ensure_internal_client_crypto_provider();
+    let provider_mismatch = crypto_provider.is_err();
     // Never auto-follow redirects on a shared outbound client (SSRF posture,
     // matches src/connection_pool.rs and the configured clients above).
     let mut builder = reqwest::Client::builder()
@@ -301,7 +346,15 @@ fn build_dns_cached_fallback_client(
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
     }
-    builder = tls_posture.apply(builder);
+    if let Err(error) = &crypto_provider {
+        tracing::error!(
+            %error,
+            "Refusing to build a usable plugin HTTP client: the process-default crypto provider \
+             is not the FIPS-approved one this enforcing process requires. The client is left \
+             unable to establish any connection."
+        );
+    }
+    builder = tls_posture.apply_or_inert(builder, provider_mismatch);
     if http2_prior_knowledge {
         builder = builder.http2_prior_knowledge();
     }
@@ -312,10 +365,11 @@ fn build_dns_cached_fallback_client(
              TLS posture as a last resort.",
             e
         );
-        let mut builder = tls_posture.apply(
+        let mut builder = tls_posture.apply_or_inert(
             reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none()),
+            provider_mismatch,
         );
         if http2_prior_knowledge {
             builder = builder.http2_prior_knowledge();
@@ -331,6 +385,9 @@ fn build_dns_cached_fallback_client(
                 let mut builder = reqwest::Client::builder()
                     .no_proxy()
                     .redirect(reqwest::redirect::Policy::none());
+                if provider_mismatch {
+                    builder = PluginTlsPosture::apply_inert_crypto_posture(builder);
+                }
                 if http2_prior_knowledge {
                     builder = builder.http2_prior_knowledge();
                 }
@@ -361,6 +418,7 @@ fn build_configured_plugin_client(
     tls_posture: &PluginTlsPosture,
     http2_prior_knowledge: bool,
 ) -> reqwest::Client {
+    let crypto_provider = crate::fips::ensure_internal_client_crypto_provider();
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
@@ -390,7 +448,17 @@ fn build_configured_plugin_client(
     //   - custom CA configured -> trust ONLY that parsed bundle
     //   - invalid custom CA    -> empty trust store (fail closed)
     //   - no CA configured     -> reqwest 0.13 defaults
-    builder = tls_posture.apply(builder);
+    //   - non-approved crypto provider under enforced FIPS -> inert (replaces
+    //     the configured posture outright; see `apply_inert_crypto_posture`)
+    if let Err(error) = &crypto_provider {
+        tracing::error!(
+            %error,
+            "Refusing to build a usable plugin HTTP client: the process-default crypto provider \
+             is not the FIPS-approved one this enforcing process requires. The client is left \
+             unable to establish any connection."
+        );
+    }
+    builder = tls_posture.apply_or_inert(builder, crypto_provider.is_err());
 
     if pool_config.enable_http_keep_alive {
         builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
@@ -1263,6 +1331,7 @@ mod fallback_tests {
     //! Targets a private helper, so these tests live inline.
     use super::*;
     use crate::dns::DnsConfig;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn fallback_client_builds_with_dns_cache() {
@@ -1332,30 +1401,61 @@ mod fallback_tests {
 
     #[tokio::test]
     async fn fallback_client_uses_dns_cache_resolver() {
-        // Verify the fallback client routes DNS through the gateway cache.
-        let dns_cache = DnsCache::new(DnsConfig::default());
-        let initial_len = dns_cache.cache_len();
+        // `.invalid` cannot resolve through system DNS. The request can reach
+        // this listener only when the fallback client uses the supplied cache's
+        // static override, making resolver attachment observable without a
+        // wall-clock race on asynchronous cache population.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fallback resolver test listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let hostname = "fallback-client-resolver.invalid";
+        let dns_cache = DnsCache::new(DnsConfig {
+            global_overrides: std::collections::HashMap::from([(
+                hostname.to_string(),
+                "127.0.0.1".to_string(),
+            )]),
+            ..DnsConfig::default()
+        });
         let client = build_dns_cached_fallback_client(
-            Some(dns_cache.clone()),
+            Some(dns_cache),
             &PluginTlsPosture::PlatformRoots,
             false,
         );
 
-        let _ = client
-            .get("http://localhost:1/")
-            .timeout(Duration::from_millis(100))
-            .send()
-            .await;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
+                .await
+                .expect("fallback resolver connection timed out")
+                .expect("accept fallback resolver connection");
+            let mut request = [0u8; 1024];
+            let request_len = socket
+                .read(&mut request)
+                .await
+                .expect("read fallback resolver request");
+            assert!(
+                request
+                    .get(..request_len)
+                    .is_some_and(|bytes| bytes.starts_with(b"GET ")),
+                "fallback resolver listener did not receive an HTTP request"
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write fallback resolver response");
+        });
 
-        let after_len = dns_cache.cache_len();
-        assert!(
-            after_len > initial_len,
-            "DNS cache should have populated via the cached resolver \
-             (initial={}, after={}). If the fallback bypassed the resolver \
-             via a default reqwest client, the cache would stay empty.",
-            initial_len,
-            after_len
-        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            client.get(format!("http://{hostname}:{port}/")).send(),
+        )
+        .await
+        .expect("fallback resolver request timed out")
+        .expect("fallback client must resolve the override-only hostname");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        server.await.expect("fallback resolver test server failed");
     }
 }
 

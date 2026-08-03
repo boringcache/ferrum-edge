@@ -1,5 +1,5 @@
+use crate::fips::approved::Sha256;
 use dashmap::DashMap;
-use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

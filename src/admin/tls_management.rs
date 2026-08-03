@@ -1596,7 +1596,7 @@ fn validate_cert_key_pair(
 
     let versions = [&rustls::version::TLS13, &rustls::version::TLS12];
     let builder =
-        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        ServerConfig::builder_with_provider(Arc::new(crate::fips::base_crypto_provider()))
             .with_protocol_versions(&versions)
             .map_err(|error| format!("failed to set TLS protocol versions: {error}"))?;
     let cert_count = cert_chain.len();

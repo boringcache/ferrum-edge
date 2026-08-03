@@ -1,3 +1,4 @@
+use crate::fips::approved::Sha256;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -9,7 +10,6 @@ use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use super::auth_flow::constant_time_eq;
 use super::claim_resolver::extract_claim_string;
