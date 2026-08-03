@@ -380,13 +380,21 @@ impl http_body::Body for GrpcBody {
                 if *cancelled_terminal {
                     return Poll::Ready(None);
                 }
+                // Poll the queue before the cancellation acquire. This makes
+                // the acquire below the linearization point for a ready frame:
+                // shutdown published while `poll_recv` is observing queued
+                // DATA discards that frame instead of letting one final chunk
+                // cross the backend boundary. If the queue is pending, the
+                // response-side shutdown also wakes the pump, whose sender
+                // drop wakes this receiver.
+                let next_frame = receiver.poll_recv(cx);
                 if cancelled.load(Ordering::Acquire) {
                     *cancelled_terminal = true;
                     return Poll::Ready(Some(Err(
                         "gRPC request body upload cancelled before downstream EOF".into(),
                     )));
                 }
-                match receiver.poll_recv(cx) {
+                match next_frame {
                     Poll::Ready(Some(Ok(frame))) => {
                         if let Some(data) = frame.data_ref() {
                             if *max_bytes > 0 {
