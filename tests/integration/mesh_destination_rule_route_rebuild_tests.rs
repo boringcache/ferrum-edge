@@ -185,6 +185,14 @@ fn sd_upstream() -> Upstream {
     }
 }
 
+fn unrelated_upstream() -> Upstream {
+    let mut upstream = sd_upstream();
+    upstream.id = "ratings-u".to_string();
+    upstream.name = Some("ratings.default.svc.cluster.local".to_string());
+    upstream.targets[0].host = "ratings.default.svc.cluster.local".to_string();
+    upstream
+}
+
 fn destination_rule(idle_ms: Option<u64>, tls_sni: Option<&str>) -> MeshDestinationRule {
     MeshDestinationRule {
         name: "reviews-dr".to_string(),
@@ -824,6 +832,9 @@ async fn update_config_rebuilds_lb_for_projected_dr_change_with_unrelated_consum
     new_config
         .consumers
         .push(unrelated_consumer("c-unrelated", "unrelated-user"));
+    let unrelated = unrelated_upstream();
+    old_config.upstreams.push(unrelated.clone());
+    new_config.upstreams.push(unrelated);
     new_config.normalize_fields();
 
     let delta = ferrum_edge::config_delta::ConfigDelta::compute(&old_config, &new_config);
@@ -846,6 +857,11 @@ async fn update_config_rebuilds_lb_for_projected_dr_change_with_unrelated_consum
 
     old_config.normalize_fields();
     let (state, _handles) = new_proxy_state(old_config);
+    let unrelated_before = state
+        .load_balancer_cache
+        .load()
+        .get_balancer("default", "ratings-u")
+        .expect("unrelated upstream balancer");
     assert_eq!(
         lb_effective_algorithm(&state, Some(8080)),
         LoadBalancerAlgorithm::RoundRobin
@@ -903,6 +919,15 @@ async fn update_config_rebuilds_lb_for_projected_dr_change_with_unrelated_consum
             .find_by_username("unrelated-user")
             .is_some(),
         "unrelated consumer delta must still publish into the consumer index"
+    );
+    let unrelated_after = state
+        .load_balancer_cache
+        .load()
+        .get_balancer("default", "ratings-u")
+        .expect("unrelated upstream balancer after projected DR update");
+    assert!(
+        Arc::ptr_eq(&unrelated_before, &unrelated_after),
+        "a projected DR edit must preserve unrelated RR/WRR/latency state"
     );
 }
 
