@@ -753,13 +753,15 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
             assert_eq!(
                 actual
                     .query_pairs()
-                    .find_map(|(key, value)| (key == "post_logout_redirect_uri").then(|| value)),
+                    .find_map(|(key, value)| {
+                        (key == "post_logout_redirect_uri").then_some(value)
+                    }),
                 Some("http://127.0.0.1/".into())
             );
             assert_eq!(
                 actual
                     .query_pairs()
-                    .find_map(|(key, value)| (key == "client_id").then(|| value)),
+                    .find_map(|(key, value)| (key == "client_id").then_some(value)),
                 Some(client.client_id.as_str().into())
             );
             assert_cookie_cleared(&headers, cookie_name(&renewed));
