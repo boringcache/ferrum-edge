@@ -5,7 +5,10 @@ use ferrum_edge::config::types::{
     ActiveHealthCheck, AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig,
     HealthProbeType, MAX_TCP_IDLE_TIMEOUT, Proxy,
 };
-use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
+use ferrum_edge::proxy::stream_match::{
+    MAX_STREAM_MATCH_ARMS, StreamMatchArm, StreamMatchCriteria,
+};
+use std::collections::BTreeMap;
 
 fn make_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
     Proxy {
@@ -302,6 +305,77 @@ fn test_stream_match_is_rejected_for_unimplemented_datagram_path() {
             "{scheme} must not silently ignore stream_match: {errors:?}"
         );
     }
+}
+
+#[test]
+fn test_direct_stream_match_rejects_invalid_kubernetes_identity_fields() {
+    let invalid_arms = [
+        StreamMatchArm {
+            source_labels: BTreeMap::from([("bad key".to_string(), "ok".to_string())]),
+            ..Default::default()
+        },
+        StreamMatchArm {
+            source_labels: BTreeMap::from([("app".to_string(), "bad/value".to_string())]),
+            ..Default::default()
+        },
+        StreamMatchArm {
+            source_namespace: Some("Team_A".to_string()),
+            ..Default::default()
+        },
+        StreamMatchArm {
+            gateways: vec!["ingress".to_string()],
+            ..Default::default()
+        },
+        StreamMatchArm {
+            gateways: vec!["team-a/Bad_Name".to_string()],
+            ..Default::default()
+        },
+        StreamMatchArm {
+            source_subnets: vec!["10.0.0.0/999".to_string()],
+            ..Default::default()
+        },
+    ];
+
+    for arm in invalid_arms {
+        let mut proxy = make_stream_proxy("invalid-direct-match", BackendScheme::Tcp, 5432);
+        proxy.stream_match = Some(StreamMatchCriteria { arms: vec![arm] });
+        let errors = proxy.validate_fields().unwrap_err();
+        assert!(
+            errors.iter().any(|error| error.contains("stream_match")),
+            "direct config must reject invalid matcher fields: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn test_direct_stream_match_accepts_empty_kubernetes_label_value() {
+    let mut proxy = make_stream_proxy("empty-label-value", BackendScheme::Tcp, 5432);
+    proxy.stream_match = Some(StreamMatchCriteria {
+        arms: vec![StreamMatchArm {
+            source_labels: BTreeMap::from([("app.kubernetes.io/name".to_string(), String::new())]),
+            ..Default::default()
+        }],
+    });
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_direct_stream_match_enforces_public_arm_bound() {
+    let mut proxy = make_stream_proxy("too-many-arms", BackendScheme::Tcp, 5432);
+    proxy.stream_match = Some(StreamMatchCriteria {
+        arms: (0..=MAX_STREAM_MATCH_ARMS)
+            .map(|_| StreamMatchArm {
+                gateways: vec!["mesh".to_string()],
+                ..Default::default()
+            })
+            .collect(),
+    });
+    let errors = proxy.validate_fields().unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("at most") && error.contains("arms"))
+    );
 }
 
 #[test]

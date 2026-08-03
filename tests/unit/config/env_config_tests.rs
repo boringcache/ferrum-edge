@@ -396,6 +396,100 @@ fn test_env_config_mesh_mode_valid() {
 }
 
 #[test]
+fn test_stream_gateway_ref_defaults_only_for_mesh_sidecar() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_MESH_TOPOLOGY", "sidecar"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_ALLOW_NO_CA", "true"),
+        ],
+        || {
+            remove_var("FERRUM_STREAM_GATEWAY_REF");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.stream_gateway_ref.as_deref(), Some("mesh"));
+        },
+    );
+
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_ALLOW_NO_CA", "true"),
+        ],
+        || {
+            remove_var("FERRUM_STREAM_GATEWAY_REF");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.stream_gateway_ref.is_none());
+        },
+    );
+
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_STREAM_GATEWAY_REF");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.stream_gateway_ref.is_none());
+        },
+    );
+}
+
+#[test]
+fn test_stream_gateway_ref_is_strict_and_empty_clears_binding() {
+    for valid in ["mesh", "istio-system/ingress"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_STREAM_GATEWAY_REF", valid),
+            ],
+            || {
+                let config = EnvConfig::from_env().unwrap();
+                assert_eq!(config.stream_gateway_ref.as_deref(), Some(valid));
+            },
+        );
+    }
+
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_STREAM_GATEWAY_REF", ""),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.stream_gateway_ref.is_none());
+        },
+    );
+
+    for invalid in ["ingress", " Team-a/ingress", "Team-a/ingress", "ns/name/extra"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_STREAM_GATEWAY_REF", invalid),
+            ],
+            || {
+                let error = EnvConfig::from_env().unwrap_err();
+                assert!(error.contains("FERRUM_STREAM_GATEWAY_REF"), "got: {error}");
+            },
+        );
+    }
+}
+
+#[test]
 fn test_env_config_injector_mode_valid() {
     with_env_vars(&[("FERRUM_MODE", "injector")], || {
         let config = EnvConfig::from_env().unwrap();

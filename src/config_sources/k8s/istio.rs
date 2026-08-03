@@ -2487,7 +2487,7 @@ fn parse_l4_match_arm(
                 format!("VirtualService {kind}[] match.sourceNamespace must not be empty"),
             ));
         }
-        crate::config::types::validate_namespace(ns).map_err(|e| {
+        crate::proxy::stream_match::validate_kubernetes_namespace(ns).map_err(|e| {
             invalid_resource(
                 object,
                 format!("VirtualService {kind}[] match.sourceNamespace: {e}"),

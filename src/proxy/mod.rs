@@ -7039,6 +7039,7 @@ impl ProxyState {
                 env_config_arc.pool_shard_amount,
                 health_checker.clone(),
                 mesh_outbound_enforcement.clone(),
+                env_config_arc.stream_gateway_ref.clone(),
                 trusted_proxies.clone(),
             ),
         );

@@ -3,7 +3,7 @@
 use ferrum_edge::proxy::stream_match::{
     CompiledStreamMatch, StreamMatchArm, StreamMatchCriteria, StreamMatchEvidence,
     canonicalize_gateway_name, resolve_shared_stream_proxy_in_epoch, source_namespace_from_spiffe,
-    trusted_stream_gateway_ref, trustworthy_source_labels,
+    validate_canonical_gateway_ref, trustworthy_source_labels,
 };
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -121,16 +121,14 @@ fn combined_predicates_require_all_evidence() {
 }
 
 #[test]
-fn gateway_canonicalize_and_default_binding() {
+fn gateway_canonicalize_and_validate_binding() {
     assert_eq!(
         canonicalize_gateway_name("ingress", "bookinfo").unwrap(),
         "bookinfo/ingress"
     );
-    assert_eq!(
-        trusted_stream_gateway_ref().as_deref(),
-        Some("mesh"),
-        "unset FERRUM_STREAM_GATEWAY_REF defaults to mesh"
-    );
+    assert!(validate_canonical_gateway_ref("mesh").is_ok());
+    assert!(validate_canonical_gateway_ref("bookinfo/ingress").is_ok());
+    assert!(validate_canonical_gateway_ref("ingress").is_err());
     assert_eq!(
         source_namespace_from_spiffe("spiffe://cluster.local/ns/prod/sa/web").as_deref(),
         Some("prod")

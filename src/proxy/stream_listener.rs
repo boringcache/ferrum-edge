@@ -716,6 +716,9 @@ pub struct StreamListenerManager {
     /// — readers short-circuit on the contained `Option::None`.
     mesh_outbound_enforcement:
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    /// Immutable trusted gateway binding parsed during EnvConfig admission.
+    /// Cloned into TCP listener/accept state as an `Arc` pointer only.
+    stream_gateway_ref: Option<Arc<str>>,
     /// Node-waypoint identity resolver shared with `ProxyState`. Present only
     /// in `NodeWaypoint` topology; `None` everywhere else. When set, each
     /// spawned **TCP** stream accept loop resolves the accepted connection's
@@ -877,6 +880,7 @@ impl StreamListenerManager {
             0,
             Arc::new(HealthChecker::new()),
             crate::modes::mesh::outbound_enforcement::empty_slot(),
+            None,
             trusted_proxies,
         )
     }
@@ -916,6 +920,7 @@ impl StreamListenerManager {
         health_checker: Arc<HealthChecker>,
         mesh_outbound_enforcement:
             crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+        stream_gateway_ref: Option<Arc<str>>,
         trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
     ) -> Self {
         Self {
@@ -959,6 +964,7 @@ impl StreamListenerManager {
             global_shutdown_rx: arc_swap::ArcSwap::new(Arc::new(None)),
             backend_tls_reload_epoch: Arc::new(AtomicU64::new(0)),
             mesh_outbound_enforcement,
+            stream_gateway_ref,
             node_waypoint_identity_resolver: arc_swap::ArcSwap::new(Arc::new(None)),
             trusted_proxies,
         }
@@ -1811,6 +1817,7 @@ impl StreamListenerManager {
                 let listener_udp_metrics = Some(metrics.clone());
                 let global_shutdown_for_listener = global_shutdown.clone();
                 let mesh_outbound_enforcement = self.mesh_outbound_enforcement.clone();
+                let stream_gateway_ref = self.stream_gateway_ref.clone();
                 let bind_failures = Arc::clone(&self.bind_failures);
                 let async_bind_failures = Arc::clone(&self.async_bind_failures);
                 let async_failure_tx = async_failure_tx.clone();
@@ -1991,6 +1998,7 @@ impl StreamListenerManager {
                         io_uring_splice_enabled,
                         record_mesh_mtls_metric,
                         mesh_outbound_enforcement,
+                        stream_gateway_ref,
                         node_waypoint_identity_resolver,
                         trusted_proxies,
                     })

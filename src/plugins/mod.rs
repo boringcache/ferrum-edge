@@ -7028,7 +7028,7 @@ pub struct StreamConnectionContext {
     /// Listener-configured gateway binding for VirtualService L4 `gateways`
     /// matching (`mesh` or `namespace/name`). Never inferred from untrusted
     /// wire data.
-    pub trusted_gateway_ref: Option<String>,
+    pub trusted_gateway_ref: Option<Arc<str>>,
 }
 
 impl StreamConnectionContext {

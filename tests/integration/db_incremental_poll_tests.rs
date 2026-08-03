@@ -12,8 +12,9 @@ use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
     PluginScope, Proxy, Upstream, UpstreamTarget, default_namespace,
 };
+use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tempfile::TempDir;
 
 async fn sqlite_store() -> (DatabaseStore, TempDir) {
@@ -144,6 +145,101 @@ fn test_proxy(id: &str, listen_path: &str, plugins: Vec<PluginAssociation>) -> P
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_proxy_stream_match_round_trips_and_updates_without_widening() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let start_sequence = store
+        .latest_change_sequence("ferrum")
+        .await
+        .expect("latest sequence must load");
+    let mut proxy = test_proxy("stream-match-round-trip", "/unused", Vec::new());
+    proxy.listen_path = None;
+    proxy.backend_scheme = Some(BackendScheme::Tcp);
+    proxy.dispatch_kind = DispatchKind::TcpRaw;
+    proxy.listen_port = Some(15432);
+    proxy.stream_match = Some(StreamMatchCriteria {
+        arms: vec![StreamMatchArm {
+            source_labels: BTreeMap::from([("app".to_string(), "billing".to_string())]),
+            source_subnets: vec!["10.0.0.0/8".to_string()],
+            gateways: vec!["mesh".to_string()],
+            ..Default::default()
+        }],
+    });
+    let created_match = proxy.stream_match.clone();
+
+    store
+        .create_proxy(&proxy)
+        .await
+        .expect("proxy matcher create must persist");
+    let created = store
+        .get_proxy("ferrum", &proxy.id)
+        .await
+        .expect("created proxy matcher must decode")
+        .expect("created proxy must exist");
+    assert_eq!(created.stream_match, created_match);
+    assert!(created.compiled_stream_match.is_some());
+
+    let full = store
+        .load_full_config("ferrum")
+        .await
+        .expect("full SQL config load must preserve matcher");
+    assert_eq!(full.proxies[0].stream_match, created_match);
+    assert!(full.proxies[0].compiled_stream_match.is_some());
+
+    let created_delta = store
+        .load_incremental_config("ferrum", start_sequence)
+        .await
+        .expect("incremental create must preserve matcher");
+    assert_eq!(created_delta.added_or_modified_proxies[0].stream_match, created_match);
+    assert!(
+        created_delta.added_or_modified_proxies[0]
+            .compiled_stream_match
+            .is_some()
+    );
+
+    proxy.stream_match = Some(StreamMatchCriteria {
+        arms: vec![StreamMatchArm {
+            source_namespace: Some("payments".to_string()),
+            destination_subnets: vec!["192.0.2.10/32".to_string()],
+            gateways: vec!["istio-system/ingress".to_string()],
+            ..Default::default()
+        }],
+    });
+    proxy.updated_at = Utc::now();
+    let updated_match = proxy.stream_match.clone();
+    assert!(
+        store
+            .update_proxy(&proxy)
+            .await
+            .expect("proxy matcher update must persist")
+    );
+    let updated = store
+        .get_proxy("ferrum", &proxy.id)
+        .await
+        .expect("updated proxy matcher must decode")
+        .expect("updated proxy must exist");
+    assert_eq!(updated.stream_match, updated_match);
+    assert!(updated.compiled_stream_match.is_some());
+    let updated_delta = store
+        .load_incremental_config("ferrum", created_delta.sequence_cursor)
+        .await
+        .expect("incremental update must preserve matcher");
+    assert_eq!(updated_delta.added_or_modified_proxies[0].stream_match, updated_match);
+
+    sqlx::query("UPDATE proxies SET stream_match = ? WHERE id = ? AND namespace = ?")
+        .bind("{not-json")
+        .bind(&proxy.id)
+        .bind(&proxy.namespace)
+        .execute(&store.pool())
+        .await
+        .expect("corrupt matcher fixture update must succeed");
+    let error = store
+        .get_proxy("ferrum", &proxy.id)
+        .await
+        .expect_err("malformed persisted matcher must fail closed");
+    assert!(error.to_string().contains("failed to parse stream_match JSON"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

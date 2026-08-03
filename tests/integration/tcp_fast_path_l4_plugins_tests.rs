@@ -374,6 +374,7 @@ async fn try_spawn_fast_path_gateway(
             record_mesh_mtls_metric: false,
             mesh_outbound_enforcement: ferrum_edge::modes::mesh::outbound_enforcement::empty_slot(),
             node_waypoint_identity_resolver: None,
+            stream_gateway_ref: None,
             trusted_proxies: Arc::new(TrustedProxies::none()),
         };
         tokio::spawn(async move {

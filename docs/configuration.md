@@ -781,6 +781,7 @@ See [docs/http3.md](http3.md) for the full HTTP/3 dispatch model, cross-protocol
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
+| `FERRUM_STREAM_GATEWAY_REF` | No | `mesh` only in `mesh` mode with Sidecar topology; otherwise none | Trusted process/listener binding for VirtualService L4 `gateways`: exact `mesh`, empty to clear the binding (gateway predicates deny), or canonical lowercase Kubernetes `namespace/name`. Short names, whitespace, and malformed values fail startup. The binding is parsed once and is never derived from wire data. |
 | `FERRUM_STREAM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for TCP/UDP/DTLS stream proxy listeners |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | No | `300` | Default TCP idle timeout; `0` disables |
 | `FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS` | No | `300` | Hard cap for TCP half-close drain; the userspace `copy_bidirectional` fast path requires this, `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`, `backend_read_timeout_ms`, and `backend_write_timeout_ms` all set to `0`. Linux splice paths enforce these bounds inline and do not require disabling them. |

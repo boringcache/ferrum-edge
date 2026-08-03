@@ -7,6 +7,20 @@
 const SQL_DIALECT_SOURCE: &str = include_str!("../../../src/config/migrations/sql_dialect.rs");
 
 #[test]
+fn proxy_stream_match_is_in_every_v001_sql_dialect() {
+    assert_eq!(
+        SQL_DIALECT_SOURCE.matches("stream_match MEDIUMTEXT").count(),
+        1,
+        "MySQL V001 must persist bounded matcher JSON in MEDIUMTEXT"
+    );
+    assert_eq!(
+        SQL_DIALECT_SOURCE.matches("stream_match TEXT").count(),
+        1,
+        "Postgres/SQLite V001 must persist matcher JSON in TEXT"
+    );
+}
+
+#[test]
 fn upstream_namespace_name_unique_index_across_dialects() {
     // Issue #2999: upstream (namespace, name) uniqueness must be a durable
     // DB invariant, not only an advisory admin precheck.

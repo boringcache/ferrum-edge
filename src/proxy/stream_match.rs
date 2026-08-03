@@ -13,7 +13,6 @@
 //! predicate that requires it — never match by absence or client-controlled
 //! headers.
 
-use crate::config::types::validate_namespace;
 use crate::identity::spiffe::SpiffeId;
 use crate::util::cidr::CidrSet;
 use serde::{Deserialize, Serialize};
@@ -22,6 +21,16 @@ use std::net::IpAddr;
 
 /// Reserved Istio gateway token meaning "apply on the mesh / sidecar".
 pub const MESH_GATEWAY_TOKEN: &str = "mesh";
+
+/// Admission bounds for the serialized L4 matcher carrier. These limits keep
+/// hand-authored/admin/file config at parity with the public OpenAPI schema and
+/// bound cold-path compilation plus SQL/Mongo document size.
+pub const MAX_STREAM_MATCH_ARMS: usize = 64;
+pub const MAX_STREAM_MATCH_LABELS: usize = 64;
+pub const MAX_STREAM_MATCH_SUBNETS: usize = 64;
+pub const MAX_STREAM_MATCH_GATEWAYS: usize = 64;
+pub const MAX_STREAM_MATCH_CIDR_LENGTH: usize = 64;
+pub const MAX_STREAM_MATCH_GATEWAY_LENGTH: usize = 127;
 
 /// Serializable L4 match carrier stored on a stream [`Proxy`](crate::config::types::Proxy).
 ///
@@ -68,6 +77,11 @@ impl StreamMatchCriteria {
     /// Compile into the allocation-free hot-path matcher. Fails closed on any
     /// unrepresentable CIDR / empty gateway token that slipped past admission.
     pub fn compile(&self) -> Result<CompiledStreamMatch, String> {
+        if self.arms.len() > MAX_STREAM_MATCH_ARMS {
+            return Err(format!(
+                "arms must contain at most {MAX_STREAM_MATCH_ARMS} entries"
+            ));
+        }
         let mut arms = Vec::with_capacity(self.arms.len());
         for (index, arm) in self.arms.iter().enumerate() {
             arms.push(
@@ -81,25 +95,56 @@ impl StreamMatchCriteria {
 
 impl StreamMatchArm {
     fn compile(&self) -> Result<CompiledStreamMatchArm, String> {
+        if self.source_labels.is_empty()
+            && self.source_namespace.is_none()
+            && self.source_subnets.is_empty()
+            && self.destination_subnets.is_empty()
+            && self.gateways.is_empty()
+        {
+            return Err("match arm must contain at least one predicate".to_string());
+        }
+        if self.source_labels.len() > MAX_STREAM_MATCH_LABELS {
+            return Err(format!(
+                "source_labels must contain at most {MAX_STREAM_MATCH_LABELS} entries"
+            ));
+        }
+        if self.source_subnets.len() > MAX_STREAM_MATCH_SUBNETS {
+            return Err(format!(
+                "source_subnets must contain at most {MAX_STREAM_MATCH_SUBNETS} entries"
+            ));
+        }
+        if self.destination_subnets.len() > MAX_STREAM_MATCH_SUBNETS {
+            return Err(format!(
+                "destination_subnets must contain at most {MAX_STREAM_MATCH_SUBNETS} entries"
+            ));
+        }
+        if self.gateways.len() > MAX_STREAM_MATCH_GATEWAYS {
+            return Err(format!(
+                "gateways must contain at most {MAX_STREAM_MATCH_GATEWAYS} entries"
+            ));
+        }
         let source_subnets = compile_cidr_list(&self.source_subnets, "source_subnets")?;
         let destination_subnets =
             compile_cidr_list(&self.destination_subnets, "destination_subnets")?;
-        for gateway in &self.gateways {
-            if gateway.is_empty() {
-                return Err("gateways entry must not be empty".to_string());
+        for (key, value) in &self.source_labels {
+            if !valid_kubernetes_label_key(key) {
+                return Err(format!(
+                    "source_labels key '{key}' is not a valid Kubernetes label key"
+                ));
+            }
+            if !valid_kubernetes_label_value(value) {
+                return Err(format!(
+                    "source_labels['{key}'] is not a valid Kubernetes label value"
+                ));
             }
         }
-        // Labels / namespace are validated at translation; re-check empties so a
-        // hand-authored Proxy cannot widen by omission.
-        if self
-            .source_labels
-            .keys()
-            .any(|k| k.is_empty() || k.chars().all(char::is_whitespace))
-        {
-            return Err("source_labels keys must be non-empty".to_string());
-        }
         if let Some(ns) = self.source_namespace.as_deref() {
-            validate_namespace(ns).map_err(|e| format!("source_namespace: {e}"))?;
+            validate_kubernetes_namespace(ns)
+                .map_err(|e| format!("source_namespace: {e}"))?;
+        }
+        for (index, gateway) in self.gateways.iter().enumerate() {
+            validate_canonical_gateway_ref(gateway)
+                .map_err(|e| format!("gateways[{index}]: {e}"))?;
         }
         Ok(CompiledStreamMatchArm {
             source_labels: self.source_labels.clone(),
@@ -125,6 +170,11 @@ fn compile_cidr_list(entries: &[String], field: &str) -> Result<CidrSet, String>
     for (i, entry) in entries.iter().enumerate() {
         if entry.trim().is_empty() {
             return Err(format!("{field}[{i}] must be a non-empty CIDR or IP"));
+        }
+        if entry.len() > MAX_STREAM_MATCH_CIDR_LENGTH {
+            return Err(format!(
+                "{field}[{i}] must be at most {MAX_STREAM_MATCH_CIDR_LENGTH} characters"
+            ));
         }
     }
     CidrSet::parse_strict(&entries.join(",")).map_err(|e| format!("{field}: {e}"))
@@ -357,7 +407,8 @@ impl CompiledStreamMatchArm {
 /// would force an object-safe `Debug` supertrait on every label map.
 #[derive(Clone, Copy, Default)]
 pub struct StreamMatchEvidence<'a> {
-    /// Socket-peer / direct client IP (`source.ip`). Never from client headers.
+    /// Authoritative client IP after the trusted PROXY boundary (or direct
+    /// socket peer without PROXY protocol). Never from client headers.
     pub source_ip: Option<IpAddr>,
     /// Original destination IP (`SO_ORIGINAL_DST` / capture metadata).
     pub destination_ip: Option<IpAddr>,
@@ -491,15 +542,53 @@ pub fn canonicalize_gateway_name(raw: &str, vs_namespace: &str) -> Result<String
                 "gateway '{trimmed}' must be 'mesh', '<name>', or '<namespace>/<name>'"
             ));
         }
-        validate_namespace(ns).map_err(|e| format!("gateway namespace: {e}"))?;
+        validate_kubernetes_namespace(ns).map_err(|e| format!("gateway namespace: {e}"))?;
         validate_gateway_name_segment(name)?;
         Ok(format!("{ns}/{name}"))
     } else {
         validate_gateway_name_segment(trimmed)?;
-        validate_namespace(vs_namespace)
+        validate_kubernetes_namespace(vs_namespace)
             .map_err(|e| format!("VirtualService namespace for gateway qualification: {e}"))?;
         Ok(format!("{vs_namespace}/{trimmed}"))
     }
+}
+
+/// Validate the exact process/listener gateway binding accepted from
+/// `FERRUM_STREAM_GATEWAY_REF`. Unlike VirtualService translation, a short
+/// gateway name has no trustworthy namespace context and is therefore rejected.
+pub fn validate_canonical_gateway_ref(raw: &str) -> Result<(), String> {
+    if raw.len() > MAX_STREAM_MATCH_GATEWAY_LENGTH {
+        return Err(format!(
+            "gateway reference must be at most {MAX_STREAM_MATCH_GATEWAY_LENGTH} characters"
+        ));
+    }
+    if raw == MESH_GATEWAY_TOKEN {
+        return Ok(());
+    }
+    if raw.trim() != raw {
+        return Err("gateway reference must not contain surrounding whitespace".to_string());
+    }
+    let Some((namespace, name)) = raw.split_once('/') else {
+        return Err(
+            "gateway reference must be 'mesh' or canonical '<namespace>/<name>'".to_string(),
+        );
+    };
+    if namespace.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(
+            "gateway reference must be 'mesh' or canonical '<namespace>/<name>'".to_string(),
+        );
+    }
+    validate_kubernetes_namespace(namespace).map_err(|e| format!("gateway namespace: {e}"))?;
+    validate_gateway_name_segment(name)
+}
+
+/// Validate a Kubernetes namespace (DNS-1123 label, 1-63 bytes).
+pub fn validate_kubernetes_namespace(namespace: &str) -> Result<(), String> {
+    validate_gateway_name_segment(namespace).map_err(|_| {
+        format!(
+            "namespace '{namespace}' must be a lowercase DNS-1123 label (1-63 chars)"
+        )
+    })
 }
 
 fn validate_gateway_name_segment(name: &str) -> Result<(), String> {
@@ -577,25 +666,6 @@ fn valid_kubernetes_label_name(value: &str) -> bool {
             .as_bytes()
             .last()
             .is_some_and(|byte| byte.is_ascii_alphanumeric())
-}
-
-/// Resolve the trusted VirtualService L4 gateway binding for this process.
-///
-/// Precedence:
-/// 1. Explicit `FERRUM_STREAM_GATEWAY_REF` (`mesh` or `namespace/name`); an
-///    empty value clears the binding (gateway predicates deny).
-/// 2. Otherwise the reserved `mesh` token — Istio's default when gateways are
-///    omitted. Named-gateway data planes must set `FERRUM_STREAM_GATEWAY_REF`
-///    explicitly; the binding is never inferred from untrusted wire data.
-pub fn trusted_stream_gateway_ref() -> Option<String> {
-    if let Some(raw) = crate::config::conf_file::resolve_ferrum_var("FERRUM_STREAM_GATEWAY_REF") {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        return Some(trimmed.to_string());
-    }
-    Some(MESH_GATEWAY_TOKEN.to_string())
 }
 
 /// Extract the source namespace from a peer SPIFFE ID string when present.
