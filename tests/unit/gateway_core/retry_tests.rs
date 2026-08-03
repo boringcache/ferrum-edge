@@ -372,6 +372,20 @@ fn http_retry_re_resolves_mesh_transport_before_each_dispatch() {
         !retry_body.contains("direct_http_mesh_transport_refusal("),
         "generic retry loop must dispatch the secured transport, not refuse it"
     );
+
+    let mesh_unavailable = retry_body
+        .find("Mesh retry target cannot be dispatched securely; failing closed")
+        .expect("mesh transport unavailable fail-closed not found");
+    let grpc_shape = retry_body[mesh_unavailable..]
+        .find("mesh_grpc_unavailable_response(")
+        .expect("gRPC mesh-unavailable fail-closed must use Trailers-Only UNAVAILABLE");
+    let json_shape = retry_body[mesh_unavailable..]
+        .find("Mesh transport dispatch required for this backend target")
+        .expect("plain HTTP mesh-unavailable fail-closed must keep JSON 502");
+    assert!(
+        grpc_shape < json_shape,
+        "is_grpc_request must select mesh_grpc_unavailable_response before the JSON 502 arm"
+    );
 }
 
 #[test]

@@ -29887,19 +29887,32 @@ async fn handle_proxy_request_inner(
                     reason,
                     "Mesh retry target cannot be dispatched securely; failing closed"
                 );
-                result = retry::BackendResponse {
-                    status_code: 502,
-                    body: ResponseBody::buffered(
-                        br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#
-                            .to_vec(),
-                    ),
-                    headers: HashMap::from([(
-                        "gateway-error-reason".to_string(),
-                        reason.to_string(),
-                    )]),
-                    connection_error: false,
-                    backend_resolved_ip: None,
-                    error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                // Mirror the initial mesh transport gate: gRPC-flavored requests
+                // that reached this generic retry planner (sidecar mTLS fallthrough
+                // or pass-through gRPC-Web over HBONE) must fail closed with a
+                // Trailers-Only UNAVAILABLE, never a JSON 502 the client cannot
+                // parse. Plain HTTP keeps the Bad Gateway shape.
+                result = if is_grpc_request {
+                    mesh_grpc_unavailable_response(
+                        None,
+                        reason,
+                        retry::ErrorClass::DispatchPolicyRejected,
+                    )
+                } else {
+                    retry::BackendResponse {
+                        status_code: 502,
+                        body: ResponseBody::buffered(
+                            br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#
+                                .to_vec(),
+                        ),
+                        headers: HashMap::from([(
+                            "gateway-error-reason".to_string(),
+                            reason.to_string(),
+                        )]),
+                        connection_error: false,
+                        backend_resolved_ip: None,
+                        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                    }
                 };
                 final_upstream_target = current_target.clone();
                 backend_admission_started_at = Instant::now();
