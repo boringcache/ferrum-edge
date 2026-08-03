@@ -3,7 +3,7 @@
 use ferrum_edge::proxy::stream_match::{
     CompiledStreamMatch, StreamMatchArm, StreamMatchCriteria, StreamMatchEvidence,
     canonicalize_gateway_name, resolve_shared_stream_proxy_in_epoch, source_namespace_from_spiffe,
-    validate_canonical_gateway_ref, trustworthy_source_labels,
+    trustworthy_source_labels, validate_canonical_gateway_ref,
 };
 use std::collections::BTreeMap;
 use std::net::IpAddr;

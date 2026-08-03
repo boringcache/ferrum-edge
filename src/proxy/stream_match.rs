@@ -139,8 +139,7 @@ impl StreamMatchArm {
             }
         }
         if let Some(ns) = self.source_namespace.as_deref() {
-            validate_kubernetes_namespace(ns)
-                .map_err(|e| format!("source_namespace: {e}"))?;
+            validate_kubernetes_namespace(ns).map_err(|e| format!("source_namespace: {e}"))?;
         }
         for (index, gateway) in self.gateways.iter().enumerate() {
             validate_canonical_gateway_ref(gateway)

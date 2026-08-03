@@ -192,7 +192,10 @@ async fn sql_proxy_stream_match_round_trips_and_updates_without_widening() {
         .load_incremental_config("ferrum", start_sequence)
         .await
         .expect("incremental create must preserve matcher");
-    assert_eq!(created_delta.added_or_modified_proxies[0].stream_match, created_match);
+    assert_eq!(
+        created_delta.added_or_modified_proxies[0].stream_match,
+        created_match
+    );
     assert!(
         created_delta.added_or_modified_proxies[0]
             .compiled_stream_match
@@ -226,7 +229,10 @@ async fn sql_proxy_stream_match_round_trips_and_updates_without_widening() {
         .load_incremental_config("ferrum", created_delta.sequence_cursor)
         .await
         .expect("incremental update must preserve matcher");
-    assert_eq!(updated_delta.added_or_modified_proxies[0].stream_match, updated_match);
+    assert_eq!(
+        updated_delta.added_or_modified_proxies[0].stream_match,
+        updated_match
+    );
 
     sqlx::query("UPDATE proxies SET stream_match = ? WHERE id = ? AND namespace = ?")
         .bind("{not-json")
@@ -239,7 +245,11 @@ async fn sql_proxy_stream_match_round_trips_and_updates_without_widening() {
         .get_proxy("ferrum", &proxy.id)
         .await
         .expect_err("malformed persisted matcher must fail closed");
-    assert!(error.to_string().contains("failed to parse stream_match JSON"));
+    assert!(
+        error
+            .to_string()
+            .contains("failed to parse stream_match JSON")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

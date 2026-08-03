@@ -2426,7 +2426,7 @@ fn parse_l4_match_arm(
     vs_gateways: &[String],
 ) -> Result<Option<crate::proxy::stream_match::StreamMatchArm>, K8sTranslateError> {
     use crate::proxy::stream_match::{
-        MAX_STREAM_MATCH_GATEWAYS, MAX_STREAM_MATCH_GATEWAY_LENGTH, MAX_STREAM_MATCH_LABELS,
+        MAX_STREAM_MATCH_GATEWAY_LENGTH, MAX_STREAM_MATCH_GATEWAYS, MAX_STREAM_MATCH_LABELS,
         StreamMatchArm, canonicalize_gateway_name, valid_kubernetes_label_key,
         valid_kubernetes_label_value,
     };
@@ -2719,9 +2719,7 @@ fn virtual_service_l4_proxy_id(
 /// Presence is materially different from omission: malformed, mixed, or empty
 /// values must never collapse to the empty result that means Istio's `mesh`
 /// default.
-fn parse_l4_virtual_service_gateways(
-    object: &K8sObject,
-) -> Result<Vec<String>, K8sTranslateError> {
+fn parse_l4_virtual_service_gateways(object: &K8sObject) -> Result<Vec<String>, K8sTranslateError> {
     use crate::proxy::stream_match::{MESH_GATEWAY_TOKEN, canonicalize_gateway_name};
 
     let Some(value) = object.spec.get("gateways") else {

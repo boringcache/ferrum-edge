@@ -8769,9 +8769,7 @@ mod stream_match_source_evidence_tests {
     use crate::config::types::BackendScheme;
     use crate::consumer_index::ConsumerIndex;
     use crate::plugins::StreamConnectionContext;
-    use crate::proxy::stream_match::{
-        StreamMatchArm, StreamMatchCriteria, StreamMatchEvidence,
-    };
+    use crate::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria, StreamMatchEvidence};
 
     use super::authoritative_stream_match_source_ip;
 
@@ -8947,10 +8945,12 @@ mod node_waypoint_stream_scope_tests {
         }
         .compile()
         .unwrap();
-        assert!(matcher.matches(&crate::proxy::stream_match::StreamMatchEvidence {
-            destination_ip: orig_dst.map(|addr| addr.ip()),
-            ..Default::default()
-        }));
+        assert!(
+            matcher.matches(&crate::proxy::stream_match::StreamMatchEvidence {
+                destination_ip: orig_dst.map(|addr| addr.ip()),
+                ..Default::default()
+            })
+        );
     }
 }
 

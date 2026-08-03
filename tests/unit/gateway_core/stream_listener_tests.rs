@@ -292,19 +292,14 @@ async fn test_reconcile_starts_single_hosted_passthrough_as_sni_listener() {
 #[tokio::test]
 async fn shared_l4_catchall_is_grouped_and_resolves_after_constrained_candidate() {
     let frontend_port = ephemeral_port().await;
-    let constrained_backend = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
-    let catchall_backend = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let constrained_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let catchall_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 
     // Put the catch-all first deliberately. Runtime planning must still group
     // it on the shared socket and place it after constrained candidates.
     let mut catchall = create_stream_proxy("catchall", BackendScheme::Tcp, frontend_port);
     catchall.backend_port = catchall_backend.local_addr().unwrap().port();
-    let mut constrained =
-        create_stream_proxy("constrained", BackendScheme::Tcp, frontend_port);
+    let mut constrained = create_stream_proxy("constrained", BackendScheme::Tcp, frontend_port);
     constrained.backend_port = constrained_backend.local_addr().unwrap().port();
     constrain_to_loopback(&mut constrained);
     let config = GatewayConfig {
@@ -347,12 +342,8 @@ async fn shared_l4_catchall_is_grouped_and_resolves_after_constrained_candidate(
 #[tokio::test]
 async fn shared_l4_double_digit_ids_preserve_declaration_order() {
     let frontend_port = ephemeral_port().await;
-    let match_two_backend = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
-    let match_ten_backend = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let match_two_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let match_ten_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 
     let mut match_two = create_stream_proxy("route-match-2", BackendScheme::Tcp, frontend_port);
     match_two.backend_port = match_two_backend.local_addr().unwrap().port();
@@ -396,12 +387,8 @@ async fn shared_l4_double_digit_ids_preserve_declaration_order() {
 #[tokio::test]
 async fn passthrough_same_sni_double_digit_ids_preserve_declaration_order() {
     let frontend_port = ephemeral_port().await;
-    let match_two_backend = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
-    let match_ten_backend = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let match_two_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let match_ten_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 
     let mut match_two = create_stream_proxy("route-match-2", BackendScheme::Tcp, frontend_port);
     match_two.backend_port = match_two_backend.local_addr().unwrap().port();

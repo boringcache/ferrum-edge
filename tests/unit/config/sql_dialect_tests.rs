@@ -9,7 +9,9 @@ const SQL_DIALECT_SOURCE: &str = include_str!("../../../src/config/migrations/sq
 #[test]
 fn proxy_stream_match_is_in_every_v001_sql_dialect() {
     assert_eq!(
-        SQL_DIALECT_SOURCE.matches("stream_match MEDIUMTEXT").count(),
+        SQL_DIALECT_SOURCE
+            .matches("stream_match MEDIUMTEXT")
+            .count(),
         1,
         "MySQL V001 must persist bounded matcher JSON in MEDIUMTEXT"
     );

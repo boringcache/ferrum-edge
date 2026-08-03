@@ -267,14 +267,22 @@ fn test_shared_l4_listener_rejects_incompatible_listener_behavior() {
     let errors = test_config(vec![matched.clone(), different_scheme.clone()])
         .validate_stream_proxies()
         .unwrap_err();
-    assert!(errors.iter().any(|error| error.contains("mixes backend schemes")));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("mixes backend schemes"))
+    );
 
     different_scheme = make_stream_proxy("different-frontend", BackendScheme::Tcp, 5432);
     different_scheme.frontend_tls = true;
     let errors = test_config(vec![matched, different_scheme])
         .validate_stream_proxies()
         .unwrap_err();
-    assert!(errors.iter().any(|error| error.contains("mixes frontend_tls")));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("mixes frontend_tls"))
+    );
 
     let mut tls_matched = make_stream_proxy("tls-matched", BackendScheme::Tcps, 5432);
     add_stream_match(&mut tls_matched);
@@ -772,7 +780,11 @@ fn test_passthrough_shared_listener_rejects_mixed_scheme() {
     let errors = test_config(vec![plain, tls_scheme])
         .validate_stream_proxies()
         .unwrap_err();
-    assert!(errors.iter().any(|error| error.contains("mixes backend schemes")));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("mixes backend schemes"))
+    );
 }
 
 #[test]

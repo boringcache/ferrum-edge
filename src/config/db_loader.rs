@@ -5456,7 +5456,12 @@ impl DatabaseStore {
         for row in &rows {
             let id: String = row.try_get("id")?;
             let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
-            proxies.push(row_to_proxy(row, id, plugins)?);
+            let mut proxy = row_to_proxy(row, id, plugins)?;
+            // Match get_proxy / full-load admission: compiled_stream_match and
+            // host canonicalization are serde-skipped / derived, so incremental
+            // point-loads must normalize before publishing the delta.
+            proxy.normalize_fields();
+            proxies.push(proxy);
         }
         Self::ensure_no_unmatched_proxy_plugin_associations(
             "load_incremental_config",
@@ -5473,7 +5478,13 @@ impl DatabaseStore {
         let rows = self
             .load_rows_by_ids("consumers", namespace, ids, "load_consumers_by_ids")
             .await?;
-        rows.iter().map(row_to_consumer).collect()
+        let mut consumers = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut consumer = row_to_consumer(row)?;
+            consumer.normalize_fields();
+            consumers.push(consumer);
+        }
+        Ok(consumers)
     }
 
     async fn load_plugin_configs_by_ids(
@@ -5489,7 +5500,13 @@ impl DatabaseStore {
                 "load_plugin_configs_by_ids",
             )
             .await?;
-        rows.iter().map(row_to_plugin_config).collect()
+        let mut configs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut plugin_config = row_to_plugin_config(row)?;
+            plugin_config.normalize_fields();
+            configs.push(plugin_config);
+        }
+        Ok(configs)
     }
 
     async fn load_upstreams_by_ids(
@@ -5500,7 +5517,13 @@ impl DatabaseStore {
         let rows = self
             .load_rows_by_ids("upstreams", namespace, ids, "load_upstreams_by_ids")
             .await?;
-        rows.iter().map(row_to_upstream).collect()
+        let mut upstreams = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut upstream = row_to_upstream(row)?;
+            upstream.normalize_fields();
+            upstreams.push(upstream);
+        }
+        Ok(upstreams)
     }
 
     async fn load_rows_by_ids(
@@ -10258,9 +10281,11 @@ fn row_to_proxy_inner(
             .try_get::<Option<i32>, _>("stream_proxy_protocol")?
             .map(|v| v != 0),
         stream_match: match optional_utf8_text_column(row, "stream_match")? {
-            Some(s) => Some(serde_json::from_str::<StreamMatchCriteria>(&s).map_err(|e| {
-                anyhow::anyhow!("Proxy {}: failed to parse stream_match JSON: {}", pid, e)
-            })?),
+            Some(s) => Some(
+                serde_json::from_str::<StreamMatchCriteria>(&s).map_err(|e| {
+                    anyhow::anyhow!("Proxy {}: failed to parse stream_match JSON: {}", pid, e)
+                })?,
+            ),
             None => None,
         },
         compiled_stream_match: None,

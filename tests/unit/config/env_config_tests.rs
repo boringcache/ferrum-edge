@@ -474,7 +474,12 @@ fn test_stream_gateway_ref_is_strict_and_empty_clears_binding() {
         },
     );
 
-    for invalid in ["ingress", " Team-a/ingress", "Team-a/ingress", "ns/name/extra"] {
+    for invalid in [
+        "ingress",
+        " Team-a/ingress",
+        "Team-a/ingress",
+        "ns/name/extra",
+    ] {
         with_env_vars(
             &[
                 ("FERRUM_MODE", "file"),

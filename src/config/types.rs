@@ -4973,15 +4973,12 @@ impl GatewayConfig {
             }
 
             let all_passthrough = proxies_on_port.iter().all(|p| p.passthrough);
-            let stream_match_group = proxies_on_port
+            let stream_match_group = proxies_on_port.iter().all(|p| {
+                !p.passthrough
+                    && matches!(p.dispatch_kind, DispatchKind::TcpRaw | DispatchKind::TcpTls)
+            }) && proxies_on_port
                 .iter()
-                .all(|p| {
-                    !p.passthrough
-                        && matches!(p.dispatch_kind, DispatchKind::TcpRaw | DispatchKind::TcpTls)
-                })
-                && proxies_on_port
-                    .iter()
-                    .any(|p| p.stream_match.as_ref().is_some_and(|m| !m.is_empty()));
+                .any(|p| p.stream_match.as_ref().is_some_and(|m| !m.is_empty()));
 
             if !all_passthrough && !stream_match_group {
                 let non_pt: Vec<&str> = proxies_on_port
@@ -6959,9 +6956,7 @@ impl Proxy {
         // turn a configured matcher into an unconstrained datagram route.
         if let Some(criteria) = self.stream_match.as_ref() {
             if !matches!(effective_scheme, BackendScheme::Tcp | BackendScheme::Tcps) {
-                errors.push(
-                    "stream_match is only valid for tcp/tcps stream proxies".to_string(),
-                );
+                errors.push("stream_match is only valid for tcp/tcps stream proxies".to_string());
             } else if !criteria.is_empty()
                 && let Err(e) = criteria.compile()
             {

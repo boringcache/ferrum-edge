@@ -2856,7 +2856,10 @@ fn mesh_l4_virtual_service_preserves_double_digit_match_declaration_order() {
         .filter(|proxy| proxy.listen_port == Some(3306))
         .map(|proxy| proxy.id.as_str())
         .collect();
-    assert!(ids[2].ends_with("__0-2"), "declaration order changed: {ids:?}");
+    assert!(
+        ids[2].ends_with("__0-2"),
+        "declaration order changed: {ids:?}"
+    );
     assert!(
         ids[10].ends_with("__0-10"),
         "double-digit match moved lexicographically: {ids:?}"
