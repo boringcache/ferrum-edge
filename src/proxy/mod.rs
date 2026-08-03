@@ -32973,9 +32973,8 @@ async fn proxy_to_backend_mesh_retry(
     let retry_response_ctx =
         plugins_may_release_response_body_under_retries(plugins, request_ctx)
             .then(|| retry_response_decision_context(request_ctx));
-    let mesh_body = MeshClientRequestBody::Replayable(
-        request_body.cloned().unwrap_or_else(Bytes::new),
-    );
+    let mesh_body =
+        MeshClientRequestBody::Replayable(request_body.cloned().unwrap_or_default());
     let route_request_body_limit = request_ctx.route_request_body_limit();
     let route_response_body_limit = request_ctx.route_response_body_limit();
     let (response, _, request_body_exceeded) = if dispatch_hbone {
@@ -33797,8 +33796,8 @@ async fn proxy_to_backend(
     // reqwest-oriented preflight would reject every healthy cross-cluster route
     // before the HBONE connector could inspect those authoritative fields.
     //
-    // Every ordinary host still fails closed here. Retry dispatch is always a
-    // reqwest path and retains the unconditional preflight above.
+    // Every ordinary host still fails closed here. Retry dispatch repeats the
+    // same target-effective preflight before entering any direct or mesh pool.
     let resolved_ip = if dispatch_hbone
         && upstream_target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target)
     {
