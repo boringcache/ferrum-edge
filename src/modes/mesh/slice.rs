@@ -910,19 +910,6 @@ impl MeshSlice {
         // authoritative revision, so a DP comparing two CPs' slices compares
         // their config generations rather than their wall clocks.
         let revision = config.mesh_revision.clone();
-        let Some(mesh) = config.mesh.as_ref() else {
-            return Self {
-                node_id: request.node_id,
-                namespace: request.namespace,
-                workload_spiffe_id: request.workload_spiffe_id,
-                waypoint_name: request.waypoint_name,
-                labels: request.labels,
-                version,
-                revision,
-                ..Self::default()
-            };
-        };
-
         let virtual_service_l4_proxies = config
             .proxies
             .iter()
@@ -949,6 +936,20 @@ impl MeshSlice {
                 }
             })
             .collect();
+
+        let Some(mesh) = config.mesh.as_ref() else {
+            return Self {
+                node_id: request.node_id,
+                namespace: request.namespace,
+                workload_spiffe_id: request.workload_spiffe_id,
+                waypoint_name: request.waypoint_name,
+                labels: request.labels,
+                virtual_service_l4_proxies,
+                version,
+                revision,
+                ..Self::default()
+            };
+        };
 
         let namespace = request.namespace.clone();
         let cluster_domain = request.cluster_domain.clone();
