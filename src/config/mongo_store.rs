@@ -6384,6 +6384,9 @@ mod inner {
                 .await?
             {
                 let mut proxy = doc_to_proxy(doc)?;
+                // Match SQL incremental + full-load admission: derived fields
+                // such as compiled_stream_match are serde-skipped.
+                proxy.normalize_fields();
                 proxy.api_spec_id = None;
                 added_or_modified_proxies.push(proxy);
             }
@@ -6411,7 +6414,9 @@ mod inner {
                 .load_change_ids(self.consumers(), namespace, &consumer_upsert_doc_ids)
                 .await?
             {
-                added_or_modified_consumers.push(doc_to_consumer(doc)?);
+                let mut consumer = doc_to_consumer(doc)?;
+                consumer.normalize_fields();
+                added_or_modified_consumers.push(consumer);
             }
             let loaded_consumer_ids: HashSet<String> = added_or_modified_consumers
                 .iter()
@@ -6434,6 +6439,7 @@ mod inner {
                 .await?
             {
                 let mut plugin = doc_to_plugin_config(doc)?;
+                plugin.normalize_fields();
                 plugin.api_spec_id = None;
                 added_or_modified_plugin_configs.push(plugin);
             }
@@ -6454,6 +6460,7 @@ mod inner {
                 .await?
             {
                 let mut upstream = doc_to_upstream(doc)?;
+                upstream.normalize_fields();
                 upstream.api_spec_id = None;
                 added_or_modified_upstreams.push(upstream);
             }
@@ -13524,6 +13531,8 @@ mod inner {
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
                 stream_proxy_protocol: None,
+                stream_match: None,
+                compiled_stream_match: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -13730,6 +13739,8 @@ mod inner {
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
                 stream_proxy_protocol: None,
+                stream_match: None,
+                compiled_stream_match: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -13839,6 +13850,8 @@ mod inner {
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
                 stream_proxy_protocol: None,
+                stream_match: None,
+                compiled_stream_match: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -14050,6 +14063,8 @@ mod inner {
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
                 stream_proxy_protocol: None,
+                stream_match: None,
+                compiled_stream_match: None,
                 created_at: now,
                 updated_at: now,
             };

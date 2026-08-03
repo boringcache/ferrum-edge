@@ -27,7 +27,7 @@
 //!   the six proxy/upstream `backend_tls_*` material path/PEM columns
 //!   (`MAX_TLS_INLINE_PEM_LENGTH` = 1 MiB), `upstreams.subsets` (uncapped
 //!   label-set serialization), and `proxies.allowed_ws_origins` (uncapped
-//!   admitted JSON).
+//!   admitted JSON), and `proxies.stream_match` (bounded matcher JSON).
 //!
 //! The proxy schema intentionally omits a *unique* index on
 //! `(namespace, listen_path)`: path uniqueness is host-scoped, so only
@@ -588,6 +588,7 @@ impl V001SqlBuilder {
                 allowed_ws_origins MEDIUMTEXT,
                 udp_max_response_amplification_factor REAL,
                 stream_proxy_protocol INTEGER,
+                stream_match MEDIUMTEXT,
                 api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL,
@@ -652,6 +653,7 @@ impl V001SqlBuilder {
                 allowed_ws_origins TEXT,
                 udp_max_response_amplification_factor REAL,
                 stream_proxy_protocol INTEGER,
+                stream_match TEXT,
                 api_spec_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,

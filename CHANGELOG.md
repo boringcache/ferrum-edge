@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
+  `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
+  compile onto a shared precomputed `Proxy.stream_match` carrier and are
+  evaluated from trustworthy connection/workload metadata before stream route
+  selection (issues #3246–#3250). Shared-SPIFFE label evidence is bound to an
+  exact pod/IP or identical-label replica set. AND semantics apply within one
+  match arm; OR across match candidates on a shared listen port. Missing
+  identity, label, subnet, or gateway evidence denies the requiring predicate;
+  candidates retain VirtualService declaration order, including an explicitly
+  earlier catch-all that shadows later rules;
+  `exportTo` projects routes into eligible sidecar/named-gateway namespaces,
+  where workload selectors remain mesh-only and gateway selection stays
+  independent;
+  malformed label keys/values, namespaces, gateway names, and CIDRs fail closed
+  at translation with field-specific `FerrumAccepted=False`/`Invalid`
+  diagnostics. Istio
+  gateway scope defaults to the reserved `mesh` token; named-gateway data
+  planes set `FERRUM_STREAM_GATEWAY_REF`. Existing SNI/port routing and
+  weighted-split fail-closed behavior are preserved.
+
 - Audited admin mutations are durable **before they run** (issue #2421).
   The admin write gate fsyncs a pre-mutation audit intent — a stable event id
   plus the authenticated actor, method, sanitized path / namespace, canonical

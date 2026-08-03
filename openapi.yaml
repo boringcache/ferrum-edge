@@ -7485,6 +7485,24 @@ components:
             proxies produces a validation error (PROXY protocol is TCP-borne).
 
             Default: null / false (disabled; socket peer is always used as client_ip).
+        stream_match:
+          oneOf:
+            - $ref: "#/components/schemas/StreamMatchCriteria"
+            - type: "null"
+          description: |
+            Optional bounded L4 connection matcher for TCP/TCP+TLS proxies.
+            Predicates within one arm are ANDed; arms are ORed in declaration
+            order. Any predicate whose trusted connection evidence is absent
+            denies that arm. Source IP is the canonical authoritative client IP
+            after trusted PROXY-protocol processing, never an untrusted
+            application header.
+            Destination IP comes from trusted original-destination capture.
+            Gateway identity is trusted listener configuration only.
+
+            Omitted, null, `{}`, or `{ "arms": [] }` means no additional matcher.
+            A non-empty arm must contain at least one predicate. Invalid or
+            uncompiled configured matchers fail closed. Only valid for TCP-borne
+            stream proxies; UDP and DTLS configurations are rejected.
         websocket_idle_timeout_seconds:
           type: [integer, "null"]
           format: uint64
@@ -7614,6 +7632,90 @@ components:
       required:
         - backend_host
         - backend_port
+
+    StreamMatchCriteria:
+      type: object
+      additionalProperties: false
+      properties:
+        arms:
+          type: array
+          maxItems: 64
+          default: []
+          items:
+            $ref: "#/components/schemas/StreamMatchArm"
+          description: |
+            OR-ordered match arms. Declaration order is semantic both within
+            this list and across proxies sharing a stream listener; an earlier
+            unconstrained candidate shadows later candidates. Empty means no
+            additional L4 matcher.
+
+    StreamMatchArm:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        source_labels:
+          type: object
+          minProperties: 1
+          maxProperties: 64
+          propertyNames:
+            minLength: 1
+            maxLength: 317
+            pattern: "^(?:(?=.{1,253}/)[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)*/)?[A-Za-z0-9](?:[-_.A-Za-z0-9]{0,61}[A-Za-z0-9])?$"
+          additionalProperties:
+            type: string
+            maxLength: 63
+            pattern: "^$|^[A-Za-z0-9](?:[-_.A-Za-z0-9]{0,61}[A-Za-z0-9])?$"
+          description: |
+            Kubernetes label key/value pairs that must all match trustworthy
+            workload identity evidence. Empty label values are valid. Missing,
+            ambiguous, or unauthenticated label evidence denies the arm.
+        source_namespace:
+          type: string
+          minLength: 1
+          maxLength: 63
+          pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+          description: |
+            Exact Kubernetes source namespace from authenticated SPIFFE/workload
+            identity. Missing authenticated namespace evidence denies the arm.
+        source_subnets:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+            minLength: 1
+            maxLength: 64
+          description: |
+            IPv4/IPv6 CIDRs or individual IP addresses. Entries are parsed
+            strictly at admission. The authoritative canonical client IP after
+            the trusted PROXY boundary must belong to at least one entry.
+        destination_subnets:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+            minLength: 1
+            maxLength: 64
+          description: |
+            IPv4/IPv6 CIDRs or individual IP addresses, parsed strictly at
+            admission. The trusted captured original destination must belong to
+            at least one entry; missing capture evidence denies the arm.
+        gateways:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+            minLength: 1
+            maxLength: 127
+            pattern: "^(mesh|[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?/[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)$"
+          description: |
+            Exact trusted gateway bindings: `mesh` or canonical
+            `namespace/name`. Short names are rejected outside translation
+            because no namespace can be inferred safely. Missing listener
+            binding denies the arm; the value is never wire-derived.
 
     BackendScheme:
       type: string

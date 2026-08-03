@@ -83,6 +83,7 @@ mod spiffe_identity_listener_wiring_tests;
 mod startup_tests;
 mod stream_health_check_tests;
 mod stream_listener_tests;
+mod stream_match_tests;
 mod stream_plugin_namespace_lookup_tests;
 mod tcp_accept_loop_supervision_tests;
 mod tcp_proxy_tests;

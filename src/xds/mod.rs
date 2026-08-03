@@ -49,7 +49,8 @@ pub use carrier::{
     FERRUM_ECDS_REQUEST_AUTH_TYPE_URL, FERRUM_ECDS_SERVICE_ENTRIES_TYPE_URL,
     FERRUM_ECDS_SERVICES_TYPE_URL, FERRUM_ECDS_SIDECAR_EGRESS_SCOPE_TYPE_URL,
     FERRUM_ECDS_TELEMETRY_TYPE_URL, FERRUM_ECDS_TRUST_BUNDLES_TYPE_URL,
-    FERRUM_ECDS_WORKLOADS_TYPE_URL, MeshSliceCarrier, apply_carrier, build_slice_carriers,
+    FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL, FERRUM_ECDS_WORKLOADS_TYPE_URL, MeshSliceCarrier,
+    apply_carrier, build_slice_carriers,
 };
 #[allow(unused_imports)]
 pub use nonce::{AckOutcome, XdsNonceTracker};

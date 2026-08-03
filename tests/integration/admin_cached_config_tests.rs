@@ -142,6 +142,8 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

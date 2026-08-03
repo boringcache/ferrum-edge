@@ -21,6 +21,7 @@ use crate::tls::inventory_cache::DEFAULT_SNAPSHOT_TTL_SECONDS;
 use crate::util::cidr::CidrSet;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::sync::Arc;
 
 #[macro_use]
 #[path = "env_config_macro.rs"]
@@ -2226,6 +2227,10 @@ pub struct EnvConfig {
     /// Bind address for TCP/UDP stream proxy listeners (default: 0.0.0.0).
     #[allow(dead_code)] // Used in Phase 2 (stream listener startup)
     pub stream_proxy_bind_address: String,
+    /// Trusted listener-side gateway identity used by VirtualService L4
+    /// `gateways` predicates. `None` means no binding, so those predicates
+    /// fail closed. Defaults to `mesh` only in mesh Sidecar topology.
+    pub stream_gateway_ref: Option<Arc<str>>,
 
     // DTLS frontend certificates (ECDSA P-256 or P-384 required)
     /// Path to DTLS server certificate (PEM) for frontend DTLS termination.
@@ -2867,6 +2872,7 @@ impl Default for EnvConfig {
             admin_require_namespace_claim: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
+            stream_gateway_ref: None,
             dtls_cert_path: None,
             dtls_key_path: None,
             dtls_client_ca_cert_path: None,
@@ -3430,6 +3436,27 @@ impl EnvConfig {
             tls_cert_expiry_warning_days: u64 = "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS" => 30u64;
             tls_inventory_snapshot_ttl_seconds: u64 = "FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS" => DEFAULT_SNAPSHOT_TTL_SECONDS, clamp(0u64, 86_400u64);
         }
+
+        // This binding is trusted process configuration, never connection or
+        // header data. An explicit empty value deliberately clears it. When it
+        // is omitted, only the mesh Sidecar topology receives Istio's implicit
+        // `mesh` binding; unrelated listeners and waypoint topologies do not.
+        let stream_gateway_ref = match resolve_var(conf, "FERRUM_STREAM_GATEWAY_REF") {
+            Some(raw) if raw.is_empty() => None,
+            Some(raw) => {
+                crate::proxy::stream_match::validate_canonical_gateway_ref(&raw)
+                    .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;
+                Some(Arc::<str>::from(raw))
+            }
+            None if mode == OperatingMode::Mesh => {
+                let topology = resolve_var(conf, "FERRUM_MESH_TOPOLOGY")
+                    .unwrap_or_else(|| "sidecar".to_string());
+                topology
+                    .eq_ignore_ascii_case("sidecar")
+                    .then(|| Arc::<str>::from(crate::proxy::stream_match::MESH_GATEWAY_TOKEN))
+            }
+            None => None,
+        };
         let tls_curves =
             resolve_tls_key_exchange_groups(tls_key_exchange_groups, tls_curves_legacy);
 
@@ -4090,6 +4117,7 @@ impl EnvConfig {
             tls_inventory_snapshot_ttl_seconds,
             tls_early_data_methods,
             stream_proxy_bind_address,
+            stream_gateway_ref,
             dtls_cert_path,
             dtls_key_path,
             dtls_client_ca_cert_path,
@@ -4923,6 +4951,11 @@ impl EnvConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
+        if let Some(gateway_ref) = self.stream_gateway_ref.as_deref() {
+            crate::proxy::stream_match::validate_canonical_gateway_ref(gateway_ref)
+                .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;
+        }
+
         if matches!(&self.mode, OperatingMode::ControlPlane)
             && !self.k8s_controller_enabled
             && !self.mesh_config_authority_id.is_empty()

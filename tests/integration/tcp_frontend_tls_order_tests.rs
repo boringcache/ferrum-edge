@@ -114,6 +114,8 @@ fn tcp_tls_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &[Strin
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -369,6 +371,7 @@ async fn try_spawn_tcp_tls_gateway(
             record_mesh_mtls_metric: false,
             mesh_outbound_enforcement: ferrum_edge::modes::mesh::outbound_enforcement::empty_slot(),
             node_waypoint_identity_resolver: None,
+            stream_gateway_ref: None,
             trusted_proxies: Arc::new(TrustedProxies::none()),
         };
         let _ = start_tcp_listener(cfg).await;

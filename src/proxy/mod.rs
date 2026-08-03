@@ -61,6 +61,7 @@ pub(crate) mod response_buffer_budget;
 pub mod sni;
 pub mod stream_error;
 pub mod stream_listener;
+pub mod stream_match;
 pub mod tcp_proxy;
 pub mod udp_batch;
 pub mod udp_proxy;
@@ -7038,6 +7039,7 @@ impl ProxyState {
                 env_config_arc.pool_shard_amount,
                 health_checker.clone(),
                 mesh_outbound_enforcement.clone(),
+                env_config_arc.stream_gateway_ref.clone(),
                 trusted_proxies.clone(),
             ),
         );
