@@ -67,8 +67,7 @@ pub const MESH_SLICE_DRIFT_REJECTION_REASON: &str = "reported_rejection";
 // Both retained rejection labels are compile-time bounded. Keeping this as a
 // real use of the public limit also prevents the binary's private module graph
 // from treating the integration-test contract constant as dead code.
-const _: () =
-    assert!(MESH_SLICE_DRIFT_REJECTION_REASON.len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
+const _: () = assert!(MESH_SLICE_DRIFT_REJECTION_REASON.len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
 const _: () = assert!("unspecified".len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
 
 /// Bound the subscription selector retained for disconnected projection.
