@@ -8642,6 +8642,18 @@ pub enum SpoolWriteHookPoint {
     QuotaInventoryTaken,
 }
 
+/// Deterministic injection points around bounded streaming spool replay.
+///
+/// External tests use these to prove fail-closed reopen semantics after a
+/// complete preflight: identity changes, ceiling starvation between passes, and
+/// quarantine outcomes when the second open refuses the artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpoolReplayHookPoint {
+    /// Preflight finished and released its stream reservation; the matching
+    /// reopen has not started. The path argument is the claimed artifact.
+    AfterStreamingPreflight,
+}
+
 /// The hook carries the namespace root of the [`SpoolManager`] that reached the
 /// point, so a hook installed by one test is inert for every other manager.
 ///
@@ -8671,6 +8683,32 @@ pub fn set_spool_write_hook_for_tests(hook: Option<SpoolWriteHookForTests>) {
 
 fn snapshot_spool_write_hook_for_tests() -> Option<SpoolWriteHookForTests> {
     spool_write_hook_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+type SpoolReplayHookForTests = Arc<dyn Fn(SpoolReplayHookPoint, &Path) + Send + Sync + 'static>;
+
+fn spool_replay_hook_slot() -> &'static Mutex<Option<SpoolReplayHookForTests>> {
+    static HOOK: OnceLock<Mutex<Option<SpoolReplayHookForTests>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+/// Install or clear a process-global hook around streaming spool replay.
+///
+/// Tests must clear the hook before finishing (including panic paths) and
+/// ignore every invocation whose claimed path is outside their own spool root.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn set_spool_replay_hook_for_tests(hook: Option<SpoolReplayHookForTests>) {
+    if let Ok(mut slot) = spool_replay_hook_slot().lock() {
+        *slot = hook;
+    }
+}
+
+fn snapshot_spool_replay_hook_for_tests() -> Option<SpoolReplayHookForTests> {
+    spool_replay_hook_slot()
         .lock()
         .ok()
         .and_then(|slot| slot.clone())
@@ -10679,6 +10717,9 @@ async fn replay_spool_once(
         if line_count == 0 {
             spool.remove_delivered_claim(claim.path())?;
             continue;
+        }
+        if let Some(hook) = snapshot_spool_replay_hook_for_tests() {
+            hook(SpoolReplayHookPoint::AfterStreamingPreflight, claim.path());
         }
         let mut reader = match StreamingSpoolReader::open_matching(
             claim.path(),
