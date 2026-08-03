@@ -14,19 +14,24 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     clickhouse_insert_url_for_tests, compact_recovery_probe_for_tests,
     compile_charge_event_projection, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     encode_spool_bytes_without_content_size_for_tests,
-    encode_spool_bytes_without_ratio_padding_for_tests, new_ulid,
+    encode_spool_bytes_without_ratio_padding_for_tests,
+    encode_zstd_declaring_content_size_for_tests, new_ulid,
     probe_charge_body_materialization_for_tests,
     probe_charge_body_materialization_with_projection_for_tests,
-    probe_compact_recovery_retry_for_tests, probe_shared_spool_batch_clone_for_tests,
+    probe_compact_recovery_retry_for_tests, probe_empty_dead_letter_publish_for_tests,
+    probe_shared_spool_batch_clone_for_tests, probe_streaming_replay_batch_range_errors_for_tests,
     render_prometheus, render_status_json, replay_spool_once_for_tests,
     replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
     serialize_json_each_row, serialize_json_each_row_projected, set_spool_write_hook_for_tests,
     spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
-    spool_decompression_limit_for_tests, spool_streaming_limits_for_tests,
-    write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
+    spool_decompression_limit_for_tests, spool_split_worklist_max_entries_for_tests,
+    spool_streaming_limits_for_tests, write_private_file_atomically_for_tests,
+    write_private_file_atomically_with_fault_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
-use ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling;
+use ferrum_edge::plugins::utils::byte_budget::{
+    RetainedByteCeiling, probe_preallocated_payload_capacity_guard_for_tests,
+};
 use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, REQUEST_ID_METADATA_KEY, TransactionSummary, WsDisconnectContext,
 };
@@ -7069,6 +7074,494 @@ async fn spool_replay_releases_its_reservations_on_success_and_on_retryable_fail
         ceiling.used(),
         0,
         "a successful replay releases every reservation"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed coverage for replay/dead-letter hardening (PR #3535).
+//
+// These probes exercise currently uncovered boundary and restoration branches:
+// writer admission bounds, hostile on-disk shapes, durable dead-letter publish
+// faults, and streaming range validation. Assertions stay behavioral — no
+// ignore attributes and no vacuous threshold changes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spool_artifact_materialization_fails_closed_on_row_count_row_bytes_and_replay_ceiling() {
+    let (_, max_rows, _, _) = spool_streaming_limits_for_tests();
+    let temp = tempfile::tempdir().unwrap();
+    let roomy = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    let spool = ceiling_spool(&temp, roomy);
+
+    let too_many = vec![sample_event("bound-row-count"); max_rows + 1];
+    let error = spool
+        .probe_spool_artifact_materialization_for_tests(&too_many)
+        .expect_err("row-count overflow must refuse before serialization");
+    assert!(
+        error.contains("refusing to spool") && error.contains("row"),
+        "unexpected row-count refusal: {error}"
+    );
+    assert!(
+        !error.contains("bound-row-count"),
+        "refusal diagnostics must not echo charge-record fields: {error}"
+    );
+
+    let mut oversized = sample_event("bound-row-bytes");
+    oversized.request_id = Some("x".repeat(200 * 1024));
+    let error = spool
+        .probe_spool_artifact_materialization_for_tests(&[oversized])
+        .expect_err("an oversize conservative row bound must refuse");
+    assert!(
+        error.contains("refusing to spool a row") && error.contains("byte"),
+        "unexpected row-byte refusal: {error}"
+    );
+
+    // Large enough to serialize one JSON row, but below the streaming-replay
+    // minimum the writer proves before publishing a durable artifact.
+    let tight = leaked_chargeback_test_ceiling(64 * 1024);
+    let tight_spool = ceiling_spool(&tempfile::tempdir().unwrap(), tight);
+    let error = tight_spool
+        .probe_spool_artifact_materialization_for_tests(&[sample_event("bound-replay-ceiling")])
+        .expect_err("artifacts that cannot stream under the ceiling must be refused");
+    assert!(
+        error.contains("streaming replay") || error.contains("retained bytes"),
+        "unexpected replay-ceiling refusal: {error}"
+    );
+    assert_eq!(tight.used(), 0);
+    assert_eq!(
+        spool_split_worklist_max_entries_for_tests(),
+        usize::BITS as usize + 4
+    );
+}
+
+#[test]
+fn streaming_replay_batch_range_validation_fails_closed() {
+    let ceiling = leaked_chargeback_test_ceiling(64 * 1024);
+    let [empty, out_of_range, inverted] =
+        probe_streaming_replay_batch_range_errors_for_tests(ceiling)
+            .expect("range probes must run under the test ceiling");
+    assert!(empty.contains("empty batch range"), "{empty}");
+    assert!(out_of_range.contains("out of range"), "{out_of_range}");
+    assert!(inverted.contains("byte range is invalid"), "{inverted}");
+    assert_eq!(ceiling.used(), 0);
+}
+
+#[test]
+fn preallocated_payload_capacity_guard_refuses_undersized_reservations() {
+    let ceiling = leaked_chargeback_test_ceiling(64 * 1024);
+    probe_preallocated_payload_capacity_guard_for_tests(ceiling)
+        .expect("capacity guard must refuse an undersized reservation");
+    assert_eq!(ceiling.used(), 0);
+}
+
+#[tokio::test]
+async fn spool_replay_quarantines_hostile_json_shapes_and_whitespace_only_artifacts() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    for (ulid, payload, label) in [
+        (
+            "01ARZ3NDEKTSV4RRFFQ69G5FF1",
+            &b"[1,2,3]\n"[..],
+            "non-object JSONEachRow",
+        ),
+        (
+            "01ARZ3NDEKTSV4RRFFQ69G5FF2",
+            &b"{not-json}\n"[..],
+            "malformed JSONEachRow",
+        ),
+        (
+            "01ARZ3NDEKTSV4RRFFQ69G5FF3",
+            &b"   "[..],
+            "whitespace-only artifact",
+        ),
+    ] {
+        let source = day.join(owned_data_name(ulid));
+        fs::write(&source, payload).unwrap();
+        replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+            .await
+            .unwrap_or_else(|error| panic!("{label} must not become a retryable tick: {error}"));
+        if label.contains("whitespace-only") {
+            // Whitespace-only content yields zero billable rows and is removed.
+            assert!(
+                !source.exists(),
+                "{label} must leave no durable claim behind"
+            );
+        } else {
+            assert!(
+                !source.exists(),
+                "{label} must be removed from the replay set"
+            );
+            assert!(
+                source
+                    .with_file_name(format!(
+                        "{}.corrupt",
+                        source.file_name().unwrap().to_string_lossy()
+                    ))
+                    .exists(),
+                "{label} must be quarantined for operator review"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn spool_replay_fails_closed_on_non_file_hardlink_symlink_and_declared_zstd_size() {
+    use std::os::unix::fs::{PermissionsExt, hard_link, symlink};
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    let directory = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FF4"));
+    fs::create_dir(&directory).unwrap();
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+        .await
+        .expect(
+            "a directory planted as a spool artifact is skipped/quarantine-failed without aborting the tick",
+        );
+
+    let linked = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FF5"));
+    fs::write(&linked, br#"{"event_id":"hardlink"}"#).unwrap();
+    let alias = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FF6"));
+    hard_link(&linked, &alias).unwrap();
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+        .await
+        .expect("hard-linked artifacts are unreadable and must not abort later replay");
+    assert!(
+        linked
+            .with_file_name(format!(
+                "{}.corrupt",
+                linked.file_name().unwrap().to_string_lossy()
+            ))
+            .exists()
+            || alias
+                .with_file_name(format!(
+                    "{}.corrupt",
+                    alias.file_name().unwrap().to_string_lossy()
+                ))
+                .exists()
+            || (!linked.exists() && !alias.exists()),
+        "at least one hard-linked name must leave the live replay set"
+    );
+
+    let outside = temp.path().join("outside-symlink-target");
+    fs::write(&outside, br#"{"event_id":"symlink"}"#).unwrap();
+    let linked_path = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FF7"));
+    symlink(&outside, &linked_path).unwrap();
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+        .await
+        .expect("symlink inventory entries must not abort the tick");
+    assert_eq!(fs::read(&outside).unwrap(), br#"{"event_id":"symlink"}"#);
+
+    // A same-UID mode-000 data file still appears in inventory but fails the
+    // secure open; that is an unreadable quarantine path, not a retry.
+    let denied = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FFB"));
+    fs::write(&denied, br#"{"event_id":"mode-denied"}"#).unwrap();
+    let mut denied_perms = fs::metadata(&denied).unwrap().permissions();
+    denied_perms.set_mode(0o000);
+    fs::set_permissions(&denied, denied_perms).unwrap();
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+        .await
+        .expect("permission-denied opens are unreadable, not retryable");
+    let denied_corrupt = denied.with_file_name(format!(
+        "{}.corrupt",
+        denied.file_name().unwrap().to_string_lossy()
+    ));
+    let restore_path = if denied_corrupt.exists() {
+        denied_corrupt
+    } else {
+        denied.clone()
+    };
+    if restore_path.exists() {
+        let mut restore = fs::metadata(&restore_path).unwrap().permissions();
+        restore.set_mode(0o600);
+        fs::set_permissions(&restore_path, restore).unwrap();
+    }
+
+    let declared = day.join(format!(
+        "01ARZ3NDEKTSV4RRFFQ69G5FF8.{}.ndjson.zst",
+        default_test_owner_tag()
+    ));
+    let frame =
+        encode_zstd_declaring_content_size_for_tests(spool_artifact_byte_limit_for_tests() + 1);
+    fs::write(&declared, frame).unwrap();
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+        .await
+        .expect("an oversized declared zstd size is quarantined before decode");
+    assert!(
+        declared
+            .with_file_name(format!(
+                "{}.corrupt",
+                declared.file_name().unwrap().to_string_lossy()
+            ))
+            .exists(),
+        "declared-size overflow must quarantine the planted frame"
+    );
+}
+
+#[tokio::test]
+async fn spool_replay_defers_when_ceiling_cannot_hold_stream_and_batch() {
+    let temp = tempfile::tempdir().unwrap();
+    // Between one small-file stream reservation (~row + 64 KiB reader) and the
+    // full row+batch+index+worklist+dead-letter budget proven at open.
+    let ceiling = leaked_chargeback_test_ceiling(100 * 1024);
+    let spool = ceiling_spool(&temp, ceiling);
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let source = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FF9"));
+    fs::write(&source, br#"{"event_id":"ceiling-stream-batch"}"#).unwrap();
+
+    let error = replay_spool_once_with_ceiling_for_tests(&spool, "http://127.0.0.1:1/", 4, ceiling)
+        .await
+        .expect_err("a ceiling that cannot hold one row and batch must defer");
+    assert!(
+        error.contains("ceiling") || error.contains("streaming"),
+        "unexpected deferral diagnostic: {error}"
+    );
+    assert!(
+        source.exists(),
+        "ceiling deferral must leave the durable record claimable"
+    );
+    assert_eq!(ceiling.used(), 0);
+}
+
+#[tokio::test]
+async fn spool_replay_defers_when_a_peer_reservation_starves_batch_admission() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let ceiling = leaked_chargeback_test_ceiling(2 * 1024 * 1024);
+    let spool = ceiling_spool(&temp, ceiling);
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let source = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FFC"));
+    fs::write(&source, br#"{"event_id":"peer-starved-batch"}"#).unwrap();
+
+    // Leave enough headroom for the fixed stream reservation and dead-letter
+    // tally, but not for the batch body the open path still sizes from max().
+    let leave = 200 * 1024;
+    let peer_hold = ceiling
+        .try_acquire(ceiling.max().saturating_sub(leave))
+        .expect("peer reservation must fit");
+
+    let error = replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 4, ceiling)
+        .await
+        .expect_err("a peer-saturated ceiling must defer before delivery");
+    assert!(
+        error.contains("ceiling") || error.contains("deferred"),
+        "unexpected peer-starvation diagnostic: {error}"
+    );
+    assert!(
+        !error.to_ascii_lowercase().contains("peer-starved"),
+        "deferral diagnostics must not echo charge-record fields: {error}"
+    );
+    assert!(source.exists(), "deferral must leave the claimable source");
+    drop(peer_hold);
+    assert_eq!(ceiling.used(), 0);
+
+    replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 4, ceiling)
+        .await
+        .expect("replay must recover after the peer reservation releases");
+    assert!(!source.exists());
+}
+
+#[tokio::test]
+async fn spool_replay_defers_when_a_peer_reservation_starves_dead_letter_tally() {
+    let temp = tempfile::tempdir().unwrap();
+    let ceiling = leaked_chargeback_test_ceiling(2 * 1024 * 1024);
+    let spool = ceiling_spool(&temp, ceiling);
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let source = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FFD"));
+    fs::write(&source, br#"{"event_id":"peer-starved-tally"}"#).unwrap();
+
+    // Enough for the stream reservation alone after open, but not for the
+    // fixed dead-letter tally that replay allocates before the first batch.
+    let leave = 70 * 1024;
+    let peer_hold = ceiling
+        .try_acquire(ceiling.max().saturating_sub(leave))
+        .expect("peer reservation must fit");
+
+    let error = replay_spool_once_with_ceiling_for_tests(&spool, "http://127.0.0.1:1/", 4, ceiling)
+        .await
+        .expect_err("a peer-saturated ceiling must defer before isolation state exists");
+    assert!(
+        error.contains("ceiling") || error.contains("deferred"),
+        "unexpected tally-starvation diagnostic: {error}"
+    );
+    assert!(source.exists());
+    drop(peer_hold);
+    assert_eq!(ceiling.used(), 0);
+}
+
+#[tokio::test]
+async fn dead_letter_publish_faults_restore_the_authoritative_source() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400, 400, 400, 400, 400, 400, 400, 400]).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let clean = SpoolManager::for_tests(settings.clone(), "node-a").unwrap();
+    let generation = clean.generation_for_tests();
+    let source = clean
+        .write_events(&[sample_event("evt-dead-letter-fault")])
+        .unwrap();
+    drop(clean);
+
+    // Block create_new on the dead-letter payload temp.
+    let blocked = SpoolManager::for_tests_with_owner_and_faults(
+        settings.clone(),
+        &test_owner_spec("node-a"),
+        generation,
+        SpoolFsFault::None,
+    )
+    .unwrap();
+    let payload_final = dead_letter_payload_path(&source);
+    let payload_temp = blocked
+        .write_temp_path_for_tests(&payload_final)
+        .expect("dead-letter temp path must resolve");
+    fs::write(&payload_temp, b"blocker").unwrap();
+    let error = replay_spool_once_for_tests(&blocked, &server.uri())
+        .await
+        .expect_err("a blocked dead-letter temp must fail closed");
+    assert!(
+        error.contains("failed to create dead-letter payload temp")
+            || error.contains("dead-letter"),
+        "unexpected create failure: {error}"
+    );
+    assert!(source.exists(), "source must remain authoritative");
+    let _ = fs::remove_file(&payload_temp);
+    drop(blocked);
+
+    // Prior payload path occupied by a directory: replace/remove fails closed.
+    let occupied = SpoolManager::for_tests_with_owner_and_faults(
+        settings.clone(),
+        &test_owner_spec("node-a"),
+        generation,
+        SpoolFsFault::None,
+    )
+    .unwrap();
+    fs::create_dir(&payload_final).unwrap();
+    let error = replay_spool_once_for_tests(&occupied, &server.uri())
+        .await
+        .expect_err("a directory planted at the dead-letter payload path must fail closed");
+    assert!(
+        error.contains("failed to replace prior dead-letter payload")
+            || error.contains("dead-letter")
+            || error.contains("Is a directory")
+            || error.contains("directory"),
+        "unexpected replace failure: {error}"
+    );
+    assert!(source.exists(), "source must remain authoritative");
+    let _ = fs::remove_dir(&payload_final);
+    drop(occupied);
+
+    for fault in [
+        SpoolFsFault::FileSync,
+        #[cfg(unix)]
+        SpoolFsFault::DirOpen,
+        #[cfg(unix)]
+        SpoolFsFault::DirSync,
+    ] {
+        let faulted = SpoolManager::for_tests_with_owner_and_faults(
+            settings.clone(),
+            &test_owner_spec("node-a"),
+            generation,
+            fault,
+        )
+        .unwrap();
+        let error = match replay_spool_once_for_tests(&faulted, &server.uri()).await {
+            Err(error) => error,
+            Ok(()) => panic!("{fault:?} during dead-letter publish must fail the tick"),
+        };
+        assert!(
+            error.contains("injected fault")
+                || error.contains("dead-letter")
+                || error.contains("fsync")
+                || error.contains("directory"),
+            "unexpected {fault:?} diagnostic: {error}"
+        );
+        assert!(
+            source.exists(),
+            "{fault:?} must restore the authoritative source claim"
+        );
+        drop(faulted);
+    }
+
+    let empty_probe = SpoolManager::for_tests_with_owner_and_faults(
+        settings.clone(),
+        &test_owner_spec("node-a"),
+        generation,
+        SpoolFsFault::None,
+    )
+    .unwrap();
+    let empty_error = probe_empty_dead_letter_publish_for_tests(&empty_probe, &source)
+        .expect_err("empty dead-letter payloads must not publish");
+    assert!(
+        empty_error.contains("refusing to publish an empty dead-letter payload"),
+        "unexpected empty-publish diagnostic: {empty_error}"
+    );
+    assert!(source.exists());
+    drop(empty_probe);
+
+    // Recovery after the faulted attempts: a clean manager finishes the handoff.
+    let recovered = SpoolManager::for_tests_with_owner_and_faults(
+        settings,
+        &test_owner_spec("node-a"),
+        generation,
+        SpoolFsFault::None,
+    )
+    .unwrap();
+    replay_spool_once_for_tests(&recovered, &server.uri())
+        .await
+        .expect("dead-letter handoff must recover once the store is writable");
+    assert_rejected_sidecar(&source, 400, "permanent_http");
+}
+
+#[tokio::test]
+async fn spool_replay_continues_when_quarantine_rename_is_blocked() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    let source = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FFA"));
+    fs::write(&source, b"{not-json}\n").unwrap();
+    let quarantine = source.with_file_name(format!(
+        "{}.corrupt",
+        source.file_name().unwrap().to_string_lossy()
+    ));
+    fs::create_dir(&quarantine).unwrap();
+    fs::write(quarantine.join("blocker"), b"x").unwrap();
+
+    let newer = spool
+        .write_events(&[sample_event("evt-after-quarantine-block")])
+        .unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect("a blocked quarantine must not abort the tick after the unreadable artifact");
+    assert!(
+        source.exists(),
+        "an unquarantinable poison row remains for operator intervention"
+    );
+    assert!(
+        !newer.exists(),
+        "later valid artifacts must still replay after a quarantine failure"
     );
 }
 

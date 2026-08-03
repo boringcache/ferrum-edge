@@ -9342,6 +9342,87 @@ pub fn spool_streaming_limits_for_tests() -> (usize, usize, usize, usize) {
     )
 }
 
+/// Plant a zstd frame whose header declares `declared_size` decompressed bytes.
+///
+/// Used by external tests to exercise the fail-closed declared-size bound before
+/// the streaming decoder is constructed. The trailing bytes are intentionally
+/// not a complete frame body — header inspection happens first.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn encode_zstd_declaring_content_size_for_tests(declared_size: u64) -> Vec<u8> {
+    // Magic (little-endian 0xFD2FB528) + Frame_Header_Descriptor with
+    // FCS_Size=3 (8-byte content size) and Single_Segment=1 (no Window_Descriptor).
+    let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0xE0];
+    frame.extend_from_slice(&declared_size.to_le_bytes());
+    frame
+}
+
+/// Fail-closed `StreamingReplayBatch::body_range` probes for external tests.
+///
+/// Returns the three refusal diagnostics for an empty range, an out-of-range
+/// start, and an inverted retained byte range.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn probe_streaming_replay_batch_range_errors_for_tests(
+    ceiling: &'static RetainedByteCeiling,
+) -> Result<[String; 3], String> {
+    let payload = materialize_reserved_payload(ceiling, 64, |writer| {
+        writer
+            .write_all(b"{\"a\":1}\n{\"b\":2}")
+            .map_err(|error| error.to_string())
+    })
+    .map_err(|error| error.reason().to_string())?;
+    let index_reservation = ceiling
+        .try_acquire(2usize.saturating_mul(SPOOL_INDEX_ENTRY_BYTES))
+        .ok_or_else(|| PayloadMaterializationError::CeilingExhausted.reason().to_string())?;
+    let batch = StreamingReplayBatch {
+        payload,
+        lines: vec![(0, 7), (8, 15)],
+        _line_reservation: index_reservation,
+    };
+    let empty = batch
+        .body_range(0, 0)
+        .expect_err("empty batch ranges must fail closed");
+    let out_of_range = batch
+        .body_range(8, 9)
+        .expect_err("out-of-range batch starts must fail closed");
+
+    let mismatched_payload = materialize_reserved_payload(ceiling, 64, |writer| {
+        writer
+            .write_all(b"{\"a\":1}\n{\"b\":2}")
+            .map_err(|error| error.to_string())
+    })
+    .map_err(|error| error.reason().to_string())?;
+    let mismatched_index = ceiling
+        .try_acquire(2usize.saturating_mul(SPOOL_INDEX_ENTRY_BYTES))
+        .ok_or_else(|| PayloadMaterializationError::CeilingExhausted.reason().to_string())?;
+    let mismatched_batch = StreamingReplayBatch {
+        payload: mismatched_payload,
+        // Byte end precedes byte start — structurally impossible for a real
+        // decoder, so the range validator must refuse it.
+        lines: vec![(10, 7), (8, 15)],
+        _line_reservation: mismatched_index,
+    };
+    let inverted = mismatched_batch
+        .body_range(0, 1)
+        .expect_err("inverted batch byte ranges must fail closed");
+    Ok([empty, out_of_range, inverted])
+}
+
+/// Attempt to publish a dead-letter payload writer that never received a row.
+///
+/// External tests only: proves the empty-publish refusal keeps the authoritative
+/// source claim intact rather than inventing an empty rejected artifact.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn probe_empty_dead_letter_publish_for_tests(
+    spool: &SpoolManager,
+    source_path: &Path,
+) -> Result<(), String> {
+    let writer = DeadLetterPayloadWriter::open(spool, source_path)?;
+    writer.publish(spool).map(|_| ())
+}
+
 /// Bytes one spool line-index / worklist entry occupies.
 #[doc(hidden)]
 #[allow(dead_code)]

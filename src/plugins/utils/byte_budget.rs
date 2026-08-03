@@ -808,6 +808,31 @@ impl ReservedPayload {
     }
 }
 
+/// Prove the streaming preallocated-payload capacity guard fails closed.
+///
+/// External unit tests only: reserves 8 bytes, then hands over a vector whose
+/// capacity exceeds that reservation. Production callers size capacity to the
+/// reservation; this probe exists so the undersized-charge refusal stays
+/// covered without opening a runtime-visible API.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn probe_preallocated_payload_capacity_guard_for_tests(
+    ceiling: &'static RetainedByteCeiling,
+) -> Result<(), String> {
+    let reservation = ceiling.try_acquire(8).ok_or_else(|| {
+        PayloadMaterializationError::CeilingExhausted.reason().to_string()
+    })?;
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(b"probe");
+    match ReservedPayload::from_preallocated_vec(bytes, reservation) {
+        Err(PayloadMaterializationError::BoundExceeded) => Ok(()),
+        Err(error) => Err(error.reason().to_string()),
+        Ok(_) => Err(
+            "preallocated payload capacity guard must refuse an undersized reservation".into(),
+        ),
+    }
+}
+
 /// Reserve `bound` bytes against `ceiling` **before** anything is written, run
 /// `write` into a writer that fails closed at `bound`, and hand back an owned
 /// payload that keeps holding the reservation.
