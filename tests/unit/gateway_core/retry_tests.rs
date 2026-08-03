@@ -334,6 +334,64 @@ fn test_terminal_gateway_errors_are_never_retried_as_connection_failures() {
     }
 }
 
+#[test]
+fn http_retry_re_resolves_mesh_transport_before_each_dispatch() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let retry_loop = src
+        .find("while retry::should_retry(retry_config, &method, &result, attempt)")
+        .expect("HTTP retry loop not found");
+    let retry_tail = &src[retry_loop..];
+    let end = retry_tail
+        .find("(result, current_cb_target_key, final_upstream_target)")
+        .expect("HTTP retry loop end not found");
+    let retry_body = &retry_tail[..end];
+
+    let selection = retry_body
+        .find("select_next_retry_target(")
+        .expect("retry target rotation not found");
+    let hbone = retry_body
+        .find("target_hbone_enabled")
+        .expect("HBONE transport resolution not found");
+    let mesh_mtls = retry_body
+        .find("target_mesh_mtls_enabled")
+        .expect("sidecar mTLS transport resolution not found");
+    let admission = retry_body
+        .find("run_backend_admission_plugins(")
+        .expect("per-attempt backend admission not found");
+    let mesh_dispatch = retry_body
+        .find("proxy_to_backend_mesh_retry(")
+        .expect("mesh retry dispatch not found");
+    let plain_dispatch = retry_body
+        .find("proxy_to_backend_retry(")
+        .expect("plain retry dispatch not found");
+
+    assert!(selection < hbone && selection < mesh_mtls);
+    assert!(hbone < admission && mesh_mtls < admission);
+    assert!(admission < mesh_dispatch && mesh_dispatch < plain_dispatch);
+    assert!(
+        !retry_body.contains("direct_http_mesh_transport_refusal("),
+        "generic retry loop must dispatch the secured transport, not refuse it"
+    );
+}
+
+#[test]
+fn mesh_retry_replays_finalized_bytes_without_rerunning_body_hooks() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let helper = src
+        .find("async fn proxy_to_backend_mesh_retry(")
+        .expect("mesh retry helper not found");
+    let helper_tail = &src[helper..];
+    let end = helper_tail
+        .find("/// Proxy the request to the backend.")
+        .expect("mesh retry helper end not found");
+    let helper_body = &helper_tail[..end];
+
+    assert!(helper_body.contains("MeshClientRequestBody::Replayable("));
+    assert!(helper_body.contains("resolve_effective_proxy_for_target("));
+    assert!(!helper_body.contains("apply_request_body_plugins_with_context("));
+    assert!(!helper_body.contains("run_final_request_body_hooks("));
+}
+
 // --- classify_grpc_proxy_error tests ---
 
 #[test]

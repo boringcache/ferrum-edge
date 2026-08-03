@@ -2333,18 +2333,18 @@ fn grpc_mesh_fall_through_allows_only_pass_through_grpc_web_on_refused_transport
         // Pass-through gRPC-Web (no native content-type, no translation
         // marker): body-framed trailers ride the HTTP-family transport.
         assert!(
-            grpc_mesh_dispatch_falls_through(refused, false, false, true),
+            grpc_mesh_dispatch_falls_through(refused, false, false),
             "pass-through gRPC-Web must keep riding {refused:?} like plain HTTP"
         );
         // Native gRPC: refuse in-branch (Trailers-Only UNAVAILABLE).
         assert!(
-            !grpc_mesh_dispatch_falls_through(refused, true, false, true),
+            !grpc_mesh_dispatch_falls_through(refused, true, false),
             "native gRPC must fail closed for {refused:?}"
         );
         // Translated gRPC-Web: outbound is wire-native gRPC — refuse
         // in-branch, never tunnel it as trailerless native gRPC.
         assert!(
-            !grpc_mesh_dispatch_falls_through(refused, false, true, true),
+            !grpc_mesh_dispatch_falls_through(refused, false, true),
             "grpc_web-translated requests must fail closed for {refused:?}"
         );
     }
@@ -2353,7 +2353,6 @@ fn grpc_mesh_fall_through_allows_only_pass_through_grpc_web_on_refused_transport
             GrpcMeshDispatch::RefuseCrossClusterNoTransport,
             false,
             false,
-            true
         ),
         "a cross-cluster-only target has no mesh transport for pass-through gRPC-Web to use"
     );
@@ -2366,7 +2365,6 @@ fn grpc_mesh_fall_through_allows_only_pass_through_grpc_web_on_refused_transport
                 GrpcMeshDispatch::RefuseCrossClusterMalformed,
                 native_ct,
                 translated,
-                true
             ),
             "malformed cross-cluster mesh-mTLS must fail closed for \
              native_ct={native_ct} translated={translated}"
@@ -2375,20 +2373,20 @@ fn grpc_mesh_fall_through_allows_only_pass_through_grpc_web_on_refused_transport
 }
 
 #[test]
-fn grpc_mesh_fall_through_mesh_mtls_requires_streamable_request_body() {
+fn grpc_mesh_fall_through_mesh_mtls_accepts_replayable_request_body() {
     use grpc_proxy::{GrpcMeshDispatch, grpc_mesh_dispatch_falls_through};
     // Same-cluster AND cross-cluster Sidecar mesh-mTLS carry native gRPC
     // (streaming trailer relay) AND binary translated gRPC-Web (streaming
     // body-framed trailer conversion) down the generic mesh path when the
-    // request body can stream — the cross-cluster variant rides the SAME pool's
-    // east-west branch.
+    // request body streams or was finalized into replayable bytes — the
+    // cross-cluster variant rides the SAME pool's east-west branch.
     for dispatch in [
         GrpcMeshDispatch::MeshMtls,
         GrpcMeshDispatch::MeshMtlsCrossCluster,
     ] {
         for (native_ct, translated) in [(true, false), (false, true), (false, false)] {
             assert!(
-                grpc_mesh_dispatch_falls_through(dispatch, native_ct, translated, true),
+                grpc_mesh_dispatch_falls_through(dispatch, native_ct, translated),
                 "{dispatch:?} must fall through for native_ct={native_ct} translated={translated}"
             );
             assert!(
@@ -2396,16 +2394,11 @@ fn grpc_mesh_fall_through_mesh_mtls_requires_streamable_request_body() {
                     GrpcMeshDispatch::Direct,
                     native_ct,
                     translated,
-                    true
                 ),
                 "Direct targets stay on the direct gRPC pool"
             );
         }
-        assert!(
-            !grpc_mesh_dispatch_falls_through(dispatch, false, true, false),
-            "text-mode translated gRPC-Web still needs request-body buffering, which \
-             mesh-mTLS dispatch refuses ({dispatch:?})"
-        );
+        assert!(grpc_mesh_dispatch_falls_through(dispatch, false, true));
     }
 }
 

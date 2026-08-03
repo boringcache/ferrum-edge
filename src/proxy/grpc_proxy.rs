@@ -2489,13 +2489,10 @@ pub fn classify_grpc_mesh_dispatch(
 /// target (issue #2003).
 ///
 /// * `Direct` never falls through — the direct `GrpcConnectionPool` serves it.
-/// * `MeshMtls` / `MeshMtlsCrossCluster` fall through only when the generic
-///   mesh-mTLS path can carry the request body without pre-buffering (the
-///   cross-cluster variant rides the SAME pool, just its east-west branch).
-///   Native streams and binary translated gRPC-Web are supported there;
-///   text-mode translated gRPC-Web still needs request-body buffering for
-///   base64 decode, which that path refuses today, so it fails closed before
-///   falling through.
+/// * `MeshMtls` / `MeshMtlsCrossCluster` fall through to the generic mesh-mTLS
+///   path (the cross-cluster variant rides the SAME pool, just its east-west
+///   branch). The pool accepts both streamed bodies and finalized replayable
+///   bytes, so request transforms and retry buffering do not change transport.
 /// * `RefuseCrossClusterMalformed` never falls through: the cross-cluster
 ///   Sidecar mesh-mTLS transport tag is present but the target lacks the SNI
 ///   override / trust domain the dial needs, so even pass-through gRPC-Web
@@ -2518,13 +2515,10 @@ pub fn grpc_mesh_dispatch_falls_through(
     dispatch: GrpcMeshDispatch,
     request_uses_grpc_content_type: bool,
     grpc_web_translated: bool,
-    mesh_mtls_supports_request_body: bool,
 ) -> bool {
     match dispatch {
         GrpcMeshDispatch::Direct => false,
-        GrpcMeshDispatch::MeshMtls | GrpcMeshDispatch::MeshMtlsCrossCluster => {
-            mesh_mtls_supports_request_body
-        }
+        GrpcMeshDispatch::MeshMtls | GrpcMeshDispatch::MeshMtlsCrossCluster => true,
         GrpcMeshDispatch::RefuseCrossClusterNoTransport
         | GrpcMeshDispatch::RefuseCrossClusterMalformed => false,
         GrpcMeshDispatch::RefuseCrossCluster | GrpcMeshDispatch::RefuseHbone => {

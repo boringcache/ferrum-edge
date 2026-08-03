@@ -20,8 +20,10 @@
 //! stream, so the dispatch error mapping stays single-sourced.
 
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use dashmap::DashMap;
 use hyper::client::conn::http2;
+use http_body_util::{Either, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
 use std::fmt::Write;
@@ -107,10 +109,13 @@ pub const MESH_EASTWEST_SNI_TAG: &str = "mesh.eastwest_sni";
 /// pinned-peer one.
 pub const MESH_CROSS_CLUSTER_TAG: &str = "mesh.cross_cluster";
 
-/// Multiplexed hyper H2 sender over the SVID-mTLS session. The body type is
-/// [`SizeLimitedIncoming`] so dispatch enforces `max_request_body_size_bytes`
-/// on the streamed request body exactly like the HBONE path.
-pub type MeshMtlsSender = http2::SendRequest<SizeLimitedIncoming>;
+/// Request representation accepted by the multiplexed sidecar H2 pool.
+/// Streaming requests retain the existing inline size limiter; retry-enabled
+/// requests use immutable bytes finalized once before the first attempt.
+pub type MeshMtlsRequestBody = Either<SizeLimitedIncoming, Full<Bytes>>;
+
+/// Multiplexed hyper H2 sender over the SVID-mTLS session.
+pub type MeshMtlsSender = http2::SendRequest<MeshMtlsRequestBody>;
 
 thread_local! {
     static MESH_MTLS_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(192));

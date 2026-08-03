@@ -2872,14 +2872,6 @@ fn is_h3_transport_failure(resp: &retry::BackendResponse) -> bool {
     resp.error_class.is_some_and(is_h3_transport_error_class)
 }
 
-fn can_use_hbone_pool(
-    retain_request_body: bool,
-    requires_request_body_buffering: bool,
-    stream_request_body: bool,
-) -> bool {
-    !retain_request_body && !requires_request_body_buffering && stream_request_body
-}
-
 fn proxy_can_dispatch_hbone(proxy: &Proxy) -> bool {
     proxy.dispatch_kind == DispatchKind::HttpPool
 }
@@ -3064,6 +3056,19 @@ pub(crate) const BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON: &str =
 enum ClientRequestBody {
     Streaming(Box<Request<Incoming>>),
     Buffered(BufferedClientRequestBody),
+}
+
+/// Request body representation accepted by the secured mesh transports.
+///
+/// The ordinary fast path keeps streaming the frontend body. Retry-enabled or
+/// body-policy requests are finalized once into immutable bytes before the
+/// first backend attempt; every later attempt clones only the `Bytes` handle.
+/// Keeping this transport-local avoids widening `ClientRequestBody` with a
+/// replay-only state that unrelated gRPC/H3 intake paths could accidentally
+/// consume.
+enum MeshClientRequestBody {
+    Streaming(Request<Incoming>),
+    Replayable(Bytes),
 }
 
 /// A request body collected before backend dispatch together with the pristine
@@ -3305,6 +3310,118 @@ async fn buffer_request_body_for_before_proxy(
         headers: parts.headers,
         body: body_bytes,
     }))
+}
+
+/// Finalize a request body for HBONE or sidecar mTLS dispatch.
+///
+/// Request transforms and final-body policy run exactly once, before the first
+/// secured-transport attempt. The returned `Bytes` are retained only when the
+/// retry loop needs replay; mesh pool acquisition, identity verification, and
+/// backend admission remain per attempt.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_mesh_request_body(
+    client_request_body: ClientRequestBody,
+    method: &str,
+    headers: &HashMap<String, String>,
+    max_request_body_size_bytes: usize,
+    request_body_read_timeout_ms: u64,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    plugins: &[Arc<dyn Plugin>],
+    mut ctx: Option<&mut RequestContext>,
+    stream_request_body: bool,
+    request_body_prepared: bool,
+    retain_request_body: bool,
+    ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    resolved_ip: Option<String>,
+) -> Result<(MeshClientRequestBody, Option<Bytes>), retry::BackendResponse> {
+    let buffered = match client_request_body {
+        ClientRequestBody::Streaming(request) if stream_request_body => {
+            return Ok((MeshClientRequestBody::Streaming(*request), None));
+        }
+        ClientRequestBody::Streaming(request) => buffer_request_body_for_before_proxy(
+            *request,
+            method,
+            headers,
+            max_request_body_size_bytes,
+            request_body_read_timeout_ms,
+            grpc_deadline_at,
+        )
+        .await
+        .map_err(|error| match error {
+            RequestBodyBufferError::TooLarge => retry::BackendResponse {
+                status_code: 413,
+                body: ResponseBody::buffered(
+                    br#"{"error":"Request body exceeds maximum size"}"#.to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip.clone(),
+                error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+            },
+            RequestBodyBufferError::ClientDisconnected(message) => {
+                debug!(error = %message, "Client disconnected while buffering mesh request body");
+                retry::BackendResponse {
+                    status_code: 499,
+                    body: ResponseBody::buffered(br#"{"error":"Client disconnected"}"#.to_vec()),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
+                    error_class: Some(retry::ErrorClass::ClientDisconnect),
+                }
+            }
+            RequestBodyBufferError::TimedOut => {
+                request_body_timeout_backend_response(resolved_ip.clone())
+            }
+            RequestBodyBufferError::DeadlineExceeded => {
+                client_grpc_deadline_exceeded_response(resolved_ip.clone())
+            }
+        })?,
+        buffered => buffered,
+    };
+
+    let buffered = match buffered {
+        ClientRequestBody::Buffered(buffered) => buffered,
+        ClientRequestBody::Streaming(request) => {
+            return Ok((MeshClientRequestBody::Streaming(*request), None));
+        }
+    };
+
+    if !request_body_prepared {
+        ctx_bytes_sent_observed.fetch_max(
+            buffered.body.len() as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+    let body = if request_body_prepared {
+        buffered.body
+    } else {
+        let transformed = apply_request_body_plugins_with_context(
+            plugins,
+            ctx.as_deref_mut(),
+            grpc_deadline_at,
+            headers,
+            buffered.body,
+        )
+        .await;
+        match run_final_request_body_hooks(
+            plugins,
+            ctx,
+            grpc_deadline_at,
+            headers,
+            &transformed,
+        )
+        .await
+        {
+            PluginResult::Continue => transformed,
+            reject @ PluginResult::Reject { .. }
+            | reject @ PluginResult::RejectBinary { .. } => {
+                return Err(reject_result_to_backend_response(reject, resolved_ip));
+            }
+        }
+    };
+    let body = Bytes::from(body);
+    let retained = (retain_request_body && !body.is_empty()).then(|| body.clone());
+    Ok((MeshClientRequestBody::Replayable(body), retained))
 }
 
 pub(crate) fn store_request_body_metadata(
@@ -25224,7 +25341,6 @@ async fn handle_proxy_request_inner(
                 grpc_proxy::classify_grpc_mesh_dispatch(target),
                 request_uses_grpc_content_type,
                 grpc_request_is_web_translated,
-                !requires_request_body_buffering,
             )
         });
     let grpc_uses_native_dispatch =
@@ -26024,10 +26140,10 @@ async fn handle_proxy_request_inner(
     //     down the generic HTTP dispatch path, whose mesh-mTLS gate + pool
     //     (`proxy_to_backend_mesh_mtls`) carry gRPC natively: the pool is
     //     hyper h2 end-to-end with pinned peer SVID, the request body streams
-    //     (`SizeLimitedIncoming`), and the `StreamingH2` response arm relays
+    //     or uses finalized replayable bytes, and the `StreamingH2` response arm relays
     //     backend trailers through `StripHopByHopTrailers` — the same trailer
     //     semantics as `GrpcConnectionPool`. When that path cannot dispatch
-    //     (retry configured, body buffering required, no gateway SVID) the
+    //     (missing gateway SVID or invalid target identity) the
     //     mesh-mTLS gate below fails closed with a gRPC UNAVAILABLE.
     //   * NATIVE-gRPC requests (and gRPC-Web the `grpc_web` plugin
     //     TRANSLATED — wire-native gRPC by dispatch time) to Ambient
@@ -26051,10 +26167,8 @@ async fn handle_proxy_request_inner(
     //     refusal is encoded in the gRPC-Web wire format here because this
     //     early fail-closed branch returns before the normal `grpc_web`
     //     `after_proxy`/body hooks can translate a native gRPC error response).
-    //     `MeshMtls` still falls through for native gRPC and binary translated
-    //     gRPC-Web, but text-mode translated gRPC-Web remains fail-closed here
-    //     because it requires request-body buffering and the generic mesh-mTLS
-    //     path does not accept pre-buffered request bodies.
+    //     `MeshMtls` still falls through for native gRPC and translated
+    //     gRPC-Web, including request-body representations finalized by policy.
     if grpc_uses_native_dispatch {
         {
             let grpc_proxy_headers = owned_proxy_headers.as_mut().unwrap_or(&mut ctx.headers);
@@ -27150,19 +27264,12 @@ async fn handle_proxy_request_inner(
                     .await);
                 }
 
-                // Re-screen the (possibly LB-rotated) retry target for mesh
-                // transport tags (issue #2003): the initial-attempt guard /
-                // fall-through above only classified the FIRST selected target,
-                // and this loop dials `GrpcConnectionPool` directly — a rotation
-                // onto a mesh-tagged target (mixed mesh/non-mesh upstream) must
-                // fail closed, never direct-dial past the secured transport.
-                // `MeshMtls` / `MeshMtlsCrossCluster` also refuse here (any
-                // non-`Direct` classification does): the generic mesh-mTLS path
-                // cannot dispatch retries (`!has_retry` gate), so there is no
-                // transport to switch to mid-loop. No circuit-breaker probe
-                // slot is held for the new target yet (the breaker is checked
-                // just below), so only the request is counted — mirrors the
-                // egress-policy re-screen below.
+                // This loop owns the direct `GrpcConnectionPool` response/trailer
+                // pipeline. A rotation onto a mesh target must fail closed rather
+                // than direct-dial past its identity boundary; mesh-mTLS retries
+                // are handled by the generic mesh path when mesh was selected for
+                // the first attempt. Switching response pipelines mid-loop would
+                // lose the exact gRPC HeaderMap/trailer contract.
                 if let Some(ref rotated_target) = grpc_current_target
                     && grpc_proxy::classify_grpc_mesh_dispatch(rotated_target)
                         != grpc_proxy::GrpcMeshDispatch::Direct
@@ -27170,15 +27277,14 @@ async fn handle_proxy_request_inner(
                     warn!(
                         proxy_id = %proxy.id,
                         target_host = %rotated_target.host,
-                        "gRPC retry rotated onto a mesh-transport-tagged target; \
-                         refusing the direct dial and failing closed with gRPC UNAVAILABLE"
+                        "Direct gRPC retry rotated onto a mesh target; refusing an insecure or trailer-losing transport switch"
                     );
                     record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
                     if let Some(content_type) = grpc_web_response_content_type {
                         return Ok(build_grpc_web_error_response(
                             content_type,
                             14,
-                            "gRPC retry target requires a mesh transport that does not support retries",
+                            "direct gRPC retry cannot switch into a mesh transport",
                             plugin_cache_view
                                 .initial_response_header_policy_plugins()
                                 .as_ref(),
@@ -27188,7 +27294,7 @@ async fn handle_proxy_request_inner(
                         && let Some(response) = build_translated_grpc_web_error_response(
                             &ctx,
                             14,
-                            "gRPC retry target requires a mesh transport that does not support retries",
+                            "direct gRPC retry cannot switch into a mesh transport",
                             plugin_cache_view
                                 .initial_response_header_policy_plugins()
                                 .as_ref(),
@@ -27198,7 +27304,7 @@ async fn handle_proxy_request_inner(
                     }
                     return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         14, // UNAVAILABLE
-                        "gRPC retry target requires a mesh transport that does not support retries",
+                        "direct gRPC retry cannot switch into a mesh transport",
                         initial_response_header_policy_plugins.as_ref(),
                     ));
                 }
@@ -29216,11 +29322,9 @@ async fn handle_proxy_request_inner(
     //
     // Dispatch decision is per-target, captured atomically per attempt:
     //
-    // * Same target across attempts → keep the snapshot. Cross-protocol
-    //   replay against the same backend would bypass
-    //   `proxy.retry.retry_on_methods` (the failed transport attempt may
-    //   have flushed headers/body before the error surfaced) and risk
-    //   duplicating non-idempotent requests on the same backend instance.
+    // * Same target across attempts → keep the direct-H3 snapshot. Mesh
+    //   attempts re-resolve their identity and transport plan because SVIDs
+    //   and capability state can rotate during backoff.
     //
     // * Load-balancer rotated to a different target → recompute the
     //   snapshot for the new target. Different target → different backend
@@ -29244,25 +29348,15 @@ async fn handle_proxy_request_inner(
     let hbone_required = upstream_target
         .as_deref()
         .is_some_and(hbone_pool::target_hbone_enabled);
-    let current_dispatch_hbone = !has_retry
-        && can_use_hbone_pool(
-            has_retry,
-            requires_request_body_buffering,
-            stream_request_body,
-        )
-        && can_attempt_hbone_backend(
-            state.backend_capabilities.as_ref(),
-            &proxy,
-            upstream_target.as_deref(),
-            state.gateway_svid_bundle.load().is_some(),
-        );
+    let current_dispatch_hbone = can_attempt_hbone_backend(
+        state.backend_capabilities.as_ref(),
+        &proxy,
+        upstream_target.as_deref(),
+        state.gateway_svid_bundle.load().is_some(),
+    );
     if hbone_required && !current_dispatch_hbone {
-        let block_reason = if has_retry {
-            "effective retry config disables HBONE dispatch"
-        } else if requires_request_body_buffering {
-            "request body buffering disables HBONE dispatch"
-        } else if !stream_request_body {
-            "non-streaming request body disables HBONE dispatch"
+        let block_reason = if state.gateway_svid_bundle.load().is_none() {
+            "gateway workload identity is unavailable"
         } else {
             "HBONE backend capability is not available"
         };
@@ -29322,23 +29416,10 @@ async fn handle_proxy_request_inner(
     let mesh_mtls_required = upstream_target
         .as_deref()
         .is_some_and(mesh_mtls_pool::target_mesh_mtls_enabled);
-    let current_dispatch_mesh_mtls = !has_retry
-        && can_use_hbone_pool(
-            has_retry,
-            requires_request_body_buffering,
-            stream_request_body,
-        )
-        && supports_mesh_mtls_backend(&state, &proxy, upstream_target.as_deref());
+    let current_dispatch_mesh_mtls =
+        supports_mesh_mtls_backend(&state, &proxy, upstream_target.as_deref());
     if mesh_mtls_required && !current_dispatch_mesh_mtls {
-        let block_reason = if has_retry {
-            "effective retry config disables sidecar SVID-mTLS dispatch"
-        } else if requires_request_body_buffering {
-            "request body buffering disables sidecar SVID-mTLS dispatch"
-        } else if !stream_request_body {
-            "non-streaming request body disables sidecar SVID-mTLS dispatch"
-        } else {
-            "sidecar SVID-mTLS backend transport is not available"
-        };
+        let block_reason = "sidecar SVID-mTLS backend transport is not available";
         warn!(
             proxy_id = %proxy.id,
             upstream_target = ?upstream_target,
@@ -29363,8 +29444,8 @@ async fn handle_proxy_request_inner(
         // This gate is the fail-closed surface for gRPC-over-mesh-mTLS (issue
         // #2003): gRPC requests to same-cluster `mesh.mtls` targets skip the
         // direct-dial gRPC branch and dispatch through the mesh-mTLS pool, so
-        // when that transport is unavailable (retry configured, request-body
-        // buffering, missing gateway SVID) the request must die HERE with a
+        // when that transport is unavailable (for example, missing gateway
+        // SVID) the request must die HERE with a
         // protocol-appropriate Trailers-Only refusal — never fall back to a
         // plaintext direct dial.
         if is_grpc_request {
@@ -29466,8 +29547,8 @@ async fn handle_proxy_request_inner(
             &request_client_ip,
             &request_xff_append_ip,
             ctx.request_is_secure,
-            false,
-            false,
+            current_dispatch_hbone,
+            current_dispatch_mesh_mtls,
             current_dispatch_h3,
             &bytes_sent_observed,
             inbound_version,
@@ -29507,9 +29588,12 @@ async fn handle_proxy_request_inner(
                 response,
                 retained_body,
                 backend_admission_permits: permits,
-                ..
+                request_body_exceeded,
+                streaming_h2_read_timeout_ms: mesh_read_timeout_ms,
             } => {
                 backend_admission_permits = permits;
+                mesh_request_body_exceeded = request_body_exceeded;
+                streaming_h2_read_timeout_ms = mesh_read_timeout_ms;
                 (*response, retained_body)
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
@@ -29689,15 +29773,39 @@ async fn handle_proxy_request_inner(
                 .await);
             }
 
-            if let Some(reason) =
-                backend_dispatch::direct_http_mesh_transport_refusal(current_target.as_deref())
+            // Resolve the exact selected target's transport for this attempt.
+            // This is deliberately repeated even for a same-target retry: SVID
+            // rotation, capability refresh, and target policy reloads can all
+            // change the effective mesh dial plan while backoff is pending.
+            let retry_hbone_required = current_target
+                .as_deref()
+                .is_some_and(hbone_pool::target_hbone_enabled);
+            let retry_mesh_mtls_required = current_target
+                .as_deref()
+                .is_some_and(mesh_mtls_pool::target_mesh_mtls_enabled);
+            let retry_dispatch_hbone = retry_hbone_required
+                && can_attempt_hbone_backend(
+                    state.backend_capabilities.as_ref(),
+                    &proxy,
+                    current_target.as_deref(),
+                    state.gateway_svid_bundle.load().is_some(),
+                );
+            let retry_dispatch_mesh_mtls = retry_mesh_mtls_required
+                && supports_mesh_mtls_backend(&state, &proxy, current_target.as_deref());
+            if (retry_hbone_required && !retry_dispatch_hbone)
+                || (retry_mesh_mtls_required && !retry_dispatch_mesh_mtls)
             {
+                let reason = if retry_hbone_required {
+                    "HBONE transport or gateway identity is unavailable for retry target"
+                } else {
+                    "sidecar mTLS transport or gateway identity is unavailable for retry target"
+                };
                 warn!(
                     proxy_id = %proxy.id,
                     target_host = current_target.as_deref().map(|target| target.host.as_str()).unwrap_or(""),
                     target_port = current_target.as_deref().map(|target| target.port).unwrap_or(0),
                     reason,
-                    "HTTP retry rotated onto a mesh-transport-tagged target; refusing direct retry dispatch"
+                    "Mesh retry target cannot be dispatched securely; failing closed"
                 );
                 result = retry::BackendResponse {
                     status_code: 502,
@@ -29717,6 +29825,27 @@ async fn handle_proxy_request_inner(
                 backend_admission_started_at = Instant::now();
                 // No backend attempt was made for the rotated target. Keep the
                 // synthetic policy refusal neutral for CB/passive-health.
+                skip_final_cb_record = true;
+                break;
+            }
+
+            // A wire-native gRPC request that entered the generic path did so
+            // because its first target selected sidecar mesh-mTLS. Keep its
+            // trailer-preserving response pipeline stable: rotating onto a
+            // direct target would require the separate direct gRPC pool and an
+            // exact HeaderMap the generic HTTP planner intentionally does not
+            // reconstruct. Pass-through gRPC-Web is body-framed and may rotate
+            // across all HTTP-family transports normally.
+            if (request_uses_grpc_content_type || grpc_request_is_web_translated)
+                && !retry_dispatch_mesh_mtls
+            {
+                result = mesh_grpc_unavailable_response(
+                    None,
+                    "mesh gRPC retry cannot switch into the direct gRPC transport",
+                    retry::ErrorClass::DispatchPolicyRejected,
+                );
+                final_upstream_target = current_target.clone();
+                backend_admission_started_at = Instant::now();
                 skip_final_cb_record = true;
                 break;
             }
@@ -29820,7 +29949,30 @@ async fn handle_proxy_request_inner(
             // `current_dispatch_h3` was either kept from the prior attempt
             // (same target → same protocol) or recomputed above for the
             // new target (rotation → match the new target's capability).
-            result = if current_dispatch_h3 {
+            result = if retry_dispatch_hbone || retry_dispatch_mesh_mtls {
+                let (response, request_body_exceeded, read_timeout_ms) =
+                    proxy_to_backend_mesh_retry(
+                        &state,
+                        &proxy,
+                        &current_url,
+                        &method,
+                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        current_target.as_deref(),
+                        retained_body.as_ref(),
+                        retry_dispatch_hbone,
+                        &plugins,
+                        &ctx,
+                        should_stream,
+                        &ctx.client_ip,
+                        &request_xff_append_ip,
+                        ctx.request_is_secure,
+                        &bytes_sent_observed,
+                    )
+                    .await;
+                mesh_request_body_exceeded = request_body_exceeded;
+                streaming_h2_read_timeout_ms = Some(read_timeout_ms);
+                response
+            } else if current_dispatch_h3 {
                 proxy_to_backend_http3_retry(
                     &state,
                     &proxy,
@@ -29864,7 +30016,11 @@ async fn handle_proxy_request_inner(
             // iteration's `current_dispatch_h3` — that decision was locked
             // before the attempt — but it does affect the next iteration
             // IF the LB rotates to a target that gets recomputed here.
-            if current_dispatch_h3 && is_h3_transport_failure(&result) {
+            if !retry_dispatch_hbone
+                && !retry_dispatch_mesh_mtls
+                && current_dispatch_h3
+                && is_h3_transport_failure(&result)
+            {
                 mark_h3_unsupported_for_backend_target(
                     state.backend_capabilities.as_ref(),
                     &proxy,
@@ -32725,6 +32881,155 @@ pub(crate) async fn proxy_to_backend_retry(
     }
 }
 
+/// Dispatch one replay attempt over the selected target's secured mesh
+/// transport. The caller re-runs LB, circuit-breaker, and backend-admission
+/// gates before entering; this helper re-resolves the target-effective proxy,
+/// identity/SNI plan, timeout, pool partition, and connection policy.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_to_backend_mesh_retry(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    upstream_target: Option<&UpstreamTarget>,
+    request_body: Option<&Bytes>,
+    dispatch_hbone: bool,
+    plugins: &[Arc<dyn Plugin>],
+    request_ctx: &RequestContext,
+    stream_response: bool,
+    client_ip: &str,
+    xff_append_ip: &str,
+    request_is_secure: bool,
+    ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+) -> (
+    retry::BackendResponse,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+    u64,
+) {
+    let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
+    let proxy = effective_proxy.as_ref();
+    let effective_host = upstream_target
+        .map(|target| target.host.as_str())
+        .unwrap_or(&proxy.backend_host);
+    if let Some(reason) = denied_literal_backend_or_dns_override(
+        effective_host,
+        proxy,
+        &state.env_config.backend_allow_ips,
+    ) {
+        warn!(
+            proxy_id = %proxy.id,
+            backend = %effective_host,
+            reason,
+            "Backend egress policy denied literal-IP mesh retry target; not dialing"
+        );
+        return (
+            backend_egress_denied_response(effective_host),
+            None,
+            proxy.backend_read_timeout_ms,
+        );
+    }
+
+    let resolved_ip = if dispatch_hbone
+        && upstream_target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target)
+    {
+        None
+    } else {
+        let resolve = state.dns_cache.resolve(
+            effective_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        );
+        let result = if let Some(deadline) = request_ctx.grpc_deadline_at() {
+            match tokio::time::timeout_at(deadline, resolve).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return (
+                        client_grpc_deadline_exceeded_response_for_request(
+                            request_ctx,
+                            headers,
+                            None,
+                        ),
+                        None,
+                        proxy.backend_read_timeout_ms,
+                    );
+                }
+            }
+        } else {
+            resolve.await
+        };
+        match result {
+            Ok(ip) => Some(ip.to_string()),
+            Err(error) => {
+                return (
+                    backend_dns_resolution_failed_response(effective_host, &error),
+                    None,
+                    proxy.backend_read_timeout_ms,
+                );
+            }
+        }
+    };
+
+    let retry_response_ctx =
+        plugins_may_release_response_body_under_retries(plugins, request_ctx)
+            .then(|| retry_response_decision_context(request_ctx));
+    let mesh_body = MeshClientRequestBody::Replayable(
+        request_body.cloned().unwrap_or_else(Bytes::new),
+    );
+    let route_request_body_limit = request_ctx.route_request_body_limit();
+    let route_response_body_limit = request_ctx.route_response_body_limit();
+    let (response, _, request_body_exceeded) = if dispatch_hbone {
+        proxy_to_backend_hbone(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            mesh_body,
+            upstream_target,
+            plugins,
+            Some(request_ctx),
+            retry_response_ctx.as_ref(),
+            stream_response,
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+            resolved_ip,
+            ctx_bytes_sent_observed,
+            route_request_body_limit,
+            route_response_body_limit,
+        )
+        .await
+    } else {
+        proxy_to_backend_mesh_mtls(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            mesh_body,
+            upstream_target,
+            plugins,
+            request_ctx,
+            retry_response_ctx.as_ref(),
+            stream_response,
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+            resolved_ip,
+            ctx_bytes_sent_observed,
+            route_request_body_limit,
+            route_response_body_limit,
+        )
+        .await
+    };
+    (
+        response,
+        request_body_exceeded,
+        proxy.backend_read_timeout_ms,
+    )
+}
+
 /// Proxy the request to the backend.
 ///
 /// `dispatch_h3` is captured by the caller and forced through here so the
@@ -33547,6 +33852,26 @@ async fn proxy_to_backend(
         ) {
             return reject;
         }
+        let (mesh_request_body, mesh_retained_body) = match prepare_mesh_request_body(
+            client_request_body,
+            method,
+            headers,
+            effective_max_request_body_size_bytes,
+            proxy.backend_read_timeout_ms,
+            request_ctx.grpc_deadline_at(),
+            plugins,
+            ctx.as_deref_mut(),
+            stream_request_body,
+            request_body_prepared,
+            retain_request_body,
+            ctx_bytes_sent_observed,
+            resolved_ip.clone(),
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(response) => return backend_dispatch_response(response, None, None),
+        };
         backend_admission_permits = match preacquired_backend_admission.take_or_run(
             backend_admission_plugins,
             request_ctx,
@@ -33564,7 +33889,7 @@ async fn proxy_to_backend(
             backend_url,
             method,
             headers,
-            client_request_body,
+            mesh_request_body,
             upstream_target,
             plugins,
             Some(request_ctx),
@@ -33581,7 +33906,7 @@ async fn proxy_to_backend(
         .await;
         return BackendDispatchResult::Response {
             response: Box::new(backend_resp),
-            retained_body: body_bytes,
+            retained_body: mesh_retained_body.or(body_bytes),
             backend_admission_permits,
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
@@ -33644,6 +33969,38 @@ async fn proxy_to_backend(
         ) {
             return reject;
         }
+        let mesh_request_body_limit = if mesh_grpc_flavored {
+            effective_request_body_limit(
+                grpc_proxy::mesh_request_body_limit(
+                    true,
+                    state.max_request_body_size_bytes,
+                    state.max_grpc_recv_size_bytes,
+                ),
+                route_request_body_limit,
+            )
+        } else {
+            effective_max_request_body_size_bytes
+        };
+        let (mesh_request_body, mesh_retained_body) = match prepare_mesh_request_body(
+            client_request_body,
+            method,
+            headers,
+            mesh_request_body_limit,
+            proxy.backend_read_timeout_ms,
+            request_ctx.grpc_deadline_at(),
+            plugins,
+            ctx.as_deref_mut(),
+            stream_request_body,
+            request_body_prepared,
+            retain_request_body,
+            ctx_bytes_sent_observed,
+            resolved_ip.clone(),
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(response) => return backend_dispatch_response(response, None, None),
+        };
         backend_admission_permits = match preacquired_backend_admission.take_or_run(
             backend_admission_plugins,
             request_ctx,
@@ -33661,7 +34018,7 @@ async fn proxy_to_backend(
             backend_url,
             method,
             headers,
-            client_request_body,
+            mesh_request_body,
             upstream_target,
             plugins,
             request_ctx,
@@ -33678,7 +34035,7 @@ async fn proxy_to_backend(
         .await;
         return BackendDispatchResult::Response {
             response: Box::new(backend_resp),
-            retained_body: body_bytes,
+            retained_body: mesh_retained_body.or(body_bytes),
             backend_admission_permits,
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
@@ -35943,17 +36300,27 @@ fn hbone_hyper_error_response(
     proxy: &Proxy,
     err: hyper::Error,
     resolved_ip: Option<String>,
+    request_body_replayable: bool,
 ) -> retry::BackendResponse {
     error!(proxy_id = %proxy.id, error = %err, "HBONE tunneled HTTP request failed");
+    // A canceled hyper dispatch with an immutable body proves the request was
+    // rejected by the client connection before it reached the peer stream
+    // (the same pooled-GOAWAY boundary used by direct H2 and gRPC). Other H2/H1
+    // errors may be post-wire and remain conservative protocol failures.
+    let error_class = if request_body_replayable && err.is_canceled() {
+        retry::ErrorClass::ConnectionPoolError
+    } else {
+        retry::ErrorClass::ProtocolError
+    };
     retry::BackendResponse {
         status_code: 502,
         body: ResponseBody::buffered(Bytes::from_static(
             br#"{"error":"HBONE backend unavailable"}"#,
         )),
         headers: HashMap::new(),
-        connection_error: false,
+        connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
-        error_class: Some(retry::ErrorClass::ProtocolError),
+        error_class: Some(error_class),
     }
 }
 
@@ -36571,7 +36938,7 @@ async fn proxy_to_backend_hbone(
     backend_url: &str,
     method: &str,
     headers: &HashMap<String, String>,
-    client_request_body: ClientRequestBody,
+    client_request_body: MeshClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     source_identity_ctx: Option<&RequestContext>,
@@ -36616,32 +36983,6 @@ async fn proxy_to_backend_hbone(
 
     // The dispatch debug (with the cross-cluster dial host / SNI / trust-domain
     // detail) is emitted below once those are resolved.
-
-    let original_req = match client_request_body {
-        ClientRequestBody::Streaming(request) => *request,
-        ClientRequestBody::Buffered(_) => {
-            debug_assert!(
-                false,
-                "HBONE pool should not be used when request body is pre-buffered"
-            );
-            return (
-                retry::BackendResponse {
-                    status_code: 500,
-                    body: ResponseBody::buffered(
-                        r#"{"error":"HBONE request buffering invariant violated"}"#
-                            .as_bytes()
-                            .to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: None,
-                },
-                None,
-                None,
-            );
-        }
-    };
 
     // Folded once for this dispatch, above the first size decision: the declared
     // Content-Length reject, the streaming adapter, and the buffered response
@@ -36876,7 +37217,7 @@ async fn proxy_to_backend_hbone(
         Ok(parts) => parts,
         Err(err) => {
             return (
-                hbone_hyper_error_response(proxy, err, resolved_ip),
+                hbone_hyper_error_response(proxy, err, resolved_ip, false),
                 None,
                 None,
             );
@@ -36934,19 +37275,32 @@ async fn proxy_to_backend_hbone(
         .build()
         .unwrap_or_else(|_| hyper::Uri::from_static("/"));
 
-    let (mut parts, body) = original_req.into_parts();
     let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let max_request_body_size = if effective_request_body_size_limit > 0 {
         effective_request_body_size_limit
     } else {
         usize::MAX
     };
-    let body = body::SizeLimitedIncoming::new_with_counter(
-        body,
-        max_request_body_size,
-        Arc::clone(&body_size_exceeded),
-        Arc::clone(ctx_bytes_sent_observed),
+    let request_body_replayable = matches!(
+        &client_request_body,
+        MeshClientRequestBody::Replayable(_)
     );
+    let (mut parts, body) = match client_request_body {
+        MeshClientRequestBody::Streaming(request) => {
+            let (parts, body) = request.into_parts();
+            let body = body::SizeLimitedIncoming::new_with_counter(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+            );
+            (parts, http_body_util::Either::Left(body))
+        }
+        MeshClientRequestBody::Replayable(body) => {
+            let (parts, ()) = Request::new(()).into_parts();
+            (parts, http_body_util::Either::Right(http_body_util::Full::new(body)))
+        }
+    };
     parts.uri = tunneled_uri;
     parts.version = hyper::Version::HTTP_11;
     parts.method = match parse_hyper_method(method) {
@@ -37096,7 +37450,7 @@ async fn proxy_to_backend_hbone(
                     );
                 }
                 return (
-                    hbone_hyper_error_response(proxy, err, resolved_ip),
+                    hbone_hyper_error_response(proxy, err, resolved_ip, request_body_replayable),
                     None,
                     None,
                 );
@@ -37152,7 +37506,7 @@ async fn proxy_to_backend_hbone(
                     );
                 }
                 return (
-                    hbone_hyper_error_response(proxy, err, resolved_ip),
+                    hbone_hyper_error_response(proxy, err, resolved_ip, request_body_replayable),
                     None,
                     None,
                 );
@@ -37234,7 +37588,7 @@ async fn proxy_to_backend_hbone(
             }
             Err(HyperBodyCollectError::Read(err)) => {
                 return (
-                    hbone_hyper_error_response(proxy, err, resolved_ip),
+                    hbone_hyper_error_response(proxy, err, resolved_ip, false),
                     None,
                     None,
                 );
@@ -37299,7 +37653,7 @@ async fn proxy_to_backend_mesh_mtls(
     backend_url: &str,
     method: &str,
     headers: &HashMap<String, String>,
-    client_request_body: ClientRequestBody,
+    client_request_body: MeshClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     request_ctx: &RequestContext,
@@ -37456,32 +37810,6 @@ async fn proxy_to_backend_mesh_mtls(
         sni_override = sni_override.unwrap_or(""),
         "Proxying request via sidecar SVID-mTLS HTTP/2"
     );
-
-    let original_req = match client_request_body {
-        ClientRequestBody::Streaming(request) => *request,
-        ClientRequestBody::Buffered(_) => {
-            debug_assert!(
-                false,
-                "mesh mTLS pool should not be used when request body is pre-buffered"
-            );
-            return (
-                retry::BackendResponse {
-                    status_code: 500,
-                    body: ResponseBody::buffered(
-                        r#"{"error":"mesh mTLS request buffering invariant violated"}"#
-                            .as_bytes()
-                            .to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: None,
-                },
-                None,
-                None,
-            );
-        }
-    };
 
     // gRPC flavor (issue #2003): same-cluster `mesh.mtls` gRPC skips the
     // direct-dial gRPC pool and dispatches here — the mesh-mTLS pool is hyper
@@ -37710,7 +38038,7 @@ async fn proxy_to_backend_mesh_mtls(
                 );
             }
             return (
-                hbone_hyper_error_response(proxy, err, resolved_ip),
+                hbone_hyper_error_response(proxy, err, resolved_ip, false),
                 None,
                 None,
             );
@@ -37889,7 +38217,6 @@ async fn proxy_to_backend_mesh_mtls(
         }
     };
 
-    let (mut parts, body) = original_req.into_parts();
     let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // `request_body_limit` is flavor-aware (codex r1-3): the gRPC receive
     // limit for gRPC-flavored requests, the general request-body limit
@@ -37900,12 +38227,26 @@ async fn proxy_to_backend_mesh_mtls(
     } else {
         usize::MAX
     };
-    let body = body::SizeLimitedIncoming::new_with_counter(
-        body,
-        max_request_body_size,
-        Arc::clone(&body_size_exceeded),
-        Arc::clone(ctx_bytes_sent_observed),
+    let request_body_replayable = matches!(
+        &client_request_body,
+        MeshClientRequestBody::Replayable(_)
     );
+    let (mut parts, body) = match client_request_body {
+        MeshClientRequestBody::Streaming(request) => {
+            let (parts, body) = request.into_parts();
+            let body = body::SizeLimitedIncoming::new_with_counter(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+            );
+            (parts, http_body_util::Either::Left(body))
+        }
+        MeshClientRequestBody::Replayable(body) => {
+            let (parts, ()) = Request::new(()).into_parts();
+            (parts, http_body_util::Either::Right(http_body_util::Full::new(body)))
+        }
+    };
     parts.uri = tunneled_uri;
     parts.version = hyper::Version::HTTP_2;
     parts.method = match parse_hyper_method(method) {
@@ -38124,15 +38465,25 @@ async fn proxy_to_backend_mesh_mtls(
                     None,
                 );
             }
+            let error_class = if request_body_replayable && err.is_canceled() {
+                retry::ErrorClass::ConnectionPoolError
+            } else {
+                retry::ErrorClass::ProtocolError
+            };
             return (
                 if is_grpc_flavored {
                     mesh_grpc_unavailable_response(
                         resolved_ip,
                         "sidecar mTLS backend unavailable",
-                        retry::ErrorClass::ProtocolError,
+                        error_class,
                     )
                 } else {
-                    hbone_hyper_error_response(proxy, err, resolved_ip)
+                    hbone_hyper_error_response(
+                        proxy,
+                        err,
+                        resolved_ip,
+                        request_body_replayable,
+                    )
                 },
                 None,
                 None,
@@ -38336,7 +38687,7 @@ async fn proxy_to_backend_mesh_mtls(
                             retry::ErrorClass::ProtocolError,
                         )
                     } else {
-                        hbone_hyper_error_response(proxy, err, resolved_ip)
+                        hbone_hyper_error_response(proxy, err, resolved_ip, false)
                     },
                     None,
                     None,
