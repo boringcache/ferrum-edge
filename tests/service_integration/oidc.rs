@@ -751,11 +751,9 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
             assert_eq!(actual.origin(), expected.origin());
             assert_eq!(actual.path(), expected.path());
             assert_eq!(
-                actual
-                    .query_pairs()
-                    .find_map(|(key, value)| {
-                        (key == "post_logout_redirect_uri").then_some(value)
-                    }),
+                actual.query_pairs().find_map(|(key, value)| {
+                    (key == "post_logout_redirect_uri").then_some(value)
+                }),
                 Some("http://127.0.0.1/".into())
             );
             assert_eq!(
