@@ -969,3 +969,28 @@ async fn update_config_withdraws_projected_lb_policy_with_unrelated_consumer_del
             .is_some()
     );
 }
+
+#[tokio::test]
+async fn ordinary_proxy_edit_preserves_unaffected_load_balancer_snapshot() {
+    let old_config = prepared_with_dr(None);
+    let mut new_config = old_config.clone();
+    let proxy = new_config
+        .proxies
+        .iter_mut()
+        .find(|proxy| proxy.id == "reviews-p")
+        .expect("reviews proxy");
+    proxy.backend_read_timeout_ms = Some(7_500);
+    proxy.updated_at += Duration::seconds(1);
+    new_config.normalize_fields();
+
+    let (state, _handles) = new_proxy_state(old_config);
+    let before = Arc::clone(&*state.load_balancer_cache.load());
+
+    assert_eq!(state.update_config(new_config), ConfigApplyOutcome::Applied);
+
+    let after = Arc::clone(&*state.load_balancer_cache.load());
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "an ordinary route-only proxy edit must not full-rebuild and reset every load balancer"
+    );
+}

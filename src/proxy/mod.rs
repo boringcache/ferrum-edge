@@ -8829,6 +8829,48 @@ impl ProxyState {
             || Self::projected_mesh_stream_relay_dispatch_content_changed(old_config, new_config)
     }
 
+    /// Whether a DestinationRule-derived, serde-skipped projection changed in
+    /// a way that requires rebuilding the load-balancer snapshot.
+    ///
+    /// Keep this narrower than [`Self::projected_route_proxy_content_changed`]:
+    /// that route signal deliberately compares all timestamp-neutral proxy
+    /// content so a same-timestamp route edit cannot leave a stale RouterCache.
+    /// Using the broad signal for LB staging would full-rebuild every upstream
+    /// (resetting RR/WRR/latency state) on an ordinary HTTP proxy edit that has
+    /// no load-balancing effect.
+    fn projected_dr_dispatch_content_changed(
+        old_config: &GatewayConfig,
+        new_config: &GatewayConfig,
+    ) -> bool {
+        let old_route_indexed: HashMap<(&str, &str), &Proxy> = old_config
+            .proxies
+            .iter()
+            .filter(|proxy| !proxy.dispatch_kind.is_stream())
+            .map(|proxy| ((proxy.namespace.as_str(), proxy.id.as_str()), proxy))
+            .collect();
+
+        new_config
+            .proxies
+            .iter()
+            .filter(|proxy| !proxy.dispatch_kind.is_stream())
+            .any(|new_proxy| {
+                old_route_indexed
+                    .get(&(new_proxy.namespace.as_str(), new_proxy.id.as_str()))
+                    .is_some_and(|old_proxy| {
+                        old_proxy.resolved_tls != new_proxy.resolved_tls
+                            || !Self::route_dispatch_overrides_eq(
+                                &old_proxy.dispatch_port_overrides,
+                                &new_proxy.dispatch_port_overrides,
+                            )
+                            || !Self::route_dispatch_override_options_eq(
+                                old_proxy.dispatch_port_override_fallback.as_ref(),
+                                new_proxy.dispatch_port_override_fallback.as_ref(),
+                            )
+                    })
+            })
+            || Self::projected_mesh_stream_relay_dispatch_content_changed(old_config, new_config)
+    }
+
     /// Timestamp-neutral proxy content comparison for route-table reuse.
     ///
     /// Serialized proxy content catches ordinary route/backend/policy edits while
@@ -9115,10 +9157,10 @@ impl ProxyState {
         // rebuild the full LB from the new config, matching the empty-delta
         // projected path (#3243). Ordinary upstream membership deltas keep the
         // incremental rebuild; unchanged LB surfaces reuse the live snapshot.
-        let projected_routes_changed =
-            Self::projected_route_proxy_content_changed(&current.config, new_config);
+        let projected_lb_changed =
+            Self::projected_dr_dispatch_content_changed(&current.config, new_config);
         let upstream_lb_changed = Self::delta_load_balancers_changed(delta);
-        let lb_changed = upstream_lb_changed || projected_routes_changed;
+        let lb_changed = upstream_lb_changed || projected_lb_changed;
 
         let plugin_inner = self.plugin_cache.build_delta_inner(
             &current.plugin_cache,
@@ -9133,7 +9175,7 @@ impl ProxyState {
         } else {
             Arc::clone(&current.consumer_index)
         };
-        let load_balancer = if projected_routes_changed {
+        let load_balancer = if projected_lb_changed {
             LoadBalancerCache::build_inner(new_config)
         } else if upstream_lb_changed {
             LoadBalancerCache::build_delta_inner(
@@ -9489,6 +9531,8 @@ impl ProxyState {
                     // unrelated event (#3243).
                     let projected_routes_changed =
                         Self::projected_route_proxy_content_changed(&current.config, &new_config);
+                    let projected_lb_changed =
+                        Self::projected_dr_dispatch_content_changed(&current.config, &new_config);
                     if !mesh_changed
                         && !projected_routes_changed
                         && country_mmdb_plugin_cache.is_none()
@@ -9529,13 +9573,13 @@ impl ProxyState {
                         plugin_cache: country_mmdb_plugin_cache
                             .unwrap_or_else(|| Arc::clone(&current.plugin_cache)),
                         consumer_index: Arc::clone(&current.consumer_index),
-                        load_balancer: if projected_routes_changed {
+                        load_balancer: if projected_lb_changed {
                             LoadBalancerCache::build_inner(&new_config)
                         } else {
                             Arc::clone(&current.load_balancer)
                         },
                         route_changed: rebuild_routes,
-                        lb_changed: projected_routes_changed,
+                        lb_changed: projected_lb_changed,
                     }));
                 }
                 let country_mmdb_load_mode = if matches!(
