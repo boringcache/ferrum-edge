@@ -82,6 +82,7 @@ fn extract_validator_ops(
 async fn load_production_http(
     uri: String,
     process: ExternalRefProcessPolicy,
+    fixture_ready: Option<std::sync::mpsc::Receiver<()>>,
 ) -> Result<ferrum_edge::admin::api_specs::external_refs::LoadedExternalDocument, ExtractError> {
     let extension = ExternalRefSpecExtension {
         enabled: true,
@@ -98,8 +99,15 @@ async fn load_production_http(
     // Arm the total deadline at the blocking load boundary. Computing it before
     // `spawn_blocking` schedules lets coverage-induced worker delay burn the
     // budget before dial, so the client times out without ever reaching the
-    // live non-responding peer the fixture is meant to prove.
+    // live non-responding peer the fixture is meant to prove. When a fixture
+    // supplies `fixture_ready`, wait for it inside the worker so the peer is
+    // already blocked on `accept` before the budget starts.
     tokio::task::spawn_blocking(move || {
+        if let Some(ready) = fixture_ready {
+            ready
+                .recv_timeout(Duration::from_secs(5))
+                .expect("HTTP fixture must be waiting on accept");
+        }
         let deadline = Instant::now() + total_timeout;
         let uri = Url::parse(&uri)
             .map_err(|_| ExtractError::SchemaReference("invalid test URI".to_string()))?;
@@ -128,12 +136,15 @@ fn spawn_raw_http_response(response: Vec<u8>) -> (u16, std::thread::JoinHandle<(
 
 /// Accept one request and hold the socket open without writing a response.
 ///
-/// The accepted stream is handed back through `stalled` so the caller owns
-/// when it is dropped. The fixture thread must not block on peer FIN: a
-/// cancelled reqwest fetch can leave the TCP session open long enough for an
-/// unbounded second `read` + `join` to hang under coverage instrumentation.
+/// `ready` fires once the fixture thread is blocked on `accept`, so the caller
+/// can start the client only after the listener is live. The accepted stream is
+/// handed back through `stalled` so the caller owns when it is dropped. The
+/// fixture thread must not block on peer FIN: a cancelled reqwest fetch can
+/// leave the TCP session open long enough for an unbounded second `read` +
+/// `join` to hang under coverage instrumentation.
 fn spawn_stalled_http_peer() -> (
     u16,
+    std::sync::mpsc::Receiver<()>,
     std::sync::mpsc::Receiver<std::net::TcpStream>,
     std::thread::JoinHandle<()>,
 ) {
@@ -145,16 +156,18 @@ fn spawn_stalled_http_peer() -> (
         .local_addr()
         .expect("stalled HTTP fixture address")
         .port();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (stalled_tx, stalled_rx) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
+        let _ = ready_tx.send(());
         let Ok((mut stream, _)) = listener.accept() else {
             return;
         };
         let mut request = [0u8; 1024];
         let _ = stream.read(&mut request);
-        let _ = tx.send(stream);
+        let _ = stalled_tx.send(stream);
     });
-    (port, rx, server)
+    (port, ready_rx, stalled_rx, server)
 }
 
 #[test]
@@ -1251,7 +1264,7 @@ fn ipv6_origins_are_canonicalized_with_brackets() {
 async fn private_https_is_denied_even_when_backend_egress_is_unrestricted() {
     let mut process = process_enabled(None);
     process.allowed_origins = vec!["https://10.0.0.1:443".to_string()];
-    let error = load_production_http("https://10.0.0.1/schema.json".to_string(), process)
+    let error = load_production_http("https://10.0.0.1/schema.json".to_string(), process, None)
         .await
         .expect_err("HTTPS RFC1918 destination must be unconditionally denied");
     assert!(error.to_string().contains("public destination"));
@@ -1330,7 +1343,7 @@ async fn hostname_redirect_hops_are_allowlisted_resolved_and_pinned() {
         format!("http://127.0.0.1:{redirect_port}"),
         format!("http://localhost:{destination_port}"),
     ];
-    let loaded = load_production_http(format!("http://127.0.0.1:{redirect_port}/start"), process)
+    let loaded = load_production_http(format!("http://127.0.0.1:{redirect_port}/start"), process, None)
         .await
         .expect("every redirect hop should be revalidated and hostname-pinned");
     assert_eq!(loaded.root, json!({"type": "string"}));
@@ -1355,7 +1368,7 @@ async fn redirect_to_origin_outside_policy_is_rejected() {
     });
     let mut process = process_enabled(None);
     process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
-    let error = load_production_http(format!("http://127.0.0.1:{port}/start"), process)
+    let error = load_production_http(format!("http://127.0.0.1:{port}/start"), process, None)
         .await
         .expect_err("redirect outside the explicit origin policy must fail");
     server.join().expect("redirect fixture thread");
@@ -1382,7 +1395,7 @@ async fn oversized_chunked_response_aborts_at_document_cap() {
     let mut process = process_enabled(None);
     process.max_document_bytes = 16;
     process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
-    let error = load_production_http(format!("http://127.0.0.1:{port}/large"), process)
+    let error = load_production_http(format!("http://127.0.0.1:{port}/large"), process, None)
         .await
         .expect_err("chunked body beyond cap must abort");
     assert!(matches!(error, ExtractError::SchemaTooLarge { .. }));
@@ -1400,7 +1413,7 @@ async fn response_content_type_allowlist_rejects_invalid_and_unsupported_headers
         let (port, server) = spawn_raw_http_response(response);
         let mut process = process_enabled(None);
         process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
-        let error = load_production_http(format!("http://127.0.0.1:{port}/content-type"), process)
+        let error = load_production_http(format!("http://127.0.0.1:{port}/content-type"), process, None)
             .await
             .expect_err("present invalid or unsupported Content-Type must fail closed");
         server.join().expect("HTTP fixture thread");
@@ -1422,7 +1435,7 @@ async fn absent_response_content_type_uses_bounded_format_detection() {
     let (port, server) = spawn_raw_http_response(response);
     let mut process = process_enabled(None);
     process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
-    let loaded = load_production_http(format!("http://127.0.0.1:{port}/no-content-type"), process)
+    let loaded = load_production_http(format!("http://127.0.0.1:{port}/no-content-type"), process, None)
         .await
         .expect("absent Content-Type may use bounded JSON/YAML detection");
     server.join().expect("HTTP fixture thread");
@@ -1431,20 +1444,25 @@ async fn absent_response_content_type_uses_bounded_format_detection() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn total_deadline_covers_response_io() {
-    let (port, stalled_rx, server) = spawn_stalled_http_peer();
+    let (port, ready_rx, stalled_rx, server) = spawn_stalled_http_peer();
     let mut process = process_enabled(None);
     process.request_timeout = Duration::from_secs(1);
     process.total_timeout = Duration::from_millis(30);
     process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
-    let error = load_production_http(format!("http://127.0.0.1:{port}/slow"), process)
-        .await
-        .expect_err("total timeout must cover request and response I/O");
+    let uri = format!("http://127.0.0.1:{port}/slow");
+    let (load_result, stalled_result) = tokio::join!(
+        load_production_http(uri, process, Some(ready_rx)),
+        tokio::task::spawn_blocking(move || {
+            stalled_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("stalled fixture must accept the timed-out request")
+        }),
+    );
+    let _stalled = stalled_result.expect("stalled fixture worker");
+    let error = load_result.expect_err("total timeout must cover request and response I/O");
     // Reclaim the stalled peer only after the client has fail-closed so the
-    // open, non-responding connection covered the full total deadline. Taking
+    // open, non-responding connection covered the full total deadline. Dropping
     // the stream here also finishes the fixture thread without waiting on FIN.
-    let _stalled = stalled_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("stalled fixture must accept the timed-out request");
     server.join().expect("deadline fixture thread");
     assert!(error.to_string().contains("timed out") || error.to_string().contains("timeout"));
 }
