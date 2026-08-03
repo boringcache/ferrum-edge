@@ -281,25 +281,31 @@ spire_parent_id_for_node() {
 }
 
 spire_register_workload() {
+  # Closed call contract: exactly one node selector beyond ns/sa (see sole caller).
+  # A dynamic argv array here is an opaque executable surface to the trusted Cross
+  # verifier for newly added automation, so keep the create dispatch fully literal.
   local context="$1" namespace="$2" spiffe_id="$3" parent_id="$4"
-  local workload_namespace="$5" service_account="$6" selector existing=""
-  shift 6
-  local -a selectors=("k8s:ns:$workload_namespace" "k8s:sa:$service_account") args
-  # Keep opaque selector values behind assignment syntax the trusted automation
-  # scanner recognizes; Bash's NAME+= form is not part of that closed grammar.
-  for selector in "$@"; do
-    selectors=("${selectors[@]}" "$selector")
-  done
+  local workload_namespace="$5" service_account="$6" node_selector="$7"
+  local existing="" ns_selector sa_selector
+  [[ $# -eq 7 && -n "$node_selector" ]] || {
+    echo "spire_register_workload requires ns, sa, and exactly one node selector" >&2
+    return 1
+  }
+  ns_selector="k8s:ns:$workload_namespace"
+  sa_selector="k8s:sa:$service_account"
   if existing="$(spire_server_exec "$context" "$namespace" entry show \
       -spiffeID "$spiffe_id" -parentID "$parent_id" 2>/dev/null)" &&
-    spire_entry_has_selectors "$existing" "${selectors[@]}"; then
+    spire_entry_has_selectors "$existing" \
+      "$ns_selector" "$sa_selector" "$node_selector"; then
     return 0
   fi
-  args=(entry create -spiffeID "$spiffe_id" -parentID "$parent_id")
-  for selector in "${selectors[@]}"; do
-    args=("${args[@]}" -selector "$selector")
-  done
-  spire_server_exec "$context" "$namespace" "${args[@]}"
+  spire_server_exec "$context" "$namespace" \
+    entry create \
+    -spiffeID "$spiffe_id" \
+    -parentID "$parent_id" \
+    -selector "$ns_selector" \
+    -selector "$sa_selector" \
+    -selector "$node_selector"
 }
 
 spire_bundle_b64der() {
