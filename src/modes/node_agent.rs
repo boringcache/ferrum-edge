@@ -34,8 +34,7 @@ use crate::capture::{
 use crate::cni::ownership::{
     DurableCniCleanupSnapshot, DurableCniOwnershipRecord, cni_ownership_store_is_rejected,
     configure_cni_ownership_store, is_safe_cni_pod_uid, load_configured_cni_ownership,
-    load_durable_cni_ownership, ownership_store_path_for_socket,
-    persist_configured_cni_ownership,
+    load_durable_cni_ownership, ownership_store_path_for_socket, persist_configured_cni_ownership,
 };
 use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
 use crate::cni::spec::{
@@ -7259,12 +7258,7 @@ fn fallback_cni_response(
     let valid = request
         .valid_attachments
         .iter()
-        .map(|attachment| {
-            (
-                attachment.container_id.as_str(),
-                attachment.ifname.as_str(),
-            )
-        })
+        .map(|attachment| (attachment.container_id.as_str(), attachment.ifname.as_str()))
         .collect::<HashSet<_>>();
     if records.iter().any(|record| {
         record.network_name == request.network_name
@@ -11525,8 +11519,7 @@ mod tests {
     #[test]
     fn cni_iptables_fallback_gates_readiness_and_durable_gc() {
         use crate::cni::ownership::{
-            DurableCniOwnershipRecord, ownership_store_path_for_socket,
-            store_durable_cni_ownership,
+            DurableCniOwnershipRecord, ownership_store_path_for_socket, store_durable_cni_ownership,
         };
         use crate::cni::spec::CniValidAttachment;
 
@@ -11589,9 +11582,7 @@ mod tests {
                 container_id: "ctr-stale".to_string(),
                 ifname: "eth0".to_string(),
                 pod_uid: "pod-uid-stale".to_string(),
-                cleanup: durable_cleanup_snapshot_from_state(&enrolled_pod_state(
-                    "pod-uid-stale",
-                )),
+                cleanup: durable_cleanup_snapshot_from_state(&enrolled_pod_state("pod-uid-stale")),
             }],
         )
         .expect("seed durable ownership");
