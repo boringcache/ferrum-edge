@@ -5,8 +5,8 @@
 //! production load-balancer rotation primitive and the direct-dispatch guard,
 //! avoiding a timing-sensitive multi-listener functional fixture.
 
-use ferrum_edge::LoadBalancerCache;
 use ferrum_edge::_test_support::direct_http_mesh_transport_refusal_for_test;
+use ferrum_edge::LoadBalancerCache;
 use ferrum_edge::config::types::GatewayConfig;
 
 #[test]

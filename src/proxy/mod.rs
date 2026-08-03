@@ -3282,22 +3282,21 @@ async fn buffer_request_body_for_before_proxy(
             request_body_read_timeout_ms,
         )
         .await?;
-        collected
-            .map_err(|e| {
-                // Limited::collect() returns either a LengthLimitError (the body
-                // actually exceeded the cap -> 413) or the underlying transport
-                // error (the client dropped the connection mid-upload -> 499).
-                // Distinguish them so a client disconnect is not misreported and
-                // logged as "Request body exceeds maximum size", mirroring the
-                // unlimited branch below.
-                if e.downcast_ref::<http_body_util::LengthLimitError>()
-                    .is_some()
-                {
-                    RequestBodyBufferError::TooLarge
-                } else {
-                    RequestBodyBufferError::ClientDisconnected(e.to_string())
-                }
-            })?
+        collected.map_err(|e| {
+            // Limited::collect() returns either a LengthLimitError (the body
+            // actually exceeded the cap -> 413) or the underlying transport
+            // error (the client dropped the connection mid-upload -> 499).
+            // Distinguish them so a client disconnect is not misreported and
+            // logged as "Request body exceeds maximum size", mirroring the
+            // unlimited branch below.
+            if e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                RequestBodyBufferError::TooLarge
+            } else {
+                RequestBodyBufferError::ClientDisconnected(e.to_string())
+            }
+        })?
     } else {
         let collected = collect_request_body_with_deadline(
             body.collect(),
@@ -3420,8 +3419,7 @@ async fn prepare_mesh_request_body(
         } else {
             (
                 400,
-                br#"{"error":"Request trailers are not replayable over mesh transport"}"#
-                    .to_vec(),
+                br#"{"error":"Request trailers are not replayable over mesh transport"}"#.to_vec(),
             )
         };
         return Err(retry::BackendResponse {
@@ -3461,8 +3459,7 @@ async fn prepare_mesh_request_body(
         .await
         {
             PluginResult::Continue => transformed,
-            reject @ PluginResult::Reject { .. }
-            | reject @ PluginResult::RejectBinary { .. } => {
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 return Err(reject_result_to_backend_response(reject, resolved_ip));
             }
         }
@@ -29382,9 +29379,7 @@ async fn handle_proxy_request_inner(
     // dispatch consumes the request; cloning its HeaderMap is deferred until a
     // mesh retry actually occurs, while the plugin-facing map remains the
     // authority for mutations on every attempt.
-    let mesh_retry_headers = has_retry
-        .then(|| ctx.raw_headers_snapshot())
-        .flatten();
+    let mesh_retry_headers = has_retry.then(|| ctx.raw_headers_snapshot()).flatten();
     // The reqwest pin is now an optimization rather than the correctness
     // boundary: every streaming response arm can drive inspectors. Evaluate it
     // from the finalized context so a body transform that adds/removes
@@ -33057,9 +33052,8 @@ async fn proxy_to_backend_mesh_retry(
         }
     };
 
-    let retry_response_ctx =
-        plugins_may_release_response_body_under_retries(plugins, request_ctx)
-            .then(|| retry_response_decision_context(request_ctx));
+    let retry_response_ctx = plugins_may_release_response_body_under_retries(plugins, request_ctx)
+        .then(|| retry_response_decision_context(request_ctx));
     let Some(replay_headers) = replay_headers else {
         warn!(
             proxy_id = %proxy.id,
@@ -38551,12 +38545,7 @@ async fn proxy_to_backend_mesh_mtls(
                         error_class,
                     )
                 } else {
-                    hbone_hyper_error_response(
-                        proxy,
-                        err,
-                        resolved_ip,
-                        request_body_replayable,
-                    )
+                    hbone_hyper_error_response(proxy, err, resolved_ip, request_body_replayable)
                 },
                 None,
                 None,
@@ -44286,7 +44275,10 @@ mod tests {
             Ok(_) => panic!("non-empty native trailers must fail closed before mesh dispatch"),
         };
 
-        assert_eq!(err.status_code, 200, "gRPC refusal uses Trailers-Only HTTP 200");
+        assert_eq!(
+            err.status_code, 200,
+            "gRPC refusal uses Trailers-Only HTTP 200"
+        );
         assert!(!err.connection_error);
         assert_eq!(
             err.error_class,
@@ -44400,12 +44392,7 @@ mod tests {
         };
 
         assert!(retained.is_none());
-        let MeshClientRequestBody::Replayable {
-            body,
-            trailers,
-            ..
-        } = mesh_body
-        else {
+        let MeshClientRequestBody::Replayable { body, trailers, .. } = mesh_body else {
             panic!("buffered mesh path must produce Replayable");
         };
         assert_eq!(&*body, b"payload");

@@ -3764,7 +3764,10 @@ async fn start_mesh_retry_mtls_backend(
                     .iter()
                     .map(|value| value.as_bytes().to_vec())
                     .collect();
-                let te = req.headers().get("te").map(|value| value.as_bytes().to_vec());
+                let te = req
+                    .headers()
+                    .get("te")
+                    .map(|value| value.as_bytes().to_vec());
                 let content_length = req
                     .headers()
                     .get("content-length")
@@ -3801,10 +3804,8 @@ async fn start_mesh_retry_mtls_backend(
                 let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(2);
                 let _ = tx.send(Ok(Frame::data(Bytes::from(body)))).await;
                 let mut response_trailers = hyper::HeaderMap::new();
-                response_trailers.insert(
-                    "grpc-status",
-                    hyper::header::HeaderValue::from_static("0"),
-                );
+                response_trailers
+                    .insert("grpc-status", hyper::header::HeaderValue::from_static("0"));
                 let _ = tx.send(Ok(Frame::trailers(response_trailers))).await;
                 drop(tx);
                 Ok::<_, hyper::Error>(
@@ -3868,14 +3869,12 @@ async fn grpc_mesh_retry_request(
         )
         .header("te", "trailers")
         .body(StreamBody::new(stream::iter(frames)))?;
-    request.headers_mut().append(
-        "x-repeated",
-        hyper::header::HeaderValue::from_static("one"),
-    );
-    request.headers_mut().append(
-        "x-repeated",
-        hyper::header::HeaderValue::from_static("two"),
-    );
+    request
+        .headers_mut()
+        .append("x-repeated", hyper::header::HeaderValue::from_static("one"));
+    request
+        .headers_mut()
+        .append("x-repeated", hyper::header::HeaderValue::from_static("two"));
     request.headers_mut().append(
         "x-repeated-bin",
         hyper::header::HeaderValue::from_static("AAE="),
@@ -3950,7 +3949,10 @@ async fn functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_
     let listener = bind_fixture_listener(loopback_ephemeral())
         .await
         .expect("bind held mesh retry listener");
-    let backend_port = listener.local_addr().expect("mesh retry listener addr").port();
+    let backend_port = listener
+        .local_addr()
+        .expect("mesh retry listener addr")
+        .port();
     let application_hits = Arc::new(AtomicUsize::new(0));
     let (first_record, observation, backend_task) = start_mesh_retry_mtls_backend(
         listener,
@@ -4031,7 +4033,10 @@ plugin_configs: []
         "successful retry must preserve response trailers: {response:?}"
     );
     assert_eq!(response.body, payload, "replayed body must be echoed once");
-    assert_eq!(observed.body, payload, "backend must receive the exact replay bytes");
+    assert_eq!(
+        observed.body, payload,
+        "backend must receive the exact replay bytes"
+    );
     assert_eq!(
         observed.repeated,
         vec![b"one".to_vec(), b"two".to_vec()],
@@ -4054,13 +4059,19 @@ plugin_configs: []
             .is_some_and(|value| value.starts_with(b"127.0.0.1")),
         "gateway-owned forwarding identity must be regenerated: {observed:?}"
     );
-    assert_eq!(observed.x_forwarded_proto.as_deref(), Some(b"http".as_slice()));
+    assert_eq!(
+        observed.x_forwarded_proto.as_deref(),
+        Some(b"http".as_slice())
+    );
     assert_eq!(
         observed.baggage.as_deref(),
         Some(b"user.key=kept".as_slice()),
         "identity baggage must be stripped without dropping unrelated baggage"
     );
-    assert!(observed.trailers.is_none(), "ordinary unary request has no trailers");
+    assert!(
+        observed.trailers.is_none(),
+        "ordinary unary request has no trailers"
+    );
     assert_eq!(application_hits.load(Ordering::SeqCst), 1);
 
     let mut native_trailers = hyper::HeaderMap::new();
@@ -4071,7 +4082,10 @@ plugin_configs: []
     let rejected = grpc_mesh_retry_request(gateway.proxy_port, &payload, Some(native_trailers))
         .await
         .expect("native trailer refusal response");
-    assert_eq!(rejected.status, 200, "gRPC refusal uses Trailers-Only HTTP 200");
+    assert_eq!(
+        rejected.status, 200,
+        "gRPC refusal uses Trailers-Only HTTP 200"
+    );
     assert_eq!(
         rejected.headers.get("grpc-status").map(String::as_str),
         Some("12"),

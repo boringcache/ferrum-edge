@@ -2390,11 +2390,7 @@ fn grpc_mesh_fall_through_mesh_mtls_accepts_replayable_request_body() {
                 "{dispatch:?} must fall through for native_ct={native_ct} translated={translated}"
             );
             assert!(
-                !grpc_mesh_dispatch_falls_through(
-                    GrpcMeshDispatch::Direct,
-                    native_ct,
-                    translated,
-                ),
+                !grpc_mesh_dispatch_falls_through(GrpcMeshDispatch::Direct, native_ct, translated,),
                 "Direct targets stay on the direct gRPC pool"
             );
         }

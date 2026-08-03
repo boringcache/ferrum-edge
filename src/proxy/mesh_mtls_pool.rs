@@ -21,8 +21,8 @@
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use hyper::client::conn::http2;
 use http_body_util::Either;
+use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
 use std::fmt::Write;
