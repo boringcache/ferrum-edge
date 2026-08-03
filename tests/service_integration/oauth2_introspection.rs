@@ -129,8 +129,8 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
         .await
         .expect("active opaque token");
     assert!(
-        !active.contains('.'),
-        "Hydra access tokens must be opaque (no JWT dots)"
+        jsonwebtoken::decode_header(&active).is_err(),
+        "Hydra access tokens must be opaque (not a compact JWT)"
     );
 
     let direct_cfg = json!({

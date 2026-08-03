@@ -126,7 +126,8 @@ cargo test --test service_integration oauth2_introspection
 What it drives:
 
 1. Opaque access tokens from Hydra `client_credentials` and authorization-code
-   grants (asserted not to contain JWT `.` separators).
+   grants (asserted not to decode as a compact JWT; opaque serialization may
+   still contain `.` delimiters).
 2. Direct admin introspection URL (`/admin/oauth2/introspect`) with
    `client_secret_basic` and `client_secret_post` configs (Hydra admin does
    not enforce client auth; request shaping is observed on the facade).

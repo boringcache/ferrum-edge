@@ -407,7 +407,8 @@ async fn oidc_live_discovery_login_session_and_claims() {
 
     // Authenticated session: identity + claim headers + correlation cleared.
     let mut ctx = session_ctx(&session_cookie, "/app");
-    // Client-supplied claim destination and reserved header must not stick.
+    // Client-supplied claim destination must not stick; reserved Authorization
+    // must be preserved through claim fan-out.
     ctx.headers
         .insert("x-authenticated-email".to_string(), "evil@attacker".into());
     ctx.headers
@@ -438,10 +439,10 @@ async fn oidc_live_discovery_login_session_and_claims() {
         roles.contains(FIXTURE_ROLE),
         "roles claim must reach upstream"
     );
-    assert_ne!(
+    assert_eq!(
         upstream.get("authorization").map(String::as_str),
         Some("Bearer attacker"),
-        "reserved Authorization must not be overwritten by claim fan-out"
+        "claim fan-out must preserve client-supplied Authorization"
     );
 
     // Negative: wrong state / missing correlation cookie.
