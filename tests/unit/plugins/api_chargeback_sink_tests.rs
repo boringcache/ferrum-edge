@@ -7210,7 +7210,8 @@ async fn spool_replay_quarantines_hostile_json_shapes_and_whitespace_only_artifa
 #[cfg(unix)]
 #[tokio::test]
 async fn spool_replay_fails_closed_on_non_file_hardlink_symlink_and_declared_zstd_size() {
-    use std::os::unix::fs::{PermissionsExt, hard_link, symlink};
+    use std::fs::hard_link;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     let temp = tempfile::tempdir().unwrap();
     let spool = test_spool(&temp);
