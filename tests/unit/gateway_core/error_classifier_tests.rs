@@ -490,6 +490,17 @@ fn test_boxed_hbone_dns_lookup_is_pre_wire_dns_error() {
 }
 
 #[test]
+fn test_boxed_hbone_h2_handshake_is_pre_wire_pool_error() {
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(HbonePoolError::H2Handshake {
+        host: "svc-b.ferrum.svc.cluster.local".to_string(),
+        message: "peer closed before SETTINGS".to_string(),
+    });
+    let class = classify_boxed_setup_error(err.as_ref());
+    assert_eq!(class, ErrorClass::ConnectionPoolError);
+    assert!(!request_reached_wire(class));
+}
+
+#[test]
 fn test_boxed_hbone_extended_connect_unsupported_is_protocol_error() {
     // A peer that never negotiated RFC 8441 (Sidecar WS Extended CONNECT) is a
     // ProtocolError — post-wire by class (the connection established), so it is

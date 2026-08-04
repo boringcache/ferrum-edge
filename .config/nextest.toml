@@ -60,6 +60,15 @@ http3-serial = { max-threads = 1 }
 # binary serial so image pulls, container startup, and heavyweight fixtures
 # cannot contend across process-isolated cases in hosted CI.
 service-integration-serial = { max-threads = 1 }
+# `serial_test` only coordinates tests inside one process, while nextest runs
+# every case in its own process. Vault and AWS secret-backend cases each start
+# disposable Docker containers (hashicorp/vault, localstack/localstack); running
+# cases concurrently can make multiple processes pull the same image tag at once,
+# which produced "failed to pull the image … bytes remaining on stream" in
+# hosted CI before assertions ran. Keep the whole binary serial so image pulls,
+# container startup, and env-mutating fixtures cannot contend across
+# process-isolated cases.
+secrets-functional-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'test(/h3/) or test(/http3/) or test(/capability/)'
@@ -69,3 +78,7 @@ threads-required = "num-test-threads"
 [[profile.default.overrides]]
 filter = 'binary(=service_integration)'
 test-group = 'service-integration-serial'
+
+[[profile.default.overrides]]
+filter = 'binary(=secrets_functional)'
+test-group = 'secrets-functional-serial'
