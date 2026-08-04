@@ -288,7 +288,10 @@ fn backend_tls_policy_configmap_ca_and_sans_project_to_upstream() {
         .iter()
         .next()
         .expect("expected upstream");
-    assert_eq!(upstream.backend_tls_sni.as_deref(), Some("auth.example.com"));
+    assert_eq!(
+        upstream.backend_tls_sni.as_deref(),
+        Some("auth.example.com")
+    );
     let ca = upstream
         .backend_tls_server_ca_cert_path
         .as_deref()
@@ -352,9 +355,10 @@ fn backend_tls_policy_missing_ca_fails_closed_with_fault_route() {
         "invalid BackendTLSPolicy must not create a TLS upstream"
     );
     assert!(
-        translated.warnings.iter().any(|warning| {
-            warning.contains("BackendTLSPolicy") && warning.contains("invalid")
-        }),
+        translated
+            .warnings
+            .iter()
+            .any(|warning| { warning.contains("BackendTLSPolicy") && warning.contains("invalid") }),
         "expected invalid-policy warning, got {:?}",
         translated.warnings
     );
