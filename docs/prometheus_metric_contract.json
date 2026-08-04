@@ -1999,6 +1999,31 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_slice_drift_data_planes",
+    "type": "gauge",
+    "help": "Tracked mesh data planes by CP-side slice convergence state.",
+    "labels": [
+      "state",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_slice_drift_tracked_data_planes",
+    "type": "gauge",
+    "help": "Total mesh data planes retained in the CP slice-drift registry.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_subscribe_audience_rejections_total",
     "type": "counter",
     "help": "MeshSubscribe subscriptions refused by the control plane because the bearer JWT audience does not match the required subscription purpose, by subscription class and reason.",

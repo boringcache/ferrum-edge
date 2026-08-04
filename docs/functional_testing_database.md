@@ -461,7 +461,7 @@ current functional coverage. Retain only exact residuals.
 ### Exact residuals (live trackers)
 
 - [ ] MongoDB replica-set **change-stream-triggered** config wakeups (polling remains the authoritative backstop) — [#3330](https://github.com/ferrum-edge/ferrum-edge/issues/3330)
-- [ ] Live OIDC relying-party / OAuth2 introspection service-integration coverage — [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333)
+- [x] Live OIDC relying-party / OAuth2 introspection service-integration coverage — [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333)
 
 ## Testing with MongoDB
 

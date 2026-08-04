@@ -90,7 +90,7 @@ issue body alone.
 |----------|---------------|-------|
 | Subset-scoped Istio HTTP connection-pool policy | #3228 / #3240–#3242 | `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests` inside subsets |
 | EgressGateway UDP `ServiceEntry` materialization | #3263 | Explicit mesh product deferral |
-| `ai_stream_router` `google_gemini` adapter | #3299 | Config accepted; construction fails closed until implemented |
+| `ai_stream_router` `google_gemini` adapter | #3299 | Implemented — request translation + SSE/JSON stream normalization |
 | Native-gRPC transcript capture | #3304 | HTTP-only today |
 | Pre-first-byte stream-router fallback | #3328 | Resolved by explicit rejection: the `fallback` block now fails admission. Implementing it needs a per-attempt request-preparation boundary in proxy dispatch, not a plugin change |
 | Native SMTP/email notification channel | #3329 | |
