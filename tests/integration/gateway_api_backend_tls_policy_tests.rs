@@ -285,8 +285,7 @@ fn backend_tls_policy_configmap_ca_and_sans_project_to_upstream() {
     let upstream = translated
         .config
         .upstreams
-        .iter()
-        .next()
+        .first()
         .expect("expected upstream");
     assert_eq!(
         upstream.backend_tls_sni.as_deref(),
@@ -323,8 +322,7 @@ fn backend_tls_policy_secret_ca_uses_k8s_uri() {
     let upstream = translated
         .config
         .upstreams
-        .iter()
-        .next()
+        .first()
         .expect("expected upstream");
     let ca = upstream
         .backend_tls_server_ca_cert_path
