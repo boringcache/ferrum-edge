@@ -159,6 +159,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Corrected stale `prometheus_metrics` source documentation that claimed
+  `TransactionSummary.client_disconnected` was "hardcoded false in all literal
+  constructors" and that `ferrum_client_disconnects_total` could not yet fire
+  (#3257). The HTTP-family plumbing has been live since the deferred-log path
+  landed: `ProxyBody` classifies the terminal body state and
+  `DeferredTransactionLogger` writes it into the summary for HTTP/1.1, HTTP/2,
+  and gRPC, while HTTP/3 populates it synchronously from `H3StreamResult`. The
+  comments now record which paths set the flag, why a backend-side reset keeps
+  it false, why buffered responses always report false, and that WebSocket
+  sessions are counted by `ferrum_websocket_sessions_total` instead. Added the
+  previously missing regression coverage tying terminal body classification to
+  the rendered counter, including its `proxy_id`-only cardinality bound and
+  stale-entry eviction.
+
 - DestinationRule-only create/update/removal now atomically republishes the
   affected route table (and LB) before mesh status/revision reports the
   generation programmed (#3243). `#[serde(skip)]` DR-derived proxy projections

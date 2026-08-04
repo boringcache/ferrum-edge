@@ -109,12 +109,30 @@ pub struct WsTrafficKey {
 /// Composite key for the HTTP-family client-disconnect counter.
 ///
 /// Populated whenever a `TransactionSummary` is logged with
-/// `client_disconnected == true`. A forthcoming deferred-log path will make
-/// this field meaningful for HTTP/1.1, HTTP/2, HTTP/3, gRPC, and WebSocket
-/// flows; until then the counter will only fire for protocols that already
-/// populate the field (none, at time of introduction), but we wire it now so
-/// that dashboards reading `ferrum_client_disconnects_total` work the moment
-/// the plumbing lands — no registry change needed at that time.
+/// `client_disconnected == true`. That flag is live on every HTTP-family
+/// streaming path:
+///
+/// * HTTP/1.1, HTTP/2, and gRPC hand the response body back to hyper, so the
+///   terminal state is classified by [`crate::proxy::body::ProxyBody`] — body
+///   drained, body error, or dropped mid-stream — and written into the summary
+///   by [`crate::proxy::deferred_log::DeferredTransactionLogger`] at fire time.
+/// * HTTP/3 drives its QUIC send stream to completion synchronously inside
+///   `proxy_to_backend_h3_streaming`, so its summary sites read the flag off
+///   `H3StreamResult` without a deferred logger.
+///
+/// Only downstream aborts are counted: a backend-side close mid-body maps to a
+/// transport `ErrorClass` with `client_disconnected == false` (see
+/// [`crate::retry::classify_body_error`]), so backend resets never inflate this
+/// series. Buffered responses log before the body reaches the wire and so
+/// always report `false` — a disconnect while hyper writes an already
+/// materialized body is not observable at that log site.
+///
+/// WebSocket sessions are not counted here; their terminal classification has a
+/// dedicated bounded family, `ferrum_websocket_sessions_total`, keyed by
+/// [`WsSessionKey`].
+///
+/// `proxy_id` is the only label, so cardinality is bounded by the configured
+/// proxy count regardless of request volume, method, or path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClientDisconnectKey {
     pub proxy_id: Arc<str>,
@@ -1399,9 +1417,9 @@ impl MetricsRegistry {
 
         // Increment the client-disconnect counter whenever the summary flags
         // the client as having aborted before receiving the full response.
-        // Today this stays at zero for HTTP-family protocols (the field is
-        // hardcoded false in all literal constructors); once the deferred-log
-        // refactor populates it, this counter starts reporting automatically.
+        // `ClientDisconnectKey` documents which paths set that flag and why a
+        // backend-side reset keeps it false, so this series stays a downstream
+        // abort signal rather than a generic body-failure counter.
         if summary.client_disconnected {
             let key = ClientDisconnectKey { proxy_id };
             self.client_disconnect_counter

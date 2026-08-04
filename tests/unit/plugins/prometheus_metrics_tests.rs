@@ -4,8 +4,8 @@ use ferrum_edge::ebpf::NodeAgentMetrics;
 use ferrum_edge::plugins::mesh::prometheus_helpers;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::prometheus_metrics::{
-    CounterKey, HboneRelayFailureKey, MeshTcpEgressConnKey, MetricsRegistry, PrometheusMetrics,
-    global_registry,
+    ClientDisconnectKey, CounterKey, HboneRelayFailureKey, MeshTcpEgressConnKey, MetricsRegistry,
+    PrometheusMetrics, global_registry,
 };
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, AiCost, AiUsageExport, Direction, Plugin, RequestContext,
@@ -570,6 +570,111 @@ async fn test_registry_increments_counter_on_repeated_requests() {
     assert_eq!(count.value.load(Ordering::Relaxed), 5);
 }
 
+/// `ferrum_client_disconnects_total` must open a series when a summary reaches
+/// `record()` with `client_disconnected = true`.
+///
+/// This is the metric end of the HTTP-family disconnect chain: `ProxyBody`
+/// classifies the terminal body state, `DeferredTransactionLogger` writes the
+/// flag into the summary, and `record()` turns it into this series. Before this
+/// test the counter had no coverage at all, so a regression that stopped
+/// incrementing it would have rendered an empty family silently.
+#[tokio::test]
+async fn test_registry_records_client_disconnect_from_summary() {
+    let registry = MetricsRegistry::new();
+
+    let mut aborted = make_summary("proxy-1", "GET", 200, 30.0, -1.0);
+    aborted.response_streamed = true;
+    aborted.client_disconnected = true;
+    aborted.body_error_class = Some(ErrorClass::ClientDisconnect);
+    registry.record(&aborted);
+
+    let key = ClientDisconnectKey {
+        proxy_id: Arc::from("proxy-1"),
+    };
+    assert_eq!(
+        registry
+            .client_disconnect_counter
+            .get(&key)
+            .expect("a client-disconnected summary must open the series")
+            .value
+            .load(Ordering::Relaxed),
+        1
+    );
+
+    let output = registry.render_uncached();
+    assert!(
+        output.contains("ferrum_client_disconnects_total{proxy_id=\"proxy-1\"} 1"),
+        "the client-disconnect series must render: {output}"
+    );
+}
+
+/// Only downstream aborts may open the series. A backend-side body failure is
+/// classified into `body_error_class` but leaves `client_disconnected = false`
+/// (see `crate::retry::classify_body_error`), so it must not be counted here —
+/// otherwise the counter degrades into a generic body-failure signal and
+/// double-counts backend resets.
+#[tokio::test]
+async fn test_registry_ignores_client_disconnect_for_completed_response() {
+    let registry = MetricsRegistry::new();
+
+    let mut backend_reset = make_summary("proxy-1", "GET", 200, 30.0, -1.0);
+    backend_reset.response_streamed = true;
+    backend_reset.client_disconnected = false;
+    backend_reset.body_error_class = Some(ErrorClass::ConnectionReset);
+    registry.record(&backend_reset);
+    registry.record(&make_summary("proxy-1", "GET", 200, 10.0, 8.0));
+
+    assert!(
+        registry.client_disconnect_counter.is_empty(),
+        "a backend reset and a clean response must both leave the series closed"
+    );
+    let output = registry.render_uncached();
+    assert!(
+        !output.contains("ferrum_client_disconnects_total"),
+        "an untouched disconnect family must stay out of the exposition: {output}"
+    );
+}
+
+/// `ClientDisconnectKey` carries `proxy_id` only, so request volume, method,
+/// status, and path must all collapse onto a single series per proxy. This is
+/// the cardinality bound that lets the counter run on the request path.
+#[tokio::test]
+async fn test_registry_client_disconnect_counter_is_bounded_by_proxy_id() {
+    let registry = MetricsRegistry::new();
+
+    for (proxy_id, method, status) in [
+        ("proxy-a", "GET", 200),
+        ("proxy-a", "POST", 201),
+        ("proxy-a", "DELETE", 503),
+        ("proxy-b", "GET", 200),
+    ] {
+        let mut aborted = make_summary(proxy_id, method, status, 30.0, -1.0);
+        aborted.response_streamed = true;
+        aborted.client_disconnected = true;
+        registry.record(&aborted);
+    }
+
+    assert_eq!(
+        registry.client_disconnect_counter.len(),
+        2,
+        "method / status / volume must not fan out the disconnect series"
+    );
+
+    let proxy_a = ClientDisconnectKey {
+        proxy_id: Arc::from("proxy-a"),
+    };
+    assert_eq!(
+        registry
+            .client_disconnect_counter
+            .get(&proxy_a)
+            .expect("proxy-a must have a disconnect series")
+            .value
+            .load(Ordering::Relaxed),
+        3,
+        "all three proxy-a aborts must accumulate on one series"
+    );
+}
+
 #[tokio::test]
 async fn test_registry_renders_mesh_tcp_egress_connection_counter() {
     let registry = MetricsRegistry::new();
@@ -1107,7 +1212,12 @@ async fn test_registry_render_escapes_prometheus_label_values() {
 async fn test_evict_stale_removes_old_entries() {
     let registry = MetricsRegistry::new();
 
-    registry.record(&make_summary("stale-proxy", "GET", 200, 10.0, 5.0));
+    // Flag the disconnect so the `client_disconnect_counter` retain arm is
+    // exercised too. Reusing the same proxy/method/status keeps every existing
+    // per-map length assertion below unchanged.
+    let mut stale_http = make_summary("stale-proxy", "GET", 200, 10.0, 5.0);
+    stale_http.client_disconnected = true;
+    registry.record(&stale_http);
     registry.record_stream(&make_stream_summary("stale-stream", "tcp"));
     registry.record_ws_session(&make_ws_summary("stale-ws"));
     registry.record_tls_source_refresh("vault", "certificate", "frontend", "success");
@@ -1133,6 +1243,7 @@ async fn test_evict_stale_removes_old_entries() {
     assert!(registry.ws_session_duration_buckets.is_empty());
     assert!(registry.ws_bytes_counter.is_empty());
     assert!(registry.ws_frames_counter.is_empty());
+    assert!(registry.client_disconnect_counter.is_empty());
     assert!(registry.tls_source_refresh_counter.is_empty());
     assert!(registry.mesh_outbound_registry_decisions.is_empty());
     assert!(registry.mesh_outbound_registry_stream_decisions.is_empty());
@@ -1142,7 +1253,9 @@ async fn test_evict_stale_removes_old_entries() {
 async fn test_evict_stale_keeps_fresh_entries() {
     let registry = MetricsRegistry::new();
 
-    registry.record(&make_summary("fresh-proxy", "GET", 200, 10.0, 5.0));
+    let mut fresh_http = make_summary("fresh-proxy", "GET", 200, 10.0, 5.0);
+    fresh_http.client_disconnected = true;
+    registry.record(&fresh_http);
     registry.record_tls_source_refresh("file", "certificate", "admin", "unchanged");
     registry.record_mesh_outbound_registry_decision("fresh-ns", "backend.test", "deny");
     registry.record_mesh_outbound_registry_stream_decision("fresh-ns", "udp", "admit");
@@ -1153,6 +1266,7 @@ async fn test_evict_stale_keeps_fresh_entries() {
 
     // Entry should still exist
     assert_eq!(registry.request_counter.len(), 1);
+    assert_eq!(registry.client_disconnect_counter.len(), 1);
     assert_eq!(registry.tls_source_refresh_counter.len(), 1);
     assert_eq!(registry.mesh_outbound_registry_decisions.len(), 1);
     assert_eq!(registry.mesh_outbound_registry_stream_decisions.len(), 1);
