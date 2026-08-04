@@ -436,6 +436,54 @@ pub fn strip_backend_request_headers_for_grpc(headers: &mut http::HeaderMap) {
     headers.insert(http::header::TE, http::HeaderValue::from_static("trailers"));
 }
 
+/// Returns `true` for request-trailer names that may not cross a backend trust
+/// boundary.
+///
+/// Request trailers arrive after authentication, routing, forwarding-identity
+/// regeneration, and request-header plugins have already consumed the initial
+/// header block. They therefore must not restate credentials, gateway-owned
+/// assertions, forwarding identity, framing controls, or initial-only gRPC
+/// call parameters. `Forwarded` is rejected unconditionally because this late
+/// boundary has no route-level `add_forwarded_header` context and failing
+/// closed prevents protocol-path-dependent identity shape.
+#[inline]
+pub(crate) fn is_forbidden_backend_request_trailer_name(name: &str) -> bool {
+    is_backend_request_strip_header(name)
+        || is_proxy_owned_forwarding_header(name, true)
+        || name.starts_with("grpc-")
+        || name.starts_with("x-consumer-")
+        || name.starts_with("x-ferrum-")
+        || name.starts_with("x-path-param-")
+        || matches!(
+            name,
+            "proxy-authenticate"
+                | "content-type"
+                | "content-encoding"
+                | "host"
+                | "user-agent"
+                | "x-grpc-web"
+                | "authorization"
+                | "cookie"
+                | "x-api-key"
+                | "x-geo-country"
+        )
+}
+
+/// Sanitize client request trailers before forwarding them to a backend.
+///
+/// This helper is shared by the native H3 relay and the H3-to-H2 gRPC bridge
+/// so their late trust boundary cannot drift.
+pub(crate) fn sanitize_backend_request_trailers(trailers: &mut http::HeaderMap) {
+    let strip: Vec<http::HeaderName> = trailers
+        .keys()
+        .filter(|name| is_forbidden_backend_request_trailer_name(name.as_str()))
+        .cloned()
+        .collect();
+    for name in strip {
+        trailers.remove(name);
+    }
+}
+
 /// Remove reserved gateway-asserted headers from a request `HeaderMap`.
 ///
 /// `x-consumer-username` / `x-consumer-custom-id` are injected by the gateway
@@ -1896,6 +1944,90 @@ mod tests {
         assert!(!is_proxy_owned_forwarding_header("via", true));
         assert!(!is_proxy_owned_forwarding_header("authorization", true));
         assert!(!is_proxy_owned_forwarding_header("X-Forwarded", true));
+    }
+
+    #[test]
+    fn backend_request_trailer_boundary_strips_late_identity_and_credentials() {
+        for name in [
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+            "forwarded",
+            "authorization",
+            "cookie",
+            "x-api-key",
+            "x-consumer-username",
+            "x-consumer-custom-id",
+            "x-geo-country",
+            "x-ferrum-internal",
+            "x-path-param-account",
+            "grpc-timeout",
+            "content-type",
+            "connection",
+        ] {
+            assert!(
+                is_forbidden_backend_request_trailer_name(name),
+                "late request trailer `{name}` must not cross the backend boundary"
+            );
+        }
+        assert!(!is_forbidden_backend_request_trailer_name(
+            "x-request-checksum"
+        ));
+    }
+
+    #[test]
+    fn sanitize_backend_request_trailers_strips_reserved_assertions_and_keeps_app_metadata() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.append(
+            "x-request-checksum",
+            http::HeaderValue::from_static("sha256:first"),
+        );
+        trailers.append(
+            "x-request-checksum",
+            http::HeaderValue::from_static("sha256:second"),
+        );
+        trailers.append(
+            "x-geo-country",
+            http::HeaderValue::from_static("attacker-first"),
+        );
+        trailers.append(
+            "x-geo-country",
+            http::HeaderValue::from_static("attacker-second"),
+        );
+        trailers.insert(
+            "x-consumer-username",
+            http::HeaderValue::from_static("forged"),
+        );
+        trailers.insert(
+            "authorization",
+            http::HeaderValue::from_static("Bearer forged"),
+        );
+        trailers.insert("connection", http::HeaderValue::from_static("close"));
+        trailers.insert(
+            "x-path-param-account",
+            http::HeaderValue::from_static("acct-1"),
+        );
+        // Malformed values must still be evaluated by name and stripped; a
+        // non-UTF8 reserved assertion cannot bypass the late trust boundary.
+        trailers.append(
+            "x-geo-country",
+            http::HeaderValue::from_bytes(&[0xff, 0xfe]).expect("raw header value"),
+        );
+
+        sanitize_backend_request_trailers(&mut trailers);
+
+        let checksums: Vec<_> = trailers
+            .get_all("x-request-checksum")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(checksums, ["sha256:first", "sha256:second"]);
+        assert!(!trailers.contains_key("x-geo-country"));
+        assert!(!trailers.contains_key("x-consumer-username"));
+        assert!(!trailers.contains_key("authorization"));
+        assert!(!trailers.contains_key("connection"));
+        assert!(!trailers.contains_key("x-path-param-account"));
+        assert_eq!(trailers.len(), 2);
     }
 
     #[test]
