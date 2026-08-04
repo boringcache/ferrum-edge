@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- NodeWaypoint captured TCP observability now exports the bounded-cardinality
+  `ferrum_mesh_bpf_accept_to_first_byte_microseconds` histogram for IPv4 and
+  IPv6. SOCK_OPS timestamps passive establishment and enrolls the exact accepted
+  socket in a bounded SOCKHASH; an SK_SKB stream parser consumes the first
+  non-empty inbound application-data callback only after the existing orig-dst
+  bridge confirms capture. Socket-cookie identity, delete-wins/BPF_EXIST phase
+  transitions, bounded deferred userspace SOCKHASH removal after a parser/verdict
+  grace period, kernel close cleanup, LRU eviction, one-hour monotonic age
+  validation, and reload generation isolation prevent tuple/listener reuse,
+  callback-lock recursion, raced handoff, stale state, and `ktime` wrap from
+  fabricating samples. The metric has fixed microsecond buckets with saturating
+  count/bucket counters, drops sum overflow, and adds no per-flow labels (#3309).
 - Gateway API `BackendTLSPolicy` is watched and translated for Service-backed
   `HTTPRoute`/`GRPCRoute` backends (issue #3276). `validation.hostname` projects
   to upstream `backend_tls_sni`, optional `subjectAltNames` to
@@ -16,7 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or `wellKnownCACertificates: System` to the upstream CA trust posture with
   `backend_scheme: https`. Invalid or conflicting policies fail closed with an
   HTTP 500 fault abort. Policy `status.ancestors` is not written yet.
-
 - VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
   compile onto a shared precomputed `Proxy.stream_match` carrier and are

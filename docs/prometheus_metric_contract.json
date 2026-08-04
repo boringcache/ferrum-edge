@@ -1476,6 +1476,20 @@
     "emission": "when_process_initialized"
   },
   {
+    "name": "ferrum_mesh_bpf_accept_to_first_byte_microseconds",
+    "type": "histogram",
+    "help": "Time from captured TCP passive-established accept to the first inbound application-data byte on the same accepted socket, in microseconds. Missing, raced, stale, reversed, or corrupt correlation evidence emits no sample; fixed le buckets plus sum/count; sum overflow or counter saturation drops the sample.",
+    "labels": [
+      "le"
+    ],
+    "subsystem": "mesh_bpf",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled",
+    "name_template": "{prefix}_accept_to_first_byte_microseconds",
+    "default_prefix": "ferrum_mesh_bpf"
+  },
+  {
     "name": "ferrum_mesh_bpf_drop_reasons",
     "type": "gauge",
     "help": "Well-known BPF drop reason labels (gauge=1 to make the label set self-documenting).",
@@ -1542,7 +1556,7 @@
   {
     "name": "ferrum_mesh_bpf_srtt_microseconds",
     "type": "histogram",
-    "help": "TCP smoothed RTT samples in microseconds. Fixed le buckets plus sum/count; zero samples are ignored and sum overflow drops the sample.",
+    "help": "TCP smoothed RTT samples in microseconds. Fixed le buckets plus sum/count; zero samples are ignored and sum overflow or counter saturation drops the sample.",
     "labels": [
       "le"
     ],
@@ -1556,7 +1570,7 @@
   {
     "name": "ferrum_mesh_bpf_syn_to_ack_microseconds",
     "type": "histogram",
-    "help": "Time between SYN send and ACK observation in microseconds. Fixed le buckets plus sum/count; zero samples are ignored and sum overflow drops the sample.",
+    "help": "Time between SYN send and ACK observation in microseconds. Fixed le buckets plus sum/count; zero samples are ignored and sum overflow or counter saturation drops the sample.",
     "labels": [
       "le"
     ],
