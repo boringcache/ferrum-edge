@@ -10332,13 +10332,11 @@ impl RequestBodyBufferingScreener {
         let answer = match plugin_name {
             "ai_response_guard" => ai_response_guard::AiResponseGuard::new_shape_only(config)
                 .map(|plugin| plugin.requires_request_body_buffering()),
-            "ai_transcript_audit" => {
-                ai_transcript_audit::AiTranscriptAudit::new_shape_only(
-                    config,
-                    self.http_client.clone(),
-                )
-                .map(|plugin| plugin.requires_request_body_buffering())
-            }
+            "ai_transcript_audit" => ai_transcript_audit::AiTranscriptAudit::new_shape_only(
+                config,
+                self.http_client.clone(),
+            )
+            .map(|plugin| plugin.requires_request_body_buffering()),
             "body_validator" => body_validator::BodyValidator::new_shape_only(config)
                 .map(|plugin| plugin.requires_request_body_buffering()),
             // Unreachable today. A name added to the shape-only list without a
