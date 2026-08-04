@@ -1510,9 +1510,14 @@ impl Plugin for Waf {
             // untouched header set is neither rescanned nor rescored
             // (`GHSA-62jg-v563-4q23`).
             let digest = response_header_map_digest(response_headers);
-            ctx.waf_response_header_digests
-                .insert(self.instance_id, digest);
             let result = self.finish_scan(ctx, outcome);
+            // A rejection can be rebuilt into the same header map and must be
+            // scanned again by the bounded fail-closed recheck. Only successful
+            // decisions are safe to memoize.
+            if matches!(&result, PluginResult::Continue) {
+                ctx.waf_response_header_digests
+                    .insert(self.instance_id, digest);
+            }
             if !matches!(&result, PluginResult::Continue) {
                 return result;
             }
@@ -1703,9 +1708,14 @@ impl Plugin for Waf {
         }
         let outcome =
             self.run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
-        ctx.waf_response_header_digests
-            .insert(self.instance_id, digest);
-        self.finish_scan(ctx, outcome)
+        let result = self.finish_scan(ctx, outcome);
+        // Do not memoize refused maps: the final response pipeline deliberately
+        // rechecks a rebuilt rejection, which can be byte-for-byte identical.
+        if matches!(&result, PluginResult::Continue) {
+            ctx.waf_response_header_digests
+                .insert(self.instance_id, digest);
+        }
+        result
     }
 
     /// The authoritative WAF response BODY decision, over the exact

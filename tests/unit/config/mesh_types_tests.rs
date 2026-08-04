@@ -40,6 +40,7 @@ fn mesh_config_round_trips_through_serde() {
                     namespace: Some("svc".into()),
                 },
                 service_name: "api".into(),
+                service_namespace: None,
                 addresses: Vec::new(),
                 ports: vec![WorkloadPort {
                     port: 8443,

@@ -5409,6 +5409,13 @@ mod inner {
     ///
     /// Wave 5: `tags` and `server_urls` are stored as native BSON arrays.
     fn api_spec_to_doc(spec: &ApiSpec) -> Result<Document, anyhow::Error> {
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+            spec.external_ref_snapshot.as_deref(),
+            spec.external_ref_digest.as_deref(),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+        })?;
         let mut doc = mongodb::bson::to_document(spec)?;
         doc.insert("_id", spec.id.as_str());
         doc.insert(
@@ -5418,6 +5425,20 @@ mod inner {
                 bytes: spec.spec_content.clone(),
             }),
         );
+        match &spec.external_ref_snapshot {
+            Some(bytes) => {
+                doc.insert(
+                    "external_ref_snapshot",
+                    Bson::Binary(Binary {
+                        subtype: BinarySubtype::Generic,
+                        bytes: bytes.clone(),
+                    }),
+                );
+            }
+            None => {
+                doc.remove("external_ref_snapshot");
+            }
+        }
         Ok(doc)
     }
 
@@ -5468,7 +5489,14 @@ mod inner {
         Ok(event)
     }
 
-    fn doc_to_api_spec(mut doc: Document) -> Result<ApiSpec, anyhow::Error> {
+    fn doc_to_api_spec(doc: Document) -> Result<ApiSpec, anyhow::Error> {
+        doc_to_api_spec_inner(doc, true)
+    }
+
+    fn doc_to_api_spec_inner(
+        mut doc: Document,
+        snapshot_projected: bool,
+    ) -> Result<ApiSpec, anyhow::Error> {
         doc.remove("_id");
         let spec_content = match doc.remove("spec_content") {
             Some(Bson::Binary(binary)) => binary.bytes,
@@ -5497,6 +5525,41 @@ mod inner {
             }
             None => anyhow::bail!("api_specs.spec_content missing"),
         };
+        let external_ref_snapshot = match doc.remove("external_ref_snapshot") {
+            Some(Bson::Binary(binary)) => {
+                if binary.bytes.len()
+                    > crate::admin::api_specs::external_refs::MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES
+                {
+                    anyhow::bail!("api_specs.external_ref_snapshot exceeds size limit");
+                }
+                Some(binary.bytes)
+            }
+            Some(Bson::Null) | None => None,
+            Some(Bson::Array(values)) => {
+                if values.len()
+                    > crate::admin::api_specs::external_refs::MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES
+                {
+                    anyhow::bail!("api_specs.external_ref_snapshot exceeds size limit");
+                }
+                let mut bytes = Vec::with_capacity(values.len());
+                for value in values {
+                    let byte = match value {
+                        Bson::Int32(v) if (0..=u8::MAX as i32).contains(&v) => v as u8,
+                        Bson::Int64(v) if (0..=u8::MAX as i64).contains(&v) => v as u8,
+                        _ => {
+                            anyhow::bail!(
+                                "api_specs.external_ref_snapshot array contains a non-byte value"
+                            );
+                        }
+                    };
+                    bytes.push(byte);
+                }
+                Some(bytes)
+            }
+            Some(_) => {
+                anyhow::bail!("api_specs.external_ref_snapshot has an unexpected BSON type");
+            }
+        };
 
         // Let serde populate the rest of the struct, then restore the bytes
         // from the BSON Binary above. This avoids materializing a huge BSON
@@ -5504,6 +5567,21 @@ mod inner {
         doc.insert("spec_content", Bson::Array(Vec::new()));
         let mut spec: ApiSpec = mongodb::bson::from_document(doc)?;
         spec.spec_content = spec_content;
+        spec.external_ref_snapshot = external_ref_snapshot;
+        if snapshot_projected {
+            crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+                spec.external_ref_snapshot.as_deref(),
+                spec.external_ref_digest.as_deref(),
+            )
+            .map_err(|_| {
+                anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+            })?;
+        } else {
+            crate::admin::api_specs::external_refs::validate_external_ref_summary_digest(
+                spec.external_ref_digest.as_deref(),
+            )
+            .map_err(|_| anyhow::anyhow!("api_specs external-ref digest validation failed"))?;
+        }
         Ok(spec)
     }
 
@@ -5515,7 +5593,7 @@ mod inner {
                 bytes: Vec::new(),
             }),
         );
-        doc_to_api_spec(doc)
+        doc_to_api_spec_inner(doc, false)
     }
 
     #[derive(Clone)]
@@ -6384,6 +6462,9 @@ mod inner {
                 .await?
             {
                 let mut proxy = doc_to_proxy(doc)?;
+                // Match SQL incremental + full-load admission: derived fields
+                // such as compiled_stream_match are serde-skipped.
+                proxy.normalize_fields();
                 proxy.api_spec_id = None;
                 added_or_modified_proxies.push(proxy);
             }
@@ -6411,7 +6492,9 @@ mod inner {
                 .load_change_ids(self.consumers(), namespace, &consumer_upsert_doc_ids)
                 .await?
             {
-                added_or_modified_consumers.push(doc_to_consumer(doc)?);
+                let mut consumer = doc_to_consumer(doc)?;
+                consumer.normalize_fields();
+                added_or_modified_consumers.push(consumer);
             }
             let loaded_consumer_ids: HashSet<String> = added_or_modified_consumers
                 .iter()
@@ -6434,6 +6517,7 @@ mod inner {
                 .await?
             {
                 let mut plugin = doc_to_plugin_config(doc)?;
+                plugin.normalize_fields();
                 plugin.api_spec_id = None;
                 added_or_modified_plugin_configs.push(plugin);
             }
@@ -6454,6 +6538,7 @@ mod inner {
                 .await?
             {
                 let mut upstream = doc_to_upstream(doc)?;
+                upstream.normalize_fields();
                 upstream.api_spec_id = None;
                 added_or_modified_upstreams.push(upstream);
             }
@@ -11705,7 +11790,9 @@ mod inner {
                 .sort(doc! { sort_field: sort_dir })
                 .skip(mongo_skip)
                 .limit(mongo_limit)
-                .projection(doc! { "spec_content": 0, "resource_hash": 0 })
+                .projection(
+                    doc! { "spec_content": 0, "resource_hash": 0, "external_ref_snapshot": 0 },
+                )
                 .build();
             let api_specs = self.api_specs();
             let mut cursor = api_specs.find(filter_doc).with_options(options).await?;
@@ -13400,6 +13487,8 @@ mod inner {
                 server_urls: vec!["https://api.example.com".to_string()],
                 operation_count: 3,
                 resource_hash: "b".repeat(64),
+                external_ref_snapshot: None,
+                external_ref_digest: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -13414,6 +13503,28 @@ mod inner {
             assert_eq!(restored.spec_content, spec.spec_content);
             assert_eq!(restored.tags, spec.tags);
             assert_eq!(restored.server_urls, spec.server_urls);
+
+            let mut mismatched = api_spec_to_doc(&spec).expect("api_spec_to_doc mismatch fixture");
+            mismatched.insert("external_ref_digest", "a".repeat(64));
+            let error = doc_to_api_spec(mismatched.clone())
+                .expect_err("full Mongo decode must reject digest without snapshot");
+            assert!(error.to_string().contains("integrity validation failed"));
+            let summary = doc_to_api_spec_summary(mismatched)
+                .expect("summary projection may omit an external-ref snapshot blob");
+            assert_eq!(summary.external_ref_digest, Some("a".repeat(64)));
+
+            let mut corrupt = api_spec_to_doc(&spec).expect("api_spec_to_doc corrupt fixture");
+            corrupt.insert("external_ref_digest", "b".repeat(64));
+            corrupt.insert(
+                "external_ref_snapshot",
+                Bson::Binary(Binary {
+                    subtype: BinarySubtype::Generic,
+                    bytes: vec![0x1f, 0x8b, 0x00],
+                }),
+            );
+            let error = doc_to_api_spec(corrupt)
+                .expect_err("full Mongo decode must reject corrupt snapshot bytes");
+            assert!(error.to_string().contains("integrity validation failed"));
         }
 
         #[test]
@@ -13440,6 +13551,8 @@ mod inner {
                 server_urls: vec!["https://api.example.com".to_string()],
                 operation_count: 7,
                 resource_hash: "d".repeat(64),
+                external_ref_snapshot: None,
+                external_ref_digest: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -13524,6 +13637,8 @@ mod inner {
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
                 stream_proxy_protocol: None,
+                stream_match: None,
+                compiled_stream_match: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -13730,6 +13845,8 @@ mod inner {
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
                 stream_proxy_protocol: None,
+                stream_match: None,
+                compiled_stream_match: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -13839,6 +13956,8 @@ mod inner {
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
                 stream_proxy_protocol: None,
+                stream_match: None,
+                compiled_stream_match: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -14050,6 +14169,8 @@ mod inner {
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
                 stream_proxy_protocol: None,
+                stream_match: None,
+                compiled_stream_match: None,
                 created_at: now,
                 updated_at: now,
             };

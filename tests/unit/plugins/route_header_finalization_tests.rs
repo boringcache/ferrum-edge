@@ -86,6 +86,8 @@ fn make_proxy(id: &str, plugin_ids: &[&str]) -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

@@ -6,7 +6,7 @@
 //! (authorization policies, PeerAuthentication mTLS posture, effective
 //! workload labels for selector matching, request authentication / JWT rules,
 //! ServiceEntry shape, SPIFFE trust bundles, outbound traffic policy,
-//! ProxyConfig, and per-pod workload endpoints).
+//! ProxyConfig, VirtualService L4 proxies, and per-pod workload endpoints).
 //!
 //! Without this module, `FERRUM_MESH_CONFIG_PROTOCOL=xds` produced an
 //! UNPROTECTED mesh: the DP rebuilt the slice with every one of those fields
@@ -134,6 +134,11 @@ pub const FERRUM_ECDS_LABELS_TYPE_URL: &str =
 /// intersection replace them. `false` is the DP default, so it is never emitted.
 pub const FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.WorkloadLabelsAmbiguousCarrier";
+/// Inner `type_url` for namespace-projected Istio VirtualService L4 proxies.
+/// These full proxy JSON objects are carried because ordinary `GatewayConfig`
+/// proxies do not otherwise ride `MeshSlice`.
+pub const FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.VirtualServiceL4ProxiesCarrier";
 /// Inner `type_url` for the authorization-policy carrier (`MeshPolicy` list).
 pub const FERRUM_ECDS_MESH_POLICIES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.MeshPoliciesCarrier";
@@ -210,6 +215,7 @@ pub enum MeshSliceCarrier {
     /// the workload's authoritative labels. Always `true` when emitted (the CP
     /// only emits it when set); see [`FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL`].
     LabelsAmbiguous(bool),
+    VirtualServiceL4Proxies(Vec<serde_json::Value>),
     MeshPolicies(Vec<MeshPolicy>),
     VirtualServiceCorsPolicies(Vec<MeshVirtualServiceCorsPolicy>),
     PeerAuthentications(Vec<PeerAuthentication>),
@@ -259,6 +265,7 @@ impl MeshSliceCarrier {
             }
             MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
             MeshSliceCarrier::LabelsAmbiguous(_) => FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL,
+            MeshSliceCarrier::VirtualServiceL4Proxies(_) => FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
             MeshSliceCarrier::VirtualServiceCorsPolicies(_) => {
                 FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL
@@ -296,6 +303,7 @@ impl MeshSliceCarrier {
             }
             MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
             MeshSliceCarrier::LabelsAmbiguous(_) => "workload-labels-ambiguous",
+            MeshSliceCarrier::VirtualServiceL4Proxies(_) => "virtual-service-l4-proxies",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
             MeshSliceCarrier::VirtualServiceCorsPolicies(_) => "virtual-service-cors-policies",
             MeshSliceCarrier::PeerAuthentications(_) => "peer-authentications",
@@ -328,6 +336,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(value) => encode(value),
             MeshSliceCarrier::WorkloadLabels(value) => encode(value),
             MeshSliceCarrier::LabelsAmbiguous(value) => encode(value),
+            MeshSliceCarrier::VirtualServiceL4Proxies(value) => encode(value),
             MeshSliceCarrier::MeshPolicies(value) => encode(value),
             MeshSliceCarrier::VirtualServiceCorsPolicies(value) => encode(value),
             MeshSliceCarrier::PeerAuthentications(value) => encode(value),
@@ -392,6 +401,9 @@ impl MeshSliceCarrier {
             FERRUM_ECDS_LABELS_TYPE_URL => MeshSliceCarrier::WorkloadLabels(decode_json(value)?),
             FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL => {
                 MeshSliceCarrier::LabelsAmbiguous(decode_json(value)?)
+            }
+            FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL => {
+                MeshSliceCarrier::VirtualServiceL4Proxies(decode_json(value)?)
             }
             FERRUM_ECDS_MESH_POLICIES_TYPE_URL => {
                 MeshSliceCarrier::MeshPolicies(decode_json(value)?)
@@ -469,6 +481,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         FERRUM_ECDS_LABELS_TYPE_URL => Some("ferrum-mesh-carrier/workload-labels"),
         FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL => {
             Some("ferrum-mesh-carrier/workload-labels-ambiguous")
+        }
+        FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL => {
+            Some("ferrum-mesh-carrier/virtual-service-l4-proxies")
         }
         FERRUM_ECDS_MESH_POLICIES_TYPE_URL => Some("ferrum-mesh-carrier/mesh-policies"),
         FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL => {
@@ -606,6 +621,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     if slice.labels_ambiguous {
         carriers.push(MeshSliceCarrier::LabelsAmbiguous(true));
     }
+    if !slice.virtual_service_l4_proxies.is_empty() {
+        carriers.push(MeshSliceCarrier::VirtualServiceL4Proxies(
+            slice.virtual_service_l4_proxies.clone(),
+        ));
+    }
     if !slice.mesh_policies.is_empty() {
         carriers.push(MeshSliceCarrier::MeshPolicies(slice.mesh_policies.clone()));
     }
@@ -685,6 +705,9 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         }
         MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
         MeshSliceCarrier::LabelsAmbiguous(value) => slice.labels_ambiguous = value,
+        MeshSliceCarrier::VirtualServiceL4Proxies(value) => {
+            slice.virtual_service_l4_proxies = value
+        }
         MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
         MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {
             slice.virtual_service_cors_policies = value
@@ -867,6 +890,9 @@ mod tests {
                 "api".to_string(),
             )])),
             MeshSliceCarrier::LabelsAmbiguous(true),
+            MeshSliceCarrier::VirtualServiceL4Proxies(vec![serde_json::json!({
+                "id": "istio-vs-l4_tcp__default__db__0-0"
+            })]),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),
@@ -964,6 +990,7 @@ mod tests {
                 "api".to_string(),
             )])),
             MeshSliceCarrier::LabelsAmbiguous(true),
+            MeshSliceCarrier::VirtualServiceL4Proxies(Vec::new()),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),
