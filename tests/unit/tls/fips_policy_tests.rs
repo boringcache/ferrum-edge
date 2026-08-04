@@ -358,7 +358,10 @@ fn env_policy_rejects_unverified_sql_config_database_tls_modes() {
                 err.contains(&format!("FERRUM_DB_TLS_MODE={mode_name}")),
                 "{err}"
             );
-            assert!(err.contains("verify-ca") && err.contains("verify-full"), "{err}");
+            assert!(
+                err.contains("verify-ca") && err.contains("verify-full"),
+                "{err}"
+            );
         }
     }
 }
