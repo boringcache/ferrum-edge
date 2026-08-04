@@ -2077,9 +2077,16 @@ fn protobuf_string_field<'a>(
     Ok(found)
 }
 
-fn for_each_protobuf_field(
-    mut message: &[u8],
-    mut visit: impl FnMut(u32, u8, &[u8]) -> Result<(), &'static str>,
+/// Visit each top-level protobuf field of `message`.
+///
+/// The visitor receives `&'a [u8]` — the SAME lifetime as `message` — rather
+/// than a higher-ranked `&[u8]`. Every value handed to the visitor is a
+/// subslice of `message` (`split_at` / `&start[..consumed]`), so this is sound,
+/// and it lets a caller such as [`protobuf_string_field`] hoist a borrowed
+/// field value out of the closure instead of copying it.
+fn for_each_protobuf_field<'a>(
+    mut message: &'a [u8],
+    mut visit: impl FnMut(u32, u8, &'a [u8]) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
     while !message.is_empty() {
         let key = decode_varint(&mut message)?;
