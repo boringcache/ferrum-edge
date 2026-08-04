@@ -326,7 +326,6 @@ async fn gemini_sse_and_json_streams_normalize() {
     assert!(buffered.trim_end().ends_with("data: [DONE]"));
 }
 
-
 #[tokio::test]
 async fn layered_gzip_br_residual_encoding_normalizes_without_leaking_frames() {
     let plugin = plugin();
@@ -384,7 +383,6 @@ async fn layered_gzip_br_residual_encoding_normalizes_without_leaking_frames() {
     assert!(text.trim_end().ends_with("data: [DONE]"));
     assert!(!text.contains("upstream_error"));
 }
-
 
 #[tokio::test]
 async fn unsupported_layered_coding_rejects_before_stream_fallback() {
