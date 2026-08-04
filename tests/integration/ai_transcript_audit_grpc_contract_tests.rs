@@ -1,9 +1,7 @@
 //! Cross-module registration and validation contract for
 //! `ai_transcript_audit` native gRPC capture (issue #3304).
 
-use ferrum_edge::plugins::{
-    ProxyProtocol, create_plugin, validate_plugin_config,
-};
+use ferrum_edge::plugins::{ProxyProtocol, create_plugin, validate_plugin_config};
 use serde_json::json;
 
 fn grpc_descriptor_path() -> String {
@@ -107,10 +105,7 @@ fn shared_validation_rejects_unknown_grpc_keys_and_empty_methods() {
         }),
     )
     .expect_err("empty methods must fail closed");
-    assert!(
-        empty_methods.contains("methods"),
-        "got: {empty_methods}"
-    );
+    assert!(empty_methods.contains("methods"), "got: {empty_methods}");
 }
 
 #[test]

@@ -9960,7 +9960,6 @@ async fn sink_delivery_failure_diagnostics_are_redacted() {
     );
 }
 
-
 // ══════════════════════════════════════════════════════════════════════
 // Native gRPC capture (issue #3304)
 // ══════════════════════════════════════════════════════════════════════
@@ -10074,8 +10073,7 @@ fn grpc_block_extends_supported_protocols_and_buffering() {
     assert!(protocols.contains(&ProxyProtocol::Http));
     assert!(protocols.contains(&ProxyProtocol::Grpc));
     assert_eq!(
-        protocols,
-        HTTP_GRPC_PROTOCOLS,
+        protocols, HTTP_GRPC_PROTOCOLS,
         "grpc enrollment must advertise the shared HTTP+gRPC matrix"
     );
 
@@ -10197,7 +10195,9 @@ async fn grpc_unary_roundtrip_redacts_credential_in_payload() {
         .on_final_request_body_with_context(&mut ctx, &headers, &req)
         .await;
     assert_eq!(
-        ctx.metadata.get("ai_transcript_audit.candidate").map(String::as_str),
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
         Some("true")
     );
     plugin
@@ -10205,7 +10205,11 @@ async fn grpc_unary_roundtrip_redacts_credential_in_payload() {
         .await;
 
     let records = wait_for_records(&server).await;
-    assert_eq!(records.len(), 1, "expected one audit record, got {records:?}");
+    assert_eq!(
+        records.len(),
+        1,
+        "expected one audit record, got {records:?}"
+    );
     let record = &records[0];
     let request_body = record
         .get("request_body")
@@ -10283,7 +10287,10 @@ async fn grpc_malformed_and_oversized_frames_omit_excerpt() {
     let omitted = records[0]
         .get("request_body_omitted_reason")
         .and_then(Value::as_str);
-    let req_body = records[0].get("request_body").cloned().unwrap_or(Value::Null);
+    let req_body = records[0]
+        .get("request_body")
+        .cloned()
+        .unwrap_or(Value::Null);
     assert!(
         omitted == Some("grpc_framing_error")
             || omitted == Some("grpc_message_limit")
@@ -10335,7 +10342,10 @@ async fn grpc_malformed_and_oversized_frames_omit_excerpt() {
     let resp_omitted = records[0]
         .get("response_body_omitted_reason")
         .and_then(Value::as_str);
-    let resp_body = records[0].get("response_body").cloned().unwrap_or(Value::Null);
+    let resp_body = records[0]
+        .get("response_body")
+        .cloned()
+        .unwrap_or(Value::Null);
     assert!(
         resp_omitted == Some("grpc_message_limit")
             || resp_body.is_null()
@@ -10412,7 +10422,10 @@ async fn grpc_compressed_identity_and_unsupported_encoding() {
         .await;
     let records = wait_for_records(&server2).await;
     assert_eq!(records.len(), 1);
-    let request_body = records[0].get("request_body").cloned().unwrap_or(Value::Null);
+    let request_body = records[0]
+        .get("request_body")
+        .cloned()
+        .unwrap_or(Value::Null);
     let omitted = records[0]
         .get("request_body_omitted_reason")
         .and_then(Value::as_str);
