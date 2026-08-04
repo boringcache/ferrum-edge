@@ -226,7 +226,6 @@ async fn gzip_residual_encoding_repairs_headers_and_normalizes_stream() {
 }
 
 #[tokio::test]
-#[tokio::test]
 async fn gemini_sse_and_json_streams_normalize() {
     let plugin = AiStreamRouter::new(
         &json!({
