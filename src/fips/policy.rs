@@ -380,19 +380,21 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
     // SQL modes that do not authenticate the config-database peer must not be
     // admitted into the enforced boundary. `verify-ca` and `verify-full` are
     // the only explicit modes that validate the server certificate chain.
-    if env_config.db_type.as_deref().is_some_and(|db_type| {
+    let sql_config_store = env_config.db_type.as_deref().is_some_and(|db_type| {
         db_type.eq_ignore_ascii_case("postgres") || db_type.eq_ignore_ascii_case("mysql")
-    }) {
-        if let Some(mode) = env_config.db_tls_mode {
-            match mode {
-                DbTlsMode::VerifyCa | DbTlsMode::VerifyFull => {}
-                unverified => {
-                    return Err(format!(
-                        "FERRUM_DB_TLS_MODE={unverified} does not authenticate the SQL \
-                         config-database peer and is refused while FIPS mode is enforced; use \
-                         `verify-ca` or `verify-full`."
-                    ));
-                }
+    });
+    if sql_config_store && let Some(mode) = env_config.db_tls_mode {
+        // Exhaustive on purpose: a future `DbTlsMode` variant must be an
+        // explicit decision here, and until it is made it falls into the
+        // refusal arm rather than being silently admitted.
+        match mode {
+            DbTlsMode::VerifyCa | DbTlsMode::VerifyFull => {}
+            unverified => {
+                return Err(format!(
+                    "FERRUM_DB_TLS_MODE={unverified} does not authenticate the SQL \
+                     config-database peer and is refused while FIPS mode is enforced; use \
+                     `verify-ca` or `verify-full`."
+                ));
             }
         }
     }
