@@ -13,7 +13,7 @@
 //! `--no-default-features --features fips` (the hosted FIPS lane).
 
 use chrono::Utc;
-use ferrum_edge::config::env_config::EnvConfig;
+use ferrum_edge::config::env_config::{DbTlsMode, EnvConfig};
 use ferrum_edge::config::types::{Consumer, GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::fips;
 use ferrum_edge::fips::policy;
@@ -335,6 +335,33 @@ fn env_policy_rejects_every_mongodb_config_store_shape() {
         assert!(err.contains("FERRUM_DB_TYPE=mongodb"), "{err}");
         assert!(err.contains("database-driver cryptography"), "{err}");
         assert!(!err.contains("user:secret"), "database URL leaked: {err}");
+    }
+}
+
+#[test]
+fn env_policy_rejects_sql_require_without_peer_verification() {
+    for db_type in ["postgres", "mysql", "POSTGRES"] {
+        let env_config = EnvConfig {
+            db_type: Some(db_type.to_string()),
+            db_tls_mode: Some(DbTlsMode::Require),
+            ..EnvConfig::default()
+        };
+        let err = policy::check_env_config_enforced(&env_config)
+            .expect_err("unauthenticated SQL TLS is refused");
+        assert!(err.contains("FERRUM_DB_TLS_MODE=require"), "{err}");
+        assert!(err.contains("CA and hostname verification"), "{err}");
+    }
+}
+
+#[test]
+fn env_policy_accepts_verified_sql_tls_modes() {
+    for db_tls_mode in [DbTlsMode::VerifyCa, DbTlsMode::VerifyFull] {
+        let env_config = EnvConfig {
+            db_type: Some("postgres".to_string()),
+            db_tls_mode: Some(db_tls_mode),
+            ..EnvConfig::default()
+        };
+        policy::check_env_config_enforced(&env_config).expect("verified SQL TLS is admitted");
     }
 }
 

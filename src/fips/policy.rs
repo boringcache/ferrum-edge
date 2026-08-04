@@ -26,7 +26,7 @@
 
 use std::fmt::Write as _;
 
-use crate::config::env_config::EnvConfig;
+use crate::config::env_config::{DbTlsMode, EnvConfig};
 use crate::config::types::{BackendScheme, GatewayConfig, PluginConfig};
 
 /// Maximum number of individual offending entries named in one diagnostic.
@@ -373,6 +373,22 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
             "FERRUM_DB_TYPE=mongodb uses database-driver cryptography outside Ferrum's selected \
              validated-module boundary and is refused while FIPS mode is enforced. Use a SQL \
              config database or file mode."
+                .to_string(),
+        );
+    }
+
+    // SQL `require` encrypts the config-database connection but authenticates
+    // neither its certificate chain nor hostname. Do not admit that peer-
+    // verification bypass into the enforced boundary.
+    if env_config.db_tls_mode == Some(DbTlsMode::Require)
+        && env_config.db_type.as_deref().is_some_and(|db_type| {
+            db_type.eq_ignore_ascii_case("postgres") || db_type.eq_ignore_ascii_case("mysql")
+        })
+    {
+        return Err(
+            "FERRUM_DB_TLS_MODE=require disables CA and hostname verification for the SQL \
+             config database and is refused while FIPS mode is enforced; use `verify-ca` or \
+             `verify-full`."
                 .to_string(),
         );
     }
