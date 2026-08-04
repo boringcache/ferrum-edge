@@ -134,9 +134,14 @@ fn write_pending_key(buf: &mut String, host: &str, port: u16, subset: Option<&st
 ///
 /// One instance lives on `ProxyState` and is shared across every reqwest/H1
 /// dispatch for the gateway lifetime, so the cap bounds concurrent in-flight
-/// requests per `(host, port, selected subset)` across all proxies in the same
-/// admission lane. `None` is distinct from every named subset, preventing a
-/// selected subset's cap from leaking to an unmatched destination.
+/// requests per `(host, port, selected subset name)` across all proxies in the
+/// same admission lane. `None` is distinct from every named subset, preventing a
+/// selected subset's cap from leaking to an unmatched destination. The key has
+/// no upstream/Service identity: two Services that dial the same `host:port`
+/// under a conventionally-named subset (e.g. both `v1`) share one lane even when
+/// their caps differ — Envoy scopes this per cluster; Ferrum's pre-existing
+/// `(host, port)` sharing already had that residual, and the subset dimension
+/// only isolates distinct names.
 pub struct BackendPendingLimiter {
     inner: Arc<DashMap<String, Arc<BackendPendingCounter>>>,
 }

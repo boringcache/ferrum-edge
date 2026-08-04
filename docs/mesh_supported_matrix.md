@@ -173,6 +173,11 @@ need them, or because they are blocked upstream / architecturally:
   it is not projected as effective policy. Use `http2MaxRequests`.
   (`http1MaxPendingRequests` IS enforced — a 503-on-overflow pending-request gate
   on the HTTP/1.1 dispatch path; see the DR table in `docs/mesh.md`.)
+- **DR `subsets[].trafficPolicy.portLevelSettings`** — detected and listed in
+  `deferred_fields` with a translate-time warning, but not applied. Ferrum
+  honors only top-level `trafficPolicy.portLevelSettings` (Istio's
+  highest-precedence subset port-level tier is unsupported). Express per-port
+  policy at top-level or via subset `connectionPool` fields; see `docs/mesh.md`.
 - **LB `MAGLEV` / `PASSTHROUGH`** — niche; `PASSTHROUGH` approximates to round-robin.
 - **VirtualService `tcp[]` / `tls[]` weighted multi-destination splitting** —
   `tls[]` SNI passthrough (`sniHosts` + port → passthrough stream proxy) and

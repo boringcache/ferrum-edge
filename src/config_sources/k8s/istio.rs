@@ -1979,6 +1979,26 @@ fn translate_subset(
         .ok_or_else(|| invalid_resource(object, "DestinationRule subset requires a name"))?
         .to_string();
     let labels = string_map(value.get("labels").unwrap_or(&Value::Null));
+
+    // Subset-scoped `portLevelSettings` are not parsed or applied. Istio treats
+    // them as the highest precedence tier; Ferrum only honors top-level
+    // `trafficPolicy.portLevelSettings`. Surface a bounded, value-redacted
+    // warning and keep the gap in `deferred_fields` (see `istio_status.rs`) so
+    // operators are not told the DestinationRule applied in full.
+    if value
+        .get("trafficPolicy")
+        .and_then(|tp| tp.get("portLevelSettings"))
+        .and_then(Value::as_array)
+        .is_some_and(|entries| !entries.is_empty())
+    {
+        acc.warnings.push(format!(
+            "DestinationRule {}/{}: subsets[].trafficPolicy.portLevelSettings is not applied \
+             (subset-scoped port-level settings are unsupported); express per-port policy at \
+             top-level trafficPolicy.portLevelSettings or use subset connectionPool fields",
+            object.metadata.namespace, object.metadata.name
+        ));
+    }
+
     let traffic_policy = value
         .get("trafficPolicy")
         .map(|tp| translate_traffic_policy(acc, object, tp, TrafficPolicyScope::Subset))
@@ -18475,6 +18495,71 @@ extensionProviders:
         );
         assert_eq!(subset.max_retries, Some(9));
         assert_eq!(subset.http1_max_pending_requests, Some(16));
+    }
+
+    #[test]
+    fn destination_rule_subset_port_level_settings_warn_and_are_dropped() {
+        // Subset-scoped portLevelSettings are unsupported. Translation must
+        // succeed (other subset fields still apply), emit a value-redacted
+        // warning, and never project the nested policy.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "subsets": [{
+                        "name": "v1",
+                        "labels": {"version": "v1"},
+                        "trafficPolicy": {
+                            "connectionPool": {"http": {"maxRetries": 2}},
+                            "portLevelSettings": [{
+                                "port": {"number": 8080},
+                                "connectionPool": {"http": {"h2UpgradePolicy": "UPGRADE"}}
+                            }]
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("subset portLevelSettings must not reject translation");
+
+        assert!(
+            result.warnings.iter().any(|w| {
+                w.contains("subsets[].trafficPolicy.portLevelSettings")
+                    && w.contains("not applied")
+            }),
+            "subset portLevelSettings must warn; warnings = {:?}",
+            result.warnings
+        );
+        // Hostile/operator values must not be echoed in the diagnostic.
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("8080") || w.contains("UPGRADE")),
+            "subset portLevelSettings warning must not echo operator values; warnings = {:?}",
+            result.warnings
+        );
+
+        let dr = &result.config.mesh.unwrap().destination_rules[0];
+        let subset_tp = dr.subsets[0]
+            .traffic_policy
+            .as_ref()
+            .expect("subset connectionPool still translates");
+        assert_eq!(
+            subset_tp
+                .connection_pool_http
+                .as_ref()
+                .and_then(|http| http.max_retries),
+            Some(2),
+            "supported subset connectionPool fields must still project"
+        );
+        // Top-level port map is empty — subset portLevelSettings never land there.
+        assert!(
+            dr.port_level_settings.is_empty(),
+            "subset portLevelSettings must not populate top-level port_level_settings"
+        );
     }
 
     #[test]

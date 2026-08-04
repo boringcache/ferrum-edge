@@ -660,9 +660,15 @@ fn destination_rule_status(
             // *maxEjectionPercent cap*, the latter resolved by
             // `LoadBalancerCache::max_ejection_percent_resolved_from` with the
             // same per-port > per-subset > upstream precedence as the thresholds.
+            // `subsets[].trafficPolicy.portLevelSettings` remains deferred (not
+            // applied; Istio's highest-precedence tier) — keep in sync with
+            // `translate_subset` in `src/config_sources/k8s/istio.rs`.
             // Surface the rest so operators see the gap in `kubectl describe`.
             let mut deferred: Vec<&'static str> = Vec::new();
             deferred.extend(deferred_connection_pool_http_fields(&object.spec));
+            if subset_has_port_level_settings(&object.spec) {
+                deferred.push(DEFERRED_SUBSET_PORT_LEVEL_SETTINGS);
+            }
             let message = if deferred.is_empty() {
                 format!("Ferrum accepted this DestinationRule (host: {host})")
             } else {
@@ -716,6 +722,27 @@ const DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[(
     "maxRequestsPerConnection",
     "connectionPool.http.maxRequestsPerConnection (not applied: backend close-after-N-requests is unsupported)",
 )];
+
+/// Subset-scoped `portLevelSettings` are never parsed or applied. Keep the
+/// label in sync with the warning in `translate_subset`.
+const DEFERRED_SUBSET_PORT_LEVEL_SETTINGS: &str =
+    "subsets[].trafficPolicy.portLevelSettings (not applied: subset-scoped port-level settings are unsupported)";
+
+/// True when any subset carries a non-empty `trafficPolicy.portLevelSettings`
+/// array. Empty arrays are ignored so a no-op block does not look deferred.
+fn subset_has_port_level_settings(spec: &Value) -> bool {
+    spec.get("subsets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|subset| {
+            subset
+                .get("trafficPolicy")
+                .and_then(|tp| tp.get("portLevelSettings"))
+                .and_then(Value::as_array)
+                .is_some_and(|entries| !entries.is_empty())
+        })
+}
 
 /// Collect the deferred `connectionPool.http.*` field labels in every scope.
 ///
@@ -2253,6 +2280,48 @@ mod tests {
         assert!(
             deferred.is_empty(),
             "applied top-level/subset h2UpgradePolicy, maxRetries, and http1MaxPendingRequests must not be deferred: {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_subset_port_level_settings_are_deferred() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "DestinationRule",
+            "subset-pls-dr",
+            json!({
+                "host": "reviews.default.svc.cluster.local",
+                "subsets": [{
+                    "name": "v1",
+                    "labels": { "version": "v1" },
+                    "trafficPolicy": {
+                        "connectionPool": { "http": { "maxRetries": 2 } },
+                        "portLevelSettings": [{
+                            "port": { "number": 8080 },
+                            "connectionPool": { "http": { "h2UpgradePolicy": "UPGRADE" } }
+                        }]
+                    }
+                }]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| {
+                f.contains("subsets[].trafficPolicy.portLevelSettings") && f.contains("not applied")
+            }),
+            "subset portLevelSettings must be operator-visible as deferred, got {deferred:?}"
+        );
+        // Applied subset connectionPool knobs must not ride along as deferred.
+        assert!(
+            !deferred.iter().any(|f| f.contains("maxRetries")),
+            "applied subset maxRetries must not be deferred: {deferred:?}"
         );
     }
 

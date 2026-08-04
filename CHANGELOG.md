@@ -222,6 +222,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reqwest backend TLS clients built via `use_preconfigured_tls` /
+  `BackendTlsConfigBuilder::build_rustls_for_reqwest` now advertise ALPN
+  `[h2, http/1.1]` unless the proxy forces HTTP/1.1 (`h2UpgradePolicy:
+  DO_NOT_UPGRADE` or `pool_enable_http2: false`). Previously the
+  BuiltRustls path left ALPN empty, so production reqwest dials never
+  negotiated HTTP/2 on main. **Behavior change for existing deployments:**
+  every non-force-H1 HTTPS reqwest dispatch — including retry-configured
+  proxies, traffic routed to reqwest by body-buffering plugins or body-size
+  limits, and capability-`Unknown` targets — now offers h2 and will switch
+  from HTTP/1.1 to multiplexed HTTP/2 against dual-ALPN backends. Direct-H2 /
+  H3/QUIC builders are unchanged. Enables DestinationRule
+  `h2UpgradePolicy: UPGRADE` on the default reqwest path (issues #3228,
+  #3240–#3242).
 - Required CI owners now declare `merge_group` triggers and event-aware
   base/head selection so a future `main` merge queue can run the six required
   checks (`Tests`, `Merge Coverage`, `Gateway API Conformance`,
