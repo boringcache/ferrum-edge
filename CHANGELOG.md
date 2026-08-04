@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- NodeWaypoint captured TCP observability now exports the bounded-cardinality
+  `ferrum_mesh_bpf_accept_to_first_byte_microseconds` histogram for IPv4 and
+  IPv6. SOCK_OPS timestamps passive establishment and enrolls the exact accepted
+  socket in a bounded SOCKHASH; an SK_SKB stream parser consumes the first
+  non-empty inbound application-data callback only after the existing orig-dst
+  bridge confirms capture. Socket-cookie identity, delete-wins/BPF_EXIST phase
+  transitions, bounded deferred userspace SOCKHASH removal after a parser/verdict
+  grace period, kernel close cleanup, LRU eviction, one-hour monotonic age
+  validation, and reload generation isolation prevent tuple/listener reuse,
+  callback-lock recursion, raced handoff, stale state, and `ktime` wrap from
+  fabricating samples. The metric has fixed microsecond buckets with saturating
+  count/bucket counters, drops sum overflow, and adds no per-flow labels (#3309).
 - `ai_semantic_firewall` streamed `inspect` mode now accepts
   `streaming.window: tokens` with an explicitly selected bounded tokenizer
   (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft
@@ -16,7 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complete-token cuts under the existing `max_window_bytes` memory/CPU cap
   (issue #3302). Invalid or non-token-window uses of the new fields fail closed
   with field-specific diagnostics; OpenAPI and `docs/plugins.md` stay in parity.
-
 - VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
   compile onto a shared precomputed `Proxy.stream_match` carrier and are
