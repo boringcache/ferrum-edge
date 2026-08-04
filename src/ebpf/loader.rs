@@ -16,6 +16,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsFd;
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
+use aya::maps::SockHash;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::programs::sock_ops::SockOpsLinkId;
@@ -26,7 +28,7 @@ use aya::programs::tc::{SchedClassifierLink, SchedClassifierLinkId};
 // ingress-redirect teardown owns its links rather than tracking link ids, so it
 // calls that method directly.
 use aya::programs::{
-    CgroupAttachMode, CgroupSockAddr, Link, SchedClassifier, SockOps, TcAttachType,
+    CgroupAttachMode, CgroupSockAddr, Link, SchedClassifier, SkSkb, SockOps, TcAttachType,
 };
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::{Ebpf, EbpfLoader};
@@ -37,10 +39,11 @@ use tracing::{debug, info, warn};
 use super::maps::BpfMaps;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::{
-    BPF_MAP_ORIG_DST4, BPF_MAP_ORIG_DST6, BPF_MAP_SOCK_OPS_EVENTS, BPF_MAP_SOCK_OPS_STATS,
-    BPF_ORIG_DST4_PIN_PATH, BPF_ORIG_DST6_PIN_PATH, BPF_PROGRAM_SOCK_OPS,
-    BPF_SOCK_OPS_EVENTS_PIN_PATH, BPF_SOCK_OPS_STATS_PIN_PATH, EbpfBackend, IncludePortsPolicy,
-    PodInfo, TcAttachDirection,
+    BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH, BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS, BPF_MAP_ORIG_DST4,
+    BPF_MAP_ORIG_DST6, BPF_MAP_SOCK_OPS_EVENTS, BPF_MAP_SOCK_OPS_STATS, BPF_ORIG_DST4_PIN_PATH,
+    BPF_ORIG_DST6_PIN_PATH, BPF_PROGRAM_FIRST_BYTE_PARSER, BPF_PROGRAM_FIRST_BYTE_VERDICT,
+    BPF_PROGRAM_SOCK_OPS, BPF_SOCK_OPS_EVENTS_PIN_PATH, BPF_SOCK_OPS_STATS_PIN_PATH, EbpfBackend,
+    IncludePortsPolicy, PodInfo, TcAttachDirection,
 };
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use ferrum_ebpf_common::{BpfCaptureConfig, SOCK_OPS_RINGBUF_DEFAULT_BYTES};
@@ -113,6 +116,9 @@ pub struct AyaEbpfBackend {
     /// implicitly when `Ebpf` is dropped, but holding the id lets future
     /// callers detach explicitly if needed).
     sock_ops_link_id: Option<SockOpsLinkId>,
+    /// Both SK_SKB programs are attached to the accepted-socket sockhash.
+    /// Their link ownership stays in `Ebpf` and is released on cleanup/drop.
+    first_byte_hooks_attached: bool,
     /// Node-level tc ingress redirect attachments, keyed by interface so a
     /// detach can be reported (and retried) per interface. These are
     /// node-scoped, not per-pod, so they deliberately live outside `pod_links`.
@@ -135,6 +141,7 @@ impl AyaEbpfBackend {
             maps: None,
             pod_links: HashMap::new(),
             sock_ops_link_id: None,
+            first_byte_hooks_attached: false,
             ingress_redirect_links: Vec::new(),
             orig_dst_maps_pinned: false,
             node_source_ipv4_present: false,
@@ -248,6 +255,22 @@ impl EbpfBackend for AyaEbpfBackend {
                 "SOCK_OPS program not present in ELF (TCP-layer observability disabled)"
             );
         }
+
+        // The platform hook that actually observes application data is SK_SKB,
+        // not SOCK_OPS. Load and attach parser+verdict to the bounded sockhash
+        // before SOCK_OPS can enroll any accepted sockets. This telemetry hook
+        // remains best-effort: failure does not weaken the orig-dst identity
+        // bridge or alter traffic.
+        self.first_byte_hooks_attached = match attach_first_byte_hooks(&mut bpf) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to attach accept-to-first-byte SK_SKB hooks (latency metric disabled)"
+                );
+                false
+            }
+        };
 
         self.maps = Some(BpfMaps::from_ebpf(&mut bpf)?);
 
@@ -721,6 +744,7 @@ impl EbpfBackend for AyaEbpfBackend {
         }
         self.pod_links.clear();
         self.sock_ops_link_id = None;
+        self.first_byte_hooks_attached = false;
         self.orig_dst_maps_pinned = false;
         self.maps = None;
         self.bpf = None;
@@ -728,11 +752,76 @@ impl EbpfBackend for AyaEbpfBackend {
         // doesn't mislead a future mesh-proxy start. Missing pin is fine.
         let _ = fs::remove_file(BPF_SOCK_OPS_EVENTS_PIN_PATH);
         let _ = fs::remove_file(BPF_SOCK_OPS_STATS_PIN_PATH);
+        let _ = fs::remove_file(BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH);
         let _ = fs::remove_file(BPF_ORIG_DST4_PIN_PATH);
         let _ = fs::remove_file(BPF_ORIG_DST6_PIN_PATH);
         info!("BPF programs and maps cleaned up");
         Ok(())
     }
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn attach_first_byte_hooks(bpf: &mut Ebpf) -> Result<(), String> {
+    for name in [
+        BPF_PROGRAM_FIRST_BYTE_PARSER,
+        BPF_PROGRAM_FIRST_BYTE_VERDICT,
+    ] {
+        let prog: &mut SkSkb = bpf
+            .program_mut(name)
+            .ok_or_else(|| format!("BPF program '{name}' not found in ELF"))?
+            .try_into()
+            .map_err(|e| format!("'{name}' is not an SkSkb program: {e}"))?;
+        prog.load()
+            .map_err(|e| format!("Failed to load BPF program '{name}': {e}"))?;
+    }
+
+    let map_fd = {
+        let sockets =
+            SockHash::<_, u64>::try_from(bpf.map(BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS).ok_or_else(
+                || format!("BPF map '{BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS}' not found"),
+            )?)
+            .map_err(|e| format!("'{BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS}' is not a SockHash: {e}"))?;
+        sockets
+            .fd()
+            .try_clone()
+            .map_err(|e| format!("Failed to clone first-byte sockhash fd: {e}"))?
+    };
+
+    let parser_link = {
+        let parser: &mut SkSkb = bpf
+            .program_mut(BPF_PROGRAM_FIRST_BYTE_PARSER)
+            .ok_or_else(|| "first-byte parser disappeared after load".to_string())?
+            .try_into()
+            .map_err(|e| format!("first-byte parser type changed after load: {e}"))?;
+        parser
+            .attach(&map_fd)
+            .map_err(|e| format!("Failed to attach first-byte stream parser: {e}"))?
+    };
+
+    let verdict_result = {
+        let verdict: &mut SkSkb = bpf
+            .program_mut(BPF_PROGRAM_FIRST_BYTE_VERDICT)
+            .ok_or_else(|| "first-byte verdict disappeared after load".to_string())?
+            .try_into()
+            .map_err(|e| format!("first-byte verdict type changed after load: {e}"))?;
+        verdict.attach(&map_fd)
+    };
+    if let Err(e) = verdict_result {
+        if let Some(parser_ref) = bpf.program_mut(BPF_PROGRAM_FIRST_BYTE_PARSER)
+            && let Ok(parser) = TryInto::<&mut SkSkb>::try_into(parser_ref)
+        {
+            let _ = parser.detach(parser_link);
+        }
+        return Err(format!("Failed to attach first-byte stream verdict: {e}"));
+    }
+
+    debug!(
+        parser = BPF_PROGRAM_FIRST_BYTE_PARSER,
+        verdict = BPF_PROGRAM_FIRST_BYTE_VERDICT,
+        map = BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS,
+        "BPF accept-to-first-byte SK_SKB hooks attached"
+    );
+    Ok(())
 }
 
 /// Resolve `FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES` with the kernel-default
@@ -813,26 +902,43 @@ fn pin_sock_ops_maps(bpf: &mut Ebpf) -> Result<(), String> {
             parent.display()
         ));
     }
-    pin_map_at(bpf, BPF_MAP_SOCK_OPS_EVENTS, BPF_SOCK_OPS_EVENTS_PIN_PATH)?;
+    // The events ringbuf pin is the generation commit marker. Unpublish the old
+    // marker before touching either dependent pin, then publish the replacement
+    // marker only after stats and SockHash are ready. Unlinking preserves old
+    // consumers' already-open map fds while preventing a new consumer from
+    // retaining a mixed generation; every failure below leaves no visible
+    // marker for the partial generation.
+    remove_pin_if_present(BPF_SOCK_OPS_EVENTS_PIN_PATH)?;
     pin_map_at(bpf, BPF_MAP_SOCK_OPS_STATS, BPF_SOCK_OPS_STATS_PIN_PATH)?;
+    pin_map_at(
+        bpf,
+        BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS,
+        BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH,
+    )?;
+    pin_map_at(bpf, BPF_MAP_SOCK_OPS_EVENTS, BPF_SOCK_OPS_EVENTS_PIN_PATH)?;
     Ok(())
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 fn pin_map_at(bpf: &mut Ebpf, map_name: &str, pin_path: &str) -> Result<(), String> {
     // If a stale pin exists (e.g. previous run did not clean up), remove
-    // it so the new map gets pinned fresh. Best-effort: missing path is
-    // fine, only surface real errors.
-    if std::path::Path::new(pin_path).exists()
-        && let Err(e) = fs::remove_file(pin_path)
-    {
-        return Err(format!("Failed to remove stale pin '{pin_path}': {e}"));
-    }
+    // it so the new map gets pinned fresh. Missing paths (including a
+    // concurrent disappearance) are benign; all other errors are fatal.
+    remove_pin_if_present(pin_path)?;
     let map = bpf
         .map_mut(map_name)
         .ok_or_else(|| format!("BPF map '{map_name}' not found"))?;
     map.pin(pin_path)
         .map_err(|e| format!("Failed to pin '{map_name}' at '{pin_path}': {e}"))
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn remove_pin_if_present(pin_path: &str) -> Result<(), String> {
+    match fs::remove_file(pin_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Failed to remove stale pin '{pin_path}': {e}")),
+    }
 }
 
 /// Live-kernel verification (GAP-2M / connect-side datapath).
@@ -940,12 +1046,17 @@ mod live_kernel_tests {
 
         let mut backend = AyaEbpfBackend::new();
         // Loading runs the in-kernel BPF verifier over every program in the
-        // ELF — connect4/6, getpeername4/6, tc_inbound, and the GAP-2M
-        // sock_ops cookie bridge. Success here is the core live validation
+        // ELF — connect4/6, getpeername4/6, tc programs, the GAP-2M sock_ops
+        // cookie bridge, and both SK_SKB first-byte hooks. Success here is the
+        // core live validation
         // that the (blind-built) kernel code is accepted by a real verifier.
         backend
             .load_programs()
             .expect("load + verify BPF programs on the running kernel");
+        assert!(
+            backend.first_byte_hooks_attached,
+            "SK_SKB parser and verdict must verify and attach to the accepted-socket sockhash"
+        );
 
         let cgroup = ScratchCgroup::create().expect("create scratch cgroup v2 node");
 
