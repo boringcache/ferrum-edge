@@ -136,6 +136,10 @@ pub enum H2Step {
     /// headers against `matcher`. Mismatch is counted but doesn't stop the
     /// script — see [`ScriptedH2Backend::matcher_mismatches`].
     ExpectHeaders(MatchHeaders),
+    /// Read exactly one request DATA frame without waiting for END_STREAM.
+    /// The bytes are appended to `ReceivedStream.body`. Use this to prove an
+    /// upstream observes request DATA while the downstream upload remains open.
+    ReadRequestData,
     /// Drain the client's request body into the current stream's
     /// `ReceivedStream.body`. Call after `ExpectHeaders`.
     DrainRequestBody,
@@ -832,7 +836,7 @@ async fn run_script(
                         return Err("DrainRequestBody: no current stream".into());
                     };
                     let stream_index = cs.stream_index;
-                    let mut accumulated = Vec::new();
+                    let mut accumulated = cs.recorded.body.clone();
                     loop {
                         match cs.body.data().await {
                             Some(Ok(chunk)) => {
@@ -870,6 +874,27 @@ async fn run_script(
                     cs.recorded.body = accumulated.clone();
                     if let Some(entry) = state.streams.lock().await.get_mut(stream_index) {
                         entry.body = accumulated;
+                    }
+                }
+                H2Step::ReadRequestData => {
+                    let Some(cs) = current_stream.as_mut() else {
+                        return Err("ReadRequestData: no current stream".into());
+                    };
+                    let chunk = match cs.body.data().await {
+                        Some(Ok(chunk)) => chunk,
+                        Some(Err(e)) => {
+                            return Err(format!("ReadRequestData: recv error: {e}"));
+                        }
+                        None => {
+                            return Err(
+                                "ReadRequestData: request reached EOF before DATA arrived".into()
+                            );
+                        }
+                    };
+                    let _ = cs.body.flow_control().release_capacity(chunk.len());
+                    cs.recorded.body.extend_from_slice(&chunk);
+                    if let Some(entry) = state.streams.lock().await.get_mut(cs.stream_index) {
+                        entry.body.extend_from_slice(&chunk);
                     }
                 }
                 H2Step::RespondHeaders(headers) => {
