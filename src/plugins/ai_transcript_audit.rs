@@ -58,7 +58,6 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use flate2::bufread::GzDecoder;
 use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
-use prost::Message as _;
 use prost_reflect::{
     DescriptorPool, DynamicMessage, Kind, MessageDescriptor, ReflectMessage, Value as ProtobufValue,
 };
@@ -2893,7 +2892,9 @@ impl AiTranscriptAudit {
             None => return,
         };
         {
-            let Some(mut staged) = self.staging.get_mut(&record_id) else {
+            // Read-only probe: the mutating borrow is taken again below, after
+            // the capture work, so this guard does not need a mutable binding.
+            let Some(staged) = self.staging.get_mut(&record_id) else {
                 return;
             };
             if staged.captured {
