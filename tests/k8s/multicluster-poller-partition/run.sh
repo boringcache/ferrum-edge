@@ -585,6 +585,18 @@ metric_file_uint_value() {
   bounded_uint "$value" "$metric"
 }
 
+# A missing Prometheus family and a genuinely zero counter both read as 0.
+# Report which one a snapshot actually contains so a zero delta names its own
+# cause instead of leaving "absent series" and "no increment" indistinguishable.
+metric_family_presence() {
+  local file="$1" metric="$2"
+  if grep -Fq "$metric{" "$file"; then
+    printf 'series-present\n'
+  else
+    printf 'series-absent\n'
+  fi
+}
+
 metric_uint_value() {
   local value metric="$3"
   value="$( metric_value "$@")" || return 1
@@ -704,6 +716,7 @@ scenario_transient() {
   local transient_json="$RESULTS_DIR/poller.transient.last_good_retained.json"
   local transient_metrics="$RESULTS_DIR/poller.transient.last_good_retained.prom"
   local snapshot_ages snapshot_trust_age snapshot_endpoint_age ff df
+  local fed_presence disc_presence
   admin_json "$CONTEXT_A" "$JWT_A" > "$transient_json"
   metrics "$CONTEXT_A" "$JWT_A" > "$transient_metrics"
   set_all_proxies true
@@ -726,7 +739,10 @@ scenario_transient() {
   TRANSIENT_DISCOVERY_FAILURE_DELTA=$((df - INITIAL_DISCOVERY_FAILURES))
   (( TRANSIENT_FEDERATION_FAILURE_DELTA >= 1 && TRANSIENT_FEDERATION_FAILURE_DELTA <= 5 &&
      TRANSIENT_DISCOVERY_FAILURE_DELTA >= 1 && TRANSIENT_DISCOVERY_FAILURE_DELTA <= 5 )) || {
+    fed_presence="$( metric_family_presence "$transient_metrics" ferrum_mesh_federation_poll_failures_total)"
+    disc_presence="$( metric_family_presence "$transient_metrics" ferrum_mesh_remote_discovery_poll_failures_total)"
     echo "unbounded partition failure deltas during backoff: federation=$TRANSIENT_FEDERATION_FAILURE_DELTA discovery=$TRANSIENT_DISCOVERY_FAILURE_DELTA" >&2
+    echo "partition snapshot series: federation=$fed_presence discovery=$disc_presence" >&2
     return 1
   }
   record multicluster_poller.transient.last_good_retained pass "traffic-200-during-short-partition" "poller.transient.last_good_retained.{json,prom}"

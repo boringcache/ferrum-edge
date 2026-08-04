@@ -1663,12 +1663,20 @@ impl MetricsRegistry {
     /// Returns a cached result if the cache is still fresh (within render_cache_ttl_secs).
     /// Also runs lazy stale-entry eviction on each cache miss to bound memory growth.
     ///
-    /// NodeWaypoint ADR process-static counters are appended **after** the
-    /// cache lookup so a scrape always observes the latest handshake / identity
-    /// / policy samples. Those producers live outside this registry and do not
+    /// Mesh observability and NodeWaypoint ADR process-static families are
+    /// appended **after** the cache lookup so a scrape always observes the
+    /// latest samples. Those producers live outside this registry and do not
     /// invalidate `render_cache`; folding them into the cached body made live
     /// before/after probes within `render_cache_ttl_secs` miss counter movement
-    /// (issue #3334 / PR #3388 live gate).
+    /// (issue #3334 / PR #3388 live gate for NodeWaypoint; the multicluster
+    /// poller partition live gate for mesh federation / remote discovery).
+    ///
+    /// The mesh block additionally carries wall-clock freshness gauges
+    /// (`ferrum_mesh_federation_bundle_age_seconds`,
+    /// `ferrum_mesh_remote_discovery_endpoint_age_seconds`). Nothing increments
+    /// when time simply passes, so no invalidation hook could keep those honest
+    /// inside a memoized body — a cached age is wrong by however long the cache
+    /// has been held. Rendering them live is the only correct option.
     pub fn render(&self) -> String {
         // Check cache
         let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
@@ -1682,15 +1690,34 @@ impl MetricsRegistry {
             let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
             self.evict_stale(stale_ttl);
 
-            let output = self.render_uncached();
+            let output = self.render_cacheable_body();
 
             self.render_cache
                 .store(Arc::new(Some((Instant::now(), output.clone()))));
 
             output
         };
+        self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
         output
+    }
+
+    /// Append the process-static mesh observability families from live state.
+    ///
+    /// Kept off the render cache so `/metrics` scrapes see federation and
+    /// remote-discovery counter increments immediately, and so the cached-bundle
+    /// age gauges report the age at scrape time rather than at cache-fill time.
+    fn append_mesh_observability_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|l| l.clone())
+            .unwrap_or_default();
+        let gateway_ns_label = gateway_namespace_label(&ns_label);
+        prometheus_helpers::render_mesh_observability_metrics_with_gateway_namespace(
+            output,
+            &gateway_ns_label,
+        );
     }
 
     /// Append NodeWaypoint ADR series from the live process-static atomics.
@@ -1710,7 +1737,24 @@ impl MetricsRegistry {
     }
 
     /// Render metrics without caching. Used internally and for testing.
+    ///
+    /// Includes the process-static mesh observability families so this stays a
+    /// complete rendering of everything the registry owns plus everything it
+    /// composes. `render()` reaches the same families through a live append
+    /// rather than through the cached body.
     pub fn render_uncached(&self) -> String {
+        let mut output = self.render_cacheable_body();
+        self.append_mesh_observability_prometheus(&mut output);
+        output
+    }
+
+    /// Render only the families whose producers invalidate `render_cache`.
+    ///
+    /// This is the body that `render()` is allowed to memoize for
+    /// `render_cache_ttl_secs`. Anything sourced from process-static state
+    /// outside this registry must be appended by the caller instead, because
+    /// such producers cannot invalidate the cache.
+    fn render_cacheable_body(&self) -> String {
         // Pre-estimate capacity: ~200 bytes per counter entry, ~800 per histogram proxy
         let estimated_cap = 512
             + self.request_counter.len() * 200
@@ -2634,12 +2678,8 @@ impl MetricsRegistry {
             }
         }
 
-        prometheus_helpers::render_mesh_observability_metrics_with_gateway_namespace(
-            &mut output,
-            &gateway_ns_label,
-        );
-        // NodeWaypoint ADR counters are appended in `render()` outside the
-        // cache — do not fold them into this cached body.
+        // Mesh observability and NodeWaypoint ADR families are appended outside
+        // this cached body — do not fold either of them back in here.
 
         if let Some(snapshot) = self.database_delta_poll_metrics_snapshot() {
             output.push_str(
