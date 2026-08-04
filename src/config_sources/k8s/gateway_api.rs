@@ -3302,8 +3302,9 @@ fn http_route_resources(
                         .backends
                         .iter()
                         .fold(0u32, |sum, backend| sum.saturating_add(backend.weight));
-                    backend_resolution.invalid_weight =
-                        backend_resolution.invalid_weight.saturating_add(fault_weight);
+                    backend_resolution.invalid_weight = backend_resolution
+                        .invalid_weight
+                        .saturating_add(fault_weight);
                     backend_resolution.valid_weight = 0;
                     backend_resolution.backends.clear();
                     backend_resolution

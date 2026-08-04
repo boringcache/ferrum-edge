@@ -163,9 +163,8 @@ fn parse_service_target_ref(
                 .to_string(),
         );
     }
-    let name = string_field(target_ref, "name").ok_or_else(|| {
-        "spec.targetRefs[].name is required for Service targets".to_string()
-    })?;
+    let name = string_field(target_ref, "name")
+        .ok_or_else(|| "spec.targetRefs[].name is required for Service targets".to_string())?;
     let section_name = string_field(target_ref, "sectionName")
         .filter(|name| !name.is_empty())
         .map(str::to_string);
@@ -202,7 +201,9 @@ fn parse_validation(
         None
     } else if let Some(refs) = ca_refs.filter(|refs| !refs.is_empty()) {
         if refs.len() > 8 {
-            return Err("spec.validation.caCertificateRefs must have at most 8 entries".to_string());
+            return Err(
+                "spec.validation.caCertificateRefs must have at most 8 entries".to_string(),
+            );
         }
         // Ferrum projects a single exclusive CA bundle path today. Multiple
         // refs are accepted only when they resolve to one usable source; more
@@ -254,8 +255,7 @@ fn resolve_ca_certificate_ref(
         ));
     }
     let kind = string_field(reference, "kind").unwrap_or("ConfigMap");
-    let name =
-        string_field(reference, "name").ok_or_else(|| "name is required".to_string())?;
+    let name = string_field(reference, "name").ok_or_else(|| "name is required".to_string())?;
     if let Some(namespace) = string_field(reference, "namespace")
         && namespace != object.metadata.namespace
     {
@@ -290,10 +290,7 @@ fn resolve_ca_certificate_ref(
 }
 
 fn parse_subject_alt_names(validation: &Value) -> Result<Vec<String>, String> {
-    let Some(entries) = validation
-        .get("subjectAltNames")
-        .and_then(Value::as_array)
-    else {
+    let Some(entries) = validation.get("subjectAltNames").and_then(Value::as_array) else {
         return Ok(Vec::new());
     };
     if entries.len() > 5 {
@@ -309,9 +306,7 @@ fn parse_subject_alt_names(validation: &Value) -> Result<Vec<String>, String> {
                 })?
                 .to_string(),
             "URI" => string_field(entry, "uri")
-                .ok_or_else(|| {
-                    format!("spec.validation.subjectAltNames[{index}].uri is required")
-                })?
+                .ok_or_else(|| format!("spec.validation.subjectAltNames[{index}].uri is required"))?
                 .to_string(),
             other => {
                 return Err(format!(
@@ -366,9 +361,8 @@ pub(super) fn lookup_for_service(
         return BackendTlsPolicyLookup::None;
     }
 
-    let port_name = service_port.and_then(|port| {
-        acc.lookup_service_port_name(service_namespace, service_name, port)
-    });
+    let port_name = service_port
+        .and_then(|port| acc.lookup_service_port_name(service_namespace, service_name, port));
 
     let mut matching: Vec<&IndexedBackendTlsPolicy> = entries
         .iter()
