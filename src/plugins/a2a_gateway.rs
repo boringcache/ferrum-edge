@@ -756,8 +756,11 @@ impl A2aGateway {
         {
             return PluginResult::Continue;
         }
-        match validate_grpc_agent_card_rewrite(body, response_headers, &self.endpoint.protocol_versions)
-        {
+        match validate_grpc_agent_card_rewrite(
+            body,
+            response_headers,
+            &self.endpoint.protocol_versions,
+        ) {
             Ok(()) => PluginResult::Continue,
             Err(diagnostic) => {
                 if self.observability.emit_metadata {
@@ -1120,10 +1123,7 @@ impl Plugin for A2aGateway {
                         Some("agent_card_grpc_frame_too_large");
                     return None;
                 };
-                if !sink.push(&[0])
-                    || !sink.push(&msg_len.to_be_bytes())
-                    || !sink.push(&message)
-                {
+                if !sink.push(&[0]) || !sink.push(&msg_len.to_be_bytes()) || !sink.push(&message) {
                     ctx.mark_buffered_response_capacity_refusal_pending();
                     return None;
                 }
@@ -1864,7 +1864,8 @@ fn validate_grpc_agent_card_rewrite(
     if !looks_like_agent_card_protobuf(message) {
         return Err("agent_card_protobuf_shape_unrecognized");
     }
-    let protocol_version = protobuf_string_field(message, AGENT_CARD_PB_PROTOCOL_VERSION)?.unwrap_or("");
+    let protocol_version =
+        protobuf_string_field(message, AGENT_CARD_PB_PROTOCOL_VERSION)?.unwrap_or("");
     if !supports_agent_card_protobuf_layout(protocol_version, configured_versions) {
         return Err("unsupported_agent_card_protobuf_version");
     }
@@ -1888,8 +1889,8 @@ fn rewrite_grpc_agent_card_frame(
     if !looks_like_agent_card_protobuf(message) {
         return Err("agent_card_protobuf_shape_unrecognized");
     }
-    let protocol_version = protobuf_string_field(message, AGENT_CARD_PB_PROTOCOL_VERSION)?
-        .unwrap_or("");
+    let protocol_version =
+        protobuf_string_field(message, AGENT_CARD_PB_PROTOCOL_VERSION)?.unwrap_or("");
     if !supports_agent_card_protobuf_layout(protocol_version, configured_versions) {
         return Err("unsupported_agent_card_protobuf_version");
     }
@@ -1969,8 +1970,8 @@ fn rewrite_agent_card_protobuf(
     public_base: &str,
     endpoint_path: &str,
 ) -> Result<Option<Vec<u8>>, &'static str> {
-    let preferred_transport = protobuf_string_field(message, AGENT_CARD_PB_PREFERRED_TRANSPORT)?
-        .unwrap_or("");
+    let preferred_transport =
+        protobuf_string_field(message, AGENT_CARD_PB_PREFERRED_TRANSPORT)?.unwrap_or("");
     let rewrite_preferred = should_rewrite_transport(if preferred_transport.is_empty() {
         None
     } else {
@@ -1988,8 +1989,8 @@ fn rewrite_agent_card_protobuf(
                 Ok(())
             }
             (AGENT_CARD_PB_URL, PROTO_WIRE_LEN) if rewrite_preferred => {
-                let current = std::str::from_utf8(value)
-                    .map_err(|_| "agent_card_protobuf_url_invalid")?;
+                let current =
+                    std::str::from_utf8(value).map_err(|_| "agent_card_protobuf_url_invalid")?;
                 if current != new_url {
                     encode_protobuf_string_field(&mut output, AGENT_CARD_PB_URL, &new_url);
                     changed = true;
@@ -2068,9 +2069,8 @@ fn protobuf_string_field<'a>(
             if wire != PROTO_WIRE_LEN {
                 return Err("agent_card_protobuf_field_wire_mismatch");
             }
-            found = Some(
-                std::str::from_utf8(value).map_err(|_| "agent_card_protobuf_string_invalid")?,
-            );
+            found =
+                Some(std::str::from_utf8(value).map_err(|_| "agent_card_protobuf_string_invalid")?);
         }
         Ok(())
     })?;
