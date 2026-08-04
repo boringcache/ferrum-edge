@@ -587,7 +587,7 @@ x-ferrum-proxy:
 
     let backup = admin_get_json(&client, &gateway, "/backup", &auth).await;
     assert_eq!(backup["counts"]["api_specs"], 2);
-    assert_eq!(backup["api_specs"]["section_version"], "1");
+    assert_eq!(backup["api_specs"]["section_version"], "2");
     let backup_items = backup["api_specs"]["items"]
         .as_array()
         .expect("MongoDB backup API spec items");

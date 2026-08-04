@@ -11250,6 +11250,14 @@ fn start_mesh_admin_listeners(
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
         admin_request_limits: crate::admin::AdminRequestLimits::from_env_config(env_config),
         backend_allow_ips: env_config.backend_allow_ips.clone(),
+        external_ref_policy: std::sync::Arc::new(env_config.admin_spec_external_ref_policy.clone()),
+        external_ref_loader: std::sync::Arc::new(
+            crate::admin::api_specs::DefaultExternalDocumentLoader {
+                egress: env_config.backend_allow_ips.clone(),
+                dns_cache: None,
+                fixtures: std::collections::HashMap::new(),
+            },
+        ),
     };
 
     let mut handles = Vec::new();
