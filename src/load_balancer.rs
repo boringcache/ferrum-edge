@@ -1268,8 +1268,20 @@ impl LoadBalancerCache {
             );
         }
 
-        // Upstream index is cheap to rebuild (just Arc<Upstream> clones)
-        let new_upstream_idx = Self::build_upstream_index(full_new_config);
+        // Upstream index is cheap to rebuild (just Arc<Upstream> clones).
+        // The explicit added/modified values are authoritative for this staged
+        // LB epoch: config publication may preserve a newer live
+        // service-discovery target set there while `full_new_config` retains
+        // the operator-authored static targets. Overlay them so the balancer
+        // and its upstream index cannot disagree inside one request epoch.
+        let mut new_upstream_idx = Self::build_upstream_index(full_new_config);
+        for upstream in added.iter().chain(modified.iter()) {
+            let key = crate::config::db_backend::namespaced_runtime_key(
+                &upstream.namespace,
+                &upstream.id,
+            );
+            new_upstream_idx.insert(key, Arc::new(upstream.clone()));
+        }
 
         // Single atomic swap
         Arc::new(LoadBalancerCacheInner {

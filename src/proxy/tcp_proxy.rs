@@ -136,12 +136,13 @@ impl NodeWaypointIdentityWarnLimiter {
 ///
 /// Behavior:
 /// - `resolver` is `None` outside `NodeWaypoint` topology and for non-mesh TCP
-///   proxies → returns `(None, None)`; no per-pod scope is consulted (unchanged
-///   pre-fix behavior).
+///   proxies → returns `(None, None, None)`; no per-pod scope is consulted
+///   (unchanged pre-fix behavior).
 /// - When the connection's `SO_COOKIE` cannot be resolved to an enrolled pod
 ///   (GAP-2M IPv6 / tuple miss, no node-agent enrollment yet, non-Linux,
 ///   unknown cookie), or the identity resolves but its workload has left the
-///   live slice, returns `(None, None)` and stamps `mesh_authz.scope_missing`.
+///   live slice, returns `(None, None, None)` and stamps
+///   `mesh_authz.scope_missing`.
 ///   `mesh_authz` then **fails closed** (rejects the stream, 403) when any
 ///   namespace/selector-scoped policy is configured, and falls through to
 ///   mesh-wide-only when the mesh has only mesh-wide policies — the same gate
@@ -161,7 +162,7 @@ impl NodeWaypointIdentityWarnLimiter {
 /// This helper never refuses the stream itself — unlike the HBONE listener,
 /// which drops a connection without a resolved identity — because raw TCP
 /// proxies in node-waypoint topology may legitimately carry non-captured
-/// traffic; it returns `(None, None)` and lets `mesh_authz` make the
+/// traffic; it returns `(None, None, None)` and lets `mesh_authz` make the
 /// fail-closed-vs-mesh-wide decision above. The scope (`PolicyScopeCache`) may
 /// be `None` even when the identity resolves — the workload carries no scoped
 /// policy, or it left the current slice — and is taken from the same slice
@@ -176,9 +177,10 @@ fn resolve_node_waypoint_stream_scope(
 ) -> (
     Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
     Option<String>,
+    Option<SocketAddr>,
 ) {
     let Some(resolver) = resolver else {
-        return (None, None);
+        return (None, None, None);
     };
     // Take the scope FROM the resolve result so the identity gate and the
     // per-pod scope come from the SAME slice generation (the "never partial"
@@ -189,10 +191,11 @@ fn resolve_node_waypoint_stream_scope(
         Ok(resolved) => (
             resolved.policy_scope,
             Some(resolved.identity.spiffe_id.as_str().to_string()),
+            Some(resolved.orig_dst),
         ),
         Err(error) => {
             warn_node_waypoint_identity_scope_missing(proxy_id, client_ip, &error, warn_limiter);
-            (None, None)
+            (None, None, None)
         }
     }
 }
@@ -1008,6 +1011,9 @@ pub struct TcpListenerConfig {
     /// policy set for the proxy's own workload identity rather than per-pod.
     pub node_waypoint_identity_resolver:
         Option<Arc<crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>>,
+    /// Immutable trusted gateway binding admitted at process startup. This is
+    /// configuration evidence only and is never derived from connection data.
+    pub stream_gateway_ref: Option<Arc<str>>,
     /// Pre-parsed trusted proxy CIDR set (from `FERRUM_TRUSTED_PROXIES`).
     /// When a proxy has `stream_proxy_protocol: true`, the accept loop reads
     /// the inbound PROXY protocol header and honors the forwarded address only
@@ -1060,6 +1066,7 @@ struct TcpAcceptLoopState {
     node_waypoint_identity_resolver:
         Option<Arc<crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>>,
     node_waypoint_identity_warn_limiter: Arc<NodeWaypointIdentityWarnLimiter>,
+    stream_gateway_ref: Option<Arc<str>>,
     trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
 }
 
@@ -1306,6 +1313,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         record_mesh_mtls_metric,
         mesh_outbound_enforcement,
         node_waypoint_identity_resolver,
+        stream_gateway_ref,
         trusted_proxies,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
@@ -1390,6 +1398,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         mesh_outbound_enforcement,
         node_waypoint_identity_resolver,
         node_waypoint_identity_warn_limiter: Arc::new(NodeWaypointIdentityWarnLimiter::new()),
+        stream_gateway_ref,
         trusted_proxies,
     };
 
@@ -1562,6 +1571,7 @@ async fn run_tcp_accept_loop(
                     state.node_waypoint_identity_resolver.clone();
                 let node_waypoint_identity_warn_limiter =
                     state.node_waypoint_identity_warn_limiter.clone();
+                let stream_gateway_ref = state.stream_gateway_ref.clone();
                 let trusted_proxies = state.trusted_proxies.clone();
 
                 tokio::spawn(async move {
@@ -1648,7 +1658,11 @@ async fn run_tcp_accept_loop(
                     // pod instead of treating every stream as mesh-wide. See
                     // [`resolve_node_waypoint_stream_scope`] for the fail-closed
                     // semantics.
-                    let (node_waypoint_policy_scope, node_waypoint_peer_spiffe_id) =
+                    let (
+                        node_waypoint_policy_scope,
+                        node_waypoint_peer_spiffe_id,
+                        node_waypoint_orig_dst,
+                    ) =
                         resolve_node_waypoint_stream_scope(
                             node_waypoint_identity_resolver.as_deref(),
                             &stream,
@@ -1687,6 +1701,17 @@ async fn run_tcp_accept_loop(
                             .plugin_cache
                             .proxy_lifecycle_generation(&p.namespace, &p.id)
                     });
+                    // Capture original destination for L4 destinationSubnets
+                    // before any splice/dial. Missing evidence denies the
+                    // predicate rather than matching by absence.
+                    stream_ctx.destination_ip = node_waypoint_orig_dst
+                        .or_else(|| crate::socket_opts::original_dst(&stream))
+                        .map(|addr| crate::util::client_identity::canonical_ip(addr.ip()));
+                    // Gateway binding is process/listener configuration — never
+                    // inferred from wire data. EnvConfig supplies `mesh` only
+                    // for mesh Sidecar topology; every other default is no
+                    // binding, and operators may set an explicit canonical ref.
+                    stream_ctx.trusted_gateway_ref = stream_gateway_ref.clone();
                     // Populated above from the node-waypoint resolver in
                     // NodeWaypoint topology so `mesh_authz` enforces
                     // namespace/selector-scoped policies per source pod
@@ -2428,35 +2453,98 @@ async fn handle_tcp_connection_inner(
         None
     };
 
-    // --- SNI-based proxy resolution for shared passthrough ports ---
-    // When multiple passthrough proxies share a listen_port, we must peek at
-    // the ClientHello to extract SNI before looking up the proxy config.
-    // A shared passthrough port may host same-ID proxies from different
-    // namespaces, so the match is a full `(namespace, id)` identity and both
-    // halves replace the listener's defaults for the rest of this connection.
+    // --- Shared-port proxy resolution (SNI and/or L4 stream_match) ---
+    // When multiple proxies share a listen_port, candidates arrive in
+    // `sni_proxy_ids`. Passthrough groups peek SNI then apply stream_match;
+    // non-passthrough L4 match groups resolve by stream_match alone.
     let listener_namespace = proxy_namespace;
-    let resolved_identity: Option<NamespacedResourceId> = if let Some(sni_ids) = sni_proxy_ids {
+    let source_ip = authoritative_stream_match_source_ip(stream_ctx);
+    let peer_spiffe = stream_ctx
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("peer_spiffe_id"))
+        .cloned();
+    let source_namespace_owned = peer_spiffe
+        .as_deref()
+        .and_then(super::stream_match::source_namespace_from_spiffe);
+    // The NodeWaypoint scope was derived from the exact eBPF-resolved pod UID;
+    // clone only its Arc so label evidence remains independent of later
+    // StreamConnectionContext mutation. Other topologies bind same-SPIFFE
+    // workloads by canonical source IP, accepting residual ambiguity only when
+    // every candidate proves identical labels.
+    let exact_node_waypoint_scope = stream_ctx.node_waypoint_policy_scope.clone();
+    let source_labels = peer_spiffe.as_deref().and_then(|spiffe| {
+        epoch.config.mesh.as_ref().and_then(|mesh| {
+            super::stream_match::trustworthy_source_labels(
+                &mesh.workloads,
+                spiffe,
+                source_ip,
+                exact_node_waypoint_scope.as_deref(),
+            )
+        })
+    });
+
+    // Prefetch SNI (when needed) before constructing StreamMatchEvidence.
+    // Evidence holds `Option<&dyn SourceLabelLookup>`, which is not Sync, so
+    // keeping it live across an await would make the spawned connection
+    // future !Send. Build and drop evidence only in synchronous match scopes.
+    let shared_port_uses_sni = sni_proxy_ids.is_some_and(|candidate_ids| {
+        epoch
+            .proxy_by_namespaced_id(listener_namespace, proxy_id)
+            .is_some_and(|p| p.passthrough)
+            || candidate_ids.iter().any(|id| {
+                epoch
+                    .proxy_by_namespaced_id(&id.namespace, &id.id)
+                    .is_some_and(|p| p.passthrough)
+            })
+    });
+    let shared_port_sni = if shared_port_uses_sni {
         let sni = super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
         stream_ctx.sni_hostname = sni.clone();
-
-        let matched = super::sni::resolve_proxy_by_sni_in_epoch(sni.as_deref(), sni_ids, epoch)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No matching passthrough proxy for SNI {:?} on port {}",
-                    sni,
-                    stream_ctx.listen_port
-                )
-            })?
-            .clone();
-        // Update stream_ctx to reflect the resolved proxy identity.
-        stream_ctx.proxy_namespace = matched.namespace.clone();
-        stream_ctx.proxy_id = matched.id.clone();
-        stream_ctx.proxy_name = epoch
-            .proxy_by_namespaced_id(&matched.namespace, &matched.id)
-            .and_then(|p| p.name.clone());
-        Some(matched)
+        sni
     } else {
         None
+    };
+
+    let resolved_identity: Option<NamespacedResourceId> = {
+        let evidence = super::stream_match::StreamMatchEvidence {
+            source_ip,
+            destination_ip: stream_ctx.destination_ip,
+            source_namespace: source_namespace_owned.as_deref(),
+            source_labels: source_labels
+                .map(|labels| labels as &dyn super::stream_match::SourceLabelLookup),
+            trusted_gateway_ref: stream_ctx.trusted_gateway_ref.as_deref(),
+        };
+        if let Some(candidate_ids) = sni_proxy_ids {
+            let matched = super::stream_match::resolve_shared_stream_proxy_in_epoch(
+                shared_port_sni.as_deref(),
+                candidate_ids,
+                &evidence,
+                epoch,
+                shared_port_uses_sni,
+            )
+            .ok_or_else(|| {
+                if shared_port_uses_sni {
+                    anyhow::anyhow!(
+                        "No matching passthrough proxy for connection on port {}",
+                        stream_ctx.listen_port
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "No matching L4 stream_match proxy on port {}",
+                        stream_ctx.listen_port
+                    )
+                }
+            })?;
+            stream_ctx.proxy_namespace = matched.namespace.clone();
+            stream_ctx.proxy_id = matched.id.clone();
+            stream_ctx.proxy_name = epoch
+                .proxy_by_namespaced_id(&matched.namespace, &matched.id)
+                .and_then(|p| p.name.clone());
+            Some(matched)
+        } else {
+            None
+        }
     };
     let (proxy_namespace, proxy_id) = match &resolved_identity {
         Some(resolved) => (resolved.namespace.as_str(), resolved.id.as_str()),
@@ -2467,6 +2555,32 @@ async fn handle_tcp_connection_inner(
     let proxy = epoch
         .proxy_by_namespaced_id(proxy_namespace, proxy_id)
         .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found in config"))?;
+
+    // Single-listener proxies still enforce stream_match before dialing.
+    // A configured but uncompiled matcher fails closed (never match by
+    // absence of the compiled form).
+    if resolved_identity.is_none() {
+        let criteria = proxy.stream_match.as_ref().filter(|c| !c.is_empty());
+        if criteria.is_some() {
+            let evidence = super::stream_match::StreamMatchEvidence {
+                source_ip,
+                destination_ip: stream_ctx.destination_ip,
+                source_namespace: source_namespace_owned.as_deref(),
+                source_labels: source_labels
+                    .map(|labels| labels as &dyn super::stream_match::SourceLabelLookup),
+                trusted_gateway_ref: stream_ctx.trusted_gateway_ref.as_deref(),
+            };
+            match proxy.compiled_stream_match.as_ref() {
+                Some(matcher) if matcher.matches(&evidence) => {}
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Stream proxy {proxy_namespace}/{proxy_id} stream_match denied connection on port {}",
+                        stream_ctx.listen_port
+                    ));
+                }
+            }
+        }
+    }
 
     if resolved_identity.is_some() {
         // The accept loop stamped the generation from the listener's
@@ -3687,6 +3801,17 @@ async fn handle_tcp_connection_inner(
         splice_used: used_splice,
         first_failure: copy_result.first_failure,
     })
+}
+
+/// Return source-IP evidence only from the stream context's authoritative
+/// client identity. The accept path sets `client_ip` to a trusted PROXY source
+/// only after validating the direct peer; otherwise it is the socket peer.
+/// Parsing also folds IPv4-mapped IPv6 before CIDR matching.
+#[inline]
+fn authoritative_stream_match_source_ip(
+    stream_ctx: &StreamConnectionContext,
+) -> Option<std::net::IpAddr> {
+    stream_ctx.canonical_client_ip()
 }
 
 fn mesh_tcp_protocol_label(backend_scheme: BackendScheme) -> &'static str {
@@ -8637,6 +8762,50 @@ mod cause_direction_tests {
 }
 
 #[cfg(test)]
+mod stream_match_source_evidence_tests {
+    use std::sync::Arc;
+
+    use crate::config::types::BackendScheme;
+    use crate::consumer_index::ConsumerIndex;
+    use crate::plugins::StreamConnectionContext;
+    use crate::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria, StreamMatchEvidence};
+
+    use super::authoritative_stream_match_source_ip;
+
+    #[test]
+    fn trusted_forwarded_source_is_used_instead_of_direct_proxy_peer() {
+        let stream_ctx = StreamConnectionContext::new(
+            "::ffff:10.20.30.40".to_string(),
+            "192.0.2.10".to_string(),
+            "proxy".to_string(),
+            None,
+            15432,
+            BackendScheme::Tcp,
+            Arc::new(ConsumerIndex::new(&[])),
+        );
+        let matcher = StreamMatchCriteria {
+            arms: vec![StreamMatchArm {
+                source_subnets: vec!["10.0.0.0/8".to_string()],
+                ..Default::default()
+            }],
+        }
+        .compile()
+        .unwrap();
+
+        let authoritative = authoritative_stream_match_source_ip(&stream_ctx);
+        assert_eq!(authoritative, Some("10.20.30.40".parse().unwrap()));
+        assert!(matcher.matches(&StreamMatchEvidence {
+            source_ip: authoritative,
+            ..Default::default()
+        }));
+        assert!(!matcher.matches(&StreamMatchEvidence {
+            source_ip: Some("192.0.2.10".parse().unwrap()),
+            ..Default::default()
+        }));
+    }
+}
+
+#[cfg(test)]
 mod node_waypoint_stream_scope_tests {
     //! Unit tests for [`resolve_node_waypoint_stream_scope`], the TCP stream
     //! accept-path helper that maps a connection to its source pod's
@@ -8660,7 +8829,7 @@ mod node_waypoint_stream_scope_tests {
         let _client = connect.await.expect("join").expect("connect");
 
         let warn_limiter = NodeWaypointIdentityWarnLimiter::new();
-        let (scope, principal) = resolve_node_waypoint_stream_scope(
+        let (scope, principal, orig_dst) = resolve_node_waypoint_stream_scope(
             None,
             &accepted,
             "proxy",
@@ -8669,6 +8838,7 @@ mod node_waypoint_stream_scope_tests {
         );
         assert!(scope.is_none(), "no resolver must yield no per-pod scope");
         assert!(principal.is_none(), "no resolver must yield no principal");
+        assert!(orig_dst.is_none(), "no resolver must yield no destination");
     }
 
     /// Full resolution against a real accepted socket: the helper reads the
@@ -8730,6 +8900,7 @@ mod node_waypoint_stream_scope_tests {
                 namespace: Some("team-a".to_string()),
             },
             service_name: "api".to_string(),
+            service_namespace: None,
             addresses: Vec::new(),
             ports: Vec::new(),
             trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
@@ -8745,7 +8916,7 @@ mod node_waypoint_stream_scope_tests {
         };
         resolver.install_policy_scopes_from_workloads(&[workload]);
 
-        let (scope, principal) = resolve_node_waypoint_stream_scope(
+        let (scope, principal, orig_dst) = resolve_node_waypoint_stream_scope(
             Some(resolver.as_ref()),
             &accepted,
             "proxy",
@@ -8760,6 +8931,25 @@ mod node_waypoint_stream_scope_tests {
             principal.as_deref(),
             Some("spiffe://cluster.local/ns/team-a/sa/api"),
             "resolved pod SPIFFE ID must be returned as the source principal"
+        );
+        assert_eq!(
+            orig_dst,
+            Some("10.0.0.1:8080".parse().unwrap()),
+            "resolver-captured original destination must reach stream matching"
+        );
+        let matcher = crate::proxy::stream_match::StreamMatchCriteria {
+            arms: vec![crate::proxy::stream_match::StreamMatchArm {
+                destination_subnets: vec!["10.0.0.0/24".to_string()],
+                ..Default::default()
+            }],
+        }
+        .compile()
+        .unwrap();
+        assert!(
+            matcher.matches(&crate::proxy::stream_match::StreamMatchEvidence {
+                destination_ip: orig_dst.map(|addr| addr.ip()),
+                ..Default::default()
+            })
         );
     }
 }

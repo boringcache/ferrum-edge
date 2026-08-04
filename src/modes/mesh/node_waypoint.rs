@@ -1403,6 +1403,7 @@ mod tests {
                 namespace: Some(namespace.to_string()),
             },
             service_name: service_name.to_string(),
+            service_namespace: None,
             addresses: Vec::new(),
             ports: Vec::new(),
             trust_domain: TrustDomain::new("td").expect("td"),

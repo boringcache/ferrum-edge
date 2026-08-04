@@ -7732,6 +7732,33 @@ pub mod _test_support {
         node_agent_cleanup_seams::probe_cleanup_failure_preserves_original_error_for_test()
     }
 
+    // ── CNI STATUS live Kubernetes ADD-dependency readiness (#3225 / #3536) ─
+    /// Exact STATUS Kubernetes probe budget used by production (under the 5s CNI RPC timeout).
+    pub const CNI_STATUS_KUBE_PROBE_TIMEOUT: Duration =
+        crate::modes::node_agent::CNI_STATUS_KUBE_PROBE_TIMEOUT_FOR_TEST;
+
+    /// Drive STATUS (and other CNI verbs) through the kube-metadata path with an
+    /// injectable [`kube::Client`] so external tests can prove live ADD-dependency
+    /// success, failure, timeout, and recovery without network access.
+    pub async fn apply_cni_request_with_kube_metadata_for_test(
+        backend: &mut dyn crate::ebpf::EbpfBackend,
+        pod_states: &dashmap::DashMap<String, crate::ebpf::PodAttachmentState>,
+        config: &crate::modes::node_agent::NodeAgentConfig,
+        metrics: &crate::ebpf::NodeAgentMetrics,
+        kube_client: &kube::Client,
+        request: &crate::cni::rpc::CniRpcRequest,
+    ) -> (crate::cni::rpc::CniRpcResponse, Option<String>) {
+        crate::modes::node_agent::apply_cni_request_with_kube_metadata_for_test(
+            backend,
+            pod_states,
+            config,
+            metrics,
+            kube_client,
+            request,
+        )
+        .await
+    }
+
     // ── mesh startup-rollback seams (issue #2372) ────────────────────────────
     pub type MeshStartupRollbackProbe = mesh_startup_rollback_seams::MeshStartupRollbackProbe;
     pub type MeshStartupListenerDrainProbe =

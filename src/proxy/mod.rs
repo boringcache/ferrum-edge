@@ -61,6 +61,7 @@ pub(crate) mod response_buffer_budget;
 pub mod sni;
 pub mod stream_error;
 pub mod stream_listener;
+pub mod stream_match;
 pub mod tcp_proxy;
 pub mod udp_batch;
 pub mod udp_proxy;
@@ -7231,6 +7232,7 @@ impl ProxyState {
                 env_config_arc.pool_shard_amount,
                 health_checker.clone(),
                 mesh_outbound_enforcement.clone(),
+                env_config_arc.stream_gateway_ref.clone(),
                 trusted_proxies.clone(),
             ),
         );
@@ -8991,8 +8993,11 @@ impl ProxyState {
     /// projections such as `dispatch_port_overrides` and
     /// `dispatch_port_override_fallback` are `#[serde(skip)]` fields populated by
     /// `GatewayConfig::resolve_dispatch_port_overrides()`. A DestinationRule-only
-    /// edit can therefore leave `delta.modified_proxies` empty while the route
-    /// table's stored `Arc<Proxy>` needs to carry new dispatch policy.
+    /// edit can therefore leave `delta.modified_proxies` empty (or leave the
+    /// entire `ConfigDelta` empty when upstream timestamps are also unchanged)
+    /// while the route table's stored `Arc<Proxy>` needs to carry new dispatch
+    /// policy. Callers must consult this helper from both the non-empty delta
+    /// path and the empty-delta publish path (#3243).
     fn projected_route_proxy_content_changed(
         old_config: &GatewayConfig,
         new_config: &GatewayConfig,
@@ -9017,6 +9022,156 @@ impl ProxyState {
                     .is_some_and(|old_proxy| !Self::proxy_content_eq(old_proxy, new_proxy))
             })
             || Self::projected_mesh_stream_relay_dispatch_content_changed(old_config, new_config)
+    }
+
+    /// Timestamp-neutral upstream content changes that require rebuilding
+    /// individual upstream load balancers.
+    ///
+    /// `ConfigDelta` keys upstream modifications on `updated_at`. Mesh
+    /// projections can change serde-skipped fields without advancing that
+    /// timestamp, and defensive same-timestamp handling must also keep the LB's
+    /// upstream index current. Compare normalized serialized content plus every
+    /// skipped field consumed by dispatch, then rebuild only those upstreams so
+    /// unrelated RR/WRR/latency state survives a DR-only reload.
+    fn projected_dr_dispatch_changed_upstreams(
+        old_config: &GatewayConfig,
+        new_config: &GatewayConfig,
+    ) -> Vec<Upstream> {
+        fn content_eq(a: &Upstream, b: &Upstream) -> bool {
+            let skipped_fields_equal = a.resolved_subset_tls == b.resolved_subset_tls
+                && a.dispatch_port_override_fallback == b.dispatch_port_override_fallback
+                && a.targets.len() == b.targets.len()
+                && a.targets
+                    .iter()
+                    .zip(&b.targets)
+                    .all(|(a_target, b_target)| {
+                        a_target.service_port_policy_key == b_target.service_port_policy_key
+                    });
+            if !skipped_fields_equal {
+                return false;
+            }
+
+            fn content_value(upstream: &Upstream) -> Option<serde_json::Value> {
+                let mut normalized = upstream.clone();
+                let epoch = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                    .unwrap_or_else(chrono::Utc::now);
+                normalized.created_at = epoch;
+                normalized.updated_at = epoch;
+                serde_json::to_value(&normalized).ok()
+            }
+
+            match (content_value(a), content_value(b)) {
+                (Some(a_value), Some(b_value)) => a_value == b_value,
+                _ => false,
+            }
+        }
+
+        let old_upstreams: HashMap<(&str, &str), &Upstream> = old_config
+            .upstreams
+            .iter()
+            .map(|upstream| {
+                (
+                    (upstream.namespace.as_str(), upstream.id.as_str()),
+                    upstream,
+                )
+            })
+            .collect();
+
+        new_config
+            .upstreams
+            .iter()
+            .filter(|new_upstream| {
+                old_upstreams
+                    .get(&(new_upstream.namespace.as_str(), new_upstream.id.as_str()))
+                    .is_some_and(|old_upstream| !content_eq(old_upstream, new_upstream))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Keep the live target set when rebuilding policy for an unchanged
+    /// service-discovery source.
+    ///
+    /// The request epoch's upstream index can contain a newer merged
+    /// static+discovered target set than `GatewayConfig.upstreams`: discovery
+    /// updates the LB epoch without mutating the authored config snapshot. A
+    /// DR-only rebuild from the config's static targets would therefore roll
+    /// discovery back. The running task would not necessarily repair it because
+    /// its `last_discovered` value already matches the provider response.
+    ///
+    /// Preserve targets only when both the discovery configuration and the
+    /// authored target definitions (including the serde-skipped mesh policy
+    /// port key) are unchanged. A real target/provider edit must use the new
+    /// config verbatim.
+    fn preserve_live_discovery_targets(
+        current: &crate::load_balancer::LoadBalancerCacheInner,
+        old_config: &GatewayConfig,
+        modified: &mut [Upstream],
+    ) {
+        fn discovery_source_eq(a: &Upstream, b: &Upstream) -> bool {
+            if a.service_discovery.is_none() || b.service_discovery.is_none() {
+                return false;
+            }
+            match (
+                serde_json::to_value(&a.service_discovery),
+                serde_json::to_value(&b.service_discovery),
+            ) {
+                (Ok(a_value), Ok(b_value)) => a_value == b_value,
+                _ => false,
+            }
+        }
+
+        fn authored_targets_eq(a: &Upstream, b: &Upstream) -> bool {
+            if a.targets.len() != b.targets.len()
+                || !a
+                    .targets
+                    .iter()
+                    .zip(&b.targets)
+                    .all(|(a_target, b_target)| {
+                        a_target.service_port_policy_key == b_target.service_port_policy_key
+                    })
+            {
+                return false;
+            }
+            match (
+                serde_json::to_value(&a.targets),
+                serde_json::to_value(&b.targets),
+            ) {
+                (Ok(a_value), Ok(b_value)) => a_value == b_value,
+                _ => false,
+            }
+        }
+
+        let old_upstreams: HashMap<(&str, &str), &Upstream> = old_config
+            .upstreams
+            .iter()
+            .map(|upstream| {
+                (
+                    (upstream.namespace.as_str(), upstream.id.as_str()),
+                    upstream,
+                )
+            })
+            .collect();
+
+        for replacement in modified {
+            let Some(old_upstream) =
+                old_upstreams.get(&(replacement.namespace.as_str(), replacement.id.as_str()))
+            else {
+                continue;
+            };
+            if !discovery_source_eq(old_upstream, replacement)
+                || !authored_targets_eq(old_upstream, replacement)
+            {
+                continue;
+            }
+            if let Some(live_upstream) = LoadBalancerCache::get_upstream_from(
+                current,
+                &replacement.namespace,
+                &replacement.id,
+            ) {
+                replacement.targets = live_upstream.targets.clone();
+            }
+        }
     }
 
     /// Timestamp-neutral proxy content comparison for route-table reuse.
@@ -9295,7 +9450,44 @@ impl ProxyState {
         let route_changed = Self::delta_routes_changed(delta, &current.config, new_config)
             || Self::mesh_route_table_inputs_changed(&current.config, new_config);
         let consumer_changed = Self::delta_consumers_changed(delta);
-        let lb_changed = Self::delta_load_balancers_changed(delta);
+        // DestinationRule-derived projections (`dispatch_port_overrides`,
+        // `dispatch_port_override_fallback`, stream-relay dispatch maps, and the
+        // upstream `port_overrides` / locality / algorithm / hash policy they
+        // mirror) can change without an upstream `updated_at` bump. When a
+        // projected-only change shares a publish with an unrelated non-empty
+        // ConfigDelta (consumer/plugin/...), `delta_load_balancers_changed` is
+        // false and a delta LB rebuild would see an empty upstream delta. Feed
+        // the timestamp-neutral upstreams into the same incremental builder so
+        // only affected balancers are replaced; all unrelated counters and
+        // EWMAs survive (#3243).
+        let projected_lb_modified =
+            Self::projected_dr_dispatch_changed_upstreams(&current.config, new_config);
+        let projected_lb_changed = !projected_lb_modified.is_empty();
+        let upstream_lb_changed = Self::delta_load_balancers_changed(delta);
+        let lb_changed = upstream_lb_changed || projected_lb_changed;
+
+        let mut lb_modified = delta.modified_upstreams.clone();
+        let mut lb_modified_keys: std::collections::HashSet<NamespacedResourceId> = lb_modified
+            .iter()
+            .map(|upstream| NamespacedResourceId::new(&upstream.namespace, &upstream.id))
+            .chain(
+                delta
+                    .added_upstreams
+                    .iter()
+                    .map(|upstream| NamespacedResourceId::new(&upstream.namespace, &upstream.id)),
+            )
+            .collect();
+        for upstream in projected_lb_modified {
+            if lb_modified_keys.insert(NamespacedResourceId::new(&upstream.namespace, &upstream.id))
+            {
+                lb_modified.push(upstream);
+            }
+        }
+        Self::preserve_live_discovery_targets(
+            &current.load_balancer,
+            &current.config,
+            &mut lb_modified,
+        );
 
         let plugin_inner = self.plugin_cache.build_delta_inner(
             &current.plugin_cache,
@@ -9316,7 +9508,7 @@ impl ProxyState {
                 new_config,
                 &delta.added_upstreams,
                 &delta.removed_upstream_ids,
-                &delta.modified_upstreams,
+                &lb_modified,
             )
         } else {
             Arc::clone(&current.load_balancer)
@@ -9652,7 +9844,26 @@ impl ProxyState {
                             ),
                         )?;
                     let mesh_changed = current.config.mesh != new_config.mesh;
-                    if !mesh_changed && country_mmdb_plugin_cache.is_none() {
+                    // DestinationRule-derived projections
+                    // (`dispatch_port_overrides`, `dispatch_port_override_fallback`,
+                    // `resolved_tls`, stream-relay dispatch maps) are
+                    // `#[serde(skip)]` and invisible to ConfigDelta's
+                    // `updated_at` comparison. A DR-only edit that left every
+                    // resource timestamp unchanged must still republish the
+                    // route table (and LB, which also consumes DR-derived
+                    // upstream policy) before any status/revision ACK — otherwise
+                    // route-held `Arc<Proxy>` values stay stale until an
+                    // unrelated event (#3243).
+                    let projected_routes_changed =
+                        Self::projected_route_proxy_content_changed(&current.config, &new_config);
+                    let mut projected_lb_modified =
+                        Self::projected_dr_dispatch_changed_upstreams(&current.config, &new_config);
+                    let projected_lb_changed = !projected_lb_modified.is_empty();
+                    if !mesh_changed
+                        && !projected_routes_changed
+                        && !projected_lb_changed
+                        && country_mmdb_plugin_cache.is_none()
+                    {
                         return Ok(None);
                     }
 
@@ -9675,11 +9886,18 @@ impl ProxyState {
                     // a mesh slice update that retargets/adds/removes a local
                     // stream-family port would leave the inbound accept loop relaying
                     // to a stale loopback backend (or falling through to Hyper for a
-                    // newly added port). An MMDB-only publish reuses that table.
-                    route_changed.set(mesh_changed);
+                    // newly added port). An MMDB-only publish reuses that table
+                    // unless a projected DR-derived proxy field also changed.
+                    let rebuild_routes = mesh_changed || projected_routes_changed;
+                    route_changed.set(rebuild_routes);
+                    Self::preserve_live_discovery_targets(
+                        &current.load_balancer,
+                        &current.config,
+                        &mut projected_lb_modified,
+                    );
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
-                        route_table: if mesh_changed {
+                        route_table: if rebuild_routes {
                             RouterCache::build_route_table_snapshot(&new_config)
                         } else {
                             Arc::clone(&current.route_table)
@@ -9687,9 +9905,19 @@ impl ProxyState {
                         plugin_cache: country_mmdb_plugin_cache
                             .unwrap_or_else(|| Arc::clone(&current.plugin_cache)),
                         consumer_index: Arc::clone(&current.consumer_index),
-                        load_balancer: Arc::clone(&current.load_balancer),
-                        route_changed: mesh_changed,
-                        lb_changed: false,
+                        load_balancer: if projected_lb_changed {
+                            LoadBalancerCache::build_delta_inner(
+                                &current.load_balancer,
+                                &new_config,
+                                &[],
+                                &[],
+                                &projected_lb_modified,
+                            )
+                        } else {
+                            Arc::clone(&current.load_balancer)
+                        },
+                        route_changed: rebuild_routes,
+                        lb_changed: projected_lb_changed,
                     }));
                 }
                 let country_mmdb_load_mode = if matches!(
@@ -41723,6 +41951,7 @@ mod tests {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "redis".to_string(),
+            service_namespace: None,
             addresses: vec!["10.0.0.7".to_string()],
             ports: vec![WorkloadPort {
                 port: 6380,
@@ -46164,6 +46393,7 @@ mod tests {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "redis".to_string(),
+            service_namespace: None,
             addresses: vec!["10.0.0.7".to_string()],
             ports: vec![WorkloadPort {
                 port: 6380,
@@ -49812,6 +50042,7 @@ mod tests {
             spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "app".to_string(),
+            service_namespace: None,
             addresses: vec!["10.1.2.3".to_string(), "fd00:10:244:1::4".to_string()],
             ports: vec![WorkloadPort {
                 port: 8080,
@@ -49912,6 +50143,7 @@ mod tests {
             spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "app".to_string(),
+            service_namespace: None,
             addresses: vec!["fd00:10:244:1::4".to_string()],
             ports: vec![WorkloadPort {
                 port: 8080,
@@ -50984,6 +51216,7 @@ mod tests {
                     .unwrap(),
                 selector: WorkloadSelector::default(),
                 service_name: "reviews".to_string(),
+                service_namespace: None,
                 addresses: vec![addr.to_string()],
                 ports: vec![],
                 trust_domain: TrustDomain::new("remote.local").unwrap(),

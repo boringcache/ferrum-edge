@@ -29,6 +29,7 @@ fn build_gateway_config(n_workloads: usize) -> GatewayConfig {
             spiffe_id: spiffe_id.clone(),
             selector: WorkloadSelector::default(),
             service_name: service_name.clone(),
+            service_namespace: None,
             addresses: vec![format!("10.0.{}.{}", (i / 254) % 254, (i % 254) + 1)],
             ports: vec![],
             trust_domain: trust_domain.clone(),

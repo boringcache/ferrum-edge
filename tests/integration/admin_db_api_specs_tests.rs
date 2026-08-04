@@ -39,6 +39,7 @@
 
 use ferrum_edge::{
     ExtractedBundle, GatewayConfig,
+    admin::api_specs::{EffectiveExternalRefPolicy, ExternalRefSnapshot},
     config::{
         BackendAllowIps, BackendEgressPolicy,
         db_backend::{
@@ -178,6 +179,8 @@ fn make_spec(id: &str, proxy_id: &str, namespace: &str, content: &[u8]) -> ApiSp
         server_urls: vec![],
         operation_count: 0,
         resource_hash: String::new(),
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -2056,7 +2059,11 @@ async fn list_api_specs_does_not_hydrate_spec_content_blob() {
         plugins: vec![],
     };
     let raw_content = vec![b'x'; 1024 * 64];
-    let spec = make_spec(&spec_id, &proxy_id, ns, &raw_content);
+    let mut spec = make_spec(&spec_id, &proxy_id, ns, &raw_content);
+    let snapshot = ExternalRefSnapshot::empty(&EffectiveExternalRefPolicy::disabled());
+    let snapshot_bytes = snapshot.gzip_bytes().expect("snapshot gzip");
+    spec.external_ref_snapshot = Some(snapshot_bytes.clone());
+    spec.external_ref_digest = Some(snapshot.snapshot_digest.clone());
     let stored_spec_content = spec.spec_content.clone();
     store
         .submit_api_spec_bundle(&bundle, &spec)
@@ -2071,9 +2078,14 @@ async fn list_api_specs_does_not_hydrate_spec_content_blob() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, spec_id);
     assert_eq!(listed[0].content_hash, spec.content_hash);
+    assert_eq!(listed[0].external_ref_digest, spec.external_ref_digest);
     assert!(
         listed[0].spec_content.is_empty(),
         "list_api_specs is a summary path and must not hydrate the compressed spec blob"
+    );
+    assert!(
+        listed[0].external_ref_snapshot.is_none(),
+        "list_api_specs must keep external snapshot bytes private"
     );
 
     let fetched = store
@@ -2085,6 +2097,7 @@ async fn list_api_specs_does_not_hydrate_spec_content_blob() {
         fetched.spec_content, stored_spec_content,
         "single-spec GET must still hydrate the compressed spec blob"
     );
+    assert_eq!(fetched.external_ref_snapshot, Some(snapshot_bytes));
 }
 
 // ---------------------------------------------------------------------------
@@ -2889,6 +2902,8 @@ fn make_spec_with_metadata(
         server_urls: meta.server_urls.clone(),
         operation_count: meta.operation_count,
         resource_hash,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -2933,6 +2948,8 @@ fn make_spec_from_openapi_body(
         server_urls: meta.server_urls.clone(),
         operation_count: meta.operation_count,
         resource_hash,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -3068,6 +3085,8 @@ async fn submit_truncates_long_description_at_4kib() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -3148,6 +3167,8 @@ async fn swagger_2_0_server_urls_constructed_from_schemes_host_basepath() {
         server_urls: meta.server_urls.clone(),
         operation_count: 0,
         resource_hash,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -3224,6 +3245,8 @@ async fn replace_with_unchanged_resources_skips_proxy_write() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash: resource_hash1.clone(),
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -3289,6 +3312,8 @@ async fn replace_with_unchanged_resources_skips_proxy_write() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash: resource_hash2,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: spec1.created_at,
         updated_at: now2,
     };
@@ -3370,6 +3395,8 @@ async fn replace_with_changed_resources_updates_proxy() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash: resource_hash1.clone(),
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -3428,6 +3455,8 @@ async fn replace_with_changed_resources_updates_proxy() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash: resource_hash2,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: spec1.created_at,
         updated_at: now2,
     };
@@ -3564,6 +3593,8 @@ async fn list_filter_spec_version_prefix() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash: rh32,
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -5147,4 +5178,59 @@ async fn concurrent_put_same_spec_resource_hash_idempotent() {
          got {} (expected {})",
         proxy_after_puts.updated_at, post_updated_at
     );
+}
+
+#[tokio::test]
+async fn full_sql_api_spec_reads_reject_corrupt_external_ref_pairs() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let namespace = "ferrum";
+    let proxy_id = uid("proxy-corrupt-extref");
+    let spec_id = uid("spec-corrupt-extref");
+    let (bundle, spec) =
+        make_spec_with_metadata(&spec_id, &proxy_id, namespace, "Integrity API", "0", &[]);
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("submit spec");
+
+    sqlx::query("UPDATE api_specs SET external_ref_digest = ? WHERE namespace = ? AND id = ?")
+        .bind("a".repeat(64))
+        .bind(namespace)
+        .bind(&spec_id)
+        .execute(&store.pool())
+        .await
+        .expect("corrupt digest pair");
+
+    let error = store
+        .get_api_spec(namespace, &spec_id)
+        .await
+        .expect_err("full row decode must reject digest without snapshot");
+    assert!(error.to_string().contains("integrity validation failed"));
+
+    // The list query intentionally projects out the blob. A well-formed digest
+    // remains usable as summary metadata without pretending the omitted blob is
+    // a corrupt full record.
+    let summary = store
+        .list_api_specs(namespace, &simple_filter(10, 0))
+        .await
+        .expect("summary projection may omit snapshot blob");
+    assert!(summary.items.iter().any(|item| item.id == spec_id));
+
+    sqlx::query(
+        "UPDATE api_specs SET external_ref_snapshot = ?, external_ref_digest = ? \
+         WHERE namespace = ? AND id = ?",
+    )
+    .bind(vec![0x1f, 0x8b, 0x00])
+    .bind("b".repeat(64))
+    .bind(namespace)
+    .bind(&spec_id)
+    .execute(&store.pool())
+    .await
+    .expect("corrupt snapshot bytes");
+    let error = store
+        .get_api_spec(namespace, &spec_id)
+        .await
+        .expect_err("full row decode must reject malformed snapshot gzip");
+    assert!(error.to_string().contains("integrity validation failed"));
 }

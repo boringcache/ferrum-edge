@@ -3084,6 +3084,7 @@ mod tests {
                 namespace: Some("clients".to_string()),
             },
             service_name: "client".to_string(),
+            service_namespace: None,
             addresses: vec!["10.2.0.11".to_string()],
             ports: Vec::new(),
             trust_domain: TrustDomain::new("cluster.local").expect("source trust domain"),
