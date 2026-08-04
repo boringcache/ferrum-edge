@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use tracing::{debug, warn};
 
-use crate::config::types::GatewayConfig;
+use crate::config::types::{GatewayConfig, Proxy};
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
     MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
@@ -910,7 +910,7 @@ impl MeshSlice {
         // authoritative revision, so a DP comparing two CPs' slices compares
         // their config generations rather than their wall clocks.
         let revision = config.mesh_revision.clone();
-        let virtual_service_l4_proxies = config
+        let virtual_service_l4_proxy_candidates: Vec<&Proxy> = config
             .proxies
             .iter()
             .filter(|proxy| {
@@ -923,21 +923,11 @@ impl MeshSlice {
                         .as_ref()
                         .is_some_and(|criteria| !criteria.is_empty())
             })
-            .filter_map(|proxy| match serde_json::to_value(proxy) {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    warn!(
-                        proxy_id = %proxy.id,
-                        error = %error,
-                        "Failed to serialize a VirtualService L4 proxy into the mesh slice; \
-                         dropping the route fail-closed"
-                    );
-                    None
-                }
-            })
             .collect();
 
         let Some(mesh) = config.mesh.as_ref() else {
+            let virtual_service_l4_proxies =
+                serialize_virtual_service_l4_proxies(virtual_service_l4_proxy_candidates);
             return Self {
                 node_id: request.node_id,
                 namespace: request.namespace,
@@ -1141,6 +1131,31 @@ impl MeshSlice {
         } else {
             (BTreeSet::new(), BTreeSet::new())
         };
+
+        let virtual_service_l4_proxies = serialize_virtual_service_l4_proxies(
+            virtual_service_l4_proxy_candidates
+                .into_iter()
+                .filter(|proxy| {
+                    let Some(sidecar) = applicable_sidecar else {
+                        return true;
+                    };
+                    let (resource_namespace, host_candidates) = policy_host_scope(
+                        &proxy.backend_host,
+                        &proxy.namespace,
+                        &cluster_domain,
+                        &mesh_service_identities,
+                        &service_entry_hosts,
+                    );
+                    let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+                    sidecar_egress_includes_service(
+                        sidecar.namespace,
+                        sidecar.egress,
+                        &resource_namespace,
+                        &host_refs,
+                        Some(&[proxy.backend_port]),
+                    )
+                }),
+        );
 
         let services: Vec<MeshService> = mesh
             .services
@@ -2108,6 +2123,26 @@ fn visible_service_entry_hosts<L: WorkloadLabels + ?Sized>(
 
 fn mesh_service_host_candidates(service: &MeshService, cluster_domain: &str) -> Vec<String> {
     service_host_aliases(&service.name, &service.namespace, cluster_domain)
+}
+
+fn serialize_virtual_service_l4_proxies<'a>(
+    proxies: impl IntoIterator<Item = &'a Proxy>,
+) -> Vec<serde_json::Value> {
+    proxies
+        .into_iter()
+        .filter_map(|proxy| match serde_json::to_value(proxy) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    error = %error,
+                    "Failed to serialize a VirtualService L4 proxy into the mesh slice; \
+                     dropping the route fail-closed"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 fn service_host_aliases(name: &str, namespace: &str, cluster_domain: &str) -> Vec<String> {
@@ -8436,6 +8471,57 @@ mod tests {
         assert_eq!(
             MeshSidecarEgress::parse_host_pattern("bare-host"),
             SidecarHostPattern::SameNamespaceHostBare { host: "bare-host" }
+        );
+    }
+
+    #[test]
+    fn sidecar_narrowing_filters_virtual_service_l4_proxy_backends() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar_with_ports(
+                "restricted",
+                "alpha",
+                None,
+                vec![(vec!["beta/allowed"], Some(3306))],
+            )],
+            ..MeshConfig::default()
+        };
+        let mut config = config_with_mesh(mesh);
+        let proxy = |id: &str, backend_host: &str, backend_port: u16| {
+            serde_json::from_value::<Proxy>(serde_json::json!({
+                "id": id,
+                "namespace": "alpha",
+                "backend_scheme": "tcp",
+                "backend_host": backend_host,
+                "backend_port": backend_port,
+                "listen_port": backend_port,
+                "stream_match": {"arms": [{"gateways": ["mesh"]}]}
+            }))
+            .expect("test VirtualService L4 proxy is valid")
+        };
+        config.proxies = vec![
+            proxy(
+                "istio-vs-l4_tcp__alpha__allowed__0-0",
+                "allowed.beta.svc.cluster.local",
+                3306,
+            ),
+            proxy(
+                "istio-vs-l4_tcp__alpha__secret__0-0",
+                "secret.beta.svc.cluster.local",
+                3306,
+            ),
+            proxy(
+                "istio-vs-l4_tcp__alpha__wrong-port__0-0",
+                "allowed.beta.svc.cluster.local",
+                5432,
+            ),
+        ];
+
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+
+        assert_eq!(slice.virtual_service_l4_proxies.len(), 1);
+        assert_eq!(
+            slice.virtual_service_l4_proxies[0]["id"],
+            "istio-vs-l4_tcp__alpha__allowed__0-0"
         );
     }
 
