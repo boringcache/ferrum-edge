@@ -413,61 +413,37 @@ fn dp_grpc_no_verify_is_covered_by_the_ordinary_validator_not_by_fips() {
 }
 
 #[test]
-fn mongodb_require_mode_is_refused_because_it_disables_verification() {
-    // The mode whose *name* reads as more secure is the one that turns CA and
-    // hostname verification off.
-    let error = policy::check_env_config_enforced(&env_with(|c| {
-        c.db_type = Some("mongodb".to_string());
-        c.db_tls_mode = Some(DbTlsMode::Require);
-    }))
-    .expect_err("MongoDB `require` must be refused");
-    assert!(error.contains("verify-full"), "{error}");
-
-    policy::check_env_config_enforced(&env_with(|c| {
-        c.db_type = Some("mongodb".to_string());
-        c.db_tls_mode = Some(DbTlsMode::VerifyFull);
-    }))
-    .expect("`verify-full` must be admitted");
+fn every_mongodb_tls_mode_is_refused_at_the_config_store_boundary() {
+    for mode in [DbTlsMode::Require, DbTlsMode::VerifyFull] {
+        let error = policy::check_env_config_enforced(&env_with(|config| {
+            config.db_type = Some("MoNgOdB".to_string());
+            config.db_tls_mode = Some(mode);
+        }))
+        .expect_err("every MongoDB config store must be refused");
+        assert!(error.contains("FERRUM_DB_TYPE=mongodb"), "{error}");
+        assert!(error.contains("database-driver cryptography"), "{error}");
+    }
 }
 
 #[test]
-fn mongodb_uri_verification_bypass_is_refused_without_echoing_the_url() {
-    let error = policy::check_env_config_enforced(&env_with(|c| {
-        c.db_type = Some("mongodb".to_string());
-        c.db_url = Some(
-            "mongodb://admin:sup3rs3cr3t@db.internal:27017/ferrum?tls=true&tlsInsecure=true"
-                .to_string(),
-        );
-    }))
-    .expect_err("a URI-level verification bypass must be refused");
+fn blanket_mongodb_rejection_never_echoes_uri_or_credentials() {
+    for url in [
+        "mongodb://admin:sup3rs3cr3t@db.internal:27017/ferrum?tls=true&tlsInsecure=true",
+        "mongodb://admin:explicit-false@db.internal:27017/ferrum?tlsAllowInvalidCertificates=false",
+        "mongodb://admin:tlsInsecure@db.internal:27017/ferrum",
+    ] {
+        let error = policy::check_env_config_enforced(&env_with(|config| {
+            config.db_type = Some("mongodb".to_string());
+            config.db_url = Some(url.to_string());
+        }))
+        .expect_err("every MongoDB URI must be refused");
 
-    assert!(error.contains("tlsinsecure"), "{error}");
-    // The URL carries the database credentials and must never be interpolated.
-    assert!(!error.contains("sup3rs3cr3t"), "{error}");
-    assert!(!error.contains("db.internal"), "{error}");
-}
-
-#[test]
-fn a_mongodb_uri_that_explicitly_disables_the_bypass_is_admitted() {
-    policy::check_env_config_enforced(&env_with(|c| {
-        c.db_type = Some("mongodb".to_string());
-        c.db_url = Some(
-            "mongodb://db.internal:27017/ferrum?tlsAllowInvalidCertificates=false".to_string(),
-        );
-    }))
-    .expect("`=false` is not a bypass and must not be reported as one");
-}
-
-#[test]
-fn a_credential_that_merely_contains_an_option_name_is_not_read_as_one() {
-    // Only the query component is inspected, so a password that happens to
-    // spell an option name is not a false rejection — and is not inspected any
-    // more closely than that.
-    policy::check_env_config_enforced(&env_with(|c| {
-        c.db_type = Some("mongodb".to_string());
-        c.db_url = Some("mongodb://admin:tlsInsecure@db.internal:27017/ferrum".to_string());
-    }))
-    .expect("an option name inside userinfo is not a URI option");
+        assert!(error.contains("FERRUM_DB_TYPE=mongodb"), "{error}");
+        assert!(!error.contains("sup3rs3cr3t"), "{error}");
+        assert!(!error.contains("explicit-false"), "{error}");
+        assert!(!error.contains("db.internal"), "{error}");
+        assert!(!error.contains("tlsInsecure"), "{error}");
+    }
 }
 
 // ── Gateway-document peer verification ──────────────────────────────────────
