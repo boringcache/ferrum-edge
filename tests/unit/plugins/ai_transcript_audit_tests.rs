@@ -10642,7 +10642,10 @@ struct AuditPayload<'a> {
 fn audit_string_list(values: &[&str]) -> prost_reflect::Value {
     use prost_reflect::Value;
 
-    let items = values.iter().map(|v| Value::String(v.to_string())).collect();
+    let items = values
+        .iter()
+        .map(|v| Value::String(v.to_string()))
+        .collect();
     Value::List(items)
 }
 
