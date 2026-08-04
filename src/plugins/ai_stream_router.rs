@@ -57,9 +57,10 @@
 //!   explicit provider `error`) before emitting a success-shaped terminal
 //!   sequence; premature EOF / malformed events fail closed with an
 //!   upstream-error SSE frame. Requests that will be normalized strip
-//!   `Accept-Encoding`, and residual `Content-Encoding` is decoded (gzip / br)
-//!   or rejected before SSE parsing so response headers describe identity
-//!   bytes.
+//!   `Accept-Encoding`, and residual `Content-Encoding` chains are decoded
+//!   (`gzip` / `x-gzip` / `br`, including stacked lists) in reverse application
+//!   order under shared bounded limits, or rejected fail-closed before SSE
+//!   parsing so response headers describe identity bytes.
 //! - `google_gemini`: OpenAI Chat Completions request is translated to the
 //!   Gemini/`streamGenerateContent` (Vertex-compatible) request body; native
 //!   Gemini SSE (`alt=sse`) and Vertex-compatible JSON array / object streams
@@ -219,7 +220,9 @@ use tracing::debug;
 use url::{Host, Url};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
-use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
+use super::utils::content_encoding::{
+    DecodeLimits, decode_content_encoding, parse_content_codings,
+};
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, ResponseStreamInspectorStage,
@@ -335,9 +338,10 @@ const META_REQUEST_TRANSLATED: &str = "ai_stream_router.request_translated";
 /// `tool_use` for that generation, so it must not be disarmable by a later
 /// metadata write.
 const META_TOOL_CHOICE_NONE: &str = "ai_stream_router.tool_choice_none";
-/// Provider `Content-Encoding` that must be decoded before Anthropic SSE
+/// Provider `Content-Encoding` chain that must be decoded before Anthropic SSE
 /// normalization. Stamped in `after_proxy` before representation headers are
-/// repaired so both streaming and buffered normalizers see the same coding.
+/// repaired so both streaming and buffered normalizers see the same coding list
+/// (canonical application-order members joined with `", "`).
 ///
 /// Deliberately left in metadata and deliberately NOT authorization state
 /// (`GHSA-xhp5-hqj8-3mwg`): it is derived from the PROVIDER's own response
@@ -352,12 +356,27 @@ const META_PROVIDER_ENCODING: &str = "ai_stream_router.provider_content_encoding
 /// telling response plugins the request asked for a streaming response.
 const META_STREAMING_SHARED: &str = "ai_request_streaming";
 
-/// Bound decoding of residual provider content codings before SSE normalization.
+/// Bound decoding of residual provider content coding chains before SSE
+/// normalization. Absolute per-layer / aggregate ceilings match the streaming
+/// buffer caps; the 1024:1 ratio matches the shared compression pipeline so a
+/// tiny gzip/br bomb cannot spend the full absolute budget.
 const NORMALIZE_DECODE_LIMITS: DecodeLimits = DecodeLimits {
     max_decoded_bytes: 8 * 1024 * 1024,
     max_cumulative_bytes: 16 * 1024 * 1024,
     max_codings: 4,
-    max_amplification_ratio: 0,
+    max_amplification_ratio: 1024,
+};
+
+/// Compile-time proof that residual-decode ceilings stay finite and ordered:
+/// per-layer ≤ aggregate, layer count ≥ 1, and amplification is enabled.
+const _: () = {
+    assert!(NORMALIZE_DECODE_LIMITS.max_decoded_bytes > 0);
+    assert!(NORMALIZE_DECODE_LIMITS.max_cumulative_bytes > 0);
+    assert!(NORMALIZE_DECODE_LIMITS.max_codings > 0);
+    assert!(NORMALIZE_DECODE_LIMITS.max_amplification_ratio > 0);
+    assert!(
+        NORMALIZE_DECODE_LIMITS.max_decoded_bytes <= NORMALIZE_DECODE_LIMITS.max_cumulative_bytes
+    );
 };
 
 // ---------------------------------------------------------------------------
@@ -3195,7 +3214,7 @@ impl Plugin for AiStreamRouter {
         Some(wrap_provider_normalizer(
             provider_type,
             model,
-            encoding.as_deref(),
+            encoding,
             tools_forbidden,
         ))
     }
@@ -3250,28 +3269,34 @@ impl Plugin for AiStreamRouter {
         // authoritative (`GHSA-xhp5-hqj8-3mwg`); do not re-read them from
         // mutable metadata.
         let ceiling = ctx.retained_response_body_ceiling();
-        // Prefer the after_proxy-claimed coding; otherwise classify residual
-        // headers the same way so unsupported/hostile tokens never reach decode
-        // and never echo into the client envelope.
-        let encoding = if let Some(claimed) = ctx.metadata.get(META_PROVIDER_ENCODING) {
-            Some(claimed.as_str())
-        } else {
-            match classify_provider_content_encoding(response_headers) {
-                ProviderContentEncoding::Identity => None,
-                ProviderContentEncoding::Supported(coding) => Some(coding),
-                ProviderContentEncoding::Unsupported(internal) => {
-                    return bounded_upstream_sse_error_body(
-                        provider_content_encoding_client_message(&internal),
-                        ceiling,
-                    );
+        // Classify residual encoding with the same fixed-cardinality reasons
+        // `after_proxy` uses. Never feed raw header/metadata strings into the
+        // client-facing decode error envelope.
+        let encoding = match ctx.metadata.get(META_PROVIDER_ENCODING) {
+            Some(meta) => {
+                let mut probe = HashMap::with_capacity(1);
+                probe.insert("content-encoding".to_string(), meta.clone());
+                match classify_provider_content_encoding(&probe) {
+                    ProviderContentEncoding::Supported(coding) => Some(coding),
+                    ProviderContentEncoding::Identity => None,
+                    ProviderContentEncoding::Unsupported(reason) => {
+                        return bounded_upstream_sse_error_body(reason.as_str(), ceiling);
+                    }
                 }
             }
+            None => match classify_provider_content_encoding(response_headers) {
+                ProviderContentEncoding::Supported(coding) => Some(coding),
+                ProviderContentEncoding::Identity => None,
+                ProviderContentEncoding::Unsupported(reason) => {
+                    return bounded_upstream_sse_error_body(reason.as_str(), ceiling);
+                }
+            },
         };
-        let plaintext = match prepare_sse_bytes_for_normalization(body, encoding) {
+        let plaintext = match prepare_sse_bytes_for_normalization(body, encoding.as_deref()) {
             Ok(bytes) => bytes,
             Err(message) => {
                 return bounded_upstream_sse_error_body(
-                    provider_content_encoding_client_message(&message),
+                    safe_residual_decode_diagnostic(&message),
                     ceiling,
                 );
             }
@@ -3349,13 +3374,13 @@ impl Plugin for AiStreamRouter {
             }
             ProviderContentEncoding::Supported(coding) => {
                 ctx.metadata
-                    .insert(META_PROVIDER_ENCODING.to_string(), coding.to_string());
+                    .insert(META_PROVIDER_ENCODING.to_string(), coding);
                 repair_normalized_representation_headers(response_headers);
                 PluginResult::Continue
             }
-            ProviderContentEncoding::Unsupported(_) => openai_error_response(
+            ProviderContentEncoding::Unsupported(reason) => openai_error_response(
                 502,
-                UNSUPPORTED_PROVIDER_CONTENT_ENCODING_MESSAGE,
+                reason.as_str(),
                 "upstream_error",
                 None,
                 Some("unsupported_content_encoding"),
@@ -3480,7 +3505,7 @@ fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
     headers.retain(|k, _| !k.eq_ignore_ascii_case(name));
 }
 
-fn content_encoding_value(headers: &HashMap<String, String>) -> Result<Option<&str>, String> {
+fn content_encoding_value(headers: &HashMap<String, String>) -> Result<Option<&str>, ()> {
     let mut values = headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
@@ -3489,16 +3514,47 @@ fn content_encoding_value(headers: &HashMap<String, String>) -> Result<Option<&s
         return Ok(None);
     };
     if values.next().is_some() {
-        return Err("multiple case-variant Content-Encoding headers".to_string());
+        // Ambiguous duplicate field-lines — fixed category, no header echo.
+        return Err(());
     }
     let value = value.trim();
     Ok((!value.is_empty()).then_some(value))
 }
 
+/// Fixed-cardinality residual `Content-Encoding` rejection reasons.
+///
+/// Client-facing 502 bodies, SSE upstream-error frames, and forged-metadata
+/// normalization must never interpolate raw header/metadata members (including
+/// credential-like or unbounded attacker tokens).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderEncodingRejectReason {
+    AmbiguousDuplicateFieldLines,
+    MalformedList,
+    UnsupportedCoding,
+    MixedIdentity,
+    TooManyLayers,
+}
+
+impl ProviderEncodingRejectReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::AmbiguousDuplicateFieldLines => "ambiguous Content-Encoding field-lines",
+            Self::MalformedList => "malformed Content-Encoding list",
+            Self::UnsupportedCoding => "unsupported Content-Encoding coding",
+            Self::MixedIdentity => {
+                "identity Content-Encoding cannot be combined with other codings"
+            }
+            Self::TooManyLayers => "Content-Encoding exceeds supported coding layer count",
+        }
+    }
+}
+
 enum ProviderContentEncoding {
     Identity,
-    Supported(&'static str),
-    Unsupported(String),
+    /// Canonical `#content-coding` list in application order (e.g. `gzip`,
+    /// `gzip, br`). Decode undoes layers in reverse.
+    Supported(String),
+    Unsupported(ProviderEncodingRejectReason),
 }
 
 fn classify_provider_content_encoding(
@@ -3507,49 +3563,76 @@ fn classify_provider_content_encoding(
     let raw = match content_encoding_value(headers) {
         Ok(Some(raw)) => raw,
         Ok(None) => return ProviderContentEncoding::Identity,
-        Err(message) => return ProviderContentEncoding::Unsupported(message),
-    };
-    let mut codings = Vec::new();
-    for part in raw.split(',') {
-        let coding = part.trim();
-        if coding.is_empty() {
+        Err(()) => {
             return ProviderContentEncoding::Unsupported(
-                "content-encoding contains an empty coding".to_string(),
+                ProviderEncodingRejectReason::AmbiguousDuplicateFieldLines,
             );
         }
-        if coding.contains(';') {
-            return ProviderContentEncoding::Unsupported(format!(
-                "content-encoding coding '{coding}' contains unsupported parameters"
-            ));
+    };
+    let codings = match parse_content_codings(raw) {
+        Ok(codings) => codings,
+        // Parser diagnostics are already fixed-cardinality; map to field-
+        // specific reasons without forwarding the string (defense in depth).
+        Err(message) => {
+            return ProviderContentEncoding::Unsupported(reject_reason_from_parse_error(&message));
         }
-        let lower = coding.to_ascii_lowercase();
-        match lower.as_str() {
-            "identity" => {}
-            "gzip" | "br" => codings.push(lower),
-            other => {
-                return ProviderContentEncoding::Unsupported(format!(
-                    "unsupported content-encoding '{other}'"
-                ));
-            }
-        }
+    };
+    if codings.len() > NORMALIZE_DECODE_LIMITS.max_codings {
+        return ProviderContentEncoding::Unsupported(ProviderEncodingRejectReason::TooManyLayers);
     }
-    if codings.is_empty() {
-        ProviderContentEncoding::Identity
-    } else if codings.len() == 1 {
-        match codings[0].as_str() {
-            "gzip" => ProviderContentEncoding::Supported("gzip"),
-            "br" => ProviderContentEncoding::Supported("br"),
-            other => ProviderContentEncoding::Unsupported(format!(
-                "unsupported content-encoding '{other}'"
-            )),
-        }
+    if codings.iter().all(|coding| coding == "identity") {
+        return ProviderContentEncoding::Identity;
+    }
+    if codings.iter().any(|coding| coding == "identity") {
+        return ProviderContentEncoding::Unsupported(ProviderEncodingRejectReason::MixedIdentity);
+    }
+    // Supported tokens only: parse_content_codings already rejected anything
+    // outside gzip / x-gzip / br / identity.
+    ProviderContentEncoding::Supported(codings.join(", "))
+}
+
+fn reject_reason_from_parse_error(message: &str) -> ProviderEncodingRejectReason {
+    if message.contains("unsupported content-encoding") {
+        ProviderEncodingRejectReason::UnsupportedCoding
     } else {
-        // Multi-layer residual encodings are unusual for SSE and are rejected
-        // rather than partially decoded into a mislabeled stream.
-        ProviderContentEncoding::Unsupported(
-            "multi-layer content-encoding is not supported for Anthropic SSE normalization"
-                .to_string(),
-        )
+        ProviderEncodingRejectReason::MalformedList
+    }
+}
+
+/// Map residual decode failures to fixed client diagnostics.
+///
+/// Decode helpers may still carry absolute size numbers from compile-time
+/// limits; never forward arbitrary `io::Error` text or upstream body bytes.
+fn safe_residual_decode_diagnostic(message: &str) -> &'static str {
+    if message.contains("amplification exceeds") {
+        "upstream Content-Encoding amplification limit exceeded"
+    } else if message.contains("decoded content exceeds")
+        || message.contains("decoded content-encoding work exceeds")
+        || message.contains("streaming size limit")
+        || message.contains("size overflowed")
+        || message.contains("work overflowed")
+    {
+        "upstream Content-Encoding size limit exceeded"
+    } else if message.contains("truncated") {
+        "upstream Content-Encoding is truncated"
+    } else if message.contains("trailing") || message.contains("concatenated") {
+        "upstream Content-Encoding contains trailing or concatenated data"
+    } else if message.contains("identity") && message.contains("combined") {
+        ProviderEncodingRejectReason::MixedIdentity.as_str()
+    } else if message.contains("more than") && message.contains("coding layers") {
+        ProviderEncodingRejectReason::TooManyLayers.as_str()
+    } else if message.contains("unsupported content-encoding")
+        || message.contains("unsupported Content-Encoding")
+    {
+        ProviderEncodingRejectReason::UnsupportedCoding.as_str()
+    } else if message.contains("empty coding")
+        || message.contains("no coding members")
+        || message.contains("not a valid HTTP token")
+        || message.contains("unsupported parameters")
+    {
+        ProviderEncodingRejectReason::MalformedList.as_str()
+    } else {
+        "upstream Content-Encoding decode failed"
     }
 }
 
@@ -3621,10 +3704,9 @@ fn upstream_sse_error_body(message: &str) -> Vec<u8> {
 
 /// [`upstream_sse_error_body`] under the response's retained ceiling.
 ///
-/// The envelope shape is fixed. Client-visible `message` values for residual
-/// encoding rejection are fixed/redacted via
-/// [`provider_content_encoding_client_message`]; other upstream diagnostics are
-/// still serialized through the bounded sink rather than built as a complete
+/// The envelope shape is fixed. Callers pass fixed-cardinality diagnostics
+/// (never raw header/metadata members or upstream body bytes), and the whole
+/// body is SERIALIZED THROUGH the bounded sink rather than built as a complete
 /// `Vec` that a bounded copy would only measure afterwards: the JSON string is
 /// written by `serde_json` straight into the sink, which stops at the ceiling
 /// (GHSA-pwcm-6rh8-f2gh). `None` (leave the response alone) is the fail-closed
@@ -3665,7 +3747,7 @@ const BUFFERED_NORMALIZE_CHUNK_BYTES: usize = 16 * 1024;
 fn wrap_provider_normalizer(
     provider_type: ProviderType,
     model: String,
-    encoding: Option<&str>,
+    encoding: Option<String>,
     tools_forbidden: bool,
 ) -> Box<dyn ResponseStreamInspector> {
     let engine = match provider_type {
@@ -3683,16 +3765,28 @@ fn wrap_provider_normalizer(
             ));
         }
     };
-    match encoding {
-        Some("gzip") => Box::new(ContentDecodingNormalizer::gzip(engine)),
-        Some("br") => Box::new(ContentDecodingNormalizer::brotli(engine)),
-        Some(_) => Box::new(ImmediateUpstreamErrorNormalizer::new(
-            UNSUPPORTED_PROVIDER_CONTENT_ENCODING_MESSAGE.to_string(),
-        )),
-        None => match engine {
+    let Some(encoding) = encoding else {
+        return match engine {
+            NormalizeEngine::Anthropic(inner) => Box::new(inner),
+            NormalizeEngine::Gemini(inner) => Box::new(inner),
+        };
+    };
+    // Re-validate the metadata stamp (or a forged value) with the same
+    // classifier `after_proxy` used. Unsupported / ambiguous chains fail closed
+    // immediately — never buffer opaque provider frames under a bad coding.
+    let mut probe = HashMap::with_capacity(1);
+    probe.insert("content-encoding".to_string(), encoding);
+    match classify_provider_content_encoding(&probe) {
+        ProviderContentEncoding::Supported(coding) => {
+            Box::new(ContentDecodingNormalizer::new(coding, engine))
+        }
+        ProviderContentEncoding::Identity => match engine {
             NormalizeEngine::Anthropic(inner) => Box::new(inner),
             NormalizeEngine::Gemini(inner) => Box::new(inner),
         },
+        ProviderContentEncoding::Unsupported(reason) => Box::new(
+            ImmediateUpstreamErrorNormalizer::new(reason.as_str().to_string()),
+        ),
     }
 }
 
@@ -3748,39 +3842,6 @@ fn provider_stream_media_fail_closed_message(
         ),
         ProviderStreamMediaDecision::Normalize | ProviderStreamMediaDecision::PassThrough => None,
     }
-}
-
-/// Fixed-cardinality residual Content-Encoding diagnostic.
-///
-/// Never echoes the provider coding token or header parameters into a
-/// client-visible 502 / SSE envelope.
-const UNSUPPORTED_PROVIDER_CONTENT_ENCODING_MESSAGE: &str =
-    "Upstream provider stream used an unsupported Content-Encoding";
-
-/// Map an internal residual-encoding / decode diagnostic to a client-visible
-/// string without echoing untrusted coding tokens.
-///
-/// Structural diagnostics that never embed a coding token stay stable (the
-/// buffered envelope serialization contract depends on
-/// `multiple case-variant Content-Encoding headers`). Token-bearing rejection
-/// strings are replaced with [`UNSUPPORTED_PROVIDER_CONTENT_ENCODING_MESSAGE`].
-/// Trusted gzip/br decode-limit diagnostics pass through unchanged.
-fn provider_content_encoding_client_message(internal: &str) -> &str {
-    if internal == "multiple case-variant Content-Encoding headers" {
-        return internal;
-    }
-    if internal.starts_with("unsupported content-encoding")
-        || internal.contains("unsupported parameters")
-        || internal.contains("is not a valid HTTP token")
-        || internal.contains("contains an empty coding")
-        || internal.starts_with("multi-layer content-encoding")
-        || internal.starts_with("content-encoding has more than")
-        || internal == "content-encoding contains no coding members"
-        || internal == "identity content-encoding cannot be combined with other codings"
-    {
-        return UNSUPPORTED_PROVIDER_CONTENT_ENCODING_MESSAGE;
-    }
-    internal
 }
 
 /// Ensure Gemini streaming requests negotiate `alt=sse` when normalizing.
@@ -5958,13 +6019,18 @@ fn next_json_value_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// Decode residual provider content coding, then feed plaintext into the
-/// Anthropic/Gemini→OpenAI normalizer. Because a compressed stream's
-/// checksum/trailer is not trustworthy until EOF, this rare fallback buffers
-/// the encoded body within a strict cap before decoding. Normal requests strip
-/// Accept-Encoding and retain fully progressive identity stream normalization.
+/// Decode residual provider content-coding chains, then feed plaintext into
+/// the Anthropic/Gemini→OpenAI normalizer. Because a compressed stream's
+/// checksum/trailer is not trustworthy until EOF — and intermediate layers of a
+/// stacked list cannot be validated until the outer coding is complete — this
+/// rare fallback buffers the encoded body within a strict cap before decoding
+/// in reverse application order. Encoded octets are never forwarded to the
+/// client; decode/limit failures emit an upstream-error SSE frame. Normal
+/// requests strip Accept-Encoding and retain fully progressive identity stream
+/// normalization.
 struct ContentDecodingNormalizer {
-    encoding: &'static str,
+    /// Canonical `#content-coding` list in application order.
+    encoding: String,
     encoded: Vec<u8>,
     inner: NormalizeEngine,
 }
@@ -6026,17 +6092,9 @@ impl NormalizeEngine {
 }
 
 impl ContentDecodingNormalizer {
-    fn gzip(inner: NormalizeEngine) -> Self {
+    fn new(encoding: String, inner: NormalizeEngine) -> Self {
         Self {
-            encoding: "gzip",
-            encoded: Vec::new(),
-            inner,
-        }
-    }
-
-    fn brotli(inner: NormalizeEngine) -> Self {
-        Self {
-            encoding: "br",
+            encoding,
             encoded: Vec::new(),
             inner,
         }
@@ -6046,7 +6104,7 @@ impl ContentDecodingNormalizer {
         let mut out = NormalizedSseOut::unbounded();
         out.begin_call();
         self.inner
-            .emit_upstream_error(provider_content_encoding_client_message(&message), &mut out);
+            .emit_upstream_error(safe_residual_decode_diagnostic(&message), &mut out);
         self.inner.finish_failure(&mut out);
         ResponseStreamAction::Terminate(Some(Bytes::from(out.take_call_bytes())))
     }
@@ -6067,12 +6125,17 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
                 .fail_decode("encoded provider stream size overflowed".to_string())
                 .await;
         };
+        // Cap the wire buffer at the aggregate decode budget so a hostile
+        // provider cannot pin more than the shared residual-decode ceiling
+        // before any layer runs.
         if next_len > NORMALIZE_DECODE_LIMITS.max_cumulative_bytes {
             return self
                 .fail_decode("encoded provider stream exceeds the streaming size limit".to_string())
                 .await;
         }
         self.encoded.extend_from_slice(chunk);
+        // Hold encoded frames until EOF+decode succeeds — never serve opaque
+        // provider octets as normalized AI output.
         ResponseStreamAction::Forward(Bytes::new())
     }
 
@@ -6080,11 +6143,20 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
         if self.inner.done_emitted() {
             return ResponseStreamAction::Terminate(None);
         }
-        let decoded = match prepare_sse_bytes_for_normalization(&self.encoded, Some(self.encoding))
-        {
+        let decoded = match prepare_sse_bytes_for_normalization(
+            &self.encoded,
+            Some(self.encoding.as_str()),
+        ) {
             Ok(bytes) => bytes.into_owned(),
             Err(message) => return self.fail_decode(message).await,
         };
+        // Encoded working set is spent; drop it before driving the plaintext
+        // normalizer so peak retention is decode output + normalized SSE, not
+        // also the original wire bytes.
+        // `mem::take` drops the spent allocation immediately without asking
+        // the allocator to shrink a buffer this terminal inspector will never
+        // reuse.
+        drop(std::mem::take(&mut self.encoded));
         let mut out = Vec::new();
         if !decoded.is_empty() {
             match self.inner.on_chunk(&decoded).await {

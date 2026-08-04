@@ -21,6 +21,7 @@ use crate::tls::inventory_cache::DEFAULT_SNAPSHOT_TTL_SECONDS;
 use crate::util::cidr::CidrSet;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::sync::Arc;
 
 #[macro_use]
 #[path = "env_config_macro.rs"]
@@ -1661,14 +1662,14 @@ pub struct EnvConfig {
     pub node_agent_hbone_redirect_port: u16,
     /// Opt in to the node-agent CNI plugin lifecycle hook. When `true`, the
     /// node-agent listens on `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` for ADD /
-    /// DEL / CHECK calls forwarded by the `ferrum-cni` binary that the
+    /// DEL / CHECK / GC calls forwarded by the `ferrum-cni` binary that the
     /// Helm install drops into `/opt/cni/bin/`. Default `false` so existing
     /// operators with a working install do not change behavior on upgrade;
     /// the kube-rs pod watcher remains the source of truth for enrollment
     /// regardless of this flag — CNI is an optimization, not a hard
     /// dependency.
     pub node_agent_cni_enabled: bool,
-    /// Path the node-agent listens on for the CNI plugin RPC. Default
+    /// Absolute path the node-agent listens on for the CNI plugin RPC. Default
     /// `/var/run/ferrum/node-agent-cni.sock` — a sibling of the existing
     /// `DEFAULT_NODE_AGENT_SOCKET_PATH` so the two surfaces don't collide.
     /// Only consulted when `node_agent_cni_enabled` is `true`.
@@ -2226,6 +2227,10 @@ pub struct EnvConfig {
     /// Bind address for TCP/UDP stream proxy listeners (default: 0.0.0.0).
     #[allow(dead_code)] // Used in Phase 2 (stream listener startup)
     pub stream_proxy_bind_address: String,
+    /// Trusted listener-side gateway identity used by VirtualService L4
+    /// `gateways` predicates. `None` means no binding, so those predicates
+    /// fail closed. Defaults to `mesh` only in mesh Sidecar topology.
+    pub stream_gateway_ref: Option<Arc<str>>,
 
     // DTLS frontend certificates (ECDSA P-256 or P-384 required)
     /// Path to DTLS server certificate (PEM) for frontend DTLS termination.
@@ -2342,6 +2347,31 @@ pub struct EnvConfig {
     /// Max request body size in MiB for POST/PUT /api-specs.
     /// Default: 25 MiB.
     pub admin_spec_max_body_size_mib: usize,
+
+    /// Master process gate for OpenAPI external `$ref` resolution on
+    /// `POST`/`PUT /api-specs`. Default `false` preserves fail-closed
+    /// `UnsupportedExternalRef` unless both this gate and the per-spec
+    /// `x-ferrum-external-refs` extension enable resolution.
+    pub admin_spec_external_refs_enabled: bool,
+    /// Absolute filesystem jail for `file:` / relative external `$ref` targets.
+    /// Empty disables file refs.
+    pub admin_spec_external_refs_file_root: String,
+    /// Comma-separated HTTPS origins allowed for network external `$ref`s.
+    pub admin_spec_external_refs_allowed_origins: String,
+    /// Comma-separated explicit HTTP origins (fixture/dev only).
+    pub admin_spec_external_refs_allow_http_origins: String,
+    pub admin_spec_external_refs_max_documents: usize,
+    pub admin_spec_external_refs_max_document_bytes: usize,
+    pub admin_spec_external_refs_max_aggregate_bytes: usize,
+    pub admin_spec_external_refs_max_refs: usize,
+    pub admin_spec_external_refs_max_uri_length: usize,
+    pub admin_spec_external_refs_max_redirects: usize,
+    pub admin_spec_external_refs_max_nesting: usize,
+    pub admin_spec_external_refs_connect_timeout_ms: u64,
+    pub admin_spec_external_refs_request_timeout_ms: u64,
+    pub admin_spec_external_refs_total_timeout_ms: u64,
+    /// Parsed external-`$ref` process policy (fail-closed on invalid env parts).
+    pub admin_spec_external_ref_policy: crate::admin::api_specs::ExternalRefProcessPolicy,
 
     /// Absolute deadline (seconds) for reading a **1 MiB** admin request body,
     /// applied to every admin body-collecting handler including the API-spec
@@ -2867,6 +2897,7 @@ impl Default for EnvConfig {
             admin_require_namespace_claim: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
+            stream_gateway_ref: None,
             dtls_cert_path: None,
             dtls_key_path: None,
             dtls_client_ca_cert_path: None,
@@ -2934,6 +2965,22 @@ impl Default for EnvConfig {
             admin_max_connections_per_ip: 0,
             admin_restore_max_body_size_mib: 100,
             admin_spec_max_body_size_mib: 25,
+            admin_spec_external_refs_enabled: false,
+            admin_spec_external_refs_file_root: String::new(),
+            admin_spec_external_refs_allowed_origins: String::new(),
+            admin_spec_external_refs_allow_http_origins: String::new(),
+            admin_spec_external_refs_max_documents: 32,
+            admin_spec_external_refs_max_document_bytes: 5_242_880,
+            admin_spec_external_refs_max_aggregate_bytes: 20_971_520,
+            admin_spec_external_refs_max_refs: 256,
+            admin_spec_external_refs_max_uri_length: 2048,
+            admin_spec_external_refs_max_redirects: 3,
+            admin_spec_external_refs_max_nesting: 16,
+            admin_spec_external_refs_connect_timeout_ms: 5000,
+            admin_spec_external_refs_request_timeout_ms: 15_000,
+            admin_spec_external_refs_total_timeout_ms: 60_000,
+            admin_spec_external_ref_policy:
+                crate::admin::api_specs::ExternalRefProcessPolicy::default(),
             admin_body_read_timeout_seconds: crate::admin::DEFAULT_ADMIN_BODY_READ_TIMEOUT_SECONDS,
             admin_http2_max_concurrent_streams:
                 crate::admin::DEFAULT_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS,
@@ -3430,6 +3477,27 @@ impl EnvConfig {
             tls_cert_expiry_warning_days: u64 = "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS" => 30u64;
             tls_inventory_snapshot_ttl_seconds: u64 = "FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS" => DEFAULT_SNAPSHOT_TTL_SECONDS, clamp(0u64, 86_400u64);
         }
+
+        // This binding is trusted process configuration, never connection or
+        // header data. An explicit empty value deliberately clears it. When it
+        // is omitted, only the mesh Sidecar topology receives Istio's implicit
+        // `mesh` binding; unrelated listeners and waypoint topologies do not.
+        let stream_gateway_ref = match resolve_var(conf, "FERRUM_STREAM_GATEWAY_REF") {
+            Some(raw) if raw.is_empty() => None,
+            Some(raw) => {
+                crate::proxy::stream_match::validate_canonical_gateway_ref(&raw)
+                    .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;
+                Some(Arc::<str>::from(raw))
+            }
+            None if mode == OperatingMode::Mesh => {
+                let topology = resolve_var(conf, "FERRUM_MESH_TOPOLOGY")
+                    .unwrap_or_else(|| "sidecar".to_string());
+                topology
+                    .eq_ignore_ascii_case("sidecar")
+                    .then(|| Arc::<str>::from(crate::proxy::stream_match::MESH_GATEWAY_TOKEN))
+            }
+            None => None,
+        };
         let tls_curves =
             resolve_tls_key_exchange_groups(tls_key_exchange_groups, tls_curves_legacy);
 
@@ -3456,6 +3524,20 @@ impl EnvConfig {
             admin_max_connections_per_ip: usize = "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP" => 0usize;
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
             admin_spec_max_body_size_mib: usize = "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB" => 25usize;
+            admin_spec_external_refs_enabled: bool = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED" => false;
+            admin_spec_external_refs_file_root: String = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_FILE_ROOT" => String::new();
+            admin_spec_external_refs_allowed_origins: String = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ALLOWED_ORIGINS" => String::new();
+            admin_spec_external_refs_allow_http_origins: String = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ALLOW_HTTP_ORIGINS" => String::new();
+            admin_spec_external_refs_max_documents: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_DOCUMENTS" => 32usize;
+            admin_spec_external_refs_max_document_bytes: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_DOCUMENT_BYTES" => 5_242_880usize;
+            admin_spec_external_refs_max_aggregate_bytes: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_AGGREGATE_BYTES" => 20_971_520usize;
+            admin_spec_external_refs_max_refs: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_REFS" => 256usize;
+            admin_spec_external_refs_max_uri_length: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_URI_LENGTH" => 2048usize;
+            admin_spec_external_refs_max_redirects: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_REDIRECTS" => 3usize;
+            admin_spec_external_refs_max_nesting: usize = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_MAX_NESTING" => 16usize;
+            admin_spec_external_refs_connect_timeout_ms: u64 = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_CONNECT_TIMEOUT_MS" => 5000u64;
+            admin_spec_external_refs_request_timeout_ms: u64 = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_REQUEST_TIMEOUT_MS" => 15_000u64;
+            admin_spec_external_refs_total_timeout_ms: u64 = "FERRUM_ADMIN_SPEC_EXTERNAL_REFS_TOTAL_TIMEOUT_MS" => 60_000u64;
             admin_body_read_timeout_seconds: u64 = "FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS" => crate::admin::DEFAULT_ADMIN_BODY_READ_TIMEOUT_SECONDS;
             admin_http2_max_concurrent_streams: u32 = "FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS" => crate::admin::DEFAULT_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS, max(1u32);
             admin_http2_max_header_list_size_bytes: u32 = "FERRUM_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES" => crate::admin::DEFAULT_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES, max(1_024u32);
@@ -3830,6 +3912,32 @@ impl EnvConfig {
             backend_block_dangerous_ranges,
         )?;
 
+        // Fail closed on invalid external-$ref policy parts (empty budgets,
+        // non-absolute file root, malformed origins, etc.).
+        let admin_spec_external_ref_policy =
+            crate::admin::api_specs::ExternalRefProcessPolicy::from_env_parts(
+                admin_spec_external_refs_enabled,
+                crate::admin::api_specs::external_refs::ExternalRefEnvOrigins {
+                    file_root: &admin_spec_external_refs_file_root,
+                    allowed_origins: &admin_spec_external_refs_allowed_origins,
+                    allow_http_origins: &admin_spec_external_refs_allow_http_origins,
+                },
+                crate::admin::api_specs::external_refs::ExternalRefEnvBudgets {
+                    max_documents: admin_spec_external_refs_max_documents,
+                    max_document_bytes: admin_spec_external_refs_max_document_bytes,
+                    max_aggregate_bytes: admin_spec_external_refs_max_aggregate_bytes,
+                    max_refs: admin_spec_external_refs_max_refs,
+                    max_uri_length: admin_spec_external_refs_max_uri_length,
+                    max_redirects: admin_spec_external_refs_max_redirects,
+                    max_nesting: admin_spec_external_refs_max_nesting,
+                },
+                crate::admin::api_specs::external_refs::ExternalRefEnvTimeouts {
+                    connect_timeout_ms: admin_spec_external_refs_connect_timeout_ms,
+                    request_timeout_ms: admin_spec_external_refs_request_timeout_ms,
+                    total_timeout_ms: admin_spec_external_refs_total_timeout_ms,
+                },
+            )?;
+
         let mut config = Self {
             mode: mode.clone(),
             namespace,
@@ -4090,6 +4198,7 @@ impl EnvConfig {
             tls_inventory_snapshot_ttl_seconds,
             tls_early_data_methods,
             stream_proxy_bind_address,
+            stream_gateway_ref,
             dtls_cert_path,
             dtls_key_path,
             dtls_client_ca_cert_path,
@@ -4113,6 +4222,21 @@ impl EnvConfig {
             admin_max_connections_per_ip,
             admin_restore_max_body_size_mib,
             admin_spec_max_body_size_mib,
+            admin_spec_external_refs_enabled,
+            admin_spec_external_refs_file_root,
+            admin_spec_external_refs_allowed_origins,
+            admin_spec_external_refs_allow_http_origins,
+            admin_spec_external_refs_max_documents,
+            admin_spec_external_refs_max_document_bytes,
+            admin_spec_external_refs_max_aggregate_bytes,
+            admin_spec_external_refs_max_refs,
+            admin_spec_external_refs_max_uri_length,
+            admin_spec_external_refs_max_redirects,
+            admin_spec_external_refs_max_nesting,
+            admin_spec_external_refs_connect_timeout_ms,
+            admin_spec_external_refs_request_timeout_ms,
+            admin_spec_external_refs_total_timeout_ms,
+            admin_spec_external_ref_policy,
             admin_body_read_timeout_seconds,
             admin_http2_max_concurrent_streams,
             admin_http2_max_header_list_size_bytes,
@@ -4923,6 +5047,11 @@ impl EnvConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
+        if let Some(gateway_ref) = self.stream_gateway_ref.as_deref() {
+            crate::proxy::stream_match::validate_canonical_gateway_ref(gateway_ref)
+                .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;
+        }
+
         if matches!(&self.mode, OperatingMode::ControlPlane)
             && !self.k8s_controller_enabled
             && !self.mesh_config_authority_id.is_empty()
@@ -5313,6 +5442,22 @@ impl EnvConfig {
             }
             if self.node_agent_cni_enabled && self.node_agent_cni_socket_path.trim().is_empty() {
                 return Err("FERRUM_NODE_AGENT_CNI_SOCKET_PATH must not be empty when \
+                     FERRUM_NODE_AGENT_CNI_ENABLED is true"
+                    .into());
+            }
+            if self.node_agent_cni_enabled
+                && self.node_agent_cni_socket_path != self.node_agent_cni_socket_path.trim()
+            {
+                return Err(
+                    "FERRUM_NODE_AGENT_CNI_SOCKET_PATH must not contain surrounding \
+                     whitespace"
+                        .into(),
+                );
+            }
+            if self.node_agent_cni_enabled
+                && !std::path::Path::new(self.node_agent_cni_socket_path.trim()).is_absolute()
+            {
+                return Err("FERRUM_NODE_AGENT_CNI_SOCKET_PATH must be absolute when \
                      FERRUM_NODE_AGENT_CNI_ENABLED is true"
                     .into());
             }

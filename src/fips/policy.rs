@@ -174,18 +174,6 @@ pub const PROCESS_PEER_BYPASS_ENV: &[(&str, &str)] = &[
     ),
 ];
 
-/// MongoDB URI options that disable config-database TLS peer verification.
-///
-/// A fixed MongoDB vocabulary, matched case-insensitively because the driver
-/// treats URI option names case-insensitively.
-const MONGODB_URI_VERIFICATION_BYPASS_PARAMS: &[&str] = &[
-    "tlsinsecure",
-    "tlsallowinvalidcertificates",
-    "tlsallowinvalidhostnames",
-    "tlsdisableocspendpointcheck",
-    "sslinsecure",
-];
-
 /// `true` when an environment-only boolean switch is engaged.
 ///
 /// Deliberately permissive about spelling in the *rejecting* direction: any
@@ -202,40 +190,6 @@ fn env_flag_engaged(name: &str) -> bool {
         // runs, so this cannot silently drop an engaged switch.
         Err(_) => false,
     }
-}
-
-/// The first MongoDB URI verification-bypass option present in `FERRUM_DB_URL`.
-///
-/// Returns the matched *parameter name* only. The URL is never returned,
-/// logged, or interpolated: it carries the database credentials.
-fn mongodb_url_verification_bypass(env_config: &EnvConfig) -> Option<&'static str> {
-    if env_config.db_type.as_deref() != Some("mongodb") {
-        return None;
-    }
-    let url = env_config.db_url.as_deref()?;
-    // The query component only. A password or host that happened to contain
-    // `tlsinsecure` must not be read as an option, and must not be inspected
-    // any more closely than this.
-    let query = url.split_once('?').map(|(_, query)| query)?;
-    query.split(['&', ';']).find_map(|pair| {
-        let key = pair.split('=').next().unwrap_or_default().trim();
-        // The driver treats `false` as not engaged. A bare flag with no value
-        // is engaged, matching MongoDB's own permissive parsing.
-        let engaged = match pair.split_once('=') {
-            Some((_, value)) => !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "" | "0" | "false"
-            ),
-            None => true,
-        };
-        if !engaged {
-            return None;
-        }
-        MONGODB_URI_VERIFICATION_BYPASS_PARAMS
-            .iter()
-            .copied()
-            .find(|parameter| parameter.eq_ignore_ascii_case(key))
-    })
 }
 
 /// A plugin configuration key that admits an unauthenticated TLS/DTLS peer.
@@ -406,6 +360,23 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
         ));
     }
 
+    // The MongoDB driver performs authentication and protocol cryptography
+    // through its own HMAC, PBKDF2, SHA-1, SHA-2, and MD5 implementations.
+    // Selecting its AWS-LC-backed rustls feature routes only TLS, not those
+    // primitives, so the config store cannot be admitted into this boundary.
+    if env_config
+        .db_type
+        .as_deref()
+        .is_some_and(|db_type| db_type.eq_ignore_ascii_case("mongodb"))
+    {
+        return Err(
+            "FERRUM_DB_TYPE=mongodb uses database-driver cryptography outside Ferrum's selected \
+             validated-module boundary and is refused while FIPS mode is enforced. Use a SQL \
+             config database or file mode."
+                .to_string(),
+        );
+    }
+
     // ── TLS versions ────────────────────────────────────────────────────
     // Ferrum already restricts both bounds to 1.2/1.3, and SP 800-52r2 permits
     // both. Re-assert here so a future widening of the ordinary vocabulary
@@ -496,30 +467,6 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
                 "{name} disables {detail}, and is refused while FIPS mode is enforced."
             ));
         }
-    }
-
-    // The configuration database is a peer like any other, and MongoDB's
-    // `require` mode is the one whose *name* reads as more secure while it is
-    // the mode that turns CA and hostname verification off
-    // (`DbTlsMode::allows_invalid_certificates`).
-    if env_config.mongodb_tls_allows_invalid_certs() {
-        return Err("FERRUM_DB_TLS_MODE=require maps to the MongoDB driver's \
-             `allow_invalid_certificates`, which encrypts the config-database connection but \
-             disables CA and hostname verification. It is refused while FIPS mode is enforced; \
-             use `verify-ca` or `verify-full`."
-            .to_string());
-    }
-
-    // A MongoDB connection string can carry the same opt-out as a URI option,
-    // bypassing `FERRUM_DB_TLS_MODE` entirely. Only the matched parameter name
-    // — a fixed MongoDB URI vocabulary — is reported; the URL itself carries
-    // credentials and is never interpolated.
-    if let Some(parameter) = mongodb_url_verification_bypass(env_config) {
-        return Err(format!(
-            "FERRUM_DB_URL sets the MongoDB URI option `{parameter}`, which disables \
-             config-database TLS peer verification. It is refused while FIPS mode is enforced. \
-             The offending URL is withheld from this diagnostic."
-        ));
     }
 
     // Direct process-environment escape hatches. These are read here rather
@@ -827,7 +774,7 @@ pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), Strin
         .consumers
         .iter()
         .filter(|consumer| {
-            consumer.credentials.get("basic_auth").is_some_and(|value| {
+            consumer.credentials.get("basicauth").is_some_and(|value| {
                 stored_password_hash_representations(value).any(|hash| match hash {
                     Some(hash) => !is_approved_password_hash(hash),
                     None => true,
