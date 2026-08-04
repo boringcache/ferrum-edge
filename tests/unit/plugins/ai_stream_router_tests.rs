@@ -7839,6 +7839,213 @@ async fn test_gemini_json_array_chunk_splits_and_malformed_separators_fail_close
     }
 }
 
+/// Provider-controlled segmentation must not change the normalized bytes.
+///
+/// The JSON-framing scanner resumes across chunk boundaries instead of
+/// re-reading the unread window, so the split points that matter are the ones
+/// that land inside a string, inside an escape sequence, and inside nested
+/// containers. All of them must agree with single-chunk delivery.
+#[tokio::test]
+async fn test_gemini_json_framing_is_split_invariant_including_strings_and_escapes() {
+    // Structural bytes hidden inside strings/escapes: `}`/`{`/`,`/`]` in text,
+    // an escaped quote, an escaped backslash, and a `\u` escape.
+    // `responseId` pins the chunk id so split runs are byte-comparable.
+    let body = concat!(
+        "[{\"responseId\":\"resp_split\",\"candidates\":[{\"index\":0,",
+        "\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"a}{b\\\"c\\\\d,[e]\\u007b\"}]}}]},",
+        "{\"responseId\":\"resp_split\",\"candidates\":[{\"index\":0,",
+        "\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"tail\"}]},\"finishReason\":\"STOP\"}]}]",
+    );
+    let whole = run_gemini_normalizer(4096, body, "application/json").await;
+    assert!(whole.contains("\"finish_reason\":\"stop\""), "{whole}");
+    assert!(!whole.contains("upstream_error"), "{whole}");
+    assert!(whole.contains("\"content\":\"tail\""), "{whole}");
+
+    // Byte-at-a-time plus a sweep of small sizes that straddle every interesting
+    // boundary in the payload above.
+    for chunk_size in [1usize, 2, 3, 5, 7, 11, 13, 17, 29, 64] {
+        let split = run_gemini_normalizer(chunk_size, body, "application/json").await;
+        assert_eq!(
+            strip_created(&split),
+            strip_created(&whole),
+            "chunk size {chunk_size} must produce identical normalized output"
+        );
+    }
+
+    // Concatenated (non-array) framing carries the same guarantee.
+    let concat_body = concat!(
+        "{\"responseId\":\"resp_cat\",\"candidates\":[{\"index\":0,",
+        "\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"x\\\"}\\\\\"}]}}]}",
+        "{\"responseId\":\"resp_cat\",\"candidates\":[{\"index\":0,",
+        "\"finishReason\":\"STOP\"}]}",
+    );
+    let concat_whole = run_gemini_normalizer(4096, concat_body, "application/json").await;
+    for chunk_size in [1usize, 2, 3, 9] {
+        let split = run_gemini_normalizer(chunk_size, concat_body, "application/json").await;
+        assert_eq!(
+            strip_created(&split),
+            strip_created(&concat_whole),
+            "concatenated framing must be split-invariant at chunk size {chunk_size}"
+        );
+    }
+    assert!(!concat_whole.contains("upstream_error"), "{concat_whole}");
+}
+
+/// Normalized Gemini JSON-array streams leave as SSE, so they must be labelled
+/// as SSE — an `application/json` label on `chat.completion.chunk` frames plus
+/// `data: [DONE]` misroutes OpenAI SDKs and content-type-keyed response plugins.
+#[tokio::test]
+async fn test_gemini_json_framing_response_is_relabelled_event_stream() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    let mut ctx = post_ctx(&body);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "17".to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        resp_headers.get("content-type").map(String::as_str),
+        Some("text/event-stream"),
+        "JSON-framed normalization must relabel the response as SSE"
+    );
+    // The existing representation repairs still apply.
+    assert!(!resp_headers.contains_key("content-length"));
+
+    // An SSE label (including its parameters) is left untouched.
+    for original in [
+        "text/event-stream",
+        "text/event-stream; charset=utf-8",
+        "TEXT/EVENT-STREAM",
+    ] {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), original.to_string());
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            resp_headers.get("content-type").map(String::as_str),
+            Some(original),
+            "an SSE label must survive normalization verbatim"
+        );
+    }
+}
+
+/// A `promptFeedback` block is a terminal like any other: it may not contradict
+/// a candidate that already finished, and it may not close a stream with the
+/// success terminal while another candidate is visible-but-unfinished.
+#[tokio::test]
+async fn test_gemini_prompt_block_respects_candidate_lifecycle() {
+    // Candidate 0 already finished with STOP: no second, contradictory terminal.
+    let after_finish = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+        "data: {\"promptFeedback\":{\"blockReason\":\"PROHIBITED_CONTENT\"}}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, after_finish, "text/event-stream").await;
+    assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+    assert!(
+        !out.contains("\"finish_reason\":\"content_filter\""),
+        "a finished choice must not receive a second terminal: {out}"
+    );
+    assert_eq!(out.matches("\"finish_reason\":\"").count(), 1, "{out}");
+    assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+
+    // Candidate 1 emitted visible output and never finished: the prompt block is
+    // a premature close, not a success.
+    let unfinished_sibling = concat!(
+        "data: {\"candidates\":[",
+        "{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"a\"}]}},",
+        "{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"b\"}]}}]}\n\n",
+        "data: {\"promptFeedback\":{\"blockReason\":\"PROHIBITED_CONTENT\"}}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, unfinished_sibling, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(
+        out.contains("before every candidate reached a terminal finishReason"),
+        "{out}"
+    );
+    assert!(!out.contains("\"total_tokens\""), "{out}");
+    assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+
+    // The single-candidate case is unchanged: the block finishes choice 0.
+    let solo = "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n";
+    let out = run_gemini_normalizer(4096, solo, "text/event-stream").await;
+    assert!(out.contains("\"finish_reason\":\"content_filter\""), "{out}");
+    assert!(!out.contains("upstream_error"), "{out}");
+    assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+}
+
+/// Claim admission and translation must agree on orphaned `tool_call_id`, so
+/// the client gets the precise message instead of the generic translation 400.
+#[tokio::test]
+async fn test_gemini_orphaned_tool_call_id_rejected_at_claim() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call_missing", "content": "{\"ok\":true}"}
+        ]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), Some(400));
+    if let PluginResult::Reject { body, .. } = &result {
+        assert!(
+            body.contains("tool_call_id has no matching assistant tool call"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("could not be translated safely"),
+            "admission must not fall through to the generic translation error: {body}"
+        );
+    }
+
+    // A matched id still admits and translates.
+    let paired = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"ok\":true}"}
+        ]
+    });
+    let mut ctx = post_ctx(&paired);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
 #[tokio::test]
 async fn test_gemini_keeps_claim_model_and_pins_response_id() {
     // Provider modelVersion must not overwrite the claim-committed model.
@@ -8421,7 +8628,9 @@ async fn test_gemini_claim_fail_closed_roles_tools_and_legacy_pairing() {
         }
     }
 
-    // Matching tool_call_id is enforced at translation (not only claim validation).
+    // Matching tool_call_id is enforced at claim admission — the validator and
+    // the translator walk the same rule, so the client gets the precise
+    // `messages[i]` diagnostic rather than the generic translation failure.
     let unknown_tool_id = json!({
         "model": "gemini-1.5-flash",
         "stream": true,
@@ -8436,16 +8645,26 @@ async fn test_gemini_claim_fail_closed_roles_tools_and_legacy_pairing() {
     });
     let mut ctx = post_ctx(&unknown_tool_id);
     let mut headers = json_headers();
-    assert!(matches!(
-        plugin.before_proxy(&mut ctx, &mut headers).await,
-        PluginResult::Continue
-    ));
-    let original = serde_json::to_vec(&unknown_tool_id).unwrap();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400, "{body}");
+            assert!(
+                body.contains("tool_call_id has no matching assistant tool call"),
+                "{body}"
+            );
+            assert!(body.contains("invalid_messages"), "{body}");
+            assert!(!body.contains("call_unknown"), "{body}");
+        }
+        other => panic!("orphaned tool_call_id must reject at claim, got {other:?}"),
+    }
+    // No claim was committed, so nothing downstream can translate this body.
     assert!(
         plugin
             .transform_request_body_with_context(
                 &mut ctx,
-                &original,
+                serde_json::to_vec(&unknown_tool_id).unwrap().as_slice(),
                 Some("application/json"),
                 &headers,
             )
@@ -8453,19 +8672,6 @@ async fn test_gemini_claim_fail_closed_roles_tools_and_legacy_pairing() {
             .is_none(),
         "unknown tool_call_id must not produce a provider body"
     );
-    match plugin
-        .on_final_request_body_with_context(&mut ctx, &headers, &original)
-        .await
-    {
-        PluginResult::Reject {
-            status_code, body, ..
-        } => {
-            assert_eq!(status_code, 400, "{body}");
-            assert!(body.contains("could not be translated safely"), "{body}");
-            assert!(!body.contains("call_unknown"), "{body}");
-        }
-        other => panic!("untranslated Gemini body must fail closed, got {other:?}"),
-    }
 }
 
 #[tokio::test]

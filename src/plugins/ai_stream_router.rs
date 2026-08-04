@@ -230,21 +230,22 @@ use super::{
 use crate::config::types::{BackendScheme, BackendTlsConfig};
 use crate::util::unknown_keys::reject_unknown_keys;
 
-/// Exact response fields invalidated when Anthropic SSE is normalized.
+/// Exact response fields invalidated when provider SSE is normalized.
 ///
 /// Derived from the shared representation-invalidation inventory so trailer
-/// policy cannot drift from the header rewrite. The three extra fields are
-/// owned directly by [`repair_normalized_representation_headers`].
+/// policy cannot drift from the header rewrite. The four extra fields are owned
+/// directly by [`repair_normalized_representation_headers`] and
+/// [`stamp_normalized_sse_content_type`].
 static AI_STREAM_ROUTER_RESPONSE_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
     std::sync::LazyLock::new(|| {
-        let mut names = Vec::with_capacity(super::TRANSFORM_INVALIDATED_RESPONSE_HEADERS.len() + 3);
+        let mut names = Vec::with_capacity(super::TRANSFORM_INVALIDATED_RESPONSE_HEADERS.len() + 4);
         names.extend(
             super::TRANSFORM_INVALIDATED_RESPONSE_HEADERS
                 .iter()
                 .map(|name| (*name).to_string()),
         );
         names.extend(
-            ["content-encoding", "content-length", "vary"]
+            ["content-encoding", "content-length", "content-type", "vary"]
                 .into_iter()
                 .map(str::to_string),
         );
@@ -1939,6 +1940,12 @@ fn validate_gemini_translation(openai_body: &Value) -> Result<(), String> {
         .and_then(Value::as_array)
         .ok_or_else(|| "request missing 'messages' array".to_string())?;
     let mut pending_legacy_by_name: HashMap<String, String> = HashMap::new();
+    // Mirrors `translate_to_gemini`'s `tool_names_by_id`: a `tool` message can
+    // only be represented as a `functionResponse` when a PRECEDING assistant
+    // message declared the id. Admission must reject an orphaned id here, or the
+    // translator rejects it later and the client gets the generic
+    // "could not be translated safely" 400 instead of this precise diagnostic.
+    let mut declared_tool_call_ids: HashSet<String> = HashSet::new();
     let mut message_index = 0;
     while message_index < messages.len() {
         let message = &messages[message_index];
@@ -1954,9 +1961,14 @@ fn validate_gemini_translation(openai_body: &Value) -> Result<(), String> {
                 && messages[message_index]["role"].as_str() == Some("tool")
             {
                 let tool_message = &messages[message_index];
-                let _ = tool_message["tool_call_id"].as_str().ok_or_else(|| {
+                let tool_call_id = tool_message["tool_call_id"].as_str().ok_or_else(|| {
                     format!("messages[{message_index}] tool message missing tool_call_id")
                 })?;
+                if !declared_tool_call_ids.contains(tool_call_id) {
+                    return Err(format!(
+                        "messages[{message_index}] tool_call_id has no matching assistant tool call"
+                    ));
+                }
                 tool_result_text(&tool_message["content"])
                     .map_err(|error| format!("messages[{message_index}] {error}"))?;
                 message_index += 1;
@@ -2004,6 +2016,9 @@ fn validate_gemini_translation(openai_body: &Value) -> Result<(), String> {
             return Err(format!(
                 "messages[{message_index}] mixes modern tool_calls with legacy function_call"
             ));
+        }
+        for call in &tool_calls {
+            declared_tool_call_ids.insert(call.id.clone());
         }
         let had_legacy = legacy_call.is_some();
         if let Some(call) = legacy_call {
@@ -3311,14 +3326,17 @@ impl Plugin for AiStreamRouter {
         .await
     }
 
-    /// Bind every field normalized Anthropic SSE invalidates.
+    /// Bind every field normalized provider SSE invalidates.
     ///
     /// When this plugin rewrites provider SSE into OpenAI-shaped identity bytes,
     /// `repair_normalized_representation_headers` removes `content-encoding` and
     /// `content-length`, runs
     /// [`super::invalidate_content_bound_response_headers`] (validators, digests,
     /// signatures, and the open-ended `x-amz-checksum-*` / `x-checksum-*`
-    /// families), and scrubs or rewrites `vary`. A trailer-only copy of any of
+    /// families), and scrubs or rewrites `vary`; for a non-SSE provider framing
+    /// such as the Gemini JSON-array fallback,
+    /// [`stamp_normalized_sse_content_type`] additionally relabels
+    /// `content-type`. A trailer-only copy of any of
     /// them is invisible to the per-request mutation witness (absent → absent),
     /// so the exact names and checksum prefixes are derived from the same shared
     /// invalidation inventory. Other application trailers remain intact.
@@ -3370,12 +3388,14 @@ impl Plugin for AiStreamRouter {
         match classify_provider_content_encoding(response_headers) {
             ProviderContentEncoding::Identity => {
                 repair_normalized_representation_headers(response_headers);
+                stamp_normalized_sse_content_type(response_headers);
                 PluginResult::Continue
             }
             ProviderContentEncoding::Supported(coding) => {
                 ctx.metadata
                     .insert(META_PROVIDER_ENCODING.to_string(), coding);
                 repair_normalized_representation_headers(response_headers);
+                stamp_normalized_sse_content_type(response_headers);
                 PluginResult::Continue
             }
             ProviderContentEncoding::Unsupported(reason) => openai_error_response(
@@ -3647,6 +3667,35 @@ fn repair_normalized_representation_headers(headers: &mut HashMap<String, String
     remove_header_ci(headers, "content-length");
     super::invalidate_content_bound_response_headers(headers);
     scrub_accept_encoding_from_vary(headers);
+}
+
+/// Media type every normalizer emits, whatever the provider labelled its own
+/// framing as.
+const NORMALIZED_SSE_CONTENT_TYPE: &str = "text/event-stream";
+
+/// Relabel a normalized response whose provider media type is not SSE.
+///
+/// The Gemini adapter also normalizes the Vertex JSON-array fallback (a
+/// provider that ignores the injected `alt=sse` answers `application/json`), and
+/// what leaves the gateway on that path is OpenAI `chat.completion.chunk` SSE
+/// terminated by `data: [DONE]`. Leaving the provider's `application/json`
+/// label on those bytes would make OpenAI SDKs, intermediaries, and the
+/// gateway's own `is_streaming_content_type` dispatch on a media type the body
+/// no longer has. Responses already labelled `text/event-stream` (every
+/// Anthropic normalization, and Gemini's SSE framing) are left untouched so
+/// their `charset` and other parameters survive.
+fn stamp_normalized_sse_content_type(headers: &mut HashMap<String, String>) {
+    let already_sse = headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type") && is_event_stream_content_type(value)
+    });
+    if already_sse {
+        return;
+    }
+    remove_header_ci(headers, "content-type");
+    headers.insert(
+        "content-type".to_string(),
+        NORMALIZED_SSE_CONTENT_TYPE.to_string(),
+    );
 }
 
 fn scrub_accept_encoding_from_vary(headers: &mut HashMap<String, String>) {
@@ -4890,6 +4939,9 @@ struct GeminiStreamNormalizer {
     buf: Vec<u8>,
     cursor: usize,
     scan_cursor: usize,
+    /// Resumable structural state for the JSON-framed value scanner. See
+    /// [`JsonScanMemo`] for the staleness argument.
+    json_scan: JsonScanMemo,
     bytes_ingested: usize,
     events_seen: usize,
     normalized_out_bytes: usize,
@@ -4916,6 +4968,7 @@ impl GeminiStreamNormalizer {
             buf: Vec::new(),
             cursor: 0,
             scan_cursor: 0,
+            json_scan: JsonScanMemo::Fresh,
             bytes_ingested: 0,
             events_seen: 0,
             normalized_out_bytes: 0,
@@ -4943,10 +4996,24 @@ impl GeminiStreamNormalizer {
         self.buf.len().saturating_sub(self.cursor)
     }
 
+    /// Sole cursor writer outside compaction.
+    ///
+    /// The JSON scan memo is expressed relative to the start of the value under
+    /// scan, which is always `cursor`, so any cursor move invalidates it. Doing
+    /// the reset here — rather than at each call site — is what makes a stale
+    /// memo unrepresentable.
+    fn set_cursor(&mut self, pos: usize) {
+        if pos != self.cursor {
+            self.json_scan = JsonScanMemo::Fresh;
+        }
+        self.cursor = pos;
+    }
+
     fn clear_buffer(&mut self) {
         self.buf.clear();
         self.cursor = 0;
         self.scan_cursor = 0;
+        self.json_scan = JsonScanMemo::Fresh;
         if self.buf.capacity() > 64 * 1024 {
             self.buf.shrink_to(4096);
         }
@@ -4964,6 +5031,9 @@ impl GeminiStreamNormalizer {
             let consumed = self.cursor;
             self.buf.drain(..consumed);
             self.scan_cursor = self.scan_cursor.saturating_sub(consumed);
+            // Draining exactly `cursor` bytes leaves the unread region
+            // byte-for-byte identical and moves its start to 0, so the
+            // cursor-relative JSON scan memo stays valid without adjustment.
             self.cursor = 0;
         }
     }
@@ -5090,6 +5160,39 @@ impl GeminiStreamNormalizer {
             out,
         );
         self.finish(StreamTerminal::UpstreamFailure, out);
+        true
+    }
+
+    /// Terminate on a `promptFeedback.blockReason` under the same
+    /// candidate-lifecycle contract every other terminal obeys.
+    ///
+    /// A prompt block ends the whole generation, but it must not manufacture a
+    /// second terminal chunk for a choice that already finished (a `stop`
+    /// followed by a contradictory `content_filter`), and it must not close a
+    /// multi-candidate stream with the success-shaped terminal while another
+    /// candidate has emitted client-visible output and never reached a terminal
+    /// `finishReason`. That second case is exactly the premature close
+    /// `finish_stream` fails closed on, so it fails closed here too.
+    fn finish_prompt_block(&mut self, out: &mut NormalizedSseOut) -> bool {
+        if !self.candidate_already_finished(0) {
+            self.ensure_role(0, out);
+            self.write_chunk_line(0, json!({}), Some("content_filter"), out);
+            self.mark_candidate_finished_visible(0);
+            self.saw_successful_finish = true;
+        }
+        let unfinished_visible = self
+            .candidates
+            .values()
+            .any(|state| state.emitted_client_visible && !state.finished);
+        if unfinished_visible {
+            self.emit_upstream_error(
+                "upstream provider blocked the Gemini prompt before every candidate reached a terminal finishReason",
+                out,
+            );
+            self.finish(StreamTerminal::UpstreamFailure, out);
+            return true;
+        }
+        self.finish(StreamTerminal::MessageStop, out);
         true
     }
 
@@ -5266,14 +5369,7 @@ impl GeminiStreamNormalizer {
         }
 
         match gemini_prompt_block_reason(event) {
-            Ok(Some(_)) => {
-                self.ensure_role(0, out);
-                self.write_chunk_line(0, json!({}), Some("content_filter"), out);
-                self.mark_candidate_finished_visible(0);
-                self.saw_successful_finish = true;
-                self.finish(StreamTerminal::MessageStop, out);
-                return true;
-            }
+            Ok(Some(_)) => return self.finish_prompt_block(out),
             Ok(None) => {}
             Err(message) => {
                 self.emit_upstream_error(message, out);
@@ -5560,7 +5656,7 @@ impl GeminiStreamNormalizer {
                     "upstream provider sent a malformed SSE event; stream terminated",
                 ),
             };
-            self.cursor = end;
+            self.set_cursor(end);
             self.scan_cursor = end;
             self.events_seen = self.events_seen.saturating_add(1);
             let terminate = match outcome {
@@ -5586,9 +5682,11 @@ impl GeminiStreamNormalizer {
     }
 
     fn skip_json_whitespace(&mut self) {
-        while self.cursor < self.buf.len() && self.buf[self.cursor].is_ascii_whitespace() {
-            self.cursor += 1;
+        let mut pos = self.cursor;
+        while pos < self.buf.len() && self.buf[pos].is_ascii_whitespace() {
+            pos += 1;
         }
+        self.set_cursor(pos);
         self.scan_cursor = self.cursor;
     }
 
@@ -5616,7 +5714,7 @@ impl GeminiStreamNormalizer {
                 GeminiJsonArrayState::Inactive => {
                     if self.buf[self.cursor] == b'[' {
                         self.json_array_state = GeminiJsonArrayState::ExpectFirstValueOrEnd;
-                        self.cursor += 1;
+                        self.set_cursor(self.cursor + 1);
                         self.scan_cursor = self.cursor;
                         continue;
                     }
@@ -5624,7 +5722,7 @@ impl GeminiStreamNormalizer {
                 GeminiJsonArrayState::ExpectFirstValueOrEnd => {
                     if self.buf[self.cursor] == b']' {
                         self.json_array_state = GeminiJsonArrayState::Closed;
-                        self.cursor += 1;
+                        self.set_cursor(self.cursor + 1);
                         self.scan_cursor = self.cursor;
                         continue;
                     }
@@ -5640,12 +5738,12 @@ impl GeminiStreamNormalizer {
                 GeminiJsonArrayState::ExpectCommaOrEnd => {
                     if self.buf[self.cursor] == b']' {
                         self.json_array_state = GeminiJsonArrayState::Closed;
-                        self.cursor += 1;
+                        self.set_cursor(self.cursor + 1);
                         self.scan_cursor = self.cursor;
                         continue;
                     }
                     if self.buf[self.cursor] == b',' {
-                        self.cursor += 1;
+                        self.set_cursor(self.cursor + 1);
                         self.scan_cursor = self.cursor;
                         self.json_array_state = GeminiJsonArrayState::ExpectValueAfterComma;
                         continue;
@@ -5655,16 +5753,48 @@ impl GeminiStreamNormalizer {
                 }
             }
 
-            let unread = &self.buf[self.cursor..];
-            let Some(end_rel) = next_json_value_end(unread) else {
-                if unread.len() > MAX_SSE_EVENT_BYTES {
-                    self.fail_bound(
-                        "upstream provider sent an oversized SSE event; stream terminated",
-                        out,
-                    );
-                    return true;
+            // Incremental framing scan: every `on_chunk` resumes where the last
+            // one stopped instead of re-reading the whole unread window, so a
+            // value delivered in tiny provider-controlled segments costs O(n)
+            // in total rather than O(n^2).
+            let resume = match self.json_scan {
+                JsonScanMemo::Invalid => None,
+                JsonScanMemo::Fresh => Some(JsonValueScan::default()),
+                JsonScanMemo::Partial(state) => Some(state),
+            };
+            let step = match resume {
+                Some(state) => scan_json_value(&self.buf[self.cursor..], state),
+                None => JsonScanStep::Invalid,
+            };
+            let end_rel = match step {
+                JsonScanStep::Complete(end_rel) => end_rel,
+                JsonScanStep::Partial(state) => {
+                    self.json_scan = JsonScanMemo::Partial(state);
+                    if self.unread_len() > MAX_SSE_EVENT_BYTES {
+                        self.fail_bound(
+                            "upstream provider sent an oversized SSE event; stream terminated",
+                            out,
+                        );
+                        return true;
+                    }
+                    break;
                 }
-                break;
+                JsonScanStep::Invalid => {
+                    // Monotone under appends: a first byte that cannot open a
+                    // JSON value, or a structural close below depth 0, can
+                    // never be repaired by more bytes. Remember it so the
+                    // remainder of the stream is not rescanned; the unread
+                    // window still fails closed once it exceeds the cap.
+                    self.json_scan = JsonScanMemo::Invalid;
+                    if self.unread_len() > MAX_SSE_EVENT_BYTES {
+                        self.fail_bound(
+                            "upstream provider sent an oversized SSE event; stream terminated",
+                            out,
+                        );
+                        return true;
+                    }
+                    break;
+                }
             };
             if end_rel > MAX_SSE_EVENT_BYTES {
                 self.fail_bound(
@@ -5693,7 +5823,7 @@ impl GeminiStreamNormalizer {
                     return true;
                 }
             };
-            self.cursor = end;
+            self.set_cursor(end);
             self.scan_cursor = end;
             self.events_seen = self.events_seen.saturating_add(1);
             if matches!(
@@ -5976,47 +6106,97 @@ fn map_gemini_finish_reason(reason: &str) -> Result<&'static str, &'static str> 
     }
 }
 
-/// Index just past one complete top-level JSON value, or `None` if incomplete.
-fn next_json_value_end(buf: &[u8]) -> Option<usize> {
-    if buf.is_empty() {
-        return None;
+/// Resume point for the top-level JSON value scanner.
+///
+/// `scanned` counts bytes already inspected from the START OF THE VALUE, and
+/// the three flags are the exact structural state the scanner needs to continue
+/// mid-string or mid-escape without misparsing. A resume offset alone would not
+/// be enough: restarting inside a string would read `{`/`}`/`"` as structure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct JsonValueScan {
+    scanned: usize,
+    depth: usize,
+    in_string: bool,
+    escape: bool,
+}
+
+/// Memoized scan position for the value that starts at the normalizer cursor.
+///
+/// Staleness is unrepresentable rather than merely avoided: every offset is
+/// relative to `cursor`, `GeminiStreamNormalizer::set_cursor` drops the memo the
+/// instant the cursor moves (including whitespace skips, array punctuation, and
+/// consuming a completed value), `clear_buffer` resets it, and the only other
+/// buffer mutations are appends at the end and a compaction that drains exactly
+/// `cursor` bytes — neither of which changes the unread region or its offsets.
+/// So `cursor + scanned <= buf.len()` always holds and the memo can only ever
+/// describe still-unread bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JsonScanMemo {
+    /// Nothing scanned yet for the value starting at the cursor.
+    Fresh,
+    /// Partial scan; resume without re-reading already-scanned bytes.
+    Partial(JsonValueScan),
+    /// These bytes can never complete a top-level JSON value.
+    Invalid,
+}
+
+/// Outcome of one incremental scan pass.
+enum JsonScanStep {
+    /// One complete value ends this many bytes after the value start.
+    Complete(usize),
+    /// More bytes are needed; resume from the carried state.
+    Partial(JsonValueScan),
+    /// Not a JSON object/array, or a structural close below depth 0.
+    Invalid,
+}
+
+/// Advance the scan for one complete top-level JSON value at `buf[0]`.
+///
+/// Resuming from `resume` is byte-for-byte equivalent to scanning `buf` from
+/// zero: the scanner is a left-to-right DFA over `(depth, in_string, escape)`,
+/// and the "must open with `{`/`[`" admission check runs exactly once, on the
+/// fresh pass.
+fn scan_json_value(buf: &[u8], resume: JsonValueScan) -> JsonScanStep {
+    let mut state = resume;
+    if state.scanned == 0 {
+        match buf.iter().find(|b| !b.is_ascii_whitespace()).copied() {
+            // Nothing structural yet; re-admit on the next pass.
+            None => return JsonScanStep::Partial(state),
+            Some(b'{' | b'[') => {}
+            Some(_) => return JsonScanStep::Invalid,
+        }
     }
-    let first = *buf.iter().find(|b| !b.is_ascii_whitespace())?;
-    if first != b'{' && first != b'[' {
-        return None;
-    }
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escape = false;
-    for (idx, &b) in buf.iter().enumerate() {
-        if in_string {
-            if escape {
-                escape = false;
+    let start = state.scanned.min(buf.len());
+    for (rel, &b) in buf[start..].iter().enumerate() {
+        if state.in_string {
+            if state.escape {
+                state.escape = false;
                 continue;
             }
             match b {
-                b'\\' => escape = true,
-                b'"' => in_string = false,
+                b'\\' => state.escape = true,
+                b'"' => state.in_string = false,
                 _ => {}
             }
             continue;
         }
         match b {
-            b'"' => in_string = true,
-            b'{' | b'[' => depth = depth.saturating_add(1),
+            b'"' => state.in_string = true,
+            b'{' | b'[' => state.depth = state.depth.saturating_add(1),
             b'}' | b']' => {
-                if depth == 0 {
-                    return None;
+                if state.depth == 0 {
+                    return JsonScanStep::Invalid;
                 }
-                depth -= 1;
-                if depth == 0 {
-                    return Some(idx + 1);
+                state.depth -= 1;
+                if state.depth == 0 {
+                    return JsonScanStep::Complete(start + rel + 1);
                 }
             }
             _ => {}
         }
     }
-    None
+    state.scanned = buf.len();
+    JsonScanStep::Partial(state)
 }
 
 /// Decode residual provider content-coding chains, then feed plaintext into
@@ -6413,5 +6593,109 @@ mod sse_buffer_tests {
             "capacity {capacity} should stay well below total input {total_input}"
         );
         assert_eq!(normalizer.bytes_ingested, iterations * event.len());
+    }
+
+    /// Payload whose structural bytes are deliberately hidden inside strings and
+    /// escapes, so a scanner that resumed on an offset alone would misparse it.
+    const TRICKY_JSON: &[u8] = br#"{"a":"}{\"x\":[1]","b":{"c":["\\","]"]},"d":"\u007b"}"#;
+
+    #[test]
+    fn json_value_scan_resume_matches_single_pass() {
+        let fresh = JsonValueScan::default();
+        let one_shot = match scan_json_value(TRICKY_JSON, fresh) {
+            JsonScanStep::Complete(end) => end,
+            _ => panic!("payload must complete in a single pass"),
+        };
+        assert_eq!(one_shot, TRICKY_JSON.len());
+
+        // Every possible two-piece split resumes to the same answer.
+        for split in 1..TRICKY_JSON.len() {
+            let state = match scan_json_value(&TRICKY_JSON[..split], fresh) {
+                JsonScanStep::Partial(state) => state,
+                _ => panic!("prefix must be incomplete at split {split}"),
+            };
+            assert_eq!(state.scanned, split, "split {split} must memoize progress");
+            match scan_json_value(TRICKY_JSON, state) {
+                JsonScanStep::Complete(end) => assert_eq!(end, one_shot, "split {split}"),
+                _ => panic!("resumed scan must complete at split {split}"),
+            }
+        }
+
+        // Byte-at-a-time never rescans: each pass consumes exactly the new byte.
+        let mut state = JsonValueScan::default();
+        let mut completed = None;
+        for take in 1..=TRICKY_JSON.len() {
+            match scan_json_value(&TRICKY_JSON[..take], state) {
+                JsonScanStep::Complete(end) => {
+                    completed = Some(end);
+                    break;
+                }
+                JsonScanStep::Partial(next) => {
+                    assert_eq!(next.scanned, take, "scan must not rewind at {take}");
+                    state = next;
+                }
+                JsonScanStep::Invalid => panic!("valid payload rejected at {take}"),
+            }
+        }
+        assert_eq!(completed, Some(one_shot));
+    }
+
+    #[test]
+    fn json_value_scan_rejects_non_container_and_structural_underflow() {
+        let fresh = JsonValueScan::default();
+        for hostile in [b"5".as_slice(), b"\"str\"".as_slice(), b"}".as_slice()] {
+            assert!(matches!(
+                scan_json_value(hostile, fresh),
+                JsonScanStep::Invalid
+            ));
+        }
+        // A resumed pass keeps the same structural verdict.
+        let state = match scan_json_value(b"[1", fresh) {
+            JsonScanStep::Partial(state) => state,
+            _ => panic!("prefix must be incomplete"),
+        };
+        assert!(matches!(
+            scan_json_value(b"[1]]", state),
+            JsonScanStep::Complete(3)
+        ));
+    }
+
+    /// The framing memo must advance with the buffer rather than restarting, and
+    /// must never describe bytes outside the unread window.
+    #[test]
+    fn gemini_json_framing_memo_is_incremental_and_never_stale() {
+        let mut normalizer = GeminiStreamNormalizer::new("gemini-test".to_string(), false);
+        let event =
+            br#"{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"hi"}]}}]}"#;
+        let mut out = NormalizedSseOut::unbounded();
+        for (idx, byte) in event.iter().enumerate() {
+            out.begin_call();
+            assert!(
+                !normalizer.push_chunk(&[*byte], &mut out),
+                "partial value must not terminate at byte {idx}"
+            );
+            out.reset_call();
+            if idx + 1 == event.len() {
+                break;
+            }
+            match normalizer.json_scan {
+                JsonScanMemo::Partial(state) => {
+                    assert_eq!(
+                        state.scanned,
+                        normalizer.unread_len(),
+                        "memo must cover exactly the unread window at byte {idx}"
+                    );
+                    assert!(
+                        normalizer.cursor + state.scanned <= normalizer.buf.len(),
+                        "memo must never point past the buffer at byte {idx}"
+                    );
+                }
+                other => panic!("byte {idx} must memoize a partial scan: {other:?}"),
+            }
+        }
+        // The completed value consumed the buffer and dropped the memo.
+        assert_eq!(normalizer.json_scan, JsonScanMemo::Fresh);
+        assert_eq!(normalizer.events_seen, 1);
+        assert_eq!(normalizer.unread_len(), 0);
     }
 }
