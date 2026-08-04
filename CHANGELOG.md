@@ -55,7 +55,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `export_visibility_admits` helper. Malformed lists (`~`, empty entries,
   non-RFC-1123 namespace names, over-long lists, `*` mixed with an explicit
   namespace) on a native/file/xDS source are now a config rejection instead of
-  being interpreted at evaluation time.
+  being interpreted at evaluation time. Visibility is enforced at the SAME
+  three points a DestinationRule's is — CP slice narrowing, the xDS ECDS
+  carrier fold on the data plane, and outbound `cors` plugin synthesis on the
+  data plane — so a producer that bypasses slice admission cannot inject
+  another namespace's CORS behaviour onto a workload's outbound routes.
+
+- The mesh root namespace (`meshConfig.rootNamespace`) now rides `MeshSlice`
+  (native field plus a dedicated `IstioRootNamespaceCarrier` ECDS carrier), so
+  the data plane can distinguish an admitted root-tier DestinationRule from one
+  declared in an arbitrary namespace and **refuse** the latter at
+  materialization. This closes the reverse-translated xDS path, where
+  carrier-recovered rules never pass slice admission. A producer that carries no
+  root namespace keeps the earlier permissive bucketing rather than refusing a
+  rule it has no evidence to classify.
+
+- DestinationRule lookup-tier arbitration on the data plane is now per
+  destination HOST rather than per upstream, matching Istio's per-host
+  resolution. An upstream whose targets span two services previously collapsed
+  the two independent lookups into one upstream-wide minimum, silently skipping
+  the only rule the second host had.
+
+- `exportTo` entries on the DestinationRule, ServiceEntry, and
+  VirtualService-CORS xDS carriers are canonicalized (trimmed) at decode. The
+  shared visibility evaluator deliberately never reinterprets padded input and
+  ACK-time validation checks a trimmed copy, so an un-normalized `[" beta "]`
+  was previously ACKed and then matched nothing.
 
 - VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`

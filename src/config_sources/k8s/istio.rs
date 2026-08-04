@@ -1043,10 +1043,9 @@ fn destination_rule(
         if declared.is_empty() {
             vec!["*".to_string()]
         } else {
-            declared
-                .iter()
-                .map(|entry| entry.trim().to_string())
-                .collect()
+            let mut entries = declared;
+            crate::modes::mesh::config::normalize_mesh_export_to(&mut entries);
+            entries
         }
     };
 
@@ -3355,10 +3354,9 @@ fn virtual_service_routes(
             if declared.is_empty() {
                 vec!["*".to_string()]
             } else {
-                declared
-                    .iter()
-                    .map(|entry| entry.trim().to_string())
-                    .collect()
+                let mut entries = declared;
+                crate::modes::mesh::config::normalize_mesh_export_to(&mut entries);
+                entries
             }
         };
         for host in &hosts {

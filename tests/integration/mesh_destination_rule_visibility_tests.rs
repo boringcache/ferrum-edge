@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 
-use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::config::types::{GatewayConfig, UpstreamTarget};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
@@ -1617,5 +1617,92 @@ fn a_wildcard_host_grants_no_service_tier() {
         vec!["client-override".to_string()],
         "a wildcard host cannot be owned, so a third-party rule for it is \
          refused and the client's own rule stands"
+    );
+}
+
+// ── Per-host tier arbitration ────────────────────────────────────────────
+
+/// Istio resolves a DestinationRule PER DESTINATION HOST. An upstream whose
+/// targets span two services carries two independent lookups, so one host's
+/// winning tier must not suppress the only rule the other host has.
+///
+/// Arbitrating per UPSTREAM used to compute a single minimum across every
+/// matching rule: the alpha client's own rule for `a.alpha` made `Client` the
+/// upstream-wide winner, and beta's rule — the sole policy for `b.beta`, and
+/// correctly admitted at the service tier — was skipped, silently dropping its
+/// load-balancer setting.
+#[test]
+fn an_upstream_spanning_two_services_resolves_each_host_independently() {
+    let a_host = "a.alpha.svc.cluster.local";
+    let b_host = "b.beta.svc.cluster.local";
+
+    let mut beta_rule = rule("beta", "beta-owner", b_host, 4444, &["*"]);
+    beta_rule.traffic_policy = Some(MeshTrafficPolicy {
+        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
+        ..MeshTrafficPolicy::default()
+    });
+
+    let mesh = MeshConfig {
+        services: vec![service_in("alpha", "a"), service_in("beta", "b")],
+        workloads: vec![
+            workload_in("alpha", "a"),
+            workload_in("beta", "b"),
+            workload_in("alpha", "web"),
+        ],
+        destination_rules: vec![rule("alpha", "client-a", a_host, 1111, &["*"]), beta_rule],
+        sidecars: vec![permissive_sidecar("alpha")],
+        ..MeshConfig::default()
+    };
+
+    let mut upstream = http_upstream("mixed-u", a_host, 8080);
+    upstream.namespace = "alpha".to_string();
+    upstream.name = None;
+    upstream.targets.push(UpstreamTarget {
+        host: b_host.to_string(),
+        port: 8080,
+        service_port_policy_key: None,
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    });
+    let mut proxy = http_proxy("mixed-p", a_host, 8080);
+    proxy.namespace = "alpha".to_string();
+    proxy.upstream_id = Some("mixed-u".to_string());
+
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        upstreams: vec![upstream],
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        namespace: "alpha".to_string(),
+        sidecar_enforced: true,
+        ..default_mesh_runtime()
+    };
+    let prepared =
+        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+
+    let proxy = prepared
+        .proxies
+        .iter()
+        .find(|p| p.id == "mixed-p")
+        .expect("operator proxy survives mesh preparation");
+    assert_eq!(
+        proxy.backend_connect_timeout_ms, 1111,
+        "the client-tier rule still wins outright for its OWN host"
+    );
+
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.id == "mixed-u")
+        .expect("operator upstream survives mesh preparation");
+    assert_eq!(
+        upstream.algorithm,
+        ferrum_edge::config::types::LoadBalancerAlgorithm::LeastConnections,
+        "the service-tier rule for the SECOND host must still apply — its host \
+         has no client-tier rule, so nothing outranks it"
     );
 }

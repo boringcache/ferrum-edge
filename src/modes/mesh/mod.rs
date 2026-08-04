@@ -2104,6 +2104,15 @@ fn gateway_config_from_mesh_slice_with_federation(
             trust_bundles,
             multi_cluster: slice.multi_cluster.clone(),
             outbound_traffic_policy: slice.outbound_traffic_policy,
+            // Keep the reconstructed mesh block agreeing with the slice the
+            // materializer actually reads (issue #2469). A producer that
+            // carried no root namespace leaves the field at Istio's default
+            // rather than blanking it.
+            istio_root_namespace: if slice.istio_root_namespace.trim().is_empty() {
+                config::default_istio_root_namespace()
+            } else {
+                slice.istio_root_namespace.clone()
+            },
             ..MeshConfig::default()
         })),
         loaded_at,
@@ -4817,8 +4826,8 @@ fn materialize_mesh_outbound_proxies(
             }
             // Name the upstream with the service FQDN (not the internal id) so a
             // DestinationRule keyed on the service host matches it
-            // (`destination_rule_matches_upstream` matches by target host / upstream
-            // NAME / id, and the targets are pod IPs) — otherwise no DR traffic policy
+            // (`upstream_destination_rule_match_hosts` enumerates target host /
+            // upstream NAME / id, and the targets are pod IPs) — otherwise no DR traffic policy
             // would apply to outbound HBONE routes (top-level connectTimeout / LB /
             // outlier, plus per-port `portLevelSettings`, which `apply_destination_rules`
             // fans out from the owning Service port onto the targets' dial ports).
@@ -6938,9 +6947,21 @@ fn synthesize_mesh_outbound_cors_plugins(
     // normalization on this DP, and `destination_rule_host_matches` lowercases
     // and strips trailing dots but does NOT trim whitespace — a padded carried
     // host would silently match no service and synthesize no plugin.
+    let client_namespace = mesh_slice.namespace.as_str();
     let mut sorted_policies: Vec<(String, &config::MeshVirtualServiceCorsPolicy)> = mesh_slice
         .virtual_service_cors_policies
         .iter()
+        // Re-apply the visibility boundary on the DP before ANY host match,
+        // symmetrically with the DestinationRule re-check in
+        // `apply_destination_rules`. A VirtualService CORS policy is
+        // host-targeting client-side traffic policy with the same blast
+        // radius as a DR: without this, a cross-wired or independently
+        // implemented producer could inject another tenant's CORS behavior
+        // onto this workload's outbound routes even though the
+        // byte-equivalent DestinationRule would be filtered out.
+        .filter(|policy| {
+            config::virtual_service_cors_policy_exported_to_namespace(policy, client_namespace)
+        })
         .map(|policy| (config::normalize_mesh_hostname_like(&policy.host), policy))
         .collect();
     sorted_policies.sort_by(|a, b| (&a.1.namespace, &a.1.name).cmp(&(&b.1.namespace, &b.1.name)));
@@ -7034,13 +7055,17 @@ fn synthesize_mesh_outbound_cors_plugins(
 /// - `subsets` as `SubsetDefinition` entries on the upstream
 ///
 /// Selection follows Istio's lookup path, NOT resource spelling (issue #2469).
-/// Every upstream first resolves its winning tier — a rule in the subscriber's
-/// own namespace outranks one in the target service's namespace, which
-/// outranks anything else (the slice has already resolved and admitted the
-/// configured `istio_root_namespace` tier, and has already applied `exportTo`
-/// visibility, so only rules this subscriber may see arrive here). Losing-tier
-/// rules are skipped outright for that upstream, so renaming a namespace can
-/// never flip which policy wins.
+/// Arbitration is PER DESTINATION HOST, because that is the unit Istio
+/// resolves: a rule in the subscriber's own namespace outranks one in the
+/// target service's namespace, which outranks the mesh root namespace, and a
+/// rule outside all three is refused. Losing-tier rules are skipped for that
+/// host, so renaming a namespace can never flip which policy wins, and an
+/// upstream whose targets span two services still resolves each destination
+/// independently instead of letting one host's winner suppress the only rule
+/// the other host has.
+///
+/// `exportTo` visibility has already been applied at slice construction and is
+/// re-applied below, so only rules this subscriber may see arrive here.
 ///
 /// Within the winning tier every rule is same-namespace by construction — one
 /// owner, Istio's merge case — and those apply in deterministic
@@ -7142,43 +7167,89 @@ fn apply_destination_rules(
         );
     }
 
-    // Winning Istio lookup tier per upstream (issue #2469), precomputed once
-    // for the whole apply pass — this is cold-path slice-apply work, never per
-    // request. The slice already resolved the configured root namespace and
-    // enforced `exportTo` visibility, so the tiers still distinguishable here
-    // are "the subscriber's own namespace" (Client) and "the target service's
-    // namespace" (Service); everything else — including an admitted
-    // root-namespace default — is the lowest-priority bucket. Skipping
-    // losing-tier rules per upstream is what stops the `(namespace, name)`
-    // ordering below from acting as cross-tier precedence.
-    let winning_tier_by_upstream: Vec<Option<DestinationRuleLookupTier>> = config
+    // Istio resolves the DestinationRule for a destination HOST, so tier
+    // arbitration is per destination host, not per upstream. Arbitrating per
+    // upstream conflates independent lookups whenever one upstream's targets
+    // span two services: the upstream-wide minimum then skips the ONLY rule a
+    // second host has, and that host's policy is silently dropped.
+    //
+    // Precomputed once for the whole apply pass — cold-path slice-apply work,
+    // never per request. `winning_tier_by_upstream_host[i][j]` is the winning
+    // tier for `upstream_destination_rule_match_hosts(config.upstreams[i])[j]`;
+    // the host list is derived from the same helper at both computation and
+    // use, so the parallel indexes cannot drift.
+    let tier_scope = MaterializationTierScope {
+        client_namespace,
+        root_namespace: mesh_slice.istio_root_namespace.trim(),
+        cluster_domain: runtime.cluster_domain.trim_matches('.'),
+    };
+    let winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleLookupTier>>> = config
         .upstreams
         .iter()
         .map(|upstream| {
-            sorted_destination_rules
-                .iter()
-                .copied()
-                .filter(|dr| destination_rule_matches_upstream(dr, upstream))
-                .map(|dr| materialization_destination_rule_tier(dr, upstream, client_namespace))
-                .min()
+            let hosts = upstream_destination_rule_match_hosts(upstream);
+            let mut winners: Vec<Option<DestinationRuleLookupTier>> =
+                Vec::with_capacity(hosts.len());
+            for host in hosts {
+                let mut winner: Option<DestinationRuleLookupTier> = None;
+                for dr in sorted_destination_rules.iter().copied() {
+                    if !destination_rule_host_matches(&dr.host, &dr.namespace, host) {
+                        continue;
+                    }
+                    let Some(tier) = tier_scope.eligible_tier(dr, upstream, host) else {
+                        continue;
+                    };
+                    winner = Some(match winner {
+                        Some(current) => current.min(tier),
+                        None => tier,
+                    });
+                }
+                winners.push(winner);
+            }
+            winners
         })
         .collect();
 
+    // Rules that matched a destination but were refused at every one of them
+    // for being declared outside Istio's client/service/root lookup
+    // namespaces. Counted, then reported ONCE — a per-rule warning would be
+    // per-reload × per-DP spam.
+    let mut refused_out_of_lookup_path = 0usize;
+
     for dr in sorted_destination_rules.iter().copied() {
+        let mut matched_any_host = false;
+        let mut eligible_any_host = false;
         let matching_upstream_indices: Vec<usize> = config
             .upstreams
             .iter()
             .enumerate()
             .filter_map(|(idx, upstream)| {
-                if !destination_rule_matches_upstream(dr, upstream) {
-                    return None;
+                let winners = winning_tier_by_upstream_host.get(idx)?;
+                let hosts = upstream_destination_rule_match_hosts(upstream);
+                let mut wins_a_host = false;
+                for (host_idx, host) in hosts.into_iter().enumerate() {
+                    if !destination_rule_host_matches(&dr.host, &dr.namespace, host) {
+                        continue;
+                    }
+                    matched_any_host = true;
+                    // A rule outside the lookup path is refused outright; a
+                    // rule from a lower-priority tier must not overwrite the
+                    // winning tier's policy for THIS host.
+                    let Some(tier) = tier_scope.eligible_tier(dr, upstream, host) else {
+                        continue;
+                    };
+                    eligible_any_host = true;
+                    if winners.get(host_idx).copied().flatten() == Some(tier) {
+                        wins_a_host = true;
+                    }
                 }
-                // A rule from a lower-priority tier must not overwrite the
-                // winning tier's policy on this upstream.
-                let tier = materialization_destination_rule_tier(dr, upstream, client_namespace);
-                (winning_tier_by_upstream.get(idx).copied().flatten() == Some(tier)).then_some(idx)
+                wins_a_host.then_some(idx)
             })
             .collect();
+
+        if matched_any_host && !eligible_any_host {
+            refused_out_of_lookup_path += 1;
+        }
 
         if matching_upstream_indices.is_empty() {
             debug!(
@@ -7574,6 +7645,19 @@ fn apply_destination_rules(
         }
     }
 
+    if refused_out_of_lookup_path > 0 {
+        // Bounded and value-free: only the count and the subscriber's own
+        // namespace. A slice-built path refuses these at admission, so
+        // reaching here means a producer sent a rule this subscriber's lookup
+        // path never covered.
+        warn!(
+            client_namespace = %client_namespace,
+            refused = refused_out_of_lookup_path,
+            "Refused DestinationRules declared outside Istio's client/service/root \
+             lookup namespaces before materialization"
+        );
+    }
+
     // Final pass: project per-subset `trafficPolicy.tls` overlays onto each
     // upstream's `resolved_subset_tls` map. Runs once after all DRs are
     // applied so subset TLS layers over the FINAL upstream-level TLS rather
@@ -7780,55 +7864,121 @@ fn into_upstream_locality(
     }
 }
 
-/// Istio lookup tier for a `(DestinationRule, Upstream)` pair on the data
-/// plane (issue #2469).
-///
-/// The upstream's own `namespace` IS the target service namespace for every
-/// materialized mesh upstream (`mesh_outbound_route_upstream` stamps the
-/// service's namespace) and for operator-authored upstreams alike, so it is
-/// the authoritative service tier here. `Root` is deliberately not
-/// distinguished: the configured `istio_root_namespace` lives on the config
-/// source, not on the slice, and slice narrowing already resolved and admitted
-/// that tier — an admitted root rule simply lands in the lowest bucket, which
-/// is exactly its Istio precedence relative to Client and Service.
-///
-/// This is a precedence pass, not an admission pass. Visibility (`exportTo`)
-/// and namespace eligibility are enforced fail-closed at slice construction,
-/// where the client namespace, the mesh root namespace, and the full service
-/// inventory are all known.
-fn materialization_destination_rule_tier(
-    dr: &MeshDestinationRule,
-    upstream: &Upstream,
-    client_namespace: &str,
-) -> DestinationRuleLookupTier {
-    match destination_rule_lookup_tier(
-        &dr.namespace,
-        client_namespace,
-        Some(upstream.namespace.as_str()),
-        // Root is resolved at slice build; see the doc comment.
-        "",
-    ) {
-        DestinationRuleLookupTier::Client => DestinationRuleLookupTier::Client,
-        DestinationRuleLookupTier::Service => DestinationRuleLookupTier::Service,
-        // `Root` is unreachable with an empty root namespace, but map it with
-        // `Unscoped` so a future caller that supplies one cannot change the
-        // meaning of this bucket by accident.
-        DestinationRuleLookupTier::Root | DestinationRuleLookupTier::Unscoped => {
-            DestinationRuleLookupTier::Unscoped
+/// The lookup inputs the data-plane DestinationRule tier pass resolves
+/// against, gathered once per apply so the per-`(rule, upstream, host)`
+/// classification stays a pure function of them (issue #2469).
+struct MaterializationTierScope<'a> {
+    /// The subscriber workload's namespace — Istio's FIRST lookup tier.
+    client_namespace: &'a str,
+    /// The mesh's `meshConfig.rootNamespace`, carried on `MeshSlice`. EMPTY
+    /// means the producer carried no root namespace; see
+    /// [`MaterializationTierScope::eligible_tier`].
+    root_namespace: &'a str,
+    /// Cluster DNS domain, used to read a target service namespace out of a
+    /// `name.namespace.svc.<domain>` host.
+    cluster_domain: &'a str,
+}
+
+impl MaterializationTierScope<'_> {
+    /// Istio lookup tier for a `(DestinationRule, Upstream, destination host)`
+    /// triple, or `None` when the rule must be refused outright.
+    ///
+    /// Two namespaces are accepted as SERVICE-tier evidence, and the more
+    /// specific (smaller) resulting tier wins:
+    ///
+    /// - the upstream's own `namespace` — authoritative for every materialized
+    ///   mesh upstream (`mesh_outbound_route_upstream` stamps the service's
+    ///   namespace) and for operator-authored upstreams;
+    /// - the namespace pinned by the matched host's own `*.svc[.domain]`
+    ///   syntax, which is what makes a mixed-namespace upstream resolve each
+    ///   destination independently.
+    ///
+    /// Taking the union (rather than replacing one with the other) keeps this
+    /// classification a superset of the pre-#2469 upstream-only one, so the
+    /// refusal below can only ever reject a rule that was ALREADY outside
+    /// every lookup namespace.
+    ///
+    /// Refusal is gated on the slice carrying a root namespace. Without it
+    /// `Root` and `Unscoped` are indistinguishable (both fall to the lowest
+    /// bucket), and refusing would silently drop a legitimate mesh-wide
+    /// default — so an absent root namespace keeps the pre-#2469 permissive
+    /// bucketing instead. Every Ferrum-built slice carries one.
+    ///
+    /// This is a precedence pass layered over admission, not a replacement for
+    /// it: visibility (`exportTo`) and namespace eligibility are enforced
+    /// fail-closed at slice construction, where the client namespace, the mesh
+    /// root namespace, and the full service inventory are all known. It exists
+    /// so a reverse-translated xDS carrier — which never passes
+    /// `admit_destination_rules` — cannot land an arbitrary namespace's rule
+    /// on this workload's routes.
+    fn eligible_tier(
+        &self,
+        dr: &MeshDestinationRule,
+        upstream: &Upstream,
+        matched_host: &str,
+    ) -> Option<DestinationRuleLookupTier> {
+        let by_upstream = destination_rule_lookup_tier(
+            &dr.namespace,
+            self.client_namespace,
+            Some(upstream.namespace.as_str()),
+            self.root_namespace,
+        );
+        let by_host = destination_rule_lookup_tier(
+            &dr.namespace,
+            self.client_namespace,
+            cluster_service_host_namespace(matched_host, self.cluster_domain),
+            self.root_namespace,
+        );
+        let tier = by_upstream.min(by_host);
+        if tier.is_in_lookup_path() || self.root_namespace.is_empty() {
+            Some(tier)
+        } else {
+            None
         }
     }
 }
 
-fn destination_rule_matches_upstream(dr: &MeshDestinationRule, upstream: &Upstream) -> bool {
-    upstream
-        .targets
-        .iter()
-        .any(|target| destination_rule_host_matches(&dr.host, &dr.namespace, &target.host))
-        || upstream
-            .name
-            .as_deref()
-            .is_some_and(|name| destination_rule_host_matches(&dr.host, &dr.namespace, name))
-        || destination_rule_host_matches(&dr.host, &dr.namespace, &upstream.id)
+/// The namespace a cluster-service host names, when the host's OWN syntax pins
+/// it (`name.namespace.svc` or `name.namespace.svc.<cluster-domain>`).
+///
+/// Deliberately syntax-only, matching the `.svc`-qualified row of the
+/// target-service ownership table: an external name such as `api.example.com`
+/// must never nominate a namespace, and a host carrying a DIFFERENT cluster's
+/// DNS domain must not nominate a local one.
+fn cluster_service_host_namespace<'a>(host: &'a str, cluster_domain: &str) -> Option<&'a str> {
+    let host = host.trim().trim_end_matches('.');
+    let cluster_domain = cluster_domain.trim().trim_matches('.');
+    let (name, rest) = host.split_once('.')?;
+    if name.is_empty() {
+        return None;
+    }
+    let (namespace, rest) = rest.split_once('.')?;
+    if namespace.is_empty() {
+        return None;
+    }
+    let pinned = rest == "svc"
+        || rest.strip_prefix("svc.").is_some_and(|domain| {
+            !cluster_domain.is_empty() && domain.eq_ignore_ascii_case(cluster_domain)
+        });
+    pinned.then_some(namespace)
+}
+
+/// Every candidate destination host a DestinationRule may match this upstream
+/// on, in a STABLE order: target hosts first, then the upstream `name`, then
+/// the upstream `id`.
+///
+/// A DR matches the upstream iff it matches at least one of these. Order is
+/// load-bearing — `apply_destination_rules` indexes its precomputed per-host
+/// winning tiers against this list, and calls this helper again during
+/// application, so the two must enumerate identically.
+fn upstream_destination_rule_match_hosts(upstream: &Upstream) -> Vec<&str> {
+    let mut hosts: Vec<&str> = Vec::with_capacity(upstream.targets.len() + 2);
+    hosts.extend(upstream.targets.iter().map(|target| target.host.as_str()));
+    if let Some(name) = upstream.name.as_deref() {
+        hosts.push(name);
+    }
+    hosts.push(upstream.id.as_str());
+    hosts
 }
 
 /// True when EVERY target of this upstream dispatches through an SVID-backed
@@ -17029,6 +17179,87 @@ mod tests {
         );
     }
 
+    fn carried_cors_policy(
+        namespace: &str,
+        export_to: &[&str],
+    ) -> config::MeshVirtualServiceCorsPolicy {
+        config::MeshVirtualServiceCorsPolicy {
+            name: "reviews-cors".to_string(),
+            namespace: namespace.to_string(),
+            host: "reviews.default.svc.cluster.local".to_string(),
+            export_to: export_to.iter().map(|entry| entry.to_string()).collect(),
+            cors: config::MeshCorsPolicy {
+                allowed_origins: vec![config::MeshCorsOriginMatch::Exact(
+                    "https://tenant-b.example".to_string(),
+                )],
+                allowed_methods: Vec::new(),
+                allowed_headers: Vec::new(),
+                exposed_headers: Vec::new(),
+                max_age_seconds: None,
+                allow_credentials: None,
+                unmatched_preflights: None,
+            },
+        }
+    }
+
+    fn synthesized_cors_plugin_ids(policy: config::MeshVirtualServiceCorsPolicy) -> Vec<String> {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("reviews", "reviews", "10.0.0.1")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            virtual_service_cors_policies: vec![policy],
+            ..MeshSlice::default()
+        };
+        let runtime = test_mesh_runtime_config();
+        assert_eq!(runtime.topology, MeshTopology::Sidecar);
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &runtime, &slice);
+        synthesize_mesh_outbound_cors_plugins(&mut config, &runtime, &slice);
+        config
+            .plugin_configs
+            .iter()
+            .filter(|plugin| plugin.plugin_name == "cors")
+            .map(|plugin| plugin.id.clone())
+            .collect()
+    }
+
+    /// Defence in depth, symmetric with the DestinationRule re-check in
+    /// `apply_destination_rules`: a CORS policy that reached the slice from a
+    /// cross-wired or independently implemented producer must not be
+    /// synthesized onto another tenant's outbound routes. The byte-equivalent
+    /// DestinationRule is filtered, so this one has to be too.
+    #[test]
+    fn mesh_outbound_cors_synthesis_refuses_a_policy_not_exported_here() {
+        assert!(
+            synthesized_cors_plugin_ids(carried_cors_policy("tenant-b", &["."])).is_empty(),
+            "a namespace-local policy from another namespace must not attach \
+             CORS behavior to this workload's outbound routes"
+        );
+        assert!(
+            synthesized_cors_plugin_ids(carried_cors_policy("tenant-b", &["tenant-c"])).is_empty(),
+            "an allowlist that omits this namespace must not attach CORS behavior"
+        );
+        assert!(
+            synthesized_cors_plugin_ids(carried_cors_policy("tenant-b", &[])).is_empty(),
+            "an EMPTY carried export_to is namespace-local, not public"
+        );
+    }
+
+    /// The gate is `exportTo`, not "same namespace": a genuinely public
+    /// cross-namespace policy still applies.
+    #[test]
+    fn mesh_outbound_cors_synthesis_admits_a_publicly_exported_policy() {
+        assert_eq!(
+            synthesized_cors_plugin_ids(carried_cors_policy("tenant-b", &["*"])),
+            vec!["__mesh-cors-default-reviews-80".to_string()],
+        );
+        assert_eq!(
+            synthesized_cors_plugin_ids(carried_cors_policy("tenant-b", &["default"])),
+            vec!["__mesh-cors-default-reviews-80".to_string()],
+        );
+    }
+
     #[test]
     fn http_tcp_and_udp_stream_port_predicates_partition_protocols() {
         // The three routability predicates must form a STRICT 3-WAY PARTITION
@@ -20495,6 +20726,87 @@ mod tests {
                 .proxies
                 .iter()
                 .all(|proxy| proxy.backend_connect_timeout_ms == 1234)
+        );
+    }
+
+    /// A slice carrying one DestinationRule declared in `rule_namespace`,
+    /// publicly exported, targeting a `default`-namespace service. The
+    /// subscriber is in `alpha`, so the rule's tier is decided purely by how
+    /// `rule_namespace` relates to client / service / root.
+    fn lookup_tier_slice(rule_namespace: &str, istio_root_namespace: &str) -> MeshSlice {
+        MeshSlice {
+            namespace: "alpha".to_string(),
+            istio_root_namespace: istio_root_namespace.to_string(),
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: rule_namespace.to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshSlice::default()
+        }
+    }
+
+    fn lookup_tier_rule_applied(slice: &MeshSlice) -> bool {
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), slice)
+            .expect("destination rules apply");
+        config.upstreams[0].algorithm == LoadBalancerAlgorithm::Random
+    }
+
+    /// Issue #2469 on the reverse-translated xDS path, where carrier-recovered
+    /// rules never pass `admit_destination_rules`: a publicly exported rule
+    /// from a namespace that is neither the client's, nor the target service's,
+    /// nor the mesh root is refused at materialization instead of applying
+    /// whenever no higher tier matches.
+    #[test]
+    fn destination_rule_outside_the_lookup_path_is_refused_at_materialization() {
+        assert!(
+            !lookup_tier_rule_applied(&lookup_tier_slice("gamma", "istio-system")),
+            "an unrelated namespace's rule must not reach the upstream"
+        );
+    }
+
+    /// The refusal must not swallow the tiers that ARE in the lookup path —
+    /// carrying the root namespace is what makes `Root` distinguishable from
+    /// `Unscoped` in the first place.
+    #[test]
+    fn destination_rule_root_and_service_tiers_survive_the_refusal() {
+        assert!(
+            lookup_tier_rule_applied(&lookup_tier_slice("istio-system", "istio-system")),
+            "the configured root namespace is Istio's third lookup tier"
+        );
+        assert!(
+            lookup_tier_rule_applied(&lookup_tier_slice("default", "istio-system")),
+            "the target service's namespace is Istio's second lookup tier"
+        );
+        assert!(
+            lookup_tier_rule_applied(&lookup_tier_slice("alpha", "istio-system")),
+            "the client's own namespace is Istio's first lookup tier"
+        );
+    }
+
+    /// A producer that carries no root namespace leaves `Root` and `Unscoped`
+    /// indistinguishable, so refusing would silently drop a legitimate
+    /// mesh-wide default. Absent evidence keeps the permissive bucketing.
+    #[test]
+    fn destination_rule_refusal_requires_a_carried_root_namespace() {
+        assert!(
+            lookup_tier_rule_applied(&lookup_tier_slice("gamma", "")),
+            "without a carried root namespace the materializer must not refuse"
         );
     }
 

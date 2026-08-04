@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::{Mutex, OnceLock};
 use tracing::{debug, warn};
 
 use crate::config::types::GatewayConfig;
@@ -204,6 +205,27 @@ impl MeshSliceRequest {
 pub struct MeshSlice {
     pub node_id: String,
     pub namespace: String,
+    /// The mesh's configured `meshConfig.rootNamespace`
+    /// (`FERRUM_K8S_ISTIO_ROOT_NAMESPACE`), carried so the data plane can
+    /// classify Istio's THIRD DestinationRule lookup tier (issue #2469).
+    ///
+    /// Without it the materializer cannot tell an admitted root-namespace
+    /// default apart from a rule declared in an arbitrary namespace: both land
+    /// in the lowest bucket, so a `Root`-vs-`Unscoped` refusal is impossible
+    /// and a reverse-translated xDS carrier for an unrelated namespace applies
+    /// whenever no client/service-tier rule matches. It is a SCOPING input,
+    /// not a policy: it only ever decides which of two buckets a rule lands
+    /// in, never whether the rule was visible (that is `exportTo`, evaluated
+    /// strictly earlier).
+    ///
+    /// EMPTY means "this producer did not carry the root namespace". The
+    /// materializer then keeps the pre-#2469 permissive bucketing rather than
+    /// refusing rules it cannot classify — refusing on absent evidence would
+    /// silently drop a legitimate mesh-wide default. Every Ferrum-built slice
+    /// carries it (`MeshConfig::istio_root_namespace` defaults to
+    /// `istio-system`), so real deployments always get the enforcement.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub istio_root_namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_spiffe_id: Option<String>,
     /// GAMMA Waypoint identity for this slice. `Some` only when the DP
@@ -632,6 +654,13 @@ impl MeshSlice {
     pub fn content_eq(&self, other: &Self) -> bool {
         self.node_id == other.node_id
             && self.namespace == other.namespace
+            // Changing `meshConfig.rootNamespace` re-buckets every
+            // DestinationRule the DP holds: a rule that was the winning Root
+            // default becomes Unscoped (refused) and vice versa. It MUST be
+            // compared so the slice is re-broadcast and the materializer
+            // re-runs tier resolution; omitting it would keep serving the
+            // policy resolved against the OLD root namespace.
+            && self.istio_root_namespace == other.istio_root_namespace
             && self.workload_spiffe_id == other.workload_spiffe_id
             && self.waypoint_name == other.waypoint_name
             && self.labels == other.labels
@@ -1391,6 +1420,13 @@ impl MeshSlice {
         // both are host-targeting client-side traffic policy, so a namespace
         // that cannot override a workload's DRs must not be able to inject
         // CORS behavior onto its routes either.
+        //
+        // The symmetry is enforced at the same THREE points a DR's visibility
+        // is: here, at the xDS carrier fold (`retain_visible_cors_policies` in
+        // `config_consumer/xds_client.rs`), and again on the DP at outbound
+        // `cors` synthesis (`synthesize_mesh_outbound_cors_plugins`). Adding a
+        // gate to one without the others reopens cross-tenant CORS injection
+        // over any producer that bypasses slice admission.
         let virtual_service_cors_policies: Vec<MeshVirtualServiceCorsPolicy> = mesh
             .virtual_service_cors_policies
             .iter()
@@ -1518,6 +1554,11 @@ impl MeshSlice {
         Self {
             node_id: request.node_id,
             namespace: request_namespace.clone(),
+            // Issue #2469: the DP needs the mesh root namespace to distinguish
+            // an admitted root-tier default from a rule in an arbitrary
+            // namespace. The CP resolves the tier at admission; carrying the
+            // namespace lets the DP's defence-in-depth pass do the same.
+            istio_root_namespace: mesh.istio_root_namespace.clone(),
             workload_spiffe_id: request.workload_spiffe_id,
             waypoint_name: request.waypoint_name,
             labels: effective_labels,
@@ -2342,7 +2383,8 @@ where
         admitted.push((**rule).clone());
     }
     let ambiguous_groups = per_group_kept.values().filter(|count| **count > 1).count();
-    if ambiguous_groups > 0 {
+    let changed = record_destination_rule_ambiguity(scope.client_namespace, ambiguous_groups);
+    if ambiguous_groups > 0 && changed {
         warn!(
             client_namespace = %scope.client_namespace,
             ambiguous_destinations = ambiguous_groups,
@@ -2351,6 +2393,32 @@ where
         );
     }
     admitted
+}
+
+/// Last reported ambiguous-destination count per client namespace.
+///
+/// `admit_destination_rules` runs once per subscriber per config generation,
+/// and one namespace legitimately splitting a host's policy across two
+/// DestinationRules is a common Istio pattern — warning unconditionally is
+/// per-reload × per-DP log spam. Bounded by the mesh's namespace count and
+/// touched only on the cold slice-build path, never per request.
+static DESTINATION_RULE_AMBIGUITY_REPORTED: OnceLock<Mutex<HashMap<String, usize>>> =
+    OnceLock::new();
+
+/// Record this namespace's ambiguous-destination count, returning `true` when
+/// it differs from the last recorded one (so the caller reports a CHANGE
+/// rather than a steady state). A poisoned lock reports — fail toward
+/// visibility, never panic on a config-apply path.
+fn record_destination_rule_ambiguity(client_namespace: &str, ambiguous: usize) -> bool {
+    let reported = DESTINATION_RULE_AMBIGUITY_REPORTED.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut reported) = reported.lock() else {
+        return true;
+    };
+    if reported.get(client_namespace) == Some(&ambiguous) {
+        return false;
+    }
+    reported.insert(client_namespace.to_string(), ambiguous);
+    true
 }
 
 fn destination_rule_host_scope(
@@ -3878,6 +3946,7 @@ mod tests {
             extension_configs: Vec::new(),
             runtime_overlay: MeshRuntimeOverlay::default(),
             waypoint_name: None,
+            istio_root_namespace: "istio-system".into(),
         };
         assert!(slice.content_eq(&slice.clone()));
     }

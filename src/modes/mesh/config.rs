@@ -1249,6 +1249,28 @@ pub(crate) fn export_visibility_admits(
     })
 }
 
+/// THE `exportTo` entry canonicalizer, and the other half of
+/// [`export_visibility_admits`]'s contract.
+///
+/// The evaluator deliberately refuses to reinterpret padded input, which only
+/// holds as a safety property if EVERY source canonicalizes first — otherwise
+/// a boundary that validates a trimmed copy (`validate_mesh_export_to` trims
+/// per entry) accepts `" beta "` while the stored entry goes on to match
+/// nothing, i.e. accepted-then-silently-inert. Config-source normalization
+/// (`MeshConfig::normalize`), the Kubernetes translator, and the xDS carrier
+/// decode paths all funnel through this ONE function so they cannot drift.
+///
+/// Trimming is the whole transformation: an entry that is still invalid after
+/// trimming stays invalid and is rejected by [`validate_mesh_export_to`].
+pub fn normalize_mesh_export_to(export_to: &mut [String]) {
+    for entry in export_to {
+        let trimmed = entry.trim();
+        if trimmed.len() != entry.len() {
+            *entry = trimmed.to_string();
+        }
+    }
+}
+
 /// True when this DestinationRule is exported to `workload_namespace`
 /// (issue #2465).
 ///
@@ -4652,12 +4674,7 @@ fn normalize_mesh_fields_internal(
         for host in &mut se.hosts {
             *host = normalize_mesh_hostname_like(host);
         }
-        for entry in &mut se.export_to {
-            let trimmed = entry.trim();
-            if trimmed.len() != entry.len() {
-                *entry = trimmed.to_string();
-            }
-        }
+        normalize_mesh_export_to(&mut se.export_to);
         for ep in &mut se.endpoints {
             ep.address.make_ascii_lowercase();
         }
@@ -4674,12 +4691,7 @@ fn normalize_mesh_fields_internal(
         // xDS JSON. Canonicalize the same whitespace the evaluator and
         // validator recognize so equivalent visibility does not produce
         // different carrier bytes or defeat slice dedupe.
-        for entry in &mut dr.export_to {
-            let trimmed = entry.trim();
-            if trimmed.len() != entry.len() {
-                *entry = trimmed.to_string();
-            }
-        }
+        normalize_mesh_export_to(&mut dr.export_to);
     }
     // Same treatment as DestinationRule hosts: synthesis matches
     // `policy.host` against service FQDNs via `destination_rule_host_matches`
@@ -4687,12 +4699,7 @@ fn normalize_mesh_fields_internal(
     // like `" Svc.Default "` would silently attach no CORS plugin.
     for policy in virtual_service_cors_policies {
         policy.host = normalize_mesh_hostname_like(&policy.host);
-        for entry in &mut policy.export_to {
-            let trimmed = entry.trim();
-            if trimmed.len() != entry.len() {
-                *entry = trimmed.to_string();
-            }
-        }
+        normalize_mesh_export_to(&mut policy.export_to);
     }
     for sidecar in sidecars {
         for egress in &mut sidecar.egress {

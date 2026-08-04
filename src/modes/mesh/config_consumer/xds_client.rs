@@ -1265,7 +1265,13 @@ fn reverse_translate(
         };
         dr_carrier_seen = true;
         match serde_json::from_slice::<MeshDestinationRule>(&inner.value) {
-            Ok(dr) => {
+            Ok(mut dr) => {
+                // Restore the invariant `export_visibility_admits` documents:
+                // every source canonicalizes entries before the evaluator
+                // runs. `validate_ecds_destination_rule_carrier` accepts a
+                // TRIMMED copy at ACK time, so without this a third-party CP
+                // sending `[" beta "]` would be ACKed and then match nothing.
+                crate::modes::mesh::config::normalize_mesh_export_to(&mut dr.export_to);
                 if let Some((namespace, name)) = reserved_dr_name {
                     validate_reserved_destination_rule_carrier_name(
                         &resource.name,
@@ -1407,6 +1413,12 @@ fn reverse_translate(
     Ok(MeshSlice {
         node_id: config.node_id.clone(),
         namespace: config.namespace.clone(),
+        // Issue #2469: the mesh root namespace rides its own carrier so a
+        // reverse-translated slice can classify Istio's third DestinationRule
+        // lookup tier. Empty when the CP emitted no carrier — the materializer
+        // then keeps its permissive pre-#2469 bucketing rather than refusing
+        // rules it has no evidence to classify.
+        istio_root_namespace: recovered.istio_root_namespace,
         workload_spiffe_id: config.workload_spiffe_id.clone(),
         waypoint_name: config.waypoint_name.clone(),
         // A non-empty WorkloadLabels carrier is authoritative — the CP computed
@@ -1503,7 +1515,16 @@ fn reverse_translate(
         // GAP-1a: authorization policies recovered from the MeshPolicies
         // carrier. Without this the xDS mesh had NO authz (implicit allow-all).
         mesh_policies: recovered.mesh_policies,
-        virtual_service_cors_policies: recovered.virtual_service_cors_policies,
+        // Gate the CORS carrier exactly like the legacy DR carrier above is
+        // gated to the workload namespace: an ECDS carrier is raw producer
+        // input that never passed this DP's slice admission, so the
+        // `exportTo` boundary has to be enforced here or a cross-wired CP
+        // could inject another tenant's CORS policy onto this workload's
+        // outbound routes.
+        virtual_service_cors_policies: retain_visible_cors_policies(
+            recovered.virtual_service_cors_policies,
+            &config.namespace,
+        ),
         // GAP-1a: PeerAuthentication mTLS posture recovered from the PeerAuth
         // carrier. Without this every port fell back to Permissive.
         peer_authentications: recovered.peer_authentications,
@@ -1653,6 +1674,9 @@ struct RecoveredSliceCarriers {
     outbound_traffic_policy: Option<crate::modes::mesh::config::OutboundTrafficPolicy>,
     multi_cluster: Option<crate::modes::mesh::config::MultiClusterConfig>,
     sidecar_egress_scope: Option<MeshEgressScopeSnapshot>,
+    /// `meshConfig.rootNamespace` recovered from its own carrier (issue
+    /// #2469). Empty when the producer emitted no carrier.
+    istio_root_namespace: String,
 }
 
 /// Decode every Ferrum mesh-slice ECDS carrier in `accumulator` and fold it
@@ -1691,6 +1715,42 @@ fn recover_slice_carriers(
         }
     }
     Ok(recovered)
+}
+
+/// Drop recovered VirtualService CORS carrier entries that are not exported to
+/// this workload's namespace (issue #2465, CORS half).
+///
+/// The reserved DestinationRule carrier already gets `exportTo` validation at
+/// ACK time and a visibility re-check at materialization; the CORS carrier had
+/// neither, so an unfiltered carrier reached the slice and was synthesized onto
+/// this workload's outbound routes. The check runs through the ONE shared
+/// evaluator, so the two carriers narrow identically.
+///
+/// Diagnostics carry only a count and the DP's own namespace — never a
+/// carrier-supplied host, name, or `exportTo` value.
+fn retain_visible_cors_policies(
+    policies: Vec<crate::modes::mesh::config::MeshVirtualServiceCorsPolicy>,
+    workload_namespace: &str,
+) -> Vec<crate::modes::mesh::config::MeshVirtualServiceCorsPolicy> {
+    let declared = policies.len();
+    let retained: Vec<_> = policies
+        .into_iter()
+        .filter(|policy| {
+            crate::modes::mesh::config::virtual_service_cors_policy_exported_to_namespace(
+                policy,
+                workload_namespace,
+            )
+        })
+        .collect();
+    let dropped = declared.saturating_sub(retained.len());
+    if dropped > 0 {
+        warn!(
+            workload_namespace = %workload_namespace,
+            dropped,
+            "Dropped xDS VirtualService CORS carrier entries not exported to this namespace"
+        );
+    }
+    retained
 }
 
 fn validate_ecds_mesh_slice_carrier(resource: &AccumulatedResource) -> Result<(), String> {
@@ -1924,6 +1984,7 @@ fn apply_recovered_carrier(
         }
         MeshSliceCarrier::MultiCluster(value) => recovered.multi_cluster = Some(value),
         MeshSliceCarrier::SidecarEgressScope(value) => recovered.sidecar_egress_scope = Some(value),
+        MeshSliceCarrier::IstioRootNamespace(value) => recovered.istio_root_namespace = value,
     }
 }
 
@@ -4775,6 +4836,10 @@ mod tests {
                 known_destinations: vec!["api.default.svc.cluster.local:8080".to_string()],
                 ..MeshEgressScopeSnapshot::default()
             }),
+            // Issue #2469: the mesh root namespace must survive the xDS
+            // round trip or the DP cannot tell an admitted root-tier
+            // DestinationRule from an arbitrary-namespace one.
+            istio_root_namespace: "istio-config".to_string(),
             ..MeshSlice::default()
         }
     }
@@ -4804,6 +4869,11 @@ mod tests {
         );
         assert_eq!(recovered.service_entries, native.service_entries);
         assert_eq!(recovered.destination_rules, native.destination_rules);
+        assert_eq!(
+            recovered.istio_root_namespace, native.istio_root_namespace,
+            "the mesh root namespace must round-trip so the DP can classify \
+             Istio's third DestinationRule lookup tier (issue #2469)"
+        );
         assert_eq!(recovered.trust_bundles, native.trust_bundles);
         assert_eq!(recovered.proxy_configs, native.proxy_configs);
         assert_eq!(
@@ -4867,6 +4937,109 @@ mod tests {
             recovered.resolve_effective_mtls_mode(8080),
             crate::modes::mesh::config::MtlsMode::Strict,
             "strict PeerAuthentication must survive the xDS round trip"
+        );
+    }
+
+    fn recover_slice_from_native(native: &MeshSlice) -> MeshSlice {
+        let snapshot = translate_mesh_slice_to_snapshot(native);
+        let accumulator = accumulator_from_snapshot(&snapshot);
+        let mut config = test_config();
+        config.node_id = native.node_id.clone();
+        config.namespace = native.namespace.clone();
+        accumulator
+            .try_build_mesh_slice(&config)
+            .expect("reverse translate succeeds")
+            .expect("all required types present")
+    }
+
+    fn carried_cors_policy(
+        namespace: &str,
+        export_to: &[&str],
+    ) -> crate::modes::mesh::config::MeshVirtualServiceCorsPolicy {
+        use crate::modes::mesh::config::{MeshCorsOriginMatch, MeshCorsPolicy};
+
+        crate::modes::mesh::config::MeshVirtualServiceCorsPolicy {
+            name: format!("{namespace}-cors"),
+            namespace: namespace.to_string(),
+            host: "api.default.svc.cluster.local".to_string(),
+            export_to: export_to.iter().map(|entry| entry.to_string()).collect(),
+            cors: MeshCorsPolicy {
+                allowed_origins: vec![MeshCorsOriginMatch::Exact(
+                    "https://tenant-b.example".to_string(),
+                )],
+                allowed_methods: Vec::new(),
+                allowed_headers: Vec::new(),
+                exposed_headers: Vec::new(),
+                max_age_seconds: None,
+                allow_credentials: None,
+                unmatched_preflights: None,
+            },
+        }
+    }
+
+    /// Issue #2465, CORS half. The VirtualService-CORS ECDS carrier is raw
+    /// producer input that never passed this DP's slice admission, so the
+    /// `exportTo` boundary is enforced at the fold — symmetrically with the
+    /// DestinationRule carrier's namespace gate. Without it a cross-wired CP
+    /// could inject another tenant's CORS policy onto this workload's routes
+    /// even though the byte-equivalent DestinationRule would be filtered.
+    #[test]
+    fn xds_cors_carrier_not_exported_to_this_namespace_is_refused() {
+        let mut native = representative_protected_slice();
+        native.virtual_service_cors_policies = vec![
+            carried_cors_policy("tenant-b", &["."]),
+            carried_cors_policy("tenant-c", &["tenant-d"]),
+            carried_cors_policy("tenant-e", &[]),
+        ];
+        let recovered = recover_slice_from_native(&native);
+        assert!(
+            recovered.virtual_service_cors_policies.is_empty(),
+            "no CORS carrier entry outside this namespace's visibility may reach the slice"
+        );
+    }
+
+    /// The gate is `exportTo`, not "same namespace": a genuinely public
+    /// cross-namespace CORS carrier entry still survives the fold.
+    #[test]
+    fn xds_cors_carrier_exported_here_survives_the_fold() {
+        let mut native = representative_protected_slice();
+        native.virtual_service_cors_policies = vec![
+            carried_cors_policy("tenant-b", &["*"]),
+            carried_cors_policy("tenant-c", &["."]),
+        ];
+        let recovered = recover_slice_from_native(&native);
+        assert_eq!(recovered.virtual_service_cors_policies.len(), 1);
+        assert_eq!(
+            recovered.virtual_service_cors_policies[0].namespace,
+            "tenant-b"
+        );
+    }
+
+    /// `export_visibility_admits` deliberately never reinterprets padded
+    /// entries, so every source must canonicalize first. ACK-time validation
+    /// checks a TRIMMED copy, so an un-normalized carrier would otherwise be
+    /// accepted and then silently match nothing.
+    #[test]
+    fn xds_carrier_export_to_entries_are_canonicalized_on_decode() {
+        let mut native = representative_protected_slice();
+        native.destination_rules[0].export_to = vec![" default ".to_string()];
+        native.service_entries[0].export_to = vec!["\tdefault\n".to_string()];
+        let padded = carried_cors_policy("tenant-b", &[" default "]);
+        native.virtual_service_cors_policies = vec![padded];
+
+        let recovered = recover_slice_from_native(&native);
+        assert_eq!(
+            recovered.destination_rules[0].export_to,
+            vec!["default".to_string()]
+        );
+        assert_eq!(
+            recovered.service_entries[0].export_to,
+            vec!["default".to_string()]
+        );
+        assert_eq!(
+            recovered.virtual_service_cors_policies.len(),
+            1,
+            "a padded entry naming this namespace must be canonicalized, not silently inert"
         );
     }
 
