@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Gateway API `BackendTLSPolicy` is watched and translated for Service-backed
+  `HTTPRoute`/`GRPCRoute` backends (issue #3276). `validation.hostname` projects
+  to upstream `backend_tls_sni`, optional `subjectAltNames` to
+  `backend_tls_san_allow_list`, and either ConfigMap/Secret `caCertificateRefs`
+  or `wellKnownCACertificates: System` to the upstream CA trust posture with
+  `backend_scheme: https`. Invalid or conflicting policies fail closed with an
+  HTTP 500 fault abort. Policy `status.ancestors` is not written yet.
+
 - VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
   compile onto a shared precomputed `Proxy.stream_match` carrier and are

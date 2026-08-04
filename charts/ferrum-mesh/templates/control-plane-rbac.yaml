@@ -17,12 +17,14 @@ rules:
       - tlsroutes
       - tcproutes
       - referencegrants
+      - backendtlspolicies
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources:
       - namespaces
       - services
       - secrets
+      - configmaps
     verbs: ["get", "list", "watch"]
   - apiGroups: ["discovery.k8s.io"]
     resources:

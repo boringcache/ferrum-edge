@@ -746,6 +746,7 @@ jobs:
               integration::ai_token_metrics_contract_tests
               integration::api_chargeback_sink_tests
               integration::gateway_allowed_routes_selector_tests
+              integration::gateway_api_backend_tls_policy_tests
               integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_istio_status_tests
               integration::k8s_controller_shutdown_tests

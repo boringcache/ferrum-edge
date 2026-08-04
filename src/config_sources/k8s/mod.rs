@@ -4,6 +4,7 @@
 //! supported Istio + Gateway API surface into Ferrum's canonical Layer 2 model.
 //! Unsupported resources fail closed when silent translation would be unsafe.
 
+mod backend_tls_policy;
 mod core;
 mod gateway_api;
 mod istio;
@@ -528,6 +529,8 @@ pub(crate) struct K8sAccumulator {
     /// sibling into `Conflicted=True`.
     gateway_api_route_conflicts: Vec<GatewayApiRouteConflict>,
     gateway_api_materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
+    /// Gateway API `BackendTLSPolicy` index keyed by target Service identity.
+    backend_tls_policies: backend_tls_policy::BackendTlsPolicyIndex,
 }
 
 impl K8sAccumulator {
@@ -557,6 +560,7 @@ impl K8sAccumulator {
             namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
             gateway_api_materialized_route_parents: HashSet::new(),
+            backend_tls_policies: backend_tls_policy::BackendTlsPolicyIndex::default(),
         }
     }
 
@@ -589,6 +593,24 @@ impl K8sAccumulator {
             .is_some_and(|ports| ports.contains(&port))
     }
 
+    /// Reverse-lookup a Service port name for a numeric port when the Service
+    /// was collected. Used by BackendTLSPolicy `sectionName` matching.
+    pub(crate) fn lookup_service_port_name(
+        &self,
+        namespace: &str,
+        service: &str,
+        port: u16,
+    ) -> Option<&str> {
+        self.service_port_names
+            .get(namespace)
+            .and_then(|by_svc| by_svc.get(service))
+            .and_then(|ports| {
+                ports
+                    .iter()
+                    .find_map(|(name, number)| (*number == port).then_some(name.as_str()))
+            })
+    }
+
     pub(crate) fn has_observed_services(&self) -> bool {
         !self.service_port_names.is_empty()
     }
@@ -609,6 +631,14 @@ impl K8sAccumulator {
 
     pub(crate) fn secret_tls_material_digest(&self, namespace: &str, name: &str) -> Option<&str> {
         core::secret_tls_material_digest(self, namespace, name)
+    }
+
+    pub(crate) fn secret_ca_bundle_digest(&self, namespace: &str, name: &str) -> Option<&str> {
+        core::secret_ca_bundle_digest(self, namespace, name)
+    }
+
+    pub(crate) fn configmap_ca_bundle_pem(&self, namespace: &str, name: &str) -> Option<&str> {
+        core::configmap_ca_bundle_pem(self, namespace, name)
     }
 
     fn observe_namespace(&mut self, namespace: &str) {
@@ -959,6 +989,13 @@ where
             }
         } else if object.kind == "Secret" {
             core::collect(&mut acc, object)?;
+        } else if object.kind == "ConfigMap"
+            && !mesh_config::is_istio_mesh_config_map(&acc.options, object)
+        {
+            // Gateway API BackendTLSPolicy caCertificateRefs commonly point at
+            // ConfigMaps. Collect CA bundles here; the istio root ConfigMap is
+            // handled by the mesh_config branch below.
+            core::collect(&mut acc, object)?;
         } else if mesh_config::is_istio_mesh_config_map(&acc.options, object) {
             mesh_config::collect(&mut acc, object)?;
         } else if acc.options.pod_discovery_enabled && object.kind == "ServiceEntry" {
@@ -966,6 +1003,19 @@ where
         } else if acc.options.pod_discovery_enabled && core::is_core_resource_kind(&object.kind) {
             core::collect(&mut acc, object)?;
         }
+    }
+
+    // BackendTLSPolicy validation resolves ConfigMap/Secret CA refs, so it
+    // runs after the core material index above rather than interleaved with it.
+    for object in &included_objects {
+        if object.kind != "BackendTLSPolicy" {
+            continue;
+        }
+        if !includes_object_namespace(&acc.options, object) {
+            continue;
+        }
+        observe_object_namespace(&mut acc, object);
+        backend_tls_policy::collect(&mut acc, object)?;
     }
 
     // WorkloadEntry cross-namespace attachment admission depends on the full

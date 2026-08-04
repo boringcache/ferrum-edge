@@ -18,6 +18,7 @@ use super::{
 pub(super) struct CoreState {
     services: HashMap<K8sServiceKey, CoreService>,
     secrets: HashMap<K8sServiceKey, CoreSecret>,
+    configmaps: HashMap<K8sServiceKey, CoreConfigMap>,
     pods: HashMap<PodKey, CorePod>,
     pod_by_ip: HashMap<String, PodKey>,
     endpoint_slices: Vec<CoreEndpointSlice>,
@@ -57,6 +58,18 @@ struct CoreService {
 struct CoreSecret {
     valid_tls_certificate: bool,
     tls_material_digest: Option<String>,
+    /// SHA-256 hex digest of the Secret `data["ca.crt"]` payload when present
+    /// and PEM-decodable. Used by Gateway API `BackendTLSPolicy` CA refs.
+    ca_bundle_digest: Option<String>,
+}
+
+#[derive(Debug)]
+struct CoreConfigMap {
+    /// Inline PEM text from ConfigMap `data["ca.crt"]` / `binaryData["ca.crt"]`
+    /// when present and PEM-decodable. BackendTLSPolicy emits this as an inline
+    /// CA source because runtime `k8s://` loading is Secret-only today.
+    ca_bundle_pem: Option<String>,
+    ca_bundle_digest: Option<String>,
 }
 
 #[derive(Debug)]
@@ -113,7 +126,7 @@ struct CoreAutoWorkload {
 pub(super) fn is_core_resource_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "Pod" | "Service" | "EndpointSlice" | "Node" | "Namespace" | "Secret"
+        "Pod" | "Service" | "EndpointSlice" | "Node" | "Namespace" | "Secret" | "ConfigMap"
     )
 }
 
@@ -129,6 +142,10 @@ pub(super) fn collect(
         "Service" => collect_service(acc, object),
         "Secret" => {
             collect_secret(acc, object);
+            Ok(())
+        }
+        "ConfigMap" => {
+            collect_configmap(acc, object);
             Ok(())
         }
         "Pod" => {
@@ -442,6 +459,26 @@ pub(super) fn secret_tls_material_digest<'a>(
         .and_then(|secret| secret.tls_material_digest.as_deref())
 }
 
+pub(super) fn secret_ca_bundle_digest<'a>(
+    acc: &'a K8sAccumulator,
+    namespace: &str,
+    name: &str,
+) -> Option<&'a str> {
+    K8sServiceKey::new(namespace.to_string(), name.to_string())
+        .and_then(|key| acc.core.secrets.get(&key))
+        .and_then(|secret| secret.ca_bundle_digest.as_deref())
+}
+
+pub(super) fn configmap_ca_bundle_pem<'a>(
+    acc: &'a K8sAccumulator,
+    namespace: &str,
+    name: &str,
+) -> Option<&'a str> {
+    K8sServiceKey::new(namespace.to_string(), name.to_string())
+        .and_then(|key| acc.core.configmaps.get(&key))
+        .and_then(|configmap| configmap.ca_bundle_pem.as_deref())
+}
+
 fn collect_secret(acc: &mut K8sAccumulator, object: &K8sObject) {
     let Some(key) = K8sServiceKey::new(
         object.metadata.namespace.clone(),
@@ -457,6 +494,29 @@ fn collect_secret(acc: &mut K8sAccumulator, object: &K8sObject) {
             tls_material_digest: valid_tls_certificate
                 .then(|| secret_tls_material_digest_for_object(object))
                 .flatten(),
+            ca_bundle_digest: secret_ca_bundle_digest_for_object(object),
+        },
+    );
+}
+
+fn collect_configmap(acc: &mut K8sAccumulator, object: &K8sObject) {
+    let Some(key) = K8sServiceKey::new(
+        object.metadata.namespace.clone(),
+        object.metadata.name.clone(),
+    ) else {
+        return;
+    };
+    let ca_bundle_pem = configmap_ca_bundle_pem_for_object(object);
+    let ca_bundle_digest = ca_bundle_pem.as_ref().map(|pem| {
+        let mut digest = Sha256::new();
+        digest.update(pem.as_bytes());
+        hex::encode(digest.finalize())
+    });
+    acc.core.configmaps.insert(
+        key,
+        CoreConfigMap {
+            ca_bundle_pem,
+            ca_bundle_digest,
         },
     );
 }
@@ -470,6 +530,62 @@ fn secret_tls_material_digest_for_object(secret: &K8sObject) -> Option<String> {
     digest.update([0]);
     digest.update(key.as_bytes());
     Some(hex::encode(digest.finalize()))
+}
+
+fn secret_ca_bundle_digest_for_object(secret: &K8sObject) -> Option<String> {
+    let data = secret.spec.get("data").and_then(Value::as_object)?;
+    let ca = data.get("ca.crt").and_then(Value::as_str)?;
+    let _ = secret_data_decodes_to_certificate_chain(ca)?;
+    let mut digest = Sha256::new();
+    digest.update(ca.as_bytes());
+    Some(hex::encode(digest.finalize()))
+}
+
+/// Maximum admitted inline ConfigMap CA bundle size for BackendTLSPolicy.
+const MAX_CONFIGMAP_CA_BUNDLE_BYTES: usize = 256 * 1024;
+
+fn configmap_ca_bundle_pem_for_object(configmap: &K8sObject) -> Option<String> {
+    if let Some(pem) = configmap
+        .spec
+        .get("data")
+        .and_then(Value::as_object)
+        .and_then(|data| data.get("ca.crt"))
+        .and_then(Value::as_str)
+    {
+        return validate_inline_ca_bundle_pem(pem).map(str::to_string);
+    }
+
+    let encoded = configmap
+        .spec
+        .get("binaryData")
+        .and_then(Value::as_object)
+        .and_then(|data| data.get("ca.crt"))
+        .and_then(Value::as_str)?;
+    use base64::Engine as _;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return None;
+    };
+    if bytes.len() > MAX_CONFIGMAP_CA_BUNDLE_BYTES {
+        return None;
+    }
+    let Ok(pem) = String::from_utf8(bytes) else {
+        return None;
+    };
+    validate_inline_ca_bundle_pem(&pem).map(|_| pem)
+}
+
+fn validate_inline_ca_bundle_pem(pem: &str) -> Option<&str> {
+    if pem.len() > MAX_CONFIGMAP_CA_BUNDLE_BYTES {
+        return None;
+    }
+    if !pem.contains("-----BEGIN CERTIFICATE-----") {
+        return None;
+    }
+    let mut reader = std::io::Cursor::new(pem.as_bytes());
+    let Ok(certs) = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() else {
+        return None;
+    };
+    (!certs.is_empty()).then_some(pem)
 }
 
 pub(crate) fn secret_object_is_valid_tls_certificate(secret: &K8sObject) -> bool {

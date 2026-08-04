@@ -88,7 +88,8 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | `GRPCRoute` | Not claimed by the `GATEWAY-HTTP` gate | Watched and translated — see [GRPCRoute predicate translation](#grpcroute-predicate-translation) — but not advertised as a passing upstream `GATEWAY-GRPC` profile until request traffic conformance is added |
 | `TCPRoute` | Yes, via Ferrum black-box live checks (not upstream `GATEWAY-TCP`) | Lab installs the pinned `v1.5.1` experimental-channel CRD bundle (one coherent channel that includes `TCPRoute`). Live kind traffic proves parent/listener attachment, same-namespace and ReferenceGrant cross-namespace backend resolution, tagged TCP echo forwarding, empty/missing/unpermitted backend fail-closed behavior, parent status (`Accepted`/`ResolvedRefs`/`Programmed`), live backendRef updates, and deletion withdrawal. Upstream profile/features remain `GATEWAY-HTTP` / `Gateway,ReferenceGrant,HTTPRoute`; `GATEWAY-TCP` is **not** claimed on this pin (the profile/tests land in later Gateway API releases). |
 | `TLSRoute` | Not claimed | Watched/translated for L4 experiments, but not advertised as a supported Gateway API conformance profile |
-| `UDPRoute`, `BackendTLSPolicy`, `ListenerSet`, `BackendLBPolicy` | No | Not claimed as effective Gateway API conformance features |
+| `BackendTLSPolicy` | Not claimed by upstream conformance profiles | Watched and translated for Service-backed `HTTPRoute`/`GRPCRoute` backends: `validation.hostname` → upstream SNI, `caCertificateRefs` (ConfigMap inline PEM or Secret `k8s://…#ca.crt`) or `wellKnownCACertificates: System`, optional `subjectAltNames` → SAN allow-list, `backend_scheme: https`. Invalid/conflicting policies fail closed with an HTTP 500 fault abort. Policy `status.ancestors` is not written yet. |
+| `UDPRoute`, `ListenerSet`, `BackendLBPolicy` | No | Not claimed as effective Gateway API conformance features |
 
 ## GRPCRoute predicate translation
 
