@@ -35,7 +35,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -261,19 +261,29 @@ pub enum GrpcBody {
     ///
     /// Used by the HTTP/3 cross-protocol gRPC bridge: H3's
     /// `h3::server::RequestStream` cannot be expressed as a hyper `Incoming`,
-    /// so a pump task reads `RequestStream::recv_data()` and pushes `Bytes`
-    /// chunks — or `Err(())` on a frontend upload failure (so a truncated
-    /// upload becomes a backend RST rather than a clean END_STREAM the backend
-    /// would mistake for a completed stream) — into the bounded sender. This
-    /// body polls the receiver. Inline size enforcement (`bytes_seen` /
+    /// so a pump task reads request DATA and trailing metadata and pushes
+    /// `Frame<Bytes>` values — or `Err(())` on a frontend upload failure (so a
+    /// truncated upload becomes a backend RST rather than a clean END_STREAM
+    /// the backend would mistake for a completed stream) — into the bounded
+    /// sender. This body polls the receiver. Inline size enforcement (`bytes_seen` /
     /// `max_bytes` / `exceeded`) and the upload observer match `Streaming`
     /// exactly; only the source differs. The same `Pin<&mut Self>` exclusivity
     /// argument as `Streaming` makes the plain `usize` counter safe.
     Channel {
-        receiver: tokio::sync::mpsc::Receiver<Result<Bytes, ()>>,
+        receiver: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, ()>>,
         bytes_seen: usize,
         max_bytes: usize,
         exceeded: Arc<AtomicBool>,
+        /// Set when the H3 response side terminates before the request pump
+        /// reaches a clean downstream EOF. Checked before queued DATA so the
+        /// H2 backend sees RST_STREAM rather than a truncated clean END_STREAM.
+        cancelled: Arc<AtomicBool>,
+        /// Local terminal state after the cancellation error has been emitted.
+        /// Prevents a defensive re-poll from exposing any queued DATA.
+        cancelled_terminal: bool,
+        /// DATA bytes actually yielded to hyper for the H2 backend. Queued or
+        /// cancellation-discarded frames are deliberately not counted.
+        forwarded_bytes: Arc<AtomicU64>,
         /// Fired from `Drop` when this request body terminates — same contract
         /// as [`GrpcBody::Streaming::upload_observer`]. `None` for the H3
         /// bridge, which records the circuit-breaker outcome at response time.
@@ -338,7 +348,7 @@ impl http_body::Body for GrpcBody {
                     if *max_bytes > 0
                         && let Some(data) = frame.data_ref()
                     {
-                        *bytes_seen += data.len();
+                        *bytes_seen = bytes_seen.saturating_add(data.len());
                         if *bytes_seen > *max_bytes {
                             exceeded.store(true, Ordering::Release);
                             // Return an error to RST_STREAM the request,
@@ -362,34 +372,59 @@ impl http_body::Body for GrpcBody {
                 bytes_seen,
                 max_bytes,
                 exceeded,
+                cancelled,
+                cancelled_terminal,
+                forwarded_bytes,
                 ..
-            } => match receiver.poll_recv(cx) {
-                Poll::Ready(Some(Ok(data))) => {
-                    if *max_bytes > 0 {
-                        *bytes_seen += data.len();
-                        if *bytes_seen > *max_bytes {
-                            exceeded.store(true, Ordering::Release);
-                            // RST_STREAM the request so the backend cannot
-                            // treat the truncated prefix as a complete stream —
-                            // identical to the `Streaming` overflow branch.
-                            return Poll::Ready(Some(Err(format!(
-                                "gRPC request payload exceeds maximum of {} bytes",
-                                max_bytes
-                            )
-                            .into())));
-                        }
-                    }
-                    Poll::Ready(Some(Ok(Frame::data(data))))
+            } => {
+                if *cancelled_terminal {
+                    return Poll::Ready(None);
                 }
-                // The pump task signals a frontend upload failure with `Err(())`
-                // so we RST the backend instead of sending a clean END_STREAM
-                // that the backend would mistake for a completed request.
-                Poll::Ready(Some(Err(()))) => Poll::Ready(Some(Err(
-                    "gRPC request body upload failed (frontend stream error)".into(),
-                ))),
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            },
+                // Poll the queue before the cancellation acquire. This makes
+                // the acquire below the linearization point for a ready frame:
+                // shutdown published while `poll_recv` is observing queued
+                // DATA discards that frame instead of letting one final chunk
+                // cross the backend boundary. If the queue is pending, the
+                // response-side shutdown also wakes the pump, whose sender
+                // drop wakes this receiver.
+                let next_frame = receiver.poll_recv(cx);
+                if cancelled.load(Ordering::Acquire) {
+                    *cancelled_terminal = true;
+                    return Poll::Ready(Some(Err(
+                        "gRPC request body upload cancelled before downstream EOF".into(),
+                    )));
+                }
+                match next_frame {
+                    Poll::Ready(Some(Ok(frame))) => {
+                        if let Some(data) = frame.data_ref() {
+                            if *max_bytes > 0 {
+                                *bytes_seen = bytes_seen.saturating_add(data.len());
+                                if *bytes_seen > *max_bytes {
+                                    exceeded.store(true, Ordering::Release);
+                                    // RST_STREAM the request so the backend cannot
+                                    // treat the truncated prefix as a complete stream —
+                                    // identical to the `Streaming` overflow branch.
+                                    return Poll::Ready(Some(Err(format!(
+                                        "gRPC request payload exceeds maximum of {} bytes",
+                                        max_bytes
+                                    )
+                                    .into())));
+                                }
+                            }
+                            forwarded_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        }
+                        Poll::Ready(Some(Ok(frame)))
+                    }
+                    // The pump task signals a frontend upload failure with `Err(())`
+                    // so we RST the backend instead of sending a clean END_STREAM
+                    // that the backend would mistake for a completed request.
+                    Poll::Ready(Some(Err(()))) => Poll::Ready(Some(Err(
+                        "gRPC request body upload failed (frontend stream error)".into(),
+                    ))),
+                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
         }
     }
 
@@ -405,7 +440,11 @@ impl http_body::Body for GrpcBody {
             // No cheap "channel closed" probe without polling; `false` is always
             // safe (hyper polls once more to observe `None`/overflow). The
             // `exceeded` short-circuit mirrors `Streaming`.
-            GrpcBody::Channel { exceeded, .. } => exceeded.load(Ordering::Relaxed),
+            GrpcBody::Channel {
+                exceeded,
+                cancelled_terminal,
+                ..
+            } => *cancelled_terminal || exceeded.load(Ordering::Relaxed),
         }
     }
 
@@ -2827,24 +2866,29 @@ pub async fn proxy_grpc_request_streaming(
 /// hyper `Incoming`.
 ///
 /// Used by the HTTP/3 cross-protocol gRPC bridge: H3's `RequestStream` cannot be
-/// expressed as a hyper `Incoming`, so a pump task feeds request DATA frames into
-/// `receiver` and this entry wraps it in a [`GrpcBody::Channel`]. Behaviour is
-/// otherwise identical to [`proxy_grpc_request_streaming`] — the response is
-/// always streamed (the request body is consumed on the wire, so retries are
-/// impossible), and request-size limits are enforced inline via the same byte
-/// counting. `body_size_exceeded` is the shared overflow flag the channel body
-/// sets on limit breach so the caller can surface `RESOURCE_EXHAUSTED`.
+/// expressed as a hyper `Incoming`, so a pump task feeds request DATA and trailer
+/// frames into `receiver` and this entry wraps it in a [`GrpcBody::Channel`].
+/// Behaviour is otherwise identical to [`proxy_grpc_request_streaming`] — the
+/// response is always streamed (the request body is consumed on the wire, so
+/// retries are impossible), and request-size limits are enforced inline against
+/// DATA via the same byte counting. `body_size_exceeded` is the shared overflow
+/// flag the channel body sets on limit breach so the caller can surface
+/// `RESOURCE_EXHAUSTED`; `body_cancelled` converts response-side shutdown into
+/// a backend request-body error, and `body_bytes_forwarded` counts only DATA
+/// frames yielded across that boundary.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_grpc_request_streaming_channel(
     method: hyper::Method,
     headers: hyper::HeaderMap,
-    receiver: tokio::sync::mpsc::Receiver<Result<Bytes, ()>>,
+    receiver: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, ()>>,
     proxy: &Proxy,
     backend_url: &str,
     grpc_pool: &GrpcConnectionPool,
     proxy_headers: &HashMap<String, String>,
     max_grpc_recv_size_bytes: usize,
     body_size_exceeded: Arc<AtomicBool>,
+    body_cancelled: Arc<AtomicBool>,
+    body_bytes_forwarded: Arc<AtomicU64>,
     upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
@@ -2854,6 +2898,9 @@ pub async fn proxy_grpc_request_streaming_channel(
         bytes_seen: 0,
         max_bytes: max_grpc_recv_size_bytes,
         exceeded: Arc::clone(&body_size_exceeded),
+        cancelled: body_cancelled,
+        cancelled_terminal: false,
+        forwarded_bytes: body_bytes_forwarded,
         upload_observer,
     };
     proxy_grpc_streaming_dispatch(
