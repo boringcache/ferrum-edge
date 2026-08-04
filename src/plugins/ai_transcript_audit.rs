@@ -60,8 +60,7 @@ use flate2::bufread::GzDecoder;
 use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use prost::Message as _;
 use prost_reflect::{
-    DescriptorPool, DynamicMessage, Kind, MessageDescriptor, ReflectMessage,
-    Value as ProtobufValue,
+    DescriptorPool, DynamicMessage, Kind, MessageDescriptor, ReflectMessage, Value as ProtobufValue,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -3021,11 +3020,10 @@ impl AiTranscriptAudit {
 
         let mut messages = Vec::with_capacity(frames.len());
         for (index, frame) in frames.iter().enumerate() {
-            let decoded =
-                match DynamicMessage::decode(descriptor.clone(), frame.payload.as_ref()) {
-                    Ok(message) => message,
-                    Err(_) => return ShapedBody::omitted(OMIT_REASON_GRPC_DECODE),
-                };
+            let decoded = match DynamicMessage::decode(descriptor.clone(), frame.payload.as_ref()) {
+                Ok(message) => message,
+                Err(_) => return ShapedBody::omitted(OMIT_REASON_GRPC_DECODE),
+            };
             let mut budget = GrpcWalkBudget::new();
             if has_unknown_fields(&decoded, &mut budget) {
                 return ShapedBody::omitted(OMIT_REASON_GRPC_DECODE);
@@ -3042,13 +3040,8 @@ impl AiTranscriptAudit {
                 }
             } else {
                 let mut strings = Vec::new();
-                if collect_string_fields(
-                    &decoded,
-                    &mut Vec::new(),
-                    &mut strings,
-                    &mut walk_budget,
-                )
-                .is_err()
+                if collect_string_fields(&decoded, &mut Vec::new(), &mut strings, &mut walk_budget)
+                    .is_err()
                 {
                     return ShapedBody::omitted(OMIT_REASON_GRPC_SCAN_LIMIT);
                 }
@@ -4455,8 +4448,7 @@ impl Plugin for AiTranscriptAudit {
             return;
         }
 
-        let captures_response_body =
-            self.response_body_capture_allowed_for(ctx, response_headers);
+        let captures_response_body = self.response_body_capture_allowed_for(ctx, response_headers);
         let response_hash = captures_response_body.then(|| self.redactor.keyed_hash_hex(body));
         if let Some(response_hash) = response_hash.as_ref() {
             ctx.metadata
@@ -7176,7 +7168,6 @@ fn json_looks_like_ai_request(json: &Value) -> bool {
     object.contains_key("model") && WEAK_MARKERS.iter().any(|field| object.contains_key(*field))
 }
 
-
 // ══════════════════════════════════════════════════════════════════════
 // Native gRPC capture helpers (issue #3304)
 // ══════════════════════════════════════════════════════════════════════
@@ -7529,10 +7520,13 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
         })?
         .to_string();
 
-    let max_message_bytes =
-        cfg_positive_usize(grpc, "max_message_bytes", DEFAULT_GRPC_MAX_MESSAGE_BYTES, "grpc")?;
-    let max_messages =
-        cfg_positive_usize(grpc, "max_messages", DEFAULT_GRPC_MAX_MESSAGES, "grpc")?;
+    let max_message_bytes = cfg_positive_usize(
+        grpc,
+        "max_message_bytes",
+        DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+        "grpc",
+    )?;
+    let max_messages = cfg_positive_usize(grpc, "max_messages", DEFAULT_GRPC_MAX_MESSAGES, "grpc")?;
 
     let Some(method_configs) = grpc.get("methods").and_then(Value::as_object) else {
         return Err(
@@ -7600,8 +7594,7 @@ fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
     let trimmed = method_path.trim();
     if trimmed.is_empty() {
         return Err(
-            "ai_transcript_audit: a 'grpc.methods' key must be a non-empty method path"
-                .to_string(),
+            "ai_transcript_audit: a 'grpc.methods' key must be a non-empty method path".to_string(),
         );
     }
     if trimmed
