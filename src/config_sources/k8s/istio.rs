@@ -1769,10 +1769,14 @@ fn translate_locality_lb_setting(
                     ),
                 ));
             };
-            // Duplicates are accepted (Istio iterates them as independent ordered
-            // steps) but surface a deterministic warning so operators notice
-            // accidental repetition. Rejecting would silently diverge from Istio
-            // admission of the same YAML.
+            // Duplicate *identical* raw strings are accepted (Istio keeps every
+            // list position as a match step) but surface a deterministic warning
+            // so operators notice accidental repetition. Rejecting would silently
+            // diverge from Istio admission of the same YAML. Ranking still
+            // resolves expected values through one override map (last key=value
+            // wins for that key at every position, including bare-key entries) —
+            // distinct forms of the same key (`version=v1` vs `version`) do not
+            // trip this raw-string dedupe.
             if !seen.insert(raw.to_string()) {
                 tracing::warn!(
                     resource = %object.metadata.name,
@@ -1780,7 +1784,8 @@ fn translate_locality_lb_setting(
                     key = %key,
                     index = idx,
                     "DestinationRule localityLbSetting.failoverPriority contains a duplicate \
-                     entry; each occurrence is still evaluated as an independent ordered match step"
+                     identical entry; each list position remains a match step (expected values \
+                     still follow Istio's last-wins override map for that key)"
                 );
             }
             // Key must be a non-empty Kubernetes-style label key fragment.

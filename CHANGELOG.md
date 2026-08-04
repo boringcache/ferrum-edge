@@ -47,11 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-port, or per-subset active/passive health enables failover. An entirely
   empty source-label map creates no tiers; with a non-empty map, individually
   missing labels compare as empty strings.
-  Duplicates are accepted as independent ordered steps with a key-only warning.
+  Duplicate list positions are kept; expected values follow Istio's override-map
+  semantics (last `key=value` wins for that key at every position, including
+  bare-key entries), with a warning on duplicate identical raw strings.
   FerrumAccepted status reports field-specific rejection diagnostics and an
   inactive-policy advisory when the applicable DestinationRule policy lacks
   `outlierDetection`. Docs, OpenAPI, and focused create/update/delete/data-path
   tests cover the behavior.
+- **Behavior change (bundled with #3238):** mesh `source_locality` projection no
+  longer picks the first same-SPIFFE local sibling. When multiple label-
+  compatible local workloads share the mesh SPIFFE but disagree on locality,
+  Ferrum now returns `None` and turns locality-first preference off for that
+  slice (fail closed). Previously the result was ordering-dependent. Same-SPIFFE
+  local siblings that agree, or a single matching workload, are unchanged.
 
 - Audited admin mutations are durable **before they run** (issue #2421).
   The admin write gate fsyncs a pre-mutation audit intent — a stable event id

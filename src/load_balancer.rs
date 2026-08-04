@@ -2161,8 +2161,14 @@ fn build_locality_lb_state(
 /// Rank `0` is highest priority (matched all configured labels). Rank `N` is
 /// lowest (matched none). Missing labels on either the source or the endpoint
 /// compare as empty strings (Istio map-lookup semantics). When the first
-/// configured label is `topology.istio.io/network` and it mismatches, Istio
-/// demotes the endpoint by `N` while continuing to match the remaining labels.
+/// configured entry is the bare label name `topology.istio.io/network` (raw
+/// string equality — not the override form `key=value`) and it mismatches,
+/// Istio demotes the endpoint by `N` while continuing to match the remaining
+/// labels.
+///
+/// Expected values follow Istio's `priorityLabelOverrides`: one override map
+/// (last `key=value` wins) is consulted at every position of that key,
+/// including bare-key positions. Steps are therefore not value-independent.
 fn compute_failover_priority_ranks(
     failover_priority: &[String],
     source_labels: &HashMap<String, String>,
@@ -2179,20 +2185,35 @@ fn compute_failover_priority_ranks(
     {
         return targets.iter().map(|_| lowest).collect();
     }
-    let includes_network = failover_priority.first().is_some_and(|entry| {
-        parse_failover_priority_entry(entry)
-            .is_some_and(|(key, _)| key == FAILOVER_PRIORITY_LABEL_NETWORK)
-    });
+    // Istio: `failoverPriorities[0] == label.TopologyNetwork.Name` — raw string
+    // comparison against the bare label name, so `topology.istio.io/network=…`
+    // as entry 0 does not trigger the network demotion special case.
+    let includes_network = failover_priority
+        .first()
+        .is_some_and(|entry| entry.as_str() == FAILOVER_PRIORITY_LABEL_NETWORK);
 
-    // Resolve (key, expected_value) once for the source so the per-target loop
-    // stays allocation-free.
-    let mut expected: Vec<(&str, String)> = Vec::with_capacity(n);
+    // Build the override map first (last key=value wins), then resolve every
+    // entry — bare or overridden — through that map. Matches Istio's
+    // `priorityLabelOverrides` so a later `key=value` also applies at earlier
+    // bare-key positions of the same key.
+    let mut overridden: HashMap<&str, &str> = HashMap::with_capacity(n);
+    let mut keys: Vec<&str> = Vec::with_capacity(n);
     for entry in failover_priority {
         let Some((key, override_value)) = parse_failover_priority_entry(entry) else {
             return targets.iter().map(|_| lowest).collect();
         };
-        let value = match override_value {
-            Some(value) => value.to_string(),
+        keys.push(key);
+        if let Some(value) = override_value {
+            overridden.insert(key, value);
+        }
+    }
+
+    // Resolve (key, expected_value) once for the source so the per-target loop
+    // stays allocation-free.
+    let mut expected: Vec<(&str, String)> = Vec::with_capacity(n);
+    for key in keys {
+        let value = match overridden.get(key) {
+            Some(value) => (*value).to_string(),
             None => source_labels.get(key).cloned().unwrap_or_default(),
         };
         expected.push((key, value));

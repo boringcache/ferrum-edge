@@ -2689,6 +2689,93 @@ fn failover_priority_network_first_demotes_without_dropping_later_matches() {
 }
 
 #[test]
+fn failover_priority_network_override_entry0_does_not_trigger_network_special_case() {
+    // Istio compares failoverPriorities[0] to the bare TopologyNetwork name as
+    // a raw string. The override form `topology.istio.io/network=net-a` must
+    // NOT get network demotion — both endpoints share one tier after the first
+    // mismatch (round-robin across A and B).
+    let source_labels = HashMap::from([(
+        "topology.kubernetes.io/region".to_string(),
+        "us-west".to_string(),
+    )]);
+    let up = upstream_with_failover_priority(
+        source_labels,
+        vec![
+            labeled_target(
+                "net-b-west.local",
+                Some("us-west/us-west-1/a"),
+                &[
+                    ("topology.istio.io/network", "net-b"),
+                    ("topology.kubernetes.io/region", "us-west"),
+                ],
+            ),
+            labeled_target(
+                "net-b-eu.local",
+                Some("eu-central/eu-central-1/a"),
+                &[
+                    ("topology.istio.io/network", "net-b"),
+                    ("topology.kubernetes.io/region", "eu-central"),
+                ],
+            ),
+        ],
+        vec![
+            "topology.istio.io/network=net-a".to_string(),
+            "topology.kubernetes.io/region".to_string(),
+        ],
+    );
+    let snapshot = LoadBalancerCache::new(&config(up)).load();
+    let mut seen = HashSet::new();
+    for i in 0..30 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("net-override-{i}"),
+            no_health(),
+        )
+        .expect("selected");
+        seen.insert(selection.target.host.clone());
+    }
+    assert_eq!(
+        seen.len(),
+        2,
+        "network=value as entry 0 must not demote later matches into separate tiers — saw {seen:?}"
+    );
+}
+
+#[test]
+fn failover_priority_duplicate_key_applies_override_map_at_every_position() {
+    // Istio builds one overriddenValueByLabel map (last key=value wins) and
+    // consults it at every position of that key, including bare-key positions.
+    // ["version=v1", "version"] with source version=v2 must compare against v1
+    // at both steps so an endpoint with version=v1 matches both.
+    let source_labels = HashMap::from([("version".to_string(), "v2".to_string())]);
+    let up = upstream_with_failover_priority(
+        source_labels,
+        vec![
+            labeled_target("v1.local", None, &[("version", "v1")]),
+            labeled_target("v2.local", None, &[("version", "v2")]),
+        ],
+        vec!["version=v1".to_string(), "version".to_string()],
+    );
+    let snapshot = LoadBalancerCache::new(&config(up)).load();
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("dup-key-{i}"),
+            no_health(),
+        )
+        .expect("selected");
+        assert_eq!(
+            selection.target.host, "v1.local",
+            "override map must apply at bare-key positions too"
+        );
+    }
+}
+
+#[test]
 fn failover_priority_without_health_signal_leaves_selection_unchanged() {
     let mut up = upstream_with_failover_priority(
         HashMap::from([("version".to_string(), "v1".to_string())]),
@@ -2921,4 +3008,78 @@ fn failover_priority_more_than_255_components_preserves_distinct_ranks() {
         selection.target.host, "lower.local",
         "component 257 must remain a distinct better rank than component 256"
     );
+}
+
+#[test]
+fn failover_priority_vec_fallback_path_falls_through_unhealthy_preferred_tier_above_128_targets() {
+    // Force the >128 Vec fallback: 160 targets. Rank-0 (full match) endpoints
+    // are all unhealthy; selection must fall through to the region-only tier.
+    let source_labels = HashMap::from([
+        (
+            "topology.kubernetes.io/region".to_string(),
+            "us-west".to_string(),
+        ),
+        (
+            "topology.kubernetes.io/zone".to_string(),
+            "us-west-1".to_string(),
+        ),
+    ]);
+    let mut targets = Vec::with_capacity(160);
+    let mut full_match = Vec::with_capacity(80);
+    for i in 0..80 {
+        let t = labeled_target(
+            &format!("full-{i}.local"),
+            Some("us-west/us-west-1/a"),
+            &[
+                ("topology.kubernetes.io/region", "us-west"),
+                ("topology.kubernetes.io/zone", "us-west-1"),
+            ],
+        );
+        full_match.push(t.clone());
+        targets.push(t);
+    }
+    for i in 0..80 {
+        targets.push(labeled_target(
+            &format!("region-{i}.local"),
+            Some("us-west/us-west-2/a"),
+            &[
+                ("topology.kubernetes.io/region", "us-west"),
+                ("topology.kubernetes.io/zone", "us-west-2"),
+            ],
+        ));
+    }
+    let up = upstream_with_failover_priority(
+        source_labels,
+        targets,
+        vec![
+            "topology.kubernetes.io/region".to_string(),
+            "topology.kubernetes.io/zone".to_string(),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let active_unhealthy = DashMap::new();
+    for target in &full_match {
+        active_unhealthy.insert(target_key("ferrum|u1", target), 1);
+    }
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+    for i in 0..32 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("fp-vec-fb-{i}"),
+            Some(&health),
+        )
+        .expect("vec-fallback failoverPriority selection");
+        assert!(
+            selection.target.host.starts_with("region-"),
+            "Vec fallback must fall through unhealthy full-match tier to region-only — got {}",
+            selection.target.host
+        );
+    }
 }
