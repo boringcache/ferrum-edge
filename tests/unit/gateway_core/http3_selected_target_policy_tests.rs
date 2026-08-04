@@ -932,10 +932,39 @@ fn h3_deferred_hooks_cannot_spoof_backend_gateway_assertions() {
     assert!(websocket.contains("\"x-geo-country\","));
     assert!(websocket.contains("if let Some(country) = ctx.backend_geo_country()"));
 
+    // Native H3 request trailers are sanitized through the shared late-boundary
+    // helper (not an inline strip). Pin both the call site and the geo arm so a
+    // refactor cannot drop the reserved assertion from either side.
     let h3_client = include_str!("../../../src/http3/client.rs");
+    let trailer_recv = h3_client
+        .find("frontend_stream.recv_trailers().await")
+        .expect("native H3 relay must read client request trailers");
+    let trailer_finish = h3_client[trailer_recv..]
+        .find("backend_stream\n            .finish()")
+        .or_else(|| h3_client[trailer_recv..].find("backend_stream.finish()"))
+        .expect("native H3 relay must finish the backend stream after trailers");
+    let trailer_block = &h3_client[trailer_recv..trailer_recv + trailer_finish];
     assert!(
-        h3_client.contains("|| s == \"x-geo-country\""),
+        trailer_block.contains("sanitize_backend_request_trailers(&mut trailers)"),
+        "H3 client request trailers must pass through the shared backend-trailer sanitizer"
+    );
+
+    let headers = include_str!("../../../src/proxy/headers.rs");
+    let forbidden_start = headers
+        .find("fn is_forbidden_backend_request_trailer_name")
+        .expect("shared request-trailer forbid helper must remain present");
+    let forbidden_tail = &headers[forbidden_start..];
+    let forbidden_end = forbidden_tail
+        .find("\npub(crate) fn sanitize_backend_request_trailers")
+        .expect("sanitize helper must follow the forbid predicate");
+    let forbidden = &forbidden_tail[..forbidden_end];
+    assert!(
+        forbidden.contains("\"x-geo-country\""),
         "H3 client trailers must not reintroduce a reserved geo assertion"
+    );
+    assert!(
+        forbidden.contains("name.starts_with(\"x-consumer-\")"),
+        "shared request-trailer forbid helper must reject consumer identity assertions"
     );
 }
 
