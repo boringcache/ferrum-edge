@@ -59,7 +59,8 @@ use dashmap::DashMap;
 use flate2::bufread::GzDecoder;
 use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use prost_reflect::{
-    DescriptorPool, DynamicMessage, Kind, MessageDescriptor, ReflectMessage, Value as ProtobufValue,
+    DescriptorPool, DynamicMessage, Kind, MapKey, MessageDescriptor, ReflectMessage,
+    Value as ProtobufValue,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -2893,8 +2894,8 @@ impl AiTranscriptAudit {
         };
         {
             // Read-only probe: the mutating borrow is taken again below, after
-            // the capture work, so this guard does not need a mutable binding.
-            let Some(staged) = self.staging.get_mut(&record_id) else {
+            // the capture work, so a shared shard guard is enough here.
+            let Some(staged) = self.staging.get(&record_id) else {
                 return;
             };
             if staged.captured {
@@ -3034,8 +3035,9 @@ impl AiTranscriptAudit {
             if let Some(paths) = method.text_fields.as_ref() {
                 for path in paths {
                     if let Some(value) = read_text_field(&decoded, path, &mut walk_budget) {
+                        let sensitive = sensitive_grpc_field_path(path);
                         let key = path.join(".");
-                        let exported = self.export_grpc_string(&key, &value);
+                        let exported = self.export_grpc_string(sensitive, &value);
                         fields.insert(key, Value::String(exported));
                     }
                 }
@@ -3046,9 +3048,9 @@ impl AiTranscriptAudit {
                 {
                     return ShapedBody::omitted(OMIT_REASON_GRPC_SCAN_LIMIT);
                 }
-                for (path, value) in strings {
-                    let exported = self.export_grpc_string(&path, &value);
-                    fields.insert(path, Value::String(exported));
+                for captured in strings {
+                    let exported = self.export_grpc_string(captured.sensitive, &captured.value);
+                    fields.insert(captured.path, Value::String(exported));
                 }
             }
             let mut obj = serde_json::Map::new();
@@ -3080,18 +3082,32 @@ impl AiTranscriptAudit {
         }
     }
 
-    /// Apply the same redaction contract used for HTTP JSON excerpts: sensitive
-    /// field-name values are replaced wholesale, and remaining strings pass
-    /// through the configured PII redactor in redacting modes.
-    fn export_grpc_string(&self, field_path: &str, value: &str) -> String {
-        let leaf = field_path.rsplit('.').next().unwrap_or(field_path);
-        if self.mode.redacts_body() && sensitive_json_field(leaf) {
+    /// Apply the same redaction contract used for HTTP JSON excerpts.
+    ///
+    /// `sensitive` is decided by the descriptor walk (or by
+    /// [`sensitive_grpc_field_path`] for operator-selected `text_fields`) and is
+    /// true when ANY ancestor segment matched the field-name policy — including
+    /// a map key that is deliberately not exported as a transcript label. That
+    /// mirrors [`redact_json_value_strings_at_depth`], which replaces the whole
+    /// subtree under a sensitive object key rather than only its leaf.
+    ///
+    /// Non-sensitive strings go through the same shared JSON string redaction
+    /// the HTTP path uses, so JSON embedded inside a protobuf string (tool-call
+    /// arguments, for example) cannot bypass the field-name policy either.
+    fn export_grpc_string(&self, sensitive: bool, value: &str) -> String {
+        if !self.mode.redacts_body() {
+            return value.to_string();
+        }
+        if sensitive {
             return REDACTED_PLACEHOLDER.to_string();
         }
-        if self.mode.redacts_body() {
-            self.redactor.redact(value)
-        } else {
-            value.to_string()
+        let mut json = Value::String(value.to_string());
+        redact_json_value_strings(&self.redactor, &mut json);
+        match json {
+            Value::String(text) => text,
+            // Unreachable: the string arm always writes a string back. Fail
+            // closed rather than exporting an unexpected shape.
+            _ => REDACTED_PLACEHOLDER.to_string(),
         }
     }
 
@@ -7386,21 +7402,66 @@ fn value_has_unknown_fields(value: &ProtobufValue, budget: &mut GrpcWalkBudget) 
     }
 }
 
+/// One captured protobuf string.
+///
+/// `sensitive` is resolved during the walk rather than re-derived from `path`,
+/// because the redaction decision needs names the exported label deliberately
+/// drops: map keys (kept out of the label) and repeated-element field names
+/// (whose label segment is a numeric index).
+struct GrpcCapturedString {
+    path: String,
+    value: String,
+    sensitive: bool,
+}
+
+/// Whether any segment of a field path names a sensitive field.
+///
+/// The HTTP JSON path replaces the whole subtree under a sensitive object key,
+/// so a benign leaf beneath `credentials` or `password_reset` must not export.
+fn sensitive_grpc_field_path(path: &[String]) -> bool {
+    path.iter().any(|segment| sensitive_json_field(segment))
+}
+
+/// Whether a protobuf map key names a sensitive field. Only string keys can:
+/// scalar keys are positional identifiers, never field names.
+fn sensitive_map_key(key: &MapKey) -> bool {
+    match key {
+        MapKey::String(text) => sensitive_json_field(text),
+        _ => false,
+    }
+}
+
 fn collect_string_fields(
     message: &DynamicMessage,
     path: &mut Vec<String>,
-    out: &mut Vec<(String, String)>,
+    out: &mut Vec<GrpcCapturedString>,
+    budget: &mut GrpcWalkBudget,
+) -> Result<(), ()> {
+    collect_message_strings(message, path, false, out, budget)
+}
+
+/// `sensitive` is inherited from every ancestor already walked, so the flag is
+/// sticky once any enclosing field name — or map key — matches the policy.
+fn collect_message_strings(
+    message: &DynamicMessage,
+    path: &mut Vec<String>,
+    sensitive: bool,
+    out: &mut Vec<GrpcCapturedString>,
     budget: &mut GrpcWalkBudget,
 ) -> Result<(), ()> {
     budget.enter()?;
     for (field, value) in message.fields() {
-        path.push(field.name().to_string());
-        collect_string_value(value, path, out, budget)?;
+        let name = field.name();
+        let nested = sensitive || sensitive_json_field(name);
+        path.push(name.to_string());
+        collect_string_value(value, path, nested, out, budget)?;
         path.pop();
     }
     for (field, value) in message.extensions() {
-        path.push(field.name().to_string());
-        collect_string_value(value, path, out, budget)?;
+        let name = field.name();
+        let nested = sensitive || sensitive_json_field(name);
+        path.push(name.to_string());
+        collect_string_value(value, path, nested, out, budget)?;
         path.pop();
     }
     budget.leave();
@@ -7410,31 +7471,43 @@ fn collect_string_fields(
 fn collect_string_value(
     value: &ProtobufValue,
     path: &mut Vec<String>,
-    out: &mut Vec<(String, String)>,
+    sensitive: bool,
+    out: &mut Vec<GrpcCapturedString>,
     budget: &mut GrpcWalkBudget,
 ) -> Result<(), ()> {
     budget.charge()?;
     match value {
         ProtobufValue::String(text) => {
-            out.push((path.join("."), text.to_string()));
+            out.push(GrpcCapturedString {
+                path: path.join("."),
+                value: text.to_string(),
+                sensitive,
+            });
         }
         ProtobufValue::Message(message) => {
-            collect_string_fields(message, path, out, budget)?;
+            collect_message_strings(message, path, sensitive, out, budget)?;
         }
         ProtobufValue::List(items) => {
             for (index, item) in items.iter().enumerate() {
+                // The index is a positional label, not a field name: the
+                // repeated field's own name already decided sensitivity, so a
+                // `repeated string api_keys` redacts every element.
                 path.push(index.to_string());
-                collect_string_value(item, path, out, budget)?;
+                collect_string_value(item, path, sensitive, out, budget)?;
                 path.pop();
             }
         }
         ProtobufValue::Map(entries) => {
             // Map keys are not exported as transcript path labels (operator
-            // text_fields cannot select them either). Walk values under a
-            // stable placeholder segment so nested strings remain captureable.
-            for entry in entries.values() {
+            // text_fields cannot select them either), so values are walked
+            // under a stable placeholder segment. The key is still a field
+            // name for policy purposes: a `metadata` map carrying an
+            // `authorization` entry must redact exactly as the equivalent
+            // JSON object key would.
+            for (key, entry) in entries {
+                let nested = sensitive || sensitive_map_key(key);
                 path.push("*".to_string());
-                collect_string_value(entry, path, out, budget)?;
+                collect_string_value(entry, path, nested, out, budget)?;
                 path.pop();
             }
         }

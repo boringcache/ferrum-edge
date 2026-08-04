@@ -22280,12 +22280,23 @@ components:
             to native gRPC, but only for the enrolled methods: every other gRPC
             method is left undecoded, uncaptured, and unbuffered. Captured
             string fields honor the same mode/redaction contract as HTTP
-            excerpts. Malformed, truncated, oversized, undecodable, or
-            unknown-field payloads omit the excerpt with a compiled-in reason
-            rather than exporting partial or unredacted bytes. Requires a
+            excerpts: in redacted_body a value is replaced wholesale when ANY
+            enclosing name matches the sensitive field-name policy — the field
+            itself, any ancestor message field, or the protobuf map key of a
+            map entry (map keys are never exported as labels but always decide
+            redaction) — every element of a repeated field inherits that field's
+            own decision, and JSON embedded inside a protobuf string is decoded
+            and redacted before export. Malformed, truncated, oversized,
+            undecodable, or unknown-field payloads omit the excerpt with a
+            compiled-in reason rather than exporting partial or unredacted
+            bytes. Requires a
             node-local FileDescriptorSet; Admin/CP admission validates shape
             only, and mode-aware file-dependency validation resolves the
-            descriptor on data-plane nodes.
+            descriptor on data-plane nodes. Enrollment buffers the enrolled
+            method's request body, so enrolling a client-streaming or
+            bidirectional-streaming method converts it to fully buffered
+            request semantics; max_messages caps how much is captured, not how
+            much is buffered.
           properties:
             descriptor_path:
               type: string

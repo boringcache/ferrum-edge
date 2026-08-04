@@ -10453,3 +10453,372 @@ async fn grpc_unenrolled_method_never_stages() {
         "unenrolled methods must not become audit candidates"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// gRPC name-based redaction parity with the HTTP JSON contract
+// ══════════════════════════════════════════════════════════════════════
+//
+// The checked-in `test_validator.bin` fixture has no repeated, map, or nested
+// message fields, so these tests encode a proto3 `FileDescriptorSet` directly
+// from `descriptor.proto` wire shapes — no `protoc` run and no new checked-in
+// fixture binary.
+//
+// ```proto
+// syntax = "proto3";
+// package audit;
+// message Credentials { string display_name = 1; }
+// message Payload {
+//   string prompt = 1;
+//   repeated string api_keys = 2;
+//   map<string, string> metadata = 3;
+//   Credentials credentials = 4;
+//   string tool_arguments = 5;
+//   map<string, string> labels = 6;
+// }
+// message Ack { string status = 1; }
+// ```
+
+const PB3_LABEL_OPTIONAL: u64 = 1;
+const PB3_LABEL_REPEATED: u64 = 3;
+const PB3_TYPE_STRING: u64 = 9;
+const PB3_TYPE_MESSAGE: u64 = 11;
+const PB3_CREDENTIALS: &str = ".audit.Credentials";
+const PB3_METADATA_ENTRY: &str = ".audit.Payload.MetadataEntry";
+const PB3_LABELS_ENTRY: &str = ".audit.Payload.LabelsEntry";
+
+fn pb3_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn pb3_tag(out: &mut Vec<u8>, field: u32, wire: u64) {
+    pb3_varint(out, (u64::from(field) << 3) | wire);
+}
+
+fn pb3_len_field(field: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    pb3_tag(&mut out, field, 2);
+    pb3_varint(&mut out, payload.len() as u64);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn pb3_str_field(field: u32, value: &str) -> Vec<u8> {
+    pb3_len_field(field, value.as_bytes())
+}
+
+fn pb3_varint_field(field: u32, value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    pb3_tag(&mut out, field, 0);
+    pb3_varint(&mut out, value);
+    out
+}
+
+/// One `FieldDescriptorProto`.
+fn pb3_field(name: &str, number: u32, label: u64, kind: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(pb3_str_field(1, name));
+    out.extend(pb3_varint_field(3, u64::from(number)));
+    out.extend(pb3_varint_field(4, label));
+    out.extend(pb3_varint_field(5, kind));
+    out
+}
+
+/// A message-typed `FieldDescriptorProto` (`type_name` is field 6).
+fn pb3_message_field(name: &str, number: u32, label: u64, ty: &str) -> Vec<u8> {
+    let mut out = pb3_field(name, number, label, PB3_TYPE_MESSAGE);
+    out.extend(pb3_str_field(6, ty));
+    out
+}
+
+/// One `DescriptorProto`.
+fn pb3_message(name: &str, fields: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = pb3_str_field(1, name);
+    for field in fields {
+        out.extend(pb3_len_field(2, field));
+    }
+    out
+}
+
+fn pb3_with_nested(mut message: Vec<u8>, nested: &[u8]) -> Vec<u8> {
+    message.extend(pb3_len_field(3, nested));
+    message
+}
+
+/// Set `MessageOptions.map_entry` (options is field 7; map_entry is field 7).
+fn pb3_as_map_entry(mut message: Vec<u8>) -> Vec<u8> {
+    let options = pb3_varint_field(7, 1);
+    message.extend(pb3_len_field(7, &options));
+    message
+}
+
+/// A synthetic `map<string, string>` entry message.
+fn pb3_string_map_entry(name: &str) -> Vec<u8> {
+    let key = pb3_field("key", 1, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let value = pb3_field("value", 2, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    pb3_as_map_entry(pb3_message(name, &[key, value]))
+}
+
+fn audit_descriptor_set() -> Vec<u8> {
+    let display_name = pb3_field("display_name", 1, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let credentials_msg = pb3_message("Credentials", &[display_name]);
+
+    let prompt = pb3_field("prompt", 1, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let api_keys = pb3_field("api_keys", 2, PB3_LABEL_REPEATED, PB3_TYPE_STRING);
+    let metadata = pb3_message_field("metadata", 3, PB3_LABEL_REPEATED, PB3_METADATA_ENTRY);
+    let credentials = pb3_message_field("credentials", 4, PB3_LABEL_OPTIONAL, PB3_CREDENTIALS);
+    let tool_arguments = pb3_field("tool_arguments", 5, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let label_map = pb3_message_field("labels", 6, PB3_LABEL_REPEATED, PB3_LABELS_ENTRY);
+    let fields = vec![
+        prompt,
+        api_keys,
+        metadata,
+        credentials,
+        tool_arguments,
+        label_map,
+    ];
+    let payload = pb3_message("Payload", &fields);
+    let payload = pb3_with_nested(payload, &pb3_string_map_entry("MetadataEntry"));
+    let payload = pb3_with_nested(payload, &pb3_string_map_entry("LabelsEntry"));
+
+    let status = pb3_field("status", 1, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let ack = pb3_message("Ack", &[status]);
+
+    let mut file = pb3_str_field(1, "audit.proto");
+    file.extend(pb3_str_field(2, "audit"));
+    for message in [credentials_msg, payload, ack] {
+        file.extend(pb3_len_field(4, &message));
+    }
+    file.extend(pb3_str_field(12, "proto3"));
+    pb3_len_field(1, &file)
+}
+
+fn audit_descriptor_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bytes = audit_descriptor_set();
+    std::fs::write(dir.path().join("audit.bin"), bytes).expect("write pb set");
+    dir
+}
+
+fn audit_descriptor_path(dir: &tempfile::TempDir) -> String {
+    dir.path().join("audit.bin").to_string_lossy().to_string()
+}
+
+/// Only `email` is enabled, so no built-in pattern can match a bearer token,
+/// an `sk-`-free opaque key, or the embedded-JSON secret: the field-name
+/// policy is the only thing that can keep them out of the excerpt.
+fn audit_grpc_overrides(dir: &tempfile::TempDir) -> Value {
+    json!({
+        "redaction": { "builtins": ["email"], "hash_redacted_values": false },
+        "grpc": {
+            "descriptor_path": audit_descriptor_path(dir),
+            "methods": {
+                "/audit.Sink/Ingest": {
+                    "request_type": "audit.Payload",
+                    "response_type": "audit.Ack"
+                }
+            }
+        }
+    })
+}
+
+#[derive(Default)]
+struct AuditPayload<'a> {
+    prompt: Option<&'a str>,
+    api_keys: Vec<&'a str>,
+    metadata: Vec<(&'a str, &'a str)>,
+    display_name: Option<&'a str>,
+    tool_arguments: Option<&'a str>,
+    labels: Vec<(&'a str, &'a str)>,
+}
+
+fn audit_string_list(values: &[&str]) -> prost_reflect::Value {
+    use prost_reflect::Value;
+
+    let items = values.iter().map(|v| Value::String(v.to_string())).collect();
+    Value::List(items)
+}
+
+fn audit_string_map(entries: &[(&str, &str)]) -> prost_reflect::Value {
+    use prost_reflect::{MapKey, Value};
+
+    let map = entries
+        .iter()
+        .map(|(k, v)| (MapKey::String(k.to_string()), Value::String(v.to_string())))
+        .collect();
+    Value::Map(map)
+}
+
+fn audit_payload_bytes(dir: &tempfile::TempDir, payload: AuditPayload<'_>) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(audit_descriptor_path(dir)).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("audit.Payload").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    if let Some(prompt) = payload.prompt {
+        msg.set_field_by_name("prompt", Value::String(prompt.to_string()));
+    }
+    if !payload.api_keys.is_empty() {
+        msg.set_field_by_name("api_keys", audit_string_list(&payload.api_keys));
+    }
+    if !payload.metadata.is_empty() {
+        msg.set_field_by_name("metadata", audit_string_map(&payload.metadata));
+    }
+    if let Some(display_name) = payload.display_name {
+        let credentials = pool.get_message_by_name("audit.Credentials").unwrap();
+        let mut inner = DynamicMessage::new(credentials);
+        inner.set_field_by_name("display_name", Value::String(display_name.to_string()));
+        msg.set_field_by_name("credentials", Value::Message(inner));
+    }
+    if let Some(arguments) = payload.tool_arguments {
+        msg.set_field_by_name("tool_arguments", Value::String(arguments.to_string()));
+    }
+    if !payload.labels.is_empty() {
+        msg.set_field_by_name("labels", audit_string_map(&payload.labels));
+    }
+    msg.encode_to_vec()
+}
+
+fn audit_ack_bytes(dir: &tempfile::TempDir, status: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(audit_descriptor_path(dir)).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("audit.Ack").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("status", Value::String(status.to_string()));
+    msg.encode_to_vec()
+}
+
+/// Run one enrolled unary gRPC roundtrip and return the exported request
+/// excerpt (the `request_body` field of the single emitted audit record).
+async fn audit_grpc_request_excerpt(payload: AuditPayload<'_>) -> String {
+    let dir = audit_descriptor_dir();
+    let request = grpc_frame(&audit_payload_bytes(&dir, payload));
+    let response = grpc_frame(&audit_ack_bytes(&dir, "ok"));
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, audit_grpc_overrides(&dir)),
+        loopback_http_client(),
+    )
+    .expect("valid audit grpc config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/audit.Sink/Ingest");
+    let headers = grpc_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &request)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &response)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "expected one audit record, got {records:?}"
+    );
+    records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A `map<string, string>` keyed `authorization` is the severe case: the
+/// exported label is `metadata.*`, whose leaf segment is not a sensitive name,
+/// and no built-in pattern matches a generic bearer token. Only consulting the
+/// map key keeps the credential out of the sink.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_sensitive_map_key_redacts_value_without_exporting_the_key() {
+    let payload = AuditPayload {
+        prompt: Some("summarize the ticket"),
+        metadata: vec![("authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.body.sig")],
+        labels: vec![("note", "second pass")],
+        ..AuditPayload::default()
+    };
+    let excerpt = audit_grpc_request_excerpt(payload).await;
+
+    assert!(
+        !excerpt.contains("eyJhbGciOiJIUzI1NiJ9"),
+        "a map value keyed `authorization` leaked a bearer token: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("Bearer "),
+        "a map value keyed `authorization` leaked a bearer token: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("[REDACTED]"),
+        "the sensitive map value must export the placeholder: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("authorization"),
+        "map keys must stay out of the exported transcript label: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("second pass"),
+        "a benign map value must still be captured: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("summarize the ticket"),
+        "a benign string field must still be captured: {excerpt}"
+    );
+}
+
+/// Ancestor names, repeated-field elements, and JSON embedded in a protobuf
+/// string all follow the HTTP JSON contract rather than a leaf-only check.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_name_redaction_covers_ancestors_repeats_and_embedded_json() {
+    let arguments = r#"{"api_key":"embedded-secret-value","city":"Paris"}"#;
+    let payload = AuditPayload {
+        prompt: Some("summarize the ticket"),
+        api_keys: vec!["repeated-secret-one", "repeated-secret-two"],
+        display_name: Some("Ada Lovelace"),
+        tool_arguments: Some(arguments),
+        ..AuditPayload::default()
+    };
+    let excerpt = audit_grpc_request_excerpt(payload).await;
+
+    // Repeated field: the label leaf is a numeric index, so the decision has
+    // to come from the `api_keys` field name and cover every element.
+    assert!(
+        !excerpt.contains("repeated-secret-one"),
+        "a `repeated string api_keys` element leaked: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("repeated-secret-two"),
+        "a `repeated string api_keys` element leaked: {excerpt}"
+    );
+    // Sensitive ancestor with a benign leaf.
+    assert!(
+        !excerpt.contains("Ada Lovelace"),
+        "`credentials.display_name` leaked under a sensitive parent: {excerpt}"
+    );
+    // JSON encoded inside a protobuf string.
+    assert!(
+        !excerpt.contains("embedded-secret-value"),
+        "JSON embedded in a protobuf string bypassed the policy: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("Paris"),
+        "embedded-JSON redaction must not blank the whole value: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("summarize the ticket"),
+        "a benign string field must still be captured: {excerpt}"
+    );
+}

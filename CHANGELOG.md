@@ -14,7 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema-decoded, and redacted under the same capture `mode` contract as HTTP;
   unenrolled methods stay undecoded and unbuffered. Malformed, oversized, or
   undecodable frames omit excerpts with compiled-in reasons rather than
-  exporting partial or unredacted bytes.
+  exporting partial or unredacted bytes. Name-based redaction matches the HTTP
+  JSON contract exactly: a value is replaced when any enclosing name is
+  sensitive — the field, an ancestor message field, or a protobuf map key
+  (never exported as a label, always consulted for the decision) — repeated
+  elements inherit their field's decision instead of being judged on the
+  numeric index, and JSON embedded in a protobuf string is decoded and redacted
+  before export.
 
 - VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
