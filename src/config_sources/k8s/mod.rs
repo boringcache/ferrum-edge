@@ -9,6 +9,7 @@ mod gateway_api;
 mod istio;
 mod mesh_config;
 
+pub use istio::MAX_PROJECTED_L4_PROXIES;
 pub(crate) use core::secret_object_is_valid_tls_certificate;
 pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,

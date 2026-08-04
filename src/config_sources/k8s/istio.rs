@@ -2993,6 +2993,19 @@ fn l4_export_namespaces(
     Ok((namespaces, public))
 }
 
+/// Upper bound on how many stream proxies one VirtualService may materialize
+/// via L4 `exportTo` namespace projection.
+///
+/// Public or wildcard visibility expands each L4 candidate proxy across every
+/// known export namespace. Without a hard cap, a single CRD can force
+/// O(namespaces × matches) proxy clones through translation, validation, and
+/// reload. This limit is intentionally independent of
+/// [`crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS`], which only bounds
+/// match arms inside one proxy's `stream_match` criteria. Keeping 64 here is a
+/// conservative cluster-scale fan-out ceiling that still admits large but
+/// realistic multi-namespace meshes while remaining independently tunable.
+pub const MAX_PROJECTED_L4_PROXIES: usize = 64;
+
 fn project_l4_proxy_visibility(
     object: &K8sObject,
     acc: &K8sAccumulator,
@@ -3021,12 +3034,12 @@ fn project_l4_proxy_visibility(
         .len()
         .checked_mul(export_namespaces.len())
         .ok_or_else(|| invalid_resource(object, "VirtualService L4 projection count overflow"))?;
-    if projected_proxy_count > crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS {
+    if projected_proxy_count > MAX_PROJECTED_L4_PROXIES {
         return Err(invalid_resource(
             object,
             format!(
                 "VirtualService L4 visibility may project at most {} stream proxies",
-                crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS
+                MAX_PROJECTED_L4_PROXIES
             ),
         ));
     }

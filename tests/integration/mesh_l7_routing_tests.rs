@@ -2759,36 +2759,71 @@ fn mesh_tier3_l4_virtual_service_source_labels_materialize_stream_match() {
     );
 }
 
+fn public_l4_visibility_fixture(
+    export_to: Option<Value>,
+    extra_namespaces: usize,
+) -> (Vec<K8sObject>, K8sTranslationOptions) {
+    let mut spec = serde_json::json!({
+        "hosts": ["db.example.com"],
+        "tcp": [{
+            "match": [{"port": 3306}],
+            "route": [{"destination": {
+                "host": "mysql.default.svc.cluster.local",
+                "port": {"number": 3306}
+            }}]
+        }]
+    });
+    if let Some(export_to) = export_to {
+        spec["exportTo"] = export_to;
+    }
+
+    let mut objects = vec![object("VirtualService", spec)];
+    for index in 0..extra_namespaces {
+        let mut observed = object("ConfigMap", serde_json::json!({}));
+        observed.metadata.name = format!("observed-{index}");
+        observed.metadata.namespace = format!("namespace-{index}");
+        objects.push(observed);
+    }
+
+    // Watch-all so ConfigMaps outside `default` widen `known_namespaces` the
+    // same way a cluster-scoped Kubernetes source does in production.
+    (objects, options().with_source_namespaces(Vec::new()))
+}
+
 #[test]
 fn mesh_l4_virtual_service_public_visibility_caps_projected_proxies() {
+    use ferrum_edge::config_sources::k8s::MAX_PROJECTED_L4_PROXIES;
+
     for export_to in [
         None,
         Some(serde_json::json!([])),
         Some(serde_json::json!(["*"])),
     ] {
-        let mut spec = serde_json::json!({
-            "hosts": ["db.example.com"],
-            "tcp": [{
-                "match": [{"port": 3306}],
-                "route": [{"destination": {
-                    "host": "mysql.default.svc.cluster.local",
-                    "port": {"number": 3306}
-                }}]
-            }]
-        });
-        if let Some(export_to) = export_to {
-            spec["exportTo"] = export_to;
-        }
+        // Boundary: VS namespace (`default`) plus MAX-1 observed namespaces
+        // yields exactly MAX projected proxies and must succeed.
+        let (objects, opts) =
+            public_l4_visibility_fixture(export_to.clone(), MAX_PROJECTED_L4_PROXIES - 1);
+        let translated = translate_k8s_objects(&objects, opts)
+            .expect("public L4 visibility at the projected proxy cap must translate");
+        let projected = translated
+            .config
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.listen_port == Some(3306))
+            .count();
+        assert_eq!(
+            projected, MAX_PROJECTED_L4_PROXIES,
+            "at-cap public projection must materialize exactly {MAX_PROJECTED_L4_PROXIES} proxies"
+        );
+        assert_eq!(
+            translated.config.known_namespaces.len(),
+            MAX_PROJECTED_L4_PROXIES,
+            "fixture must observe exactly {MAX_PROJECTED_L4_PROXIES} namespaces or the cap is vacuous"
+        );
 
-        let mut objects = vec![object("VirtualService", spec)];
-        for index in 0..ferrum_edge::proxy::stream_match::MAX_STREAM_MATCH_ARMS {
-            let mut observed = object("ConfigMap", serde_json::json!({}));
-            observed.metadata.name = format!("observed-{index}");
-            observed.metadata.namespace = format!("namespace-{index}");
-            objects.push(observed);
-        }
-
-        let error = translate_k8s_objects(&objects, options())
+        // Breach: one more observed namespace pushes projection over the cap.
+        let (objects, opts) = public_l4_visibility_fixture(export_to, MAX_PROJECTED_L4_PROXIES);
+        let error = translate_k8s_objects(&objects, opts)
             .expect_err("public L4 visibility must not exceed the projected proxy cap");
         assert!(
             format!("{error}").contains("may project at most"),
