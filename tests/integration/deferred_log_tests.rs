@@ -1025,7 +1025,11 @@ struct MetricsRecordingPlugin {
 }
 
 impl MetricsRecordingPlugin {
-    fn new() -> (Self, Arc<MetricsRegistry>, Arc<Mutex<Vec<TransactionSummary>>>) {
+    fn new() -> (
+        Self,
+        Arc<MetricsRegistry>,
+        Arc<Mutex<Vec<TransactionSummary>>>,
+    ) {
         let registry = Arc::new(MetricsRegistry::new());
         let captured = Arc::new(Mutex::new(Vec::new()));
         (
