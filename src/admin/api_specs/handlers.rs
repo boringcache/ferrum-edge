@@ -1996,7 +1996,6 @@ async fn validate_bundle(
                     Err(e) => return Err(classify_db_error(e)),
                 }
             }
-
         }
 
         if proxy.dispatch_kind.is_stream() {

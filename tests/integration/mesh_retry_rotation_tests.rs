@@ -186,7 +186,10 @@ fn declared_body_without_a_retained_copy_is_never_replayed() {
 fn chunked_upload_without_a_retained_copy_is_never_replayed() {
     let ctx = request_ctx_with_raw_headers("POST", raw_header("transfer-encoding", "chunked"));
     let declares = inbound_request_declares_body_for_test(&ctx);
-    assert!(declares, "a transfer-encoding field line declares a request body");
+    assert!(
+        declares,
+        "a transfer-encoding field line declares a request body"
+    );
     assert!(
         !retry_replay_preserves_request_body_for_test(declares, false),
         "a chunked upload with nothing retained must refuse replay"
@@ -200,8 +203,13 @@ fn unparseable_content_length_refuses_replay_fail_closed() {
     // treating an unparseable declaration as "no body".
     let ctx = request_ctx_with_raw_headers("POST", raw_header("content-length", "not-a-number"));
     let declares = inbound_request_declares_body_for_test(&ctx);
-    assert!(declares, "an unparseable content-length is not a zero-length body");
-    assert!(!retry_replay_preserves_request_body_for_test(declares, false));
+    assert!(
+        declares,
+        "an unparseable content-length is not a zero-length body"
+    );
+    assert!(!retry_replay_preserves_request_body_for_test(
+        declares, false
+    ));
 }
 
 #[test]
@@ -217,7 +225,10 @@ fn bodyless_request_still_retries_normally() {
     let zero_length = request_ctx_with_raw_headers("POST", raw_header("content-length", "0"));
     let zero_declares = inbound_request_declares_body_for_test(&zero_length);
     assert!(!zero_declares);
-    assert!(retry_replay_preserves_request_body_for_test(zero_declares, false));
+    assert!(retry_replay_preserves_request_body_for_test(
+        zero_declares,
+        false
+    ));
 }
 
 #[test]
