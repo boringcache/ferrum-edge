@@ -377,20 +377,24 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
         );
     }
 
-    // SQL `require` encrypts the config-database connection but authenticates
-    // neither its certificate chain nor hostname. Do not admit that peer-
-    // verification bypass into the enforced boundary.
-    if env_config.db_tls_mode == Some(DbTlsMode::Require)
-        && env_config.db_type.as_deref().is_some_and(|db_type| {
-            db_type.eq_ignore_ascii_case("postgres") || db_type.eq_ignore_ascii_case("mysql")
-        })
-    {
-        return Err(
-            "FERRUM_DB_TLS_MODE=require disables CA and hostname verification for the SQL \
-             config database and is refused while FIPS mode is enforced; use `verify-ca` or \
-             `verify-full`."
-                .to_string(),
-        );
+    // SQL modes that do not authenticate the config-database peer must not be
+    // admitted into the enforced boundary. `verify-ca` and `verify-full` are
+    // the only explicit modes that validate the server certificate chain.
+    if env_config.db_type.as_deref().is_some_and(|db_type| {
+        db_type.eq_ignore_ascii_case("postgres") || db_type.eq_ignore_ascii_case("mysql")
+    }) {
+        if let Some(mode) = env_config.db_tls_mode {
+            match mode {
+                DbTlsMode::VerifyCa | DbTlsMode::VerifyFull => {}
+                unverified => {
+                    return Err(format!(
+                        "FERRUM_DB_TLS_MODE={unverified} does not authenticate the SQL \
+                         config-database peer and is refused while FIPS mode is enforced; use \
+                         `verify-ca` or `verify-full`."
+                    ));
+                }
+            }
+        }
     }
 
     // ── TLS versions ────────────────────────────────────────────────────
