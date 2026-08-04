@@ -607,7 +607,12 @@ fields are never logged.
   retained memory is therefore independent of artifact length and compression
   ratio. Transient ceiling pressure stays retryable: the claim is released and
   the artifact replays in order on a later tick; a busy ceiling never
-  quarantines a healthy file.
+  quarantines a healthy file. Lowering `FERRUM_LOG_DELIVERY_MAX_RETAINED_BYTES`
+  below the replay minimum of an artifact that was already spooled under a
+  higher ceiling wedges replay at that artifact: each tick retries it first,
+  emits a per-tick warning identifying it, and newer files wait behind it until
+  quota eviction removes the wedged artifact or an operator deletes it manually.
+  Data is not lost; this is a head-of-line stall, not silent corruption.
 - `spool.meta.json` is bounded separately at 64 KiB. It is the one managed file
   read *before* ownership is established — on every prepare and every replay
   listing — so it is reachable without first deriving this owner's tag. An

@@ -8438,8 +8438,13 @@ impl DeadLetterPayloadWriter {
         // recovery never needs quota for two complete rejected payloads and
         // never evicts unrelated active spool data merely to duplicate one.
         for (path, kind) in [(&prior_meta_path, "metadata"), (&final_path, "payload")] {
+            let removed_len = spool_regular_file_len(path);
             match fs::remove_file(path) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if let Some(len) = removed_len {
+                        spool.usage.account_sub(1, len);
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(format!(
