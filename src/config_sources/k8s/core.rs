@@ -68,8 +68,12 @@ struct CoreConfigMap {
     /// Inline PEM text from ConfigMap `data["ca.crt"]` / `binaryData["ca.crt"]`
     /// when present and PEM-decodable. BackendTLSPolicy emits this as an inline
     /// CA source because runtime `k8s://` loading is Secret-only today.
+    ///
+    /// No digest counterpart here, unlike [`CoreSecret`]: the Secret path emits
+    /// a `k8s://…?sha256=` REFERENCE, so it needs a digest for the projected
+    /// value to change when the bundle rotates. This path emits the PEM itself,
+    /// so the content already is the change signal.
     ca_bundle_pem: Option<String>,
-    ca_bundle_digest: Option<String>,
 }
 
 #[derive(Debug)]
@@ -507,18 +511,9 @@ fn collect_configmap(acc: &mut K8sAccumulator, object: &K8sObject) {
         return;
     };
     let ca_bundle_pem = configmap_ca_bundle_pem_for_object(object);
-    let ca_bundle_digest = ca_bundle_pem.as_ref().map(|pem| {
-        let mut digest = Sha256::new();
-        digest.update(pem.as_bytes());
-        hex::encode(digest.finalize())
-    });
-    acc.core.configmaps.insert(
-        key,
-        CoreConfigMap {
-            ca_bundle_pem,
-            ca_bundle_digest,
-        },
-    );
+    acc.core
+        .configmaps
+        .insert(key, CoreConfigMap { ca_bundle_pem });
 }
 
 fn secret_tls_material_digest_for_object(secret: &K8sObject) -> Option<String> {
