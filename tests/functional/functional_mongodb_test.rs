@@ -2686,7 +2686,7 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
     )
     .await;
 
-    let fallback_health = wait_for_proxy_count_above(
+    let mut fallback_health = wait_for_proxy_count_above(
         &client,
         &harness,
         &auth_header,
@@ -2696,6 +2696,24 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
          the watcher cannot deliver stream events",
     )
     .await;
+
+    // Applying the proxy happens inside the authoritative poll attempt, while
+    // poll freshness is stamped at the attempt's normal exit. Do not sample
+    // `/health` in the narrow interval between those two events: wait for the
+    // independently observable completion signal before evaluating the same
+    // watcher-down snapshot below.
+    let freshness_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < freshness_deadline {
+        let last_poll_after = fallback_health["database_polling"]["last_poll_completed_at"]
+            .as_str()
+            .unwrap_or("");
+        if !last_poll_after.is_empty() && last_poll_after != last_poll_before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        fallback_health =
+            authenticated_health(&client, &harness, &auth_header, "phase3 freshness").await;
+    }
 
     assert_eq!(
         fallback_health["database_polling"]["status"], "ok",

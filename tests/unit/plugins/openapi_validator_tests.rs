@@ -3665,7 +3665,7 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
         },
     )
     .expect_err("unsupported response coding must fail closed internally");
-    assert_eq!(internal, "unsupported content-encoding 'zstd'");
+    assert_eq!(internal, "unsupported content-encoding coding");
     assert!(
         !response_error(&ctx).unwrap_or_default().contains("zstd"),
         "unsupported coding name must not leak into response_error metadata"

@@ -769,7 +769,7 @@ When ambient NodeWaypoint and the node agent run on the same host-network nodes,
 
 The node-agent's default enrollment path is the kube-rs pod watcher: it polls the Kubernetes API for pods scheduled to its node and reconciles BPF attachment from the resulting label/annotation snapshots. That works but races kubelet — a freshly-scheduled pod may complete its CNI sandbox setup, attach a network namespace, and start sending traffic *before* the watcher has seen the `Apply` event. During that window outbound traffic is not yet routed through Ferrum's eBPF redirect.
 
-The optional CNI-style install closes that window. A small `ferrum-cni` binary, dropped into the host's `/opt/cni/bin/` directory and chained behind the cluster's primary CNI (Calico, Cilium, etc.), forwards each ADD/DEL/CHECK invocation from kubelet to the long-lived node-agent over a Unix domain socket. On ADD, the node-agent fetches the pod from the Kubernetes API by namespace/name so it can evaluate labels and annotations immediately; the kube-rs watcher still runs afterward as the source of truth for reconciliation.
+The optional CNI-style install closes that window. A small `ferrum-cni` binary, dropped into the host's `/opt/cni/bin/` directory and chained behind the cluster's primary CNI (Calico, Cilium, etc.), forwards each ADD/DEL/CHECK/STATUS/GC invocation from kubelet to the long-lived node-agent over a Unix domain socket. On ADD, the node-agent fetches the pod from the Kubernetes API by namespace/name so it can evaluate labels and annotations immediately; the kube-rs watcher still runs afterward as the source of truth for reconciliation. On STATUS (CNI 1.1.0), the eBPF path probes whether Ferrum can service ADD (node-agent socket reachable, initial pod sync complete, and a live Kubernetes API readiness probe). On GC (CNI 1.1.0), the runtime supplies the still-valid `(containerID, ifname)` attachment set and the node-agent removes only Ferrum-owned CNI attachments absent from that set. The explicit node-global iptables fallback exception is described below.
 
 ### Architecture
 
@@ -780,7 +780,7 @@ The optional CNI-style install closes that window. A small `ferrum-cni` binary, 
                             │  ┌─────────┐    /opt/cni/bin/ferrum-cni      │
                             │  │ kubelet │ ───────────────────────┐        │
                             │  └─────────┘                        │        │
-                            │       │ ADD/DEL/CHECK               ▼        │
+                            │       │ ADD/DEL/CHECK/STATUS/GC     ▼        │
                             │       ▼ (stdin JSON +       ┌──────────────┐ │
                             │  /etc/cni/net.d/             │  ferrum-cni  │ │
                             │  ...-ferrum.conflist         │   (binary)   │ │
@@ -804,7 +804,22 @@ The optional CNI-style install closes that window. A small `ferrum-cni` binary, 
                             └──────────────────────────────────────────────┘
 ```
 
-The CNI plugin and the kube-rs watcher feed the same enrollment path. They are deliberately not mutually exclusive: even with the CNI plugin installed, the watcher continues to run and reconcile, so the CNI hook is an **optimization** rather than a hard dependency.
+The CNI plugin and the kube-rs watcher feed the same enrollment path. They are deliberately not mutually exclusive: even with the CNI plugin installed, the watcher continues to run and reconcile, so the CNI hook is an **optimization** rather than a hard dependency. STATUS reports whether that node-agent + Kubernetes API dependency is ready for ADD. GC is complementary: it recovers Ferrum capture/enrollment state after missed DEL calls, node crashes, or sandbox metadata loss without relying on watcher timing alone.
+
+### CNI 1.1 STATUS semantics
+
+- **Version gate.** `STATUS` is accepted only when the negotiated `cniVersion` is `1.1.0`. Older versions keep ADD/DEL/CHECK unchanged and fail closed on STATUS with an unsupported-version error.
+- **No attachment fields.** STATUS does not carry `CNI_CONTAINERID` / `CNI_IFNAME` / `CNI_NETNS` / `CNI_ARGS`, and must not include `cni.dev/attachments` or other reserved `cni.dev/` keys.
+- **Fail-closed readiness.** Success (exit 0, empty stdout) means the node-agent CNI socket answered, the main loop has completed initial pod sync, **and** a live read-only Kubernetes API readiness probe succeeded (node-scoped pods `list` with `limit=1`, bounded by the same 750ms budget as CNI ADD metadata fetch, well under the 5s CNI RPC timeout). That probe proves the ADD dependency can reach the API with the node-agent's existing get/list/watch permissions; it does not mutate enrollment, BPF, ownership, or GC state. Socket/IPC failure, incomplete initial sync, or a failed/timed-out Kubernetes probe maps to CNI error code 50 (`plugin is not available`) without echoing socket paths, Kubernetes errors, URLs, tokens, namespaces, or other raw dependency detail.
+- **Informational only.** Per the CNI 1.1.0 spec, STATUS does not prevent ADD/DEL/CHECK/GC; those verbs remain independently handled.
+
+### CNI 1.1 GC semantics
+
+- **Version gate.** `GC` is accepted only when the negotiated `cniVersion` is `1.1.0`. Older versions keep ADD/DEL/CHECK unchanged and fail closed on GC with an unsupported-version error. `VERSION` advertises `0.3.0`/`0.3.1`/`0.4.0`/`1.0.0`/`1.1.0`.
+- **Valid attachments.** The runtime supplies the CNI 1.1 `cni.dev/attachments` field as `(containerID, ifname)` tuples. Ferrum requires the reserved field even when the list is empty, bounds ingestion (attachment count, field length, safe character set), and rejects omitted, misspelled, hostile, or path-like input before reconciliation.
+- **Ownership.** Successful CNI ADD records Ferrum ownership of that attachment in memory and, when the CNI listener is enabled, in a crash-safe durable file beside the configured CNI socket (filename `cni-owned-attachments.<socket-digest>.v2` under the socket parent, typically `/var/run/ferrum/`). Each durable record stores the `(network name, containerID, ifname) -> pod UID` identity plus a bounded cleanup snapshot (attached proof, pod IPs, cgroup map keys, probe ports, inbound redirect scope) so GC can tear down Ferrum-owned eBPF state after a process restart when live `pod_states` is empty. A detached snapshot is not a valid production ownership claim and is rejected during both decode and encode, so it cannot suppress persisted map/rule cleanup. GC is authoritative only for the named CNI network and removes only its Ferrum-owned attachments absent from that network's valid set. A pod with another valid or differently-scoped Ferrum claim keeps its shared capture state. Watcher-only enrollments and other node-agent generations are never swept. Ordinary IP/map updates refresh the durable cleanup snapshot, while a watcher-detected sandbox/veth replacement retires the prior attachment claim after old-generation teardown rather than transferring that claim to the replacement. On node-agent restart, well-formed durable records are rehydrated before GC can act, and GC remains retryable until the initial Kubernetes pod relist completes; malformed, oversized, truncated, non-regular, hard-linked, symlinked, or path-like durable state fails closed (GC errors without sweeping) and never echoes raw hostile identifiers. ADD that cannot durably persist an ownership claim returns an error and does not leave a false in-memory GC claim (kubelet may retry). Durable ownership is cleared only after removal-blocking cleanup succeeds (including backend detach and map/rule teardown driven from the rehydrated snapshot); a durable-update failure retains ownership for retry and must not report success for that clear.
+- **Idempotency / partial failure.** Repeat GC with the same valid set is a no-op success once every stale Ferrum-owned attachment is fully cleaned. When ownership refresh or BPF/rule/map teardown leaves removal-blocking state for one stale UID, GC fences that UID and retains its ownership (including durable state), continues reconciling independent stale UIDs, then reports the incomplete work. A later GC re-drives the pending-removal retry path until cleanup is complete. Rehydrated ownership after a process crash carries the cleanup snapshot needed to detach and clear stale eBPF maps/rules; GC never reports success merely because live `pod_states` is empty.
+- **Explicit iptables fallback.** The node-global `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` path has no per-pod eBPF backend or pod watcher. Its CNI passthrough therefore fails ADD/CHECK/STATUS/GC until the fallback rules are fully installed (DEL remains an idempotent no-op). After readiness, STATUS reflects installed node-global capture rather than the eBPF path's pod-relist/API probe because fallback ADD has no per-pod metadata dependency. GC succeeds only when the socket-bound durable ownership file has no stale record for the requested network. A stale record from an earlier eBPF generation is retained and GC returns an error until an eBPF-capable generation can perform the exact teardown; fallback never reports that state reconciled or discards its ownership proof.
 
 ### Install steps
 
@@ -815,7 +830,7 @@ The Helm chart at `charts/ferrum-mesh/` ships an opt-in CNI installer init conta
 3. The node-agent container mounts `/var/run/ferrum/` so both the binary and the daemon share the UDS path.
 4. Set `FERRUM_NODE_AGENT_CNI_ENABLED=true` (the chart sets this when `nodeAgent.cni.enabled=true`).
 
-Manual install (no Helm): copy `ferrum-cni` to `/opt/cni/bin/` on every node, write a chained `.conflist` in `/etc/cni/net.d/` that preserves the primary CNI plugin/IPAM and appends Ferrum, ensure `/var/run/ferrum/` is writable, set `FERRUM_NODE_AGENT_CNI_ENABLED=true`. The default Unix socket path is `/var/run/ferrum/node-agent-cni.sock` (override via `FERRUM_NODE_AGENT_CNI_SOCKET_PATH`).
+Manual install (no Helm): copy `ferrum-cni` to `/opt/cni/bin/` on every node, write a chained `.conflist` in `/etc/cni/net.d/` that preserves the primary CNI plugin/IPAM and appends Ferrum, ensure `/var/run/ferrum/` is writable, set `FERRUM_NODE_AGENT_CNI_ENABLED=true`. The default Unix socket path is `/var/run/ferrum/node-agent-cni.sock`; any `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` override must be absolute.
 
 The listener holds a sibling `<socket>.lock` advisory lock for its complete
 lifetime. A second live node-agent generation refuses to replace the active
@@ -858,7 +873,7 @@ The chart writes the file at a numeric prefix (`00-`) so kubelet selects the gen
 
 ### Observability
 
-`/metrics` exposes `ferrum_node_agent_cni_calls_total{verb,outcome}` with closed labels (`verb ∈ {add,del,check}`, `outcome ∈ {success,rejected,error}`). Bounded cardinality (9 series at most). Reset on process restart. Operators use this to confirm the CNI plugin is the primary enrollment path (`success` rate climbs) versus the watcher fallback (`success` rate stays at 0 even though pods are enrolled).
+`/metrics` exposes `ferrum_node_agent_cni_calls_total{verb,outcome}` with closed labels (`verb ∈ {add,del,check,status,gc}`, `outcome ∈ {success,rejected,error}`). Bounded cardinality (15 series at most). Reset on process restart. Operators use this to confirm the CNI plugin is the primary enrollment path (`success` rate climbs) versus the watcher fallback (`success` rate stays at 0 even though pods are enrolled), and to observe STATUS readiness and GC reconciliation outcomes.
 
 Socket lifecycle failures use
 `ferrum_node_agent_cni_socket_lifecycle_total{reason}` with the closed reasons

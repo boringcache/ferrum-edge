@@ -862,6 +862,7 @@ fn workload_endpoint_key(workload: &Workload) -> WorkloadEndpointKey {
         spiffe_id: workload.spiffe_id.as_str().to_string(),
         namespace: workload.namespace.clone(),
         service_name: workload.service_name.clone(),
+        service_namespace: workload.attached_service_namespace().to_string(),
         cluster: workload.cluster.clone(),
         network: workload.network.clone(),
         addresses,
@@ -890,6 +891,9 @@ struct WorkloadEndpointKey {
     spiffe_id: String,
     namespace: String,
     service_name: String,
+    /// Attached MeshService namespace (same as workload.namespace unless a
+    /// cross-namespace WorkloadEntry association stamped service_namespace).
+    service_namespace: String,
     cluster: Option<String>,
     network: Option<String>,
     addresses: Vec<String>,
@@ -2258,6 +2262,7 @@ mod tests {
             spiffe_id,
             selector: WorkloadSelector::default(),
             service_name: service.to_string(),
+            service_namespace: None,
             addresses: vec![address.to_string()],
             ports: vec![],
             trust_domain,

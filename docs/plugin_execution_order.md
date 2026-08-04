@@ -388,7 +388,8 @@ coordination, and a later plugin may write any of them — no enforcement point
 reads them back. The one metadata value a claim-owned hook still consults is
 `ai_stream_router.provider_content_encoding`, which is derived from the
 provider's own response headers, decides only how the owning instance decodes
-its own upstream bytes, and is bounded by that decoder's limits.
+its own upstream bytes (including supported multi-layer `gzip`/`br` chains in
+reverse application order), and is bounded by that decoder's limits.
 
 `on_final_request_body` fails closed on any drift in that witness with a
 fixed-cardinality envelope that echoes no offending value — neither the
@@ -1362,7 +1363,7 @@ The AI plugins are ordered to compose correctly:
 Rather than the buffered "terminate and respond" pattern, it rewrites the routing decision via `RequestContext.route_override_*` (scheme/host/port/path/authority) so the **normal proxy dispatch path** streams the provider response straight back to the client — no full-response buffering. It strips the client's `Authorization`/API-key headers and injects the matched provider's credential.
 
 - `openai` / `openai_compatible`: request and response SSE are already OpenAI-shaped, so the stream passes through unchanged (optional `stream_options.include_usage` injection only). No response-stream inspector runs, so these requests stay on the fast dispatch path.
-- `anthropic`: the request is translated to the Anthropic Messages API streaming request, and a `ResponseStreamInspector` normalizes Anthropic SSE events (`content_block_delta` text/tool deltas, `message_delta` usage/stop) into OpenAI `chat.completion.chunk` SSE on the fly, emitting a final usage chunk and `data: [DONE]`. For these requests the plugin returns `true` from `forces_reqwest_dispatch` so the inspector is guaranteed to be wired.
+- `anthropic`: the request is translated to the Anthropic Messages API streaming request, and a `ResponseStreamInspector` normalizes Anthropic SSE events (`content_block_delta` text/tool deltas, `message_delta` usage/stop) into OpenAI `chat.completion.chunk` SSE on the fly, emitting a final usage chunk and `data: [DONE]`. Residual provider `Content-Encoding` chains (`gzip` / `x-gzip` / `br`, including stacked lists) are decoded in reverse application order under the shared bounded content-coding limits before that normalizer runs; unsupported or over-limit chains fail closed with an OpenAI-shaped `502` / upstream-error SSE frame rather than forwarding encoded frames. For these requests the plugin returns `true` from `forces_reqwest_dispatch` so the inspector is guaranteed to be wired.
 
 Streaming inspectors have semantic stages: provider/protocol `Normalize` stages
 run before policy/audit `Inspect` stages, while configured plugin priority and

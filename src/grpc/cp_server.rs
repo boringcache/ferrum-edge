@@ -2847,6 +2847,7 @@ mod tests {
                 namespace: Some("clients".to_string()),
             },
             service_name: "client".to_string(),
+            service_namespace: None,
             addresses: vec!["10.2.0.11".to_string()],
             ports: Vec::new(),
             trust_domain: TrustDomain::new("cluster.local").expect("source trust domain"),
@@ -2867,6 +2868,7 @@ mod tests {
                 namespace: Some("default".to_string()),
             },
             service_name: "reviews".to_string(),
+            service_namespace: None,
             addresses: vec!["10.2.0.12".to_string()],
             ports: Vec::new(),
             trust_domain: TrustDomain::new("cluster.local").expect("destination trust domain"),
@@ -3036,6 +3038,7 @@ mod tests {
                     namespace: Some(namespace.to_string()),
                 },
                 service_name: service_name.to_string(),
+                service_namespace: None,
                 addresses: vec![address.to_string()],
                 ports: Vec::new(),
                 trust_domain: TrustDomain::new("test.local")
@@ -3149,6 +3152,7 @@ mod tests {
                 namespace: Some(namespace.to_string()),
             },
             service_name: name.to_string(),
+            service_namespace: None,
             addresses: vec![address.to_string()],
             ports: Vec::new(),
             trust_domain: TrustDomain::new("test.local")
