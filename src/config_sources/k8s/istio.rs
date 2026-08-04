@@ -18526,8 +18526,7 @@ extensionProviders:
 
         assert!(
             result.warnings.iter().any(|w| {
-                w.contains("subsets[].trafficPolicy.portLevelSettings")
-                    && w.contains("not applied")
+                w.contains("subsets[].trafficPolicy.portLevelSettings") && w.contains("not applied")
             }),
             "subset portLevelSettings must warn; warnings = {:?}",
             result.warnings

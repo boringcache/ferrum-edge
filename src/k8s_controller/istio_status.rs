@@ -725,8 +725,7 @@ const DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[(
 
 /// Subset-scoped `portLevelSettings` are never parsed or applied. Keep the
 /// label in sync with the warning in `translate_subset`.
-const DEFERRED_SUBSET_PORT_LEVEL_SETTINGS: &str =
-    "subsets[].trafficPolicy.portLevelSettings (not applied: subset-scoped port-level settings are unsupported)";
+const DEFERRED_SUBSET_PORT_LEVEL_SETTINGS: &str = "subsets[].trafficPolicy.portLevelSettings (not applied: subset-scoped port-level settings are unsupported)";
 
 /// True when any subset carries a non-empty `trafficPolicy.portLevelSettings`
 /// array. Empty arrays are ignored so a no-op block does not look deferred.
