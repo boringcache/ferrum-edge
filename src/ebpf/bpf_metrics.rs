@@ -1,9 +1,8 @@
 //! Shared counter store for the `__mesh_bpf_metrics` plugin.
 //!
-//! The eBPF `BPF_PROG_TYPE_SOCK_OPS` program and the `connect4`/`connect6`
-//! capture hooks publish per-event records (Connect, AcceptEstablished, Rst,
-//! FinSent/Received, RttSample, drop-reason hits) over a per-CPU ringbuf. The
-//! userspace consumer (`event_consumer.rs`) drains the ringbuf and increments
+//! The eBPF SOCK_OPS, SK_SKB, and `connect4`/`connect6` capture hooks publish
+//! lifecycle, latency, and drop-reason records over the shared ringbuf. The
+//! userspace consumer (`event_consumer.rs`) drains it and increments
 //! the counters here; the [`crate::plugins::mesh::bpf_metrics`] plugin reads
 //! from the same state and emits Prometheus metrics. This decoupling means the
 //! plugin's hot/cold path doesn't touch the BPF maps directly and doesn't need
@@ -20,7 +19,7 @@
 //!
 //! ## Latency histograms
 //!
-//! SRTT and SYN→ACK samples keep the historical `_sum`/`_count` series and
+//! SRTT, SYN→ACK, and capture accept→first-byte samples keep `_sum`/`_count` and
 //! additionally maintain fixed exclusive bucket counters
 //! ([`BPF_LATENCY_BUCKET_BOUNDS_US`] plus an implicit `+Inf` slot). Observe
 //! cost is three atomics (checked sum CAS, count, one exclusive bucket) with
@@ -44,8 +43,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam_utils::CachePadded;
 
 /// Inclusive upper bounds (`le`) for TCP-layer latency histograms, in
-/// microseconds. Stable, low-cardinality contract shared by SRTT and
-/// SYN→ACK. Samples strictly greater than the last bound land in `+Inf`.
+/// microseconds. Stable, low-cardinality contract shared by SRTT, SYN→ACK, and
+/// accept→first-byte. Samples strictly greater than the last bound land in
+/// `+Inf`.
 pub const BPF_LATENCY_BUCKET_BOUNDS_US: [u64; 15] = [
     100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
     1_000_000, 2_500_000, 5_000_000,
@@ -142,14 +142,17 @@ pub struct BpfMetricsState {
     //
     // Sum + count preserve the historical mean-derivation contract.
     // Exclusive bucket counters feed Prometheus histogram exposition
-    // (cumulative at scrape time). Accept-to-first-byte remains absent:
-    // SOCK_OPS has no first-inbound-data-byte callback.
+    // (cumulative at scrape time).
     pub srtt_sample_us_sum: AtomicU64,
     pub srtt_count: CachePadded<AtomicU64>,
     pub srtt_bucket_exclusive: [CachePadded<AtomicU64>; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
     pub syn_to_ack_us_sum: AtomicU64,
     pub syn_to_ack_count: AtomicU64,
     pub syn_to_ack_bucket_exclusive: [CachePadded<AtomicU64>; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
+    pub accept_to_first_byte_us_sum: AtomicU64,
+    pub accept_to_first_byte_count: CachePadded<AtomicU64>,
+    pub accept_to_first_byte_bucket_exclusive:
+        [CachePadded<AtomicU64>; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
 
     // BPF drop-reason counters — one bin per reason. Produced by the
     // connect4/connect6 bypass paths via the shared ringbuf.
@@ -194,22 +197,27 @@ impl BpfMetricsState {
     pub fn record_srtt_sample(&self, srtt_us: u64) {
         observe_latency(
             &self.srtt_sample_us_sum,
+            &self.srtt_count,
             &self.srtt_bucket_exclusive,
             srtt_us,
-            || {
-                self.srtt_count.fetch_add(1, Ordering::Relaxed);
-            },
         );
     }
 
     pub fn record_syn_to_ack(&self, us: u64) {
         observe_latency(
             &self.syn_to_ack_us_sum,
+            &self.syn_to_ack_count,
             &self.syn_to_ack_bucket_exclusive,
             us,
-            || {
-                self.syn_to_ack_count.fetch_add(1, Ordering::Relaxed);
-            },
+        );
+    }
+
+    pub fn record_accept_to_first_byte(&self, us: u64) {
+        observe_latency(
+            &self.accept_to_first_byte_us_sum,
+            &self.accept_to_first_byte_count,
+            &self.accept_to_first_byte_bucket_exclusive,
+            us,
         );
     }
 
@@ -270,6 +278,11 @@ impl BpfMetricsState {
             syn_to_ack_us_sum: self.syn_to_ack_us_sum.load(Ordering::Relaxed),
             syn_to_ack_count: self.syn_to_ack_count.load(Ordering::Relaxed),
             syn_to_ack_bucket_exclusive: load_exclusive_buckets(&self.syn_to_ack_bucket_exclusive),
+            accept_to_first_byte_us_sum: self.accept_to_first_byte_us_sum.load(Ordering::Relaxed),
+            accept_to_first_byte_count: self.accept_to_first_byte_count.load(Ordering::Relaxed),
+            accept_to_first_byte_bucket_exclusive: load_exclusive_buckets(
+                &self.accept_to_first_byte_bucket_exclusive,
+            ),
             drop_bypass_uid_hit: self.drop_bypass_uid_hit.load(Ordering::Relaxed),
             drop_exclude_cidr_hit: self.drop_exclude_cidr_hit.load(Ordering::Relaxed),
             drop_not_in_include_cidr: self.drop_not_in_include_cidr.load(Ordering::Relaxed),
@@ -285,14 +298,20 @@ impl BpfMetricsState {
 ///
 /// - `us == 0` is treated as invalid and ignored (no sum/count/bucket update).
 /// - Samples that would overflow the `u64` sum are dropped entirely.
-/// - Otherwise: checked sum CAS, then `bump_count`, then one exclusive bucket++.
+/// - A saturated count or target bucket drops the sample entirely.
+/// - Otherwise: checked sum CAS, then saturating count and exclusive-bucket
+///   increments. A raced saturation rolls back the owned updates.
 fn observe_latency(
     sum: &AtomicU64,
+    count: &AtomicU64,
     exclusive: &[CachePadded<AtomicU64>; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
     us: u64,
-    bump_count: impl FnOnce(),
 ) {
     if us == 0 {
+        return;
+    }
+    let bucket = &exclusive[bpf_latency_exclusive_bucket_index(us)];
+    if count.load(Ordering::Relaxed) == u64::MAX || bucket.load(Ordering::Relaxed) == u64::MAX {
         return;
     }
     loop {
@@ -307,8 +326,23 @@ fn observe_latency(
             Err(_) => continue,
         }
     }
-    bump_count();
-    exclusive[bpf_latency_exclusive_bucket_index(us)].fetch_add(1, Ordering::Relaxed);
+    if !saturating_increment(count) {
+        sum.fetch_sub(us, Ordering::Relaxed);
+        return;
+    }
+    if !saturating_increment(bucket) {
+        count.fetch_sub(1, Ordering::Relaxed);
+        sum.fetch_sub(us, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn saturating_increment(counter: &AtomicU64) -> bool {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            old.checked_add(1)
+        })
+        .is_ok()
 }
 
 fn load_exclusive_buckets(
@@ -343,6 +377,9 @@ pub struct BpfMetricsSnapshot {
     pub syn_to_ack_us_sum: u64,
     pub syn_to_ack_count: u64,
     pub syn_to_ack_bucket_exclusive: [u64; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
+    pub accept_to_first_byte_us_sum: u64,
+    pub accept_to_first_byte_count: u64,
+    pub accept_to_first_byte_bucket_exclusive: [u64; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
     pub drop_bypass_uid_hit: u64,
     pub drop_exclude_cidr_hit: u64,
     pub drop_not_in_include_cidr: u64,
@@ -382,5 +419,11 @@ impl BpfMetricsSnapshot {
     /// Cumulative `le` bucket counts for SYN→ACK (finite bounds only).
     pub fn syn_to_ack_cumulative_buckets(&self) -> [u64; BPF_LATENCY_FINITE_BUCKET_COUNT] {
         bpf_latency_cumulative_from_exclusive(&self.syn_to_ack_bucket_exclusive)
+    }
+
+    pub fn accept_to_first_byte_cumulative_buckets(
+        &self,
+    ) -> [u64; BPF_LATENCY_FINITE_BUCKET_COUNT] {
+        bpf_latency_cumulative_from_exclusive(&self.accept_to_first_byte_bucket_exclusive)
     }
 }

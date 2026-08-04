@@ -513,11 +513,11 @@ jobs:
           tool: cargo-nextest
 
       - name: Run service-integration tests
-        # Consul, LDAP, Kafka/Redpanda, and MySQL run real third-party software
-        # through testcontainers. Nextest reports each test independently and
-        # keeps running after one backend fails so one middleware cannot mask
-        # another.
-        run: cargo nextest run --test service_integration --no-fail-fast consul ldap kafka mysql
+        # Consul, LDAP, Kafka/Redpanda, MySQL, and Hydra (OIDC / introspection)
+        # run real third-party software through testcontainers. Nextest reports
+        # each test independently and keeps running after one backend fails so
+        # one middleware cannot mask another.
+        run: cargo nextest run --test service_integration --no-fail-fast consul ldap kafka mysql oidc oauth2_introspection
         env:
           RUST_BACKTRACE: 1
 
@@ -694,7 +694,7 @@ jobs:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external
     # binary), so they ALSO don't need redis/mongo services. The shard split
-    # below keeps all 82 test-file filters visible to the grep-based coverage
+    # below keeps all 83 test-file filters visible to the grep-based coverage
     # contract while balancing them across two runners. Two-hundred-plus
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
     # make elapsed time, not CPU utilisation, the useful balancing signal.
@@ -729,6 +729,7 @@ jobs:
               integration::admin_cross_namespace_refs_tests
               integration::upstream_name_uniqueness_tests
               integration::admin_mesh_config_drift_tests
+              integration::admin_mesh_slice_drift_tests
               integration::admin_mesh_egress_scope_tests
               integration::admin_mesh_policy_denies_tests
               integration::admin_mesh_remote_clusters_tests

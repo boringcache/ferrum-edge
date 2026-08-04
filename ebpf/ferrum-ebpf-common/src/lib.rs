@@ -671,6 +671,137 @@ pub struct SockOpsRecord {
     pub value: u64,
 }
 
+impl SockOpsRecord {
+    /// Build an accept-to-first-byte record without increasing the hot-path
+    /// ringbuf record size. The direction and drop-reason fields are unused by
+    /// this event variant, so they carry the low/high halves of the accepted
+    /// socket cookie. Userspace uses the cookie only to remove the SK_SKB hook
+    /// after the parser and verdict have returned.
+    pub const fn accept_to_first_byte_latency(value: u64, socket_cookie: u64) -> Self {
+        Self {
+            event_type: SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY,
+            direction: socket_cookie as u32,
+            drop_reason: (socket_cookie >> 32) as u32,
+            _pad: 0,
+            value,
+        }
+    }
+
+    /// Recover the accepted socket cookie carried by an
+    /// `SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY` record.
+    pub const fn accepted_socket_cookie(self) -> u64 {
+        (self.direction as u64) | ((self.drop_reason as u64) << 32)
+    }
+}
+
+/// Per-accepted-socket correlation state shared by SOCK_OPS and SK_SKB.
+///
+/// `accepted_ns` is sampled at `BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB`.
+/// Enrollment starts in a non-emitting phase. Active-established confirmation
+/// records whether capture was proven during that handoff, then the enrolling
+/// callback arms pending/confirmed state with BPF_EXIST only after its second
+/// `bytes_received` check. First data atomically deletes state and emits only
+/// when that delete succeeds for an armed confirmed generation.
+/// The socket cookie is the map key and remains authoritative for the socket
+/// lifetime; tuples are never used as the measurement identity.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcceptFirstByteState {
+    pub accepted_ns: u64,
+    pub phase: u32,
+    pub _pad: u32,
+}
+
+impl AcceptFirstByteState {
+    pub const fn enrolling(accepted_ns: u64) -> Self {
+        Self {
+            accepted_ns,
+            phase: ACCEPT_FIRST_BYTE_PHASE_ENROLLING,
+            _pad: 0,
+        }
+    }
+
+    pub const fn pending(accepted_ns: u64) -> Self {
+        Self {
+            accepted_ns,
+            phase: ACCEPT_FIRST_BYTE_PHASE_PENDING,
+            _pad: 0,
+        }
+    }
+
+    pub const fn confirmed(accepted_ns: u64) -> Self {
+        Self {
+            accepted_ns,
+            phase: ACCEPT_FIRST_BYTE_PHASE_CONFIRMED,
+            _pad: 0,
+        }
+    }
+
+    /// Record capture confirmation without arming an enrolling generation.
+    /// The kernel installs the replacement with BPF_EXIST so concurrent
+    /// first-data deletion cannot be resurrected.
+    pub const fn confirm(self) -> Option<Self> {
+        match self.phase {
+            ACCEPT_FIRST_BYTE_PHASE_PENDING => Some(Self::confirmed(self.accepted_ns)),
+            ACCEPT_FIRST_BYTE_PHASE_ENROLLING => Some(Self {
+                accepted_ns: self.accepted_ns,
+                phase: ACCEPT_FIRST_BYTE_PHASE_ENROLLING_CONFIRMED,
+                _pad: 0,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Arm a handoff only after the enrolling callback has verified that no
+    /// application data arrived across the SockHash update. Confirmation may
+    /// have come from either side of the active/passive bridge while enrollment
+    /// was in progress.
+    pub const fn arm_after_enrollment(self, capture_confirmed: bool) -> Option<Self> {
+        match self.phase {
+            ACCEPT_FIRST_BYTE_PHASE_ENROLLING_CONFIRMED | ACCEPT_FIRST_BYTE_PHASE_CONFIRMED => {
+                Some(Self::confirmed(self.accepted_ns))
+            }
+            ACCEPT_FIRST_BYTE_PHASE_ENROLLING | ACCEPT_FIRST_BYTE_PHASE_PENDING => {
+                if capture_confirmed {
+                    Some(Self::confirmed(self.accepted_ns))
+                } else {
+                    Some(Self::pending(self.accepted_ns))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub const fn is_confirmed(self) -> bool {
+        self.phase == ACCEPT_FIRST_BYTE_PHASE_CONFIRMED
+    }
+}
+
+pub const ACCEPT_FIRST_BYTE_PHASE_PENDING: u32 = 0;
+pub const ACCEPT_FIRST_BYTE_PHASE_CONFIRMED: u32 = 1;
+pub const ACCEPT_FIRST_BYTE_PHASE_ENROLLING: u32 = 2;
+pub const ACCEPT_FIRST_BYTE_PHASE_ENROLLING_CONFIRMED: u32 = 3;
+pub const ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES: u32 = 65_536;
+
+/// Correlation entries older than one hour are stale and never produce a
+/// sample. The maps are bounded independently; this age ceiling prevents a
+/// long-idle socket or corrupt timestamp from distorting the histogram.
+pub const ACCEPT_FIRST_BYTE_MAX_DELTA_NS: u64 = 3_600_000_000_000;
+
+/// Convert a monotonic accept/first-data timestamp pair to rounded-up
+/// microseconds. Reversed values (including `ktime` wrap), zero deltas, and
+/// stale/corrupt ages are rejected rather than saturated into a false sample.
+pub const fn accept_to_first_byte_us(accepted_ns: u64, first_data_ns: u64) -> Option<u64> {
+    if first_data_ns <= accepted_ns {
+        return None;
+    }
+    let delta_ns = first_data_ns - accepted_ns;
+    if delta_ns > ACCEPT_FIRST_BYTE_MAX_DELTA_NS {
+        return None;
+    }
+    Some((delta_ns + 999) / 1_000)
+}
+
 // `SockOpsRecord::event_type` discriminants. Matches the
 // `SockOpsEvent` enum on the userspace side.
 pub const SOCK_OPS_EVENT_CONNECT: u32 = 1;
@@ -679,8 +810,8 @@ pub const SOCK_OPS_EVENT_RST: u32 = 3;
 pub const SOCK_OPS_EVENT_FIN: u32 = 4;
 pub const SOCK_OPS_EVENT_RTT_SAMPLE: u32 = 5;
 pub const SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY: u32 = 6;
-/// Reserved discriminant. SOCK_OPS has no first-inbound-data-byte callback, so
-/// no kernel producer emits this value; userspace ignores it if observed.
+/// Produced by the SK_SKB first-application-data hook after the SOCK_OPS
+/// accept-side correlation state is confirmed.
 pub const SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY: u32 = 7;
 pub const SOCK_OPS_EVENT_DROP_REASON: u32 = 8;
 
@@ -917,6 +1048,7 @@ mod userspace_pod {
         IncludePortsPolicy,
         CidrKey4,
         CidrKey6,
+        AcceptFirstByteState,
     );
 }
 
@@ -984,6 +1116,11 @@ mod tests {
         // SockOpsRecord: four u32 (16) + one u64 (8) = 24 bytes, 8-byte aligned.
         assert_eq!(mem::size_of::<SockOpsRecord>(), 24);
         assert_eq!(mem::align_of::<SockOpsRecord>(), 8);
+        let first_byte = SockOpsRecord::accept_to_first_byte_latency(42, 0x0123_4567_89ab_cdef);
+        assert_eq!(first_byte.value, 42);
+        assert_eq!(first_byte.accepted_socket_cookie(), 0x0123_4567_89ab_cdef);
+        assert_eq!(mem::size_of::<AcceptFirstByteState>(), 16);
+        assert_eq!(mem::align_of::<AcceptFirstByteState>(), 8);
     }
 
     #[test]
@@ -1000,6 +1137,7 @@ mod tests {
         assert_copy::<CidrKey6>();
         assert_copy::<IncludePortsPolicy>();
         assert_copy::<SockOpsRecord>();
+        assert_copy::<AcceptFirstByteState>();
         assert_copy::<WorkloadIdentity>();
     }
 
@@ -1068,8 +1206,8 @@ mod tests {
 
     #[test]
     fn sock_ops_event_discriminants_are_stable() {
-        // Wire ABI for the SOCK_OPS ringbuf. Discriminant 7 is reserved
-        // (accept-to-first-byte has no producer); 8 is drop-reason.
+        // Wire ABI for the BPF event ringbuf. Discriminant 7 is produced by
+        // SK_SKB accept-to-first-byte; 8 is drop-reason.
         assert_eq!(SOCK_OPS_EVENT_CONNECT, 1);
         assert_eq!(SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, 2);
         assert_eq!(SOCK_OPS_EVENT_RST, 3);

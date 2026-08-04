@@ -177,6 +177,10 @@ cargo test --test service_integration consul
 
 # LDAP auth (bind / search-then-bind / group membership against OpenLDAP)
 cargo test --test service_integration ldap
+
+# OIDC relying party + OAuth2 introspection against Ory Hydra (#3333)
+cargo test --test service_integration oidc
+cargo test --test service_integration oauth2_introspection
 ```
 
 ### Performance Tests

@@ -6803,6 +6803,7 @@ async fn test_config_rejected_detail_suppressed_during_connectivity_outage_2158(
 #[tokio::test]
 async fn test_backup_falls_back_to_cached_config_when_no_db() {
     let tc = TestConfig::default();
+    let audit_fallback = tempfile::TempDir::new().unwrap();
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
@@ -6814,7 +6815,7 @@ async fn test_backup_falls_back_to_cached_config_when_no_db() {
         mode: "test".to_string(),
         read_only: true,
         admin_audit_enabled: false,
-        admin_audit_fallback_dir: None,
+        admin_audit_fallback_dir: Some(audit_fallback.path().to_path_buf()),
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,

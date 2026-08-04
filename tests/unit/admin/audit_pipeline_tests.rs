@@ -645,7 +645,16 @@ async fn successful_delivery_reopens_fail_closed_admission_after_saturation() {
         .await,
         "the pending record is delivered"
     );
-    assert!(pipeline.is_available());
+    // The delivery sink accepting the record and the pipeline releasing the
+    // spool slot are two different observation points: the worker reports
+    // acceptance before admission has necessarily reopened. Waiting on the
+    // delivery side and then asserting pipeline state in the same breath is a
+    // race that widens under `-C instrument-coverage`, which is where it
+    // actually failed. Synchronize on the state this test is about.
+    assert!(
+        wait_until(Duration::from_secs(5), || pipeline.is_available()).await,
+        "successful delivery reopens fail-closed admission"
+    );
     assert!(pipeline.fail_closed_block_reason().is_none());
     pipeline
         .prepare_intent(event())

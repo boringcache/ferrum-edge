@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- NodeWaypoint captured TCP observability now exports the bounded-cardinality
+  `ferrum_mesh_bpf_accept_to_first_byte_microseconds` histogram for IPv4 and
+  IPv6. SOCK_OPS timestamps passive establishment and enrolls the exact accepted
+  socket in a bounded SOCKHASH; an SK_SKB stream parser consumes the first
+  non-empty inbound application-data callback only after the existing orig-dst
+  bridge confirms capture. Socket-cookie identity, delete-wins/BPF_EXIST phase
+  transitions, bounded deferred userspace SOCKHASH removal after a parser/verdict
+  grace period, kernel close cleanup, LRU eviction, one-hour monotonic age
+  validation, and reload generation isolation prevent tuple/listener reuse,
+  callback-lock recursion, raced handoff, stale state, and `ktime` wrap from
+  fabricating samples. The metric has fixed microsecond buckets with saturating
+  count/bucket counters, drops sum overflow, and adds no per-flow labels (#3309).
 - VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
   compile onto a shared precomputed `Proxy.stream_match` carrier and are
@@ -28,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gateway scope defaults to the reserved `mesh` token; named-gateway data
   planes set `FERRUM_STREAM_GATEWAY_REF`. Existing SNI/port routing and
   weighted-split fail-closed behavior are preserved.
+- `ai_stream_router` now implements the `google_gemini` provider adapter
+  (issue #3299): OpenAI Chat Completions streaming requests are translated to
+  Gemini/`streamGenerateContent` (Vertex-compatible) bodies, native SSE and
+  JSON array/object response streams are normalized to OpenAI
+  `chat.completion.chunk` SSE (content/role deltas, multi-candidate indexes,
+  finish/safety/usage, function calls, bounded provider errors), and
+  malformed/oversized/unrepresentable frames fail closed under the existing
+  stream bounds without logging credentials or oversized payloads.
 - Istio DestinationRule `trafficPolicy.loadBalancer.localityLbSetting.failoverPriority`
   is implemented end to end (#3238). The K8s translator and native/file/xDS mesh
   validators accept ordered label keys (`key`) and key/value overrides with

@@ -638,6 +638,32 @@ fn local_fallback_windows_replace_uses_movefileex_replace_existing() {
 }
 
 #[test]
+fn local_fallback_reports_publication_before_post_publish_steps() {
+    const AUDIT_SOURCE: &str = include_str!("../../../src/admin/audit.rs");
+    let write_body = AUDIT_SOURCE
+        .split("fn write_local_fallback_events_unlocked")
+        .nth(1)
+        .expect("fallback write helper exists")
+        .split("fn replace_local_fallback_file")
+        .next()
+        .expect("fallback write helper has an end");
+    let replace = write_body
+        .find("replace_local_fallback_file(&tmp, path)")
+        .expect("fallback file is atomically published");
+    let report = write_body
+        .find("on_published();")
+        .expect("publication is reported");
+    let sync = write_body
+        .find("sync_directory(dir)?")
+        .expect("fallback directory is synced");
+
+    assert!(
+        replace < report && report < sync,
+        "eviction reporting must follow publication but precede fallible post-publication steps"
+    );
+}
+
+#[test]
 fn local_fallback_read_path_uses_nofollow_handle_and_byte_ceiling() {
     const AUDIT_SOURCE: &str = include_str!("../../../src/admin/audit.rs");
     assert!(
