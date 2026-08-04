@@ -80,11 +80,11 @@ paths:
 
 - H3 clients can hit any `https` backend. Native H3 backend dispatch is used only when the capability registry proves the concrete target supports H3.
 - H3 WebSocket bridges to the same backend WebSocket transport and frame-plugin pipeline as H1/H2; the H3 frontend never speaks WebSocket directly to a backend.
-- H3 cross-protocol buffering: request bodies buffer because `RequestStream` cannot be captured by reqwest's static body; responses stream with the H3 coalesce window.
+- H3 cross-protocol request bodies use bounded channel bridges: Plain streams into reqwest and non-replayable native gRPC streams DATA/trailers into `GrpcBody::Channel`; retry/body-plugin/pre-buffered gRPC retains the buffered representation. Responses stream with the H3 coalesce window when retry/plugin policy allows.
 - Forward gRPC trailers with `send_trailers` on buffered and streaming H3 bridge responses.
 - QUIC connection migration must compare `remote_address()` per request. Rebuild `Arc<str>` only on actual change so per-IP limits follow migrated clients.
 - The vendored `h3` crate at `vendor/h3-0.0.8-ferrum-patched/` carries Ferrum's frame-drain-on-QUIC-close, H3 WebSocket Extended CONNECT, and buffered-trailer-peek (`peek_recv_trailers`) patches. Keep `docs/upstream-h3-patches/` lifecycle notes in sync when touching H3 dispatch, graceful-close classification, or the vendor copy.
-- gRPC `GrpcBody::Streaming(Incoming)` is used when no body plugins and no retries. Otherwise use `Buffered(Full<Bytes>)`.
+- gRPC uses `GrpcBody::Streaming(Incoming)` for H1/H2 frontends and `GrpcBody::Channel` for the H3-to-H2 bridge when no body plugins and no retries. Otherwise use a buffered variant.
 - Streaming gRPC responses use `coalescing_h2_body`, preserve trailers, and keep the 128 KiB target unless tests justify a change.
 
 ## Stream Proxy Rules
