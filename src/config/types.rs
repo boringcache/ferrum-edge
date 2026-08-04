@@ -6616,6 +6616,13 @@ impl SharedProtobufDescriptorLoadError {
             Self::Invalid => "ai_response_guard: failed to parse protobuf descriptor",
         }
     }
+
+    fn ai_transcript_audit_message(self) -> &'static str {
+        match self {
+            Self::Unavailable => "ai_transcript_audit: failed to read protobuf descriptor file",
+            Self::Invalid => "ai_transcript_audit: failed to parse protobuf descriptor",
+        }
+    }
 }
 
 fn load_shared_protobuf_descriptor_pool(
@@ -9547,9 +9554,9 @@ impl GatewayConfig {
     }
 
     /// Validate file dependencies for plugins that reference external files
-    /// (e.g., geo_restriction `.mmdb` databases, `body_validator` and
-    /// `ai_response_guard` protobuf descriptors, and `udp_logging` DTLS
-    /// sources).
+    /// (e.g., geo_restriction `.mmdb` databases, `body_validator`,
+    /// `ai_response_guard`, and `ai_transcript_audit` protobuf descriptors, and
+    /// `udp_logging` DTLS sources).
     ///
     /// This is separate from `validate_all_fields_with_ip_policy()` so that
     /// each mode can handle missing files independently:
@@ -9602,14 +9609,16 @@ impl GatewayConfig {
     ) -> Vec<String> {
         let mut errors = Vec::new();
         let mut validated_paths = std::collections::HashSet::new();
-        // Shared across body_validator and ai_response_guard so a path used by
-        // both families is read and decoded at most once per pass.
+        // Shared across body_validator, ai_response_guard, and
+        // ai_transcript_audit so a path used by multiple families is read and
+        // decoded at most once per pass.
         let mut protobuf_descriptor_cache = std::collections::HashMap::<
             String,
             Result<prost_reflect::DescriptorPool, SharedProtobufDescriptorLoadError>,
         >::new();
         let mut reported_body_validator_path_errors = std::collections::HashSet::new();
         let mut reported_guard_path_errors = std::collections::HashSet::new();
+        let mut reported_transcript_audit_path_errors = std::collections::HashSet::new();
         // Identical enabled UDP DTLS validation inputs share one materialization
         // (provider/file read) per pass; cached errors are still attached to
         // each affected PluginConfig id.
@@ -9689,6 +9698,39 @@ impl GatewayConfig {
                                     "PluginConfig '{}': {}",
                                     pc.id,
                                     error.ai_response_guard_message()
+                                ));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                    }
+                }
+            }
+            if pc.plugin_name == "ai_transcript_audit" {
+                use crate::plugins::ai_transcript_audit as audit;
+                match audit::grpc_descriptor_path(&pc.config) {
+                    Ok(Some(path)) => {
+                        let cached = protobuf_descriptor_cache
+                            .entry(path.clone())
+                            .or_insert_with(|| load_shared_protobuf_descriptor_pool(&path));
+                        match cached {
+                            Ok(pool) => {
+                                if let Err(error) =
+                                    audit::validate_grpc_descriptor_config(&pc.config, pool)
+                                {
+                                    errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                                }
+                            }
+                            Err(error)
+                                if reported_transcript_audit_path_errors.insert(path.clone()) =>
+                            {
+                                errors.push(format!(
+                                    "PluginConfig '{}': {}",
+                                    pc.id,
+                                    error.ai_transcript_audit_message()
                                 ));
                             }
                             Err(_) => {}

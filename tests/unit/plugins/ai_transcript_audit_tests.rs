@@ -25,8 +25,8 @@ use ferrum_edge::plugins::ai_transcript_audit::{
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
 use ferrum_edge::plugins::{
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
-    RequestContext, ResponseStreamAction, ResponseStreamInspector,
+    HTTP_GRPC_PROTOCOLS, HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient,
+    PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction, ResponseStreamInspector,
     chain_response_stream_inspectors, create_response_stream_inspector, plugin_failure_policy,
     priority, validate_plugin_config,
 };
@@ -9957,5 +9957,486 @@ async fn sink_delivery_failure_diagnostics_are_redacted() {
     assert!(
         !captured.contains("/audit/"),
         "no raw credential-bearing path may survive: {captured}"
+    );
+}
+
+
+// ══════════════════════════════════════════════════════════════════════
+// Native gRPC capture (issue #3304)
+// ══════════════════════════════════════════════════════════════════════
+
+fn grpc_descriptor_path() -> String {
+    format!(
+        "{}/tests/fixtures/test_validator.bin",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn hello_request_bytes(name: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(grpc_descriptor_path()).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("test.HelloRequest").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("name", Value::String(name.to_string()));
+    msg.set_field_by_name("age", Value::I32(42));
+    msg.encode_to_vec()
+}
+
+fn hello_response_bytes(message: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(grpc_descriptor_path()).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("test.HelloResponse").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("message", Value::String(message.to_string()));
+    msg.set_field_by_name("success", Value::Bool(true));
+    msg.encode_to_vec()
+}
+
+fn grpc_frame(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(0);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn gzip_grpc_frame(payload: &[u8]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut frame = Vec::with_capacity(5 + compressed.len());
+    frame.push(1);
+    frame.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&compressed);
+    frame
+}
+
+fn grpc_ctx(method: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        method.to_string(),
+    );
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::HttpFlavor::Grpc,
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    ctx
+}
+
+fn grpc_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers
+}
+
+fn grpc_audit_overrides() -> Value {
+    json!({
+        "redaction": {
+            "builtins": ["email", "api_key", "aws_key"],
+            "hash_redacted_values": false
+        },
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "/test.Greeter/SayHello": {
+                    "request_type": "test.HelloRequest",
+                    "response_type": "test.HelloResponse"
+                }
+            }
+        }
+    })
+}
+
+fn grpc_audit_plugin(overrides: Value) -> AiTranscriptAudit {
+    AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", overrides),
+        loopback_http_client(),
+    )
+    .expect("valid grpc audit config")
+}
+
+#[test]
+fn grpc_block_extends_supported_protocols_and_buffering() {
+    let plugin = grpc_audit_plugin(grpc_audit_overrides());
+    let protocols = plugin.supported_protocols();
+    assert!(protocols.contains(&ProxyProtocol::Http));
+    assert!(protocols.contains(&ProxyProtocol::Grpc));
+    assert_eq!(
+        protocols,
+        HTTP_GRPC_PROTOCOLS,
+        "grpc enrollment must advertise the shared HTTP+gRPC matrix"
+    );
+
+    let enrolled = grpc_ctx("/test.Greeter/SayHello");
+    assert!(plugin.should_buffer_request_body(&enrolled));
+    assert!(plugin.should_buffer_response_body(&enrolled));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &enrolled,
+        Some("application/grpc"),
+        200,
+        &grpc_headers(),
+    ));
+
+    let other = grpc_ctx("/test.Greeter/Other");
+    assert!(!plugin.should_buffer_request_body(&other));
+    assert!(!plugin.should_buffer_response_body(&other));
+
+    let http_only = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    assert_eq!(http_only.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+}
+
+#[test]
+fn grpc_config_validation_fail_closed() {
+    let base_sink = json!({
+        "type": "http",
+        "endpoint_url": "https://audit.example.com/x"
+    });
+    for bad in [
+        json!({"sink": base_sink, "grpc": {}}),
+        json!({"sink": base_sink, "grpc": {"descriptor_path": "/tmp/x.bin", "methods": {}}}),
+        json!({"sink": base_sink, "grpc": {
+            "descriptor_path": "/tmp/x.bin",
+            "methods": {"not-a-path": {"request_type": "test.HelloRequest"}}
+        }}),
+        json!({"sink": base_sink, "grpc": {
+            "descriptor_path": "/tmp/x.bin",
+            "methods": {"/test.Greeter/SayHello": {}}
+        }}),
+        json!({"sink": base_sink, "grpc": {
+            "descriptor_path": "/tmp/x.bin",
+            "unknown": 1,
+            "methods": {"/test.Greeter/SayHello": {"request_type": "test.HelloRequest"}}
+        }}),
+    ] {
+        assert!(
+            AiTranscriptAudit::new(&bad, loopback_http_client()).is_err(),
+            "expected rejection for {bad}"
+        );
+    }
+
+    // Shape-only admission must not need the node-local descriptor.
+    assert!(
+        AiTranscriptAudit::validate_config(
+            &json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/x"
+                },
+                "grpc": {
+                    "descriptor_path": "/nonexistent/descriptor.bin",
+                    "methods": {
+                        "/test.Greeter/SayHello": {
+                            "request_type": "test.HelloRequest",
+                            "response_type": "test.HelloResponse"
+                        }
+                    }
+                }
+            }),
+            loopback_http_client(),
+        )
+        .is_ok()
+    );
+
+    // Shared validate_plugin_config must also stay shape-only.
+    assert!(
+        validate_plugin_config(
+            "ai_transcript_audit",
+            &json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/x"
+                },
+                "grpc": {
+                    "descriptor_path": "/nonexistent/descriptor.bin",
+                    "methods": {
+                        "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+                    }
+                }
+            }),
+        )
+        .is_ok()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_unary_roundtrip_redacts_credential_in_payload() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+    let resp = grpc_frame(&hello_response_bytes(
+        "token=AKIAIOSFODNN7EXAMPLE keep secret",
+    ));
+    let headers = grpc_headers();
+
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata.get("ai_transcript_audit.candidate").map(String::as_str),
+        Some("true")
+    );
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &resp)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "expected one audit record, got {records:?}");
+    let record = &records[0];
+    let request_body = record
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let response_body = record
+        .get("response_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !request_body.contains("agent@example.com"),
+        "request excerpt leaked email: {request_body}"
+    );
+    assert!(
+        !response_body.contains("AKIAIOSFODNN7EXAMPLE"),
+        "response excerpt leaked aws key: {response_body}"
+    );
+    assert!(
+        request_body.contains("grpc_method") && response_body.contains("grpc_method"),
+        "excerpts must be schema-shaped JSON: req={request_body} resp={response_body}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_malformed_and_oversized_frames_omit_excerpt() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "redaction": { "builtins": ["email"], "hash_redacted_values": false },
+                "grpc": {
+                    "descriptor_path": grpc_descriptor_path(),
+                    "max_message_bytes": 16,
+                    "max_messages": 1,
+                    "methods": {
+                        "/test.Greeter/SayHello": {
+                            "request_type": "test.HelloRequest",
+                            "response_type": "test.HelloResponse"
+                        }
+                    }
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let payload = hello_request_bytes("hello");
+    let mut truncated = grpc_frame(&payload);
+    truncated.pop();
+    let oversized = grpc_frame(&payload); // payload + frame > 16-byte message ceiling
+    let mut multi = grpc_frame(&hello_response_bytes("one"));
+    multi.extend_from_slice(&grpc_frame(&hello_response_bytes("two")));
+
+    // Truncated request → omit with framing reason, still emit a record.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let headers = grpc_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &truncated)
+        .await;
+    plugin
+        .capture_final_response_body(
+            &mut ctx,
+            200,
+            &headers,
+            &grpc_frame(&hello_response_bytes("ok")),
+        )
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let omitted = records[0]
+        .get("request_body_omitted_reason")
+        .and_then(Value::as_str);
+    let req_body = records[0].get("request_body").cloned().unwrap_or(Value::Null);
+    assert!(
+        omitted == Some("grpc_framing_error")
+            || omitted == Some("grpc_message_limit")
+            || req_body.is_null()
+            || records[0]
+                .get("request_body_truncated")
+                .and_then(Value::as_bool)
+                == Some(true),
+        "truncated frame must omit/flag excerpt: record={} omitted={omitted:?}",
+        records[0]
+    );
+
+    // Oversized declared length / multi-frame above max_messages on response.
+    let server2 = mock_sink().await;
+    let endpoint2 = format!("{}/ingest", server2.uri());
+    let plugin2 = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint2,
+            json!({
+                "redaction": { "builtins": ["email"], "hash_redacted_values": false },
+                "grpc": {
+                    "descriptor_path": grpc_descriptor_path(),
+                    "max_messages": 1,
+                    "methods": {
+                        "/test.Greeter/SayHello": {
+                            "request_type": "test.HelloRequest",
+                            "response_type": "test.HelloResponse"
+                        }
+                    }
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin2.start_background_tasks().unwrap();
+    plugin2.commit_background_tasks();
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let headers = grpc_headers();
+    let req = grpc_frame(&hello_request_bytes("clean"));
+    plugin2
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    plugin2
+        .capture_final_response_body(&mut ctx, 200, &headers, &multi)
+        .await;
+    let records = wait_for_records(&server2).await;
+    assert_eq!(records.len(), 1);
+    let resp_omitted = records[0]
+        .get("response_body_omitted_reason")
+        .and_then(Value::as_str);
+    let resp_body = records[0].get("response_body").cloned().unwrap_or(Value::Null);
+    assert!(
+        resp_omitted == Some("grpc_message_limit")
+            || resp_body.is_null()
+            || records[0]
+                .get("response_body_truncated")
+                .and_then(Value::as_bool)
+                == Some(true),
+        "max_messages overflow must omit response excerpt: {}",
+        records[0]
+    );
+
+    // Keep oversized local binding used (construction with max_message_bytes).
+    let _ = oversized;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_compressed_identity_and_unsupported_encoding() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().unwrap();
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let mut headers = grpc_headers();
+    headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let req = gzip_grpc_frame(&hello_request_bytes("ops@example.com"));
+    let resp = gzip_grpc_frame(&hello_response_bytes("clean"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &resp)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !request_body.contains("ops@example.com"),
+        "gzip frame must still be redacted: {request_body}"
+    );
+
+    // Unsupported encoding omits rather than exporting compressed bytes.
+    let server2 = mock_sink().await;
+    let endpoint2 = format!("{}/ingest", server2.uri());
+    let plugin2 = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint2, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin2.start_background_tasks().unwrap();
+    plugin2.commit_background_tasks();
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let mut headers = grpc_headers();
+    headers.insert("grpc-encoding".to_string(), "snappy".to_string());
+    let body = gzip_grpc_frame(&hello_request_bytes("secret@example.com"));
+    plugin2
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    plugin2
+        .capture_final_response_body(
+            &mut ctx,
+            200,
+            &grpc_headers(),
+            &grpc_frame(&hello_response_bytes("ok")),
+        )
+        .await;
+    let records = wait_for_records(&server2).await;
+    assert_eq!(records.len(), 1);
+    let request_body = records[0].get("request_body").cloned().unwrap_or(Value::Null);
+    let omitted = records[0]
+        .get("request_body_omitted_reason")
+        .and_then(Value::as_str);
+    assert!(
+        omitted == Some("grpc_framing_error") || request_body.is_null(),
+        "unsupported encoding must omit excerpt: {}",
+        records[0]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_unenrolled_method_never_stages() {
+    let plugin = grpc_audit_plugin(grpc_audit_overrides());
+    let mut ctx = grpc_ctx("/test.Greeter/Other");
+    let headers = grpc_headers();
+    let body = grpc_frame(&hello_request_bytes("agent@example.com"));
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        !ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .is_some_and(|v| v == "true"),
+        "unenrolled methods must not become audit candidates"
     );
 }

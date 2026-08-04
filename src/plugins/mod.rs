@@ -10396,6 +10396,12 @@ pub(crate) fn validate_plugin_config_with_http_client(
         // validation and runtime construction handle the FileDescriptorSet.
         return ai_response_guard::AiResponseGuard::validate_config(config);
     }
+    if name == "ai_transcript_audit" {
+        // Shape-only: CP/admin admission must not require gRPC descriptor
+        // files installed on data-plane nodes. Mode-aware dependency
+        // validation and runtime construction handle the FileDescriptorSet.
+        return ai_transcript_audit::AiTranscriptAudit::validate_config(config, http_client);
+    }
     if name == "udp_logging" {
         // Shape-only: shared Admin / CP validation must not open node-local
         // DTLS paths. Mode-aware dependency validation and construction do.

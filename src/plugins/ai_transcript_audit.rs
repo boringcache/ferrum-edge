@@ -42,8 +42,9 @@
 //! `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in
 //! `ai_semantic_firewall` for enforcement.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Write;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -55,10 +56,17 @@ use crate::fips::approved::Sha256;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
+use flate2::bufread::GzDecoder;
 use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
+use prost::Message as _;
+use prost_reflect::{
+    DescriptorPool, DynamicMessage, Kind, MessageDescriptor, ReflectMessage,
+    Value as ProtobufValue,
+};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tracing::warn;
 
 use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
@@ -73,8 +81,8 @@ use super::utils::{
     parse_http_endpoint, redacted_endpoint_url_str, validate_batch_config,
 };
 use super::{
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
-    ResponseStreamHandoff, ResponseStreamInspector, TransactionSummary,
+    HTTP_GRPC_PROTOCOLS, HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
+    ResponseStreamAction, ResponseStreamHandoff, ResponseStreamInspector, TransactionSummary,
     allocate_response_stream_handoff_id,
 };
 use crate::proxy::{
@@ -98,7 +106,34 @@ pub const AI_TRANSCRIPT_AUDIT_CONFIG_KEYS: &[&str] = &[
     "limits",
     "privacy",
     "sink",
+    "grpc",
 ];
+
+/// Closed key set for the optional `grpc` config block.
+pub const AI_TRANSCRIPT_AUDIT_GRPC_CONFIG_KEYS: &[&str] = &[
+    "descriptor_path",
+    "methods",
+    "max_message_bytes",
+    "max_messages",
+];
+
+/// Closed key set for one `grpc.methods` entry.
+pub const AI_TRANSCRIPT_AUDIT_GRPC_METHOD_KEYS: &[&str] =
+    &["request_type", "response_type", "text_fields"];
+
+/// Default per-message decoded/decompressed ceiling for one gRPC frame.
+const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 1_048_576;
+
+/// Default ceiling on the number of length-prefixed frames one buffered gRPC
+/// request or response may carry. Streaming RPCs above this omit the excerpt
+/// rather than silently capturing a partial stream.
+const DEFAULT_GRPC_MAX_MESSAGES: usize = 64;
+
+/// Recursion depth ceiling for the protobuf message walk.
+const GRPC_MAX_MESSAGE_DEPTH: usize = 32;
+
+/// Total value-node ceiling for one protobuf message walk.
+const GRPC_MAX_MESSAGE_NODES: usize = 50_000;
 
 /// Accepted keys under `capture`.
 pub const AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS: &[&str] = &[
@@ -302,6 +337,16 @@ const OMIT_REASON_STREAM_TRUNCATION: &str = "stream_truncation_boundary";
 /// Body omitted because the instance's aggregate retained-byte budget could not
 /// admit the refreshed excerpt.
 const OMIT_REASON_RETAINED_BYTE_BUDGET: &str = "retained_byte_budget";
+/// Enrolled gRPC method whose descriptor dependency is unavailable on this node.
+const OMIT_REASON_GRPC_DESCRIPTOR_UNAVAILABLE: &str = "grpc_descriptor_unavailable";
+/// Framed gRPC body was malformed, truncated, or used an unsupported encoding.
+const OMIT_REASON_GRPC_FRAMING: &str = "grpc_framing_error";
+/// A framed message exceeded `grpc.max_message_bytes` or `grpc.max_messages`.
+const OMIT_REASON_GRPC_MESSAGE_LIMIT: &str = "grpc_message_limit";
+/// Aggregate decoded/decompressed gRPC payload exceeded the scan bound.
+const OMIT_REASON_GRPC_SCAN_LIMIT: &str = "grpc_scan_limit";
+/// Protobuf decode failed or the message carried fields outside the descriptor.
+const OMIT_REASON_GRPC_DECODE: &str = "grpc_decode_error";
 
 /// Hard bound for in-flight request excerpts and permits. At the default
 /// fail-open policy, excess candidates are omitted; fail-closed policies reject
@@ -493,6 +538,56 @@ struct CaptureConfig {
     headers: bool,
     tool_calls: bool,
     stream_hash: StreamHashScope,
+}
+
+/// One enrolled gRPC method's capture contract after descriptor resolution.
+struct GrpcMethodCapture {
+    request: Option<MessageDescriptor>,
+    response: Option<MessageDescriptor>,
+    /// Pre-split dotted field paths. `None` means every string field recursively.
+    text_fields: Option<Vec<Vec<String>>>,
+}
+
+/// Runtime view of the optional `grpc` config block.
+struct GrpcCapture {
+    methods: HashMap<String, GrpcMethodCapture>,
+    enrolled_methods: HashSet<String>,
+    max_message_bytes: usize,
+    max_messages: usize,
+    dependency_unavailable: bool,
+}
+
+impl GrpcCapture {
+    fn enrolls(&self, method_path: &str) -> bool {
+        self.enrolled_methods.contains(method_path)
+    }
+
+    fn method(&self, method_path: &str) -> Option<&GrpcMethodCapture> {
+        self.methods.get(method_path)
+    }
+}
+
+/// Config-shape view of one `grpc.methods` entry before descriptor resolution.
+struct GrpcMethodShape {
+    request_type: Option<String>,
+    response_type: Option<String>,
+    text_fields: Option<Vec<Vec<String>>>,
+}
+
+struct GrpcShape {
+    descriptor_path: String,
+    methods: HashMap<String, GrpcMethodShape>,
+    max_message_bytes: usize,
+    max_messages: usize,
+}
+
+/// Whether a constructor may open node-local descriptor files.
+#[derive(Clone, Copy)]
+enum DescriptorLoadMode {
+    /// Runtime construction on a data-plane node: read the descriptor.
+    Runtime,
+    /// Admin / CP admission: validate the config shape only.
+    ShapeOnly,
 }
 
 #[derive(Clone, Copy)]
@@ -1642,10 +1737,34 @@ pub struct AiTranscriptAudit {
     request_captures_skipped: AtomicU64,
     /// Process-local id published into authenticated `/health` after commit.
     status_id: OnceLock<u64>,
+    /// Native-gRPC capture contract. `None` keeps the plugin HTTP-only.
+    grpc: Option<GrpcCapture>,
 }
 
 impl AiTranscriptAudit {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_inner(config, http_client, DescriptorLoadMode::Runtime)
+    }
+
+    /// Validate configuration shape without opening node-local descriptor
+    /// files. Mode-aware file dependency validation is performed separately by
+    /// `GatewayConfig::validate_plugin_file_dependencies`.
+    pub fn validate_config(config: &Value, http_client: PluginHttpClient) -> Result<(), String> {
+        Self::new_shape_only(config, http_client).map(|_| ())
+    }
+
+    /// Build an instance from configuration shape alone. The gRPC enrollment
+    /// set — which drives buffering and fail-closed capture — comes from the
+    /// config shape, not from the descriptor file.
+    pub fn new_shape_only(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_inner(config, http_client, DescriptorLoadMode::ShapeOnly)
+    }
+
+    fn new_inner(
+        config: &Value,
+        http_client: PluginHttpClient,
+        descriptor_mode: DescriptorLoadMode,
+    ) -> Result<Self, String> {
         let Some(config_obj) = config.as_object() else {
             return Err("ai_transcript_audit: config must be an object".to_string());
         };
@@ -1985,6 +2104,9 @@ impl AiTranscriptAudit {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "default".to_string());
 
+        // ---- gRPC enrollment (optional) ----
+        let grpc = load_grpc_capture(config, descriptor_mode)?;
+
         Ok(Self {
             mode,
             capture,
@@ -2019,6 +2141,7 @@ impl AiTranscriptAudit {
             request_captures: AtomicU64::new(0),
             request_captures_skipped: AtomicU64::new(0),
             status_id: OnceLock::new(),
+            grpc,
         })
     }
 
@@ -2578,6 +2701,404 @@ impl AiTranscriptAudit {
             max_bytes,
             self.limits.max_redaction_scan_bytes,
         )
+    }
+
+    /// Prefers the finalized `grpc_full_method` published by
+    /// `grpc_method_router` (which reflects a method rewrite) and falls back
+    /// to the request path.
+    fn grpc_method_path(ctx: &RequestContext) -> Cow<'_, str> {
+        match ctx.metadata.get("grpc_full_method") {
+            Some(method) if !method.is_empty() => Cow::Borrowed(method.as_str()),
+            _ => Cow::Borrowed(ctx.path.as_str()),
+        }
+    }
+
+    fn grpc_capture_applies(&self, ctx: &RequestContext) -> bool {
+        let Some(grpc) = self.grpc.as_ref() else {
+            return false;
+        };
+        ctx.is_native_grpc_request() && grpc.enrolls(&Self::grpc_method_path(ctx))
+    }
+
+    fn response_body_capture_allowed_for(
+        &self,
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        if self.grpc_capture_applies(ctx) {
+            return self.capture.response;
+        }
+        response_body_capture_allowed(self.capture, response_headers)
+    }
+
+    /// Stage an enrolled native-gRPC candidate. Classification is enrollment,
+    /// not JSON AI heuristics — unenrolled methods never reach this path.
+    fn stage_grpc_candidate(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        phase: BodyPhase,
+    ) -> PluginResult {
+        if body.is_empty() {
+            self.discard_staged_candidate(ctx);
+            return PluginResult::Continue;
+        }
+
+        let record_id = ctx
+            .metadata
+            .get(MD_RECORD_ID)
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        self.sweep_staging();
+        let staging_permit = match Arc::clone(&self.staging_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.discard_staged_candidate(ctx);
+                let fail_closed = self.on_buffer_full == BufferFullPolicy::Reject
+                    || self.on_sink_error == SinkErrorPolicy::Reject;
+                ctx.metadata.insert(
+                    MD_SINK_STATUS.to_string(),
+                    if fail_closed { "rejected" } else { "dropped" }.to_string(),
+                );
+                return if fail_closed {
+                    reject_audit_unavailable()
+                } else {
+                    PluginResult::Continue
+                };
+            }
+        };
+        let sample_hit = sample_from_record_id(&record_id) < self.sampling.rate;
+        let capture = match phase {
+            BodyPhase::Final => self.capture_grpc_request(ctx, body, sample_hit),
+            BodyPhase::Provisional => RequestCapture::default(),
+        };
+
+        let staged_bytes = if capture.skipped.is_some() {
+            0
+        } else {
+            staged_retained_bytes(
+                capture.excerpt.as_deref().map_or(0, str::len),
+                capture.model.value.as_deref().map_or(0, str::len),
+                tool_names_bytes(&capture.tools.names),
+            )
+        };
+        let Some(retained_lease) = self.retained_budget.try_acquire(staged_bytes) else {
+            self.discard_staged_candidate(ctx);
+            let fail_closed = self.on_buffer_full == BufferFullPolicy::Reject
+                || self.on_sink_error == SinkErrorPolicy::Reject;
+            ctx.metadata.insert(
+                MD_SINK_STATUS.to_string(),
+                if fail_closed { "rejected" } else { "dropped" }.to_string(),
+            );
+            return if fail_closed {
+                reject_audit_unavailable()
+            } else {
+                PluginResult::Continue
+            };
+        };
+
+        let published_hash = capture.hash.clone();
+        self.staging.insert(
+            record_id.clone(),
+            AuditStaging {
+                _staging_permit: staging_permit,
+                retained_lease,
+                retained_bytes: staged_bytes,
+                captured_at: Instant::now(),
+                sample_hit,
+                request_excerpt: capture.excerpt,
+                request_truncated: capture.truncated,
+                request_body_omitted_reason: capture.omitted_reason,
+                request_hash: capture.hash,
+                request_model: capture.model.value,
+                request_model_truncated: capture.model.truncated,
+                request_model_hash: capture.model.hash,
+                tool_names: capture.tools.names,
+                tool_names_truncated: capture.tools.truncated,
+                tool_names_omitted: capture.tools.omitted,
+                tool_names_hash: capture.tools.hash,
+                commit_permit: None,
+                commit_lease: None,
+                stream_active: false,
+                stream_active_since: None,
+                stream_deadline: None,
+                captured: phase == BodyPhase::Final,
+                capture_skipped: capture.skipped,
+                rate_reservation: capture.rate_reservation,
+            },
+        );
+
+        ctx.metadata.insert(MD_RECORD_ID.to_string(), record_id);
+        ctx.metadata
+            .insert(MD_CANDIDATE.to_string(), "true".to_string());
+        ctx.metadata
+            .insert(MD_SAMPLE_HIT.to_string(), bool_str(sample_hit));
+        ctx.metadata
+            .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
+        // gRPC capture is always buffered multi-frame (bounded by
+        // `grpc.max_messages`); never mark as SSE stream request.
+        ctx.metadata.remove(MD_STREAM_REQUEST);
+        self.publish_request_capture(
+            ctx,
+            &RequestCapture {
+                hash: published_hash,
+                ..RequestCapture::default()
+            },
+        );
+        PluginResult::Continue
+    }
+
+    fn capture_grpc_request(
+        &self,
+        ctx: &RequestContext,
+        body: &[u8],
+        sample_hit: bool,
+    ) -> RequestCapture {
+        let reservation = match self.capture_skip_reason(sample_hit) {
+            Ok(reservation) => reservation,
+            Err(skipped) => {
+                self.request_captures_skipped
+                    .fetch_add(1, Ordering::Relaxed);
+                return RequestCapture {
+                    skipped: Some(skipped),
+                    ..RequestCapture::default()
+                };
+            }
+        };
+        self.request_captures.fetch_add(1, Ordering::Relaxed);
+        let hash = self.redactor.keyed_hash_hex(body);
+        let shaped = if self.capture.request {
+            self.shape_grpc_body(ctx, body, &ctx.headers, GrpcBodyDirection::Request)
+        } else {
+            ShapedBody::default()
+        };
+        RequestCapture {
+            hash: Some(hash),
+            excerpt: shaped.excerpt,
+            truncated: shaped.truncated,
+            omitted_reason: shaped.omitted_reason,
+            model: BoundedModel::default(),
+            tools: BoundedToolNames::default(),
+            skipped: None,
+            rate_reservation: reservation,
+        }
+    }
+
+    /// Complete an already-staged gRPC candidate from the FINAL request body.
+    fn capture_staged_grpc_request(&self, ctx: &mut RequestContext, body: &[u8]) {
+        let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
+            return;
+        };
+        let sample_hit = match self.owned_sample_hit(&ctx.metadata) {
+            Some(hit) => hit,
+            None => return,
+        };
+        {
+            let Some(mut staged) = self.staging.get_mut(&record_id) else {
+                return;
+            };
+            if staged.captured {
+                return;
+            }
+        }
+        let mut capture = self.capture_grpc_request(ctx, body, sample_hit);
+        self.publish_request_capture(ctx, &capture);
+        if let Some(mut staged) = self.staging.get_mut(&record_id) {
+            staged.captured = true;
+            staged.capture_skipped = capture.skipped;
+            let mut apply_metadata = true;
+            if capture.skipped.is_some() {
+                staged.retained_lease.shrink_to(0);
+                staged.retained_bytes = 0;
+            } else {
+                let model_bytes = capture.model.value.as_deref().map_or(0, str::len);
+                let tool_bytes = tool_names_bytes(&capture.tools.names);
+                let captured_bytes = staged_retained_bytes(
+                    capture.excerpt.as_deref().map_or(0, str::len),
+                    model_bytes,
+                    tool_bytes,
+                );
+                if captured_bytes <= staged.retained_bytes {
+                    staged.retained_lease.shrink_to(captured_bytes);
+                    staged.retained_bytes = captured_bytes;
+                } else if let Some(lease) = self.retained_budget.try_acquire(captured_bytes) {
+                    staged.retained_lease = lease;
+                    staged.retained_bytes = captured_bytes;
+                } else {
+                    capture.excerpt = None;
+                    capture.truncated = true;
+                    capture.omitted_reason = Some(OMIT_REASON_RETAINED_BYTE_BUDGET);
+                    let without_excerpt = staged_retained_bytes(0, model_bytes, tool_bytes);
+                    if without_excerpt <= staged.retained_bytes {
+                        staged.retained_lease.shrink_to(without_excerpt);
+                        staged.retained_bytes = without_excerpt;
+                    } else {
+                        apply_metadata = false;
+                        let prior_model_bytes = staged.request_model.as_deref().map_or(0, str::len);
+                        let prior_tool_bytes = tool_names_bytes(&staged.tool_names);
+                        let prior_without_excerpt =
+                            staged_retained_bytes(0, prior_model_bytes, prior_tool_bytes);
+                        if prior_without_excerpt <= staged.retained_bytes {
+                            staged.retained_lease.shrink_to(prior_without_excerpt);
+                            staged.retained_bytes = prior_without_excerpt;
+                        }
+                    }
+                }
+            }
+            staged.request_excerpt = capture.excerpt;
+            staged.request_truncated = capture.truncated;
+            staged.request_body_omitted_reason = capture.omitted_reason;
+            staged.request_hash = capture.hash;
+            if apply_metadata {
+                staged.request_model = capture.model.value;
+                staged.request_model_truncated = capture.model.truncated;
+                staged.request_model_hash = capture.model.hash;
+                staged.tool_names = capture.tools.names;
+                staged.tool_names_truncated = capture.tools.truncated;
+                staged.tool_names_omitted = capture.tools.omitted;
+                staged.tool_names_hash = capture.tools.hash;
+            }
+            staged.rate_reservation = capture.rate_reservation;
+        }
+    }
+
+    fn shape_grpc_body(
+        &self,
+        ctx: &RequestContext,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+        direction: GrpcBodyDirection,
+    ) -> ShapedBody {
+        if !self.mode.captures_body() {
+            return ShapedBody::default();
+        }
+        let Some(grpc) = self.grpc.as_ref() else {
+            return ShapedBody::default();
+        };
+        let method_path = Self::grpc_method_path(ctx);
+        if !grpc.enrolls(&method_path) {
+            return ShapedBody::default();
+        }
+        if grpc.dependency_unavailable {
+            return ShapedBody::omitted(OMIT_REASON_GRPC_DESCRIPTOR_UNAVAILABLE);
+        }
+        let Some(method) = grpc.method(&method_path) else {
+            return ShapedBody::omitted(OMIT_REASON_GRPC_DESCRIPTOR_UNAVAILABLE);
+        };
+        let descriptor = match direction {
+            GrpcBodyDirection::Request => method.request.as_ref(),
+            GrpcBodyDirection::Response => method.response.as_ref(),
+        };
+        let Some(descriptor) = descriptor else {
+            return ShapedBody::default();
+        };
+
+        let encoding = grpc_message_encoding(headers);
+        let max_bytes = match direction {
+            GrpcBodyDirection::Request => self.limits.max_request_bytes,
+            GrpcBodyDirection::Response => self.limits.max_response_bytes,
+        };
+        let scan_budget = self.limits.max_redaction_scan_bytes.max(max_bytes);
+
+        let frames = match parse_grpc_frames(
+            body,
+            encoding,
+            grpc.max_message_bytes,
+            grpc.max_messages,
+            scan_budget,
+        ) {
+            Ok(frames) => frames,
+            Err(GrpcFramingError::MessageTooLarge | GrpcFramingError::TooManyMessages) => {
+                return ShapedBody::omitted(OMIT_REASON_GRPC_MESSAGE_LIMIT);
+            }
+            Err(GrpcFramingError::DecodedTooLarge) => {
+                return ShapedBody::omitted(OMIT_REASON_GRPC_SCAN_LIMIT);
+            }
+            Err(GrpcFramingError::Malformed | GrpcFramingError::UnsupportedEncoding) => {
+                return ShapedBody::omitted(OMIT_REASON_GRPC_FRAMING);
+            }
+        };
+
+        let mut messages = Vec::with_capacity(frames.len());
+        for (index, frame) in frames.iter().enumerate() {
+            let decoded =
+                match DynamicMessage::decode(descriptor.clone(), frame.payload.as_ref()) {
+                    Ok(message) => message,
+                    Err(_) => return ShapedBody::omitted(OMIT_REASON_GRPC_DECODE),
+                };
+            let mut budget = GrpcWalkBudget::new();
+            if has_unknown_fields(&decoded, &mut budget) {
+                return ShapedBody::omitted(OMIT_REASON_GRPC_DECODE);
+            }
+            let mut fields = serde_json::Map::new();
+            let mut walk_budget = GrpcWalkBudget::new();
+            if let Some(paths) = method.text_fields.as_ref() {
+                for path in paths {
+                    if let Some(value) = read_text_field(&decoded, path, &mut walk_budget) {
+                        let key = path.join(".");
+                        let exported = self.export_grpc_string(&key, &value);
+                        fields.insert(key, Value::String(exported));
+                    }
+                }
+            } else {
+                let mut strings = Vec::new();
+                if collect_string_fields(
+                    &decoded,
+                    &mut Vec::new(),
+                    &mut strings,
+                    &mut walk_budget,
+                )
+                .is_err()
+                {
+                    return ShapedBody::omitted(OMIT_REASON_GRPC_SCAN_LIMIT);
+                }
+                for (path, value) in strings {
+                    let exported = self.export_grpc_string(&path, &value);
+                    fields.insert(path, Value::String(exported));
+                }
+            }
+            let mut obj = serde_json::Map::new();
+            obj.insert("index".to_string(), Value::from(index as u64));
+            obj.insert("fields".to_string(), Value::Object(fields));
+            messages.push(Value::Object(obj));
+        }
+
+        let mut root = serde_json::Map::new();
+        root.insert(
+            "grpc_method".to_string(),
+            Value::String(method_path.into_owned()),
+        );
+        root.insert("messages".to_string(), Value::Array(messages));
+        let serialized = match serde_json::to_string(&Value::Object(root)) {
+            Ok(s) => s,
+            Err(_) => return ShapedBody::omitted(OMIT_REASON_GRPC_DECODE),
+        };
+        let truncated = serialized.len() > max_bytes;
+        let excerpt = if truncated {
+            truncate_on_char_boundary(serialized, max_bytes)
+        } else {
+            serialized
+        };
+        ShapedBody {
+            excerpt: Some(excerpt),
+            truncated,
+            omitted_reason: None,
+        }
+    }
+
+    /// Apply the same redaction contract used for HTTP JSON excerpts: sensitive
+    /// field-name values are replaced wholesale, and remaining strings pass
+    /// through the configured PII redactor in redacting modes.
+    fn export_grpc_string(&self, field_path: &str, value: &str) -> String {
+        let leaf = field_path.rsplit('.').next().unwrap_or(field_path);
+        if self.mode.redacts_body() && sensitive_json_field(leaf) {
+            return REDACTED_PLACEHOLDER.to_string();
+        }
+        if self.mode.redacts_body() {
+            self.redactor.redact(value)
+        } else {
+            value.to_string()
+        }
     }
 
     /// Cheap capture admission, evaluated once per transaction on the FIRST
@@ -3387,6 +3908,9 @@ impl AiTranscriptAudit {
         {
             return false;
         }
+        if self.grpc_capture_applies(ctx) {
+            return true;
+        }
         // A `stream: true` request expects an SSE response; do not buffer it —
         // buffering holds the stream until EOF, and under retry the
         // buffered->stream content-type downgrade is disabled, so an oversized
@@ -3446,7 +3970,14 @@ impl Plugin for AiTranscriptAudit {
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
-        HTTP_ONLY_PROTOCOLS
+        // Native gRPC is in scope only through the explicit `grpc` enrollment
+        // block. Without it the plugin stays HTTP-only rather than advertising
+        // inert gRPC capture or forcing protobuf traffic to buffer.
+        if self.grpc.is_some() {
+            HTTP_GRPC_PROTOCOLS
+        } else {
+            HTTP_ONLY_PROTOCOLS
+        }
     }
 
     fn enforces_finalized_request_policy(&self) -> bool {
@@ -3529,8 +4060,13 @@ impl Plugin for AiTranscriptAudit {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        self.active
-            && ctx.method == "POST"
+        if !self.active {
+            return false;
+        }
+        if self.grpc_capture_applies(ctx) {
+            return true;
+        }
+        ctx.method == "POST"
             && ctx
                 .headers
                 .get("content-type")
@@ -3544,6 +4080,18 @@ impl Plugin for AiTranscriptAudit {
     ) -> PluginResult {
         if !self.active {
             return PluginResult::Continue;
+        }
+        if self.grpc_capture_applies(ctx) {
+            let Some(body) = ctx.metadata.remove("request_body") else {
+                return PluginResult::Continue;
+            };
+            let stage_result =
+                self.stage_grpc_candidate(ctx, body.as_bytes(), BodyPhase::Provisional);
+            ctx.metadata.insert("request_body".to_string(), body);
+            if !matches!(stage_result, PluginResult::Continue) {
+                return stage_result;
+            }
+            return self.request_phase_commit_admission(ctx);
         }
         let candidate_shape = ctx.method == "POST"
             && headers
@@ -3594,11 +4142,22 @@ impl Plugin for AiTranscriptAudit {
         // Staged (cheaply) in `before_proxy`: these are the backend-visible
         // bytes, so this is where the transaction's single capture pass runs.
         if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
-            self.capture_staged_request(ctx, body);
+            if self.grpc_capture_applies(ctx) {
+                self.capture_staged_grpc_request(ctx, body);
+            } else {
+                self.capture_staged_request(ctx, body);
+            }
             // Capture may flip `MD_STREAM_REQUEST`. Re-evaluate whether a later
             // response/stream gate will reserve, or whether request-time
             // reservation must run now (conservative maybe-stream with
             // streaming capture off has no later buffered gate).
+            return self.request_phase_commit_admission(ctx);
+        }
+        if self.grpc_capture_applies(ctx) {
+            let stage_result = self.stage_grpc_candidate(ctx, body, BodyPhase::Final);
+            if !matches!(stage_result, PluginResult::Continue) {
+                return stage_result;
+            }
             return self.request_phase_commit_admission(ctx);
         }
         // Fallback for paths where the body was not available before
@@ -3653,7 +4212,11 @@ impl Plugin for AiTranscriptAudit {
         if !flag(&ctx.metadata, MD_FINAL_REQ_SEEN)
             && let Some(body) = ctx.metadata.remove("request_body")
         {
-            self.capture_staged_request(ctx, body.as_bytes());
+            if self.grpc_capture_applies(ctx) {
+                self.capture_staged_grpc_request(ctx, body.as_bytes());
+            } else {
+                self.capture_staged_request(ctx, body.as_bytes());
+            }
             ctx.metadata.insert("request_body".to_string(), body);
         }
         if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY)
@@ -3727,6 +4290,9 @@ impl Plugin for AiTranscriptAudit {
         if !self.buffered_response_capture_wanted(ctx) {
             return false;
         }
+        if self.grpc_capture_applies(ctx) {
+            return content_type.is_some_and(is_framed_grpc);
+        }
         // Buffer JSON AI responses here; SSE goes down the streaming inspector
         // path, and framed gRPC bodies are not JSON documents.
         content_type.is_some_and(|content_type| {
@@ -3775,7 +4341,11 @@ impl Plugin for AiTranscriptAudit {
         if flag(&ctx.metadata, SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
             && let Some(body) = ctx.metadata.remove("request_body")
         {
-            self.capture_staged_request(ctx, body.as_bytes());
+            if self.grpc_capture_applies(ctx) {
+                self.capture_staged_grpc_request(ctx, body.as_bytes());
+            } else {
+                self.capture_staged_request(ctx, body.as_bytes());
+            }
             ctx.metadata.insert("request_body".to_string(), body);
         }
 
@@ -3885,14 +4455,19 @@ impl Plugin for AiTranscriptAudit {
             return;
         }
 
-        let captures_response_body = response_body_capture_allowed(self.capture, response_headers);
+        let captures_response_body =
+            self.response_body_capture_allowed_for(ctx, response_headers);
         let response_hash = captures_response_body.then(|| self.redactor.keyed_hash_hex(body));
         if let Some(response_hash) = response_hash.as_ref() {
             ctx.metadata
                 .insert(MD_RESPONSE_HASH.to_string(), response_hash.clone());
         }
         let shaped = if captures_response_body {
-            self.shape_body(body, self.limits.max_response_bytes)
+            if self.grpc_capture_applies(ctx) {
+                self.shape_grpc_body(ctx, body, response_headers, GrpcBodyDirection::Response)
+            } else {
+                self.shape_body(body, self.limits.max_response_bytes)
+            }
         } else {
             ShapedBody::default()
         };
@@ -6599,4 +7174,694 @@ fn json_looks_like_ai_request(json: &Value) -> bool {
         return true;
     }
     object.contains_key("model") && WEAK_MARKERS.iter().any(|field| object.contains_key(*field))
+}
+
+
+// ══════════════════════════════════════════════════════════════════════
+// Native gRPC capture helpers (issue #3304)
+// ══════════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Copy)]
+enum GrpcBodyDirection {
+    Request,
+    Response,
+}
+
+/// One parsed gRPC length-prefixed frame with its payload in identity form.
+struct GrpcFrame<'a> {
+    payload: Cow<'a, [u8]>,
+}
+
+/// Message encoding negotiated for this body, from `grpc-encoding`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrpcMessageEncoding {
+    Identity,
+    Gzip,
+    /// An encoding this plugin cannot decode. Only reachable when a frame
+    /// actually sets its compressed flag.
+    Unsupported,
+}
+
+/// Why a gRPC body could not be framed within the configured bounds.
+#[derive(Clone, Copy)]
+enum GrpcFramingError {
+    Malformed,
+    MessageTooLarge,
+    DecodedTooLarge,
+    TooManyMessages,
+    UnsupportedEncoding,
+}
+
+fn grpc_message_encoding(headers: &HashMap<String, String>) -> GrpcMessageEncoding {
+    let Some(value) = headers.get("grpc-encoding") else {
+        return GrpcMessageEncoding::Identity;
+    };
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("identity") {
+        GrpcMessageEncoding::Identity
+    } else if value.eq_ignore_ascii_case("gzip") {
+        GrpcMessageEncoding::Gzip
+    } else {
+        GrpcMessageEncoding::Unsupported
+    }
+}
+
+/// Parse a buffered gRPC body into its complete length-prefixed frames.
+///
+/// Every frame must be complete: a truncated trailing frame, a stray trailing
+/// byte, or an unrecognized compressed-flag value is malformed rather than
+/// "inspect what we have". The per-message ceiling, the frame-count cap, and
+/// an aggregate decoded/decompressed payload ceiling are all enforced before
+/// any further capture work.
+fn parse_grpc_frames(
+    body: &[u8],
+    encoding: GrpcMessageEncoding,
+    max_message_bytes: usize,
+    max_messages: usize,
+    max_scan_bytes: usize,
+) -> Result<Vec<GrpcFrame<'_>>, GrpcFramingError> {
+    let mut frames = Vec::new();
+    let mut offset = 0usize;
+    let mut decoded_total = 0usize;
+    while offset < body.len() {
+        if body.len() - offset < 5 {
+            return Err(GrpcFramingError::Malformed);
+        }
+        let flag = body[offset];
+        if flag > 1 {
+            return Err(GrpcFramingError::Malformed);
+        }
+        let length = u32::from_be_bytes([
+            body[offset + 1],
+            body[offset + 2],
+            body[offset + 3],
+            body[offset + 4],
+        ]) as usize;
+        offset += 5;
+        if length > max_message_bytes {
+            return Err(GrpcFramingError::MessageTooLarge);
+        }
+        if body.len() - offset < length {
+            return Err(GrpcFramingError::Malformed);
+        }
+        let raw = &body[offset..offset + length];
+        offset += length;
+        if frames.len() >= max_messages {
+            return Err(GrpcFramingError::TooManyMessages);
+        }
+        let payload = if flag == 1 {
+            match encoding {
+                GrpcMessageEncoding::Gzip => {
+                    let remaining = max_scan_bytes.saturating_sub(decoded_total);
+                    let scan_budget_binds = remaining < max_message_bytes;
+                    let inflate_limit = max_message_bytes.min(remaining);
+                    match decompress_grpc_gzip(raw, inflate_limit) {
+                        Ok(payload) => Cow::Owned(payload),
+                        Err(GrpcFramingError::MessageTooLarge) if scan_budget_binds => {
+                            return Err(GrpcFramingError::DecodedTooLarge);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                GrpcMessageEncoding::Identity | GrpcMessageEncoding::Unsupported => {
+                    return Err(GrpcFramingError::UnsupportedEncoding);
+                }
+            }
+        } else {
+            Cow::Borrowed(raw)
+        };
+        decoded_total = decoded_total.saturating_add(payload.len());
+        if decoded_total > max_scan_bytes {
+            return Err(GrpcFramingError::DecodedTooLarge);
+        }
+        frames.push(GrpcFrame { payload });
+    }
+    Ok(frames)
+}
+
+/// Bounded gzip inflate for one gRPC message. The ceiling is enforced while
+/// reading so a compression bomb cannot allocate past it.
+fn decompress_grpc_gzip(
+    payload: &[u8],
+    max_decompressed_bytes: usize,
+) -> Result<Vec<u8>, GrpcFramingError> {
+    let mut decoder = GzDecoder::new(payload);
+    let mut decompressed = Vec::with_capacity(payload.len().min(max_decompressed_bytes));
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = decoder
+            .read(&mut buffer)
+            .map_err(|_| GrpcFramingError::Malformed)?;
+        if read == 0 {
+            break;
+        }
+        if decompressed.len().saturating_add(read) > max_decompressed_bytes {
+            return Err(GrpcFramingError::MessageTooLarge);
+        }
+        decompressed.extend_from_slice(&buffer[..read]);
+    }
+    if !decoder.into_inner().is_empty() {
+        return Err(GrpcFramingError::Malformed);
+    }
+    Ok(decompressed)
+}
+
+struct GrpcWalkBudget {
+    depth: usize,
+    nodes: usize,
+}
+
+impl GrpcWalkBudget {
+    fn new() -> Self {
+        Self { depth: 0, nodes: 0 }
+    }
+
+    fn enter(&mut self) -> Result<(), ()> {
+        if self.depth >= GRPC_MAX_MESSAGE_DEPTH {
+            return Err(());
+        }
+        self.depth += 1;
+        self.charge()
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn charge(&mut self) -> Result<(), ()> {
+        if self.nodes >= GRPC_MAX_MESSAGE_NODES {
+            return Err(());
+        }
+        self.nodes += 1;
+        Ok(())
+    }
+}
+
+fn has_unknown_fields(message: &DynamicMessage, budget: &mut GrpcWalkBudget) -> bool {
+    if budget.enter().is_err() {
+        return true;
+    }
+    if message.unknown_fields().next().is_some() {
+        return true;
+    }
+    for (_, value) in message.fields() {
+        if value_has_unknown_fields(value, budget) {
+            return true;
+        }
+    }
+    for (_, value) in message.extensions() {
+        if value_has_unknown_fields(value, budget) {
+            return true;
+        }
+    }
+    budget.leave();
+    false
+}
+
+fn value_has_unknown_fields(value: &ProtobufValue, budget: &mut GrpcWalkBudget) -> bool {
+    if budget.charge().is_err() {
+        return true;
+    }
+    match value {
+        ProtobufValue::Message(message) => has_unknown_fields(message, budget),
+        ProtobufValue::List(items) => items
+            .iter()
+            .any(|item| value_has_unknown_fields(item, budget)),
+        ProtobufValue::Map(entries) => entries
+            .values()
+            .any(|entry| value_has_unknown_fields(entry, budget)),
+        _ => false,
+    }
+}
+
+fn collect_string_fields(
+    message: &DynamicMessage,
+    path: &mut Vec<String>,
+    out: &mut Vec<(String, String)>,
+    budget: &mut GrpcWalkBudget,
+) -> Result<(), ()> {
+    budget.enter()?;
+    for (field, value) in message.fields() {
+        path.push(field.name().to_string());
+        collect_string_value(value, path, out, budget)?;
+        path.pop();
+    }
+    for (field, value) in message.extensions() {
+        path.push(field.name().to_string());
+        collect_string_value(value, path, out, budget)?;
+        path.pop();
+    }
+    budget.leave();
+    Ok(())
+}
+
+fn collect_string_value(
+    value: &ProtobufValue,
+    path: &mut Vec<String>,
+    out: &mut Vec<(String, String)>,
+    budget: &mut GrpcWalkBudget,
+) -> Result<(), ()> {
+    budget.charge()?;
+    match value {
+        ProtobufValue::String(text) => {
+            out.push((path.join("."), text.to_string()));
+        }
+        ProtobufValue::Message(message) => {
+            collect_string_fields(message, path, out, budget)?;
+        }
+        ProtobufValue::List(items) => {
+            for (index, item) in items.iter().enumerate() {
+                path.push(index.to_string());
+                collect_string_value(item, path, out, budget)?;
+                path.pop();
+            }
+        }
+        ProtobufValue::Map(entries) => {
+            // Map keys are not exported as transcript path labels (operator
+            // text_fields cannot select them either). Walk values under a
+            // stable placeholder segment so nested strings remain captureable.
+            for entry in entries.values() {
+                path.push("*".to_string());
+                collect_string_value(entry, path, out, budget)?;
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn read_text_field(
+    message: &DynamicMessage,
+    path: &[String],
+    budget: &mut GrpcWalkBudget,
+) -> Option<String> {
+    read_text_field_at(message, path, budget)
+}
+
+fn read_text_field_at(
+    message: &DynamicMessage,
+    path: &[String],
+    budget: &mut GrpcWalkBudget,
+) -> Option<String> {
+    if budget.enter().is_err() || path.is_empty() {
+        return None;
+    }
+    let field = message.descriptor().get_field_by_name(&path[0])?;
+    if !message.has_field(&field) {
+        budget.leave();
+        return None;
+    }
+    let value = message.get_field(&field);
+    let result = read_text_value(&value, &path[1..], budget);
+    budget.leave();
+    result
+}
+
+fn read_text_value(
+    value: &ProtobufValue,
+    rest: &[String],
+    budget: &mut GrpcWalkBudget,
+) -> Option<String> {
+    if budget.charge().is_err() {
+        return None;
+    }
+    match value {
+        ProtobufValue::String(text) if rest.is_empty() => Some(text.to_string()),
+        ProtobufValue::Message(message) if !rest.is_empty() => {
+            read_text_field_at(message, rest, budget)
+        }
+        ProtobufValue::List(items) => {
+            // Prefer the first matching string for a repeated path leaf.
+            for item in items {
+                if let Some(found) = read_text_value(item, rest, budget) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Parse the optional `grpc` config block. `Ok(None)` means HTTP-only capture.
+fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
+    let Some(grpc) = config.get("grpc") else {
+        return Ok(None);
+    };
+    let Some(grpc_obj) = grpc.as_object() else {
+        return Err("ai_transcript_audit: 'grpc' must be an object".to_string());
+    };
+    reject_unknown_keys(
+        grpc_obj,
+        "grpc",
+        AI_TRANSCRIPT_AUDIT_GRPC_CONFIG_KEYS,
+        ERROR_PREFIX,
+    )?;
+
+    let descriptor_path = cfg_str(grpc, "descriptor_path", "grpc")?
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            "ai_transcript_audit: 'grpc.descriptor_path' is required and must be a \
+             non-empty string"
+                .to_string()
+        })?
+        .to_string();
+
+    let max_message_bytes =
+        cfg_positive_usize(grpc, "max_message_bytes", DEFAULT_GRPC_MAX_MESSAGE_BYTES, "grpc")?;
+    let max_messages =
+        cfg_positive_usize(grpc, "max_messages", DEFAULT_GRPC_MAX_MESSAGES, "grpc")?;
+
+    let Some(method_configs) = grpc.get("methods").and_then(Value::as_object) else {
+        return Err(
+            "ai_transcript_audit: 'grpc.methods' is required and must be an object".to_string(),
+        );
+    };
+    if method_configs.is_empty() {
+        return Err(
+            "ai_transcript_audit: 'grpc.methods' must configure at least one method".to_string(),
+        );
+    }
+
+    let mut methods: HashMap<String, GrpcMethodShape> = HashMap::new();
+    for (method_path, method_config) in method_configs {
+        let normalized = normalize_grpc_method_path(method_path)?;
+        let Some(method_obj) = method_config.as_object() else {
+            return Err(
+                "ai_transcript_audit: a 'grpc.methods' entry must be an object".to_string(),
+            );
+        };
+        reject_unknown_keys(
+            method_obj,
+            "grpc.methods",
+            AI_TRANSCRIPT_AUDIT_GRPC_METHOD_KEYS,
+            ERROR_PREFIX,
+        )?;
+        let request_type = cfg_str(method_config, "request_type", "grpc.methods")?
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let response_type = cfg_str(method_config, "response_type", "grpc.methods")?
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if request_type.is_none() && response_type.is_none() {
+            return Err(
+                "ai_transcript_audit: a 'grpc.methods' entry requires 'request_type' \
+                 and/or 'response_type'"
+                    .to_string(),
+            );
+        }
+        let text_fields = parse_grpc_text_fields(method_config)?;
+        let shape = GrpcMethodShape {
+            request_type,
+            response_type,
+            text_fields,
+        };
+        if methods.insert(normalized, shape).is_some() {
+            return Err(
+                "ai_transcript_audit: a 'grpc.methods' method path is configured more than once"
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(Some(GrpcShape {
+        descriptor_path,
+        methods,
+        max_message_bytes,
+        max_messages,
+    }))
+}
+
+fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
+    let trimmed = method_path.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "ai_transcript_audit: a 'grpc.methods' key must be a non-empty method path"
+                .to_string(),
+        );
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '%' | '?' | '#' | '&' | '=' | '+' | ';'))
+    {
+        return Err(
+            "ai_transcript_audit: a 'grpc.methods' key must be a '/package.Service/Method' path"
+                .to_string(),
+        );
+    }
+    let normalized = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    let rest = &normalized[1..];
+    let Some((service, method_name)) = rest.split_once('/') else {
+        return Err(
+            "ai_transcript_audit: a 'grpc.methods' key must be a '/package.Service/Method' path"
+                .to_string(),
+        );
+    };
+    if service.is_empty()
+        || method_name.is_empty()
+        || method_name.contains('/')
+        || !is_valid_grpc_service(service)
+        || !is_valid_grpc_identifier(method_name)
+    {
+        return Err(
+            "ai_transcript_audit: a 'grpc.methods' key must be a '/package.Service/Method' path"
+                .to_string(),
+        );
+    }
+    Ok(normalized)
+}
+
+fn is_valid_grpc_service(service: &str) -> bool {
+    service
+        .split('.')
+        .all(|segment| !segment.is_empty() && is_valid_grpc_identifier(segment))
+}
+
+fn is_valid_grpc_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn parse_grpc_text_fields(method_config: &Value) -> Result<Option<Vec<Vec<String>>>, String> {
+    let Some(fields) = cfg_string_array(method_config, "text_fields", "grpc.methods")? else {
+        return Ok(None);
+    };
+    if fields.is_empty() {
+        return Err(
+            "ai_transcript_audit: 'grpc.methods' 'text_fields' must not be empty".to_string(),
+        );
+    }
+    let mut parsed = Vec::with_capacity(fields.len());
+    let mut seen = HashSet::with_capacity(fields.len());
+    for field in &fields {
+        let segments: Vec<String> = field
+            .split('.')
+            .map(|part| part.trim().to_string())
+            .collect();
+        if segments.iter().any(String::is_empty) {
+            return Err(
+                "ai_transcript_audit: a 'grpc.methods' 'text_fields' entry must be a dotted \
+                 field path with non-empty segments"
+                    .to_string(),
+            );
+        }
+        if segments.len() > GRPC_MAX_MESSAGE_DEPTH {
+            return Err(
+                "ai_transcript_audit: a 'grpc.methods' 'text_fields' path exceeds the maximum \
+                 nesting depth"
+                    .to_string(),
+            );
+        }
+        let normalized = segments.join(".");
+        if !seen.insert(normalized) {
+            return Err(
+                "ai_transcript_audit: a 'grpc.methods' 'text_fields' path is configured more \
+                 than once"
+                    .to_string(),
+            );
+        }
+        parsed.push(segments);
+    }
+    Ok(Some(parsed))
+}
+
+/// The configured descriptor path, for mode-aware file dependency validation.
+pub(crate) fn grpc_descriptor_path(config: &Value) -> Result<Option<String>, String> {
+    Ok(parse_grpc_shape(config)?.map(|shape| shape.descriptor_path))
+}
+
+fn load_grpc_descriptor_pool_inner(path: &str) -> Result<DescriptorPool, (bool, String)> {
+    let bytes = std::fs::read(path).map_err(|_| {
+        (
+            true,
+            "ai_transcript_audit: failed to read protobuf descriptor file".to_string(),
+        )
+    })?;
+    DescriptorPool::decode(bytes.as_slice()).map_err(|_| {
+        (
+            false,
+            "ai_transcript_audit: failed to parse protobuf descriptor".to_string(),
+        )
+    })
+}
+
+fn resolve_text_field_path(root: &MessageDescriptor, path: &[String]) -> Result<(), String> {
+    let mut current = root.clone();
+    for (index, segment) in path.iter().enumerate() {
+        let Some(field) = current.get_field_by_name(segment) else {
+            return Err(
+                "ai_transcript_audit: a 'grpc.methods' 'text_fields' path names a field that \
+                 is not in the descriptor"
+                    .to_string(),
+            );
+        };
+        if field.is_map() {
+            return Err(
+                "ai_transcript_audit: a 'grpc.methods' 'text_fields' path may not traverse a \
+                 map field"
+                    .to_string(),
+            );
+        }
+        let last = index + 1 == path.len();
+        match field.kind() {
+            Kind::String if last => return Ok(()),
+            Kind::Message(next) if !last => current = next,
+            _ => {
+                return Err(
+                    "ai_transcript_audit: a 'grpc.methods' 'text_fields' path must end at a \
+                     string field"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Err("ai_transcript_audit: a 'grpc.methods' 'text_fields' path must not be empty".to_string())
+}
+
+fn resolve_grpc_shape(
+    shape: &GrpcShape,
+    pool: &DescriptorPool,
+) -> Result<HashMap<String, GrpcMethodCapture>, String> {
+    let mut resolved = HashMap::with_capacity(shape.methods.len());
+    for (method_path, method) in &shape.methods {
+        let request = match method.request_type.as_deref() {
+            Some(name) => Some(pool.get_message_by_name(name).ok_or_else(|| {
+                "ai_transcript_audit: a 'grpc.methods' 'request_type' was not found in the \
+                 descriptor"
+                    .to_string()
+            })?),
+            None => None,
+        };
+        let response = match method.response_type.as_deref() {
+            Some(name) => Some(pool.get_message_by_name(name).ok_or_else(|| {
+                "ai_transcript_audit: a 'grpc.methods' 'response_type' was not found in the \
+                 descriptor"
+                    .to_string()
+            })?),
+            None => None,
+        };
+        if let Some(paths) = method.text_fields.as_ref() {
+            let roots: Vec<&MessageDescriptor> = [request.as_ref(), response.as_ref()]
+                .into_iter()
+                .flatten()
+                .collect();
+            for path in paths {
+                let mut ok = false;
+                for root in &roots {
+                    if resolve_text_field_path(root, path).is_ok() {
+                        ok = true;
+                        break;
+                    }
+                }
+                if !ok {
+                    // Prefer a concrete diagnostic from the first root.
+                    if let Some(root) = roots.first() {
+                        resolve_text_field_path(root, path)?;
+                    } else {
+                        return Err(
+                            "ai_transcript_audit: a 'grpc.methods' 'text_fields' path could \
+                             not be resolved"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+        resolved.insert(
+            method_path.clone(),
+            GrpcMethodCapture {
+                request,
+                response,
+                text_fields: method.text_fields.clone(),
+            },
+        );
+    }
+    Ok(resolved)
+}
+
+/// Validate the `grpc` block against an already-loaded descriptor pool.
+pub(crate) fn validate_grpc_descriptor_config(
+    config: &Value,
+    pool: &DescriptorPool,
+) -> Result<(), String> {
+    match parse_grpc_shape(config)? {
+        Some(shape) => resolve_grpc_shape(&shape, pool).map(|_| ()),
+        None => Ok(()),
+    }
+}
+
+fn load_grpc_capture(
+    config: &Value,
+    mode: DescriptorLoadMode,
+) -> Result<Option<GrpcCapture>, String> {
+    let Some(shape) = parse_grpc_shape(config)? else {
+        return Ok(None);
+    };
+    let enrolled_methods: HashSet<String> = shape.methods.keys().cloned().collect();
+    let unresolved = GrpcCapture {
+        methods: HashMap::new(),
+        enrolled_methods: enrolled_methods.clone(),
+        max_message_bytes: shape.max_message_bytes,
+        max_messages: shape.max_messages,
+        dependency_unavailable: true,
+    };
+
+    if matches!(mode, DescriptorLoadMode::ShapeOnly) {
+        return Ok(Some(unresolved));
+    }
+
+    let pool = match load_grpc_descriptor_pool_inner(&shape.descriptor_path) {
+        Ok(pool) => pool,
+        Err((true, _)) => {
+            warn!(
+                plugin = "ai_transcript_audit",
+                "Protobuf descriptor dependency is unavailable; enrolled gRPC methods omit body \
+                 excerpts"
+            );
+            return Ok(Some(unresolved));
+        }
+        Err((false, message)) => return Err(message),
+    };
+
+    Ok(Some(GrpcCapture {
+        methods: resolve_grpc_shape(&shape, &pool)?,
+        enrolled_methods,
+        max_message_bytes: shape.max_message_bytes,
+        max_messages: shape.max_messages,
+        dependency_unavailable: false,
+    }))
 }

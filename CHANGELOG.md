@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ai_transcript_audit` native gRPC payload capture via an explicit descriptor-based
+  `grpc` enrollment block (issue #3304). Enrolled methods are framed, bounded,
+  schema-decoded, and redacted under the same capture `mode` contract as HTTP;
+  unenrolled methods stay undecoded and unbuffered. Malformed, oversized, or
+  undecodable frames omit excerpts with compiled-in reasons rather than
+  exporting partial or unredacted bytes.
+
 - VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
   compile onto a shared precomputed `Proxy.stream_match` carrier and are
