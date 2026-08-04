@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `a2a_gateway` rewrites unary gRPC Agent Card protobuf payloads (A2A 0.3.x
+  wire layout) with the same JSON-RPC endpoint URL policy as HTTP cards,
+  clears invalidated signatures, and fails closed on unsupported versions or
+  malformed/compressed frames (issue #3297).
+
 - VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
   compile onto a shared precomputed `Proxy.stream_match` carrier and are

@@ -1137,7 +1137,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 `mcp_gateway` sits at priority 2992: generic admission/auth/body validation runs first, then MCP JSON-RPC metadata is extracted and aggregate-router calls can set `RequestContext.route_override_*` before final route-dispatch plugins and request transformers. It is HTTP-only and does not implement generic auth, rate limiting, retry, timeout, tracing, WAF, DLP, or semantic safety behavior; those remain separate Ferrum plugins that can consume emitted `mcp.*` metadata.
 
-`a2a_gateway` sits at priority 2993: it runs after MCP handling and before final mesh route dispatch. It observes HTTP JSON-RPC, HTTP+JSON/REST, and gRPC A2A methods, applies optional method policy, rewrites HTTP Agent Card responses, and emits `a2a.*` metadata. It preserves SSE/gRPC streaming and does not own A2A task state.
+`a2a_gateway` sits at priority 2993: it runs after MCP handling and before final mesh route dispatch. It observes HTTP JSON-RPC, HTTP+JSON/REST, and gRPC A2A methods, applies optional method policy, rewrites HTTP and unary gRPC Agent Card responses, and emits `a2a.*` metadata. It preserves SSE and non-card gRPC streaming and does not own A2A task state.
 
 `mesh_route_dispatch` intentionally sits at priority 2995: authentication, `mesh_authz`, and rate limiting evaluate the original public proxy identity, then route overrides apply before request transformers, mirror/serverless/caching plugins, and backend dispatch. For node-waypoint Service egress with scoped mesh policies, `mesh_authz` stamps the authorized Service upstream and `mesh_route_dispatch` rejects any matching rule that would rewrite that request to a different upstream or direct backend. When multiple instances are attached to the same proxy, each matching instance replaces the complete override destination and route-local timeout/retry policy from earlier instances; a non-matching later instance leaves any earlier match in place. Per-rule `backend_tls` is only valid for direct `backend_host`/`backend_port` destinations; `upstream_id` destinations use TLS from the referenced `Upstream`. For WebSockets, the override selects only the upgrade handshake backend; the upgraded connection is pinned to that backend and frame hooks do not re-route individual frames. HBONE CONNECT traffic flows through the standard `before_proxy` chain before the HBONE relay consumes route overrides; inner H2 frames are not re-classified per stream.
 
@@ -1206,7 +1206,7 @@ Given all built-in plugins enabled, the execution order is:
 | 43 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 44 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, enforce_final_backend_header_policy, on_final_request_body, normalize_response_body, response_stream_inspector |
 | 45 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, transform_response_body |
-| 46 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body, response_stream_inspector |
+| 46 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector |
 | 47 | `mesh_route_dispatch` | 2995 | before_proxy |
 | 48 | `request_transformer` | 3000 | before_proxy, transform_request_body |
 | 49 | `request_deduplication` | 3010 | before_proxy, on_final_response_body, on_response_stream_terminated |
@@ -1569,7 +1569,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `ai_semantic_cache` | ✓ | | | | | HTTP-only exact/semantic cache for LLM JSON request and response bodies |
 | `ai_stream_router` | ✓ | | | | | Claims `stream: true` OpenAI Chat Completions, route-overrides to a provider, normalizes provider SSE to OpenAI SSE |
 | `mcp_gateway` | ✓ | | | | | HTTP-only MCP JSON-RPC parsing, metadata, and namespaced tool/resource/prompt routing |
-| `a2a_gateway` | ✓ | ✓ | | | | Detects A2A HTTP/REST/gRPC methods, rewrites HTTP Agent Cards, applies method policy, and emits `a2a.*` metadata |
+| `a2a_gateway` | ✓ | ✓ | | | | Detects A2A HTTP/REST/gRPC methods, rewrites HTTP and gRPC Agent Cards, applies method policy, and emits `a2a.*` metadata |
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
 | `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
 | `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions); terminate supports HTTP and native unary gRPC |

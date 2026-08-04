@@ -27,6 +27,23 @@ const DEFAULT_MAX_DETECTION_BODY_BYTES: u64 = 1024 * 1024;
 const DEFAULT_GRPC_SERVICE: &str = "lf.a2a.v1.A2AService";
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 
+/// A2A 0.3.x `AgentCard` protobuf field numbers used for URL rewriting.
+/// Wire surgery preserves every other field verbatim so skills/security/etc.
+/// survive re-encoding without embedding a full descriptor set.
+const AGENT_CARD_PB_URL: u32 = 3;
+const AGENT_CARD_PB_PREFERRED_TRANSPORT: u32 = 14;
+const AGENT_CARD_PB_ADDITIONAL_INTERFACES: u32 = 15;
+const AGENT_CARD_PB_PROTOCOL_VERSION: u32 = 16;
+const AGENT_CARD_PB_SIGNATURES: u32 = 17;
+const AGENT_CARD_PB_NAME: u32 = 1;
+const AGENT_CARD_PB_DESCRIPTION: u32 = 2;
+const AGENT_INTERFACE_PB_URL: u32 = 1;
+const AGENT_INTERFACE_PB_TRANSPORT: u32 = 2;
+const PROTO_WIRE_VARINT: u8 = 0;
+const PROTO_WIRE_64BIT: u8 = 1;
+const PROTO_WIRE_LEN: u8 = 2;
+const PROTO_WIRE_32BIT: u8 = 5;
+
 /// Response headers that describe the backend's original body and become stale
 /// the moment the Agent Card body is re-serialized as uncompressed JSON. Dropped
 /// case-insensitively when the plugin rewrites the card so clients never
@@ -693,6 +710,15 @@ impl A2aGateway {
                 || (self.discovery.rewrite_agent_card_urls && ctx.a2a_gateway_is_agent_card))
     }
 
+    fn should_rewrite_grpc_agent_card(&self, ctx: &RequestContext) -> bool {
+        self.enabled
+            && self.discovery.rewrite_agent_card_urls
+            && ctx.a2a_gateway_detected
+            && ctx.a2a_gateway_is_agent_card
+            && !ctx.a2a_gateway_streaming
+            && ctx.a2a_gateway_binding == Some("grpc")
+    }
+
     fn public_base_url(&self, ctx: &RequestContext) -> Option<String> {
         if let Some(configured) = self.discovery.public_base_url.as_deref() {
             return Some(configured.trim_end_matches('/').to_string());
@@ -710,6 +736,41 @@ impl A2aGateway {
         let host = header_value(&ctx.headers, "x-forwarded-host")
             .or_else(|| header_value(&ctx.headers, "host"))?;
         forwarded_public_base_url(proto, host)
+    }
+
+    fn stage_grpc_agent_card_rewrite(
+        &self,
+        ctx: &mut RequestContext,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        let Some(_public_base) = self.public_base_url(ctx) else {
+            return PluginResult::Continue;
+        };
+        if body.is_empty() {
+            // Trailers-only upstream failures carry no Agent Card payload.
+            return PluginResult::Continue;
+        }
+        if let Some(status) = header_value(response_headers, "grpc-status")
+            && status != "0"
+        {
+            return PluginResult::Continue;
+        }
+        match validate_grpc_agent_card_rewrite(body, response_headers, &self.endpoint.protocol_versions)
+        {
+            Ok(()) => PluginResult::Continue,
+            Err(diagnostic) => {
+                if self.observability.emit_metadata {
+                    ctx.metadata
+                        .insert("a2a.error".to_string(), diagnostic.to_string());
+                }
+                warn!(
+                    error = diagnostic,
+                    "Failing closed on unrewritable gRPC Agent Card response"
+                );
+                grpc_agent_card_rewrite_failure(diagnostic)
+            }
+        }
     }
 }
 
@@ -752,7 +813,8 @@ impl Plugin for A2aGateway {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        self.enabled && self.should_capture_http_response(ctx)
+        self.enabled
+            && (self.should_capture_http_response(ctx) || self.should_rewrite_grpc_agent_card(ctx))
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -913,6 +975,12 @@ impl Plugin for A2aGateway {
                 || (self.observability.emit_metadata && !detection.streaming_hint))
         {
             remove_header(headers, "accept-encoding");
+            // Agent Card gRPC rewriting needs an uncompressed unary frame; strip
+            // message-level compression negotiation the same way HTTP decoding is
+            // discouraged above.
+            if detection.binding == A2aBinding::Grpc && detection.is_agent_card {
+                remove_header(headers, "grpc-accept-encoding");
+            }
         }
         PluginResult::Continue
     }
@@ -958,13 +1026,18 @@ impl Plugin for A2aGateway {
         if self.observability.emit_metadata {
             ctx.metadata
                 .insert("a2a.response_body_size".to_string(), body.len().to_string());
-            if self.observability.log_payloads && body.len() <= self.observability.max_payload_size
+            if self.observability.log_payloads
+                && body.len() <= self.observability.max_payload_size
+                && !is_grpc_request(&ctx.headers)
             {
                 ctx.metadata.insert(
                     "a2a.payload.response".to_string(),
                     String::from_utf8_lossy(body).to_string(),
                 );
             }
+        }
+        if self.should_rewrite_grpc_agent_card(ctx) {
+            return self.stage_grpc_agent_card_rewrite(ctx, response_headers, body);
         }
         if !response_headers
             .get("content-type")
@@ -1007,6 +1080,93 @@ impl Plugin for A2aGateway {
             body: value.to_string(),
             headers,
         }
+    }
+
+    async fn transform_response_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        _content_type: Option<&str>,
+        response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        if !self.should_rewrite_grpc_agent_card(ctx) {
+            return None;
+        }
+        let public_base = self.public_base_url(ctx)?;
+        if body.is_empty() {
+            return None;
+        }
+        if let Some(status) = header_value(response_headers, "grpc-status")
+            && status != "0"
+        {
+            return None;
+        }
+        match rewrite_grpc_agent_card_frame(
+            body,
+            response_headers,
+            &public_base,
+            &self.endpoint.path,
+            &self.endpoint.protocol_versions,
+        ) {
+            Ok(None) => None,
+            Ok(Some(message)) => {
+                let ceiling = ctx.effective_max_response_body_size_bytes();
+                let mut sink =
+                    crate::proxy::response_buffer_budget::BoundedResponseBodySink::with_ceiling(
+                        ceiling,
+                    );
+                let Ok(msg_len) = u32::try_from(message.len()) else {
+                    ctx.a2a_gateway_agent_card_rewrite_error =
+                        Some("agent_card_grpc_frame_too_large");
+                    return None;
+                };
+                if !sink.push(&[0])
+                    || !sink.push(&msg_len.to_be_bytes())
+                    || !sink.push(&message)
+                {
+                    ctx.mark_buffered_response_capacity_refusal_pending();
+                    return None;
+                }
+                sink.finish()
+            }
+            Err(diagnostic) => {
+                ctx.a2a_gateway_agent_card_rewrite_error = Some(diagnostic);
+                if self.observability.emit_metadata {
+                    ctx.metadata
+                        .insert("a2a.error".to_string(), diagnostic.to_string());
+                }
+                None
+            }
+        }
+    }
+
+    fn on_response_body_transformed(
+        &self,
+        _ctx: &mut RequestContext,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        for header in BODY_COUPLED_RESPONSE_HEADERS {
+            remove_header(response_headers, header);
+        }
+        // Rewritten frames are always uncompressed identity payloads.
+        remove_header(response_headers, "grpc-encoding");
+    }
+
+    async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        let Some(diagnostic) = ctx.a2a_gateway_agent_card_rewrite_error.take() else {
+            return PluginResult::Continue;
+        };
+        warn!(
+            error = diagnostic,
+            "Failing closed on gRPC Agent Card rewrite failure after transform"
+        );
+        grpc_agent_card_rewrite_failure(diagnostic)
     }
 }
 
@@ -1678,6 +1838,336 @@ fn should_rewrite_transport(transport: Option<&str>) -> bool {
         .map(|c| c.to_ascii_lowercase())
         .collect();
     normalized == "jsonrpc"
+}
+
+fn grpc_agent_card_rewrite_failure(diagnostic: &'static str) -> PluginResult {
+    PluginResult::Reject {
+        status_code: 500,
+        body: String::new(),
+        headers: HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("grpc-status".to_string(), "13".to_string()),
+            ("grpc-message".to_string(), diagnostic.to_string()),
+        ]),
+    }
+}
+
+/// Validate that a unary gRPC Agent Card body is a supported, rewritable
+/// protobuf shape. Does not allocate a replacement frame; the transform phase
+/// performs the bounded rewrite.
+fn validate_grpc_agent_card_rewrite(
+    body: &[u8],
+    response_headers: &HashMap<String, String>,
+    configured_versions: &[String],
+) -> Result<(), &'static str> {
+    let message = extract_uncompressed_unary_grpc_message(body, response_headers)?;
+    if !looks_like_agent_card_protobuf(message) {
+        return Err("agent_card_protobuf_shape_unrecognized");
+    }
+    let protocol_version = protobuf_string_field(message, AGENT_CARD_PB_PROTOCOL_VERSION)?.unwrap_or("");
+    if !supports_agent_card_protobuf_layout(protocol_version, configured_versions) {
+        return Err("unsupported_agent_card_protobuf_version");
+    }
+    Ok(())
+}
+
+/// Rewrite a unary gRPC Agent Card protobuf message for A2A 0.3.x layout.
+///
+/// Returns `Ok(None)` when the card needs no mutation, `Ok(Some(message))` when
+/// URLs changed (signatures cleared), and `Err(diagnostic)` for malformed or
+/// unsupported payloads that must fail closed. Callers frame the message through
+/// a retained-response sink.
+fn rewrite_grpc_agent_card_frame(
+    body: &[u8],
+    response_headers: &HashMap<String, String>,
+    public_base: &str,
+    endpoint_path: &str,
+    configured_versions: &[String],
+) -> Result<Option<Vec<u8>>, &'static str> {
+    let message = extract_uncompressed_unary_grpc_message(body, response_headers)?;
+    if !looks_like_agent_card_protobuf(message) {
+        return Err("agent_card_protobuf_shape_unrecognized");
+    }
+    let protocol_version = protobuf_string_field(message, AGENT_CARD_PB_PROTOCOL_VERSION)?
+        .unwrap_or("");
+    if !supports_agent_card_protobuf_layout(protocol_version, configured_versions) {
+        return Err("unsupported_agent_card_protobuf_version");
+    }
+    let Some(rewritten) = rewrite_agent_card_protobuf(message, public_base, endpoint_path)? else {
+        return Ok(None);
+    };
+    Ok(Some(rewritten))
+}
+
+fn supports_agent_card_protobuf_layout(
+    protocol_version: &str,
+    configured_versions: &[String],
+) -> bool {
+    let version = protocol_version.trim();
+    if version.is_empty() {
+        return configured_versions
+            .iter()
+            .any(|configured| is_a2a_03_family(configured));
+    }
+    is_a2a_03_family(version)
+        && (configured_versions.is_empty()
+            || configured_versions
+                .iter()
+                .any(|configured| configured.trim() == version || is_a2a_03_family(configured)))
+}
+
+fn is_a2a_03_family(version: &str) -> bool {
+    let version = version.trim();
+    version == "0.3" || version.starts_with("0.3.")
+}
+
+fn extract_uncompressed_unary_grpc_message<'a>(
+    body: &'a [u8],
+    response_headers: &HashMap<String, String>,
+) -> Result<&'a [u8], &'static str> {
+    if let Some(encoding) = header_value(response_headers, "grpc-encoding") {
+        let encoding = encoding.trim();
+        if !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity") {
+            return Err("agent_card_grpc_encoding_unsupported");
+        }
+    }
+    if body.len() < 5 {
+        return Err("agent_card_grpc_frame_malformed");
+    }
+    if body[0] != 0 {
+        return Err("agent_card_grpc_encoding_unsupported");
+    }
+    let msg_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+    let Some(expected) = msg_len.checked_add(5) else {
+        return Err("agent_card_grpc_frame_malformed");
+    };
+    if expected != body.len() {
+        return Err("agent_card_grpc_frame_malformed");
+    }
+    Ok(&body[5..])
+}
+
+fn looks_like_agent_card_protobuf(message: &[u8]) -> bool {
+    let mut has_identity = false;
+    let mut has_endpoint = false;
+    let Ok(()) = for_each_protobuf_field(message, |field, _wire, value| {
+        match field {
+            AGENT_CARD_PB_NAME | AGENT_CARD_PB_DESCRIPTION => has_identity = true,
+            AGENT_CARD_PB_URL | AGENT_CARD_PB_ADDITIONAL_INTERFACES => has_endpoint = true,
+            _ => {}
+        }
+        let _ = value;
+        Ok(())
+    }) else {
+        return false;
+    };
+    has_identity && has_endpoint
+}
+
+fn rewrite_agent_card_protobuf(
+    message: &[u8],
+    public_base: &str,
+    endpoint_path: &str,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    let preferred_transport = protobuf_string_field(message, AGENT_CARD_PB_PREFERRED_TRANSPORT)?
+        .unwrap_or("");
+    let rewrite_preferred = should_rewrite_transport(if preferred_transport.is_empty() {
+        None
+    } else {
+        Some(preferred_transport)
+    });
+    let new_url = format!("{}{}", public_base.trim_end_matches('/'), endpoint_path);
+    let mut output = Vec::with_capacity(message.len());
+    let mut changed = false;
+    for_each_protobuf_field(message, |field, wire, value| {
+        match (field, wire) {
+            (AGENT_CARD_PB_SIGNATURES, _) => {
+                // Omit signatures from the rebuilt card. If no URL actually
+                // changes, the `changed == false` path discards `output` and
+                // the original signed body is preserved.
+                Ok(())
+            }
+            (AGENT_CARD_PB_URL, PROTO_WIRE_LEN) if rewrite_preferred => {
+                let current = std::str::from_utf8(value)
+                    .map_err(|_| "agent_card_protobuf_url_invalid")?;
+                if current != new_url {
+                    encode_protobuf_string_field(&mut output, AGENT_CARD_PB_URL, &new_url);
+                    changed = true;
+                } else {
+                    encode_protobuf_len_field(&mut output, field, value);
+                }
+                Ok(())
+            }
+            (AGENT_CARD_PB_ADDITIONAL_INTERFACES, PROTO_WIRE_LEN) => {
+                match rewrite_agent_interface_protobuf(value, public_base, endpoint_path)? {
+                    Some(rewritten) => {
+                        encode_protobuf_len_field(
+                            &mut output,
+                            AGENT_CARD_PB_ADDITIONAL_INTERFACES,
+                            &rewritten,
+                        );
+                        changed = true;
+                    }
+                    None => encode_protobuf_len_field(&mut output, field, value),
+                }
+                Ok(())
+            }
+            _ => {
+                encode_protobuf_key_value(&mut output, field, wire, value);
+                Ok(())
+            }
+        }
+    })?;
+    if !changed {
+        return Ok(None);
+    }
+    Ok(Some(output))
+}
+
+fn rewrite_agent_interface_protobuf(
+    message: &[u8],
+    public_base: &str,
+    endpoint_path: &str,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    let transport = protobuf_string_field(message, AGENT_INTERFACE_PB_TRANSPORT)?.unwrap_or("");
+    if !should_rewrite_transport(if transport.is_empty() {
+        None
+    } else {
+        Some(transport)
+    }) {
+        return Ok(None);
+    }
+    let new_url = format!("{}{}", public_base.trim_end_matches('/'), endpoint_path);
+    let mut output = Vec::with_capacity(message.len().saturating_add(new_url.len()));
+    let mut changed = false;
+    for_each_protobuf_field(message, |field, wire, value| {
+        if field == AGENT_INTERFACE_PB_URL && wire == PROTO_WIRE_LEN {
+            let current =
+                std::str::from_utf8(value).map_err(|_| "agent_card_protobuf_url_invalid")?;
+            if current != new_url {
+                encode_protobuf_string_field(&mut output, AGENT_INTERFACE_PB_URL, &new_url);
+                changed = true;
+            } else {
+                encode_protobuf_len_field(&mut output, field, value);
+            }
+        } else {
+            encode_protobuf_key_value(&mut output, field, wire, value);
+        }
+        Ok(())
+    })?;
+    Ok(changed.then_some(output))
+}
+
+fn protobuf_string_field<'a>(
+    message: &'a [u8],
+    target: u32,
+) -> Result<Option<&'a str>, &'static str> {
+    let mut found = None;
+    for_each_protobuf_field(message, |field, wire, value| {
+        if field == target {
+            if wire != PROTO_WIRE_LEN {
+                return Err("agent_card_protobuf_field_wire_mismatch");
+            }
+            found = Some(
+                std::str::from_utf8(value).map_err(|_| "agent_card_protobuf_string_invalid")?,
+            );
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+fn for_each_protobuf_field(
+    mut message: &[u8],
+    mut visit: impl FnMut(u32, u8, &[u8]) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    while !message.is_empty() {
+        let key = decode_varint(&mut message)?;
+        let field = (key >> 3) as u32;
+        let wire = (key & 0x07) as u8;
+        if field == 0 {
+            return Err("agent_card_protobuf_field_invalid");
+        }
+        let value = match wire {
+            PROTO_WIRE_VARINT => {
+                let start = message;
+                let _ = decode_varint(&mut message)?;
+                let consumed = start.len() - message.len();
+                &start[..consumed]
+            }
+            PROTO_WIRE_64BIT => {
+                if message.len() < 8 {
+                    return Err("agent_card_protobuf_truncated");
+                }
+                let (value, rest) = message.split_at(8);
+                message = rest;
+                value
+            }
+            PROTO_WIRE_LEN => {
+                let len = decode_varint(&mut message)? as usize;
+                if message.len() < len {
+                    return Err("agent_card_protobuf_truncated");
+                }
+                let (value, rest) = message.split_at(len);
+                message = rest;
+                value
+            }
+            PROTO_WIRE_32BIT => {
+                if message.len() < 4 {
+                    return Err("agent_card_protobuf_truncated");
+                }
+                let (value, rest) = message.split_at(4);
+                message = rest;
+                value
+            }
+            _ => return Err("agent_card_protobuf_wire_type_unsupported"),
+        };
+        visit(field, wire, value)?;
+    }
+    Ok(())
+}
+
+fn decode_varint(buf: &mut &[u8]) -> Result<u64, &'static str> {
+    let mut result = 0u64;
+    for shift in (0..64).step_by(7) {
+        let Some((&byte, rest)) = buf.split_first() else {
+            return Err("agent_card_protobuf_truncated");
+        };
+        *buf = rest;
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+    }
+    Err("agent_card_protobuf_varint_overflow")
+}
+
+fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn encode_protobuf_key_value(out: &mut Vec<u8>, field: u32, wire: u8, value: &[u8]) {
+    match wire {
+        PROTO_WIRE_LEN => encode_protobuf_len_field(out, field, value),
+        _ => {
+            encode_varint(u64::from(field) << 3 | u64::from(wire), out);
+            out.extend_from_slice(value);
+        }
+    }
+}
+
+fn encode_protobuf_len_field(out: &mut Vec<u8>, field: u32, value: &[u8]) {
+    encode_varint(u64::from(field) << 3 | u64::from(PROTO_WIRE_LEN), out);
+    encode_varint(value.len() as u64, out);
+    out.extend_from_slice(value);
+}
+
+fn encode_protobuf_string_field(out: &mut Vec<u8>, field: u32, value: &str) {
+    encode_protobuf_len_field(out, field, value.as_bytes());
 }
 
 fn rewrite_url_value(value: &mut Value, public_base: &str, path: &str) -> bool {

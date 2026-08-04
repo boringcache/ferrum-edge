@@ -2622,6 +2622,10 @@ pub struct RequestContext {
     pub(crate) a2a_gateway_binding: Option<&'static str>,
     pub(crate) a2a_gateway_is_agent_card: bool,
     pub(crate) a2a_gateway_streaming: bool,
+    /// Fixed diagnostic when unary gRPC Agent Card rewriting fails during the
+    /// transform phase after request-path validation. Consumed by
+    /// `on_final_response_body` to fail closed without reflecting body bytes.
+    pub(crate) a2a_gateway_agent_card_rewrite_error: Option<&'static str>,
     /// Exact upstream/public resource URI pair used to route an MCP
     /// `resources/read` request. Kept out of public metadata so upstream URI
     /// details cannot enter transaction logs, while the response hook can
@@ -3130,6 +3134,7 @@ impl RequestContext {
             a2a_gateway_binding: None,
             a2a_gateway_is_agent_card: false,
             a2a_gateway_streaming: false,
+            a2a_gateway_agent_card_rewrite_error: None,
             mcp_response_resource_binding: None,
             mcp_trusted_tool_name_rewrite: None,
             mcp_validate_tool_result: None,
@@ -4238,6 +4243,7 @@ impl RequestContext {
             a2a_gateway_binding: self.a2a_gateway_binding,
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
             a2a_gateway_streaming: self.a2a_gateway_streaming,
+            a2a_gateway_agent_card_rewrite_error: None,
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
             mcp_validate_tool_result: self.mcp_validate_tool_result.clone(),
@@ -7308,7 +7314,7 @@ pub mod priority {
     /// overrides after generic admission/auth plugins but before final dispatch.
     pub const MCP_GATEWAY: u16 = 2992;
     /// `a2a_gateway`: detects A2A HTTP/REST/gRPC traffic, applies lightweight
-    /// method policy, rewrites HTTP Agent Cards, and emits `a2a.*` metadata.
+    /// method policy, rewrites HTTP and gRPC Agent Cards, and emits `a2a.*` metadata.
     pub const A2A_GATEWAY: u16 = 2993;
     /// `mesh_route_dispatch`: rewrites `route_override_*` on `RequestContext`
     /// based on Istio VirtualService method/header/query-param predicates.

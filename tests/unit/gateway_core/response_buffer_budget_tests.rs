@@ -2273,12 +2273,16 @@ fn a_non_producing_plugin_needs_no_window() {
 // complete would-be replacement outside that window — so a producer that builds
 // its output in full and then copies it through `bounded_vec_from` bypasses the
 // aggregate accounting even though the copy is bounded. These guards pin the
-// eight declared producers to construction-side bounding (GHSA-pwcm-6rh8-f2gh).
+// declared producers to construction-side bounding (GHSA-pwcm-6rh8-f2gh).
 // ---------------------------------------------------------------------------
 
 /// Every declared producer, with the source it is implemented in.
 fn declared_producer_sources() -> Vec<(&'static str, &'static str)> {
     vec![
+        (
+            "a2a_gateway",
+            include_str!("../../../src/plugins/a2a_gateway.rs"),
+        ),
         (
             "ai_response_guard",
             include_str!("../../../src/plugins/ai_response_guard.rs"),
@@ -2398,8 +2402,9 @@ fn no_declared_producer_builds_a_complete_replacement_before_the_bound() {
                 "ceiling.checked_sub(buffer.len())?",
             ],
         ),
-        // The four already-clean producers must stay clean: none of them may
+        // The already-clean producers must stay clean: none of them may
         // acquire a build-then-copy materialisation.
+        ("a2a_gateway", &["bounded_vec_from"]),
         ("ai_tool_governor", &["bounded_vec_from"]),
         ("compression", &["bounded_vec_from"]),
         ("mcp_gateway", &["bounded_vec_from"]),

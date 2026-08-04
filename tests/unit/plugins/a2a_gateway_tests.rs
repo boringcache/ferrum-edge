@@ -1108,6 +1108,503 @@ async fn grpc_get_agent_card_denied_via_pascalcase_policy_alias() {
     );
 }
 
+fn encode_proto_varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn encode_proto_string(field: u32, value: &str, out: &mut Vec<u8>) {
+    encode_proto_varint(u64::from(field) << 3 | 2, out);
+    encode_proto_varint(value.len() as u64, out);
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn encode_proto_bytes(field: u32, value: &[u8], out: &mut Vec<u8>) {
+    encode_proto_varint(u64::from(field) << 3 | 2, out);
+    encode_proto_varint(value.len() as u64, out);
+    out.extend_from_slice(value);
+}
+
+fn encode_agent_interface(url: &str, transport: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_proto_string(1, url, &mut out);
+    encode_proto_string(2, transport, &mut out);
+    out
+}
+
+fn encode_agent_card_signature(protected: &str, signature: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_proto_string(1, protected, &mut out);
+    encode_proto_string(2, signature, &mut out);
+    out
+}
+
+fn encode_a2a_03_agent_card(
+    name: &str,
+    description: &str,
+    url: &str,
+    preferred_transport: &str,
+    interfaces: &[(&str, &str)],
+    protocol_version: &str,
+    with_signature: bool,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_proto_string(1, name, &mut out);
+    encode_proto_string(2, description, &mut out);
+    encode_proto_string(3, url, &mut out);
+    encode_proto_string(14, preferred_transport, &mut out);
+    for (interface_url, transport) in interfaces {
+        encode_proto_bytes(15, &encode_agent_interface(interface_url, transport), &mut out);
+    }
+    encode_proto_string(16, protocol_version, &mut out);
+    if with_signature {
+        encode_proto_bytes(
+            17,
+            &encode_agent_card_signature("eyJhbGciOiJFUzI1NiJ9", "stale"),
+            &mut out,
+        );
+    }
+    out
+}
+
+fn frame_grpc_message(message: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + message.len());
+    frame.push(0);
+    frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    frame.extend_from_slice(message);
+    frame
+}
+
+fn proto_string_field(message: &[u8], target: u32) -> Option<String> {
+    let mut buf = message;
+    while !buf.is_empty() {
+        let mut key = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = *buf.first()?;
+            buf = &buf[1..];
+            key |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        let field = (key >> 3) as u32;
+        let wire = (key & 0x07) as u8;
+        match wire {
+            0 => {
+                for shift in (0..64).step_by(7) {
+                    let byte = *buf.first()?;
+                    buf = &buf[1..];
+                    if byte & 0x80 == 0 {
+                        let _ = shift;
+                        break;
+                    }
+                }
+            }
+            1 => {
+                if buf.len() < 8 {
+                    return None;
+                }
+                buf = &buf[8..];
+            }
+            2 => {
+                let mut len = 0usize;
+                for shift in (0..64).step_by(7) {
+                    let byte = *buf.first()?;
+                    buf = &buf[1..];
+                    len |= usize::from(byte & 0x7f) << shift;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+                if buf.len() < len {
+                    return None;
+                }
+                let (value, rest) = buf.split_at(len);
+                buf = rest;
+                if field == target {
+                    return std::str::from_utf8(value).ok().map(str::to_owned);
+                }
+            }
+            5 => {
+                if buf.len() < 4 {
+                    return None;
+                }
+                buf = &buf[4..];
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn proto_has_field(message: &[u8], target: u32) -> bool {
+    let mut buf = message;
+    while !buf.is_empty() {
+        let mut key = 0u64;
+        for shift in (0..64).step_by(7) {
+            let Some(&byte) = buf.first() else {
+                return false;
+            };
+            buf = &buf[1..];
+            key |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                let _ = shift;
+                break;
+            }
+        }
+        let field = (key >> 3) as u32;
+        let wire = (key & 0x07) as u8;
+        let len = match wire {
+            0 => {
+                for _ in 0..10 {
+                    let Some(&byte) = buf.first() else {
+                        return false;
+                    };
+                    buf = &buf[1..];
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+                0
+            }
+            1 => 8,
+            2 => {
+                let mut len = 0usize;
+                for shift in (0..64).step_by(7) {
+                    let Some(&byte) = buf.first() else {
+                        return false;
+                    };
+                    buf = &buf[1..];
+                    len |= usize::from(byte & 0x7f) << shift;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+                len
+            }
+            5 => 4,
+            _ => return false,
+        };
+        if wire != 0 {
+            if buf.len() < len {
+                return false;
+            }
+            buf = &buf[len..];
+        }
+        if field == target {
+            return true;
+        }
+    }
+    false
+}
+
+fn proto_repeated_messages(message: &[u8], target: u32) -> Vec<Vec<u8>> {
+    let mut found = Vec::new();
+    let mut buf = message;
+    while !buf.is_empty() {
+        let mut key = 0u64;
+        for shift in (0..64).step_by(7) {
+            let Some(&byte) = buf.first() else {
+                return found;
+            };
+            buf = &buf[1..];
+            key |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        let field = (key >> 3) as u32;
+        let wire = (key & 0x07) as u8;
+        match wire {
+            0 => {
+                for _ in 0..10 {
+                    let Some(&byte) = buf.first() else {
+                        return found;
+                    };
+                    buf = &buf[1..];
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+            }
+            1 => {
+                if buf.len() < 8 {
+                    return found;
+                }
+                buf = &buf[8..];
+            }
+            2 => {
+                let mut len = 0usize;
+                for shift in (0..64).step_by(7) {
+                    let Some(&byte) = buf.first() else {
+                        return found;
+                    };
+                    buf = &buf[1..];
+                    len |= usize::from(byte & 0x7f) << shift;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+                if buf.len() < len {
+                    return found;
+                }
+                let (value, rest) = buf.split_at(len);
+                buf = rest;
+                if field == target {
+                    found.push(value.to_vec());
+                }
+            }
+            5 => {
+                if buf.len() < 4 {
+                    return found;
+                }
+                buf = &buf[4..];
+            }
+            _ => return found,
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn grpc_agent_card_response_rewrites_jsonrpc_urls() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("GetExtendedAgentCard", "application/grpc");
+    headers.insert("grpc-accept-encoding".to_string(), "gzip".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(!headers.contains_key("grpc-accept-encoding"));
+
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/grpc",
+        "GRPC",
+        &[
+            ("https://planner.internal/a2a", "JSONRPC"),
+            ("https://planner.internal/grpc", "GRPC"),
+        ],
+        "0.3.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("rewritten grpc agent card frame");
+    assert_eq!(rewritten[0], 0);
+    let msg_len = u32::from_be_bytes([rewritten[1], rewritten[2], rewritten[3], rewritten[4]])
+        as usize;
+    assert_eq!(rewritten.len(), 5 + msg_len);
+    let message = &rewritten[5..];
+    assert_eq!(
+        proto_string_field(message, 3).as_deref(),
+        Some("https://planner.internal/grpc")
+    );
+    let interfaces = proto_repeated_messages(message, 15);
+    assert_eq!(interfaces.len(), 2);
+    assert_eq!(
+        proto_string_field(&interfaces[0], 1).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+    assert_eq!(
+        proto_string_field(&interfaces[1], 1).as_deref(),
+        Some("https://planner.internal/grpc")
+    );
+    assert!(!proto_has_field(message, 17));
+    plugin.on_response_body_transformed(&mut ctx, &mut response_headers);
+    assert!(!response_headers.contains_key("content-length"));
+    assert!(!response_headers.contains_key("grpc-encoding"));
+}
+
+#[tokio::test]
+async fn grpc_agent_card_unsupported_version_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("GetAgentCard", "application/grpc");
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        "1.0.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    let PluginResult::Reject {
+        status_code,
+        headers: reject_headers,
+        ..
+    } = result
+    else {
+        panic!("unsupported protobuf version must fail closed");
+    };
+    assert_eq!(status_code, 500);
+    assert_eq!(
+        reject_headers.get("grpc-status").map(String::as_str),
+        Some("13")
+    );
+    assert_eq!(
+        reject_headers.get("grpc-message").map(String::as_str),
+        Some("unsupported_agent_card_protobuf_version")
+    );
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("unsupported_agent_card_protobuf_version")
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_malformed_frame_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("GetExtendedAgentCard", "application/grpc");
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &[0x00, 0x00, 0x00])
+        .await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 500,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("agent_card_grpc_frame_malformed")
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_without_public_base_is_not_rewritten() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "rewrite_agent_card_urls": true,
+            "trust_forwarded_headers": false
+        }
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("GetExtendedAgentCard", "application/grpc");
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        "0.3.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_preferred_jsonrpc_url_is_rewritten() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("GetExtendedAgentCard", "application/grpc");
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[],
+        "0.3.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("preferred jsonrpc url should rewrite");
+    let message = &rewritten[5..];
+    assert_eq!(
+        proto_string_field(message, 3).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+    assert!(!proto_has_field(message, 17));
+}
+
 #[tokio::test]
 async fn grpc_web_content_type_is_not_detected_as_native_grpc() {
     let plugin = plugin(json!({}));
