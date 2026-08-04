@@ -10186,7 +10186,7 @@ pub const REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT: &[&str] = &[
 /// reads the `grpc.descriptor_path` `FileDescriptorSet`, while its request-body
 /// answer is the trait default and never depends on that file.
 pub const REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY: &[&str] =
-    &["ai_response_guard", "body_validator"];
+    &["ai_response_guard", "ai_transcript_audit", "body_validator"];
 
 /// Why the request-body-buffering screen could not evaluate a plugin config.
 ///

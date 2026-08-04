@@ -682,6 +682,7 @@ fn accepted_config_key_sets_are_exported_for_schema_parity() {
             "limits",
             "privacy",
             "sink",
+            "grpc",
         ]
     );
     assert_eq!(
