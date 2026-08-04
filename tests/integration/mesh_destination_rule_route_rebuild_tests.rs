@@ -214,6 +214,11 @@ fn destination_rule(idle_ms: Option<u64>, tls_sni: Option<&str>) -> MeshDestinat
         }),
         port_level_settings: HashMap::new(),
         subsets: Vec::new(),
+        // Mesh-wide, matching the Kubernetes translator's default for an
+        // omitted `spec.exportTo`. This fixture pre-dates export visibility, so
+        // an empty list here would make the rule namespace-local on the native
+        // carrier and silently change what this route-rebuild test exercises.
+        export_to: vec!["*".to_string()],
     }
 }
 
