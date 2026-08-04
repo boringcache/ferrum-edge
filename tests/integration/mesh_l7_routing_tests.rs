@@ -2845,10 +2845,14 @@ fn mesh_l4_virtual_service_caps_candidate_proxies_before_projection() {
 
     // Namespace-local export keeps the projection product equal to the
     // candidate count so this test cannot accidentally trip the product cap.
-    assert!(
-        MAX_L4_CANDIDATE_PROXIES <= MAX_PROJECTED_L4_PROXIES,
-        "candidate ceiling must fit under the projection backstop for this fixture"
-    );
+    // Both operands are constants, so this is a compile-time assertion; a
+    // plain runtime `assert!` trips `clippy::assertions_on_constants`.
+    const {
+        assert!(
+            MAX_L4_CANDIDATE_PROXIES <= MAX_PROJECTED_L4_PROXIES,
+            "candidate ceiling must fit under the projection backstop for this fixture"
+        );
+    }
 
     let at_cap_matches: Vec<Value> = (0..MAX_L4_CANDIDATE_PROXIES)
         .map(|index| {
