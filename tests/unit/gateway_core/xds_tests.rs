@@ -576,8 +576,8 @@ fn translator_emits_labels_carrier_when_slice_has_no_extension_configs() {
     assert_eq!(
         names,
         vec![
-            "ferrum-mesh-carrier/workload-labels",
             "ferrum-mesh-carrier/istio-root-namespace",
+            "ferrum-mesh-carrier/workload-labels",
         ]
     );
 }
