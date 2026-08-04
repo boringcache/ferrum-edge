@@ -112,6 +112,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gateway scope defaults to the reserved `mesh` token; named-gateway data
   planes set `FERRUM_STREAM_GATEWAY_REF`. Existing SNI/port routing and
   weighted-split fail-closed behavior are preserved.
+- `ai_stream_router` now implements the `google_gemini` provider adapter
+  (issue #3299): OpenAI Chat Completions streaming requests are translated to
+  Gemini/`streamGenerateContent` (Vertex-compatible) bodies, native SSE and
+  JSON array/object response streams are normalized to OpenAI
+  `chat.completion.chunk` SSE (content/role deltas, multi-candidate indexes,
+  finish/safety/usage, function calls, bounded provider errors), and
+  malformed/oversized/unrepresentable frames fail closed under the existing
+  stream bounds without logging credentials or oversized payloads.
 
 - Audited admin mutations are durable **before they run** (issue #2421).
   The admin write gate fsyncs a pre-mutation audit intent — a stable event id

@@ -261,7 +261,7 @@ pub struct RedpandaContainer {
 }
 
 /// Bind an ephemeral localhost TCP port for a deterministic host→container map.
-fn free_localhost_port() -> Result<u16, BoxError> {
+pub fn free_localhost_port() -> Result<u16, BoxError> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     drop(listener);

@@ -109,6 +109,7 @@ fn update_for(slice: &MeshSlice) -> MeshConfigUpdate {
             .revision
             .as_ref()
             .map_or(0, |revision| revision.sequence),
+        session_token: "test-session".to_string(),
     }
 }
 
@@ -1391,6 +1392,15 @@ impl MeshConfigSync for ScriptedMeshCp {
         let held_open = tokio_stream::pending::<Result<MeshConfigUpdate, Status>>();
         let stream: Self::MeshSubscribeStream = Box::pin(scripted.chain(held_open));
         Ok(Response::new(stream))
+    }
+
+    async fn report_mesh_slice_status(
+        &self,
+        _request: Request<ferrum_edge::grpc::proto::MeshSliceStatusReport>,
+    ) -> Result<Response<ferrum_edge::grpc::proto::MeshSliceStatusResponse>, Status> {
+        Ok(Response::new(
+            ferrum_edge::grpc::proto::MeshSliceStatusResponse {},
+        ))
     }
 }
 

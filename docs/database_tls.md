@@ -26,6 +26,8 @@ Ferrum Edge uses one database TLS env family for every database backend that has
 
 When `FERRUM_DB_TLS_MODE` is unset, Ferrum does not add or force database TLS settings. For production network databases, set `FERRUM_DB_TLS_MODE=verify-full` and provide the CA bundle needed to validate the database server certificate.
 
+Under enforced FIPS mode (`FERRUM_FIPS_MODE=enforce`), a PostgreSQL or MySQL config database may not be reached over an unauthenticated connection. An explicitly configured `FERRUM_DB_TLS_MODE` of `disable`, `allow`, `prefer`, or `require` refuses startup, because none of those modes validate the server certificate chain; only `verify-ca` and `verify-full` are admitted. See [FIPS mode](fips.md) for the full admission boundary.
+
 For PostgreSQL and MySQL mTLS, `FERRUM_DB_TLS_CLIENT_CERT_PATH` and `FERRUM_DB_TLS_CLIENT_KEY_PATH` must be set together. For MongoDB, `FERRUM_DB_TLS_CLIENT_CERT_PATH` may point to an already-combined client cert+key PEM when `FERRUM_DB_TLS_CLIENT_KEY_PATH` is omitted.
 
 For PostgreSQL and MySQL, Ferrum appends TLS query parameters to `FERRUM_DB_URL`, `FERRUM_DB_READ_REPLICA_URL`, and each URL in `FERRUM_DB_FAILOVER_URLS`. For MongoDB, Ferrum configures the MongoDB driver `TlsOptions`; MongoDB URI TLS options can also be used directly.

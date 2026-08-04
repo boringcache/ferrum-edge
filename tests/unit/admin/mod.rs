@@ -18,6 +18,7 @@ mod api_specs_server_base_path_tests;
 mod api_specs_yaml_alias_budget_tests;
 mod audit_pipeline_tests;
 mod mesh_remote_clusters_tests;
+mod mesh_slice_drift_tests;
 mod openapi_validator_generated_config_contract_tests;
 mod plugin_config_projection_tests;
 mod tls_managed_kind_overwrite_tests;
