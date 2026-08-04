@@ -3109,18 +3109,19 @@ pub fn append_local_fallback_event(dir: &Path, event: &AuditEvent) -> Result<(),
     } else {
         None
     };
-    write_local_fallback_events_unlocked(dir, &path, &events)?;
-    if let Some(overflow) = evicted {
-        // Report eviction only after atomic publication succeeds. A failed
-        // write leaves the live file unchanged and must not claim that its
-        // oldest records were dropped. Counts only — never event contents.
-        warn!(
-            surface = "audit_local_fallback_evicted",
-            evicted = overflow,
-            retained = AUDIT_LOCAL_FALLBACK_CAPACITY,
-            "Local audit fallback store is at capacity; oldest security records were dropped"
-        );
-    }
+    write_local_fallback_events_unlocked(dir, &path, &events, || {
+        if let Some(overflow) = evicted {
+            // The callback runs immediately after atomic publication, before
+            // fallible post-publication durability and permission steps.
+            // Counts only — never event contents.
+            warn!(
+                surface = "audit_local_fallback_evicted",
+                evicted = overflow,
+                retained = AUDIT_LOCAL_FALLBACK_CAPACITY,
+                "Local audit fallback store is at capacity; oldest security records were dropped"
+            );
+        }
+    })?;
     Ok(())
 }
 
@@ -3480,6 +3481,7 @@ fn write_local_fallback_events_unlocked(
     dir: &Path,
     path: &Path,
     events: &[AuditEvent],
+    on_published: impl FnOnce(),
 ) -> Result<(), anyhow::Error> {
     let body = serde_json::to_vec_pretty(events)?;
     if body.len() > AUDIT_LOCAL_FALLBACK_MAX_BYTES {
@@ -3500,6 +3502,7 @@ fn write_local_fallback_events_unlocked(
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
+    on_published();
     sync_directory(dir)?;
     #[cfg(unix)]
     {
