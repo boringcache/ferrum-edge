@@ -115,6 +115,8 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -180,6 +182,7 @@ fn create_test_mesh_config() -> GatewayConfig {
                 namespace: Some("ferrum".to_string()),
             },
             service_name: "api".to_string(),
+            service_namespace: None,
             addresses: Vec::new(),
             ports: vec![WorkloadPort {
                 port: 8080,

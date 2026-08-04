@@ -433,6 +433,10 @@ pub struct AdminState {
     /// `ProxyState` (e.g. control plane), so CP-accepted configs match what data
     /// planes will accept.
     pub backend_allow_ips: crate::config::BackendEgressPolicy,
+    /// Process-level OpenAPI external `$ref` gate and budgets (from EnvConfig).
+    pub external_ref_policy: std::sync::Arc<crate::admin::api_specs::ExternalRefProcessPolicy>,
+    /// Loader used when external `$ref` resolution is effectively enabled.
+    pub external_ref_loader: std::sync::Arc<crate::admin::api_specs::DefaultExternalDocumentLoader>,
 }
 
 impl AdminState {

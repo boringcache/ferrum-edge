@@ -1,12 +1,16 @@
-//! `ferrum-cni` — minimal CNI plugin that forwards each ADD / DEL / CHECK
-//! invocation to the long-lived node-agent over a Unix domain socket.
+//! `ferrum-cni` — minimal CNI plugin that forwards each ADD / DEL / CHECK /
+//! STATUS / GC invocation to the long-lived node-agent over a Unix domain
+//! socket.
 //!
 //! Wire contract: kubelet invokes us per the CNI spec with stdin JSON
 //! (the chained network configuration) and the `CNI_*` environment
 //! variables (command verb, container id, netns path, args, plugin
 //! search path). We parse those, extract the K8s pod identity from
-//! `CNI_ARGS`, send a [`CniRpcRequest`] to the node-agent, and
-//! translate the response back into CNI-spec JSON on stdout.
+//! `CNI_ARGS` (for attachment verbs), send a [`CniRpcRequest`] to the
+//! node-agent, and translate the response back into CNI-spec JSON on
+//! stdout. STATUS probes node-agent readiness without attachment fields.
+//! GC carries a bounded `cni.dev/attachments` valid set instead of a
+//! single pod identity.
 //!
 //! Why this is in `src/bin/` and not its own crate:
 //! - The CNI binary needs the same `cni::spec` / `cni::rpc` /
@@ -24,7 +28,7 @@
 
 #[cfg(unix)]
 mod cni_main {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::process::ExitCode;
     use std::time::Duration;
 
@@ -33,7 +37,10 @@ mod cni_main {
     use ferrum_edge::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
     use ferrum_edge::cni::spec::{
         CniCommand, CniError, CniInvocation, CniNetConfig, CniSuccessResult, K8sPodIdentity,
-        build_error_result, parse_cni_args,
+        MAX_CNI_ATTACHMENT_FIELD_BYTES, MAX_CNI_STDIN_BYTES, SUPPORTED_CNI_VERSIONS,
+        build_error_result, cni_version_supports_gc, cni_version_supports_status, ingest_cni_args,
+        ingest_valid_attachments, is_safe_cni_container_id, is_safe_cni_netns_path,
+        is_safe_cni_network_name, is_supported_cni_version, read_stdin_bounded,
     };
 
     /// Default socket path the binary connects to when the chained CNI
@@ -61,7 +68,11 @@ mod cni_main {
         }
 
         let command = match CniInvocation::command_from_env() {
-            Ok(CniCommand::Version) => return emit_version("0.4.0"),
+            Ok(CniCommand::Version) => {
+                // VERSION may arrive without stdin; advertise the full
+                // supported set including CNI 1.1.0 (STATUS + GC).
+                return emit_version("1.1.0");
+            }
             Ok(CniCommand::Unsupported) => {
                 return emit_error("0.4.0", &CniError::UnsupportedCommand);
             }
@@ -69,15 +80,39 @@ mod cni_main {
             Err(err) => return emit_error("0.4.0", &err),
         };
 
-        let mut stdin_buf = String::new();
-        if let Err(err) = std::io::stdin().read_to_string(&mut stdin_buf) {
-            return emit_error("0.4.0", &CniError::BadConfig(format!("read stdin: {err}")));
+        let stdin_buf = match read_stdin_bounded(MAX_CNI_STDIN_BYTES) {
+            Ok(buf) => buf,
+            Err(err) => return emit_error("0.4.0", &err),
+        };
+        if ferrum_edge::util::json_dup_keys::str_ambiguity(&stdin_buf).is_some() {
+            return emit_error(
+                "0.4.0",
+                &CniError::BadConfig("ambiguous CNI configuration JSON".to_string()),
+            );
         }
         let net_config: CniNetConfig = match serde_json::from_str(&stdin_buf) {
             Ok(cfg) => cfg,
             Err(err) => return emit_error("0.4.0", &CniError::BadConfig(err.to_string())),
         };
         let cni_version = net_config.cni_version.clone();
+
+        if !is_supported_cni_version(&cni_version) {
+            return emit_error(&cni_version, &CniError::UnsupportedVersion);
+        }
+        if !is_safe_cni_network_name(&net_config.name) {
+            return emit_error(
+                &cni_version,
+                &CniError::BadConfig("invalid CNI network name".to_string()),
+            );
+        }
+        if net_config.plugin_type.len() > MAX_CNI_ATTACHMENT_FIELD_BYTES
+            || !is_safe_cni_container_id(&net_config.plugin_type)
+        {
+            return emit_error(
+                &cni_version,
+                &CniError::BadConfig("invalid CNI plugin type".to_string()),
+            );
+        }
 
         let invocation = match CniInvocation::from_env_for_command(command) {
             Ok(inv) => inv,
@@ -87,9 +122,151 @@ mod cni_main {
         match invocation.command {
             CniCommand::Version => emit_version(&cni_version),
             CniCommand::Unsupported => emit_error(&cni_version, &CniError::UnsupportedCommand),
+            CniCommand::Status => handle_status(&net_config),
+            CniCommand::Gc => handle_gc(&net_config),
             verb @ (CniCommand::Add | CniCommand::Del | CniCommand::Check) => {
                 handle_verb(verb, &net_config, &invocation)
             }
+        }
+    }
+
+    fn handle_status(net_config: &CniNetConfig) -> ExitCode {
+        let cni_version = net_config.cni_version.clone();
+        if !cni_version_supports_status(&cni_version) {
+            // Fail closed: older negotiated versions keep ADD/DEL/CHECK only.
+            return emit_error(&cni_version, &CniError::UnsupportedVersion);
+        }
+
+        // STATUS is readiness-only. Attachment-specific reserved fields are
+        // protocol-malformed for this verb.
+        if net_config.valid_attachments.is_some() {
+            return emit_error(
+                &cni_version,
+                &CniError::BadConfig(
+                    "STATUS request must not carry cni.dev/attachments".to_string(),
+                ),
+            );
+        }
+        if net_config
+            .extra
+            .keys()
+            .any(|key| key.starts_with("cni.dev/"))
+        {
+            return emit_error(
+                &cni_version,
+                &CniError::BadConfig(
+                    "unsupported reserved cni.dev/ field in STATUS request".to_string(),
+                ),
+            );
+        }
+
+        let socket_path = match cni_socket_path(net_config) {
+            Ok(path) => path,
+            Err(err) => return emit_error(&cni_version, &err),
+        };
+
+        let request = CniRpcRequest {
+            verb: RpcVerb::Status,
+            network_name: net_config.name.clone(),
+            pod_namespace: String::new(),
+            pod_name: String::new(),
+            pod_uid: None,
+            container_id: String::new(),
+            ifname: None,
+            netns_path: None,
+            args: Default::default(),
+            valid_attachments: Vec::new(),
+        };
+
+        if let Err(reason) = request.validate() {
+            return emit_error(&cni_version, &CniError::BadConfig(reason));
+        }
+
+        match send_rpc(&socket_path, &request, rpc_timeout()) {
+            // SPEC: STATUS success is exit 0 with no required stdout payload.
+            Ok(CniRpcResponse::Ok) => emit_empty_success(),
+            Ok(CniRpcResponse::Rejected { .. }) | Ok(CniRpcResponse::Error { .. }) => {
+                // Do not echo node-agent reason strings that could carry
+                // hostile input; STATUS only needs the availability code.
+                emit_error(
+                    &cni_version,
+                    &CniError::NotAvailable("node-agent is not ready".to_string()),
+                )
+            }
+            Err(_) => {
+                // Socket missing / connect / framing failure: the dependency
+                // daemon is unavailable for ADD. Avoid echoing socket paths
+                // or raw IO detail into the CNI error msg.
+                emit_error(
+                    &cni_version,
+                    &CniError::NotAvailable("node-agent is unavailable".to_string()),
+                )
+            }
+        }
+    }
+
+    fn handle_gc(net_config: &CniNetConfig) -> ExitCode {
+        let cni_version = net_config.cni_version.clone();
+        if !cni_version_supports_gc(&cni_version) {
+            // Fail closed: older negotiated versions keep ADD/DEL/CHECK only.
+            return emit_error(&cni_version, &CniError::UnsupportedVersion);
+        }
+
+        if net_config
+            .extra
+            .keys()
+            .any(|key| key.starts_with("cni.dev/"))
+        {
+            return emit_error(
+                &cni_version,
+                &CniError::BadConfig(
+                    "unsupported reserved cni.dev/ field in GC request".to_string(),
+                ),
+            );
+        }
+        let Some(runtime_attachments) = net_config.valid_attachments.clone() else {
+            return emit_error(
+                &cni_version,
+                &CniError::BadConfig("GC request is missing cni.dev/attachments".to_string()),
+            );
+        };
+        let valid_attachments = match ingest_valid_attachments(runtime_attachments) {
+            Ok(attachments) => attachments,
+            Err(err) => return emit_error(&cni_version, &err),
+        };
+
+        let socket_path = match cni_socket_path(net_config) {
+            Ok(path) => path,
+            Err(err) => return emit_error(&cni_version, &err),
+        };
+
+        let request = CniRpcRequest {
+            verb: RpcVerb::Gc,
+            network_name: net_config.name.clone(),
+            pod_namespace: String::new(),
+            pod_name: String::new(),
+            pod_uid: None,
+            container_id: String::new(),
+            ifname: None,
+            netns_path: None,
+            args: Default::default(),
+            valid_attachments,
+        };
+
+        if let Err(reason) = request.validate() {
+            return emit_error(&cni_version, &CniError::BadConfig(reason));
+        }
+
+        match send_rpc(&socket_path, &request, rpc_timeout()) {
+            // SPEC: GC success emits no stdout payload.
+            Ok(CniRpcResponse::Ok) => emit_empty_success(),
+            Ok(CniRpcResponse::Rejected { reason }) => {
+                emit_error(&cni_version, &CniError::Rejected(reason))
+            }
+            Ok(CniRpcResponse::Error { reason }) => {
+                emit_error(&cni_version, &CniError::IpcFailed(reason))
+            }
+            Err(err) => emit_error(&cni_version, &err),
         }
     }
 
@@ -99,11 +276,13 @@ mod cni_main {
         invocation: &CniInvocation,
     ) -> ExitCode {
         let cni_version = net_config.cni_version.clone();
-        let args_map = invocation
-            .args
-            .as_deref()
-            .map(parse_cni_args)
-            .unwrap_or_default();
+        let args_map = match invocation.args.as_deref() {
+            Some(raw) => match ingest_cni_args(raw) {
+                Ok(args) => args,
+                Err(err) => return emit_error(&cni_version, &err),
+            },
+            None => Default::default(),
+        };
         let identity = match K8sPodIdentity::from_args(&args_map) {
             Some(id) => id,
             None => {
@@ -123,21 +302,27 @@ mod cni_main {
             _ => return emit_error(&cni_version, &CniError::UnsupportedCommand),
         };
 
-        let socket_path = net_config
-            .ferrum
-            .as_ref()
-            .and_then(|f| f.socket_path.clone())
-            .unwrap_or_else(|| DEFAULT_CNI_SOCKET_PATH.to_string());
+        let socket_path = match cni_socket_path(net_config) {
+            Ok(path) => path,
+            Err(err) => return emit_error(&cni_version, &err),
+        };
 
         let request = CniRpcRequest {
             verb,
+            network_name: net_config.name.clone(),
             pod_namespace: identity.namespace,
             pod_name: identity.name,
             pod_uid: identity.pod_uid,
             container_id: invocation.container_id.clone(),
+            ifname: invocation.ifname.clone(),
             netns_path: invocation.netns.clone(),
             args: args_map,
+            valid_attachments: Vec::new(),
         };
+
+        if let Err(reason) = request.validate() {
+            return emit_error(&cni_version, &CniError::BadConfig(reason));
+        }
 
         match send_rpc(&socket_path, &request, rpc_timeout()) {
             Ok(CniRpcResponse::Ok) => match command {
@@ -153,7 +338,7 @@ mod cni_main {
                 }
             }
             Ok(CniRpcResponse::Error { reason }) => {
-                emit_error(&cni_version, &CniError::Rejected(reason))
+                emit_error(&cni_version, &CniError::IpcFailed(reason))
             }
             Err(err) => emit_error(&cni_version, &err),
         }
@@ -163,10 +348,24 @@ mod cni_main {
         DEFAULT_RPC_TIMEOUT
     }
 
+    fn cni_socket_path(net_config: &CniNetConfig) -> Result<String, CniError> {
+        let path = net_config
+            .ferrum
+            .as_ref()
+            .and_then(|f| f.socket_path.clone())
+            .unwrap_or_else(|| DEFAULT_CNI_SOCKET_PATH.to_string());
+        if !is_safe_cni_netns_path(&path) {
+            return Err(CniError::BadConfig(
+                "invalid Ferrum CNI socket path".to_string(),
+            ));
+        }
+        Ok(path)
+    }
+
     fn emit_version(cni_version: &str) -> ExitCode {
         let payload = serde_json::json!({
             "cniVersion": cni_version,
-            "supportedVersions": ["0.3.0", "0.3.1", "0.4.0", "1.0.0"],
+            "supportedVersions": SUPPORTED_CNI_VERSIONS,
         });
         write_stdout(&payload);
         ExitCode::SUCCESS

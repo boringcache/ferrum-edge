@@ -558,6 +558,60 @@ async fn test_non_post_continues() {
 }
 
 #[tokio::test]
+async fn test_claim_preserves_final_body_buffering_after_content_type_relabel() {
+    let plugin = build(openai_and_anthropic_config());
+
+    // Unclaimed non-JSON POST must not select buffering.
+    let mut unclaimed_plain = post_ctx(&json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "messages": []
+    }));
+    unclaimed_plain
+        .headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    assert!(
+        !ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(&unclaimed_plain),
+        "fixture must stay unclaimed"
+    );
+    assert!(
+        !plugin.should_buffer_request_body(&unclaimed_plain),
+        "unclaimed text/plain must not request buffering"
+    );
+
+    // Claim a valid streaming JSON request, then relabel as a later
+    // request_transformer would before the dispatcher recomputes requirements.
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(&ctx));
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "claimed JSON requests must buffer before relabel"
+    );
+
+    ctx.headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "private claim must keep buffering after Content-Type relabel"
+    );
+    assert!(plugin.needs_final_request_body_context());
+
+    // Mirror `final_request_body_requirements` for a contextual final hook.
+    let requires_buffering = plugin.should_buffer_request_body(&ctx);
+    let needs_final_context = requires_buffering && plugin.needs_final_request_body_context();
+    assert!(
+        requires_buffering && needs_final_context,
+        "recomputed final-body requirements must keep buffering and RequestContext"
+    );
+}
+
+#[tokio::test]
 async fn test_streaming_missing_model_rejects_by_default() {
     let plugin = build(openai_and_anthropic_config());
     let body = json!({"stream": true, "messages": [{"role": "user", "content": "hi"}]});
@@ -3314,13 +3368,69 @@ async fn test_gzip_streaming_decode_rejects_expansion_over_limit() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("bounded decoding inspector");
-    let oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
+    // Incompressible payload so the absolute per-layer ceiling trips before the
+    // 1024:1 amplification ratio (highly compressible zeros would hit ratio first).
+    let mut oversized = vec![0u8; 8 * 1024 * 1024 + 1];
+    for (i, byte) in oversized.iter_mut().enumerate() {
+        *byte = (i % 251) as u8;
+    }
     let encoded = gzip_bytes(&oversized);
     let mut collected = forwarded(inspector.on_chunk(&encoded).await);
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
     assert!(out.contains("upstream_error"));
-    assert!(out.contains("decoded content exceeds"));
+    assert!(
+        out.contains("amplification limit exceeded") || out.contains("size limit exceeded"),
+        "absolute or ratio bound must fail closed: {out}"
+    );
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
+}
+
+#[tokio::test]
+async fn test_gzip_streaming_decode_rejects_amplification_bomb() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("bounded decoding inspector");
+    // Keep the decoded fixture at (not above) the absolute 8 MiB layer ceiling,
+    // while its gzip representation crosses the independent 1024:1 ratio. A
+    // 2 MiB zero buffer is only about 1015:1 with the hosted miniz backend, so
+    // it never exercises the amplification guard and made this test fail on its
+    // own precondition before reaching production code.
+    let zeros = vec![0u8; 8 * 1024 * 1024];
+    let encoded = gzip_bytes(&zeros);
+    assert!(
+        encoded
+            .len()
+            .checked_mul(1024)
+            .is_some_and(|limit| limit < zeros.len()),
+        "fixture must exceed the 1024:1 amplification ratio (compressed={})",
+        encoded.len()
+    );
+    let mid = forwarded(inspector.on_chunk(&encoded).await);
+    assert!(
+        mid.is_empty(),
+        "encoded frames must not be forwarded before decode completes"
+    );
+    let out = String::from_utf8(forwarded(inspector.on_end().await)).unwrap();
+    assert!(out.contains("upstream_error"));
+    assert!(
+        out.contains("amplification limit exceeded"),
+        "compression bomb must trip the shared ratio bound: {out}"
+    );
     assert_eq!(out.matches("data: [DONE]").count(), 1);
 }
 
@@ -3361,7 +3471,14 @@ async fn test_brotli_encoded_buffered_anthropic_sse_is_normalized() {
 async fn test_unsupported_content_encoding_is_rejected() {
     let plugin = build(openai_and_anthropic_config());
     let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
-    for encoding in ["zstd", "gzip,", "gzip; q=1", "gzip, br"] {
+    for encoding in [
+        "zstd",
+        "deflate",
+        "gzip,",
+        "gzip; q=1",
+        "gzip, identity",
+        "gzip, br, gzip, br, gzip",
+    ] {
         let mut ctx = post_ctx(&claude);
         let mut req_headers = json_headers();
         plugin.before_proxy(&mut ctx, &mut req_headers).await;
@@ -3375,7 +3492,312 @@ async fn test_unsupported_content_encoding_is_rejected() {
             Some(502),
             "{encoding} must fail closed"
         );
+        if let PluginResult::Reject { body, .. } = &reject {
+            assert!(
+                !body.contains(encoding),
+                "rejection must not echo the raw Content-Encoding member: {body}"
+            );
+            assert!(
+                body.contains("unsupported Content-Encoding")
+                    || body.contains("malformed Content-Encoding")
+                    || body.contains("identity Content-Encoding")
+                    || body.contains("coding layer"),
+                "rejection must stay on fixed diagnostic categories: {body}"
+            );
+        }
     }
+}
+
+#[tokio::test]
+async fn test_hostile_content_encoding_diagnostics_never_echo_raw_members() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    // Adversarial long / credential-like members that must never reach clients.
+    let sentinel = format!(
+        "sk-live-{}{}",
+        "A".repeat(512),
+        "-Bearer-eyJhbGciOiJIUzI1NiJ9.payload.sig"
+    );
+    let adversarial = [
+        sentinel.as_str(),
+        "gzip; password=hunter2",
+        "!!!not-a-token!!!",
+        "zstd",
+    ];
+
+    for encoding in adversarial {
+        let mut ctx = post_ctx(&claude);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        resp_headers.insert("content-encoding".to_string(), encoding.to_string());
+        let reject = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        let PluginResult::Reject { body, .. } = reject else {
+            panic!("hostile encoding must reject: {encoding}");
+        };
+        assert!(
+            !body.contains(&sentinel)
+                && !body.contains("sk-live-")
+                && !body.contains("hunter2")
+                && !body.contains("password=")
+                && !body.contains("!!!not-a-token!!!")
+                && !body.contains("zstd")
+                && !body.contains(encoding),
+            "client 502 must not echo hostile Content-Encoding text: {body}"
+        );
+
+        // Forged metadata path: ImmediateUpstreamErrorNormalizer must also redact.
+        let mut forged = post_ctx(&claude);
+        let mut headers = json_headers();
+        plugin.before_proxy(&mut forged, &mut headers).await;
+        forged.metadata.insert(
+            "ai_stream_router.provider_content_encoding".to_string(),
+            encoding.to_string(),
+        );
+        let mut inspector = plugin
+            .response_stream_inspector(&forged, 200, Some("text/event-stream"))
+            .expect("fail-closed inspector");
+        let frame = String::from_utf8(forwarded(
+            inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await,
+        ))
+        .unwrap();
+        assert!(frame.contains("upstream_error"), "{frame}");
+        assert!(
+            !frame.contains(&sentinel)
+                && !frame.contains("sk-live-")
+                && !frame.contains("hunter2")
+                && !frame.contains("password=")
+                && !frame.contains("!!!not-a-token!!!")
+                && !frame.contains("zstd")
+                && !frame.contains(encoding),
+            "normalization error frame must not echo hostile encoding text: {frame}"
+        );
+        assert!(!frame.contains("\"content\":\"Hello\""));
+    }
+}
+
+#[tokio::test]
+async fn test_layered_gzip_br_chain_is_decoded_in_reverse_order() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    // Application order: gzip then br → decode br, then gzip.
+    resp_headers.insert("content-encoding".to_string(), "gzip, br".to_string());
+    resp_headers.insert("content-length".to_string(), "999".to_string());
+    resp_headers.insert("etag".to_string(), "\"encoded\"".to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router.provider_content_encoding")
+            .map(String::as_str),
+        Some("gzip, br")
+    );
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert!(!resp_headers.contains_key("content-length"));
+    assert!(!resp_headers.contains_key("etag"));
+
+    let layered = brotli_bytes(&gzip_bytes(ANTHROPIC_SSE.as_bytes()));
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("chain decoding inspector");
+    let held = forwarded(inspector.on_chunk(&layered).await);
+    assert!(held.is_empty(), "must not forward encoded chain frames");
+    let out = String::from_utf8(forwarded(inspector.on_end().await)).unwrap();
+    assert!(out.contains("\"content\":\"Hello\""));
+    assert!(out.trim_end().ends_with("data: [DONE]"));
+    assert!(!out.contains("upstream_error"));
+}
+
+#[tokio::test]
+async fn test_content_encoding_ows_case_and_x_gzip_are_normalized() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    resp_headers.insert(
+        "content-encoding".to_string(),
+        "  X-GZip ,  Br  ".to_string(),
+    );
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router.provider_content_encoding")
+            .map(String::as_str),
+        Some("gzip, br")
+    );
+
+    let layered = brotli_bytes(&gzip_bytes(ANTHROPIC_SSE.as_bytes()));
+    let buffered = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            &layered,
+            Some("text/event-stream"),
+            &resp_headers,
+        )
+        .await
+        .expect("ows/case chain decode+normalize");
+    let out = String::from_utf8(buffered).unwrap();
+    assert!(out.contains("chat.completion.chunk"));
+    assert!(out.contains("\"content\":\"Hello\""));
+}
+
+#[tokio::test]
+async fn test_malformed_middle_layer_in_chain_fails_closed() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    resp_headers.insert("content-encoding".to_string(), "gzip, br".to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+
+    // Outer layer claims br over gzip-compressed SSE, but the bytes are raw
+    // gzip — brotli decode of the outer layer must fail closed.
+    let truncated_chain = gzip_bytes(ANTHROPIC_SSE.as_bytes());
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("chain decoding inspector");
+    assert!(forwarded(inspector.on_chunk(&truncated_chain).await).is_empty());
+    let out = String::from_utf8(forwarded(inspector.on_end().await)).unwrap();
+    assert!(out.contains("upstream_error"));
+    assert!(!out.contains("\"content\":\"Hello\""));
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
+}
+
+#[tokio::test]
+async fn test_br_gzip_chain_order_matters() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    // Header says br then gzip, but body was built as gzip then br — reverse
+    // decode of the wrong order must fail closed rather than emit garbage SSE.
+    resp_headers.insert("content-encoding".to_string(), "br, gzip".to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+    let wrong_order = brotli_bytes(&gzip_bytes(ANTHROPIC_SSE.as_bytes()));
+    let out = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            &wrong_order,
+            Some("text/event-stream"),
+            &resp_headers,
+        )
+        .await
+        .expect("decode failure still yields a bounded error body");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("upstream_error"));
+    assert!(!text.contains("\"content\":\"Hello\""));
+}
+
+#[tokio::test]
+async fn test_empty_identity_list_is_treated_as_identity() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    resp_headers.insert(
+        "content-encoding".to_string(),
+        "identity, identity".to_string(),
+    );
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_stream_router.provider_content_encoding")
+    );
+}
+
+#[tokio::test]
+async fn test_forged_provider_encoding_metadata_fails_closed_without_forwarding() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    // Simulate a later plugin forging residual-encoding metadata after headers
+    // were repaired as identity. The inspector must fail closed immediately.
+    ctx.metadata.insert(
+        "ai_stream_router.provider_content_encoding".to_string(),
+        "zstd".to_string(),
+    );
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("fail-closed inspector");
+    let out = String::from_utf8(forwarded(
+        inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await,
+    ))
+    .unwrap();
+    assert!(out.contains("upstream_error"));
+    assert!(!out.contains("\"content\":\"Hello\""));
+}
+
+#[tokio::test]
+async fn test_truncated_encoded_stream_fails_closed_without_partial_plaintext() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    resp_headers.insert("content-encoding".to_string(), "gzip, br".to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+
+    let layered = brotli_bytes(&gzip_bytes(ANTHROPIC_SSE.as_bytes()));
+    let truncated = &layered[..layered.len() / 2];
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("chain decoding inspector");
+    assert!(forwarded(inspector.on_chunk(truncated).await).is_empty());
+    // Client/provider cancellation mid-stream: on_end sees a truncated coding
+    // and must fail closed rather than normalize a partial decode.
+    let out = String::from_utf8(forwarded(inspector.on_end().await)).unwrap();
+    assert!(out.contains("upstream_error"));
+    assert!(!out.contains("\"content\":\"Hello\""));
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
 }
 
 #[tokio::test]
@@ -4437,7 +4859,7 @@ async fn test_upstream_error_envelope_is_serialized_through_the_bound() {
     let out = String::from_utf8(out).unwrap();
     assert_eq!(
         out,
-        "data: {\"error\":{\"message\":\"multiple case-variant Content-Encoding headers\",\"type\":\"upstream_error\"}}\n\ndata: [DONE]\n\n",
+        "data: {\"error\":{\"message\":\"ambiguous Content-Encoding field-lines\",\"type\":\"upstream_error\"}}\n\ndata: [DONE]\n\n",
         "the envelope written through the sink must be byte-identical to the \
          document it replaced"
     );
@@ -4825,6 +5247,46 @@ async fn final_header_policy_does_not_touch_unclaimed_requests() {
     assert_eq!(
         headers.get("authorization").map(String::as_str),
         Some("Bearer client")
+    );
+}
+
+#[tokio::test]
+async fn transformer_content_type_relabel_keeps_final_body_requirements() {
+    let plugins = router_then_transformer(json!([{
+        "operation": "update",
+        "target": "header",
+        "key": "Content-Type",
+        "value": "text/plain"
+    }]));
+    let body = streaming_request("gpt-4o");
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(&ctx));
+    // The proxy swaps the effective outbound header map back onto the context
+    // before recomputing `final_request_body_requirements`.
+    ctx.headers = headers.clone();
+    assert_eq!(
+        ctx.headers.get("content-type").map(String::as_str),
+        Some("text/plain"),
+        "transformer must relabel the effective outbound Content-Type"
+    );
+
+    let mut requires_buffering = false;
+    let mut needs_final_context = false;
+    for plugin in &plugins {
+        if plugin.should_buffer_request_body(&ctx) {
+            requires_buffering = true;
+            needs_final_context |= plugin.needs_final_request_body_context();
+        }
+    }
+    assert!(
+        requires_buffering && needs_final_context,
+        "claimed request must keep buffering and contextual final revalidation \
+         after a later Content-Type relabel"
     );
 }
 

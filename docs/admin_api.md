@@ -958,7 +958,7 @@ Ferrum Edge can ingest an OpenAPI 2.0 (Swagger), 3.0.x, 3.1.x, or 3.2.x specific
 
 ### `POST /api-specs`
 
-Submit an OpenAPI or Swagger document. The spec must include a `x-ferrum-proxy` extension at the root. Optional `x-ferrum-upstream` and `x-ferrum-plugins` extensions create additional resources. All created resources are tagged with the spec's `api_spec_id` by the server. Clients must omit `api_spec_id` from all three extensions; copied ownership tags return 422 on POST and PUT.
+Submit an OpenAPI or Swagger document. The spec must include a `x-ferrum-proxy` extension at the root. Optional `x-ferrum-upstream` and `x-ferrum-plugins` extensions create additional resources. Optional `x-ferrum-validate` generates an `openapi_validator` plugin. Optional `x-ferrum-external-refs` opts into external/cross-document `$ref` resolution when the process gate `FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED` is also enabled; absent either gate, external refs fail closed with HTTP 422 `UnsupportedExternalRef`. See [api_specs.md](api_specs.md#external-ref-policy). All created resources are tagged with the spec's `api_spec_id` by the server. Clients must omit `api_spec_id` from all three resource extensions; copied ownership tags return 422 on POST and PUT.
 
 ```bash
 curl -X POST https://gateway/api-specs \
