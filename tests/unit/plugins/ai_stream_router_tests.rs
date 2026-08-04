@@ -7987,7 +7987,10 @@ async fn test_gemini_prompt_block_respects_candidate_lifecycle() {
     // The single-candidate case is unchanged: the block finishes choice 0.
     let solo = "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n";
     let out = run_gemini_normalizer(4096, solo, "text/event-stream").await;
-    assert!(out.contains("\"finish_reason\":\"content_filter\""), "{out}");
+    assert!(
+        out.contains("\"finish_reason\":\"content_filter\""),
+        "{out}"
+    );
     assert!(!out.contains("upstream_error"), "{out}");
     assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
 }
