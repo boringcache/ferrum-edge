@@ -1148,6 +1148,62 @@ async fn repeated_final_header_refusal_collapses_to_fixed_terminal() {
     );
 }
 
+/// A WAF refusal must not memoize the rejected digest. The rejection rebuild
+/// can reproduce the exact same map when a preserved decorator is the refused
+/// field and the discarded response already has the rejection's representation
+/// headers; the mandatory second decision must still scan and fail closed.
+#[tokio::test]
+async fn identical_rebuilt_waf_rejection_is_rescanned() {
+    let waf: Arc<dyn Plugin> = Arc::new(
+        Waf::new(&json!({
+            "mode": "enforce",
+            "include_default_rules": false,
+            "scan_budget_ms": 0,
+            "response_inspection": true,
+            "custom_rules": [{
+                "id": "CUSTOM-REFUSED-PRESERVED-COOKIE",
+                "name": "refused preserved cookie",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_headers",
+                "match_kind": "contains",
+                "pattern": "set-cookie",
+                "action": "enforce"
+            }]
+        }))
+        .expect("WAF preserved-cookie config"),
+    );
+    let late_cookie: Arc<dyn Plugin> = Arc::new(
+        ResponseTransformer::new(&json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "set-cookie",
+                "value": "sid=attacker; HttpOnly"
+            }]
+        }))
+        .expect("late cookie response_transformer config"),
+    );
+    let plugins = vec![waf, late_cookie];
+    let mut ctx = ctx_for("GET", "/cache-hit");
+    let mut status = 200u16;
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), "21".to_string()),
+    ]);
+    let mut body = bytes::Bytes::from_static(br#"{"original":"value"}"#);
+
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
+
+    assert_eq!(status, 500);
+    assert!(!header_names_contain(&headers, "set-cookie"));
+    assert_eq!(
+        body.as_ref(),
+        br#"{"error":"response policy could not be applied"}"#
+    );
+}
+
 // ───────────────────── 3. transport encoding runs last ─────────────────────
 
 /// Gateway compression is deferred behind every semantic transform AND behind
