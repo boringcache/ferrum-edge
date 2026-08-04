@@ -456,7 +456,9 @@ pub(crate) fn is_forbidden_backend_request_trailer_name(name: &str) -> bool {
         || name.starts_with("x-path-param-")
         || matches!(
             name,
-            "proxy-authenticate"
+            "via"
+                | "early-data"
+                | "proxy-authenticate"
                 | "content-type"
                 | "content-encoding"
                 | "host"
@@ -1953,6 +1955,8 @@ mod tests {
             "x-forwarded-proto",
             "x-forwarded-host",
             "forwarded",
+            "via",
+            "early-data",
             "authorization",
             "cookie",
             "x-api-key",
@@ -2002,6 +2006,8 @@ mod tests {
             "authorization",
             http::HeaderValue::from_static("Bearer forged"),
         );
+        trailers.insert("via", http::HeaderValue::from_static("attacker-proxy"));
+        trailers.insert("early-data", http::HeaderValue::from_static("1"));
         trailers.insert("connection", http::HeaderValue::from_static("close"));
         trailers.insert(
             "x-path-param-account",
@@ -2025,6 +2031,8 @@ mod tests {
         assert!(!trailers.contains_key("x-geo-country"));
         assert!(!trailers.contains_key("x-consumer-username"));
         assert!(!trailers.contains_key("authorization"));
+        assert!(!trailers.contains_key("via"));
+        assert!(!trailers.contains_key("early-data"));
         assert!(!trailers.contains_key("connection"));
         assert!(!trailers.contains_key("x-path-param-account"));
         assert_eq!(trailers.len(), 2);
