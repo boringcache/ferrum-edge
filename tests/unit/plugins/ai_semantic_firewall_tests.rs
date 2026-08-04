@@ -3289,7 +3289,10 @@ async fn token_window_inspect_forwards_clean_multilingual_window() {
     let clean = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"東京大阪\"}}]}\n\n";
     match inspector.on_chunk(clean.as_bytes()).await {
         ResponseStreamAction::Forward(bytes) => {
-            assert!(!bytes.is_empty(), "a clean multilingual token window forwards");
+            assert!(
+                !bytes.is_empty(),
+                "a clean multilingual token window forwards"
+            );
         }
         ResponseStreamAction::Terminate(_) => panic!("a clean window must not terminate"),
     }

@@ -3811,9 +3811,7 @@ impl StreamWindowEngine {
                 StreamWindowKind::Sentence => last_sentence_boundary(new),
                 StreamWindowKind::Paragraph => last_paragraph_boundary(new),
                 StreamWindowKind::Bytes => None,
-                StreamWindowKind::Tokens(cfg) => {
-                    nth_token_end(new, cfg.tokenizer, cfg.max_tokens)
-                }
+                StreamWindowKind::Tokens(cfg) => nth_token_end(new, cfg.tokenizer, cfg.max_tokens),
             };
             match boundary {
                 Some(b) => self.cleared_len + b,
@@ -7068,17 +7066,15 @@ mod stream_window_tests {
 
     #[test]
     fn token_window_releases_at_whitespace_budget() {
-        let mut eng = StreamWindowEngine::new(token_cfg(
-            StreamTokenizer::Whitespace,
-            3,
-            0,
-            4096,
-            0,
-        ));
+        let mut eng =
+            StreamWindowEngine::new(token_cfg(StreamTokenizer::Whitespace, 3, 0, 4096, 0));
         let f1 = content_event("one two ");
         assert!(!ingest(&mut eng, &f1), "under token budget → hold");
         let f2 = content_event("three");
-        assert!(ingest(&mut eng, &f2), "third whitespace token closes window");
+        assert!(
+            ingest(&mut eng, &f2),
+            "third whitespace token closes window"
+        );
         assert_eq!(window_prose(&eng), "one two three");
         assert_eq!(eng.release(), [f1, f2].concat());
     }
@@ -7094,7 +7090,10 @@ mod stream_window_tests {
             nth_token_end("abcdefghij", StreamTokenizer::Chars4, 3),
             Some(10)
         );
-        assert_eq!(nth_token_end("abcdefghij", StreamTokenizer::Chars4, 4), None);
+        assert_eq!(
+            nth_token_end("abcdefghij", StreamTokenizer::Chars4, 4),
+            None
+        );
     }
 
     #[test]
@@ -7128,13 +7127,8 @@ mod stream_window_tests {
 
     #[test]
     fn token_overlap_retains_prior_tokens() {
-        let mut eng = StreamWindowEngine::new(token_cfg(
-            StreamTokenizer::Whitespace,
-            2,
-            1,
-            4096,
-            64,
-        ));
+        let mut eng =
+            StreamWindowEngine::new(token_cfg(StreamTokenizer::Whitespace, 2, 1, 4096, 64));
         let f1 = content_event("alpha beta");
         assert!(ingest(&mut eng, &f1));
         assert_eq!(window_prose(&eng), "alpha beta");
@@ -7151,8 +7145,7 @@ mod stream_window_tests {
     #[test]
     fn token_byte_cap_prefers_complete_token_cut() {
         // Force via a tiny byte cap after at least one complete whitespace token.
-        let mut eng =
-            StreamWindowEngine::new(token_cfg(StreamTokenizer::Whitespace, 64, 0, 48, 8));
+        let mut eng = StreamWindowEngine::new(token_cfg(StreamTokenizer::Whitespace, 64, 0, 48, 8));
         let f = content_event("hello world-extra");
         assert!(ingest(&mut eng, &f), "byte cap forces a window");
         let prose = window_prose(&eng);
