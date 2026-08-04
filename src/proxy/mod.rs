@@ -29928,6 +29928,54 @@ async fn handle_proxy_request_inner(
                 break;
             }
 
+            // Fail closed for every mesh-required shape that still cannot ride a
+            // mesh transport — including cross-cluster-only tags that carry no
+            // `mesh.hbone` / `mesh.mtls` base transport. Without this gate a
+            // rotated east-west target would plaintext direct-dial the gateway.
+            // Keep this AFTER per-attempt capability resolution (SVID state can
+            // change during backoff) and BEFORE circuit-breaker probe
+            // consumption, backend admission, or any dial.
+            if !retry_dispatch_hbone
+                && !retry_dispatch_mesh_mtls
+                && let Some(reason) = backend_dispatch::direct_http_mesh_transport_refusal(
+                    current_target.as_deref(),
+                )
+            {
+                warn!(
+                    proxy_id = %proxy.id,
+                    target_host = current_target.as_deref().map(|target| target.host.as_str()).unwrap_or(""),
+                    target_port = current_target.as_deref().map(|target| target.port).unwrap_or(0),
+                    reason,
+                    "Mesh retry target cannot be dispatched securely; failing closed"
+                );
+                result = if is_grpc_request {
+                    mesh_grpc_unavailable_response(
+                        None,
+                        reason,
+                        retry::ErrorClass::DispatchPolicyRejected,
+                    )
+                } else {
+                    retry::BackendResponse {
+                        status_code: 502,
+                        body: ResponseBody::buffered(
+                            br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#
+                                .to_vec(),
+                        ),
+                        headers: HashMap::from([(
+                            "gateway-error-reason".to_string(),
+                            reason.to_string(),
+                        )]),
+                        connection_error: false,
+                        backend_resolved_ip: None,
+                        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                    }
+                };
+                final_upstream_target = current_target.clone();
+                backend_admission_started_at = Instant::now();
+                skip_final_cb_record = true;
+                break;
+            }
+
             // A wire-native gRPC request that entered the generic path did so
             // because its first target selected sidecar mesh-mTLS. Keep its
             // trailer-preserving response pipeline stable: rotating onto a

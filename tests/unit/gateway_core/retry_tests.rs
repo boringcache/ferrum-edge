@@ -368,9 +368,28 @@ fn http_retry_re_resolves_mesh_transport_before_each_dispatch() {
     assert!(selection < hbone && selection < mesh_mtls);
     assert!(hbone < admission && mesh_mtls < admission);
     assert!(admission < mesh_dispatch && mesh_dispatch < plain_dispatch);
+
+    // Capability-aware mesh dispatch stays preferred, but any mesh-required
+    // shape that cannot ride HBONE/mTLS — including cross-cluster-only — must
+    // still hit the shared refusal helper before CB/admission/plain dial.
+    let refusal = retry_body
+        .find("direct_http_mesh_transport_refusal(")
+        .expect(
+            "generic retry loop must screen mesh-required shapes via \
+             direct_http_mesh_transport_refusal before plain dial",
+        );
     assert!(
-        !retry_body.contains("direct_http_mesh_transport_refusal("),
-        "generic retry loop must dispatch the secured transport, not refuse it"
+        hbone < refusal && mesh_mtls < refusal,
+        "refusal must follow per-attempt transport resolution"
+    );
+    assert!(
+        refusal < admission,
+        "mesh refusal must precede backend admission and dial"
+    );
+    assert!(
+        retry_body[refusal..].contains("!retry_dispatch_hbone")
+            && retry_body[refusal..].contains("!retry_dispatch_mesh_mtls"),
+        "refusal gate must only fire when neither mesh transport is dispatchable"
     );
 
     let mesh_unavailable = retry_body
@@ -385,6 +404,10 @@ fn http_retry_re_resolves_mesh_transport_before_each_dispatch() {
     assert!(
         grpc_shape < json_shape,
         "is_grpc_request must select mesh_grpc_unavailable_response before the JSON 502 arm"
+    );
+    assert!(
+        retry_body[mesh_unavailable..].contains("skip_final_cb_record = true"),
+        "mesh dispatch refusal must stay backend-health-neutral"
     );
 }
 

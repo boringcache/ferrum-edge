@@ -4916,6 +4916,13 @@ impl RequestContext {
     /// The raw map is retained so plugins can evaluate multi-value and
     /// non-UTF-8 field lines. Non-UTF-8 header values are still omitted from
     /// the materialized map (same as the previous eager path).
+    ///
+    /// **This map is the authoritative removal set for outbound merges.**
+    /// [`crate::proxy::headers::merge_proxy_headers_preserving_repeated`] drops
+    /// any pristine raw field line whose name is absent here, so callers must
+    /// pass the FULLY materialized map — a partial or prebuilt map silently
+    /// deletes raw headers. It also means the non-UTF-8 values omitted above are
+    /// dropped on those outbound paths rather than forwarded byte-exact.
     pub fn materialize_headers(&mut self) {
         if self.headers_materialized {
             return;

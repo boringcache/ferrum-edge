@@ -528,6 +528,22 @@ pub fn merge_proxy_headers_and_strip_for_grpc(
 /// when a plugin changed the value, replace every raw entry with that mutation.
 /// Reserved gateway assertions are always removed from the untrusted raw base
 /// before an authenticated value from `proxy_headers` may be layered back on.
+///
+/// **`proxy_headers` is the AUTHORITATIVE REMOVAL SET.** A raw field line whose
+/// name is absent from `proxy_headers` is treated as a plugin removal and is
+/// dropped. That is required for replay correctness — otherwise a plugin's
+/// header removal is resurrected from the pristine map on every attempt — but it
+/// means a caller that passes a PARTIAL map silently deletes every raw header
+/// the map does not mention. Always pass the fully materialized
+/// [`crate::plugins::RequestContext::headers`] view; a prebuilt or filtered map
+/// needs its own merge helper (see `merge_proxy_headers_for_prebuilt_h3_grpc`).
+///
+/// One consequence: `materialize_headers` omits non-UTF-8 header values, so a
+/// field line carrying legal HTTP obs-text that is not valid UTF-8 is absent
+/// from `proxy_headers` and is therefore dropped here. For native gRPC this is
+/// inert (metadata must be ASCII, or base64 via `-bin`), but any future caller
+/// on a path that must forward arbitrary bytes byte-exact has to exempt those
+/// entries from the removal pass rather than reuse this helper as-is.
 pub fn merge_proxy_headers_preserving_repeated(
     headers: &mut http::HeaderMap,
     proxy_headers: &std::collections::HashMap<String, String>,
