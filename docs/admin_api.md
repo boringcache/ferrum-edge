@@ -1290,7 +1290,11 @@ Field semantics:
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/slice-drift
 ```
 
-Returns `404` outside CP mode. Returns `200` with an empty `data_planes` list when CP mode is active but no local `MeshSubscribe` DP has connected yet. Desired versions reflect actual per-DP projected content changes, not global reload timestamps; NACK diagnostics retain only the fixed `reported_rejection` label and discard caller text. Pair with each DP's `GET /mesh/config-drift` for the DP-local applied fingerprint. See [docs/mesh.md](mesh.md#cp-get-meshslice-drift-contract) for field semantics, retention, session-bound ACK/NACK wiring, and strict version admission.
+Returns `404` outside CP mode. Returns `200` with an empty `data_planes` list when CP mode is active but no local `MeshSubscribe` DP has connected yet. Desired versions reflect actual per-DP projected content changes, not global reload timestamps; NACK diagnostics retain only the fixed `reported_rejection` label and discard caller text.
+
+This surface is **observability only and never gates mesh configuration delivery**: a DP the bounded registry declines to track (4096-identity cap, oversized retained selector) is still served its full mesh slice, it simply does not appear in `data_planes`. A missing DP therefore means "not tracked or not connected", not "not configured" — cross-check `GET /cluster` for the connected set. On fleets above 256 tracked identities the published watermarks may lag live state by up to one maintenance interval while high-frequency send/ACK updates coalesce.
+
+Pair with each DP's `GET /mesh/config-drift` for the DP-local applied fingerprint. See [docs/mesh.md](mesh.md#cp-get-meshslice-drift-contract) for field semantics, retention, session-bound ACK/NACK wiring, and strict version admission.
 
 ## Mesh Service Graph (mesh mode)
 

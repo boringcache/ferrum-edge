@@ -3544,7 +3544,9 @@ pub async fn run(
                             ),
                         );
                         if drift_removed > 0 {
-                            warn!(
+                            // Routine retention expiry of an observability row,
+                            // not an operator-actionable condition.
+                            info!(
                                 removed = drift_removed,
                                 "Removed expired mesh slice-drift rows after retention timeout"
                             );

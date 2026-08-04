@@ -138,8 +138,17 @@ async fn start_mesh_cp() -> (
     Arc<MeshSliceDriftRegistry>,
     tokio::task::JoinHandle<()>,
 ) {
+    start_mesh_cp_with_drift(Arc::new(MeshSliceDriftRegistry::new())).await
+}
+
+async fn start_mesh_cp_with_drift(
+    drift: Arc<MeshSliceDriftRegistry>,
+) -> (
+    SocketAddr,
+    Arc<MeshSliceDriftRegistry>,
+    tokio::task::JoinHandle<()>,
+) {
     let config = Arc::new(ArcSwap::from_pointee(GatewayConfig::default()));
-    let drift = Arc::new(MeshSliceDriftRegistry::new());
     let registry = Arc::new(MeshNodeRegistry::new().with_drift(drift.clone()));
     let (server, _tx) = MeshGrpcServer::builder(config, GRPC_JWT_SECRET.to_string())
         .registry(registry)
@@ -297,6 +306,68 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
         body["data_planes"][0]["acknowledged"]["version"],
         update.version
     );
+}
+
+/// Drift tracking is observability. A registry that refuses to admit this DP
+/// (cardinality cap) must degrade the subscription to "untracked", never deny
+/// mesh configuration delivery.
+#[tokio::test(flavor = "multi_thread")]
+async fn drift_registry_refusal_still_delivers_mesh_config_untracked() {
+    let drift = Arc::new(MeshSliceDriftRegistry::with_max_entries(1));
+    // Occupy the only slot with a connected row so it cannot be evicted.
+    let occupant = drift
+        .open_session("mesh-dp-occupant", "ferrum", Utc::now(), Some("v1"))
+        .expect("occupant admitted");
+    assert!(!occupant.is_empty());
+
+    let (grpc_addr, drift, _grpc_handle) = start_mesh_cp_with_drift(drift).await;
+
+    let token = mesh_jwt("mesh-dp-refused");
+    let auth_header = format!("Bearer {token}");
+    let channel = tonic::transport::Channel::from_shared(format!("http://{grpc_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client =
+        MeshConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+            req.metadata_mut().insert(
+                "authorization",
+                tonic::metadata::MetadataValue::try_from(auth_header.as_str()).unwrap(),
+            );
+            Ok(req)
+        });
+
+    let subscribe = MeshSubscribeRequest {
+        node_id: "mesh-dp-refused".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+        workload_spiffe_id: String::new(),
+        labels: HashMap::new(),
+        waypoint_name: String::new(),
+        ambient_udp_source_scoping: false,
+        remote_discovery: false,
+        node_waypoint_capture_scoping: false,
+    };
+    let mut stream = client
+        .mesh_subscribe(tonic::Request::new(subscribe))
+        .await
+        .expect("a full drift registry must not refuse mesh config delivery")
+        .into_inner();
+    let update = stream.message().await.unwrap().unwrap();
+    assert!(!update.heartbeat);
+    assert!(
+        !update.mesh_slice_json.is_empty(),
+        "the refused DP still receives its mesh slice"
+    );
+    assert!(
+        update.session_token.is_empty(),
+        "an untracked subscription must not carry a drift session token"
+    );
+
+    let snapshot = drift.snapshot();
+    assert_eq!(snapshot.summary.tracked, 1);
+    assert_eq!(snapshot.data_planes[0].node_id, "mesh-dp-occupant");
 }
 
 #[tokio::test(flavor = "multi_thread")]

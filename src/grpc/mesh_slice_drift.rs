@@ -32,13 +32,23 @@
 //!
 //! Hot/admin reads consume an immutable [`MeshSliceDriftSnapshot`] via
 //! `ArcSwap` — scrapes never walk the live map.
+//!
+//! # Posture
+//!
+//! This registry is **observability only**. Callers on the mesh configuration
+//! path must treat every error here as "this data plane is untracked", never
+//! as a reason to refuse or tear down a subscription: a bookkeeping refusal
+//! (cardinality cap, oversized retained selector) or a poisoned lock must not
+//! be able to deny mesh config delivery. See
+//! [`super::mesh_server::MeshGrpcServer::mesh_subscribe`].
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use tracing::warn;
 use uuid::Uuid;
 
 use super::cp_server::{CpGrpcServer, CpScope};
@@ -55,6 +65,12 @@ pub const MESH_SLICE_DRIFT_MAX_ENTRIES: usize = 4096;
 
 /// Max accepted slice-version UTF-8 byte length (fail closed above this).
 pub const MESH_SLICE_DRIFT_MAX_VERSION_BYTES: usize = 256;
+
+/// Max accepted identity (JWT `sub`) UTF-8 byte length. The gRPC metadata
+/// limit alone would let a legitimately authenticated but pathologically long
+/// subject dominate retained key bytes at the 4096-identity cap, so the
+/// registry bounds it independently of the transport.
+pub const MESH_SLICE_DRIFT_MAX_NODE_ID_BYTES: usize = 256;
 
 /// Max retained rejection-reason UTF-8 byte length. Production currently
 /// retains only the fixed label below, never caller-supplied text.
@@ -74,6 +90,20 @@ const _: () = assert!("unspecified".len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
 const MESH_SLICE_DRIFT_MAX_PROJECTION_LABELS: usize = 256;
 const MESH_SLICE_DRIFT_MAX_PROJECTION_NAMESPACES: usize = 256;
 const MESH_SLICE_DRIFT_MAX_PROJECTION_BYTES: usize = 64 * 1024;
+
+/// Fleet size below which every mutation republishes the immutable snapshot
+/// immediately. A rebuild is O(tracked identities), so at small/medium fleet
+/// sizes it is trivial and the snapshot stays exactly current.
+const SNAPSHOT_COALESCE_MIN_ENTRIES: usize = 256;
+
+/// Above [`SNAPSHOT_COALESCE_MIN_ENTRIES`], per-stream send and per-DP ACK/NACK
+/// mutations republish at most this often. One CP publication fans out to every
+/// connected stream, so without coalescing a single broadcast would rebuild the
+/// whole snapshot once per stream (quadratic in fleet size) while holding the
+/// registry mutex. Deferred state is always flushed by the next structural
+/// mutation (session open/replace, disconnect, publication reconcile) or the
+/// periodic retention sweep.
+const SNAPSHOT_COALESCE_WINDOW_MS: i64 = 500;
 
 /// Closed-set convergence classification for summary metrics / admin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -218,6 +248,7 @@ struct ProjectionContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshSliceDriftAdmitError {
     EmptyNodeId,
+    NodeIdTooLong,
     EmptyNamespace,
     EmptyVersion,
     VersionTooLong,
@@ -230,13 +261,15 @@ pub enum MeshSliceDriftAdmitError {
     CardinalityExceeded,
     ProjectionContextTooLarge,
     ProjectionFailed,
-    RegistryUnavailable,
 }
 
 impl MeshSliceDriftAdmitError {
     pub const fn as_status_message(self) -> &'static str {
         match self {
             Self::EmptyNodeId => "authenticated node identity must not be empty",
+            Self::NodeIdTooLong => {
+                "authenticated node identity exceeds the 256-byte drift-registry maximum"
+            }
             Self::EmptyNamespace => "mesh slice drift namespace must not be empty",
             Self::EmptyVersion => "mesh slice status version must not be empty",
             Self::VersionTooLong => "mesh slice status version exceeds the 256-byte maximum",
@@ -261,13 +294,13 @@ impl MeshSliceDriftAdmitError {
                 "mesh subscription projection context exceeds the retained-state bound"
             }
             Self::ProjectionFailed => "mesh slice projection could not be represented",
-            Self::RegistryUnavailable => "mesh slice drift registry is unavailable",
         }
     }
 
     pub const fn field_name(self) -> &'static str {
         match self {
             Self::EmptyNodeId => "node_id",
+            Self::NodeIdTooLong => "node_id",
             Self::EmptyNamespace => "namespace",
             Self::EmptyVersion => "version",
             Self::VersionTooLong => "version",
@@ -280,7 +313,6 @@ impl MeshSliceDriftAdmitError {
             Self::CardinalityExceeded => "cardinality",
             Self::ProjectionContextTooLarge => "subscription",
             Self::ProjectionFailed => "projection",
-            Self::RegistryUnavailable => "registry",
         }
     }
 }
@@ -294,6 +326,12 @@ static DRIFT_SUMMARY: LazyLock<ArcSwap<MeshSliceDriftSummary>> =
 #[derive(Default)]
 struct RegistryState {
     entries: HashMap<String, LiveEntry>,
+    /// A fan-out mutation changed published state without rebuilding the
+    /// immutable snapshot. Cleared by the next publication.
+    pending_publish: bool,
+    /// Wall clock of the last snapshot publication, used only to bound
+    /// fan-out coalescing. `None` until the first publication.
+    last_published_at: Option<DateTime<Utc>>,
 }
 
 /// Bounded per-authenticated-DP slice-version drift registry. Every mutation,
@@ -409,7 +447,7 @@ impl MeshSliceDriftRegistry {
             validate_version(version)?;
         }
         let session_token = Uuid::new_v4().simple().to_string();
-        let mut state = self.lock_state()?;
+        let mut state = self.state_locked();
         if !state.entries.contains_key(node_id)
             && state.entries.len() >= self.max_entries
             && !evict_oldest_disconnected(&mut state.entries)
@@ -439,7 +477,7 @@ impl MeshSliceDriftRegistry {
                 desired_content_digest,
             },
         );
-        self.refresh_snapshot_locked(&state, Utc::now());
+        self.publish_locked(&mut state, Utc::now());
         Ok(session_token)
     }
 
@@ -479,7 +517,7 @@ impl MeshSliceDriftRegistry {
         at: DateTime<Utc>,
     ) -> Result<(), MeshSliceDriftAdmitError> {
         validate_version(version)?;
-        let mut state = self.lock_state()?;
+        let mut state = self.state_locked();
         let entry = state
             .entries
             .get_mut(node_id)
@@ -492,7 +530,7 @@ impl MeshSliceDriftRegistry {
             entry.rejected_at = None;
             entry.rejected_reason = None;
         }
-        self.refresh_snapshot_locked(&state, Utc::now());
+        self.publish_fanout_locked(&mut state, Utc::now());
         Ok(())
     }
 
@@ -502,22 +540,75 @@ impl MeshSliceDriftRegistry {
     /// reload or unrelated namespace mutation leaves desired untouched because
     /// the content digest ignores `MeshSlice.version` and `revision`, matching
     /// `MeshSlice::content_eq`.
-    pub fn reconcile_desired(
-        &self,
-        config: &GatewayConfig,
-        at: DateTime<Utc>,
-    ) -> Result<usize, MeshSliceDriftAdmitError> {
-        let mut state = self.lock_state()?;
+    pub fn reconcile_desired(&self, config: &GatewayConfig, at: DateTime<Utc>) -> usize {
+        let mut state = self.state_locked();
         let mut changed = 0usize;
+        let mut skipped = 0usize;
         for entry in state.entries.values_mut() {
-            if reconcile_entry_desired(entry, config, at)? {
-                changed += 1;
+            // One entry whose projection cannot be represented must not abort
+            // reconciliation for the rest of the fleet, and must not leave
+            // already-mutated rows unpublished.
+            match reconcile_entry_desired(entry, config, at) {
+                Ok(true) => changed += 1,
+                Ok(false) => {}
+                Err(_) => skipped += 1,
             }
         }
-        if changed > 0 {
-            self.refresh_snapshot_locked(&state, at);
+        if skipped > 0 {
+            // One bounded line per publication, never per entry.
+            warn!(
+                skipped,
+                "Skipped mesh slice desired reconciliation for some data planes"
+            );
         }
-        Ok(changed)
+        if changed > 0 || state.pending_publish {
+            self.publish_locked(&mut state, at);
+        }
+        changed
+    }
+
+    /// Re-stamp one live session's desired watermark from the currently
+    /// published config, under the same lock a publication reconcile uses.
+    ///
+    /// Subscribe loads the config snapshot **before** the row exists, so a
+    /// publication landing in that window reconciles a registry that does not
+    /// yet contain this identity — a no-op for it — while the already
+    /// subscribed stream still receives (and records as sent) the newer slice.
+    /// Without this the row would keep the older desired version and classify
+    /// as drifted until the next content-changing publication, which on a
+    /// quiet config store may never arrive. Loading inside the lock makes the
+    /// outcome ordering-independent: either this observes the newer config, or
+    /// the publication's own reconcile runs after this and observes the row.
+    pub fn reconcile_session_desired(
+        &self,
+        node_id: &str,
+        session_token: &str,
+        config: &ArcSwap<GatewayConfig>,
+        at: DateTime<Utc>,
+    ) -> bool {
+        let mut state = self.state_locked();
+        let Some(entry) = state.entries.get_mut(node_id) else {
+            return false;
+        };
+        if entry.session_token != session_token || !entry.connected {
+            return false;
+        }
+        let config = config.load_full();
+        let outcome = reconcile_entry_desired(entry, config.as_ref(), at);
+        let changed = match outcome {
+            Ok(changed) => changed,
+            Err(error) => {
+                warn!(
+                    field = error.field_name(),
+                    "Failed to re-reconcile mesh slice desired state at subscribe time"
+                );
+                return false;
+            }
+        };
+        if changed || state.pending_publish {
+            self.publish_locked(&mut state, at);
+        }
+        changed
     }
 
     /// Record an ACK (`error_message` empty) or NACK (non-empty, sanitised).
@@ -531,7 +622,7 @@ impl MeshSliceDriftRegistry {
     ) -> Result<(), MeshSliceDriftAdmitError> {
         let node_id = validate_identity(node_id)?;
         validate_version(version)?;
-        let mut state = self.lock_state()?;
+        let mut state = self.state_locked();
         let entry = state
             .entries
             .get_mut(node_id)
@@ -554,7 +645,7 @@ impl MeshSliceDriftRegistry {
                 entry.rejected_reason = Some(sanitize_reason(raw));
             }
         }
-        self.refresh_snapshot_locked(&state, Utc::now());
+        self.publish_fanout_locked(&mut state, Utc::now());
         Ok(())
     }
 
@@ -562,17 +653,16 @@ impl MeshSliceDriftRegistry {
     // Public integration-test helper; see `with_max_entries`.
     #[allow(dead_code)]
     pub fn mark_disconnected(&self, node_id: &str, session_token: &str, now: DateTime<Utc>) {
-        let Ok(mut state) = self.state.lock() else {
+        let mut state = self.state_locked();
+        let Some(entry) = state.entries.get_mut(node_id) else {
             return;
         };
-        if let Some(entry) = state.entries.get_mut(node_id)
-            && entry.session_token == session_token
-            && entry.connected
-        {
-            entry.connected = false;
-            entry.disconnected_at = Some(now);
-            self.refresh_snapshot_locked(&state, now);
+        if entry.session_token != session_token || !entry.connected {
+            return;
         }
+        entry.connected = false;
+        entry.disconnected_at = Some(now);
+        self.publish_locked(&mut state, now);
     }
 
     /// Production disconnect path. Re-evaluating the projection while marking
@@ -584,13 +674,13 @@ impl MeshSliceDriftRegistry {
         session_token: &str,
         config: &ArcSwap<GatewayConfig>,
         now: DateTime<Utc>,
-    ) -> Result<(), MeshSliceDriftAdmitError> {
-        let mut state = self.lock_state()?;
+    ) {
+        let mut state = self.state_locked();
         let Some(entry) = state.entries.get_mut(node_id) else {
-            return Ok(());
+            return;
         };
         if entry.session_token != session_token || !entry.connected {
-            return Ok(());
+            return;
         }
         entry.connected = false;
         entry.disconnected_at = Some(now);
@@ -600,16 +690,20 @@ impl MeshSliceDriftRegistry {
         // the now-disconnected row. Neither ordering can strand old desired
         // content after a newer config was published.
         let config = config.load_full();
-        let _ = reconcile_entry_desired(entry, config.as_ref(), now)?;
-        self.refresh_snapshot_locked(&state, now);
-        Ok(())
+        // A projection failure must still leave the row marked disconnected
+        // and published; only the desired watermark is skipped.
+        if let Err(error) = reconcile_entry_desired(entry, config.as_ref(), now) {
+            warn!(
+                field = error.field_name(),
+                "Skipped mesh slice desired reconciliation while finalizing a disconnect"
+            );
+        }
+        self.publish_locked(&mut state, now);
     }
 
     /// Remove expired disconnected rows. Returns how many were deleted.
     pub fn reap_expired(&self, now: DateTime<Utc>, retention: chrono::Duration) -> usize {
-        let Ok(mut state) = self.state.lock() else {
-            return 0;
-        };
+        let mut state = self.state_locked();
         let stale_before = now - retention;
         let before = state.entries.len();
         state.entries.retain(|_, entry| {
@@ -622,10 +716,11 @@ impl MeshSliceDriftRegistry {
             }
         });
         let removed = before.saturating_sub(state.entries.len());
-        // Maintenance also advances ages for stable non-empty rows. Empty
-        // snapshots need no periodic republish.
-        if removed > 0 || !state.entries.is_empty() {
-            self.refresh_snapshot_locked(&state, now);
+        // Maintenance also advances ages for stable non-empty rows and is the
+        // backstop that flushes coalesced fan-out state on an otherwise idle
+        // registry. Empty, never-coalesced snapshots need no periodic republish.
+        if removed > 0 || !state.entries.is_empty() || state.pending_publish {
+            self.publish_locked(&mut state, now);
         }
         removed
     }
@@ -647,12 +742,44 @@ impl MeshSliceDriftRegistry {
         self.len() == 0
     }
 
-    fn lock_state(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, RegistryState>, MeshSliceDriftAdmitError> {
-        self.state
-            .lock()
-            .map_err(|_| MeshSliceDriftAdmitError::RegistryUnavailable)
+    /// The guarded state is observability data only. `std` mutex poisoning is
+    /// sticky, so latching it would let one panic under this lock permanently
+    /// disable drift tracking — and, before the MeshSubscribe path was made
+    /// tolerant, would have denied mesh configuration delivery outright. A
+    /// stale or partially updated drift row must never take down the mesh
+    /// plane, so poisoning is recovered from instead of propagated.
+    fn state_locked(&self) -> MutexGuard<'_, RegistryState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Structural publication: always rebuilds and clears any coalesced
+    /// fan-out state.
+    fn publish_locked(&self, state: &mut RegistryState, now: DateTime<Utc>) {
+        state.pending_publish = false;
+        state.last_published_at = Some(now);
+        self.refresh_snapshot_locked(state, now);
+    }
+
+    /// Fan-out publication (per-stream send, per-DP ACK/NACK). One CP
+    /// broadcast reaches every connected stream, so republishing on each of
+    /// them costs one full snapshot rebuild per stream. Small fleets keep the
+    /// exact-current behaviour; larger fleets rebuild at most once per
+    /// [`SNAPSHOT_COALESCE_WINDOW_MS`] and are flushed by the next structural
+    /// mutation or retention sweep.
+    fn publish_fanout_locked(&self, state: &mut RegistryState, now: DateTime<Utc>) {
+        // A negative delta means the clock moved backwards (or a caller mixed
+        // fixture and wall-clock stamps); publish rather than coalesce so skew
+        // can never wedge the snapshot.
+        let coalesce = state.entries.len() >= SNAPSHOT_COALESCE_MIN_ENTRIES
+            && state.last_published_at.is_some_and(|last| {
+                (0..SNAPSHOT_COALESCE_WINDOW_MS)
+                    .contains(&now.signed_duration_since(last).num_milliseconds())
+            });
+        if coalesce {
+            state.pending_publish = true;
+        } else {
+            self.publish_locked(state, now);
+        }
     }
 
     fn refresh_snapshot_locked(&self, state: &RegistryState, now: DateTime<Utc>) {
@@ -853,6 +980,11 @@ fn validate_identity(node_id: &str) -> Result<&str, MeshSliceDriftAdmitError> {
     let trimmed = node_id.trim();
     if trimmed.is_empty() {
         return Err(MeshSliceDriftAdmitError::EmptyNodeId);
+    }
+    // Retained key bytes are bounded independently of the ~16 KiB gRPC header
+    // budget that would otherwise cap an authenticated `sub`.
+    if trimmed.len() > MESH_SLICE_DRIFT_MAX_NODE_ID_BYTES {
+        return Err(MeshSliceDriftAdmitError::NodeIdTooLong);
     }
     Ok(trimmed)
 }

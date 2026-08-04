@@ -7,10 +7,11 @@ use chrono::{Duration, TimeZone, Utc};
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::grpc::cp_server::CpScope;
 use ferrum_edge::grpc::mesh_slice_drift::{
-    MESH_SLICE_DRIFT_MAX_ENTRIES, MESH_SLICE_DRIFT_MAX_REASON_BYTES,
-    MESH_SLICE_DRIFT_REJECTION_REASON, MeshSliceConvergenceState, MeshSliceDriftAdmitError,
-    MeshSliceDriftRegistry, MeshSliceDriftSummary, render_mesh_slice_drift_summary_metrics,
-    sanitize_reason, slice_content_digest, validate_version,
+    MESH_SLICE_DRIFT_MAX_ENTRIES, MESH_SLICE_DRIFT_MAX_NODE_ID_BYTES,
+    MESH_SLICE_DRIFT_MAX_REASON_BYTES, MESH_SLICE_DRIFT_REJECTION_REASON,
+    MeshSliceConvergenceState, MeshSliceDriftAdmitError, MeshSliceDriftRegistry,
+    MeshSliceDriftSummary, render_mesh_slice_drift_summary_metrics, sanitize_reason,
+    slice_content_digest, validate_version,
 };
 use ferrum_edge::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
@@ -362,7 +363,7 @@ fn projected_digest_recursively_canonicalizes_nested_maps() {
 
     assert_eq!(
         registry.reconcile_desired(&reordered_config, at(1)),
-        Ok(0),
+        0,
         "content-equal reordered maps must not advance desired"
     );
     assert_eq!(
@@ -375,7 +376,7 @@ fn projected_digest_recursively_canonicalizes_nested_maps() {
     );
     assert_eq!(
         registry.reconcile_desired(&changed_config, at(2)),
-        Ok(1),
+        1,
         "semantic changes must advance desired"
     );
     assert_eq!(
@@ -386,6 +387,116 @@ fn projected_digest_recursively_canonicalizes_nested_maps() {
             .version,
         changed_slice.version
     );
+}
+
+/// A CP publication that lands between the subscribe path's config load and its
+/// registry insert reconciles a registry that does not yet contain the new
+/// identity, so it cannot stamp that row. The stream still receives (and
+/// records as sent) the newer slice, which would leave the row permanently
+/// `desired = old` / `sent = acked = new` — drifted until the next
+/// content-changing publication, which on a quiet config store may never come.
+/// The connect-side re-reconcile closes that window.
+#[test]
+fn subscribe_publication_race_repairs_desired_from_the_published_config() {
+    let registry = MeshSliceDriftRegistry::new();
+    let request = MeshSliceRequest {
+        node_id: "dp-a".to_string(),
+        namespace: "ferrum".to_string(),
+        ..MeshSliceRequest::default()
+    };
+    // What the subscribe path loaded before the row existed.
+    let loaded = projected_config(0, vec![service("api", "ferrum")]);
+    let loaded_slice = MeshSlice::from_gateway_config(&loaded, request.clone());
+    // What the CP published inside the race window.
+    let published = projected_config(1, vec![service("api-v2", "ferrum")]);
+    let published_slice = MeshSlice::from_gateway_config(&published, request.clone());
+    let config = ArcSwap::from_pointee(published.clone());
+
+    assert_eq!(
+        registry.reconcile_desired(&published, at(1)),
+        0,
+        "the publication cannot stamp a row that does not exist yet"
+    );
+
+    let token = registry
+        .open_projected_session(
+            "dp-a",
+            "ferrum",
+            at(1),
+            &loaded_slice,
+            request,
+            CpScope::Single("ferrum".to_string()),
+            None,
+        )
+        .unwrap();
+    registry
+        .record_projected_sent("dp-a", &token, &loaded_slice, at(1))
+        .unwrap();
+    assert_eq!(
+        registry.snapshot().data_planes[0]
+            .desired
+            .as_ref()
+            .unwrap()
+            .version,
+        loaded_slice.version,
+        "the row starts on the pre-publication projection"
+    );
+
+    assert!(
+        registry.reconcile_session_desired("dp-a", &token, &config, at(2)),
+        "the connect-side repair re-stamps desired from the published config"
+    );
+    assert_eq!(
+        registry.snapshot().data_planes[0]
+            .desired
+            .as_ref()
+            .unwrap()
+            .version,
+        published_slice.version
+    );
+
+    // The already-subscribed stream then delivers and the DP acknowledges the
+    // same published slice, so the row converges instead of staying drifted.
+    registry
+        .record_projected_sent("dp-a", &token, &published_slice, at(2))
+        .unwrap();
+    registry
+        .record_status("dp-a", &token, &published_slice.version, None, at(2))
+        .unwrap();
+    let entry = &registry.snapshot().data_planes[0];
+    assert_eq!(entry.convergence, MeshSliceConvergenceState::Converged);
+    assert!(!entry.drift.desired_vs_sent);
+    assert!(!entry.drift.desired_vs_acknowledged);
+
+    // Idempotent, and never mutates a row it does not own.
+    assert!(!registry.reconcile_session_desired("dp-a", &token, &config, at(3)));
+    assert!(!registry.reconcile_session_desired("dp-a", &"0".repeat(32), &config, at(3)));
+    assert!(!registry.reconcile_session_desired("dp-unknown", &token, &config, at(3)));
+}
+
+#[test]
+fn identity_length_is_bounded_independently_of_the_transport() {
+    let registry = MeshSliceDriftRegistry::new();
+    let longest = "d".repeat(MESH_SLICE_DRIFT_MAX_NODE_ID_BYTES);
+    let token = registry
+        .open_session(&longest, "ferrum", at(0), Some("v1"))
+        .expect("the maximum identity length is admitted");
+    assert!(!token.is_empty());
+
+    let oversized = "d".repeat(MESH_SLICE_DRIFT_MAX_NODE_ID_BYTES + 1);
+    assert_eq!(
+        registry
+            .open_session(&oversized, "ferrum", at(0), Some("v1"))
+            .unwrap_err(),
+        MeshSliceDriftAdmitError::NodeIdTooLong
+    );
+    assert_eq!(
+        registry
+            .record_status(&oversized, &token, "v1", None, at(0))
+            .unwrap_err(),
+        MeshSliceDriftAdmitError::NodeIdTooLong
+    );
+    assert_eq!(registry.len(), 1);
 }
 
 fn assert_rendered_summary_is_coherent(output: &str, summary: &MeshSliceDriftSummary) {
@@ -563,7 +674,7 @@ fn desired_tracks_projected_content_for_connected_and_retained_disconnected_rows
         .unwrap();
 
     let related = projected_config(1, vec![service("api-v2", "ferrum")]);
-    assert_eq!(registry.reconcile_desired(&related, at(1)), Ok(1));
+    assert_eq!(registry.reconcile_desired(&related, at(1)), 1);
     assert_eq!(
         registry.snapshot().data_planes[0]
             .desired
@@ -582,9 +693,7 @@ fn desired_tracks_projected_content_for_connected_and_retained_disconnected_rows
     assert!(connected.drift.desired_vs_sent);
 
     let current_config = ArcSwap::from_pointee(related.clone());
-    registry
-        .mark_disconnected_with_config("dp-a", &token, &current_config, at(1))
-        .unwrap();
+    registry.mark_disconnected_with_config("dp-a", &token, &current_config, at(1));
     assert_eq!(
         registry.snapshot().data_planes[0]
             .desired
@@ -595,14 +704,14 @@ fn desired_tracks_projected_content_for_connected_and_retained_disconnected_rows
         "disconnect closes the publish-before-drop race from current config"
     );
     let no_op = projected_config(2, vec![service("api-v2", "ferrum")]);
-    assert_eq!(registry.reconcile_desired(&no_op, at(2)), Ok(0));
+    assert_eq!(registry.reconcile_desired(&no_op, at(2)), 0);
     let unrelated = projected_config(
         3,
         vec![service("api-v2", "ferrum"), service("other", "other")],
     );
-    assert_eq!(registry.reconcile_desired(&unrelated, at(3)), Ok(0));
+    assert_eq!(registry.reconcile_desired(&unrelated, at(3)), 0);
     let next_related = projected_config(4, vec![service("api-v3", "ferrum")]);
-    assert_eq!(registry.reconcile_desired(&next_related, at(4)), Ok(1));
+    assert_eq!(registry.reconcile_desired(&next_related, at(4)), 1);
     let entry = &registry.snapshot().data_planes[0];
     assert_eq!(
         entry.desired.as_ref().unwrap().version,
