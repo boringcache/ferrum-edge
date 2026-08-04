@@ -4181,20 +4181,23 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
     let max_window_tokens_raw = streaming_u64(streaming, "max_window_tokens")?;
     let overlap_tokens_raw = streaming_u64(streaming, "overlap_tokens")?;
 
-    let reject_token_only_fields = |field: &str| -> Result<(), String> {
-        Err(format!(
+    // Build the diagnostic only; the caller wraps it. A closure returning
+    // `Result<(), String>` cannot be `return`ed from a function whose Ok type is
+    // `StreamingInspectConfig`.
+    let reject_token_only_fields = |field: &str| {
+        format!(
             "ai_semantic_firewall: streaming.{field} is only valid when streaming.window is 'tokens'"
-        ))
+        )
     };
     if !matches!(window_raw, "tokens") {
         if tokenizer_raw.is_some() {
-            return reject_token_only_fields("tokenizer");
+            return Err(reject_token_only_fields("tokenizer"));
         }
         if max_window_tokens_raw.is_some() {
-            return reject_token_only_fields("max_window_tokens");
+            return Err(reject_token_only_fields("max_window_tokens"));
         }
         if overlap_tokens_raw.is_some() {
-            return reject_token_only_fields("overlap_tokens");
+            return Err(reject_token_only_fields("overlap_tokens"));
         }
     }
 
