@@ -10,8 +10,13 @@
 use ferrum_edge::_test_support::direct_http_mesh_transport_refusal_for_test;
 use ferrum_edge::LoadBalancerCache;
 use ferrum_edge::config::types::{GatewayConfig, UpstreamTarget};
+use std::sync::Arc;
 
-fn rotate_onto_second_target(upstream_json: serde_json::Value) -> UpstreamTarget {
+/// Returns the `Arc<UpstreamTarget>` the production load balancer hands the
+/// retry planner — the LB shares targets by `Arc` rather than cloning them, so
+/// keeping that shape here means the fixture exercises exactly what dispatch
+/// sees. Deref coercion covers the `&UpstreamTarget` call sites below.
+fn rotate_onto_second_target(upstream_json: serde_json::Value) -> Arc<UpstreamTarget> {
     let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
         "version": "1",
         "proxies": [],
