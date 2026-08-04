@@ -3668,6 +3668,77 @@ fn client_request_body_proven_empty(client_request_body: &ClientRequestBody) -> 
     }
 }
 
+/// Whether a `Content-Length` field-line value provably declares a zero-length
+/// body. Anything that is not a parseable zero — a non-UTF-8 field line, a
+/// malformed number, a value out of `u64` range — answers `false` so the
+/// replay gate below fails closed.
+fn content_length_field_line_is_zero(value: &[u8]) -> bool {
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|length| length == 0)
+}
+
+/// Whether the inbound request declared a request body on the wire.
+///
+/// A first attempt can fail BEFORE the request body is ever buffered: DNS
+/// resolution and the backend egress screen both run ahead of body preparation
+/// in `proxy_to_backend_inner`, and both return a pre-wire failure with no
+/// retained body even though the client's body was already consumed. Replaying
+/// such an attempt would dispatch a body-less request the backend accepts as a
+/// complete one — a silent truncation of a non-idempotent call. This predicate
+/// is the input to that refusal.
+///
+/// Fails closed: anything not provably an absent or zero-length body counts as
+/// declared, including any `Transfer-Encoding` and any `Content-Length` the
+/// gateway cannot parse as zero. `check_protocol_headers` has already rejected
+/// conflicting and malformed length declarations before routing, so the
+/// remaining ambiguity is narrow.
+///
+/// The pristine field-line representation is authoritative (a `before_proxy`
+/// transform can rewrite the materialized map); the materialized map is the
+/// fallback for paths that already consumed the raw headers. Cold path only —
+/// evaluated once per retry-enabled request, never on the non-retrying
+/// dispatch.
+pub(crate) fn inbound_request_declares_body(ctx: &RequestContext) -> bool {
+    let mut transfer_encodings = ctx.raw_header_value_bytes("transfer-encoding");
+    if transfer_encodings.next().is_some() || ctx.headers.contains_key("transfer-encoding") {
+        return true;
+    }
+    let mut saw_raw_content_length = false;
+    for value in ctx.raw_header_value_bytes("content-length") {
+        saw_raw_content_length = true;
+        if !content_length_field_line_is_zero(value) {
+            return true;
+        }
+    }
+    if saw_raw_content_length {
+        return false;
+    }
+    ctx.headers
+        .get("content-length")
+        .is_some_and(|value| !content_length_field_line_is_zero(value.as_bytes()))
+}
+
+/// The retry loop's replay-safety gate: whether a replay attempt would carry
+/// the same request body the client sent.
+///
+/// `inbound_declares_body` is [`inbound_request_declares_body`] evaluated once
+/// per retry-enabled request; `retained_body_present` is whether the initial
+/// dispatch handed back a retained body to replay. A declared body with nothing
+/// retained means the first attempt died before body preparation and the body is
+/// gone — replaying it would truncate the request, so the loop must refuse.
+///
+/// Single source of truth for the decision so the guard and its regression
+/// coverage cannot drift.
+#[inline]
+pub(crate) fn retry_replay_preserves_request_body(
+    inbound_declares_body: bool,
+    retained_body_present: bool,
+) -> bool {
+    retained_body_present || !inbound_declares_body
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RequestBodyPhaseRequirements {
     pub required: bool,
@@ -29612,6 +29683,12 @@ async fn handle_proxy_request_inner(
     // mesh retry actually occurs, while the plugin-facing map remains the
     // authority for mutations on every attempt.
     let mesh_retry_headers = has_retry.then(|| ctx.raw_headers_snapshot()).flatten();
+    // Wire-declared request body, captured once before the initial dispatch
+    // consumes it. The retry loop refuses to replay when the client declared a
+    // body that no attempt ever retained — see the guard at the top of the loop
+    // for why `retained_body` can legitimately be absent after a failed first
+    // attempt. Only retry-enabled requests evaluate it.
+    let inbound_declares_request_body = has_retry && inbound_request_declares_body(&ctx);
     // The reqwest pin is now an optimization rather than the correctness
     // boundary: every streaming response arm can drive inspectors. Evaluate it
     // from the finalized context so a body transform that adds/removes
@@ -29938,6 +30015,43 @@ async fn handle_proxy_request_inner(
         };
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
+            // Never replay a request whose declared body was never retained.
+            //
+            // DNS resolution and the backend egress screen both run AHEAD of
+            // request-body preparation in `proxy_to_backend_inner`, so a first
+            // attempt that fails there returns a pre-wire `connection_error`
+            // (`DnsLookupError`, `DispatchPolicyRejected`) with
+            // `retained_body: None` — while the client's body has already been
+            // consumed by that attempt. Replaying would then dispatch an EMPTY
+            // body the backend accepts as a complete request, silently
+            // truncating a non-idempotent call and reporting it as proxied
+            // normally.
+            //
+            // Fail closed instead: break with the first attempt's error intact
+            // so the client sees the real failure. This gate sits at the very
+            // top of the loop — ahead of target selection, breaker accounting,
+            // and backoff — so the post-loop path attributes the attempt exactly
+            // as an unretried one, and it covers ALL THREE replay transports
+            // (mesh HBONE/mTLS, native H3, reqwest) because every one of them
+            // dispatches from `retained_body` further down this same body.
+            //
+            // `retained_body` is bound once from the initial dispatch and never
+            // reassigned inside the loop, so this decision is stable across
+            // iterations.
+            if !retry_replay_preserves_request_body(
+                inbound_declares_request_body,
+                retained_body.is_some(),
+            ) {
+                warn!(
+                    proxy_id = %proxy.id,
+                    attempt = attempt,
+                    error_class = ?result.error_class,
+                    connection_error = result.connection_error,
+                    "Refusing to replay a request whose declared body was never retained"
+                );
+                break;
+            }
+
             // Resolve and validate the next retry target before charging this
             // failure as an intermediate attempt or entering backoff. A
             // path-changing candidate will not be dispatched, so leave final

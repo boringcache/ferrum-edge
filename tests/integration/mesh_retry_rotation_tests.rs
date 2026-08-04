@@ -6,10 +6,21 @@
 //! `direct_http_mesh_transport_refusal` screen the generic HTTP retry loop
 //! consults before a plaintext dial, covering all three fail-closed shapes
 //! (HBONE, sidecar mTLS, and cross-cluster-only).
+//!
+//! It also covers the replay-safety gate at the top of the same retry loop: a
+//! first attempt that fails BEFORE request-body preparation (DNS resolution and
+//! the backend egress screen both precede it) leaves nothing to replay, and the
+//! loop must refuse rather than dispatch a body-less copy of a request the
+//! client sent a body with.
 
-use ferrum_edge::_test_support::direct_http_mesh_transport_refusal_for_test;
+use ferrum_edge::_test_support::{
+    direct_http_mesh_transport_refusal_for_test, inbound_request_declares_body_for_test,
+    retry_replay_preserves_request_body_for_test,
+};
 use ferrum_edge::LoadBalancerCache;
 use ferrum_edge::config::types::{GatewayConfig, UpstreamTarget};
+use ferrum_edge::plugins::RequestContext;
+use http::HeaderMap;
 use std::sync::Arc;
 
 /// Returns the `Arc<UpstreamTarget>` the production load balancer hands the
@@ -131,5 +142,90 @@ fn retry_rotation_refuses_cross_cluster_only_target_for_direct_dial() {
         direct_http_mesh_transport_refusal_for_test(&retry),
         Some("cross-cluster mesh transport dispatch required for this backend target"),
         "cross-cluster-only rotation must not admit a plaintext direct dial"
+    );
+}
+
+/// Build a request context carrying `raw` as its pristine inbound field lines,
+/// materialized exactly as the proxy path does before plugins run.
+fn request_ctx_with_raw_headers(method: &str, raw: HeaderMap) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        "/upload".to_string(),
+    );
+    ctx.set_raw_headers(raw);
+    ctx.materialize_headers();
+    ctx
+}
+
+fn raw_header(name: &'static str, value: &str) -> HeaderMap {
+    let mut raw = HeaderMap::new();
+    raw.insert(
+        http::HeaderName::from_static(name),
+        http::HeaderValue::from_str(value).expect("header value"),
+    );
+    raw
+}
+
+#[test]
+fn declared_body_without_a_retained_copy_is_never_replayed() {
+    // A POST whose first attempt died at DNS resolution — before
+    // `prepare_mesh_request_body` / the reqwest collect ever ran — has no
+    // retained body, but the client's body was already consumed. Replaying it
+    // would truncate a non-idempotent request.
+    let ctx = request_ctx_with_raw_headers("POST", raw_header("content-length", "1024"));
+    let declares = inbound_request_declares_body_for_test(&ctx);
+    assert!(declares, "content-length: 1024 declares a request body");
+    assert!(
+        !retry_replay_preserves_request_body_for_test(declares, false),
+        "a declared body with nothing retained must refuse replay on every transport"
+    );
+}
+
+#[test]
+fn chunked_upload_without_a_retained_copy_is_never_replayed() {
+    let ctx = request_ctx_with_raw_headers("POST", raw_header("transfer-encoding", "chunked"));
+    let declares = inbound_request_declares_body_for_test(&ctx);
+    assert!(declares, "a transfer-encoding field line declares a request body");
+    assert!(
+        !retry_replay_preserves_request_body_for_test(declares, false),
+        "a chunked upload with nothing retained must refuse replay"
+    );
+}
+
+#[test]
+fn unparseable_content_length_refuses_replay_fail_closed() {
+    // `check_protocol_headers` rejects malformed lengths before routing, so this
+    // shape should be unreachable — the gate still fails closed rather than
+    // treating an unparseable declaration as "no body".
+    let ctx = request_ctx_with_raw_headers("POST", raw_header("content-length", "not-a-number"));
+    let declares = inbound_request_declares_body_for_test(&ctx);
+    assert!(declares, "an unparseable content-length is not a zero-length body");
+    assert!(!retry_replay_preserves_request_body_for_test(declares, false));
+}
+
+#[test]
+fn bodyless_request_still_retries_normally() {
+    let ctx = request_ctx_with_raw_headers("GET", raw_header("accept", "application/json"));
+    let declares = inbound_request_declares_body_for_test(&ctx);
+    assert!(!declares);
+    assert!(
+        retry_replay_preserves_request_body_for_test(declares, false),
+        "a request that declared no body must keep retrying pre-wire failures"
+    );
+
+    let zero_length = request_ctx_with_raw_headers("POST", raw_header("content-length", "0"));
+    let zero_declares = inbound_request_declares_body_for_test(&zero_length);
+    assert!(!zero_declares);
+    assert!(retry_replay_preserves_request_body_for_test(zero_declares, false));
+}
+
+#[test]
+fn declared_body_with_a_retained_copy_still_replays() {
+    let ctx = request_ctx_with_raw_headers("POST", raw_header("content-length", "1024"));
+    let declares = inbound_request_declares_body_for_test(&ctx);
+    assert!(
+        retry_replay_preserves_request_body_for_test(declares, true),
+        "the ordinary post-buffering retry path must be unaffected by the gate"
     );
 }

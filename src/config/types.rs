@@ -2922,23 +2922,6 @@ pub(crate) fn proxy_retry_is_effective(
     }
 }
 
-/// Admission hook shared by full-config and admin-resource validation.
-///
-/// Retry no longer conflicts with HBONE or sidecar mTLS: dispatch resolves the
-/// exact selected target's effective transport and policy on every attempt.
-/// Therefore no target produces an admission conflict; validation callers keep
-/// using the shared hook so every write/import surface has identical behavior.
-pub(crate) fn first_effective_mesh_transport_conflict_with_mesh(
-    _proxy: &Proxy,
-    _upstream: &Upstream,
-    _selected_subset: Option<&str>,
-    _retry: Option<&RetryConfig>,
-    _allowed_methods: Option<&[String]>,
-    _mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
-) -> Option<MeshTransportConflict> {
-    None
-}
-
 /// Project a single referenced upstream's per-port / top-level connection
 /// policy onto a throwaway proxy clone for per-resource admission paths.
 ///
@@ -2965,45 +2948,6 @@ pub(crate) fn proxy_with_resolved_port_caps(proxy: &Proxy, upstream: &Upstream) 
     resolved.dispatch_port_override_fallback =
         dispatch_port_override_fallback_from_upstream(upstream);
     resolved
-}
-
-/// A mesh-transport requirement that conflicts with an effective retry policy.
-pub(crate) struct MeshTransportConflict {
-    /// The conflicting transport tag (`"mesh.hbone"` / `"mesh.mtls"`).
-    transport: &'static str,
-    /// Human-readable source of the requirement (a target or `mesh service
-    /// discovery`).
-    detail: String,
-}
-
-/// A `mesh_route_dispatch` upstream override destination paired with the
-/// effective retry policy the runtime applies when that rule matches.
-struct MeshRouteOverrideDest {
-    /// The override `upstream_id` (`route_override_upstream_id`).
-    upstream_id: String,
-    /// The retry policy in force for requests this rule routes: the rule's own
-    /// `retry`, `None` when the rule disables retry, or the proxy's base retry
-    /// when the rule leaves retry untouched.
-    effective_retry: Option<RetryConfig>,
-    /// The upstream subset the runtime selects for this override. A rule that
-    /// keeps the proxy's default upstream preserves `proxy.upstream_subset`
-    /// (`apply_route_overrides_inner` only clears it when the upstream changes);
-    /// a different-upstream rule drops the subset (the new upstream has its own
-    /// targets), so this is `None` there. Used so the conflict check filters the
-    /// same target set the load balancer would.
-    selected_subset: Option<String>,
-}
-
-/// Build the canonical retry/mesh-transport conflict error message.
-pub(crate) fn mesh_transport_retry_conflict_message(
-    proxy_id: &str,
-    upstream_id: &str,
-    conflict: &MeshTransportConflict,
-) -> String {
-    format!(
-        "Proxy '{}' enables retry but upstream_id '{}' {} requires {} dispatch; retry over required mesh transports is not supported",
-        proxy_id, upstream_id, conflict.detail, conflict.transport
-    )
 }
 
 /// Outcome of screening one enabled plugin config for backend-TLS SNI
@@ -4233,18 +4177,6 @@ impl GatewayConfig {
                                 ));
                             }
                         }
-                        if let Some(required) = first_effective_mesh_transport_conflict_with_mesh(
-                            proxy,
-                            upstream,
-                            proxy.upstream_subset.as_deref(),
-                            proxy.retry.as_ref(),
-                            proxy.allowed_methods.as_deref(),
-                            self.mesh.as_deref(),
-                        ) {
-                            errors.push(mesh_transport_retry_conflict_message(
-                                &proxy.id, uid, &required,
-                            ));
-                        }
                     }
                     None => {
                         errors.push(format!(
@@ -4252,39 +4184,6 @@ impl GatewayConfig {
                             proxy.id, uid
                         ));
                     }
-                }
-            }
-
-            // Route-level upstream overrides (mesh_route_dispatch) can send
-            // matched traffic to a *different* upstream than `proxy.upstream_id`.
-            // A retry-enabled proxy whose default upstream is plain but whose
-            // route rules target a mesh-tagged upstream would otherwise load and
-            // then 502 those matched requests. Validate the override
-            // destinations against the same conflict check, using each rule's
-            // EFFECTIVE retry (the rule can add/replace/disable retry, which the
-            // runtime applies via `route_override_retry` before dispatch).
-            for override_dest in self.mesh_route_dispatch_override_destinations(proxy) {
-                if let Some(upstream) = upstreams_by_key
-                    .get(&(proxy.namespace.as_str(), override_dest.upstream_id.as_str()))
-                    && let Some(required) = first_effective_mesh_transport_conflict_with_mesh(
-                        // The runtime recomputes `dispatch_port_overrides` from the
-                        // OVERRIDE destination upstream when a rule swaps the
-                        // upstream (`apply_route_overrides_inner`), so the per-port
-                        // retry cap must come from that upstream, not the proxy's
-                        // default-upstream-derived caps.
-                        &proxy_with_resolved_port_caps(proxy, upstream),
-                        upstream,
-                        override_dest.selected_subset.as_deref(),
-                        override_dest.effective_retry.as_ref(),
-                        proxy.allowed_methods.as_deref(),
-                        self.mesh.as_deref(),
-                    )
-                {
-                    errors.push(mesh_transport_retry_conflict_message(
-                        &proxy.id,
-                        override_dest.upstream_id.as_str(),
-                        &required,
-                    ));
                 }
             }
 
@@ -4309,150 +4208,6 @@ impl GatewayConfig {
         } else {
             Err(errors)
         }
-    }
-
-    /// Collect the upstream overrides this proxy's enabled `mesh_route_dispatch`
-    /// plugin instances can route matched traffic to (via
-    /// `route_override_upstream_id`), each paired with the EFFECTIVE retry the
-    /// runtime applies for that rule.
-    ///
-    /// Both proxy-scoped/proxy_group associations (`proxy.plugins`) and **global**
-    /// `mesh_route_dispatch` plugin configs are considered, because the plugin
-    /// cache merges global plugins into every proxy's chain — a global dispatch
-    /// rule routes matched requests even when the proxy has no local association.
-    /// The one exception: when this proxy attaches its own enabled
-    /// `mesh_route_dispatch` instance, `PluginCache::build_cache` shadows the
-    /// globals of the same name, so they never run for this proxy and their rules
-    /// must NOT be collected (otherwise a conflict in a shadowed global produces a
-    /// spurious admission rejection).
-    ///
-    /// The rule's effective retry mirrors `MeshRouteDispatchPlugin`'s
-    /// `route_override_retry` semantics: a rule with `retry` replaces the base
-    /// policy, `retry_disabled` clears it, and an unset rule inherits the proxy's
-    /// base `retry`. A rule that names the proxy's own default upstream is skipped
-    /// *only* when it leaves retry untouched (the default-upstream check already
-    /// covers that base retry); a same-upstream rule that adds or replaces retry
-    /// is still collected, because the runtime applies `route_override_retry`
-    /// before dispatch regardless of whether the upstream changed. Returns an
-    /// empty vec when no rule contributes a conflict to check.
-    fn mesh_route_dispatch_override_destinations(
-        &self,
-        proxy: &Proxy,
-    ) -> Vec<MeshRouteOverrideDest> {
-        let mut overrides: Vec<MeshRouteOverrideDest> = Vec::new();
-        let default_uid = proxy.upstream_id.as_deref().unwrap_or("");
-        let mut collect = |plugin: &PluginConfig| {
-            if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
-                return;
-            }
-            let Ok(dispatch) =
-                crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value(
-                    &plugin.config,
-                )
-            else {
-                return;
-            };
-            for rule in &dispatch.rules {
-                // A redirect rule answers the request itself
-                // (`build_redirect_response` short-circuits before any
-                // `route_override_upstream_id` is set), so it never dispatches to
-                // `destination.upstream_id` even when one is present. Collecting it
-                // would spuriously reject a retry-enabled proxy whose redirect rule
-                // names a mesh upstream that no matched request ever reaches.
-                if rule.redirect.is_some() {
-                    continue;
-                }
-                let Some(override_uid) = rule.destination.upstream_id.as_deref() else {
-                    continue;
-                };
-                // A rule that points at the proxy's own default upstream but
-                // leaves retry untouched is already covered by the
-                // default-upstream conflict check; skip it to avoid a duplicate.
-                // When the rule changes retry (adds its own or disables it),
-                // runtime still overwrites `proxy.retry` via `route_override_retry`
-                // before dispatch, so it must be evaluated even for the default
-                // upstream.
-                let rule_changes_retry = rule.retry.is_some() || rule.retry_disabled;
-                if override_uid == default_uid && !rule_changes_retry {
-                    continue;
-                }
-                // Effective retry the runtime would apply for this matched rule.
-                //
-                // Residual (accepted): a rule's own request-method predicate
-                // (`rule.match.methods`) is intentionally NOT modeled here, so two
-                // narrow over-rejections remain. (1) When the rule restricts itself
-                // to methods outside its own `retryable_methods` (status-code
-                // retries only), no request reaching the override can retry. (2)
-                // When the rule's method predicate is disjoint from the proxy's
-                // `allowed_methods` (e.g. proxy allows only POST, rule matches only
-                // GET), method admission rejects every such request before plugins
-                // run, so the override is unreachable. Both could be filtered by
-                // intersecting the rule's method predicate, but `match.methods`
-                // supports prefix/regex matchers (see `MethodMatcher`) that cannot
-                // be statically intersected with the concrete `allowed_methods`
-                // list, and the lenient case-insensitive `allowed_methods` admission
-                // vs the rule's case-sensitive `Exact` matching makes even an
-                // exact-only model unsafe (it would introduce fresh under-rejection).
-                // `proxy_retry_is_effective` still gates on `allowed_methods`, so the
-                // residual is confined to these method-gated mesh-override rules.
-                let effective_retry = if rule.retry.is_some() {
-                    rule.retry.clone()
-                } else if rule.retry_disabled {
-                    None
-                } else {
-                    proxy.retry.clone()
-                };
-                // Runtime preserves `proxy.upstream_subset` only when the rule
-                // keeps the default upstream; a different-upstream override drops
-                // it.
-                let selected_subset = if override_uid == default_uid {
-                    proxy.upstream_subset.clone()
-                } else {
-                    None
-                };
-                if !overrides.iter().any(|existing| {
-                    existing.upstream_id == override_uid
-                        && existing.effective_retry == effective_retry
-                        && existing.selected_subset == selected_subset
-                }) {
-                    overrides.push(MeshRouteOverrideDest {
-                        upstream_id: override_uid.to_string(),
-                        effective_retry,
-                        selected_subset,
-                    });
-                }
-            }
-        };
-        // A proxy-scoped or proxy_group-scoped `mesh_route_dispatch` instance
-        // attached via `proxy.plugins` shadows every global of the same name
-        // (`PluginCache::build_cache` removes globals whose `name()` matches a
-        // local instance), so the globals' rules never run for this proxy.
-        let mut shadows_global_dispatch = false;
-        for assoc in &proxy.plugins {
-            if let Some(plugin) = self
-                .plugin_configs
-                .iter()
-                .find(|pc| pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id)
-            {
-                if plugin.enabled && plugin.plugin_name == "mesh_route_dispatch" {
-                    shadows_global_dispatch = true;
-                }
-                collect(plugin);
-            }
-        }
-        if !shadows_global_dispatch {
-            for plugin in &self.plugin_configs {
-                // Deliberately NOT namespace-filtered: the association lookup
-                // above is namespace-local, but globals run on every proxy in
-                // every namespace at runtime. Skipping other tenants' globals
-                // here would hide their override destinations from
-                // `validate_upstream_references`' mesh-transport screen.
-                if plugin.scope == PluginScope::Global {
-                    collect(plugin);
-                }
-            }
-        }
-        overrides
     }
 
     /// Validate plugin resource invariants and proxy/plugin associations.
