@@ -369,8 +369,9 @@ phases.
 - Unit tests in `tests/unit_tests.rs`
 - Inline `#[cfg(test)]` modules in `src/`
 - Secret backend tests compile once with Vault/AWS/GCP/Azure enabled and use
-  nextest `--no-fail-fast`; service integration likewise runs Consul and LDAP
-  in one independently reported invocation.
+  nextest `--no-fail-fast`; service integration likewise runs Consul, LDAP,
+  Kafka, MySQL, OIDC, and OAuth2 introspection in one independently reported
+  invocation.
 - Integration tests split across two shards (`admin-platform`,
   `mesh-protocols`). Each shard runs the prebuilt `integration_tests` nextest
   archive with a visible list of `integration::<file_module>` positional

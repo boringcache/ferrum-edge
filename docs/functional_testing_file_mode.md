@@ -396,7 +396,7 @@ current functional coverage (most suites already run file-mode gateways).
 
 ### Exact residual
 
-- Live OIDC / OAuth2 introspection integration coverage — [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333)
+- Live OIDC / OAuth2 introspection integration coverage — [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333) (delivered in service-integration)
 
 ### Explicit non-goal
 
