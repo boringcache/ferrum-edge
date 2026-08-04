@@ -571,7 +571,12 @@ fn configmap_ca_bundle_pem_for_object(configmap: &K8sObject) -> Option<String> {
     let Ok(pem) = String::from_utf8(bytes) else {
         return None;
     };
-    validate_inline_ca_bundle_pem(&pem).map(|_| pem)
+    // Validate against a borrow, then hand back the owned bundle. `.map(|_| pem)`
+    // would move `pem` into the closure while the validation borrow is still
+    // live (E0505), and cloning just to satisfy the borrow checker would copy
+    // the whole bundle on every ConfigMap read.
+    validate_inline_ca_bundle_pem(&pem)?;
+    Some(pem)
 }
 
 fn validate_inline_ca_bundle_pem(pem: &str) -> Option<&str> {
