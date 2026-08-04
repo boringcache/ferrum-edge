@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::admin::api_specs::bounded_yaml::parse_yaml_to_json;
 use crate::admin::api_specs::extractor::MAX_SOURCE_DOCUMENT_NODES;
 use crate::admin::api_specs::{
-    ExtractError, ExtractedBundle, SpecFormat, extract, hash_resource_bundle,
+    ExtractError, ExtractedBundle, SpecFormat, extract_with_external_refs, hash_resource_bundle,
 };
 use crate::admin::audit::{self, AuditActor};
 use crate::admin::spec_codec;
@@ -2466,6 +2466,15 @@ fn build_spec_row(
     let content_hash = spec_codec::sha256_hex(body);
     let resource_hash = hash_resource_bundle(bundle)
         .map_err(|e| ApiSpecError::Internal(format!("resource hash failed: {e}")))?;
+    let (external_ref_snapshot, external_ref_digest) = match &metadata.external_ref_snapshot {
+        Some(snapshot) => {
+            let bytes = snapshot.gzip_bytes().map_err(|e| {
+                ApiSpecError::Internal(format!("external_ref_snapshot compress failed: {e}"))
+            })?;
+            (Some(bytes), Some(snapshot.snapshot_digest.clone()))
+        }
+        None => (None, None),
+    };
     let now = Utc::now();
     Ok(ApiSpec {
         id,
@@ -2488,6 +2497,8 @@ fn build_spec_row(
         server_urls: metadata.server_urls.clone(),
         operation_count: metadata.operation_count,
         resource_hash,
+        external_ref_snapshot,
+        external_ref_digest,
         created_at: now,
         updated_at: now,
     })
@@ -2893,22 +2904,45 @@ fn json_resp(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
 /// namespace submitting large specs cannot starve another.
 const MAX_CONCURRENT_SPEC_EXTRACTIONS: usize = 4;
 
-static SPEC_EXTRACTION_SLOTS: LazyLock<Semaphore> =
-    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_SPEC_EXTRACTIONS));
+static SPEC_EXTRACTION_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_SPEC_EXTRACTIONS)));
 
 /// Run spec extraction under the bounded-admission gate.
 async fn extract_admitted(
     body: &[u8],
     declared_format: Option<SpecFormat>,
     namespace: &str,
+    state: &AdminState,
 ) -> Result<(ExtractedBundle, crate::admin::api_specs::SpecMetadata), ApiSpecError> {
     // INVARIANT: `SPEC_EXTRACTION_SLOTS` is a process-lifetime static that is
     // never closed, so `acquire` cannot fail here. Fail closed rather than
     // running an unadmitted extraction if that ever changes.
-    let _permit = SPEC_EXTRACTION_SLOTS.acquire().await.map_err(|_| {
-        ApiSpecError::AdmissionUnavailable("spec extraction admission unavailable".to_string())
-    })?;
-    extract(body, declared_format, namespace).map_err(ApiSpecError::Extract)
+    let permit = Arc::clone(&SPEC_EXTRACTION_SLOTS)
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            ApiSpecError::AdmissionUnavailable("spec extraction admission unavailable".to_string())
+        })?;
+    let body = body.to_vec();
+    let namespace = namespace.to_string();
+    let policy = Arc::clone(&state.external_ref_policy);
+    let loader = Arc::clone(&state.external_ref_loader);
+    // Move the semaphore permit into the worker so cancellation of the request
+    // future cannot release capacity while its non-cancellable blocking task is
+    // still running. The HTTP loader uses this Tokio runtime's handle there.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        extract_with_external_refs(
+            &body,
+            declared_format,
+            &namespace,
+            policy.as_ref(),
+            loader.as_ref(),
+        )
+    })
+    .await
+    .map_err(|_| ApiSpecError::Internal("spec extraction worker failed".to_string()))?
+    .map_err(ApiSpecError::Extract)
 }
 
 pub async fn handle_post_api_spec(
@@ -2936,10 +2970,11 @@ pub async fn handle_post_api_spec(
     };
 
     // Extract resources from the spec body.
-    let (mut bundle, metadata) = match extract_admitted(&body, declared_format, namespace).await {
-        Ok(v) => v,
-        Err(e) => return Ok(error_response(e)),
-    };
+    let (mut bundle, metadata) =
+        match extract_admitted(&body, declared_format, namespace, state).await {
+            Ok(v) => v,
+            Err(e) => return Ok(error_response(e)),
+        };
 
     // Assign IDs for POST: mint UUIDs for every empty ID, re-link references.
     assign_ids_for_post(&mut bundle);
@@ -3107,10 +3142,11 @@ pub async fn handle_put_api_spec(
     };
 
     // Extract resources from the spec body.
-    let (mut bundle, metadata) = match extract_admitted(&body, declared_format, namespace).await {
-        Ok(v) => v,
-        Err(e) => return Ok(error_response(e)),
-    };
+    let (mut bundle, metadata) =
+        match extract_admitted(&body, declared_format, namespace, state).await {
+            Ok(v) => v,
+            Err(e) => return Ok(error_response(e)),
+        };
 
     // Serialize every graph-relevant read below through replacement
     // persistence. Re-read the spec after acquiring the guard so a concurrent
@@ -3396,8 +3432,10 @@ pub async fn handle_list_api_specs(
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
-    // Build summary items — intentionally OMIT spec_content (heavy blob) and
-    // resource_hash (internal implementation detail, not for client display).
+    // Build summary items — intentionally OMIT spec_content / external snapshot
+    // bytes (heavy private blobs) and resource_hash (internal implementation
+    // detail, not for client display). The non-secret snapshot integrity digest
+    // is part of the public summary contract.
     let items: Vec<Value> = paginated
         .items
         .iter()
@@ -3419,6 +3457,7 @@ pub async fn handle_list_api_specs(
                 "operation_count": s.operation_count,
                 "uncompressed_size": s.uncompressed_size,
                 "content_hash": s.content_hash,
+                "external_ref_digest": s.external_ref_digest,
                 "created_at": s.created_at,
                 "updated_at": s.updated_at,
             })

@@ -3720,6 +3720,39 @@ pub fn render_prometheus() -> String {
     )
 }
 
+/// Refresh maintained owned-usage gauges for every accepted sink from a bounded
+/// on-disk inventory. Status/Prometheus scrapes never call this; external tests
+/// use it after planting files outside the writer path.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn reconcile_active_spool_usage_for_tests() {
+    for runtime in active_sinks().load_full().values() {
+        if let Some(spool) = runtime.spool.as_ref() {
+            let _ = spool.reconcile_cached_usage();
+        }
+    }
+}
+
+/// Sum of owned-spool inventory walks across every accepted sink.
+///
+/// External tests use this to prove status/Prometheus rendering itself does not
+/// perform the walk.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn active_spool_inventory_walks_for_tests() -> u64 {
+    active_sinks()
+        .load_full()
+        .values()
+        .map(|runtime| {
+            runtime
+                .spool
+                .as_ref()
+                .map(|spool| spool.inventory_walks_for_tests())
+                .unwrap_or(0)
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
 fn disabled_status_snapshot() -> Value {
     let (pending, pending_bytes, oldest_age, _full, _compact) =
         pending_snapshot_finalization_stats();
@@ -3841,7 +3874,7 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
         );
         if let Some(spool) = runtime.spool.as_ref() {
             spool_enabled_any = true;
-            let stats = spool.scan_stats().unwrap_or_default();
+            let stats = spool.cached_stats();
             spool_files = spool_files.saturating_add(stats.files);
             spool_bytes = spool_bytes.saturating_add(stats.bytes);
             if !runtime.metrics.spool_available.load(Ordering::Acquire) {
@@ -3892,7 +3925,7 @@ impl SinkRuntime {
     fn status_snapshot(&self) -> Value {
         let (spool_enabled, spool_files, spool_bytes) = match self.spool.as_ref() {
             Some(spool) => {
-                let stats = spool.scan_stats().unwrap_or_default();
+                let stats = spool.cached_stats();
                 (true, stats.files, stats.bytes)
             }
             None => (false, 0, 0),
@@ -4139,7 +4172,7 @@ fn render_prometheus_for_sinks(
         let spool_stats = runtime
             .spool
             .as_ref()
-            .and_then(|spool| spool.scan_stats().ok())
+            .map(|spool| spool.cached_stats())
             .unwrap_or_default();
         spool_bytes = spool_bytes.saturating_add(spool_stats.bytes);
         spool_files = spool_files.saturating_add(spool_stats.files);
@@ -4289,12 +4322,12 @@ fn render_prometheus_for_sinks(
         ));
     }
     output.push_str(
-        "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files).\n",
+        "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, in-flight claim, corrupt, and dead-lettered files).\n",
     );
     output.push_str("# TYPE chargeback_sink_spool_bytes gauge\n");
     output.push_str(&format!("chargeback_sink_spool_bytes {}\n", spool_bytes));
     output.push_str(
-        "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, corrupt, and dead-lettered files).\n",
+        "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, in-flight claim, corrupt, and dead-lettered files).\n",
     );
     output.push_str("# TYPE chargeback_sink_spool_files gauge\n");
     output.push_str(&format!("chargeback_sink_spool_files {}\n", spool_files));
@@ -5479,6 +5512,63 @@ pub struct SpoolStats {
     pub bytes: u64,
 }
 
+/// Authoritative owned-file/byte gauges maintained across write, eviction,
+/// replay, quarantine, dead-letter, and cleanup transitions.
+///
+/// Status and Prometheus scrapes read these atomics (or the last successful
+/// reconcile publish) instead of walking the spool. Background workers refresh
+/// absolute on-disk truth through a bounded `spawn_blocking` inventory and keep
+/// the previous values when that reconcile fails.
+#[derive(Debug, Default)]
+struct SpoolUsageCounters {
+    files: AtomicU64,
+    bytes: AtomicU64,
+    /// Test-only observation of how many times this manager inventoried owned
+    /// spool metadata. Production scrapes must not increment it.
+    inventory_walks: AtomicU64,
+}
+
+impl SpoolUsageCounters {
+    fn snapshot(&self) -> SpoolStats {
+        SpoolStats {
+            files: self.files.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn publish(&self, stats: SpoolStats) {
+        self.files.store(stats.files, Ordering::Relaxed);
+        self.bytes.store(stats.bytes, Ordering::Relaxed);
+    }
+
+    fn account_add(&self, files: u64, bytes: u64) {
+        let _ = self
+            .files
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(files))
+            });
+        let _ = self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(bytes))
+            });
+    }
+
+    fn account_sub(&self, files: u64, bytes: u64) {
+        // Filesystem races (peer unlink, duplicate finalize) must never wrap.
+        let _ = self
+            .files
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(files))
+            });
+        let _ = self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(bytes))
+            });
+    }
+}
+
 /// One owned spool artifact with the size used for quota accounting.
 #[derive(Debug, Clone)]
 struct OwnedSpoolEntry {
@@ -6194,6 +6284,8 @@ pub struct SpoolManager {
     /// Canonicalized namespace root, resolved once the tree exists.
     canonical_root: OnceLock<PathBuf>,
     metrics: Arc<SinkMetrics>,
+    /// Maintained owned-file/byte gauges for status and Prometheus scrapes.
+    usage: SpoolUsageCounters,
     last_drop_warn_at: AtomicI64,
     last_unbound_warn_at: AtomicI64,
     live_storage_prepared: AtomicBool,
@@ -6244,6 +6336,7 @@ impl SpoolManager {
             namespace_root,
             canonical_root: OnceLock::new(),
             metrics: options.metrics,
+            usage: SpoolUsageCounters::default(),
             last_drop_warn_at: AtomicI64::new(0),
             last_unbound_warn_at: AtomicI64::new(0),
             live_storage_prepared: AtomicBool::new(false),
@@ -6570,6 +6663,31 @@ impl SpoolManager {
         self.list_owned_spool_files()
     }
 
+    /// Publish absolute owned-file/byte gauges from a bounded on-disk inventory.
+    ///
+    /// External tests use this after planting files outside the writer path, and
+    /// to prove status/Prometheus scrapes read maintained counters rather than
+    /// performing the walk themselves.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn reconcile_cached_usage_for_tests(&self) -> Result<SpoolStats, String> {
+        self.reconcile_cached_usage()
+    }
+
+    /// Lock-light view of the maintained owned-file/byte gauges.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn cached_stats_for_tests(&self) -> SpoolStats {
+        self.cached_stats()
+    }
+
+    /// How many owned-spool inventory walks this manager has performed.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn inventory_walks_for_tests(&self) -> u64 {
+        self.usage.inventory_walks.load(Ordering::Relaxed)
+    }
+
     /// Run quota eviction under the writer lock and return the planning report.
     ///
     /// External tests use this to assert multi-file reclaim is driven by one
@@ -6705,6 +6823,7 @@ impl SpoolManager {
         // The reservation on the encoded artifact is released only here, after
         // the blocking write, fsync, and rename have all completed.
         drop(bytes);
+        self.usage.account_add(1, incoming_len);
         invalidate_status_cache();
         Ok(final_path)
     }
@@ -6876,6 +6995,9 @@ impl SpoolManager {
         self.scan_unbound_records();
         self.recover_expired_claims()?;
         self.reconcile_stale_temp_files()?;
+        // Seed authoritative gauges from the post-recovery tree before the
+        // first status/metrics scrape can observe this generation.
+        self.publish_usage_from_inventory_locked()?;
         self.live_storage_prepared.store(true, Ordering::Release);
         Ok(())
     }
@@ -7031,8 +7153,39 @@ impl SpoolManager {
         Ok(())
     }
 
-    pub fn scan_stats(&self) -> Result<SpoolStats, String> {
+    /// Full owned-spool inventory for external tests that need on-disk truth.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn scan_stats_for_tests(&self) -> Result<SpoolStats, String> {
         Ok(self.inventory_owned_spool_files()?.stats)
+    }
+
+    /// Lock-light owned-file/byte gauges for status and Prometheus scrapes.
+    ///
+    /// Never walks or stats the spool tree. Values are maintained by writer,
+    /// replay, quarantine, deletion, and background reconcile transitions.
+    fn cached_stats(&self) -> SpoolStats {
+        self.usage.snapshot()
+    }
+
+    /// Replace maintained gauges from a bounded on-disk inventory under the
+    /// writer lock. On inventory failure the previous last-good values are kept.
+    fn reconcile_cached_usage(&self) -> Result<SpoolStats, String> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        self.publish_usage_from_inventory_locked()
+    }
+
+    fn publish_usage_from_inventory_locked(&self) -> Result<SpoolStats, String> {
+        let stats = self.inventory_owned_spool_files()?.stats;
+        let previous = self.usage.snapshot();
+        self.usage.publish(stats);
+        if previous != stats {
+            invalidate_status_cache();
+        }
+        Ok(stats)
     }
 
     /// Collect owned `(path, size)` metadata once, sorted oldest-first.
@@ -7040,6 +7193,7 @@ impl SpoolManager {
     /// Quota eviction plans from this snapshot so reclaiming K files never
     /// repeats a full directory walk/sort per deletion.
     fn inventory_owned_spool_files(&self) -> Result<OwnedSpoolInventory, String> {
+        self.usage.inventory_walks.fetch_add(1, Ordering::Relaxed);
         let files = self.list_owned_spool_files()?;
         let mut inventory = OwnedSpoolInventory {
             entries: Vec::with_capacity(files.len()),
@@ -7158,6 +7312,7 @@ impl SpoolManager {
                         remaining_bytes = remaining_bytes.saturating_sub(entry.len);
                         report.files_deleted = report.files_deleted.saturating_add(1);
                         report.bytes_freed = report.bytes_freed.saturating_add(entry.len);
+                        self.usage.account_sub(1, entry.len);
                         self.metrics
                             .spool_drops_total
                             .fetch_add(1, Ordering::Relaxed);
@@ -7335,8 +7490,12 @@ impl SpoolManager {
     }
 
     fn remove_stale_temp(&self, path: &Path, reason: &'static str) -> Result<(), String> {
+        let accounted_len = spool_regular_file_len(path);
         match fs::remove_file(path) {
             Ok(()) => {
+                if let Some(len) = accounted_len {
+                    self.usage.account_sub(1, len);
+                }
                 warn!(
                     plugin = PLUGIN_NAME,
                     path = %path.display(),
@@ -7582,11 +7741,23 @@ impl SpoolManager {
     }
 
     /// Remove a claim whose rows were fully delivered.
+    ///
+    /// Takes the spool mutation lock (writer lock plus the namespace
+    /// coordination lock) around unlink + gauge update so a concurrent
+    /// `reconcile_cached_usage` cannot inventory the still-present claim and
+    /// then publish absolute gauges that resurrect the deleted file/bytes.
     fn remove_delivered_claim(&self, claim: &Path) -> Result<(), String> {
         let _guard = self.lock_spool_mutation()?;
         self.assert_managed_path(claim)?;
+        let accounted_len = spool_regular_file_len(claim);
         match fs::remove_file(claim) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(len) = accounted_len {
+                    self.usage.account_sub(1, len);
+                }
+                invalidate_status_cache();
+                Ok(())
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 warn!(
                     plugin = PLUGIN_NAME,
@@ -8406,8 +8577,13 @@ impl DeadLetterPayloadWriter {
         // discard that replaceable sibling before quota admission; otherwise
         // large recovery payloads would require space for two identical finals
         // and could become permanently unrecoverable.
+        let replaced_payload_len = spool_regular_file_len(&self.final_path);
         match fs::remove_file(&self.final_path) {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Some(len) = replaced_payload_len {
+                    spool.usage.account_sub(1, len);
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(format!(
@@ -8479,6 +8655,11 @@ impl DeadLetterPayloadWriter {
             }
         }
         self._live.take();
+        // The published payload is an owned spool file. Account for it only on
+        // this success path: every failure return above unlinks the rename
+        // result, so it never entered the maintained gauges.
+        spool.usage.account_add(1, self.byte_len);
+        invalidate_status_cache();
         let file = self.file.take().ok_or_else(|| {
             format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
         })?;
@@ -8740,8 +8921,15 @@ fn write_dead_letter_meta(
     spool.assert_managed_path(&tmp_path)?;
     spool.assert_managed_path(source_path)?;
     spool.evict_until_can_admit(bytes.len() as u64)?;
+    // Measured after eviction: a reclaim that already deleted this record has
+    // accounted for it, so re-measuring here cannot double-subtract.
+    let replaced_meta_len = spool_regular_file_len(&meta_path);
     match fs::remove_file(&meta_path) {
-        Ok(()) => {}
+        Ok(()) => {
+            if let Some(len) = replaced_meta_len {
+                spool.usage.account_sub(1, len);
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(format!(
@@ -8761,6 +8949,12 @@ fn write_dead_letter_meta(
         spool.fs_ops,
         SpoolFinalOwnership::Unique,
     )?;
+    // Publish the new metadata record into the maintained gauges. Removing the
+    // authoritative source, accounting for it, and re-enforcing the owned-byte
+    // quota belong to `finalize_replayed_spool_file`, which does that only after
+    // the durable dead-letter payload revalidates.
+    spool.usage.account_add(1, bytes.len() as u64);
+    invalidate_status_cache();
     Ok(meta_path)
 }
 
@@ -8841,6 +9035,17 @@ fn is_spool_owned_file(path: &Path) -> bool {
         || is_spool_rejected_meta_file(path)
         || is_spool_rejected_payload_file(path)
         || is_spool_inflight_file(path)
+}
+
+/// Regular-file length for usage accounting. Symlinks and vanished paths yield
+/// `None` so callers keep last-good gauges and let reconcile correct drift.
+fn spool_regular_file_len(path: &Path) -> Option<u64> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_symlink() && meta.file_type().is_file() => {
+            Some(meta.len())
+        }
+        _ => None,
+    }
 }
 
 /// Unreserved reference encoder for external tests.
@@ -11002,13 +11207,33 @@ fn start_spool_replayer(
         let mut timer = tokio::time::interval(Duration::from_secs(replay_interval_secs));
         loop {
             timer.tick().await;
-            if let Err(error) = spool.prepare_live_storage() {
-                warn!(
-                    plugin = PLUGIN_NAME,
-                    error = %error,
-                    "Chargeback sink live spool preparation failed"
-                );
-                continue;
+            // Prepare and refresh owned-usage gauges off the Tokio worker so a
+            // large spool never blocks admin/metrics scrapes or unrelated tasks
+            // on this runtime thread. Scrapes never launch this work themselves.
+            let spool_for_refresh = Arc::clone(&spool);
+            match tokio::task::spawn_blocking(move || {
+                spool_for_refresh.prepare_live_storage()?;
+                spool_for_refresh.reconcile_cached_usage()
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %error,
+                        "Chargeback sink live spool preparation or usage reconcile failed"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %error,
+                        "Chargeback sink spool usage refresh worker did not complete"
+                    );
+                    continue;
+                }
             }
             if let Err(error) = replay_spool_once(&spool, &flush_config, batch_size).await {
                 warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink spool replay failed");
@@ -11582,12 +11807,19 @@ fn finalize_replayed_spool_file(
         let _guard = spool.lock_spool_mutation()?;
         spool.assert_managed_path(file)?;
         published_payload.revalidate(spool)?;
+        let source_len = spool_regular_file_len(file);
         fs::remove_file(file).map_err(|error| {
             format!(
                 "{PLUGIN_NAME}: failed to remove replay source after durable dead-letter handoff '{}': {error}",
                 file.display()
             )
         })?;
+        // The authoritative source leaves the owned inventory here, replaced by
+        // the much smaller metadata record `write_dead_letter_meta` published.
+        if let Some(len) = source_len {
+            spool.usage.account_sub(1, len);
+        }
+        invalidate_status_cache();
     }
     spool.metrics.spool_dead_letter_rows_total.fetch_add(
         u64::try_from(rejected_rows).unwrap_or(u64::MAX),

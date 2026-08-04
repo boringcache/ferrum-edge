@@ -2620,6 +2620,37 @@ impl Plugin for AiRateLimiter {
             }
         }
 
+        // A representation released to the streaming path is committed after
+        // this hook. If this request reserved nothing, terminal reconciliation
+        // cannot enforce a rejection: there is no charge to keep and it is too
+        // late to substitute a 502. Refuse that unsafe combination before the
+        // headers are committed. Streams backed by a non-zero reservation keep
+        // their incremental, bounded accounting path.
+        let response_content_type = response_headers.get("content-type").map(String::as_str);
+        let response_will_stream = !response_content_type.is_some_and(|content_type| {
+            is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
+        });
+        if !in_rejection_context
+            && (200..300).contains(&response_status)
+            && response_will_stream
+            && self.request_was_ai_call(ctx)
+            && self.reserved_tokens(ctx) == 0
+            && self.unmetered_policy_would_reject(ctx)
+        {
+            ctx.metadata.insert(
+                self.keys.unmetered_action.clone(),
+                self.on_unmetered_response.as_str().to_string(),
+            );
+            warn!(
+                limiter_instance = self.instance_id,
+                provider = %self.provider,
+                count_mode = %self.count_mode,
+                on_unmetered_response = self.on_unmetered_response.as_str(),
+                "ai_rate_limiter: rejecting an unreserved streaming response before commit because missing usage could not be enforced later"
+            );
+            return self.reject_unmetered();
+        }
+
         if !self.expose_headers {
             return PluginResult::Continue;
         }

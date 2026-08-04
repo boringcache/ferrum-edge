@@ -137,6 +137,12 @@ fn admin_state_with_capability_registry(jwt: JwtManager) -> AdminState {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     }
 }
 
@@ -203,6 +209,8 @@ fn make_minimal_proxy(id: &str) -> ferrum_edge::config::types::Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: now,
         updated_at: now,
     }

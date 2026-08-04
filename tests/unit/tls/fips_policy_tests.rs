@@ -35,9 +35,9 @@ fn plugin(name: &str, config: serde_json::Value) -> PluginConfig {
     }
 }
 
-fn consumer_with(basic_auth: serde_json::Value) -> Consumer {
+fn consumer_with(basicauth: serde_json::Value) -> Consumer {
     let mut credentials = std::collections::HashMap::new();
-    credentials.insert("basic_auth".to_string(), basic_auth);
+    credentials.insert("basicauth".to_string(), basicauth);
     Consumer {
         id: "consumer-1".to_string(),
         username: "alice".to_string(),
@@ -320,14 +320,22 @@ fn env_policy_ignores_a_blank_dtls_path() {
 }
 
 #[test]
-fn env_policy_accepts_provider_routed_mongodb_config_store() {
-    let env_config = EnvConfig {
-        db_type: Some("mongodb".to_string()),
-        db_url: Some("mongodb://db.example/ferrum?tls=true".to_string()),
-        ..EnvConfig::default()
-    };
-    policy::check_env_config_enforced(&env_config)
-        .expect("MongoDB TLS follows the selected build-profile provider");
+fn env_policy_rejects_every_mongodb_config_store_shape() {
+    for db_url in [
+        None,
+        Some("mongodb://db.example/ferrum?tls=true"),
+        Some("mongodb://user:secret@db.example/ferrum?tlsAllowInvalidCertificates=true"),
+    ] {
+        let env_config = EnvConfig {
+            db_type: Some("mongodb".to_string()),
+            db_url: db_url.map(str::to_string),
+            ..EnvConfig::default()
+        };
+        let err = policy::check_env_config_enforced(&env_config).expect_err("MongoDB is refused");
+        assert!(err.contains("FERRUM_DB_TYPE=mongodb"), "{err}");
+        assert!(err.contains("database-driver cryptography"), "{err}");
+        assert!(!err.contains("user:secret"), "database URL leaked: {err}");
+    }
 }
 
 #[test]
@@ -510,6 +518,46 @@ fn gateway_policy_diagnostics_stay_bounded_under_a_large_configuration() {
         err.len() < 2048,
         "diagnostic stays bounded: {} bytes",
         err.len()
+    );
+}
+
+#[test]
+fn remote_external_secret_uri_schemes_are_refused_when_enforced() {
+    for scheme in ["vault", "aws", "azure", "gcp"] {
+        let err = policy::check_external_secret_uri_scheme_enforced(scheme)
+            .expect_err("remote provider URI must be rejected");
+        assert!(
+            err.contains(scheme),
+            "names only the provider scheme: {err}"
+        );
+        assert!(err.contains("docs/fips.md"), "points to guidance: {err}");
+    }
+
+    for scheme in ["file", "k8s", "acme", "managed", "pkcs11"] {
+        policy::check_external_secret_uri_scheme_enforced(scheme)
+            .expect("local or internally routed source remains allowed");
+    }
+}
+
+#[test]
+fn tls_remote_secret_loader_enforces_fips_policy_before_resolution() {
+    let source = include_str!("../../../src/tls/source/mod.rs");
+    let loader = source
+        .split("fn load_secret_material(")
+        .nth(1)
+        .expect("remote secret loader exists")
+        .split("fn load_k8s_secret_material(")
+        .next()
+        .expect("remote secret loader has an end");
+    let gate = loader
+        .find("check_external_secret_uri_scheme")
+        .expect("loader applies the FIPS URI gate");
+    let resolve = loader
+        .find("resolve_secret_reference_blocking")
+        .expect("loader reaches the provider resolver");
+    assert!(
+        gate < resolve,
+        "FIPS refusal must precede provider resolution"
     );
 }
 

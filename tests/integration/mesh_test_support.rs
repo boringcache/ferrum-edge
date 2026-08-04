@@ -127,6 +127,7 @@ pub fn workload_for(
             namespace: Some(namespace.to_string()),
         },
         service_name: name.to_string(),
+        service_namespace: None,
         addresses: addresses.into_iter().map(|s| s.to_string()).collect(),
         ports: vec![WorkloadPort {
             port: 8080,
@@ -376,6 +377,8 @@ pub fn http_proxy(id: &str, host: &str, backend_port: u16) -> Proxy {
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
         allowed_methods: None,

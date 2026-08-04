@@ -38,6 +38,7 @@ fn workload(spiffe_id: &str, service: &str, address: &str) -> Workload {
         spiffe_id: id,
         selector: WorkloadSelector::default(),
         service_name: service.to_string(),
+        service_namespace: None,
         addresses: vec![address.to_string()],
         ports: vec![],
         trust_domain,
