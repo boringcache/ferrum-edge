@@ -22708,6 +22708,7 @@ mod tests {
         let mesh_slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
+            istio_root_namespace: "istio-system".to_string(),
             workload_spiffe_id: None,
             waypoint_name: None,
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
