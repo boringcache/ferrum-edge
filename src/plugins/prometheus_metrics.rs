@@ -1742,6 +1742,11 @@ impl MetricsRegistry {
     /// complete rendering of everything the registry owns plus everything it
     /// composes. `render()` reaches the same families through a live append
     /// rather than through the cached body.
+    // Now that `render()` memoizes `render_cacheable_body()` instead, this is
+    // reached only from the test suites, which compile against the library
+    // crate. The binary target compiles this module without them, so `-D
+    // warnings` sees it as dead there.
+    #[allow(dead_code)]
     pub fn render_uncached(&self) -> String {
         let mut output = self.render_cacheable_body();
         self.append_mesh_observability_prometheus(&mut output);
