@@ -702,6 +702,34 @@ impl Http3GrpcStream {
         Ok(())
     }
 
+    /// Send request trailing metadata without closing the request stream.
+    /// Call [`Self::finish`] afterwards to emit the terminal FIN.
+    pub async fn send_request_trailers(
+        &mut self,
+        trailers: HeaderMap,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tokio::time::timeout(Duration::from_secs(15), self.stream.send_trailers(trailers))
+            .await
+            .map_err(|_| "send_trailers timed out")?
+            .map_err(|e| format!("send_trailers: {e}"))?;
+        Ok(())
+    }
+
+    /// Reset the request-upload direction while leaving response ownership with
+    /// the caller, modeling an H3 client cancellation during a streaming RPC.
+    pub fn cancel_request_upload(&mut self) {
+        self.stream
+            .stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+
+    /// Cancel only the response-download direction while leaving the request
+    /// upload open. This models a client that stops consuming a streaming RPC
+    /// after response headers have arrived.
+    pub fn cancel_response_download(&mut self) {
+        self.stream
+            .stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+
     /// Half-close the request stream (send END_STREAM).
     pub async fn finish(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tokio::time::timeout(Duration::from_secs(15), self.stream.finish())
