@@ -1113,7 +1113,10 @@ impl Plugin for A2aGateway {
         ) {
             Ok(None) => None,
             Ok(Some(message)) => {
-                let ceiling = ctx.effective_max_response_body_size_bytes();
+                // Fold `0 = unlimited` to the retained-response fallback. A raw
+                // effective limit of 0 would make BoundedResponseBodySink refuse
+                // every non-empty write (prospective > ceiling).
+                let ceiling = ctx.retained_response_body_ceiling();
                 let mut sink =
                     crate::proxy::response_buffer_budget::BoundedResponseBodySink::with_ceiling(
                         ceiling,
