@@ -2059,10 +2059,7 @@ fn rewrite_agent_interface_protobuf(
     Ok(changed.then_some(output))
 }
 
-fn protobuf_string_field<'a>(
-    message: &'a [u8],
-    target: u32,
-) -> Result<Option<&'a str>, &'static str> {
+fn protobuf_string_field(message: &[u8], target: u32) -> Result<Option<&str>, &'static str> {
     let mut found = None;
     for_each_protobuf_field(message, |field, wire, value| {
         if field == target {
