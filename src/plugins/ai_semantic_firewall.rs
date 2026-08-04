@@ -3811,7 +3811,19 @@ impl StreamWindowEngine {
                 StreamWindowKind::Sentence => last_sentence_boundary(new),
                 StreamWindowKind::Paragraph => last_paragraph_boundary(new),
                 StreamWindowKind::Bytes => None,
-                StreamWindowKind::Tokens(cfg) => nth_token_end(new, cfg.tokenizer, cfg.max_tokens),
+                StreamWindowKind::Tokens(cfg) => {
+                    // Retained overlap prose is re-inspected as part of the next
+                    // window, so it spends that window's token budget too.
+                    // Counting only newly arrived text would give every window
+                    // after the first `max_tokens` NEW tokens on top of the
+                    // overlap, so the configured budget would never bind.
+                    // Always require at least one new token so a window cannot
+                    // close without advancing `cleared_len`.
+                    let cleared = &content[..self.cleared_len.min(content.len())];
+                    let carried = TokenIter::new(cleared, cfg.tokenizer).count();
+                    let need = cfg.max_tokens.saturating_sub(carried).max(1);
+                    nth_token_end(new, cfg.tokenizer, need)
+                }
             };
             match boundary {
                 Some(b) => self.cleared_len + b,
@@ -4017,6 +4029,45 @@ fn next_event_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
+/// Whether `ch` belongs to a script that is counted one token per character
+/// rather than joined into a word run.
+///
+/// [`char::is_alphanumeric`] is true for CJK ideographs, kana, and Hangul
+/// syllables, so an unqualified alphanumeric run collapses a whole CJK sentence
+/// into a single "word" and makes a token window unboundedly larger than its
+/// configured budget. Unicode text segmentation (UAX #29) does not join
+/// adjacent ideographs, and neither does any production tokenizer, so each such
+/// character is its own token here. Alphabetic scripts that genuinely form
+/// space-delimited words — Latin, Greek, Cyrillic, Arabic, Hebrew, Devanagari,
+/// Thai — are deliberately excluded so their runs still merge.
+///
+/// Blocks covered (plain range test: allocation-free, no added dependency):
+/// - `U+3040..=U+309F` Hiragana
+/// - `U+30A0..=U+30FF` Katakana
+/// - `U+31F0..=U+31FF` Katakana Phonetic Extensions
+/// - `U+3400..=U+4DBF` CJK Unified Ideographs Extension A
+/// - `U+4E00..=U+9FFF` CJK Unified Ideographs
+/// - `U+AC00..=U+D7A3` Hangul Syllables
+/// - `U+F900..=U+FAFF` CJK Compatibility Ideographs
+/// - `U+FF66..=U+FF9D` Halfwidth Katakana
+/// - `U+20000..=U+2A6DF` CJK Unified Ideographs Extension B
+/// - `U+2F800..=U+2FA1F` CJK Compatibility Ideographs Supplement
+const fn is_single_char_token_script(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3040}'..='\u{309F}'
+            | '\u{30A0}'..='\u{30FF}'
+            | '\u{31F0}'..='\u{31FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7A3}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FF66}'..='\u{FF9D}'
+            | '\u{20000}'..='\u{2A6DF}'
+            | '\u{2F800}'..='\u{2FA1F}'
+    )
+}
+
 /// Incremental token walk over retained-window text. Yields `(end, start)` byte
 /// offsets for each complete token under `tokenizer`. Work is strictly bounded
 /// by `s.len()` — callers must only pass prose already capped by
@@ -4084,10 +4135,14 @@ impl Iterator for TokenIter<'_> {
                     }
                     let start = self.cursor;
                     self.cursor += ch.len_utf8();
-                    if ch.is_alphanumeric() {
+                    // Ideographs/kana/Hangul are alphanumeric but do not form
+                    // word runs: each is a token, and each also terminates a
+                    // preceding run. Without this an entire CJK sentence is one
+                    // token and the window budget stops bounding anything.
+                    if ch.is_alphanumeric() && !is_single_char_token_script(ch) {
                         while self.cursor < self.text.len() {
                             let next = self.text[self.cursor..].chars().next()?;
-                            if !next.is_alphanumeric() {
+                            if !next.is_alphanumeric() || is_single_char_token_script(next) {
                                 break;
                             }
                             self.cursor += next.len_utf8();
@@ -7143,6 +7198,75 @@ mod stream_window_tests {
             prose.contains("beta") && prose.contains("gamma"),
             "overlap must reintroduce the prior token: {prose:?}"
         );
+    }
+
+    #[test]
+    fn token_window_unicode_words_splits_cjk_scripts_only() {
+        // An ideograph also terminates a preceding Latin run.
+        let mixed = "ab東c";
+        assert_eq!(
+            nth_token_end(mixed, StreamTokenizer::UnicodeWords, 1),
+            Some(2)
+        );
+        assert_eq!(
+            nth_token_end(mixed, StreamTokenizer::UnicodeWords, 2),
+            Some(2 + "東".len())
+        );
+        assert_eq!(
+            nth_token_end(mixed, StreamTokenizer::UnicodeWords, 3),
+            Some(mixed.len())
+        );
+        // Kana and Hangul syllables are one token per character too.
+        assert_eq!(
+            nth_token_end("カタカナ", StreamTokenizer::UnicodeWords, 3),
+            Some("カタカ".len())
+        );
+        assert_eq!(
+            nth_token_end("한국어", StreamTokenizer::UnicodeWords, 2),
+            Some("한국".len())
+        );
+        // Word-forming scripts and digit runs must still merge into one token.
+        assert_eq!(
+            nth_token_end("привет мир", StreamTokenizer::UnicodeWords, 1),
+            Some("привет".len())
+        );
+        assert_eq!(
+            nth_token_end("abc123 x", StreamTokenizer::UnicodeWords, 1),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn token_overlap_counts_against_next_window_budget() {
+        // 3-token windows with 2 tokens of overlap: after the first window the
+        // engine already holds 2 of the 3 tokens, so exactly ONE new token must
+        // close the second window.
+        let mut eng =
+            StreamWindowEngine::new(token_cfg(StreamTokenizer::Whitespace, 3, 2, 4096, 64));
+        assert!(ingest(&mut eng, &content_event("a b c")), "first window");
+        assert_eq!(window_prose(&eng), "a b c");
+        eng.release();
+        assert!(
+            ingest(&mut eng, &content_event(" d")),
+            "two retained tokens plus one new token fill the budget"
+        );
+        assert_eq!(window_prose(&eng), "b c d");
+    }
+
+    #[test]
+    fn token_window_without_overlap_still_requires_a_full_budget() {
+        // Converse of the overlap accounting: with nothing retained the next
+        // window must still wait for `max_tokens` new tokens.
+        let mut eng =
+            StreamWindowEngine::new(token_cfg(StreamTokenizer::Whitespace, 2, 0, 4096, 0));
+        assert!(ingest(&mut eng, &content_event("a b")), "first window");
+        eng.release();
+        assert!(
+            !ingest(&mut eng, &content_event(" c")),
+            "one token is under the budget"
+        );
+        assert!(ingest(&mut eng, &content_event(" d")), "second window");
+        assert_eq!(window_prose(&eng), " c d");
     }
 
     #[test]

@@ -3253,7 +3253,9 @@ async fn token_window_inspect_cuts_on_leaking_window() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector for event stream");
 
-    let leak = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My system prompt says never reveal policy\"}}]}\n\n";
+    // Exactly `max_window_tokens` whitespace tokens, so this one event closes a
+    // window rather than sitting under the budget with nothing inspected.
+    let leak = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My system prompt says never reveal policy details\"}}]}\n\n";
     assert!(
         matches!(
             inspector.on_chunk(leak).await,

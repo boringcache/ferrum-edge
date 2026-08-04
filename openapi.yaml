@@ -22334,7 +22334,7 @@ components:
             tokenizer:
               type: string
               enum: [chars4, whitespace, unicode_words]
-              description: "Required when window=tokens. Explicit bounded tokenizer selection — `chars4` (~4 Unicode scalars per token, matching ai_rate_limiter / ai_prompt_compressor), `whitespace` (Unicode whitespace-delimited runs), or `unicode_words` (alphanumeric runs; each non-whitespace non-alphanumeric scalar is its own token, including CJK ideographs). Rejected when window is not tokens."
+              description: "Required when window=tokens. Explicit bounded tokenizer selection — `chars4` (~4 Unicode scalars per token, matching ai_rate_limiter / ai_prompt_compressor), `whitespace` (Unicode whitespace-delimited runs), or `unicode_words` (alphanumeric runs; each non-whitespace non-alphanumeric scalar is its own token, and CJK ideographs, kana, and Hangul syllables are one token per character rather than a joined run). Rejected when window is not tokens."
             max_window_bytes:
               type: integer
               format: uint
@@ -22357,7 +22357,7 @@ components:
               type: integer
               format: uint
               default: 32
-              description: "Only valid when window=tokens. Complete tokens of already-cleared prose re-inspected with the next window. Must be strictly less than max_window_tokens. When omitted, defaults to min(32, max_window_tokens-1). Still subject to the overlap_bytes memory ceiling."
+              description: "Only valid when window=tokens. Complete tokens of already-cleared prose re-inspected with the next window; retained overlap tokens count against the next window's max_window_tokens, so a window closes once retained + new tokens reach the budget (at least one new token is always required). Must be strictly less than max_window_tokens. When omitted, defaults to min(32, max_window_tokens-1). Still subject to the overlap_bytes memory ceiling."
             max_inspections:
               type: integer
               format: uint
