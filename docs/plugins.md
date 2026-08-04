@@ -1297,8 +1297,8 @@ the queued entry is charged to it:
 | `loki_logging` label-grouping order index | the payload writer | a ceiling reservation taken before the index is allocated; the index is one `usize` per entry and does **not** scale with the number of distinct dynamic label sets | the payload finishes being written |
 | Trace exporter batch `Value` tree and serialized request body | the exporter flush loop | separate ceiling reservations taken before the tree is built and before the body is serialized | the tree is dropped right after serialization; the body when its retries finish |
 | `api_chargeback_sink` JSONEachRow insert body (live batches) | the delivery worker | a ceiling reservation taken before serialization | the request finishes |
-| `api_chargeback_sink` decoded spool artifact and its line index | the replay worker | reservations taken *before* the file is read and before the index is allocated, sized from the artifact's declared decoded length — the on-disk length when it is uncompressed, and the decompressed size recorded in the zstd frame header for one this build wrote; only a frame carrying no content size (a foreign or hand-planted archive) falls back to the ratio-clamped decompression bound | the artifact is fully replayed, deferred, or dead-lettered |
-| `api_chargeback_sink` replay worklist and per-chunk body | the replay worker | a reservation for the whole worklist before it exists, plus one per chunk body | the chunk request finishes; the worklist when the file leaves replay |
+| `api_chargeback_sink` streaming spool reader, row scratch, and bounded zstd window | the replay worker | one fixed reservation taken before the reader/decoder is constructed; decoded bytes, 1 MiB row length, and 10,000-row limits are checked before growth/admission | bounded preflight or replay of the artifact finishes |
+| `api_chargeback_sink` replay batch, at-most-128-row index, isolation worklist, and fixed dead-letter tally | the replay worker | reservations taken before each bounded allocation; one batch is at most 4 MiB and a permanent-failure tree at most 255 attempts | the batch/file is delivered, deferred, quarantined, or durably dead-lettered |
 
 Two consequences are worth calling out:
 
@@ -1318,9 +1318,9 @@ Two consequences are worth calling out:
 
 Retries never deep-copy a payload: each materialized body is an immutable
 refcounted buffer, and an attempt takes a handle rather than re-serializing.
-Spool replay never copies a row at all — chunking and 413 splitting address
-`(start, end)` byte ranges into the one decoded artifact, so splitting a batch
-cannot multiply retained row bytes.
+Spool replay streams rows into one bounded immutable batch; 413 and permanent
+failure bisection address `(start, end)` byte ranges in that batch, so isolation
+does not copy row payloads or retain the whole decoded artifact.
 
 Telemetry uses fixed labels only — no attacker-controlled label values:
 

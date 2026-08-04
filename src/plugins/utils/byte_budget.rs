@@ -764,6 +764,27 @@ pub struct ReservedPayload {
 }
 
 impl ReservedPayload {
+    /// Take ownership of a vector whose complete allocation was reserved before
+    /// construction.
+    ///
+    /// Streaming producers cannot use [`materialize_reserved_payload`] because
+    /// their input arrives incrementally. They reserve `bound`, allocate a
+    /// vector with capacity at most that bound, and transfer both here. The
+    /// runtime check keeps a future allocator/caller change fail-closed rather
+    /// than attaching an undersized charge to the payload.
+    pub(crate) fn from_preallocated_vec(
+        bytes: Vec<u8>,
+        reservation: ProcessByteReservation,
+    ) -> Result<Self, PayloadMaterializationError> {
+        if bytes.capacity() > reservation.reserved() {
+            return Err(PayloadMaterializationError::BoundExceeded);
+        }
+        Ok(Self {
+            bytes: Bytes::from(bytes),
+            _reservation: reservation,
+        })
+    }
+
     /// Refcounted handle for one delivery attempt. No payload bytes are copied.
     pub fn bytes(&self) -> Bytes {
         self.bytes.clone()
@@ -784,6 +805,33 @@ impl ReservedPayload {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
+    }
+}
+
+/// Prove the streaming preallocated-payload capacity guard fails closed.
+///
+/// External unit tests only: reserves 8 bytes, then hands over a vector whose
+/// capacity exceeds that reservation. Production callers size capacity to the
+/// reservation; this probe exists so the undersized-charge refusal stays
+/// covered without opening a runtime-visible API.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn probe_preallocated_payload_capacity_guard_for_tests(
+    ceiling: &'static RetainedByteCeiling,
+) -> Result<(), String> {
+    let reservation = ceiling.try_acquire(8).ok_or_else(|| {
+        PayloadMaterializationError::CeilingExhausted
+            .reason()
+            .to_string()
+    })?;
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(b"probe");
+    match ReservedPayload::from_preallocated_vec(bytes, reservation) {
+        Err(PayloadMaterializationError::BoundExceeded) => Ok(()),
+        Err(error) => Err(error.reason().to_string()),
+        Ok(_) => {
+            Err("preallocated payload capacity guard must refuse an undersized reservation".into())
+        }
     }
 }
 
