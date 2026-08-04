@@ -82,7 +82,7 @@ impl RpcOutcome {
 }
 
 /// One CNI invocation, normalized for the node-agent.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CniRpcRequest {
     pub verb: RpcVerb,
@@ -118,8 +118,54 @@ pub struct CniRpcRequest {
     pub args: std::collections::HashMap<String, String>,
     /// Still-valid attachments for [`RpcVerb::Gc`]. Empty for other verbs.
     /// Already bounded/validated by the CNI binary before the RPC is sent.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub valid_attachments: Vec<CniValidAttachment>,
+}
+
+impl<'de> Deserialize<'de> for CniRpcRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireRequest {
+            verb: RpcVerb,
+            network_name: String,
+            #[serde(default)]
+            pod_namespace: String,
+            #[serde(default)]
+            pod_name: String,
+            #[serde(default)]
+            pod_uid: Option<String>,
+            #[serde(default)]
+            container_id: String,
+            #[serde(default)]
+            ifname: Option<String>,
+            #[serde(default)]
+            netns_path: Option<String>,
+            #[serde(default)]
+            args: std::collections::HashMap<String, String>,
+            valid_attachments: Option<Vec<CniValidAttachment>>,
+        }
+
+        let wire = WireRequest::deserialize(deserializer)?;
+        if wire.verb == RpcVerb::Gc && wire.valid_attachments.is_none() {
+            return Err(serde::de::Error::missing_field("valid_attachments"));
+        }
+        Ok(Self {
+            verb: wire.verb,
+            network_name: wire.network_name,
+            pod_namespace: wire.pod_namespace,
+            pod_name: wire.pod_name,
+            pod_uid: wire.pod_uid,
+            container_id: wire.container_id,
+            ifname: wire.ifname,
+            netns_path: wire.netns_path,
+            args: wire.args,
+            valid_attachments: wire.valid_attachments.unwrap_or_default(),
+        })
+    }
 }
 
 impl CniRpcRequest {
@@ -316,7 +362,7 @@ mod tests {
         assert!(!json.contains("netns_path"));
         assert!(!json.contains("args"));
         assert!(!json.contains("ifname"));
-        assert!(!json.contains("valid_attachments"));
+        assert!(json.contains(r#""valid_attachments":[]"#));
     }
 
     #[test]
@@ -341,6 +387,14 @@ mod tests {
         assert_eq!(back.verb, RpcVerb::Gc);
         assert_eq!(back.valid_attachments.len(), 1);
         assert_eq!(back.valid_attachments[0].container_id, "ctr-1");
+    }
+
+    #[test]
+    fn rpc_gc_request_rejects_omitted_valid_attachments() {
+        let json = r#"{"verb":"gc","network_name":"ferrum-cni"}"#;
+        let err = serde_json::from_str::<CniRpcRequest>(json)
+            .expect_err("GC must carry an explicit authoritative attachment set");
+        assert!(err.to_string().contains("valid_attachments"));
     }
 
     #[test]

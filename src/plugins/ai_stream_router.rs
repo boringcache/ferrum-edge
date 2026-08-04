@@ -61,8 +61,24 @@
 //!   (`gzip` / `x-gzip` / `br`, including stacked lists) in reverse application
 //!   order under shared bounded limits, or rejected fail-closed before SSE
 //!   parsing so response headers describe identity bytes.
-//! - `google_gemini`: config is accepted and validated but construction fails
-//!   with a clear "not yet implemented" error until the second phase lands.
+//! - `google_gemini`: OpenAI Chat Completions request is translated to the
+//!   Gemini/`streamGenerateContent` (Vertex-compatible) request body; native
+//!   Gemini SSE (`alt=sse`) and Vertex-compatible JSON array / object streams
+//!   are normalized to OpenAI `chat.completion.chunk` SSE. Message content is
+//!   closed-shape at claim (string or array of text-part objects with exactly
+//!   `type` and `text`; mixed/extra/unknown fields, non-object members,
+//!   non-text/malformed parts, and null system/developer/user content reject
+//!   with OpenAI-shaped `400`). Assistant null/empty content is preserved only
+//!   with a valid `tool_calls` or legacy `function_call`. Content/role deltas,
+//!   multi-candidate indexes, finish/terminal state, usage metadata, safety /
+//!   prompt blocks, function calls + args, and provider error envelopes are
+//!   mapped under the same bounded fail-closed policy as Anthropic. Every
+//!   candidate that emitted client-visible output must reach a terminal
+//!   `finishReason` before clean EOF; post-finish candidate data and
+//!   unrepresentable content parts fail closed. A claimed normalizing 2xx
+//!   response with a missing or unexpected `Content-Type` fails closed rather
+//!   than streaming raw provider bytes. The model is URL-scoped via an
+//!   optional `{model}` endpoint placeholder.
 //!
 //! ## Provider fallback is rejected, not stored
 //!
@@ -214,21 +230,22 @@ use super::{
 use crate::config::types::{BackendScheme, BackendTlsConfig};
 use crate::util::unknown_keys::reject_unknown_keys;
 
-/// Exact response fields invalidated when Anthropic SSE is normalized.
+/// Exact response fields invalidated when provider SSE is normalized.
 ///
 /// Derived from the shared representation-invalidation inventory so trailer
-/// policy cannot drift from the header rewrite. The three extra fields are
-/// owned directly by [`repair_normalized_representation_headers`].
+/// policy cannot drift from the header rewrite. The four extra fields are owned
+/// directly by [`repair_normalized_representation_headers`] and
+/// [`stamp_normalized_sse_content_type`].
 static AI_STREAM_ROUTER_RESPONSE_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
     std::sync::LazyLock::new(|| {
-        let mut names = Vec::with_capacity(super::TRANSFORM_INVALIDATED_RESPONSE_HEADERS.len() + 3);
+        let mut names = Vec::with_capacity(super::TRANSFORM_INVALIDATED_RESPONSE_HEADERS.len() + 4);
         names.extend(
             super::TRANSFORM_INVALIDATED_RESPONSE_HEADERS
                 .iter()
                 .map(|name| (*name).to_string()),
         );
         names.extend(
-            ["content-encoding", "content-length", "vary"]
+            ["content-encoding", "content-length", "content-type", "vary"]
                 .into_iter()
                 .map(str::to_string),
         );
@@ -397,16 +414,10 @@ impl ProviderType {
         }
     }
 
-    /// Whether provider-native response SSE must be normalized to OpenAI
-    /// `chat.completion.chunk` SSE.
+    /// Whether provider-native response SSE / stream framing must be normalized
+    /// to OpenAI `chat.completion.chunk` SSE.
     fn needs_response_normalization(self) -> bool {
-        matches!(self, Self::Anthropic)
-    }
-
-    /// Whether MVP can serve this provider. `google_gemini` is designed into the
-    /// config now but not yet implemented.
-    fn is_implemented(self) -> bool {
-        !matches!(self, Self::GoogleGemini)
+        matches!(self, Self::Anthropic | Self::GoogleGemini)
     }
 }
 
@@ -541,13 +552,14 @@ pub(crate) struct AiStreamRouterClaim {
     model: String,
     /// Whether the claimed request forbids tool use for this generation
     /// (`tool_choice: "none"` in the client body, translated to Anthropic
-    /// `tool_choice: {"type":"none"}`). Committed at claim time from the client
-    /// representation the claim selected on, so a later metadata write cannot
-    /// disarm the response normalizer's fail-closed `tool_use` guard. Always
-    /// `false` for providers whose responses this instance does not translate.
+    /// `tool_choice: {"type":"none"}` or Gemini `functionCallingConfig.mode:
+    /// "NONE"`). Committed at claim time from the client representation the
+    /// claim selected on, so a later metadata write cannot disarm the response
+    /// normalizer's fail-closed tool-use guard. Always `false` for providers
+    /// whose responses this instance does not translate.
     tool_choice_none: bool,
     /// Set by this instance's own `transform_request_body` hook once the
-    /// Anthropic representation was produced. Read by
+    /// Anthropic or Gemini representation was produced. Read by
     /// `on_final_request_body_with_context`, which runs on the SAME context
     /// object the transform ran on (the proxy builds one hook context for both
     /// phases), so the witness never has to survive a metadata write-back and
@@ -662,12 +674,6 @@ impl AiStreamRouter {
                 "ai_stream_router: provider '{name}' missing 'provider_type'"
             ))?;
             let provider_type = ProviderType::from_str(provider_type_str)?;
-            if !provider_type.is_implemented() {
-                return Err(format!(
-                    "ai_stream_router: provider '{name}' provider_type '{}' is not yet implemented in this MVP",
-                    provider_type.as_str()
-                ));
-            }
 
             let priority_u64 = optional_u64(pv, "priority")?.unwrap_or((i as u64) + 1);
             if priority_u64 == 0 {
@@ -1131,6 +1137,54 @@ fn flatten_content_text(content: &Value) -> String {
         }
     }
     out
+}
+
+/// Closed Gemini-representable OpenAI message `content`.
+///
+/// Only a string or a closed array of text-part objects with exactly `type` and
+/// `text` may be translated. Mixed text-plus-image/audio/unknown parts, extra
+/// or unknown fields on a text part, non-object array members, malformed text
+/// parts, null content, and non-array/non-string shapes fail closed rather than
+/// being silently reduced by [`flatten_content_text`]. Callers that intentionally
+/// allow assistant null/empty content when a valid `tool_calls` or legacy
+/// `function_call` is present must handle that null case before calling this
+/// helper.
+fn gemini_message_content_text(content: &Value) -> Result<String, String> {
+    if let Some(text) = content.as_str() {
+        return Ok(text.to_string());
+    }
+    if content.is_null() {
+        return Err("content must be a string or text-parts array".to_string());
+    }
+    let parts = content
+        .as_array()
+        .ok_or_else(|| "content must be a string or text-parts array".to_string())?;
+    let mut out = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        let Some(object) = part.as_object() else {
+            return Err(format!(
+                "content[{index}] is not a Gemini-representable text part"
+            ));
+        };
+        // Closed claim shape: exactly `{ "type": "text", "text": "..." }`.
+        if object.len() != 2 || object.get("type").and_then(Value::as_str) != Some("text") {
+            return Err(format!(
+                "content[{index}] is not a Gemini-representable text part"
+            ));
+        }
+        let text = object
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("content[{index}] text part is malformed"))?;
+        if text.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(text);
+    }
+    Ok(out)
 }
 
 #[derive(Clone)]
@@ -1879,6 +1933,466 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
         .map_err(|error| format!("failed to serialize Anthropic body: {error}"))
 }
 
+/// Validate OpenAI shapes that Gemini translation must represent safely.
+fn validate_gemini_translation(openai_body: &Value) -> Result<(), String> {
+    let messages = openai_body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "request missing 'messages' array".to_string())?;
+    let mut pending_legacy_by_name: HashMap<String, String> = HashMap::new();
+    // Mirrors `translate_to_gemini`'s `tool_names_by_id`: a `tool` message can
+    // only be represented as a `functionResponse` when a PRECEDING assistant
+    // message declared the id. Admission must reject an orphaned id here, or the
+    // translator rejects it later and the client gets the generic
+    // "could not be translated safely" 400 instead of this precise diagnostic.
+    let mut declared_tool_call_ids: HashSet<String> = HashSet::new();
+    let mut message_index = 0;
+    while message_index < messages.len() {
+        let message = &messages[message_index];
+        let role = message["role"].as_str().unwrap_or("");
+        if is_system_role(role) {
+            gemini_message_content_text(&message["content"])
+                .map_err(|error| format!("messages[{message_index}] {error}"))?;
+            message_index += 1;
+            continue;
+        }
+        if role == "tool" {
+            while message_index < messages.len()
+                && messages[message_index]["role"].as_str() == Some("tool")
+            {
+                let tool_message = &messages[message_index];
+                let tool_call_id = tool_message["tool_call_id"].as_str().ok_or_else(|| {
+                    format!("messages[{message_index}] tool message missing tool_call_id")
+                })?;
+                if !declared_tool_call_ids.contains(tool_call_id) {
+                    return Err(format!(
+                        "messages[{message_index}] tool_call_id has no matching assistant tool call"
+                    ));
+                }
+                tool_result_text(&tool_message["content"])
+                    .map_err(|error| format!("messages[{message_index}] {error}"))?;
+                message_index += 1;
+            }
+            continue;
+        }
+        if role == "function" {
+            while message_index < messages.len()
+                && messages[message_index]["role"].as_str() == Some("function")
+            {
+                let function_message = &messages[message_index];
+                let name = function_message["name"]
+                    .as_str()
+                    .filter(|value| valid_tool_name(value))
+                    .ok_or_else(|| {
+                        format!("messages[{message_index}] function message has invalid name")
+                    })?;
+                if pending_legacy_by_name.remove(name).is_none() {
+                    return Err(format!(
+                        "messages[{message_index}] function result has no unmatched preceding assistant function_call"
+                    ));
+                }
+                tool_result_text(&function_message["content"])
+                    .map_err(|error| format!("messages[{message_index}] {error}"))?;
+                message_index += 1;
+            }
+            continue;
+        }
+        if role != "user" && role != "assistant" {
+            return Err(format!(
+                "messages[{message_index}] has unsupported role '{role}'"
+            ));
+        }
+        let tool_calls = if role == "assistant" {
+            parse_openai_tool_calls(message, message_index)?
+        } else {
+            Vec::new()
+        };
+        let legacy_call = if role == "assistant" {
+            parse_openai_function_call(message, message_index)?
+        } else {
+            None
+        };
+        if !tool_calls.is_empty() && legacy_call.is_some() {
+            return Err(format!(
+                "messages[{message_index}] mixes modern tool_calls with legacy function_call"
+            ));
+        }
+        for call in &tool_calls {
+            declared_tool_call_ids.insert(call.id.clone());
+        }
+        let had_legacy = legacy_call.is_some();
+        if let Some(call) = legacy_call {
+            pending_legacy_by_name.insert(call.name.clone(), call.id.clone());
+        }
+        let has_tool_representation = !tool_calls.is_empty() || had_legacy;
+        // Null is fail-closed for system/developer/user. Assistant null/empty is
+        // intentional only when a valid modern or legacy tool representation exists.
+        let text = if message["content"].is_null() {
+            if role == "assistant" && has_tool_representation {
+                String::new()
+            } else {
+                return Err(format!(
+                    "messages[{message_index}] content must be a string or text-parts array"
+                ));
+            }
+        } else {
+            gemini_message_content_text(&message["content"])
+                .map_err(|error| format!("messages[{message_index}] {error}"))?
+        };
+        if role == "assistant" && text.is_empty() && !has_tool_representation {
+            return Err(format!(
+                "messages[{message_index}] has no Gemini-representable content"
+            ));
+        }
+        if role == "user" && text.is_empty() {
+            return Err(format!(
+                "messages[{message_index}] has no Gemini-representable content"
+            ));
+        }
+        message_index += 1;
+    }
+    if !pending_legacy_by_name.is_empty() {
+        return Err("assistant function_call is missing its function result".to_string());
+    }
+    // Closed tools + tool_choice validation: never silently drop unsupported
+    // declarations or weaken non-`none` choices without a tools array.
+    let _ = gemini_declared_function_names(openai_body)?;
+    let _ = resolve_gemini_tool_choice(openai_body)?;
+    Ok(())
+}
+
+/// Closed Gemini-representable OpenAI `tools` declarations. Every entry must be
+/// `{type:"function", function:{name:...}}` with a valid name; unsupported or
+/// unrepresentable entries fail closed rather than being skipped.
+fn gemini_declared_function_names(openai_body: &Value) -> Result<Option<Vec<&str>>, String> {
+    let Some(tools) = openai_body.get("tools") else {
+        return Ok(None);
+    };
+    if tools.is_null() {
+        return Ok(None);
+    }
+    let arr = tools
+        .as_array()
+        .ok_or_else(|| "unsupported or malformed tools".to_string())?;
+    if arr.is_empty() {
+        return Ok(None);
+    }
+    let mut names = Vec::with_capacity(arr.len());
+    for tool in arr {
+        if tool.get("type").and_then(Value::as_str) != Some("function") {
+            return Err("unsupported or malformed tools".to_string());
+        }
+        let function = tool
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "unsupported or malformed tools".to_string())?;
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| valid_tool_name(value))
+            .ok_or_else(|| "unsupported or malformed tools".to_string())?;
+        names.push(name);
+    }
+    Ok(Some(names))
+}
+
+fn resolve_gemini_tool_choice(openai_body: &Value) -> Result<Option<Value>, String> {
+    let Some(choice) = openai_body.get("tool_choice") else {
+        return Ok(None);
+    };
+    if choice.is_null() {
+        return Ok(None);
+    }
+
+    let (kind, translated) = match choice {
+        Value::String(value) => match value.as_str() {
+            "none" => (ToolChoiceKind::None, json!({ "mode": "NONE" })),
+            "auto" => (ToolChoiceKind::Auto, json!({ "mode": "AUTO" })),
+            "required" => (ToolChoiceKind::ForcedAny, json!({ "mode": "ANY" })),
+            _ => return Err("unsupported or malformed tool_choice".to_string()),
+        },
+        Value::Object(object) => {
+            // Closed OpenAI shape: {type:"function", function:{name:...}}.
+            if object.len() != 2 || object.get("type").and_then(Value::as_str) != Some("function") {
+                return Err("unsupported or malformed tool_choice".to_string());
+            }
+            let function = object
+                .get("function")
+                .and_then(Value::as_object)
+                .ok_or_else(|| "unsupported or malformed tool_choice".to_string())?;
+            if function.len() != 1 {
+                return Err("unsupported or malformed tool_choice".to_string());
+            }
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| valid_tool_name(value))
+                .ok_or_else(|| "unsupported or malformed tool_choice".to_string())?;
+            (
+                ToolChoiceKind::ForcedNamed,
+                json!({
+                    "mode": "ANY",
+                    "allowedFunctionNames": [name],
+                }),
+            )
+        }
+        _ => return Err("unsupported or malformed tool_choice".to_string()),
+    };
+
+    let tools = gemini_declared_function_names(openai_body)?;
+    if kind != ToolChoiceKind::None && tools.is_none() {
+        return Err("tool_choice requires a non-empty tools array".to_string());
+    }
+    if kind == ToolChoiceKind::ForcedNamed {
+        let name = translated
+            .get("allowedFunctionNames")
+            .and_then(Value::as_array)
+            .and_then(|names| names.first())
+            .and_then(Value::as_str)
+            .ok_or_else(|| "unsupported or malformed tool_choice".to_string())?;
+        if !tools.as_ref().is_some_and(|names| names.contains(&name)) {
+            return Err("named tool_choice does not match any declared tool".to_string());
+        }
+    }
+
+    Ok(Some(translated))
+}
+
+/// Map OpenAI Chat Completions into a Gemini/Vertex `generateContent` body.
+/// The model is URL-scoped (`…/models/{model}:streamGenerateContent`), so it is
+/// intentionally omitted from the JSON body.
+fn translate_to_gemini(openai_body: &Value) -> Result<Vec<u8>, String> {
+    let messages = openai_body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "request missing 'messages' array".to_string())?;
+    validate_gemini_translation(openai_body)?;
+
+    let mut system_parts = Vec::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        if !message["role"].as_str().is_some_and(is_system_role) {
+            continue;
+        }
+        let text = gemini_message_content_text(&message["content"])
+            .map_err(|error| format!("messages[{message_index}] {error}"))?;
+        if !text.is_empty() {
+            system_parts.push(json!({ "text": text }));
+        }
+    }
+
+    let mut tool_names_by_id: HashMap<String, String> = HashMap::new();
+    let mut pending_legacy_by_name: HashMap<String, String> = HashMap::new();
+    let mut contents = Vec::with_capacity(messages.len());
+    let mut message_index = 0;
+    while message_index < messages.len() {
+        let message = &messages[message_index];
+        let role = message["role"].as_str().unwrap_or("");
+        if is_system_role(role) {
+            message_index += 1;
+            continue;
+        }
+        if role == "tool" {
+            let mut parts = Vec::new();
+            while message_index < messages.len()
+                && messages[message_index]["role"].as_str() == Some("tool")
+            {
+                let tool_message = &messages[message_index];
+                let tool_call_id = tool_message["tool_call_id"].as_str().ok_or_else(|| {
+                    format!("messages[{message_index}] tool message missing tool_call_id")
+                })?;
+                let tool_name = tool_names_by_id.get(tool_call_id).ok_or_else(|| {
+                    format!(
+                        "messages[{message_index}] tool_call_id has no matching assistant tool call"
+                    )
+                })?;
+                let text = tool_result_text(&tool_message["content"])
+                    .map_err(|error| format!("messages[{message_index}] {error}"))?;
+                let response = match serde_json::from_str::<Value>(&text) {
+                    Ok(Value::Object(object)) => Value::Object(object),
+                    Ok(value) => json!({ "output": value }),
+                    Err(_) => json!({ "output": text }),
+                };
+                parts.push(json!({
+                    "functionResponse": {
+                        "name": tool_name,
+                        "response": response,
+                    }
+                }));
+                message_index += 1;
+            }
+            contents.push(json!({
+                "role": "user",
+                "parts": parts
+            }));
+            continue;
+        }
+        if role == "function" {
+            let mut parts = Vec::new();
+            while message_index < messages.len()
+                && messages[message_index]["role"].as_str() == Some("function")
+            {
+                let function_message = &messages[message_index];
+                let name = function_message["name"]
+                    .as_str()
+                    .filter(|value| valid_tool_name(value))
+                    .ok_or_else(|| {
+                        format!("messages[{message_index}] function message has invalid name")
+                    })?;
+                let _tool_use_id = pending_legacy_by_name.remove(name).ok_or_else(|| {
+                    format!(
+                        "messages[{message_index}] function result has no unmatched preceding assistant function_call"
+                    )
+                })?;
+                let text = tool_result_text(&function_message["content"])
+                    .map_err(|error| format!("messages[{message_index}] {error}"))?;
+                let response = match serde_json::from_str::<Value>(&text) {
+                    Ok(Value::Object(object)) => Value::Object(object),
+                    Ok(value) => json!({ "output": value }),
+                    Err(_) => json!({ "output": text }),
+                };
+                parts.push(json!({
+                    "functionResponse": {
+                        "name": name,
+                        "response": response,
+                    }
+                }));
+                message_index += 1;
+            }
+            contents.push(json!({
+                "role": "user",
+                "parts": parts
+            }));
+            continue;
+        }
+
+        let native_role = if role == "assistant" { "model" } else { role };
+        let tool_calls = if role == "assistant" {
+            parse_openai_tool_calls(message, message_index)?
+        } else {
+            Vec::new()
+        };
+        let legacy_call = if role == "assistant" {
+            parse_openai_function_call(message, message_index)?
+        } else {
+            None
+        };
+        let has_tool_representation = !tool_calls.is_empty() || legacy_call.is_some();
+        let text = if message["content"].is_null() {
+            if role == "assistant" && has_tool_representation {
+                String::new()
+            } else {
+                return Err(format!(
+                    "messages[{message_index}] content must be a string or text-parts array"
+                ));
+            }
+        } else {
+            gemini_message_content_text(&message["content"])
+                .map_err(|error| format!("messages[{message_index}] {error}"))?
+        };
+        let mut parts = Vec::new();
+        if !text.is_empty() {
+            parts.push(json!({ "text": text }));
+        }
+        for call in tool_calls {
+            tool_names_by_id.insert(call.id.clone(), call.name.clone());
+            parts.push(json!({
+                "functionCall": {
+                    "name": call.name,
+                    "args": call.arguments,
+                }
+            }));
+        }
+        if let Some(call) = legacy_call {
+            pending_legacy_by_name.insert(call.name.clone(), call.id.clone());
+            parts.push(json!({
+                "functionCall": {
+                    "name": call.name,
+                    "args": call.arguments,
+                }
+            }));
+        }
+        if parts.is_empty() {
+            return Err(format!(
+                "messages[{message_index}] has no Gemini-representable content"
+            ));
+        }
+        contents.push(json!({ "role": native_role, "parts": parts }));
+        message_index += 1;
+    }
+
+    if !pending_legacy_by_name.is_empty() {
+        return Err("assistant function_call is missing its function result".to_string());
+    }
+
+    let mut body = json!({ "contents": contents });
+    if !system_parts.is_empty() {
+        body["systemInstruction"] = json!({ "parts": system_parts });
+    }
+
+    let mut gen_config = serde_json::Map::new();
+    if let Some(max_tokens) = openai_body
+        .get("max_tokens")
+        .or_else(|| openai_body.get("max_completion_tokens"))
+    {
+        gen_config.insert("maxOutputTokens".to_string(), max_tokens.clone());
+    }
+    if let Some(temp) = openai_body.get("temperature") {
+        gen_config.insert("temperature".to_string(), temp.clone());
+    }
+    if let Some(top_p) = openai_body.get("top_p") {
+        gen_config.insert("topP".to_string(), top_p.clone());
+    }
+    if let Some(stop) = openai_body.get("stop") {
+        gen_config.insert("stopSequences".to_string(), normalize_stop_sequences(stop));
+    }
+    if !gen_config.is_empty() {
+        body["generationConfig"] = Value::Object(gen_config);
+    }
+
+    if let Some(tools) = openai_body.get("tools")
+        && !tools.is_null()
+    {
+        let tools = tools
+            .as_array()
+            .ok_or_else(|| "unsupported or malformed tools".to_string())?;
+        if !tools.is_empty() {
+            let mut declarations = Vec::with_capacity(tools.len());
+            for tool in tools {
+                if tool.get("type").and_then(Value::as_str) != Some("function") {
+                    return Err("unsupported or malformed tools".to_string());
+                }
+                let function = tool
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| "unsupported or malformed tools".to_string())?;
+                let name = function
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|n| valid_tool_name(n))
+                    .ok_or_else(|| "unsupported or malformed tools".to_string())?;
+                let mut declaration = serde_json::Map::new();
+                declaration.insert("name".to_string(), Value::String(name.to_string()));
+                if let Some(description) = function.get("description").and_then(Value::as_str) {
+                    declaration.insert(
+                        "description".to_string(),
+                        Value::String(description.to_string()),
+                    );
+                }
+                if let Some(parameters) = function.get("parameters") {
+                    declaration.insert("parameters".to_string(), parameters.clone());
+                }
+                declarations.push(Value::Object(declaration));
+            }
+            body["tools"] = json!([{ "functionDeclarations": declarations }]);
+        }
+    }
+    if let Some(choice) = resolve_gemini_tool_choice(openai_body)? {
+        body["toolConfig"] = json!({ "functionCallingConfig": choice });
+    }
+
+    serde_json::to_vec(&body).map_err(|error| format!("failed to serialize Gemini body: {error}"))
+}
+
 /// Anthropic `stop_sequences` is always an array of strings.
 fn normalize_stop_sequences(stop: &Value) -> Value {
     match stop {
@@ -2170,7 +2684,7 @@ impl Plugin for AiStreamRouter {
             );
         }
 
-        // Fail closed on Anthropic tool-history / tool_choice / thinking shapes
+        // Fail closed on Anthropic / Gemini tool-history / tool_choice shapes
         // that cannot be represented safely before the route override commits.
         if provider.provider_type == ProviderType::Anthropic
             && let Err(message) = validate_anthropic_translation(&openai_body)
@@ -2185,6 +2699,22 @@ impl Plugin for AiStreamRouter {
             return openai_error_response(
                 400,
                 &format!("Invalid request for Anthropic translation: {message}"),
+                "invalid_request_error",
+                param,
+                code,
+            );
+        }
+        if provider.provider_type == ProviderType::GoogleGemini
+            && let Err(message) = validate_gemini_translation(&openai_body)
+        {
+            let (param, code) = if message.contains("tool_choice") || message.contains("tools") {
+                (Some("tool_choice"), Some("invalid_tool_choice"))
+            } else {
+                (Some("messages"), Some("invalid_messages"))
+            };
+            return openai_error_response(
+                400,
+                &format!("Invalid request for Gemini translation: {message}"),
                 "invalid_request_error",
                 param,
                 code,
@@ -2218,7 +2748,7 @@ impl Plugin for AiStreamRouter {
         //    backend-visible query as of this moment, which is the raw wire
         //    query (or an earlier plugin's published outbound query) after the
         //    authentication-owned strip markers.
-        let committed_query = if provider.endpoint_query.is_some() {
+        let mut committed_query = if provider.endpoint_query.is_some() {
             String::new()
         } else {
             crate::proxy::effective_backend_query_string(ctx).into_owned()
@@ -2248,6 +2778,16 @@ impl Plugin for AiStreamRouter {
             if let Some(raw_client_query) = raw_client_query {
                 mark_client_query_params_consumed(ctx, &raw_client_query);
             }
+        }
+
+        // Gemini/Vertex streamGenerateContent is normalized from SSE or a
+        // Vertex-compatible JSON object stream. Prefer `alt=sse` so native
+        // Gemini uses the documented SSE framing; operators may already have
+        // it on the endpoint.
+        if provider.provider_type == ProviderType::GoogleGemini
+            && provider.normalizes_response(self.normalize_response_stream)
+        {
+            ensure_gemini_alt_sse(&mut backend_path, &mut committed_query);
         }
 
         // --- Rewrite the routing decision (no internal HTTP call). ---
@@ -2310,11 +2850,14 @@ impl Plugin for AiStreamRouter {
         let committed_tls = ctx.route_override_resolved_tls.clone();
         // Committed from the CLIENT representation this claim selected on, not
         // from the later translated body: the response normalizer's fail-closed
-        // `tool_use` guard must be armed by what the request actually asked for
+        // tool-use guard must be armed by what the request actually asked for
         // and must not be disarmable afterwards. Only meaningful for the
         // provider type whose SSE this instance translates.
-        let tool_choice_none = provider.provider_type == ProviderType::Anthropic
-            && openai_body.get("tool_choice").and_then(Value::as_str) == Some("none");
+        let tool_choice_none = matches!(
+            provider.provider_type,
+            ProviderType::Anthropic | ProviderType::GoogleGemini
+        ) && openai_body.get("tool_choice").and_then(Value::as_str)
+            == Some("none");
         ctx.ai_stream_router_claim = Some(Box::new(AiStreamRouterClaim {
             owner: self.owner_id,
             provider_index,
@@ -2419,6 +2962,22 @@ impl Plugin for AiStreamRouter {
                 }
                 Some(translated)
             }
+            ProviderType::GoogleGemini => {
+                let openai_body: Value = serde_json::from_slice(body).ok()?;
+                let translated = translate_to_gemini(&openai_body).ok()?;
+                if let Some(claim) = ctx.ai_stream_router_claim.as_deref_mut() {
+                    claim.request_translated = true;
+                }
+                ctx.metadata
+                    .insert(META_REQUEST_TRANSLATED.to_string(), "true".to_string());
+                if openai_body.get("tool_choice").and_then(Value::as_str) == Some("none") {
+                    ctx.metadata
+                        .insert(META_TOOL_CHOICE_NONE.to_string(), "true".to_string());
+                } else {
+                    ctx.metadata.remove(META_TOOL_CHOICE_NONE);
+                }
+                Some(translated)
+            }
             ProviderType::OpenAi | ProviderType::OpenAiCompatible => {
                 if self.inject_usage_options {
                     inject_include_usage(body)
@@ -2426,8 +2985,6 @@ impl Plugin for AiStreamRouter {
                     None
                 }
             }
-            // Unreachable: google_gemini fails construction in this MVP.
-            ProviderType::GoogleGemini => None,
         }
     }
 
@@ -2481,6 +3038,7 @@ impl Plugin for AiStreamRouter {
         let (
             provider_index,
             provider_is_anthropic,
+            provider_is_gemini,
             destination_intact,
             committed_model,
             request_translated,
@@ -2494,6 +3052,7 @@ impl Plugin for AiStreamRouter {
             (
                 claim.provider_index,
                 provider.provider_type == ProviderType::Anthropic,
+                provider.provider_type == ProviderType::GoogleGemini,
                 route_override_still_targets(ctx, claim),
                 claim.model.clone(),
                 claim.request_translated,
@@ -2504,6 +3063,15 @@ impl Plugin for AiStreamRouter {
             return openai_error_response(
                 400,
                 "The Anthropic request body could not be translated safely",
+                "invalid_request_error",
+                Some("messages"),
+                Some("invalid_messages"),
+            );
+        }
+        if provider_is_gemini && !request_translated {
+            return openai_error_response(
+                400,
+                "The Gemini request body could not be translated safely",
                 "invalid_request_error",
                 Some("messages"),
                 Some("invalid_messages"),
@@ -2557,6 +3125,29 @@ impl Plugin for AiStreamRouter {
                 "The final AI provider request body is not valid JSON after request transforms",
             );
         };
+
+        if provider_is_gemini {
+            // Gemini/Vertex generateContent bodies are URL-scoped for the model
+            // (`…/models/{model}:streamGenerateContent`). Destination integrity
+            // already pins the path that embeds `committed_model`; here require
+            // a Gemini-shaped body and that the committed model still matches
+            // this provider's patterns.
+            match final_body.get("contents") {
+                Some(Value::Array(_)) => {}
+                _ => {
+                    return model_policy_violation(
+                        "The final Gemini provider request body has no usable 'contents' field",
+                    );
+                }
+            }
+            if !provider.matches_model(&committed_model) {
+                return model_policy_violation(
+                    "The final AI provider request model does not match the routed model policy",
+                );
+            }
+            return PluginResult::Continue;
+        }
+
         let final_model = match final_body.get("model") {
             Some(Value::String(model)) if !model.is_empty() => model.as_str(),
             _ => {
@@ -2605,23 +3196,42 @@ impl Plugin for AiStreamRouter {
         // into every client-visible chunk and the fail-closed `tool_use` guard,
         // both from the private claim rather than from the forgeable
         // `ai_stream_router.model` / `ai_stream_router.tool_choice_none` keys.
-        let (model, tools_forbidden) = {
+        let (model, tools_forbidden, provider_type) = {
             let (claim, provider) = self.owned_claim(ctx)?;
             if !provider.normalizes_response(self.normalize_response_stream) {
                 return None;
             }
-            (claim.model.clone(), claim.tool_choice_none)
+            (
+                claim.model.clone(),
+                claim.tool_choice_none,
+                provider.provider_type,
+            )
         };
-        // Only normalize a successful event stream; a non-2xx/non-SSE body is an
+        // Only normalize a successful event stream; a non-2xx body is an
         // error envelope that should reach the client untouched.
         if !(200..300).contains(&response_status) {
             return None;
         }
-        if !content_type.is_some_and(is_event_stream_content_type) {
-            return None;
+        match classify_provider_stream_media(provider_type, content_type) {
+            ProviderStreamMediaDecision::Normalize => {}
+            ProviderStreamMediaDecision::PassThrough => return None,
+            decision => {
+                let message = provider_stream_media_fail_closed_message(decision)
+                    .unwrap_or(
+                        "upstream provider returned a successful response unsuitable for stream normalization",
+                    );
+                return Some(Box::new(ImmediateUpstreamErrorNormalizer::new(
+                    message.to_string(),
+                )));
+            }
         }
         let encoding = ctx.metadata.get(META_PROVIDER_ENCODING).cloned();
-        Some(wrap_anthropic_normalizer(model, encoding, tools_forbidden))
+        Some(wrap_provider_normalizer(
+            provider_type,
+            model,
+            encoding,
+            tools_forbidden,
+        ))
     }
 
     async fn normalize_response_body_with_context(
@@ -2639,20 +3249,33 @@ impl Plugin for AiStreamRouter {
         // committed generation identity and tool-use guard
         // (`GHSA-xhp5-hqj8-3mwg`). Scoped so the claim borrow ends before the
         // buffered normalization await.
-        let (model, tools_forbidden) = {
+        let (model, tools_forbidden, provider_type) = {
             let (claim, provider) = self.owned_claim(ctx)?;
             if !provider.normalizes_response(self.normalize_response_stream) {
                 return None;
             }
-            (claim.model.clone(), claim.tool_choice_none)
+            (
+                claim.model.clone(),
+                claim.tool_choice_none,
+                provider.provider_type,
+            )
         };
         // Match the streaming normalizer: provider error envelopes reach the
         // client untouched even when a backend labels them as event streams.
         if !(200..300).contains(&response_status) {
             return None;
         }
-        if !content_type.is_some_and(is_event_stream_content_type) {
-            return None;
+        match classify_provider_stream_media(provider_type, content_type) {
+            ProviderStreamMediaDecision::Normalize => {}
+            ProviderStreamMediaDecision::PassThrough => return None,
+            decision => {
+                let message = provider_stream_media_fail_closed_message(decision)
+                    .unwrap_or(
+                        "upstream provider returned a successful response unsuitable for stream normalization",
+                    );
+                let ceiling = ctx.retained_response_body_ceiling();
+                return bounded_upstream_sse_error_body(message, ceiling);
+            }
         }
         // Every replacement this normalizer produces is materialised inside a
         // sink bounded by this response's retained ceiling — the same size as
@@ -2693,17 +3316,27 @@ impl Plugin for AiStreamRouter {
                 );
             }
         };
-        normalize_anthropic_sse_buffered(model, &plaintext, tools_forbidden, ceiling).await
+        normalize_provider_stream_buffered(
+            provider_type,
+            model,
+            &plaintext,
+            tools_forbidden,
+            ceiling,
+        )
+        .await
     }
 
-    /// Bind every field normalized Anthropic SSE invalidates.
+    /// Bind every field normalized provider SSE invalidates.
     ///
     /// When this plugin rewrites provider SSE into OpenAI-shaped identity bytes,
     /// `repair_normalized_representation_headers` removes `content-encoding` and
     /// `content-length`, runs
     /// [`super::invalidate_content_bound_response_headers`] (validators, digests,
     /// signatures, and the open-ended `x-amz-checksum-*` / `x-checksum-*`
-    /// families), and scrubs or rewrites `vary`. A trailer-only copy of any of
+    /// families), and scrubs or rewrites `vary`; for a non-SSE provider framing
+    /// such as the Gemini JSON-array fallback,
+    /// [`stamp_normalized_sse_content_type`] additionally relabels
+    /// `content-type`. A trailer-only copy of any of
     /// them is invisible to the per-request mutation witness (absent → absent),
     /// so the exact names and checksum prefixes are derived from the same shared
     /// invalidation inventory. Other application trailers remain intact.
@@ -2731,27 +3364,43 @@ impl Plugin for AiStreamRouter {
             return PluginResult::Continue;
         }
         let content_type = response_headers.get("content-type").map(String::as_str);
-        if !content_type.is_some_and(is_event_stream_content_type) {
-            return PluginResult::Continue;
+        let provider_type = match self.owned_claim(ctx) {
+            Some((_, provider)) => provider.provider_type,
+            None => return PluginResult::Continue,
+        };
+        match classify_provider_stream_media(provider_type, content_type) {
+            ProviderStreamMediaDecision::Normalize => {}
+            ProviderStreamMediaDecision::PassThrough => return PluginResult::Continue,
+            decision => {
+                let message = provider_stream_media_fail_closed_message(decision).unwrap_or(
+                    "Upstream provider returned a successful response unsuitable for stream normalization",
+                );
+                return openai_error_response(
+                    502,
+                    message,
+                    "upstream_error",
+                    None,
+                    Some("unsupported_content_type"),
+                );
+            }
         }
 
         match classify_provider_content_encoding(response_headers) {
             ProviderContentEncoding::Identity => {
                 repair_normalized_representation_headers(response_headers);
+                stamp_normalized_sse_content_type(response_headers);
                 PluginResult::Continue
             }
             ProviderContentEncoding::Supported(coding) => {
                 ctx.metadata
                     .insert(META_PROVIDER_ENCODING.to_string(), coding);
                 repair_normalized_representation_headers(response_headers);
+                stamp_normalized_sse_content_type(response_headers);
                 PluginResult::Continue
             }
             ProviderContentEncoding::Unsupported(reason) => openai_error_response(
                 502,
-                &format!(
-                    "Upstream Anthropic SSE used an unsupported Content-Encoding: {}",
-                    reason.as_str()
-                ),
+                reason.as_str(),
                 "upstream_error",
                 None,
                 Some("unsupported_content_encoding"),
@@ -3020,6 +3669,35 @@ fn repair_normalized_representation_headers(headers: &mut HashMap<String, String
     scrub_accept_encoding_from_vary(headers);
 }
 
+/// Media type every normalizer emits, whatever the provider labelled its own
+/// framing as.
+const NORMALIZED_SSE_CONTENT_TYPE: &str = "text/event-stream";
+
+/// Relabel a normalized response whose provider media type is not SSE.
+///
+/// The Gemini adapter also normalizes the Vertex JSON-array fallback (a
+/// provider that ignores the injected `alt=sse` answers `application/json`), and
+/// what leaves the gateway on that path is OpenAI `chat.completion.chunk` SSE
+/// terminated by `data: [DONE]`. Leaving the provider's `application/json`
+/// label on those bytes would make OpenAI SDKs, intermediaries, and the
+/// gateway's own `is_streaming_content_type` dispatch on a media type the body
+/// no longer has. Responses already labelled `text/event-stream` (every
+/// Anthropic normalization, and Gemini's SSE framing) are left untouched so
+/// their `charset` and other parameters survive.
+fn stamp_normalized_sse_content_type(headers: &mut HashMap<String, String>) {
+    let already_sse = headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type") && is_event_stream_content_type(value)
+    });
+    if already_sse {
+        return;
+    }
+    remove_header_ci(headers, "content-type");
+    headers.insert(
+        "content-type".to_string(),
+        NORMALIZED_SSE_CONTENT_TYPE.to_string(),
+    );
+}
+
 fn scrub_accept_encoding_from_vary(headers: &mut HashMap<String, String>) {
     let variants: Vec<_> = headers
         .iter()
@@ -3115,14 +3793,32 @@ fn bounded_upstream_sse_error_body(message: &str, ceiling: usize) -> Option<Vec<
 /// contract — cumulative event, byte, and output accounting — is unchanged.
 const BUFFERED_NORMALIZE_CHUNK_BYTES: usize = 16 * 1024;
 
-fn wrap_anthropic_normalizer(
+fn wrap_provider_normalizer(
+    provider_type: ProviderType,
     model: String,
     encoding: Option<String>,
     tools_forbidden: bool,
 ) -> Box<dyn ResponseStreamInspector> {
-    let inner = AnthropicSseNormalizer::new(model, tools_forbidden);
+    let engine = match provider_type {
+        ProviderType::Anthropic => {
+            NormalizeEngine::Anthropic(AnthropicSseNormalizer::new(model, tools_forbidden))
+        }
+        ProviderType::GoogleGemini => {
+            NormalizeEngine::Gemini(GeminiStreamNormalizer::new(model, tools_forbidden))
+        }
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible => {
+            // Unreachable: only normalizing providers install an inspector.
+            return Box::new(ImmediateUpstreamErrorNormalizer::new(
+                "internal error: non-normalizing provider requested a stream normalizer"
+                    .to_string(),
+            ));
+        }
+    };
     let Some(encoding) = encoding else {
-        return Box::new(inner);
+        return match engine {
+            NormalizeEngine::Anthropic(inner) => Box::new(inner),
+            NormalizeEngine::Gemini(inner) => Box::new(inner),
+        };
     };
     // Re-validate the metadata stamp (or a forged value) with the same
     // classifier `after_proxy` used. Unsupported / ambiguous chains fail closed
@@ -3131,13 +3827,105 @@ fn wrap_anthropic_normalizer(
     probe.insert("content-encoding".to_string(), encoding);
     match classify_provider_content_encoding(&probe) {
         ProviderContentEncoding::Supported(coding) => {
-            Box::new(ContentDecodingNormalizer::new(coding, inner))
+            Box::new(ContentDecodingNormalizer::new(coding, engine))
         }
-        ProviderContentEncoding::Identity => Box::new(inner),
+        ProviderContentEncoding::Identity => match engine {
+            NormalizeEngine::Anthropic(inner) => Box::new(inner),
+            NormalizeEngine::Gemini(inner) => Box::new(inner),
+        },
         ProviderContentEncoding::Unsupported(reason) => Box::new(
             ImmediateUpstreamErrorNormalizer::new(reason.as_str().to_string()),
         ),
     }
+}
+
+/// How a claimed normalizing provider response's `Content-Type` is handled.
+///
+/// Anthropic keeps the historical PassThrough posture when the response is not
+/// `text/event-stream`. Gemini must not stream raw 2xx provider bytes past the
+/// adapter when the media type is missing or unexpected: those cases fail
+/// closed through after_proxy / inspector / buffered normalization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderStreamMediaDecision {
+    Normalize,
+    PassThrough,
+    FailClosedMissingContentType,
+    FailClosedUnexpectedContentType,
+}
+
+fn classify_provider_stream_media(
+    provider_type: ProviderType,
+    content_type: Option<&str>,
+) -> ProviderStreamMediaDecision {
+    match provider_type {
+        ProviderType::Anthropic => {
+            if content_type.is_some_and(is_event_stream_content_type) {
+                ProviderStreamMediaDecision::Normalize
+            } else {
+                ProviderStreamMediaDecision::PassThrough
+            }
+        }
+        ProviderType::GoogleGemini => match content_type {
+            Some(ct) if is_event_stream_content_type(ct) || is_json_content_type(ct) => {
+                ProviderStreamMediaDecision::Normalize
+            }
+            None => ProviderStreamMediaDecision::FailClosedMissingContentType,
+            Some(_) => ProviderStreamMediaDecision::FailClosedUnexpectedContentType,
+        },
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible => {
+            ProviderStreamMediaDecision::PassThrough
+        }
+    }
+}
+
+/// Fixed-cardinality Content-Type diagnostics. Never echoes the provider header.
+fn provider_stream_media_fail_closed_message(
+    decision: ProviderStreamMediaDecision,
+) -> Option<&'static str> {
+    match decision {
+        ProviderStreamMediaDecision::FailClosedMissingContentType => Some(
+            "Upstream provider returned a successful response without a Content-Type suitable for Gemini stream normalization",
+        ),
+        ProviderStreamMediaDecision::FailClosedUnexpectedContentType => Some(
+            "Upstream provider returned a successful response with an unexpected Content-Type for Gemini stream normalization",
+        ),
+        ProviderStreamMediaDecision::Normalize | ProviderStreamMediaDecision::PassThrough => None,
+    }
+}
+
+/// Ensure Gemini streaming requests negotiate `alt=sse` when normalizing.
+///
+/// Native Gemini `streamGenerateContent` defaults to a JSON array stream; with
+/// `alt=sse` it uses documented SSE framing. Vertex-compatible JSON object
+/// streams remain accepted by the normalizer when a provider omits the flag.
+fn ensure_gemini_alt_sse(backend_path: &mut String, committed_query: &mut String) {
+    if query_has_alt_sse(backend_path) || query_has_alt_sse(committed_query) {
+        return;
+    }
+    if let Some(qmark) = backend_path.find('?') {
+        if backend_path[qmark + 1..].is_empty() {
+            backend_path.push_str("alt=sse");
+        } else {
+            backend_path.push_str("&alt=sse");
+        }
+        return;
+    }
+    if committed_query.is_empty() {
+        *committed_query = "alt=sse".to_string();
+    } else {
+        committed_query.push_str("&alt=sse");
+    }
+}
+
+fn query_has_alt_sse(query_or_path: &str) -> bool {
+    let query = query_or_path
+        .split_once('?')
+        .map(|(_, q)| q)
+        .unwrap_or(query_or_path);
+    query.split('&').any(|pair| {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        name.eq_ignore_ascii_case("alt") && value.eq_ignore_ascii_case("sse")
+    })
 }
 
 fn decoded_query_names(query: &str) -> HashSet<String> {
@@ -3531,9 +4319,16 @@ impl AnthropicSseNormalizer {
     }
 
     /// The final usage chunk, written through the same bounded accumulator.
-    fn write_usage_line(&mut self, out: &mut NormalizedSseOut) {
+    /// Returns an error when provider-controlled u64 counts overflow on add so
+    /// the caller can fail closed instead of publishing a wrapped total.
+    fn write_usage_line(&mut self, out: &mut NormalizedSseOut) -> Result<(), &'static str> {
         let (Some(p), Some(c)) = (self.prompt_tokens, self.completion_tokens) else {
-            return;
+            return Ok(());
+        };
+        let Some(total) = p.checked_add(c) else {
+            return Err(
+                "upstream provider sent usage token counts that overflow u64 total; stream terminated",
+            );
         };
         let id = self.id();
         let payload = json!({
@@ -3545,10 +4340,11 @@ impl AnthropicSseNormalizer {
             "usage": {
                 "prompt_tokens": p,
                 "completion_tokens": c,
-                "total_tokens": p + c,
+                "total_tokens": total,
             },
         });
         out.write_sse_data_line(&payload);
+        Ok(())
     }
 
     fn emit_upstream_error(&mut self, message: &str, out: &mut NormalizedSseOut) {
@@ -3742,11 +4538,15 @@ impl AnthropicSseNormalizer {
         if self.done_emitted {
             return;
         }
+        let mut terminal = terminal;
+        if terminal == StreamTerminal::MessageStop
+            && let Err(message) = self.write_usage_line(out)
+        {
+            self.emit_upstream_error(message, out);
+            terminal = StreamTerminal::ProviderError;
+        }
         self.done_emitted = true;
         self.terminal = Some(terminal);
-        if terminal == StreamTerminal::MessageStop {
-            self.write_usage_line(out);
-        }
         out.push_str("data: [DONE]\n\n");
     }
 
@@ -4075,24 +4875,1404 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
     }
 }
 
-/// Decode residual provider content-coding chains, then feed plaintext SSE into
-/// the Anthropic→OpenAI normalizer. Because a compressed stream's
+// ---------------------------------------------------------------------------
+// Gemini / Vertex stream → OpenAI chat.completion.chunk SSE normalizer
+// ---------------------------------------------------------------------------
+
+/// How Gemini/Vertex bytes are framed on the wire for one response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeminiFraming {
+    Undecided,
+    Sse,
+    /// Native `streamGenerateContent` without `alt=sse`, or Vertex JSON array /
+    /// concatenated-object streams.
+    JsonStream,
+}
+
+/// Strict JSON-array separator/value state. Concatenated-object streams stay
+/// `Inactive` for the whole response; array streams never accept leading,
+/// repeated, trailing, or missing commas, and reject bytes after `]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeminiJsonArrayState {
+    Inactive,
+    /// After `[` — empty `[]` is allowed; a leading comma is not.
+    ExpectFirstValueOrEnd,
+    /// After `,` — a value is required; `]` would be a trailing comma.
+    ExpectValueAfterComma,
+    /// After a complete value; awaiting `,` or `]`.
+    ExpectCommaOrEnd,
+    /// Closing `]` consumed; only whitespace allowed afterward.
+    Closed,
+}
+
+/// Per-candidate OpenAI choice state while Gemini deltas arrive.
+#[derive(Default)]
+struct GeminiCandidateState {
+    role_emitted: bool,
+    next_tool_index: u32,
+    /// True once this candidate has emitted any client-visible OpenAI choice
+    /// delta (role, content, tool_calls, or a terminal finish_reason chunk).
+    emitted_client_visible: bool,
+    finished: bool,
+    saw_tool_call: bool,
+}
+
+/// Stateful normalizer for Gemini/`streamGenerateContent` (and Vertex-compatible)
+/// response streams into OpenAI `chat.completion.chunk` SSE.
+///
+/// Accepts both SSE (`alt=sse`) and JSON array / object streams. Chunk splits
+/// are buffered under the same per-event / cumulative / output / depth bounds
+/// as the Anthropic normalizer. Malformed, oversized, or unrepresentable frames
+/// fail closed with field-specific diagnostics that never echo provider
+/// payloads, credentials, or tool-argument bodies.
+///
+/// Candidate lifecycle is fail-closed: every candidate that emitted
+/// client-visible output must reach a terminal `finishReason` before clean EOF
+/// succeeds, post-finish / duplicate-terminal candidate data is rejected, and
+/// duplicate candidate indexes within one provider event are rejected.
+/// Content parts are closed-shape: only `text` and `functionCall` map to OpenAI
+/// deltas. The sole metadata-only exception is an empty JSON object `{}` (no
+/// keys), which carries no provider output; any other non-empty part without a
+/// representable field (media, code, thought-only, scalars, unknowns) fails
+/// closed with a fixed-cardinality diagnostic.
+struct GeminiStreamNormalizer {
+    buf: Vec<u8>,
+    cursor: usize,
+    scan_cursor: usize,
+    /// Resumable structural state for the JSON-framed value scanner. See
+    /// [`JsonScanMemo`] for the staleness argument.
+    json_scan: JsonScanMemo,
+    bytes_ingested: usize,
+    events_seen: usize,
+    normalized_out_bytes: usize,
+    framing: GeminiFraming,
+    json_array_state: GeminiJsonArrayState,
+    model: String,
+    stream_id: Option<String>,
+    /// True once a provider `responseId` has been pinned for this stream.
+    response_id_pinned: bool,
+    created: i64,
+    done_emitted: bool,
+    terminal: Option<StreamTerminal>,
+    tools_forbidden: bool,
+    candidates: HashMap<u64, GeminiCandidateState>,
+    saw_successful_finish: bool,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    call_id_prefix: String,
+}
+
+impl GeminiStreamNormalizer {
+    fn new(model: String, tools_forbidden: bool) -> Self {
+        Self {
+            buf: Vec::new(),
+            cursor: 0,
+            scan_cursor: 0,
+            json_scan: JsonScanMemo::Fresh,
+            bytes_ingested: 0,
+            events_seen: 0,
+            normalized_out_bytes: 0,
+            framing: GeminiFraming::Undecided,
+            json_array_state: GeminiJsonArrayState::Inactive,
+            model,
+            stream_id: None,
+            response_id_pinned: false,
+            created: Utc::now().timestamp(),
+            done_emitted: false,
+            terminal: None,
+            tools_forbidden,
+            candidates: HashMap::new(),
+            saw_successful_finish: false,
+            prompt_tokens: None,
+            completion_tokens: None,
+            call_id_prefix: format!(
+                "{:x}",
+                (Utc::now().timestamp() as u64).wrapping_mul(1_000_000_007)
+            ),
+        }
+    }
+
+    fn unread_len(&self) -> usize {
+        self.buf.len().saturating_sub(self.cursor)
+    }
+
+    /// Sole cursor writer outside compaction.
+    ///
+    /// The JSON scan memo is expressed relative to the start of the value under
+    /// scan, which is always `cursor`, so any cursor move invalidates it. Doing
+    /// the reset here — rather than at each call site — is what makes a stale
+    /// memo unrepresentable.
+    fn set_cursor(&mut self, pos: usize) {
+        if pos != self.cursor {
+            self.json_scan = JsonScanMemo::Fresh;
+        }
+        self.cursor = pos;
+    }
+
+    fn clear_buffer(&mut self) {
+        self.buf.clear();
+        self.cursor = 0;
+        self.scan_cursor = 0;
+        self.json_scan = JsonScanMemo::Fresh;
+        if self.buf.capacity() > 64 * 1024 {
+            self.buf.shrink_to(4096);
+        }
+    }
+
+    fn maybe_compact(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        if self.cursor >= self.buf.len() {
+            self.clear_buffer();
+            return;
+        }
+        if self.cursor >= SSE_BUFFER_COMPACT_THRESHOLD && self.cursor * 2 >= self.buf.len() {
+            let consumed = self.cursor;
+            self.buf.drain(..consumed);
+            self.scan_cursor = self.scan_cursor.saturating_sub(consumed);
+            // Draining exactly `cursor` bytes leaves the unread region
+            // byte-for-byte identical and moves its start to 0, so the
+            // cursor-relative JSON scan memo stays valid without adjustment.
+            self.cursor = 0;
+        }
+    }
+
+    fn id(&mut self) -> String {
+        if let Some(id) = &self.stream_id {
+            return id.clone();
+        }
+        let id = format!("chatcmpl-stream-{}", self.created);
+        self.stream_id = Some(id.clone());
+        id
+    }
+
+    fn write_chunk_line(
+        &mut self,
+        choice_index: u64,
+        delta: Value,
+        finish_reason: Option<&str>,
+        out: &mut NormalizedSseOut,
+    ) {
+        let id = self.id();
+        let payload = json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": choice_index,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }],
+        });
+        out.write_sse_data_line(&payload);
+    }
+
+    fn write_usage_line(&mut self, out: &mut NormalizedSseOut) -> Result<(), &'static str> {
+        let (Some(p), Some(c)) = (self.prompt_tokens, self.completion_tokens) else {
+            return Ok(());
+        };
+        let Some(total) = p.checked_add(c) else {
+            return Err(
+                "upstream provider sent usage token counts that overflow u64 total; stream terminated",
+            );
+        };
+        let id = self.id();
+        let payload = json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": p,
+                "completion_tokens": c,
+                "total_tokens": total,
+            },
+        });
+        out.write_sse_data_line(&payload);
+        Ok(())
+    }
+
+    fn emit_upstream_error(&mut self, message: &str, out: &mut NormalizedSseOut) {
+        let message = truncate_provider_error_message(message);
+        let err = json!({
+            "error": {
+                "message": message,
+                "type": "upstream_error",
+            }
+        });
+        out.write_sse_data_line(&err);
+    }
+
+    fn fail_bound(&mut self, message: &'static str, out: &mut NormalizedSseOut) {
+        self.clear_buffer();
+        self.emit_upstream_error(message, out);
+        self.finish(StreamTerminal::ProviderError, out);
+    }
+
+    fn finish(&mut self, terminal: StreamTerminal, out: &mut NormalizedSseOut) {
+        if self.done_emitted {
+            return;
+        }
+        let mut terminal = terminal;
+        if terminal == StreamTerminal::MessageStop
+            && let Err(message) = self.write_usage_line(out)
+        {
+            self.emit_upstream_error(message, out);
+            terminal = StreamTerminal::ProviderError;
+        }
+        self.done_emitted = true;
+        self.terminal = Some(terminal);
+        out.push_str("data: [DONE]\n\n");
+    }
+
+    fn candidate_state(&mut self, index: u64) -> &mut GeminiCandidateState {
+        self.candidates.entry(index).or_default()
+    }
+
+    fn ensure_role(&mut self, choice_index: u64, out: &mut NormalizedSseOut) {
+        if self.candidate_state(choice_index).role_emitted {
+            return;
+        }
+        let state = self.candidate_state(choice_index);
+        state.role_emitted = true;
+        state.emitted_client_visible = true;
+        self.write_chunk_line(choice_index, json!({ "role": "assistant" }), None, out);
+    }
+
+    fn mark_candidate_finished_visible(&mut self, choice_index: u64) {
+        let state = self.candidate_state(choice_index);
+        state.finished = true;
+        state.emitted_client_visible = true;
+    }
+
+    fn candidate_already_finished(&self, choice_index: u64) -> bool {
+        self.candidates
+            .get(&choice_index)
+            .is_some_and(|state| state.finished)
+    }
+
+    fn reject_post_finish_candidate(&mut self, out: &mut NormalizedSseOut) -> bool {
+        self.emit_upstream_error(
+            "upstream provider sent Gemini candidate output after a terminal finishReason; stream terminated",
+            out,
+        );
+        self.finish(StreamTerminal::UpstreamFailure, out);
+        true
+    }
+
+    /// Terminate on a `promptFeedback.blockReason` under the same
+    /// candidate-lifecycle contract every other terminal obeys.
+    ///
+    /// A prompt block ends the whole generation, but it must not manufacture a
+    /// second terminal chunk for a choice that already finished (a `stop`
+    /// followed by a contradictory `content_filter`), and it must not close a
+    /// multi-candidate stream with the success-shaped terminal while another
+    /// candidate has emitted client-visible output and never reached a terminal
+    /// `finishReason`. That second case is exactly the premature close
+    /// `finish_stream` fails closed on, so it fails closed here too.
+    fn finish_prompt_block(&mut self, out: &mut NormalizedSseOut) -> bool {
+        if !self.candidate_already_finished(0) {
+            self.ensure_role(0, out);
+            self.write_chunk_line(0, json!({}), Some("content_filter"), out);
+            self.mark_candidate_finished_visible(0);
+            self.saw_successful_finish = true;
+        }
+        let unfinished_visible = self
+            .candidates
+            .values()
+            .any(|state| state.emitted_client_visible && !state.finished);
+        if unfinished_visible {
+            self.emit_upstream_error(
+                "upstream provider blocked the Gemini prompt before every candidate reached a terminal finishReason",
+                out,
+            );
+            self.finish(StreamTerminal::UpstreamFailure, out);
+            return true;
+        }
+        self.finish(StreamTerminal::MessageStop, out);
+        true
+    }
+
+    fn detect_framing(&mut self) -> Result<(), &'static str> {
+        if self.framing != GeminiFraming::Undecided {
+            return Ok(());
+        }
+        let unread = &self.buf[self.cursor..];
+        let Some(first) = unread.iter().find(|b| !b.is_ascii_whitespace()).copied() else {
+            return Ok(());
+        };
+        match first {
+            b'd' | b'e' | b':' => {
+                // `data:` / `event:` / SSE comment — treat as SSE once a letter
+                // or colon appears at the start of a line-ish stream.
+                self.framing = GeminiFraming::Sse;
+                Ok(())
+            }
+            b'{' | b'[' => {
+                self.framing = GeminiFraming::JsonStream;
+                Ok(())
+            }
+            _ => Err(
+                "upstream provider sent an unrecognized Gemini/Vertex stream framing; stream terminated",
+            ),
+        }
+    }
+
+    fn account_ingested(&mut self, chunk_len: usize) -> Result<(), &'static str> {
+        let Some(next) = self.bytes_ingested.checked_add(chunk_len) else {
+            return Err(
+                "upstream provider SSE stream exceeded the cumulative size limit; stream terminated",
+            );
+        };
+        if next > MAX_SSE_NORMALIZED_BODY_BYTES {
+            return Err(
+                "upstream provider SSE stream exceeded the cumulative size limit; stream terminated",
+            );
+        }
+        self.bytes_ingested = next;
+        Ok(())
+    }
+
+    fn normalized_output_exceeded(&mut self, out: &mut NormalizedSseOut, terminal: bool) -> bool {
+        let total = self.normalized_out_bytes.saturating_add(out.len());
+        let allowed = if terminal {
+            MAX_SSE_NORMALIZED_OUTPUT_BYTES
+        } else {
+            MAX_SSE_NORMALIZED_OUTPUT_BYTES
+                .saturating_sub(SSE_NORMALIZED_OUTPUT_TERMINAL_RESERVE_BYTES)
+        };
+        if total <= allowed {
+            return false;
+        }
+        out.reset_call();
+        self.done_emitted = false;
+        self.terminal = None;
+        self.fail_bound(SSE_NORMALIZED_OUTPUT_LIMIT_MESSAGE, out);
+        true
+    }
+
+    fn interpret_json_object(&mut self, raw: &str, out: &mut NormalizedSseOut) -> bool {
+        if json_nesting_depth(raw) > MAX_SSE_EVENT_JSON_DEPTH {
+            self.emit_upstream_error(
+                "upstream provider sent a Gemini event with excessive JSON nesting; stream terminated",
+                out,
+            );
+            self.finish(StreamTerminal::UpstreamFailure, out);
+            return true;
+        }
+        let event: Value = match serde_json::from_str(raw) {
+            Ok(value) => value,
+            Err(_) => {
+                self.emit_upstream_error(
+                    "upstream provider sent a malformed Gemini JSON event; stream terminated",
+                    out,
+                );
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                return true;
+            }
+        };
+        self.transcode_event(&event, out)
+    }
+
+    fn transcode_event(&mut self, event: &Value, out: &mut NormalizedSseOut) -> bool {
+        // Provider error envelopes (HTTP-shaped JSON inside the stream).
+        if let Some(error) = event.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("upstream provider stream error");
+            self.emit_upstream_error(message, out);
+            self.finish(StreamTerminal::ProviderError, out);
+            return true;
+        }
+
+        if let Some(response_id_value) = event.get("responseId") {
+            let Some(response_id) = response_id_value.as_str() else {
+                self.emit_upstream_error(
+                    "upstream provider sent an invalid Gemini responseId; stream terminated",
+                    out,
+                );
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                return true;
+            };
+            if response_id.is_empty() || response_id.len() > 128 {
+                self.emit_upstream_error(
+                    "upstream provider sent an invalid Gemini responseId; stream terminated",
+                    out,
+                );
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                return true;
+            }
+            if self.response_id_pinned {
+                if self.stream_id.as_deref() != Some(response_id) {
+                    self.emit_upstream_error(
+                        "upstream provider changed Gemini responseId mid-stream; stream terminated",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    return true;
+                }
+            } else if let Some(existing) = self.stream_id.as_deref() {
+                // A synthetic chunk id was already committed; refusing to rewrite
+                // mid-stream keeps claim-owned identity stable.
+                if existing != response_id {
+                    self.emit_upstream_error(
+                        "upstream provider changed Gemini responseId mid-stream; stream terminated",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    return true;
+                }
+                self.response_id_pinned = true;
+            } else {
+                self.stream_id = Some(response_id.to_string());
+                self.response_id_pinned = true;
+            }
+        }
+        // Validate provider modelVersion shape when present, but never replace
+        // the claim-committed model stamped into normalized chunks.
+        if let Some(model_version_value) = event.get("modelVersion") {
+            let Some(model_version) = model_version_value.as_str() else {
+                self.emit_upstream_error(
+                    "upstream provider sent an invalid Gemini modelVersion; stream terminated",
+                    out,
+                );
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                return true;
+            };
+            if !is_valid_url_model_component(model_version) {
+                self.emit_upstream_error(
+                    "upstream provider sent an invalid Gemini modelVersion; stream terminated",
+                    out,
+                );
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                return true;
+            }
+        }
+
+        if let Some(usage) = event.get("usageMetadata") {
+            match apply_gemini_usage_metadata(
+                usage,
+                &mut self.prompt_tokens,
+                &mut self.completion_tokens,
+            ) {
+                Ok(()) => {}
+                Err(message) => {
+                    self.emit_upstream_error(message, out);
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    return true;
+                }
+            }
+        }
+
+        match gemini_prompt_block_reason(event) {
+            Ok(Some(_)) => return self.finish_prompt_block(out),
+            Ok(None) => {}
+            Err(message) => {
+                self.emit_upstream_error(message, out);
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                return true;
+            }
+        }
+
+        let Some(candidates) = event.get("candidates") else {
+            // Usage-only / empty keepalive objects are forward-compatible.
+            return false;
+        };
+        let Some(candidates) = candidates.as_array() else {
+            self.emit_upstream_error(
+                "upstream provider sent Gemini candidates that were not an array; stream terminated",
+                out,
+            );
+            self.finish(StreamTerminal::UpstreamFailure, out);
+            return true;
+        };
+
+        let mut seen_indexes: HashSet<u64> = HashSet::with_capacity(candidates.len());
+        for (fallback_index, candidate) in candidates.iter().enumerate() {
+            let Some(candidate) = candidate.as_object() else {
+                self.emit_upstream_error(
+                    "upstream provider sent a non-object Gemini candidate; stream terminated",
+                    out,
+                );
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                return true;
+            };
+            let choice_index = match candidate.get("index") {
+                None => fallback_index as u64,
+                Some(value) => match value.as_u64() {
+                    Some(index) => index,
+                    None => {
+                        self.emit_upstream_error(
+                            "upstream provider sent a Gemini candidate with a malformed index; stream terminated",
+                            out,
+                        );
+                        self.finish(StreamTerminal::UpstreamFailure, out);
+                        return true;
+                    }
+                },
+            };
+            if !seen_indexes.insert(choice_index) {
+                self.emit_upstream_error(
+                    "upstream provider sent duplicate Gemini candidate indexes in one event; stream terminated",
+                    out,
+                );
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                return true;
+            }
+
+            if self.candidate_already_finished(choice_index) {
+                return self.reject_post_finish_candidate(out);
+            }
+
+            let mapped_finish = match candidate.get("finishReason") {
+                None => None,
+                Some(Value::String(finish)) => match map_gemini_finish_reason(finish) {
+                    Ok(mapped) => Some(mapped),
+                    Err(message) => {
+                        self.emit_upstream_error(message, out);
+                        self.finish(StreamTerminal::UpstreamFailure, out);
+                        return true;
+                    }
+                },
+                Some(_) => {
+                    self.emit_upstream_error(
+                        "upstream provider sent a Gemini candidate with a malformed finishReason; stream terminated",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    return true;
+                }
+            };
+
+            // Emit content/tool deltas before the finish chunk when present.
+            // Post-finish / duplicate-terminal checks above keep this fail-closed.
+            if let Err(message) = self.emit_candidate_parts(choice_index, candidate, out) {
+                self.emit_upstream_error(message, out);
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                return true;
+            }
+
+            let Some(base_finish) = mapped_finish else {
+                continue;
+            };
+            let saw_tool_call = self.candidate_state(choice_index).saw_tool_call;
+            let finish_reason = if saw_tool_call {
+                if base_finish != "stop" {
+                    self.emit_upstream_error(
+                        "upstream provider sent Gemini function calls with a non-STOP finishReason; stream terminated",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    return true;
+                }
+                "tool_calls"
+            } else {
+                base_finish
+            };
+            self.ensure_role(choice_index, out);
+            self.write_chunk_line(choice_index, json!({}), Some(finish_reason), out);
+            self.mark_candidate_finished_visible(choice_index);
+            self.saw_successful_finish = true;
+        }
+        false
+    }
+
+    fn emit_candidate_parts(
+        &mut self,
+        choice_index: u64,
+        candidate: &serde_json::Map<String, Value>,
+        out: &mut NormalizedSseOut,
+    ) -> Result<(), &'static str> {
+        let Some(content) = candidate.get("content") else {
+            return Ok(());
+        };
+        let Some(content) = content.as_object() else {
+            return Err(
+                "upstream provider sent a Gemini candidate with a non-object content; stream terminated",
+            );
+        };
+        match content.get("role") {
+            None => {}
+            Some(Value::String(role)) if role == "model" => {}
+            Some(_) => {
+                return Err(
+                    "upstream provider sent a Gemini candidate content role that was not model; stream terminated",
+                );
+            }
+        }
+        let parts = match content.get("parts") {
+            None => return Ok(()),
+            Some(value) => value.as_array().ok_or(
+                "upstream provider sent a Gemini content parts value that was not an array; stream terminated",
+            )?,
+        };
+        for part in parts {
+            let Some(part_obj) = part.as_object() else {
+                return Err(
+                    "upstream provider sent a non-object Gemini content part; stream terminated",
+                );
+            };
+            match (part_obj.get("text"), part_obj.get("functionCall")) {
+                (Some(text_value), None) => {
+                    if part_obj.len() != 1 {
+                        return Err(
+                            "upstream provider sent a Gemini content part with unrepresentable additional fields; stream terminated",
+                        );
+                    }
+                    let Some(text) = text_value.as_str() else {
+                        return Err(
+                            "upstream provider sent a Gemini text part that was not a string; stream terminated",
+                        );
+                    };
+                    if text.is_empty() {
+                        continue;
+                    }
+                    self.ensure_role(choice_index, out);
+                    self.write_chunk_line(choice_index, json!({ "content": text }), None, out);
+                }
+                (None, Some(function_call)) => {
+                    if part_obj.len() != 1 {
+                        return Err(
+                            "upstream provider sent a Gemini content part with unrepresentable additional fields; stream terminated",
+                        );
+                    }
+                    if self.tools_forbidden {
+                        return Err("upstream provider emitted tool use despite tool_choice none");
+                    }
+                    let name = function_call
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|n| valid_tool_name(n))
+                        .ok_or(
+                            "upstream provider sent a Gemini functionCall without a valid name; stream terminated",
+                        )?;
+                    let args = function_call
+                        .get("args")
+                        .filter(|value| value.is_object())
+                        .ok_or(
+                            "upstream provider sent a Gemini functionCall without object args; stream terminated",
+                        )?;
+                    let args_json = serde_json::to_string(args).map_err(|_| {
+                        "upstream provider sent unrepresentable Gemini functionCall args; stream terminated"
+                    })?;
+                    if args_json.len() > MAX_TOOL_ARGUMENTS_BYTES {
+                        return Err(
+                            "upstream provider sent oversized Gemini functionCall args; stream terminated",
+                        );
+                    }
+                    let tool_index = {
+                        let state = self.candidate_state(choice_index);
+                        state.saw_tool_call = true;
+                        state.emitted_client_visible = true;
+                        let idx = state.next_tool_index;
+                        state.next_tool_index = state.next_tool_index.saturating_add(1);
+                        idx
+                    };
+                    // Monotonic per-candidate tool index — not per-event part_index —
+                    // so multi-event tool calls cannot collide on the generated id.
+                    let call_id = format!(
+                        "call_gemini_{}_{choice_index}_{tool_index}",
+                        self.call_id_prefix
+                    );
+                    self.ensure_role(choice_index, out);
+                    self.write_chunk_line(
+                        choice_index,
+                        json!({
+                            "tool_calls": [{
+                                "index": tool_index,
+                                "id": call_id,
+                                "type": "function",
+                                "function": { "name": name, "arguments": args_json },
+                            }]
+                        }),
+                        None,
+                        out,
+                    );
+                }
+                (None, None) if part_obj.is_empty() => {
+                    // Sole metadata-only exception: an empty object carries no
+                    // provider output and cannot hide media/code/unknown parts.
+                }
+                (None, None) => {
+                    return Err(
+                        "upstream provider sent an unrepresentable Gemini content part; stream terminated",
+                    );
+                }
+                _ => {
+                    return Err(
+                        "upstream provider sent an ambiguous Gemini content part; stream terminated",
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_sse(&mut self, out: &mut NormalizedSseOut) -> bool {
+        loop {
+            let end = {
+                let scan_start = self.scan_cursor.max(self.cursor).min(self.buf.len());
+                match next_event_boundary(&self.buf[scan_start..]) {
+                    Some(end_rel) => scan_start + end_rel,
+                    None => {
+                        self.scan_cursor = self.buf.len().saturating_sub(3).max(self.cursor);
+                        break;
+                    }
+                }
+            };
+            let end_rel = end.saturating_sub(self.cursor);
+            if end_rel > MAX_SSE_EVENT_BYTES {
+                self.fail_bound(
+                    "upstream provider sent an oversized SSE event; stream terminated",
+                    out,
+                );
+                return true;
+            }
+            if self.events_seen >= MAX_SSE_EVENTS {
+                self.fail_bound(
+                    "upstream provider SSE stream exceeded the event count limit; stream terminated",
+                    out,
+                );
+                return true;
+            }
+            let start = self.cursor;
+            let raw = &self.buf[start..end];
+            let outcome = match extract_sse_event_result(raw) {
+                Ok((_event_name, None)) => FrameOutcome::Ignore,
+                Ok((_event_name, Some(data))) => {
+                    if data == "[DONE]" {
+                        FrameOutcome::Ignore
+                    } else {
+                        // Interpret immediately via a owned String to avoid
+                        // holding a borrow across mutation.
+                        FrameOutcome::Event(Value::String(data))
+                    }
+                }
+                Err(_) => FrameOutcome::Fail(
+                    "upstream provider sent a malformed SSE event; stream terminated",
+                ),
+            };
+            self.set_cursor(end);
+            self.scan_cursor = end;
+            self.events_seen = self.events_seen.saturating_add(1);
+            let terminate = match outcome {
+                FrameOutcome::Ignore => false,
+                FrameOutcome::Event(Value::String(data)) => self.interpret_json_object(&data, out),
+                FrameOutcome::Event(_) => false,
+                FrameOutcome::Fail(message) => {
+                    self.emit_upstream_error(message, out);
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    true
+                }
+            };
+            self.maybe_compact();
+            if self.normalized_output_exceeded(out, terminate) {
+                return true;
+            }
+            if terminate {
+                self.clear_buffer();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn skip_json_whitespace(&mut self) {
+        let mut pos = self.cursor;
+        while pos < self.buf.len() && self.buf[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        self.set_cursor(pos);
+        self.scan_cursor = self.cursor;
+    }
+
+    fn fail_json_array_syntax(&mut self, out: &mut NormalizedSseOut) -> bool {
+        self.emit_upstream_error(
+            "upstream provider sent malformed Gemini JSON array framing; stream terminated",
+            out,
+        );
+        self.finish(StreamTerminal::UpstreamFailure, out);
+        true
+    }
+
+    fn drain_json_stream(&mut self, out: &mut NormalizedSseOut) -> bool {
+        loop {
+            self.skip_json_whitespace();
+            if self.cursor >= self.buf.len() {
+                break;
+            }
+
+            match self.json_array_state {
+                GeminiJsonArrayState::Closed => {
+                    // Non-whitespace after the closing `]` is hostile.
+                    return self.fail_json_array_syntax(out);
+                }
+                GeminiJsonArrayState::Inactive => {
+                    if self.buf[self.cursor] == b'[' {
+                        self.json_array_state = GeminiJsonArrayState::ExpectFirstValueOrEnd;
+                        self.set_cursor(self.cursor + 1);
+                        self.scan_cursor = self.cursor;
+                        continue;
+                    }
+                }
+                GeminiJsonArrayState::ExpectFirstValueOrEnd => {
+                    if self.buf[self.cursor] == b']' {
+                        self.json_array_state = GeminiJsonArrayState::Closed;
+                        self.set_cursor(self.cursor + 1);
+                        self.scan_cursor = self.cursor;
+                        continue;
+                    }
+                    if self.buf[self.cursor] == b',' {
+                        return self.fail_json_array_syntax(out);
+                    }
+                }
+                GeminiJsonArrayState::ExpectValueAfterComma => {
+                    if self.buf[self.cursor] == b']' || self.buf[self.cursor] == b',' {
+                        return self.fail_json_array_syntax(out);
+                    }
+                }
+                GeminiJsonArrayState::ExpectCommaOrEnd => {
+                    if self.buf[self.cursor] == b']' {
+                        self.json_array_state = GeminiJsonArrayState::Closed;
+                        self.set_cursor(self.cursor + 1);
+                        self.scan_cursor = self.cursor;
+                        continue;
+                    }
+                    if self.buf[self.cursor] == b',' {
+                        self.set_cursor(self.cursor + 1);
+                        self.scan_cursor = self.cursor;
+                        self.json_array_state = GeminiJsonArrayState::ExpectValueAfterComma;
+                        continue;
+                    }
+                    // Another value without a comma separator.
+                    return self.fail_json_array_syntax(out);
+                }
+            }
+
+            // Incremental framing scan: every `on_chunk` resumes where the last
+            // one stopped instead of re-reading the whole unread window, so a
+            // value delivered in tiny provider-controlled segments costs O(n)
+            // in total rather than O(n^2).
+            let resume = match self.json_scan {
+                JsonScanMemo::Invalid => None,
+                JsonScanMemo::Fresh => Some(JsonValueScan::default()),
+                JsonScanMemo::Partial(state) => Some(state),
+            };
+            let step = match resume {
+                Some(state) => scan_json_value(&self.buf[self.cursor..], state),
+                None => JsonScanStep::Invalid,
+            };
+            let end_rel = match step {
+                JsonScanStep::Complete(end_rel) => end_rel,
+                JsonScanStep::Partial(state) => {
+                    self.json_scan = JsonScanMemo::Partial(state);
+                    if self.unread_len() > MAX_SSE_EVENT_BYTES {
+                        self.fail_bound(
+                            "upstream provider sent an oversized SSE event; stream terminated",
+                            out,
+                        );
+                        return true;
+                    }
+                    break;
+                }
+                JsonScanStep::Invalid => {
+                    // Monotone under appends: a first byte that cannot open a
+                    // JSON value, or a structural close below depth 0, can
+                    // never be repaired by more bytes. Remember it so the
+                    // remainder of the stream is not rescanned; the unread
+                    // window still fails closed once it exceeds the cap.
+                    self.json_scan = JsonScanMemo::Invalid;
+                    if self.unread_len() > MAX_SSE_EVENT_BYTES {
+                        self.fail_bound(
+                            "upstream provider sent an oversized SSE event; stream terminated",
+                            out,
+                        );
+                        return true;
+                    }
+                    break;
+                }
+            };
+            if end_rel > MAX_SSE_EVENT_BYTES {
+                self.fail_bound(
+                    "upstream provider sent an oversized SSE event; stream terminated",
+                    out,
+                );
+                return true;
+            }
+            if self.events_seen >= MAX_SSE_EVENTS {
+                self.fail_bound(
+                    "upstream provider SSE stream exceeded the event count limit; stream terminated",
+                    out,
+                );
+                return true;
+            }
+            let start = self.cursor;
+            let end = self.cursor + end_rel;
+            let raw = match std::str::from_utf8(&self.buf[start..end]) {
+                Ok(text) => text.to_string(),
+                Err(_) => {
+                    self.emit_upstream_error(
+                        "upstream provider sent a malformed SSE event; stream terminated",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    return true;
+                }
+            };
+            self.set_cursor(end);
+            self.scan_cursor = end;
+            self.events_seen = self.events_seen.saturating_add(1);
+            if matches!(
+                self.json_array_state,
+                GeminiJsonArrayState::ExpectFirstValueOrEnd
+                    | GeminiJsonArrayState::ExpectValueAfterComma
+            ) {
+                self.json_array_state = GeminiJsonArrayState::ExpectCommaOrEnd;
+            }
+            let terminate = self.interpret_json_object(&raw, out);
+            self.maybe_compact();
+            if self.normalized_output_exceeded(out, terminate) {
+                return true;
+            }
+            if terminate {
+                self.clear_buffer();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn drain_complete(&mut self, out: &mut NormalizedSseOut) -> bool {
+        if let Err(message) = self.detect_framing() {
+            self.fail_bound(message, out);
+            return true;
+        }
+        match self.framing {
+            GeminiFraming::Undecided => false,
+            GeminiFraming::Sse => self.drain_sse(out),
+            GeminiFraming::JsonStream => self.drain_json_stream(out),
+        }
+    }
+
+    fn push_chunk(&mut self, mut chunk: &[u8], out: &mut NormalizedSseOut) -> bool {
+        if let Err(message) = self.account_ingested(chunk.len()) {
+            self.fail_bound(message, out);
+            return true;
+        }
+        while !chunk.is_empty() {
+            let unread = self.unread_len();
+            let room = (MAX_SSE_EVENT_BYTES.saturating_add(1)).saturating_sub(unread);
+            let take = room.min(chunk.len());
+            self.buf.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+            if self.drain_complete(out) {
+                return true;
+            }
+            if self.unread_len() > MAX_SSE_EVENT_BYTES {
+                self.fail_bound(
+                    "upstream provider sent an oversized SSE event; stream terminated",
+                    out,
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    fn finish_stream(&mut self, out: &mut NormalizedSseOut) {
+        if self.drain_complete(out) {
+            return;
+        }
+        if self.unread_len() > 0 {
+            let trailing = &self.buf[self.cursor..];
+            let only_ws = trailing.iter().all(u8::is_ascii_whitespace);
+            if !only_ws {
+                self.emit_upstream_error(
+                    "upstream provider ended the Gemini stream with malformed trailing data",
+                    out,
+                );
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                let _ = self.normalized_output_exceeded(out, true);
+                return;
+            }
+            self.clear_buffer();
+        }
+        match self.json_array_state {
+            GeminiJsonArrayState::ExpectFirstValueOrEnd
+            | GeminiJsonArrayState::ExpectValueAfterComma
+            | GeminiJsonArrayState::ExpectCommaOrEnd => {
+                self.emit_upstream_error(
+                    "upstream provider sent malformed Gemini JSON array framing; stream terminated",
+                    out,
+                );
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                let _ = self.normalized_output_exceeded(out, true);
+                return;
+            }
+            GeminiJsonArrayState::Inactive | GeminiJsonArrayState::Closed => {}
+        }
+        // Premature EOF contract is one stable redacted diagnostic whether the
+        // stream closed with zero candidates (e.g. `[]`) or with unfinished
+        // client-visible candidates — never echo provider payload bytes.
+        let unfinished_visible = self
+            .candidates
+            .values()
+            .any(|state| state.emitted_client_visible && !state.finished);
+        if self.saw_successful_finish && !unfinished_visible {
+            self.finish(StreamTerminal::MessageStop, out);
+            let _ = self.normalized_output_exceeded(out, true);
+            return;
+        }
+        self.emit_upstream_error(
+            "upstream provider closed the Gemini stream before every candidate reached a terminal finishReason",
+            out,
+        );
+        self.finish(StreamTerminal::UpstreamFailure, out);
+        let _ = self.normalized_output_exceeded(out, true);
+    }
+
+    fn commit_forwarded(&mut self, out: &NormalizedSseOut) {
+        self.normalized_out_bytes = self.normalized_out_bytes.saturating_add(out.len());
+    }
+
+    fn drive_chunk(&mut self, chunk: &[u8], out: &mut NormalizedSseOut) -> bool {
+        out.begin_call();
+        if self.push_chunk(chunk, out) {
+            return true;
+        }
+        self.commit_forwarded(out);
+        false
+    }
+
+    fn drive_end(&mut self, out: &mut NormalizedSseOut) {
+        out.begin_call();
+        self.finish_stream(out);
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for GeminiStreamNormalizer {
+    fn stage(&self) -> ResponseStreamInspectorStage {
+        ResponseStreamInspectorStage::Normalize
+    }
+
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        if self.done_emitted {
+            return ResponseStreamAction::Terminate(None);
+        }
+        let mut out = NormalizedSseOut::unbounded();
+        if self.drive_chunk(chunk, &mut out) {
+            return ResponseStreamAction::Terminate(Some(Bytes::from(out.take_call_bytes())));
+        }
+        ResponseStreamAction::Forward(Bytes::from(out.take_call_bytes()))
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        if self.done_emitted {
+            return ResponseStreamAction::Terminate(None);
+        }
+        let mut out = NormalizedSseOut::unbounded();
+        self.drive_end(&mut out);
+        ResponseStreamAction::Terminate(Some(Bytes::from(out.take_call_bytes())))
+    }
+}
+
+fn truncate_provider_error_message(message: &str) -> String {
+    const MAX: usize = 256;
+    if message.len() <= MAX {
+        return message.to_string();
+    }
+    let mut truncated = message.chars().take(MAX).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+/// Fail-closed Gemini `usageMetadata` admission for the stream normalizer.
+///
+/// A present `usageMetadata` must be an object. Every present recognized count
+/// field (`promptTokenCount`, `candidatesTokenCount`, `completionTokenCount`,
+/// `totalTokenCount`) must be a JSON integer representable as `u64`. Omitted
+/// fields stay omitted. `candidatesTokenCount` is preferred over
+/// `completionTokenCount` when both are present and valid; a present malformed
+/// preferred field never falls through to the alternate. `totalTokenCount` is
+/// validated for shape only — published totals still come from checked
+/// `prompt + completion` addition at terminal usage emit.
+fn apply_gemini_usage_metadata(
+    usage: &Value,
+    prompt_tokens: &mut Option<u64>,
+    completion_tokens: &mut Option<u64>,
+) -> Result<(), &'static str> {
+    let Some(usage) = usage.as_object() else {
+        return Err(
+            "upstream provider sent Gemini usageMetadata that was not an object; stream terminated",
+        );
+    };
+
+    if let Some(prompt) = gemini_optional_usage_count(usage, "promptTokenCount")? {
+        *prompt_tokens = Some(prompt);
+    }
+
+    // Validate every present recognized completion-side field first so a
+    // malformed preferred key cannot silently fall back to the alternate.
+    let candidates = gemini_optional_usage_count(usage, "candidatesTokenCount")?;
+    let completion_alt = gemini_optional_usage_count(usage, "completionTokenCount")?;
+    // Documented / consumed shape: present totals must also be representable.
+    let _total = gemini_optional_usage_count(usage, "totalTokenCount")?;
+
+    if let Some(completion) = candidates.or(completion_alt) {
+        *completion_tokens = Some(completion);
+    }
+    Ok(())
+}
+
+fn gemini_optional_usage_count(
+    usage: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<u64>, &'static str> {
+    let Some(value) = usage.get(field) else {
+        return Ok(None);
+    };
+    match value.as_u64() {
+        Some(count) => Ok(Some(count)),
+        None => Err(match field {
+            "promptTokenCount" => {
+                "upstream provider sent a malformed Gemini usageMetadata.promptTokenCount; stream terminated"
+            }
+            "candidatesTokenCount" => {
+                "upstream provider sent a malformed Gemini usageMetadata.candidatesTokenCount; stream terminated"
+            }
+            "completionTokenCount" => {
+                "upstream provider sent a malformed Gemini usageMetadata.completionTokenCount; stream terminated"
+            }
+            "totalTokenCount" => {
+                "upstream provider sent a malformed Gemini usageMetadata.totalTokenCount; stream terminated"
+            }
+            _ => {
+                "upstream provider sent a malformed Gemini usageMetadata token count; stream terminated"
+            }
+        }),
+    }
+}
+
+fn gemini_prompt_block_reason(event: &Value) -> Result<Option<&'static str>, &'static str> {
+    let Some(feedback) = event.get("promptFeedback") else {
+        return Ok(None);
+    };
+    let Some(feedback) = feedback.as_object() else {
+        return Err("upstream provider sent a non-object Gemini promptFeedback; stream terminated");
+    };
+    let Some(reason) = feedback.get("blockReason") else {
+        return Ok(None);
+    };
+    match reason.as_str() {
+        Some(
+            "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "MODEL_ARMOR" | "IMAGE_SAFETY"
+            | "JAILBREAK" | "OTHER",
+        ) => Ok(Some("content_filter")),
+        Some("BLOCK_REASON_UNSPECIFIED" | "BLOCKED_REASON_UNSPECIFIED") => Ok(None),
+        Some(_) => Err(
+            "upstream provider sent an unsupported Gemini promptFeedback.blockReason; stream terminated",
+        ),
+        None => Err(
+            "upstream provider sent a non-string Gemini promptFeedback.blockReason; stream terminated",
+        ),
+    }
+}
+
+/// Map Gemini `finishReason` to an OpenAI finish_reason.
+fn map_gemini_finish_reason(reason: &str) -> Result<&'static str, &'static str> {
+    match reason {
+        "STOP" | "OTHER" => Ok("stop"),
+        "MAX_TOKENS" => Ok("length"),
+        "SAFETY"
+        | "RECITATION"
+        | "LANGUAGE"
+        | "BLOCKLIST"
+        | "PROHIBITED_CONTENT"
+        | "SPII"
+        | "MODEL_ARMOR"
+        | "MALFORMED_FUNCTION_CALL"
+        | "IMAGE_SAFETY"
+        | "IMAGE_PROHIBITED_CONTENT"
+        | "IMAGE_OTHER"
+        | "NO_IMAGE"
+        | "IMAGE_RECITATION"
+        | "UNEXPECTED_TOOL_CALL" => Ok("content_filter"),
+        _ => Err("upstream provider sent an unsupported Gemini finishReason; stream terminated"),
+    }
+}
+
+/// Resume point for the top-level JSON value scanner.
+///
+/// `scanned` counts bytes already inspected from the START OF THE VALUE, and
+/// the three flags are the exact structural state the scanner needs to continue
+/// mid-string or mid-escape without misparsing. A resume offset alone would not
+/// be enough: restarting inside a string would read `{`/`}`/`"` as structure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct JsonValueScan {
+    scanned: usize,
+    depth: usize,
+    in_string: bool,
+    escape: bool,
+}
+
+/// Memoized scan position for the value that starts at the normalizer cursor.
+///
+/// Staleness is unrepresentable rather than merely avoided: every offset is
+/// relative to `cursor`, `GeminiStreamNormalizer::set_cursor` drops the memo the
+/// instant the cursor moves (including whitespace skips, array punctuation, and
+/// consuming a completed value), `clear_buffer` resets it, and the only other
+/// buffer mutations are appends at the end and a compaction that drains exactly
+/// `cursor` bytes — neither of which changes the unread region or its offsets.
+/// So `cursor + scanned <= buf.len()` always holds and the memo can only ever
+/// describe still-unread bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JsonScanMemo {
+    /// Nothing scanned yet for the value starting at the cursor.
+    Fresh,
+    /// Partial scan; resume without re-reading already-scanned bytes.
+    Partial(JsonValueScan),
+    /// These bytes can never complete a top-level JSON value.
+    Invalid,
+}
+
+/// Outcome of one incremental scan pass.
+enum JsonScanStep {
+    /// One complete value ends this many bytes after the value start.
+    Complete(usize),
+    /// More bytes are needed; resume from the carried state.
+    Partial(JsonValueScan),
+    /// Not a JSON object/array, or a structural close below depth 0.
+    Invalid,
+}
+
+/// Advance the scan for one complete top-level JSON value at `buf[0]`.
+///
+/// Resuming from `resume` is byte-for-byte equivalent to scanning `buf` from
+/// zero: the scanner is a left-to-right DFA over `(depth, in_string, escape)`,
+/// and the "must open with `{`/`[`" admission check runs exactly once, on the
+/// fresh pass.
+fn scan_json_value(buf: &[u8], resume: JsonValueScan) -> JsonScanStep {
+    let mut state = resume;
+    if state.scanned == 0 {
+        match buf.iter().find(|b| !b.is_ascii_whitespace()).copied() {
+            // Nothing structural yet; re-admit on the next pass.
+            None => return JsonScanStep::Partial(state),
+            Some(b'{' | b'[') => {}
+            Some(_) => return JsonScanStep::Invalid,
+        }
+    }
+    let start = state.scanned.min(buf.len());
+    for (rel, &b) in buf[start..].iter().enumerate() {
+        if state.in_string {
+            if state.escape {
+                state.escape = false;
+                continue;
+            }
+            match b {
+                b'\\' => state.escape = true,
+                b'"' => state.in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => state.in_string = true,
+            b'{' | b'[' => state.depth = state.depth.saturating_add(1),
+            b'}' | b']' => {
+                if state.depth == 0 {
+                    return JsonScanStep::Invalid;
+                }
+                state.depth -= 1;
+                if state.depth == 0 {
+                    return JsonScanStep::Complete(start + rel + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    state.scanned = buf.len();
+    JsonScanStep::Partial(state)
+}
+
+/// Decode residual provider content-coding chains, then feed plaintext into
+/// the Anthropic/Gemini→OpenAI normalizer. Because a compressed stream's
 /// checksum/trailer is not trustworthy until EOF — and intermediate layers of a
 /// stacked list cannot be validated until the outer coding is complete — this
 /// rare fallback buffers the encoded body within a strict cap before decoding
 /// in reverse application order. Encoded octets are never forwarded to the
 /// client; decode/limit failures emit an upstream-error SSE frame. Normal
-/// requests strip Accept-Encoding and retain fully progressive identity SSE
+/// requests strip Accept-Encoding and retain fully progressive identity stream
 /// normalization.
 struct ContentDecodingNormalizer {
     /// Canonical `#content-coding` list in application order.
     encoding: String,
     encoded: Vec<u8>,
-    inner: AnthropicSseNormalizer,
+    inner: NormalizeEngine,
+}
+
+enum NormalizeEngine {
+    Anthropic(AnthropicSseNormalizer),
+    Gemini(GeminiStreamNormalizer),
+}
+
+impl NormalizeEngine {
+    fn done_emitted(&self) -> bool {
+        match self {
+            Self::Anthropic(inner) => inner.done_emitted,
+            Self::Gemini(inner) => inner.done_emitted,
+        }
+    }
+
+    fn emit_upstream_error(&mut self, message: &str, out: &mut NormalizedSseOut) {
+        match self {
+            Self::Anthropic(inner) => inner.emit_upstream_error(message, out),
+            Self::Gemini(inner) => inner.emit_upstream_error(message, out),
+        }
+    }
+
+    fn finish_failure(&mut self, out: &mut NormalizedSseOut) {
+        match self {
+            Self::Anthropic(inner) => inner.finish(StreamTerminal::UpstreamFailure, out),
+            Self::Gemini(inner) => inner.finish(StreamTerminal::UpstreamFailure, out),
+        }
+    }
+
+    fn drive_chunk(&mut self, chunk: &[u8], out: &mut NormalizedSseOut) -> bool {
+        match self {
+            Self::Anthropic(inner) => inner.drive_chunk(chunk, out),
+            Self::Gemini(inner) => inner.drive_chunk(chunk, out),
+        }
+    }
+
+    fn drive_end(&mut self, out: &mut NormalizedSseOut) {
+        match self {
+            Self::Anthropic(inner) => inner.drive_end(out),
+            Self::Gemini(inner) => inner.drive_end(out),
+        }
+    }
+
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        match self {
+            Self::Anthropic(inner) => inner.on_chunk(chunk).await,
+            Self::Gemini(inner) => inner.on_chunk(chunk).await,
+        }
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        match self {
+            Self::Anthropic(inner) => inner.on_end().await,
+            Self::Gemini(inner) => inner.on_end().await,
+        }
+    }
 }
 
 impl ContentDecodingNormalizer {
-    fn new(encoding: String, inner: AnthropicSseNormalizer) -> Self {
+    fn new(encoding: String, inner: NormalizeEngine) -> Self {
         Self {
             encoding,
             encoded: Vec::new(),
@@ -4105,7 +6285,7 @@ impl ContentDecodingNormalizer {
         out.begin_call();
         self.inner
             .emit_upstream_error(safe_residual_decode_diagnostic(&message), &mut out);
-        self.inner.finish(StreamTerminal::UpstreamFailure, &mut out);
+        self.inner.finish_failure(&mut out);
         ResponseStreamAction::Terminate(Some(Bytes::from(out.take_call_bytes())))
     }
 }
@@ -4117,12 +6297,12 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
     }
 
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        if self.inner.done_emitted {
+        if self.inner.done_emitted() {
             return ResponseStreamAction::Terminate(None);
         }
         let Some(next_len) = self.encoded.len().checked_add(chunk.len()) else {
             return self
-                .fail_decode("encoded Anthropic SSE size overflowed".to_string())
+                .fail_decode("encoded provider stream size overflowed".to_string())
                 .await;
         };
         // Cap the wire buffer at the aggregate decode budget so a hostile
@@ -4130,7 +6310,7 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
         // before any layer runs.
         if next_len > NORMALIZE_DECODE_LIMITS.max_cumulative_bytes {
             return self
-                .fail_decode("encoded Anthropic SSE exceeds the streaming size limit".to_string())
+                .fail_decode("encoded provider stream exceeds the streaming size limit".to_string())
                 .await;
         }
         self.encoded.extend_from_slice(chunk);
@@ -4140,7 +6320,7 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
-        if self.inner.done_emitted {
+        if self.inner.done_emitted() {
             return ResponseStreamAction::Terminate(None);
         }
         let decoded = match prepare_sse_bytes_for_normalization(
@@ -4227,36 +6407,31 @@ impl ResponseStreamInspector for ImmediateUpstreamErrorNormalizer {
     }
 }
 
-/// Buffered Anthropic→OpenAI SSE normalization, written into a
+/// Buffered provider→OpenAI SSE normalization, written into a
 /// `ceiling`-bounded accumulator from the FIRST normalized byte
 /// (GHSA-pwcm-6rh8-f2gh).
-///
-/// The accumulator is constructed once and every driver call writes into it, so
-/// there is no per-call `Bytes` that a bounded copy would only measure
-/// afterwards, and no transient whose size is a constant rather than this
-/// response's retained ceiling. The normalizer's own logic is untouched: it is
-/// driven in [`BUFFERED_NORMALIZE_CHUNK_BYTES`] slices through the same
-/// `push_chunk` / `finish_stream` path the streaming inspector uses, with the
-/// same cumulative event/byte/output accounting, and the same per-call rollback
-/// seam for its cumulative-output bound.
-///
-/// `None` — leave the response unchanged — is the fail-closed answer when a
-/// write is refused, exactly as an over-ceiling final document already was.
-async fn normalize_anthropic_sse_buffered(
+async fn normalize_provider_stream_buffered(
+    provider_type: ProviderType,
     model: String,
     body: &[u8],
     tools_forbidden: bool,
     ceiling: usize,
 ) -> Option<Vec<u8>> {
-    let mut normalizer = AnthropicSseNormalizer::new(model, tools_forbidden);
+    let mut engine = match provider_type {
+        ProviderType::Anthropic => {
+            NormalizeEngine::Anthropic(AnthropicSseNormalizer::new(model, tools_forbidden))
+        }
+        ProviderType::GoogleGemini => {
+            NormalizeEngine::Gemini(GeminiStreamNormalizer::new(model, tools_forbidden))
+        }
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible => return None,
+    };
     let mut out = NormalizedSseOut::with_ceiling(ceiling);
-    // `chunks` yields nothing for an empty body, which is the same "no chunk
-    // was ever offered" state a stream that ended immediately presents.
     for slice in body.chunks(BUFFERED_NORMALIZE_CHUNK_BYTES) {
-        if normalizer.done_emitted {
+        if engine.done_emitted() {
             break;
         }
-        let terminate = normalizer.drive_chunk(slice, &mut out);
+        let terminate = engine.drive_chunk(slice, &mut out);
         if out.refused() {
             return None;
         }
@@ -4264,8 +6439,8 @@ async fn normalize_anthropic_sse_buffered(
             return out.finish();
         }
     }
-    if !normalizer.done_emitted {
-        normalizer.drive_end(&mut out);
+    if !engine.done_emitted() {
+        engine.drive_end(&mut out);
     }
     out.finish()
 }
@@ -4418,5 +6593,109 @@ mod sse_buffer_tests {
             "capacity {capacity} should stay well below total input {total_input}"
         );
         assert_eq!(normalizer.bytes_ingested, iterations * event.len());
+    }
+
+    /// Payload whose structural bytes are deliberately hidden inside strings and
+    /// escapes, so a scanner that resumed on an offset alone would misparse it.
+    const TRICKY_JSON: &[u8] = br#"{"a":"}{\"x\":[1]","b":{"c":["\\","]"]},"d":"\u007b"}"#;
+
+    #[test]
+    fn json_value_scan_resume_matches_single_pass() {
+        let fresh = JsonValueScan::default();
+        let one_shot = match scan_json_value(TRICKY_JSON, fresh) {
+            JsonScanStep::Complete(end) => end,
+            _ => panic!("payload must complete in a single pass"),
+        };
+        assert_eq!(one_shot, TRICKY_JSON.len());
+
+        // Every possible two-piece split resumes to the same answer.
+        for split in 1..TRICKY_JSON.len() {
+            let state = match scan_json_value(&TRICKY_JSON[..split], fresh) {
+                JsonScanStep::Partial(state) => state,
+                _ => panic!("prefix must be incomplete at split {split}"),
+            };
+            assert_eq!(state.scanned, split, "split {split} must memoize progress");
+            match scan_json_value(TRICKY_JSON, state) {
+                JsonScanStep::Complete(end) => assert_eq!(end, one_shot, "split {split}"),
+                _ => panic!("resumed scan must complete at split {split}"),
+            }
+        }
+
+        // Byte-at-a-time never rescans: each pass consumes exactly the new byte.
+        let mut state = JsonValueScan::default();
+        let mut completed = None;
+        for take in 1..=TRICKY_JSON.len() {
+            match scan_json_value(&TRICKY_JSON[..take], state) {
+                JsonScanStep::Complete(end) => {
+                    completed = Some(end);
+                    break;
+                }
+                JsonScanStep::Partial(next) => {
+                    assert_eq!(next.scanned, take, "scan must not rewind at {take}");
+                    state = next;
+                }
+                JsonScanStep::Invalid => panic!("valid payload rejected at {take}"),
+            }
+        }
+        assert_eq!(completed, Some(one_shot));
+    }
+
+    #[test]
+    fn json_value_scan_rejects_non_container_and_structural_underflow() {
+        let fresh = JsonValueScan::default();
+        for hostile in [b"5".as_slice(), b"\"str\"".as_slice(), b"}".as_slice()] {
+            assert!(matches!(
+                scan_json_value(hostile, fresh),
+                JsonScanStep::Invalid
+            ));
+        }
+        // A resumed pass keeps the same structural verdict.
+        let state = match scan_json_value(b"[1", fresh) {
+            JsonScanStep::Partial(state) => state,
+            _ => panic!("prefix must be incomplete"),
+        };
+        assert!(matches!(
+            scan_json_value(b"[1]]", state),
+            JsonScanStep::Complete(3)
+        ));
+    }
+
+    /// The framing memo must advance with the buffer rather than restarting, and
+    /// must never describe bytes outside the unread window.
+    #[test]
+    fn gemini_json_framing_memo_is_incremental_and_never_stale() {
+        let mut normalizer = GeminiStreamNormalizer::new("gemini-test".to_string(), false);
+        let event =
+            br#"{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"hi"}]}}]}"#;
+        let mut out = NormalizedSseOut::unbounded();
+        for (idx, byte) in event.iter().enumerate() {
+            out.begin_call();
+            assert!(
+                !normalizer.push_chunk(&[*byte], &mut out),
+                "partial value must not terminate at byte {idx}"
+            );
+            out.reset_call();
+            if idx + 1 == event.len() {
+                break;
+            }
+            match normalizer.json_scan {
+                JsonScanMemo::Partial(state) => {
+                    assert_eq!(
+                        state.scanned,
+                        normalizer.unread_len(),
+                        "memo must cover exactly the unread window at byte {idx}"
+                    );
+                    assert!(
+                        normalizer.cursor + state.scanned <= normalizer.buf.len(),
+                        "memo must never point past the buffer at byte {idx}"
+                    );
+                }
+                other => panic!("byte {idx} must memoize a partial scan: {other:?}"),
+            }
+        }
+        // The completed value consumed the buffer and dropped the memo.
+        assert_eq!(normalizer.json_scan, JsonScanMemo::Fresh);
+        assert_eq!(normalizer.events_seen, 1);
+        assert_eq!(normalizer.unread_len(), 0);
     }
 }

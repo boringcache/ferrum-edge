@@ -158,6 +158,7 @@ impl MeshConfigSync for StaticMeshControlPlane {
                 .revision
                 .as_ref()
                 .map_or(0, |revision| revision.sequence),
+            session_token: "functional-test-session".to_string(),
         };
         let heartbeat = MeshConfigUpdate {
             version: self.slice.version.clone(),
@@ -167,11 +168,21 @@ impl MeshConfigSync for StaticMeshControlPlane {
             heartbeat: true,
             config_authority: String::new(),
             config_sequence: 0,
+            session_token: String::new(),
         };
         let heartbeats = IntervalStream::new(tokio::time::interval(Duration::from_secs(60)))
             .map(move |_| Ok(heartbeat.clone()));
         let stream = stream::once(async move { Ok(update) }).chain(heartbeats);
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn report_mesh_slice_status(
+        &self,
+        _request: Request<ferrum_edge::grpc::proto::MeshSliceStatusReport>,
+    ) -> Result<Response<ferrum_edge::grpc::proto::MeshSliceStatusResponse>, Status> {
+        Ok(Response::new(
+            ferrum_edge::grpc::proto::MeshSliceStatusResponse {},
+        ))
     }
 }
 

@@ -37,6 +37,21 @@ The guard is armed strictly *after* `load_programs` returns `Ok`. A failure in `
 
 Both owners latch on the first cleanup, so the handoff can never double-clean, and both do their cleanup synchronously — there is no async teardown in `Drop` and no background cleanup task. Cleanup failures are surfaced as structured warnings; the original startup/runtime error is always the returned cause.
 
+Accept-to-first-byte observability follows the same generation boundary. The
+node-agent attaches SK_SKB stream parser/verdict programs to a bounded
+accepted-socket SOCKHASH and keeps timestamp/phase evidence in a 65,536-entry
+LRU map. First data deletes the correlation state and emits the socket cookie;
+the mesh-proxy ringbuf consumer then queues the SOCKHASH entry for removal after
+a bounded 250 ms parser/verdict grace period. That userspace queue is also
+capped at 65,536 entries. Terminal close deletes state and the
+kernel unlinks the closed socket from the SOCKHASH. If the ringbuf is full, the
+pass-only hook remains until close rather than risking callback-lock recursion.
+Failed handoff deletes state immediately.
+`cleanup_all` drops the whole map generation and its pins, so reload cannot
+correlate a new socket with stale evidence. In-flight samples across reload are omitted,
+not reconstructed. These hooks are observability-only and always pass traffic;
+capture identity and its fail-closed readiness contract remain authoritative.
+
 Ordering on the normal shutdown path is per-pod first, then node-global: enrolled pods are detached (dropping their registry entries and readiness markers) before `cleanup_all` tears down the shared maps and pins. The `Drop` safety net has no access to the pod table, so it performs the node-global `cleanup_all` only; it exists to guarantee the pins are released, not to substitute for an orderly shutdown.
 
 ## Pod Lifecycle Events
@@ -70,6 +85,14 @@ When node-agent mode starts its admin listener, `/metrics` includes:
 | `ferrum_node_agent_pod_annotation_updates_failed_total` | Mid-life `includeOutboundPorts` annotation changes that failed to re-apply (annotation parse error or BPF map write error). The pod retains its previous policy. Cgroup-id-unavailable retries (Pod object reached the watcher before kubelet finished creating the cgroup) are not counted here — they are retried on the next Apply event. |
 | `ferrum_node_agent_capture_state{state}` | Gauge. Exactly one state is `1`: `starting`, `ready`, `unavailable`, `partially_attached`, `identity_bridge_unavailable`, or `node_global_fallback`. Readiness is only reported after startup BPF maps/programs are loaded and, in NodeWaypoint mode, the SOCK_OPS identity bridge is attached. |
 | `ferrum_mesh_node_topology_degraded{reason}` | Gauge. `1` with `reason` ∈ {`kernel_too_old`,`cgroup_v1`,`bpffs_missing`,`ebpf_feature_disabled`,`capture_mode_not_ebpf`,`capture_unavailable`,`node_waypoint_sock_ops_unavailable`} when startup cannot provide the requested eBPF topology. `0` with `reason="none"` when the eBPF capture path is nominal. Cardinality is bounded per node (a single series at a time). |
+
+The NodeWaypoint proxy's authenticated `/metrics` additionally exposes
+`ferrum_mesh_bpf_accept_to_first_byte_microseconds`. It measures from the
+captured accepted socket's passive-established timestamp to its first non-empty
+inbound application-data buffer. The histogram has fixed microsecond buckets
+and no connection, address, port, namespace, identity, or cookie labels. See
+[BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for
+correlation, eviction, and missing-evidence behavior.
 
 ## eBPF build and capture (how to build the capture image)
 
@@ -786,14 +809,14 @@ The CNI plugin and the kube-rs watcher feed the same enrollment path. They are d
 ### CNI 1.1 STATUS semantics
 
 - **Version gate.** `STATUS` is accepted only when the negotiated `cniVersion` is `1.1.0`. Older versions keep ADD/DEL/CHECK unchanged and fail closed on STATUS with an unsupported-version error.
-- **No attachment fields.** STATUS does not carry `CNI_CONTAINERID` / `CNI_IFNAME` / `CNI_NETNS` / `CNI_ARGS`, and must not include `cni.dev/attachments` or other reserved `cni.dev/` keys.
+- **No attachment fields.** STATUS does not carry `CNI_CONTAINERID` / `CNI_IFNAME` / `CNI_NETNS` / `CNI_ARGS`, and must not include `cni.dev/valid-attachments` or other reserved `cni.dev/` keys.
 - **Fail-closed readiness.** Success (exit 0, empty stdout) means the node-agent CNI socket answered, the main loop has completed initial pod sync, **and** a live read-only Kubernetes API readiness probe succeeded (node-scoped pods `list` with `limit=1`, bounded by the same 750ms budget as CNI ADD metadata fetch, well under the 5s CNI RPC timeout). That probe proves the ADD dependency can reach the API with the node-agent's existing get/list/watch permissions; it does not mutate enrollment, BPF, ownership, or GC state. Socket/IPC failure, incomplete initial sync, or a failed/timed-out Kubernetes probe maps to CNI error code 50 (`plugin is not available`) without echoing socket paths, Kubernetes errors, URLs, tokens, namespaces, or other raw dependency detail.
 - **Informational only.** Per the CNI 1.1.0 spec, STATUS does not prevent ADD/DEL/CHECK/GC; those verbs remain independently handled.
 
 ### CNI 1.1 GC semantics
 
 - **Version gate.** `GC` is accepted only when the negotiated `cniVersion` is `1.1.0`. Older versions keep ADD/DEL/CHECK unchanged and fail closed on GC with an unsupported-version error. `VERSION` advertises `0.3.0`/`0.3.1`/`0.4.0`/`1.0.0`/`1.1.0`.
-- **Valid attachments.** The runtime supplies the CNI 1.1 `cni.dev/attachments` field as `(containerID, ifname)` tuples. Ferrum requires the reserved field even when the list is empty, bounds ingestion (attachment count, field length, safe character set), and rejects omitted, misspelled, hostile, or path-like input before reconciliation.
+- **Valid attachments.** The runtime supplies the CNI 1.1 `cni.dev/valid-attachments` field as `(containerID, ifname)` tuples. Ferrum requires the reserved field even when the list is empty, bounds ingestion (attachment count, field length, safe character set), and rejects omitted, misspelled, hostile, or path-like input before reconciliation.
 - **Ownership.** Successful CNI ADD records Ferrum ownership of that attachment in memory and, when the CNI listener is enabled, in a crash-safe durable file beside the configured CNI socket (filename `cni-owned-attachments.<socket-digest>.v2` under the socket parent, typically `/var/run/ferrum/`). Each durable record stores the `(network name, containerID, ifname) -> pod UID` identity plus a bounded cleanup snapshot (attached proof, pod IPs, cgroup map keys, probe ports, inbound redirect scope) so GC can tear down Ferrum-owned eBPF state after a process restart when live `pod_states` is empty. A detached snapshot is not a valid production ownership claim and is rejected during both decode and encode, so it cannot suppress persisted map/rule cleanup. GC is authoritative only for the named CNI network and removes only its Ferrum-owned attachments absent from that network's valid set. A pod with another valid or differently-scoped Ferrum claim keeps its shared capture state. Watcher-only enrollments and other node-agent generations are never swept. Ordinary IP/map updates refresh the durable cleanup snapshot, while a watcher-detected sandbox/veth replacement retires the prior attachment claim after old-generation teardown rather than transferring that claim to the replacement. On node-agent restart, well-formed durable records are rehydrated before GC can act, and GC remains retryable until the initial Kubernetes pod relist completes; malformed, oversized, truncated, non-regular, hard-linked, symlinked, or path-like durable state fails closed (GC errors without sweeping) and never echoes raw hostile identifiers. ADD that cannot durably persist an ownership claim returns an error and does not leave a false in-memory GC claim (kubelet may retry). Durable ownership is cleared only after removal-blocking cleanup succeeds (including backend detach and map/rule teardown driven from the rehydrated snapshot); a durable-update failure retains ownership for retry and must not report success for that clear.
 - **Idempotency / partial failure.** Repeat GC with the same valid set is a no-op success once every stale Ferrum-owned attachment is fully cleaned. When ownership refresh or BPF/rule/map teardown leaves removal-blocking state for one stale UID, GC fences that UID and retains its ownership (including durable state), continues reconciling independent stale UIDs, then reports the incomplete work. A later GC re-drives the pending-removal retry path until cleanup is complete. Rehydrated ownership after a process crash carries the cleanup snapshot needed to detach and clear stale eBPF maps/rules; GC never reports success merely because live `pod_states` is empty.
 - **Explicit iptables fallback.** The node-global `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` path has no per-pod eBPF backend or pod watcher. Its CNI passthrough therefore fails ADD/CHECK/STATUS/GC until the fallback rules are fully installed (DEL remains an idempotent no-op). After readiness, STATUS reflects installed node-global capture rather than the eBPF path's pod-relist/API probe because fallback ADD has no per-pod metadata dependency. GC succeeds only when the socket-bound durable ownership file has no stale record for the requested network. A stale record from an earlier eBPF generation is retained and GC returns an error until an eBPF-capable generation can perform the exact teardown; fallback never reports that state reconciled or discards its ownership proof.

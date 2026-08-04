@@ -13,6 +13,7 @@ mod admin_mesh_remote_clusters_tests;
 mod admin_mesh_route_dispatch_sni_admission_tests;
 mod admin_mesh_runtime_overlay_tests;
 mod admin_mesh_service_graph_tests;
+mod admin_mesh_slice_drift_tests;
 mod admin_metrics_tls_inventory_snapshot_tests;
 mod admin_namespace_claim_tests;
 mod admin_node_waypoint_identities_tests;

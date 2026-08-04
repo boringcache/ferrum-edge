@@ -9,6 +9,7 @@ pub(crate) mod crud;
 pub mod jwt_auth;
 pub mod mesh_config_drift;
 pub mod mesh_remote_clusters;
+pub mod mesh_slice_drift;
 pub mod metrics;
 pub mod plugin_config_projection;
 pub mod spec_codec;
@@ -3174,6 +3175,10 @@ async fn handle_admin_request_inner(
             handle_mesh_config_drift_get(&state, query.as_deref()).await
         }
 
+        // Issue #3265: CP-side per-authenticated-DP desired/sent/ack/nack
+        // convergence. 404 outside CP mode (no mesh_registry / drift tracker).
+        (Method::GET, ["mesh", "slice-drift"]) => handle_mesh_slice_drift_get(&state).await,
+
         // Issue #2473: operator escape hatch for the config-revision freshness
         // gate. Clears the DP's last-accepted revision so the next slice from
         // ANY authority is eligible again. This is the documented recovery for
@@ -3612,6 +3617,51 @@ async fn handle_mesh_config_drift_get(
             Ok(json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &json!({"error": "Failed to serialize mesh config-drift response"}),
+            ))
+        }
+    }
+}
+
+/// Issue #3265: CP-side per-authenticated-DP mesh slice convergence.
+///
+/// Returns desired / sent / acknowledged / rejected version metadata for every
+/// tracked local MeshSubscribe identity. Reads an immutable ArcSwap snapshot —
+/// no live-map walk on the request path.
+///
+/// Returns 404 outside CP mode (no mesh registry / drift tracker). Returns 200
+/// with an empty `data_planes` list when CP mode is active but no mesh DP has
+/// subscribed yet.
+async fn handle_mesh_slice_drift_get(
+    state: &AdminState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if state.mode != "cp" {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "Mesh slice-drift is only available in control-plane mode"}),
+        ));
+    }
+    let Some(registry) = state.mesh_registry.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No mesh node registry wired"}),
+        ));
+    };
+    let Some(drift) = registry.drift() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No mesh slice-drift tracker wired"}),
+        ));
+    };
+
+    let snapshot = drift.snapshot();
+    let resp = mesh_slice_drift::build_response(snapshot.as_ref());
+    match serde_json::to_value(&resp) {
+        Ok(value) => Ok(json_response(StatusCode::OK, &value)),
+        Err(err) => {
+            error!(error = %err, "failed to serialize mesh slice-drift response");
+            Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Failed to serialize mesh slice-drift response"}),
             ))
         }
     }

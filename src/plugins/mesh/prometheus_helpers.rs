@@ -1010,6 +1010,8 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
             ));
         }
     }
+
+    crate::grpc::mesh_slice_drift::render_mesh_slice_drift_metrics(output, gateway_ns_label);
 }
 
 fn render_mesh_process_metric(

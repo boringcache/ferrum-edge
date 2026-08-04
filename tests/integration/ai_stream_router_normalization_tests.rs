@@ -226,6 +226,106 @@ async fn gzip_residual_encoding_repairs_headers_and_normalizes_stream() {
 }
 
 #[tokio::test]
+async fn gemini_sse_and_json_streams_normalize() {
+    let plugin = AiStreamRouter::new(
+        &json!({
+            "providers": [{
+                "name": "gemini",
+                "provider_type": "google_gemini",
+                "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent",
+                "api_key": "sk-gemini-test",
+                "model_patterns": ["gemini-*"],
+                "priority": 1
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .expect("valid gemini config");
+
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".into(),
+        "POST".into(),
+        "/v1/chat/completions".into(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&body).unwrap(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("accept-encoding").map(String::as_str),
+        Some("identity")
+    );
+    assert_eq!(
+        headers.get("x-goog-api-key").map(String::as_str),
+        Some("sk-gemini-test")
+    );
+
+    let translated = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("gemini translate");
+    let parsed: serde_json::Value = serde_json::from_slice(&translated).unwrap();
+    assert!(parsed.get("contents").is_some());
+
+    let sse = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"integrated\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2}}\n\n";
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("gemini inspector");
+    let mut out = Vec::new();
+    match inspector.on_chunk(sse.as_bytes()).await {
+        ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
+            out.extend_from_slice(&b)
+        }
+        ResponseStreamAction::Terminate(None) => {}
+    }
+    if !String::from_utf8_lossy(&out).contains("[DONE]") {
+        match inspector.on_end().await {
+            ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
+                out.extend_from_slice(&b)
+            }
+            ResponseStreamAction::Terminate(None) => {}
+        }
+    }
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("\"content\":\"integrated\""));
+    assert!(text.trim_end().ends_with("data: [DONE]"));
+
+    let json_stream = "[{ \"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"vertex\"}]},\"finishReason\":\"STOP\"}]}]";
+    let buffered = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            json_stream.as_bytes(),
+            Some("application/json"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("json stream normalize");
+    let buffered = String::from_utf8(buffered).unwrap();
+    assert!(buffered.contains("\"content\":\"vertex\""));
+    assert!(buffered.trim_end().ends_with("data: [DONE]"));
+}
+
+#[tokio::test]
 async fn layered_gzip_br_residual_encoding_normalizes_without_leaking_frames() {
     let plugin = plugin();
     let (mut ctx, _) = claim(&plugin).await;
