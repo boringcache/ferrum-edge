@@ -2251,8 +2251,10 @@ pub struct MeshSubset {
 /// (Istio applies VirtualService policy on the client sidecar).
 ///
 /// This is the narrow route-policy slice carriage that unblocks live VS CORS
-/// on mesh sidecars: the VS-derived `cors` plugin itself lands on
-/// `GatewayConfig` proxies, which never ride the slice. Application is
+/// on mesh sidecars: the VS-derived `cors` plugin itself lands on HTTP-family
+/// `GatewayConfig` proxies, which do not ride the slice (the dedicated
+/// `MeshSlice::virtual_service_l4_proxies` field carries only L4 routes).
+/// Application is
 /// HOST-LEVEL — match-scoped per-route CORS from multiple `http[]` entries is
 /// intentionally out of scope for mesh routes (materialized routes are
 /// host-routed `/`; the K8s translator carries the first corsPolicy-bearing

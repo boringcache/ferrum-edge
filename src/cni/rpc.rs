@@ -12,28 +12,42 @@
 //! Wire format: one length-prefixed JSON object per request, one
 //! length-prefixed JSON object per response. The length is a 4-byte
 //! big-endian `u32` of the JSON byte count, capped at `MAX_RPC_BYTES`
-//! (4 KiB; even a maxed-out pod metadata payload is <1 KiB in practice).
-//! No persistent connections, no pipelining — the CNI binary opens, sends,
-//! reads, closes. Cost is dominated by `fork+exec`, not by the socket.
+//! so a misbehaving caller cannot force unbounded allocation. No persistent
+//! connections, no pipelining — the CNI binary opens, sends, reads, closes.
+//! Cost is dominated by `fork+exec`, not by the socket.
 
 use serde::{Deserialize, Serialize};
 
-/// Hard cap on a single RPC message. We never expect to be near this; the
-/// cap exists so a misbehaving caller cannot make the node-agent allocate
-/// unbounded buffer. A real CNI ADD payload runs ~300 bytes.
-pub const MAX_RPC_BYTES: usize = 4096;
+use crate::cni::spec::{
+    CniValidAttachment, MAX_CNI_ATTACHMENT_FIELD_BYTES, ingest_valid_attachments,
+    is_safe_cni_container_id, is_safe_cni_ifname, is_safe_cni_netns_path, is_safe_cni_network_name,
+};
+
+/// Hard cap on a single RPC message. ADD/DEL/CHECK/STATUS stay tiny; GC may
+/// carry a bounded valid-attachment set. One MiB is deliberately above the CNI
+/// stdin cap so a valid normalized request does not become oversized merely
+/// because the RPC envelope adds fields, while still bounding node-agent
+/// allocation.
+pub const MAX_RPC_BYTES: usize = 1024 * 1024;
+
+/// Explicit bounds for the pass-through CNI argument map. The map is not used
+/// for STATUS/GC, but it crosses the same untrusted local RPC boundary.
+pub const MAX_RPC_ARGS: usize = 64;
+pub const MAX_RPC_ARG_FIELD_BYTES: usize = 1024;
 
 /// Length-prefix size in bytes (big-endian `u32` of the JSON body length).
 pub const LENGTH_PREFIX_BYTES: usize = 4;
 
 /// The verb the CNI binary is asking the node-agent to perform. Mirrors
-/// the CNI `ADD`/`DEL`/`CHECK` lifecycle one-for-one.
+/// the CNI `ADD`/`DEL`/`CHECK`/`STATUS`/`GC` lifecycle one-for-one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RpcVerb {
     Add,
     Del,
     Check,
+    Status,
+    Gc,
 }
 
 impl RpcVerb {
@@ -42,6 +56,8 @@ impl RpcVerb {
             Self::Add => "add",
             Self::Del => "del",
             Self::Check => "check",
+            Self::Status => "status",
+            Self::Gc => "gc",
         }
     }
 }
@@ -67,16 +83,30 @@ impl RpcOutcome {
 
 /// One CNI invocation, normalized for the node-agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CniRpcRequest {
     pub verb: RpcVerb,
+    /// CNI network configuration name. GC is authoritative only within this
+    /// scope; omitting it would let one network sweep another network's claim.
+    pub network_name: String,
+    /// Empty on STATUS/GC (no attachment parameters).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pod_namespace: String,
+    /// Empty on STATUS/GC (no attachment parameters).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pod_name: String,
     /// Optional because not every CRI surfaces `K8S_POD_UID`. When absent
     /// the node-agent reconciles via the kube-rs watcher; this just
     /// means the CNI hot path may be a no-op for that pod.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_uid: Option<String>,
+    /// Empty on STATUS/GC (no attachment parameters).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub container_id: String,
+    /// Interface name from `CNI_IFNAME` on ADD/DEL/CHECK. Combined with
+    /// `container_id` this is the CNI attachment identity GC matches against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ifname: Option<String>,
     /// Path to the pod network namespace. Absent on DEL when the sandbox
     /// is already gone — the node-agent treats absence as "best-effort
     /// teardown by pod identity".
@@ -86,6 +116,117 @@ pub struct CniRpcRequest {
     /// non-K8s_* keys). Empty by default.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub args: std::collections::HashMap<String, String>,
+    /// Still-valid attachments for [`RpcVerb::Gc`]. Empty for other verbs.
+    /// Already bounded/validated by the CNI binary before the RPC is sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub valid_attachments: Vec<CniValidAttachment>,
+}
+
+impl CniRpcRequest {
+    /// Revalidate the complete request at the node-agent boundary. The short-
+    /// lived CNI binary performs the same checks for operator feedback, but the
+    /// UDS peer is not trusted to have used that binary.
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_safe_cni_network_name(&self.network_name) {
+            return Err("invalid CNI network name".to_string());
+        }
+
+        if matches!(self.verb, RpcVerb::Gc | RpcVerb::Status) {
+            if !self.pod_namespace.is_empty()
+                || !self.pod_name.is_empty()
+                || self.pod_uid.is_some()
+                || !self.container_id.is_empty()
+                || self.ifname.is_some()
+                || self.netns_path.is_some()
+                || !self.args.is_empty()
+            {
+                return Err(match self.verb {
+                    RpcVerb::Status => {
+                        "STATUS request contains attachment-specific fields".to_string()
+                    }
+                    _ => "GC request contains attachment-specific fields".to_string(),
+                });
+            }
+            if self.verb == RpcVerb::Status {
+                if !self.valid_attachments.is_empty() {
+                    return Err("STATUS request contains a GC attachment set".to_string());
+                }
+                return Ok(());
+            }
+            ingest_valid_attachments(self.valid_attachments.clone())
+                .map(|_| ())
+                .map_err(|err| err.to_string())?;
+            return Ok(());
+        }
+
+        if !self.valid_attachments.is_empty() {
+            return Err("non-GC request contains a GC attachment set".to_string());
+        }
+        if !is_safe_k8s_namespace(&self.pod_namespace) {
+            return Err("invalid Kubernetes pod namespace".to_string());
+        }
+        if !is_safe_k8s_name(&self.pod_name) {
+            return Err("invalid Kubernetes pod name".to_string());
+        }
+        if !is_safe_cni_container_id(&self.container_id)
+            || self.container_id.len() > MAX_CNI_ATTACHMENT_FIELD_BYTES
+        {
+            return Err("invalid CNI container ID".to_string());
+        }
+        if !self.ifname.as_deref().is_some_and(is_safe_cni_ifname) {
+            return Err("invalid CNI interface name".to_string());
+        }
+        if matches!(self.verb, RpcVerb::Add | RpcVerb::Check) && self.netns_path.is_none() {
+            return Err("ADD/CHECK request is missing CNI network namespace".to_string());
+        }
+        if self
+            .netns_path
+            .as_deref()
+            .is_some_and(|path| !is_safe_cni_netns_path(path))
+        {
+            return Err("invalid CNI network namespace path".to_string());
+        }
+        if self.pod_uid.as_deref().is_some_and(|uid| {
+            uid.len() > MAX_CNI_ATTACHMENT_FIELD_BYTES || !is_safe_cni_container_id(uid)
+        }) {
+            return Err("invalid Kubernetes pod UID".to_string());
+        }
+        if self.args.len() > MAX_RPC_ARGS
+            || self.args.iter().any(|(key, value)| {
+                key.is_empty()
+                    || key.len() > MAX_RPC_ARG_FIELD_BYTES
+                    || value.len() > MAX_RPC_ARG_FIELD_BYTES
+                    || key.chars().any(char::is_control)
+                    || value.chars().any(char::is_control)
+            })
+        {
+            return Err("invalid or oversized CNI argument map".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn is_safe_k8s_namespace(value: &str) -> bool {
+    value.len() <= 63 && is_safe_dns_label(value)
+}
+
+fn is_safe_k8s_name(value: &str) -> bool {
+    if value.is_empty() || value.len() > 253 {
+        return false;
+    }
+    value.split('.').all(is_safe_dns_label)
+}
+
+fn is_safe_dns_label(value: &str) -> bool {
+    if value.is_empty() || value.len() > 63 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
 /// Node-agent response shape. We never echo back pod payload — `Ok` or
@@ -143,7 +284,13 @@ mod tests {
 
     #[test]
     fn rpc_verb_round_trips_through_json() {
-        for verb in [RpcVerb::Add, RpcVerb::Del, RpcVerb::Check] {
+        for verb in [
+            RpcVerb::Add,
+            RpcVerb::Del,
+            RpcVerb::Check,
+            RpcVerb::Status,
+            RpcVerb::Gc,
+        ] {
             let json = serde_json::to_string(&verb).expect("serialize");
             let back: RpcVerb = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(verb, back);
@@ -154,17 +301,46 @@ mod tests {
     fn rpc_request_optional_fields_skip_serializing_when_none() {
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
+            network_name: "ferrum-mesh".to_string(),
             pod_namespace: "demo".to_string(),
             pod_name: "alpha".to_string(),
             pod_uid: None,
             container_id: "abc".to_string(),
+            ifname: None,
             netns_path: None,
             args: std::collections::HashMap::new(),
+            valid_attachments: Vec::new(),
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(!json.contains("pod_uid"));
         assert!(!json.contains("netns_path"));
         assert!(!json.contains("args"));
+        assert!(!json.contains("ifname"));
+        assert!(!json.contains("valid_attachments"));
+    }
+
+    #[test]
+    fn rpc_gc_request_carries_valid_attachments() {
+        let req = CniRpcRequest {
+            verb: RpcVerb::Gc,
+            network_name: "ferrum-mesh".to_string(),
+            pod_namespace: String::new(),
+            pod_name: String::new(),
+            pod_uid: None,
+            container_id: String::new(),
+            ifname: None,
+            netns_path: None,
+            args: std::collections::HashMap::new(),
+            valid_attachments: vec![CniValidAttachment {
+                container_id: "ctr-1".to_string(),
+                ifname: "eth0".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: CniRpcRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.verb, RpcVerb::Gc);
+        assert_eq!(back.valid_attachments.len(), 1);
+        assert_eq!(back.valid_attachments[0].container_id, "ctr-1");
     }
 
     #[test]
@@ -190,12 +366,15 @@ mod tests {
     fn encode_frame_includes_length_prefix() {
         let req = CniRpcRequest {
             verb: RpcVerb::Del,
+            network_name: "ferrum-mesh".to_string(),
             pod_namespace: "demo".to_string(),
             pod_name: "alpha".to_string(),
             pod_uid: None,
             container_id: "abc".to_string(),
+            ifname: None,
             netns_path: None,
             args: std::collections::HashMap::new(),
+            valid_attachments: Vec::new(),
         };
         let frame = encode_frame(&req).expect("encode");
         assert!(frame.len() > LENGTH_PREFIX_BYTES);
@@ -214,12 +393,15 @@ mod tests {
         let huge_value = "x".repeat(MAX_RPC_BYTES + 1);
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
+            network_name: "ferrum-mesh".to_string(),
             pod_namespace: huge_value,
             pod_name: "alpha".to_string(),
             pod_uid: None,
             container_id: "abc".to_string(),
+            ifname: None,
             netns_path: None,
             args: std::collections::HashMap::new(),
+            valid_attachments: Vec::new(),
         };
         let err = encode_frame(&req).expect_err("oversized payload should reject");
         assert!(
@@ -233,6 +415,8 @@ mod tests {
         assert_eq!(RpcVerb::Add.metric_label(), "add");
         assert_eq!(RpcVerb::Del.metric_label(), "del");
         assert_eq!(RpcVerb::Check.metric_label(), "check");
+        assert_eq!(RpcVerb::Status.metric_label(), "status");
+        assert_eq!(RpcVerb::Gc.metric_label(), "gc");
     }
 
     #[test]

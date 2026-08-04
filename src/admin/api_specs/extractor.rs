@@ -29,6 +29,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use url::Url;
 
+use super::external_refs::{
+    EffectiveExternalRefPolicy, ExternalDocumentLoader, ExternalRefProcessPolicy,
+    LoadedExternalDocument, MapExternalDocumentLoader, load_external_documents,
+    parse_external_ref_extension, redact_reference,
+};
+
 /// HTTP method keys counted when computing `operation_count`.
 const HTTP_METHODS: &[&str] = &[
     "get", "post", "put", "delete", "options", "head", "patch", "trace",
@@ -73,6 +79,12 @@ pub struct SpecMetadata {
     pub server_urls: Vec<String>,
     /// Count of HTTP method keys across all `paths.*` entries.
     pub operation_count: u32,
+    /// Immutable admission snapshot of external documents used for `$ref` resolution.
+    ///
+    /// `None` when external-ref resolution stayed disabled (fail-closed default).
+    /// Set when the effective policy enables loading, even if no external documents
+    /// were reachable.
+    pub external_ref_snapshot: Option<crate::admin::api_specs::external_refs::ExternalRefSnapshot>,
 }
 
 /// Errors that can occur during spec extraction.
@@ -307,6 +319,10 @@ pub fn autodetect_format(body: &[u8]) -> SpecFormat {
 
 /// Parse `body` as an OpenAPI spec document and extract Ferrum resources.
 ///
+/// Uses the fail-closed default external-ref policy (resolution disabled) and
+/// an empty in-memory loader. Prefer [`extract_with_external_refs`] when the
+/// process gate and per-spec extension may enable cross-document `$ref`s.
+///
 /// # Arguments
 ///
 /// * `body` – raw bytes of the spec document.
@@ -319,15 +335,53 @@ pub fn autodetect_format(body: &[u8]) -> SpecFormat {
 ///
 /// `(bundle, metadata)` on success, or an [`ExtractError`] describing the
 /// first problem encountered.
+// The binary target compiles this public library module privately and uses the
+// policy-aware entry point directly; integration tests retain this compatibility
+// entry point for the default fail-closed behavior.
+#[allow(dead_code)]
 pub fn extract(
     body: &[u8],
     declared_format: Option<SpecFormat>,
     namespace: &str,
 ) -> Result<(ExtractedBundle, SpecMetadata), ExtractError> {
+    extract_with_external_refs(
+        body,
+        declared_format,
+        namespace,
+        &ExternalRefProcessPolicy::default(),
+        &MapExternalDocumentLoader::default(),
+    )
+}
+
+/// Parse `body` as an OpenAPI spec and extract Ferrum resources, optionally
+/// resolving external / cross-document `$ref`s under `process_policy`.
+///
+/// Absent or disabled policy keeps the historical fail-closed
+/// [`ExtractError::UnsupportedExternalRef`] contract. When both the process
+/// gate and `x-ferrum-external-refs` enable resolution, referenced documents
+/// are loaded through `loader` at admission time and recorded on
+/// [`SpecMetadata::external_ref_snapshot`].
+pub fn extract_with_external_refs(
+    body: &[u8],
+    declared_format: Option<SpecFormat>,
+    namespace: &str,
+    process_policy: &ExternalRefProcessPolicy,
+    loader: &dyn ExternalDocumentLoader,
+) -> Result<(ExtractedBundle, SpecMetadata), ExtractError> {
     let (root, actual_format) = parse_root_document(body, declared_format)?;
 
     // --- Version detection -----------------------------------------------
     let version = detect_version(&root)?;
+
+    // --- External / cross-document $ref policy ---------------------------
+    let extension = parse_external_ref_extension(&root)?;
+    let effective = EffectiveExternalRefPolicy::compose(process_policy, extension.as_ref())?;
+    let (external_docs, external_ref_snapshot) = if effective.enabled {
+        let (docs, snapshot) = load_external_documents(&root, &effective, loader)?;
+        (docs, Some(snapshot))
+    } else {
+        (HashMap::new(), None)
+    };
 
     // --- info.title / info.version ---------------------------------------
     // Both fields are truncated at UTF-8 character boundaries so an operator
@@ -545,7 +599,8 @@ pub fn extract(
     };
 
     if let Some(validate_ext) = parse_x_ferrum_validate_extension(&root)? {
-        let operations = extract_operation_schemas(&root, &version)?;
+        let operations =
+            extract_operation_schemas(&root, &version, &effective.document_base, &external_docs)?;
         auto_inject_openapi_validator(
             &mut plugins,
             &proxy,
@@ -588,6 +643,7 @@ pub fn extract(
         tags: tier1.tags,
         server_urls: tier1.server_urls,
         operation_count: tier1.operation_count,
+        external_ref_snapshot,
     };
 
     Ok((
@@ -1019,11 +1075,17 @@ fn merge_bypass_config(
     Ok(())
 }
 
-fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, ExtractError> {
+fn extract_operation_schemas(
+    root: &Value,
+    version: &str,
+    document_base: &Url,
+    externals: &HashMap<String, LoadedExternalDocument>,
+) -> Result<Vec<Value>, ExtractError> {
+    let resolver = LocalSchemaResolver::build(root, version, document_base, externals)?;
+    let root = resolver.primary_root();
     let Some(paths) = root.get("paths").and_then(Value::as_object) else {
         return Ok(Vec::new());
     };
-    let resolver = LocalSchemaResolver::build(root, version)?;
     let root_server_bases = if version == "2.0" {
         swagger_base_path_bases(root)?
     } else {
@@ -1051,7 +1113,7 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
         // Sibling Path Item fields (including `servers`) overlay the referenced
         // object, so effective servers on resolved Path Items remain correct.
         let resolved_path_item = resolve_path_item(
-            root,
+            resolver.primary_root(),
             path_item,
             path_template,
             MAX_SCHEMA_REF_DEPTH,
@@ -1094,7 +1156,7 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
             };
             let request_body = if version == "2.0" {
                 extract_swagger_request_body(
-                    root,
+                    resolver.primary_root(),
                     path_object,
                     operation,
                     version,
@@ -1104,7 +1166,7 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
                 )?
             } else {
                 extract_openapi_request_body(
-                    root,
+                    resolver.primary_root(),
                     operation,
                     version,
                     &resolver,
@@ -1114,7 +1176,7 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
             };
             let responses = if version == "2.0" {
                 extract_swagger_responses(
-                    root,
+                    resolver.primary_root(),
                     path_object,
                     operation,
                     version,
@@ -1124,7 +1186,7 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
                 )?
             } else {
                 extract_openapi_responses(
-                    root,
+                    resolver.primary_root(),
                     operation,
                     version,
                     &resolver,
@@ -1538,10 +1600,11 @@ fn join_server_base_and_path(base: &str, path_key: &str) -> Result<String, Extra
 /// leaves conflicts between `$ref` and adjacent Path Item fields undefined.
 /// Ferrum applies a deterministic overlay — sibling fields override fields from
 /// the referenced Path Item after resolution (same merge used for Reference
-/// Objects elsewhere in the importer). External Path Item refs are rejected as
-/// [`ExtractError::UnsupportedExternalRef`]; unresolved local refs as
-/// [`ExtractError::SchemaReference`]; cycles and excessive depth as
-/// [`ExtractError::SchemaTooDeep`].
+/// Objects elsewhere in the importer). Cross-document Path Item refs are only
+/// admitted when the effective external-ref policy enables them; otherwise they
+/// are rejected as [`ExtractError::UnsupportedExternalRef`]. Unresolved local
+/// refs surface as [`ExtractError::SchemaReference`]; cycles and excessive
+/// depth as [`ExtractError::SchemaTooDeep`].
 fn resolve_path_item(
     root: &Value,
     path_item: &Value,
@@ -2517,8 +2580,13 @@ const MAX_SCHEMA_INDEX_DEPTH: usize = 64;
 /// so hostile callback chains are rejected deterministically as schema depth,
 /// while ordinary Schema Object indexing retains its larger independent cap.
 const MAX_PATH_ITEM_INDEX_DEPTH: usize = 24;
-/// Synthetic document base for local-only URI resolution. Never fetched.
-const LOCAL_SCHEMA_DOCUMENT_BASE: &str = "https://ferrum.invalid/local-schema";
+/// Synthetic document base for local-only URI resolution when no operator
+/// `document_base` is configured. Never fetched.
+///
+/// Kept as the extractor-side name for [`super::external_refs::DEFAULT_DOCUMENT_BASE`];
+/// [`EffectiveExternalRefPolicy::document_base`] already defaults to this value.
+#[allow(dead_code)]
+const LOCAL_SCHEMA_DOCUMENT_BASE: &str = super::external_refs::DEFAULT_DOCUMENT_BASE;
 type ExtractedRequestBodySchemas = Option<(bool, Map<String, Value>)>;
 
 /// Incremental cap for all materialized request/response entries in one
@@ -2566,23 +2634,27 @@ impl GeneratedOperationBudget {
     }
 }
 
-/// Indexes local schema resources and plain-name anchors for `$ref` resolution.
+/// Indexes schema resources and plain-name anchors for `$ref` resolution across
+/// the primary OpenAPI document and any admission-time external documents.
 ///
 /// Only OpenAPI Schema Object entry points and nested JSON Schema subschema
 /// positions are indexed. Non-schema OpenAPI data (extensions, plugin config,
 /// examples) and schema annotation payloads (`default` / `examples` / `const` /
 /// `enum`) are ignored so `$id` / `id` / `$anchor` there cannot bind fragments.
 ///
-/// External network fetches are never performed. A `$ref` whose absolute URI
-/// (without fragment) is not an `$id` declared in this document is rejected as
-/// [`ExtractError::UnsupportedExternalRef`].
+/// Cross-document / network `$ref`s are admitted only when the effective
+/// external-ref policy enabled loading and the target URI is present in this
+/// resolver's document set. A `$ref` whose absolute URI (without fragment) is
+/// not an indexed resource is rejected as [`ExtractError::UnsupportedExternalRef`].
 struct LocalSchemaResolver {
+    /// Index 0 is the primary submitted document; further entries are externals.
+    documents: Vec<ResolverDocument>,
+    /// Primary document base (`policy.document_base` or the local synthetic base).
     document_base: Url,
-    /// Absolute resource URI → (anchor name → JSON Pointer from document root).
+    /// Absolute resource URI → (anchor name → JSON Pointer within that resource's document).
     anchors: HashMap<String, HashMap<String, String>>,
-    /// Absolute URIs of schema resources present in the document.
-    resources: HashSet<String>,
     /// Resource roots for longest-prefix base lookup without reparsing URLs.
+    /// Membership of a resource URI is defined by this list's `key` values.
     resource_roots: Vec<SchemaResourceRoot>,
     /// OpenAPI 3.1+ uses `$anchor`; Swagger 2.0 / OAS 3.0 use Draft-7 `$id`/`id` fragments.
     use_dollar_anchor: bool,
@@ -2593,40 +2665,105 @@ struct LocalSchemaResolver {
     /// Either way an adjacent keyword may never replace the referenced
     /// assertion (GHSA-rf4j-rhmf-8whm).
     schema_object_ref_siblings: bool,
+    /// Document currently being indexed (used by `register_resource_root`).
+    indexing_doc: usize,
+}
+
+struct ResolverDocument {
+    root: Value,
+    base: Url,
+    /// Admitted request URIs that redirected to `base`.
+    aliases: Vec<String>,
+    /// True when the document root itself is a Schema Object resource (schema-only files).
+    root_is_schema: bool,
 }
 
 struct SchemaResourceRoot {
+    doc_index: usize,
     pointer: String,
     key: String,
     base: Url,
 }
 
+/// Result of resolving a `$ref` against the multi-document resolver.
+struct ResolvedRef<'a> {
+    target: &'a Value,
+    target_base: Url,
+    /// Root of the document that owns `target` (for nested ref expansion).
+    document_root: &'a Value,
+}
+
 impl LocalSchemaResolver {
-    fn build(root: &Value, version: &str) -> Result<Self, ExtractError> {
-        let document_base = Url::parse(LOCAL_SCHEMA_DOCUMENT_BASE).map_err(|_| {
-            ExtractError::MalformedExtension {
-                which: "x-ferrum-validate",
-                error: "internal schema document base is invalid".to_string(),
+    fn build(
+        root: &Value,
+        version: &str,
+        document_base: &Url,
+        externals: &HashMap<String, LoadedExternalDocument>,
+    ) -> Result<Self, ExtractError> {
+        let mut documents = Vec::with_capacity(1 + externals.len());
+        documents.push(ResolverDocument {
+            root: root.clone(),
+            base: document_base.clone(),
+            aliases: Vec::new(),
+            root_is_schema: false,
+        });
+        let mut external_list: Vec<_> = externals.iter().collect();
+        external_list.sort_unstable_by(|(left_key, left), (right_key, right)| {
+            resource_uri_key(&left.canonical_uri)
+                .cmp(&resource_uri_key(&right.canonical_uri))
+                .then_with(|| left_key.cmp(right_key))
+        });
+        for (requested_key, ext) in external_list {
+            let mut base = ext.canonical_uri.clone();
+            base.set_fragment(None);
+            let canonical_key = resource_uri_key(&base);
+            if let Some(existing) = documents
+                .iter_mut()
+                .skip(1)
+                .find(|document| resource_uri_key(&document.base) == canonical_key)
+            {
+                if existing.root != ext.root {
+                    return Err(schema_reference_error(
+                        "external $ref aliases resolved to inconsistent document content"
+                            .to_string(),
+                    ));
+                }
+                if requested_key != &canonical_key
+                    && !existing.aliases.iter().any(|alias| alias == requested_key)
+                {
+                    existing.aliases.push(requested_key.clone());
+                }
+                continue;
             }
-        })?;
+            let root_is_schema = is_schema_only_document(&ext.root);
+            documents.push(ResolverDocument {
+                root: ext.root.clone(),
+                base,
+                aliases: if requested_key == &canonical_key {
+                    Vec::new()
+                } else {
+                    vec![requested_key.clone()]
+                },
+                root_is_schema,
+            });
+        }
+
         let use_dollar_anchor = version != "2.0" && !version.starts_with("3.0.");
         let mut resolver = Self {
+            documents,
             document_base: document_base.clone(),
             anchors: HashMap::new(),
-            resources: HashSet::new(),
             resource_roots: Vec::new(),
             use_dollar_anchor,
             schema_object_ref_siblings: use_dollar_anchor,
+            indexing_doc: 0,
         };
-        let document_key = resource_uri_key(&document_base);
-        resolver.resources.insert(document_key.clone());
-        resolver.resource_roots.push(SchemaResourceRoot {
-            pointer: String::new(),
-            key: document_key,
-            base: document_base.clone(),
-        });
-        resolver.index_openapi_schemas(root, &document_base, MAX_SCHEMA_INDEX_DEPTH)?;
-        // Longest JSON Pointer prefix wins when locating a node's resource.
+
+        for doc_index in 0..resolver.documents.len() {
+            resolver.index_owned_document(doc_index)?;
+        }
+        // Longest JSON Pointer prefix wins when locating a node's resource
+        // (filtered by doc_index at lookup time).
         resolver
             .resource_roots
             .sort_by_key(|root| std::cmp::Reverse(root.pointer.len()));
@@ -2635,6 +2772,56 @@ impl LocalSchemaResolver {
 
     fn document_base(&self) -> &Url {
         &self.document_base
+    }
+
+    fn primary_root(&self) -> &Value {
+        &self.documents[0].root
+    }
+
+    fn index_owned_document(&mut self, doc_index: usize) -> Result<(), ExtractError> {
+        self.indexing_doc = doc_index;
+        let base = self.documents[doc_index].base.clone();
+        let aliases = self.documents[doc_index].aliases.clone();
+        let root_is_schema = self.documents[doc_index].root_is_schema;
+        let document_key = resource_uri_key(&base);
+        self.register_document_root(doc_index, document_key, &base)?;
+        for alias in aliases {
+            self.register_document_root(doc_index, alias, &base)?;
+        }
+
+        // Temporarily take the root so indexing can borrow `&mut self` while
+        // walking the owned Value.
+        let root = std::mem::replace(&mut self.documents[doc_index].root, Value::Null);
+        let result = if root_is_schema {
+            self.index_schema(&root, &base, "", MAX_SCHEMA_INDEX_DEPTH)
+        } else {
+            self.index_openapi_schemas(&root, &base, MAX_SCHEMA_INDEX_DEPTH)
+        };
+        self.documents[doc_index].root = root;
+        result
+    }
+
+    fn register_document_root(
+        &mut self,
+        doc_index: usize,
+        key: String,
+        base: &Url,
+    ) -> Result<(), ExtractError> {
+        if let Some(existing) = self.resource_roots.iter().find(|root| root.key == key) {
+            if existing.doc_index != doc_index || !existing.pointer.is_empty() {
+                return Err(schema_reference_error(
+                    "external document URI resolves to multiple resources".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        self.resource_roots.push(SchemaResourceRoot {
+            doc_index,
+            pointer: String::new(),
+            key,
+            base: base.clone(),
+        });
+        Ok(())
     }
 
     /// Walk OpenAPI Schema Object locations only (not the entire document tree).
@@ -3097,9 +3284,9 @@ impl LocalSchemaResolver {
                 let resource_uri = resource_uri_key(&resource);
                 if resource_uri != resource_uri_key(base) {
                     self.register_resource_root(pointer, &resource, id_value)?;
-                } else {
-                    self.resources.insert(resource_uri.clone());
                 }
+                // Same-resource fragment `$id`/`id` only registers an anchor; the
+                // enclosing resource root is already indexed.
                 self.register_anchor(&resource_uri, fragment, pointer)?;
                 child_base = resource;
             } else {
@@ -3131,15 +3318,15 @@ impl LocalSchemaResolver {
     ) -> Result<(), ExtractError> {
         let key = resource_uri_key(base);
         if let Some(existing) = self.resource_roots.iter().find(|root| root.key == key) {
-            if existing.pointer != pointer {
+            if existing.pointer != pointer || existing.doc_index != self.indexing_doc {
                 return Err(schema_reference_error(format!(
                     "duplicate schema $id '{id_value}'"
                 )));
             }
             return Ok(());
         }
-        self.resources.insert(key.clone());
         self.resource_roots.push(SchemaResourceRoot {
+            doc_index: self.indexing_doc,
             pointer: pointer.to_string(),
             key,
             base: base.clone(),
@@ -3169,8 +3356,11 @@ impl LocalSchemaResolver {
     /// Return the base in force immediately before the schema at `pointer`
     /// applies its own `$id`. An exact resource-root match must therefore be
     /// excluded: `resolve_refs` will process that target object's `$id` once.
-    fn parent_resource_for_pointer(&self, pointer: &str) -> &Url {
+    fn parent_resource_for_pointer(&self, doc_index: usize, pointer: &str) -> &Url {
         for root in &self.resource_roots {
+            if root.doc_index != doc_index {
+                continue;
+            }
             if root.pointer.is_empty() {
                 continue;
             }
@@ -3181,23 +3371,20 @@ impl LocalSchemaResolver {
                 return &root.base;
             }
         }
-        &self.document_base
+        &self.documents[doc_index].base
     }
 
-    fn resource_root_pointer(&self, resource_uri: &str) -> &str {
+    fn resource_root_by_key(&self, resource_uri: &str) -> Option<&SchemaResourceRoot> {
         self.resource_roots
             .iter()
             .find(|root| root.key == resource_uri)
-            .map(|root| root.pointer.as_str())
-            .unwrap_or("")
     }
 
     fn resolve_reference<'a>(
         &'a self,
-        root: &'a Value,
         reference: &str,
         current_base: &Url,
-    ) -> Result<(&'a Value, Url), ExtractError> {
+    ) -> Result<ResolvedRef<'a>, ExtractError> {
         let (uri_part, raw_fragment) = split_ref_uri_and_fragment(reference);
         let decoded_fragment = decode_uri_fragment(raw_fragment, reference)?;
 
@@ -3218,30 +3405,36 @@ impl LocalSchemaResolver {
         };
 
         let resource_key = resource_uri_key(&target_resource);
-        if !self.resources.contains(&resource_key) {
+        let Some(resource_root_meta) = self.resource_root_by_key(&resource_key) else {
             return Err(ExtractError::UnsupportedExternalRef {
-                reference: reference.to_string(),
+                reference: redact_reference(reference),
             });
-        }
+        };
+        let doc_index = resource_root_meta.doc_index;
+        let resource_root_pointer = resource_root_meta.pointer.as_str();
+        let document_root = &self.documents[doc_index].root;
+        let root_is_schema = self.documents[doc_index].root_is_schema;
 
         if is_json_pointer_fragment(&decoded_fragment) {
-            let resource_root_pointer = self.resource_root_pointer(&resource_key);
             let resource_root = if resource_root_pointer.is_empty() {
-                root
+                document_root
             } else {
-                root.pointer(resource_root_pointer).ok_or_else(|| {
-                    schema_reference_error(unresolved_internal_ref_message(
-                        reference,
-                        &resource_key,
-                        resource_root_pointer,
-                    ))
-                })?
+                document_root
+                    .pointer(resource_root_pointer)
+                    .ok_or_else(|| {
+                        schema_reference_error(unresolved_internal_ref_message(
+                            reference,
+                            &resource_key,
+                            resource_root_pointer,
+                        ))
+                    })?
             };
             // Empty fragment = schema resource root. The OpenAPI document root
-            // (synthetic document base) is not a Schema Object; bare `#` against
-            // it must not expand the whole document (which recurses into itself).
+            // (synthetic / envelope document base) is not a Schema Object; bare
+            // `#` against it must not expand the whole document. Schema-only
+            // external documents *are* Schema Objects at the document root.
             let target = if decoded_fragment.is_empty() {
-                if resource_root_pointer.is_empty() {
+                if resource_root_pointer.is_empty() && !root_is_schema {
                     return Err(schema_reference_error(format!(
                         "unresolved internal $ref '{reference}': OpenAPI document root is not a Schema Object"
                     )));
@@ -3263,10 +3456,13 @@ impl LocalSchemaResolver {
             } else {
                 format!("{resource_root_pointer}{decoded_fragment}")
             };
-            return Ok((
+            return Ok(ResolvedRef {
                 target,
-                self.parent_resource_for_pointer(&absolute_pointer).clone(),
-            ));
+                target_base: self
+                    .parent_resource_for_pointer(doc_index, &absolute_pointer)
+                    .clone(),
+                document_root,
+            });
         }
 
         if !self.valid_anchor_name(&decoded_fragment) {
@@ -3275,21 +3471,26 @@ impl LocalSchemaResolver {
             )));
         }
 
+        let anchor_resource_key = resource_uri_key(&resource_root_meta.base);
         let pointer = self
             .anchors
-            .get(&resource_key)
+            .get(&anchor_resource_key)
             .and_then(|anchors| anchors.get(&decoded_fragment))
             .ok_or_else(|| {
                 schema_reference_error(format!("unresolved internal $ref '{reference}'"))
             })?;
         let target = if pointer.is_empty() {
-            root
+            document_root
         } else {
-            root.pointer(pointer).ok_or_else(|| {
+            document_root.pointer(pointer).ok_or_else(|| {
                 schema_reference_error(format!("unresolved internal $ref '{reference}'"))
             })?
         };
-        Ok((target, self.parent_resource_for_pointer(pointer).clone()))
+        Ok(ResolvedRef {
+            target,
+            target_base: self.parent_resource_for_pointer(doc_index, pointer).clone(),
+            document_root,
+        })
     }
 
     fn valid_anchor_name(&self, name: &str) -> bool {
@@ -3325,6 +3526,25 @@ impl LocalSchemaResolver {
         resource.set_fragment(None);
         Ok(resource)
     }
+}
+
+/// True when `value` is a standalone Schema Object document rather than an
+/// OpenAPI/Swagger envelope (`openapi` / `swagger` / `paths` / `components`).
+fn is_schema_only_document(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        // Boolean schemas and non-objects are schema documents.
+        return true;
+    };
+    let has_openapi_shape = object.contains_key("openapi")
+        || object.contains_key("swagger")
+        || object.contains_key("paths")
+        || object.contains_key("components");
+    if has_openapi_shape {
+        return false;
+    }
+    // No OpenAPI envelope — treat as a JSON Schema / schema-only document.
+    // Also covers roots that look like Schema Objects (`$id`, `$schema`, type, …).
+    true
 }
 
 /// A JSON-pointer fragment resolves *inside* the schema resource in force at the
@@ -3538,9 +3758,11 @@ const UNPRESERVABLE_REF_SIBLING_KEYWORDS: &[&str] = &[
 ];
 
 /// Resolution context for one Schema Object `$ref`-with-siblings composition:
-/// the document root, the reporting location, the reference being composed, the
-/// remaining recursion budget, the base URI in force inside the referring object
-/// (after its own `$id`), and the shared resolver.
+/// the *referring* document root (for sibling keyword resolution), the reporting
+/// location, the reference being composed, the remaining recursion budget, the
+/// base URI in force inside the referring object (after its own `$id`), and the
+/// shared resolver. The referenced target is expanded separately against its
+/// own document root before this composition runs.
 struct RefComposition<'a, 'b> {
     root: &'a Value,
     location: &'a str,
@@ -3554,8 +3776,12 @@ struct RefComposition<'a, 'b> {
 /// Compose a Schema Object `$ref` with its adjacent keywords without letting an
 /// adjacent keyword overwrite a referenced assertion (GHSA-rf4j-rhmf-8whm).
 ///
-/// - Identifier and annotation keywords stay on the wrapper; they assert
-///   nothing, so keeping them in place preserves both meaning and `$id` scope.
+/// - A bare `$id` / `id` beside `$ref` only rebases that reference. After the
+///   target is materialized the identifier is dropped rather than wrapping the
+///   target in `allOf`, so referenced assertions stay at the schema root.
+/// - Other identifier and annotation keywords stay on the wrapper; they assert
+///   nothing, so keeping them in place preserves both meaning and `$id` scope
+///   when further URI-reference or annotation siblings remain.
 /// - OpenAPI 3.1+ (JSON Schema 2020-12): `$ref` is an applicator and adjacent
 ///   assertions are independent, so the pair becomes
 ///   `{<annotations>, allOf: [<referenced schema>, {<adjacent assertions>}]}`,
@@ -3623,6 +3849,21 @@ fn compose_schema_ref_siblings(
         return Ok(resolved_target);
     }
 
+    // A bare `$id` / `id` beside `$ref` only rebases that reference during
+    // resolution (2020-12 §8.2.1). Once the target is materialized there is no
+    // remaining URI-reference sibling that needs the wrapper resource identity,
+    // and wrapping the target in `allOf` solely to retain `$id` buries
+    // referenced assertions (for example `required`) under `allOf[0]` — which
+    // breaks the generated validator-config contract external-ref tests pin at
+    // the schema root. Annotation or assertion siblings still need the wrapper.
+    if assertions.is_empty()
+        && wrapper_fields
+            .keys()
+            .all(|key| matches!(key.as_str(), "$id" | "id"))
+    {
+        return Ok(resolved_target);
+    }
+
     consume_resolution_budget(state, location, 1, 2)?;
     let mut wrapper = wrapper_fields;
     let mut branches = vec![resolved_target];
@@ -3671,10 +3912,11 @@ struct ResolutionBudget {
     remaining_bytes: usize,
 }
 
-/// Identity of a `$ref` target within the parsed document.
+/// Identity of a `$ref` target within the owned document set.
 ///
-/// Every target is borrowed out of the same `root` tree, so the address of the
-/// target node uniquely identifies it. Using node identity (rather than the
+/// Every target is borrowed out of a `ResolverDocument` root tree owned by the
+/// resolver, so the address of the target node uniquely identifies it across
+/// the primary and external documents. Using node identity (rather than the
 /// `$ref` literal) makes cycle detection independent of how a target is
 /// spelled: a pointer fragment, a plain-name anchor, and an `$id`-rebased
 /// relative reference that all land on the same node are the same target.
@@ -3908,14 +4150,14 @@ fn resolve_refs_bounded(
             if resolves_own_reference
                 && let Some(reference) = object.get("$ref").and_then(Value::as_str)
             {
-                // Non-local absolute/relative refs without a matching in-document `$id`
-                // are rejected inside `resolve_reference` as UnsupportedExternalRef.
-                let (target, target_base) =
-                    resolver.resolve_reference(root, reference, &child_base)?;
+                // Refs whose absolute URI is not an indexed resource (including
+                // external URIs when policy did not admit them) are rejected
+                // inside `resolve_reference` as UnsupportedExternalRef.
+                let resolved_ref = resolver.resolve_reference(reference, &child_base)?;
                 let mut resolved = resolve_ref_target(
-                    root,
-                    target,
-                    &target_base,
+                    resolved_ref.document_root,
+                    resolved_ref.target,
+                    &resolved_ref.target_base,
                     reference,
                     depth,
                     resolver,
@@ -3925,6 +4167,7 @@ fn resolve_refs_bounded(
                 if object.len() > 1 {
                     if context == ResolveContext::Schema {
                         // Schema Object: never merge keywords by replacement.
+                        // Sibling keywords stay in the *referring* document.
                         return compose_schema_ref_siblings(
                             RefComposition {
                                 root,
@@ -4024,6 +4267,12 @@ fn resolve_refs_bounded(
 
 /// Expand a `$ref` target, rejecting cycles immediately and reusing a prior
 /// identical expansion instead of recomputing it (GHSA-8jc7-c52g-85xr).
+///
+/// `root` is the document root that owns `target` (which may differ from the
+/// referring document when resolving a cross-document `$ref`). Nested refs
+/// inside the target expand against this root; sibling keywords on the
+/// referring object continue to use the referring document root at the
+/// `resolve_refs_bounded` call site.
 ///
 /// Cycle rejection happens the moment a target that is still on the active
 /// chain is re-entered, so a self-cycle or a mutual cycle fails without first

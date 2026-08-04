@@ -142,6 +142,8 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -341,6 +343,12 @@ async fn test_list_proxies_falls_back_to_cached_config() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -399,6 +407,12 @@ async fn test_list_consumers_falls_back_to_cached_config() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -452,6 +466,12 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -507,6 +527,12 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -557,6 +583,12 @@ async fn test_get_proxy_not_found_in_cache() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -605,6 +637,12 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -655,6 +693,12 @@ async fn test_get_consumer_not_found_in_cache() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -703,6 +747,12 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -754,6 +804,12 @@ async fn test_get_plugin_config_not_found_in_cache() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -802,6 +858,12 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -853,6 +915,12 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -904,6 +972,12 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -959,6 +1033,12 @@ async fn test_health_endpoint_shows_cached_config_info() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -1020,6 +1100,12 @@ async fn test_health_endpoint_shows_no_cached_config() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -1078,6 +1164,12 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -1144,6 +1236,12 @@ async fn test_cached_config_reflects_live_updates() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1259,6 +1357,12 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     }
 }
 
@@ -1482,6 +1586,12 @@ async fn create_seeded_db_admin_state(
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     }
 }
 
@@ -1753,6 +1863,12 @@ fn db_admin_state(
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     }
 }
 
@@ -2108,6 +2224,12 @@ async fn create_db_admin_state_with_availability(
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     (state, temp_dir)
 }
@@ -3194,6 +3316,12 @@ async fn test_batch_create_read_only_rejected() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -3259,7 +3387,7 @@ async fn test_backup_returns_full_config() {
     assert_eq!(body["counts"]["proxies"], 1);
     assert_eq!(body["counts"]["plugin_configs"], 1);
     assert_eq!(body["counts"]["api_specs"], 0);
-    assert_eq!(body["api_specs"]["section_version"], "1");
+    assert_eq!(body["api_specs"]["section_version"], "2");
     assert!(body["api_specs"]["items"].as_array().unwrap().is_empty());
 
     // Verify actual data
@@ -3369,7 +3497,7 @@ async fn test_backup_resource_filter() {
     assert_eq!(body["counts"]["upstreams"], 1);
     assert_eq!(body["counts"]["plugin_configs"], 1);
     assert_eq!(body["counts"]["consumers"], 0);
-    assert_eq!(body["api_specs"]["section_version"], "1");
+    assert_eq!(body["api_specs"]["section_version"], "2");
 }
 
 #[tokio::test]
@@ -3422,7 +3550,7 @@ async fn backup_with_api_specs_serializes_through_namespace_admission() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let body: Value = response.json().await.expect("backup JSON");
     assert_eq!(body["source"], "database");
-    assert_eq!(body["api_specs"]["section_version"], "1");
+    assert_eq!(body["api_specs"]["section_version"], "2");
 }
 
 #[tokio::test]
@@ -4650,6 +4778,8 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
             server_urls: vec![],
             operation_count: 0,
             resource_hash: String::new(),
+            external_ref_snapshot: None,
+            external_ref_digest: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -4695,6 +4825,8 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
             server_urls: vec![],
             operation_count: 0,
             resource_hash: String::new(),
+            external_ref_snapshot: None,
+            external_ref_digest: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -4715,7 +4847,7 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
         backup
     );
     assert_eq!(backup["counts"]["api_specs"], 2);
-    assert_eq!(backup["api_specs"]["section_version"], "1");
+    assert_eq!(backup["api_specs"]["section_version"], "2");
     assert_eq!(backup["api_specs"]["items"].as_array().unwrap().len(), 2);
     let backed_ids: Vec<&str> = backup["api_specs"]["items"]
         .as_array()
@@ -4804,6 +4936,8 @@ async fn test_restore_rollback_restores_api_specs() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash: String::new(),
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -4834,7 +4968,7 @@ async fn test_restore_rollback_restores_api_specs() {
             "strip_listen_path": true
         }],
         "api_specs": {
-            "section_version": "1",
+            "section_version": "2",
             "items": []
         }
     });
@@ -4915,6 +5049,8 @@ async fn test_restore_legacy_backup_requires_api_spec_deletion_confirmation() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash: String::new(),
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -5023,6 +5159,8 @@ async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
         server_urls: vec![],
         operation_count: 0,
         resource_hash: String::new(),
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -5052,7 +5190,7 @@ async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
             "api_spec_id": "hostile-spec"
         }],
         "api_specs": {
-            "section_version": "1",
+            "section_version": "2",
             "items": [{
                 "id": "hostile-spec",
                 "namespace": "ferrum",
@@ -5128,7 +5266,7 @@ async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
             "api_spec_id": "mismatch-spec"
         }],
         "api_specs": {
-            "section_version": "1",
+            "section_version": "2",
             "items": [{
                 "id": "mismatch-spec",
                 "namespace": "ferrum",
@@ -5465,6 +5603,12 @@ async fn test_restore_read_only_rejected() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -5883,6 +6027,12 @@ async fn test_list_upstreams_falls_back_to_cached_config() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -5941,6 +6091,12 @@ async fn test_get_upstream_by_id_falls_back_to_cached_config() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -5991,6 +6147,12 @@ async fn test_get_upstream_not_found_in_cache() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -6037,6 +6199,12 @@ async fn test_list_upstreams_no_db_no_cache_returns_503() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -6088,6 +6256,12 @@ async fn test_get_upstream_no_db_no_cache_returns_503() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -6664,6 +6838,12 @@ async fn test_backup_falls_back_to_cached_config_when_no_db() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -6719,6 +6899,12 @@ async fn test_backup_no_db_no_cache_returns_503() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -6773,6 +6959,12 @@ async fn test_create_proxy_returns_503_when_no_db() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -6824,6 +7016,12 @@ async fn test_create_upstream_returns_503_when_no_db() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -6921,6 +7119,12 @@ async fn test_cached_config_reflects_upstream_updates() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -7467,6 +7671,12 @@ async fn test_health_endpoint_shows_db_availability() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -7726,6 +7936,12 @@ async fn test_cluster_endpoint_requires_auth() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -7776,6 +7992,12 @@ async fn test_cluster_endpoint_cp_mode_empty_registry() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -7841,6 +8063,12 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -7910,6 +8138,12 @@ async fn test_cluster_endpoint_cp_mode_with_connected_mesh_nodes() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -7977,6 +8211,12 @@ async fn test_cluster_endpoint_dp_mode_connected() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -8035,6 +8275,12 @@ async fn test_cluster_endpoint_dp_mode_disconnected() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -8088,6 +8334,12 @@ async fn test_cluster_endpoint_database_mode() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);

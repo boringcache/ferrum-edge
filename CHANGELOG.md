@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
+  `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
+  compile onto a shared precomputed `Proxy.stream_match` carrier and are
+  evaluated from trustworthy connection/workload metadata before stream route
+  selection (issues #3246–#3250). Shared-SPIFFE label evidence is bound to an
+  exact pod/IP or identical-label replica set. AND semantics apply within one
+  match arm; OR across match candidates on a shared listen port. Missing
+  identity, label, subnet, or gateway evidence denies the requiring predicate;
+  candidates retain VirtualService declaration order, including an explicitly
+  earlier catch-all that shadows later rules;
+  `exportTo` projects routes into eligible sidecar/named-gateway namespaces,
+  where workload selectors remain mesh-only and gateway selection stays
+  independent;
+  malformed label keys/values, namespaces, gateway names, and CIDRs fail closed
+  at translation with field-specific `FerrumAccepted=False`/`Invalid`
+  diagnostics. Istio
+  gateway scope defaults to the reserved `mesh` token; named-gateway data
+  planes set `FERRUM_STREAM_GATEWAY_REF`. Existing SNI/port routing and
+  weighted-split fail-closed behavior are preserved.
 - Istio DestinationRule `trafficPolicy.loadBalancer.localityLbSetting.failoverPriority`
   is implemented end to end (#3238). The K8s translator and native/file/xDS mesh
   validators accept ordered label keys (`key`) and key/value overrides with
@@ -164,6 +183,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- DestinationRule-only create/update/removal now atomically republishes the
+  affected route table (and LB) before mesh status/revision reports the
+  generation programmed (#3243). `#[serde(skip)]` DR-derived proxy projections
+  (`dispatch_port_overrides`, `dispatch_port_override_fallback`, `resolved_tls`,
+  and mesh stream-relay dispatch maps) are compared even when serialized proxy
+  `updated_at` is unchanged — including the empty-`ConfigDelta` publish path —
+  so route-held `Arc<Proxy>` values cannot stay stale until an unrelated event.
 - Durable `api_chargeback_sink` ClickHouse requests now pin
   `wait_for_async_insert=1` whenever the setting is omitted, even when Ferrum
   also omits `async_insert`. This prevents a ClickHouse user/profile default

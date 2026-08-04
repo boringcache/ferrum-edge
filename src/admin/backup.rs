@@ -12,7 +12,7 @@ use crate::config::types::{
 /// Bump when the section shape or restore semantics change in a
 /// non-backward-compatible way. Older backups that omit the section entirely
 /// remain restorable via the explicit deletion-confirmation preflight.
-pub(crate) const API_SPECS_BACKUP_SECTION_VERSION: &str = "1";
+pub(crate) const API_SPECS_BACKUP_SECTION_VERSION: &str = "2";
 
 /// Stable client text when `resources=` contains an unsupported token.
 /// Never echoes the rejected token.
@@ -246,6 +246,13 @@ pub(crate) struct ApiSpecBackupItem {
     pub(crate) operation_count: u32,
     #[serde(default)]
     pub(crate) resource_hash: String,
+    /// Optional Base64 of gzip-compressed external-`$ref` admission snapshot
+    /// (section version `"2"`+). Absent on version `"1"` backups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_ref_snapshot_base64: Option<String>,
+    /// Aggregate digest of the external-`$ref` admission snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_ref_digest: Option<String>,
     pub(crate) created_at: chrono::DateTime<chrono::Utc>,
     pub(crate) updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -278,6 +285,11 @@ impl ApiSpecBackupItem {
             server_urls: spec.server_urls.clone(),
             operation_count: spec.operation_count,
             resource_hash: spec.resource_hash.clone(),
+            external_ref_snapshot_base64: spec
+                .external_ref_snapshot
+                .as_ref()
+                .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+            external_ref_digest: spec.external_ref_digest.clone(),
             created_at: spec.created_at,
             updated_at: spec.updated_at,
         }
@@ -292,6 +304,35 @@ impl ApiSpecBackupItem {
                     self.id
                 )
             })?;
+        let external_ref_snapshot = match &self.external_ref_snapshot_base64 {
+            Some(encoded) => {
+                let max_encoded =
+                    crate::admin::api_specs::external_refs::MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES
+                        .saturating_mul(4)
+                        .saturating_div(3)
+                        .saturating_add(8);
+                if encoded.len() > max_encoded {
+                    return Err(
+                        "api_spec external_ref_snapshot_base64 exceeds size limit".to_string()
+                    );
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded.as_bytes())
+                    .map_err(|_| "api_spec external_ref_snapshot_base64 is invalid".to_string())?;
+                if bytes.len()
+                    > crate::admin::api_specs::external_refs::MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES
+                {
+                    return Err("api_spec external_ref_snapshot exceeds size limit".to_string());
+                }
+                Some(bytes)
+            }
+            None => None,
+        };
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+            external_ref_snapshot.as_deref(),
+            self.external_ref_digest.as_deref(),
+        )
+        .map_err(|_| "api_spec external-ref snapshot integrity validation failed".to_string())?;
         Ok(ApiSpec {
             id: self.id.clone(),
             namespace: self.namespace.clone(),
@@ -313,6 +354,8 @@ impl ApiSpecBackupItem {
             server_urls: self.server_urls.clone(),
             operation_count: self.operation_count,
             resource_hash: self.resource_hash.clone(),
+            external_ref_snapshot,
+            external_ref_digest: self.external_ref_digest.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
@@ -400,7 +443,8 @@ pub(crate) fn validate_restore_api_specs_section_with_total_limit(
     max_total_spec_bytes: usize,
 ) -> Result<Vec<ApiSpec>, Vec<String>> {
     let mut errors = Vec::new();
-    if section.section_version != API_SPECS_BACKUP_SECTION_VERSION {
+    if section.section_version != "1" && section.section_version != API_SPECS_BACKUP_SECTION_VERSION
+    {
         errors.push("Unsupported api_specs.section_version".to_string());
         return Err(errors);
     }
@@ -1063,6 +1107,8 @@ mod tests {
             server_urls: vec![],
             operation_count: 0,
             resource_hash: "abc".to_string(),
+            external_ref_snapshot: None,
+            external_ref_digest: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1129,6 +1175,8 @@ mod tests {
             server_urls: vec![],
             operation_count: 0,
             resource_hash: "a".repeat(64),
+            external_ref_snapshot_base64: None,
+            external_ref_digest: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -1638,5 +1686,41 @@ mod tests {
         assert!(payload.proxies[0].api_spec_id.is_none());
         assert!(payload.upstreams[0].api_spec_id.is_none());
         assert!(payload.plugin_configs[0].api_spec_id.is_none());
+    }
+
+    #[test]
+    fn restore_rejects_external_ref_pair_mismatch_and_corrupt_snapshot() {
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let mut item = sample_spec_item("spec-extref", "proxy-extref", raw);
+        item.external_ref_digest = Some("a".repeat(64));
+        let section = ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![item.clone()],
+        };
+        let errors = validate_restore_api_specs_section(
+            &section,
+            &[sample_owned_proxy("spec-extref", "proxy-extref")],
+            &[],
+            &[],
+            25,
+        )
+        .expect_err("digest without snapshot must fail");
+        assert!(errors.iter().any(|error| error.contains("integrity")));
+
+        item.external_ref_snapshot_base64 =
+            Some(base64::engine::general_purpose::STANDARD.encode([0x1f, 0x8b, 0x00]));
+        let hostile = "SECRET-CANARY";
+        item.external_ref_snapshot_base64 = Some(format!(
+            "{}{}",
+            item.external_ref_snapshot_base64
+                .as_deref()
+                .unwrap_or_default(),
+            hostile
+        ));
+        let error = item
+            .to_api_spec()
+            .expect_err("corrupt snapshot encoding/content must fail");
+        assert!(!error.contains(hostile));
+        assert!(error.contains("invalid") || error.contains("integrity"));
     }
 }

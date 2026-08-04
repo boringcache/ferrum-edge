@@ -129,12 +129,15 @@ mod tests {
 
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
+            network_name: "ferrum-mesh".to_string(),
             pod_namespace: "demo".to_string(),
             pod_name: "alpha".to_string(),
             pod_uid: Some("uid-1".to_string()),
             container_id: "ctr-1".to_string(),
+            ifname: None,
             netns_path: Some("/var/run/netns/cni-1".to_string()),
             args: HashMap::new(),
+            valid_attachments: Vec::new(),
         };
         let resp =
             send_rpc(&socket_path_str, &req, Duration::from_secs(2)).expect("send_rpc succeeds");
@@ -148,12 +151,15 @@ mod tests {
         let socket_path = dir.path().join("does-not-exist.sock");
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
+            network_name: "ferrum-mesh".to_string(),
             pod_namespace: "demo".to_string(),
             pod_name: "alpha".to_string(),
             pod_uid: None,
             container_id: "ctr-1".to_string(),
+            ifname: None,
             netns_path: None,
             args: HashMap::new(),
+            valid_attachments: Vec::new(),
         };
         let err = send_rpc(
             &socket_path.to_string_lossy(),

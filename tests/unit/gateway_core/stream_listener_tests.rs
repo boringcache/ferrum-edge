@@ -14,10 +14,12 @@ use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::stream_listener::{StreamListenerDegradation, StreamListenerManager};
+use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
 use ferrum_edge::request_epoch::RequestEpochStore;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 // ============================================================================
 // Helpers
@@ -83,11 +85,59 @@ fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
     proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
     proxy
+}
+
+fn constrain_to_loopback(proxy: &mut Proxy) {
+    proxy.stream_match = Some(StreamMatchCriteria {
+        arms: vec![StreamMatchArm {
+            source_subnets: vec!["127.0.0.0/8".to_string()],
+            ..Default::default()
+        }],
+    });
+    proxy.normalize_fields();
+}
+
+fn tls_client_hello(hostname: &str) -> Vec<u8> {
+    let name = hostname.as_bytes();
+    let list_len = 3 + name.len();
+    let extension_data_len = 2 + list_len;
+    let mut extensions = Vec::new();
+    extensions.extend_from_slice(&0u16.to_be_bytes());
+    extensions.extend_from_slice(&(extension_data_len as u16).to_be_bytes());
+    extensions.extend_from_slice(&(list_len as u16).to_be_bytes());
+    extensions.push(0);
+    extensions.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(name);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&[0; 32]);
+    body.push(0);
+    body.extend_from_slice(&2u16.to_be_bytes());
+    body.extend_from_slice(&[0x00, 0x2f]);
+    body.extend_from_slice(&[1, 0]);
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let mut handshake = vec![
+        0x01,
+        ((body.len() >> 16) & 0xff) as u8,
+        ((body.len() >> 8) & 0xff) as u8,
+        (body.len() & 0xff) as u8,
+    ];
+    handshake.extend_from_slice(&body);
+
+    let mut record = vec![0x16, 0x03, 0x01];
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
 }
 
 /// Allocate an ephemeral port by binding and immediately dropping.
@@ -236,6 +286,160 @@ async fn test_reconcile_starts_single_hosted_passthrough_as_sni_listener() {
         .await
         .expect("single hosted passthrough proxy should use the SNI listener key");
 
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn shared_l4_catchall_is_grouped_and_preserves_declaration_order() {
+    let frontend_port = ephemeral_port().await;
+    let constrained_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let catchall_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    // Put the catch-all first deliberately. Runtime planning must group it on
+    // the shared socket without changing VirtualService first-match order.
+    let mut catchall = create_stream_proxy("catchall", BackendScheme::Tcp, frontend_port);
+    catchall.backend_port = catchall_backend.local_addr().unwrap().port();
+    let mut constrained = create_stream_proxy("constrained", BackendScheme::Tcp, frontend_port);
+    constrained.backend_port = constrained_backend.local_addr().unwrap().port();
+    constrain_to_loopback(&mut constrained);
+    let config = GatewayConfig {
+        proxies: vec![catchall, constrained],
+        ..empty_config()
+    };
+    assert!(config.validate_stream_proxies().is_ok());
+
+    let manager = create_manager(config);
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "catch-all and constrained candidates must share one listener: {failures:?}"
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .unwrap();
+    let _client = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
+        .await
+        .unwrap();
+    let selected = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = constrained_backend.accept() => {
+                result.unwrap();
+                "constrained"
+            }
+            result = catchall_backend.accept() => {
+                result.unwrap();
+                "catchall"
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(selected, "catchall");
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn shared_l4_double_digit_ids_preserve_declaration_order() {
+    let frontend_port = ephemeral_port().await;
+    let match_two_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let match_ten_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let mut match_two = create_stream_proxy("route-match-2", BackendScheme::Tcp, frontend_port);
+    match_two.backend_port = match_two_backend.local_addr().unwrap().port();
+    constrain_to_loopback(&mut match_two);
+    let mut match_ten = create_stream_proxy("route-match-10", BackendScheme::Tcp, frontend_port);
+    match_ten.backend_port = match_ten_backend.local_addr().unwrap().port();
+    constrain_to_loopback(&mut match_ten);
+    let config = GatewayConfig {
+        proxies: vec![match_two, match_ten],
+        ..empty_config()
+    };
+    assert!(config.validate_stream_proxies().is_ok());
+
+    let manager = create_manager(config);
+    assert!(manager.reconcile().await.is_empty());
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .unwrap();
+    let _client = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
+        .await
+        .unwrap();
+    let selected = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = match_two_backend.accept() => {
+                result.unwrap();
+                "match-2"
+            }
+            result = match_ten_backend.accept() => {
+                result.unwrap();
+                "match-10"
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(selected, "match-2");
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn passthrough_same_sni_double_digit_ids_preserve_declaration_order() {
+    let frontend_port = ephemeral_port().await;
+    let match_two_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let match_ten_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let mut match_two = create_stream_proxy("route-match-2", BackendScheme::Tcp, frontend_port);
+    match_two.backend_port = match_two_backend.local_addr().unwrap().port();
+    match_two.passthrough = true;
+    match_two.hosts = vec!["secure.example.com".to_string()];
+    constrain_to_loopback(&mut match_two);
+    let mut match_ten = create_stream_proxy("route-match-10", BackendScheme::Tcp, frontend_port);
+    match_ten.backend_port = match_ten_backend.local_addr().unwrap().port();
+    match_ten.passthrough = true;
+    match_ten.hosts = vec!["secure.example.com".to_string()];
+    match_ten.stream_match = Some(StreamMatchCriteria {
+        arms: vec![StreamMatchArm {
+            source_subnets: vec!["127.0.0.1/32".to_string()],
+            ..Default::default()
+        }],
+    });
+    match_ten.normalize_fields();
+    let config = GatewayConfig {
+        proxies: vec![match_two, match_ten],
+        ..empty_config()
+    };
+    assert!(config.validate_stream_proxies().is_ok());
+
+    let manager = create_manager(config);
+    assert!(manager.reconcile().await.is_empty());
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .unwrap();
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
+        .await
+        .unwrap();
+    client
+        .write_all(&tls_client_hello("secure.example.com"))
+        .await
+        .unwrap();
+    let selected = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = match_two_backend.accept() => {
+                result.unwrap();
+                "match-2"
+            }
+            result = match_ten_backend.accept() => {
+                result.unwrap();
+                "match-10"
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(selected, "match-2");
     manager.shutdown_all().await;
 }
 

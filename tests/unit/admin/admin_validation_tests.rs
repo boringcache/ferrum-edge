@@ -1029,6 +1029,8 @@ fn recovery_api_spec(spec_id: &str, proxy_id: &str) -> ferrum_edge::config::type
         server_urls: vec![],
         operation_count: 0,
         resource_hash: String::new(),
+        external_ref_snapshot: None,
+        external_ref_digest: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
