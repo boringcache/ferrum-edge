@@ -1185,18 +1185,28 @@ impl MeshSlice {
                     let Some(sidecar) = applicable_sidecar else {
                         return true;
                     };
-                    let (resource_namespace, host_candidates) = policy_host_scope(
+                    let host_scope = policy_host_scope(
                         &proxy.backend_host,
                         &proxy.namespace,
                         &cluster_domain,
                         &mesh_service_identities,
                         &service_entry_hosts,
                     );
-                    let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+                    // Egress scope matching needs a concrete namespace, so this
+                    // uses `scope_namespace` (which falls back to the proxy's
+                    // own namespace) rather than the evidence-backed
+                    // `service_namespace`. Sidecar egress is a reachability
+                    // filter, not an ownership decision — ownership only gates
+                    // the DestinationRule / CORS lookup tiers.
+                    let host_refs: Vec<&str> = host_scope
+                        .host_candidates
+                        .iter()
+                        .map(String::as_str)
+                        .collect();
                     sidecar_egress_includes_service(
                         sidecar.namespace,
                         sidecar.egress,
-                        &resource_namespace,
+                        &host_scope.scope_namespace,
                         &host_refs,
                         Some(&[proxy.backend_port]),
                     )
