@@ -2760,6 +2760,44 @@ fn mesh_tier3_l4_virtual_service_source_labels_materialize_stream_match() {
 }
 
 #[test]
+fn mesh_l4_virtual_service_public_visibility_caps_projected_proxies() {
+    for export_to in [
+        None,
+        Some(serde_json::json!([])),
+        Some(serde_json::json!(["*"])),
+    ] {
+        let mut spec = serde_json::json!({
+            "hosts": ["db.example.com"],
+            "tcp": [{
+                "match": [{"port": 3306}],
+                "route": [{"destination": {
+                    "host": "mysql.default.svc.cluster.local",
+                    "port": {"number": 3306}
+                }}]
+            }]
+        });
+        if let Some(export_to) = export_to {
+            spec["exportTo"] = export_to;
+        }
+
+        let mut objects = vec![object("VirtualService", spec)];
+        for index in 0..ferrum_edge::proxy::stream_match::MAX_STREAM_MATCH_ARMS {
+            let mut observed = object("ConfigMap", serde_json::json!({}));
+            observed.metadata.name = format!("observed-{index}");
+            observed.metadata.namespace = format!("namespace-{index}");
+            objects.push(observed);
+        }
+
+        let error = translate_k8s_objects(&objects, options())
+            .expect_err("public L4 visibility must not exceed the projected proxy cap");
+        assert!(
+            format!("{error}").contains("may project at most"),
+            "projection-specific diagnostic required: {error}"
+        );
+    }
+}
+
+#[test]
 fn mesh_l4_virtual_service_top_level_gateways_is_strict() {
     for invalid_gateways in [
         serde_json::json!("mesh"),

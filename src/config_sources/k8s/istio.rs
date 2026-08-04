@@ -3017,7 +3017,21 @@ fn project_l4_proxy_visibility(
         }
     }
 
-    let mut projected = Vec::new();
+    let projected_proxy_count = proxies
+        .len()
+        .checked_mul(export_namespaces.len())
+        .ok_or_else(|| invalid_resource(object, "VirtualService L4 projection count overflow"))?;
+    if projected_proxy_count > crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService L4 visibility may project at most {} stream proxies",
+                crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS
+            ),
+        ));
+    }
+
+    let mut projected = Vec::with_capacity(projected_proxy_count);
     for proxy in proxies {
         let Some(criteria) = proxy.stream_match.as_ref() else {
             continue;
