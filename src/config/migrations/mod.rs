@@ -565,8 +565,8 @@ impl MigrationRunner {
         // skips V001 once version 1 is tracked, so a newly folded-in table
         // (e.g. `proxy_route_locks`, which the proxy persistence path writes to
         // unconditionally) would otherwise be missing on existing databases.
-        // This runs after every `run_pending()` and only issues idempotent
-        // `CREATE TABLE IF NOT EXISTS` statements, so it is a no-op on fresh
+        // This runs after every `run_pending()` and idempotently creates folded-in
+        // tables/indexes and adds folded-in columns, so it is a no-op on fresh
         // databases that just applied V001 in full.
         sql_dialect::V001SqlBuilder::new(&self.db_type)
             .ensure_compatibility_tables(connection)
