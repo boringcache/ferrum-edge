@@ -29937,9 +29937,8 @@ async fn handle_proxy_request_inner(
             // consumption, backend admission, or any dial.
             if !retry_dispatch_hbone
                 && !retry_dispatch_mesh_mtls
-                && let Some(reason) = backend_dispatch::direct_http_mesh_transport_refusal(
-                    current_target.as_deref(),
-                )
+                && let Some(reason) =
+                    backend_dispatch::direct_http_mesh_transport_refusal(current_target.as_deref())
             {
                 warn!(
                     proxy_id = %proxy.id,
