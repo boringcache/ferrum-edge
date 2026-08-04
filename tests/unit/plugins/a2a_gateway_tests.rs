@@ -1157,7 +1157,11 @@ fn encode_a2a_03_agent_card(
     encode_proto_string(3, url, &mut out);
     encode_proto_string(14, preferred_transport, &mut out);
     for (interface_url, transport) in interfaces {
-        encode_proto_bytes(15, &encode_agent_interface(interface_url, transport), &mut out);
+        encode_proto_bytes(
+            15,
+            &encode_agent_interface(interface_url, transport),
+            &mut out,
+        );
     }
     encode_proto_string(16, protocol_version, &mut out);
     if with_signature {
@@ -1413,8 +1417,8 @@ async fn grpc_agent_card_response_rewrites_jsonrpc_urls() {
         .await
         .expect("rewritten grpc agent card frame");
     assert_eq!(rewritten[0], 0);
-    let msg_len = u32::from_be_bytes([rewritten[1], rewritten[2], rewritten[3], rewritten[4]])
-        as usize;
+    let msg_len =
+        u32::from_be_bytes([rewritten[1], rewritten[2], rewritten[3], rewritten[4]]) as usize;
     assert_eq!(rewritten.len(), 5 + msg_len);
     let message = &rewritten[5..];
     assert_eq!(
