@@ -131,6 +131,12 @@ fn make_admin_state(db: DatabaseStore, max_spec_mib: usize) -> AdminState {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     }
 }
 
@@ -1528,6 +1534,12 @@ async fn list_does_not_include_spec_content() {
             item.get("spec_content").is_none(),
             "spec_content must NOT be in list response; item: {item}"
         );
+        assert!(
+            item.get("external_ref_digest").is_some_and(Value::is_null),
+            "external_ref_digest must be null when no snapshot was admitted; item: {item}"
+        );
+        assert!(item.get("external_ref_snapshot").is_none());
+        assert!(item.get("external_ref_snapshot_base64").is_none());
     }
 }
 
@@ -6871,4 +6883,312 @@ async fn concurrent_cyclic_imports_all_return_deterministic_422() {
         reqwest::StatusCode::CREATED,
         "admin must remain serviceable after concurrent hostile imports; body: {body}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_ref_http_admission_runs_off_the_async_worker() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let fixture = TcpListener::bind("127.0.0.1:0").expect("bind external-ref fixture");
+    let fixture_port = fixture.local_addr().expect("fixture address").port();
+    let fixture_thread = thread::spawn(move || {
+        if let Ok((mut stream, _)) = fixture.accept() {
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let body = br#"{"type":"object","properties":{"id":{"type":"integer"}}}"#;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(headers.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let mut state = make_admin_state(store, 25);
+    let policy = ferrum_edge::admin::api_specs::ExternalRefProcessPolicy {
+        enabled: true,
+        allow_http_origins: vec![format!("http://127.0.0.1:{fixture_port}")],
+        ..Default::default()
+    };
+    state.external_ref_policy = Arc::new(policy);
+    let (base, _shutdown) = start_admin(state).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("proxy-external-ref-worker");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "External worker", "version": "1"},
+        "x-ferrum-validate": true,
+        "x-ferrum-external-refs": true,
+        "x-ferrum-proxy": {
+            "id": proxy_id.clone(),
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": "/items"
+        },
+        "paths": {
+            "/items": {
+                "get": {
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": format!(
+                                            "http://127.0.0.1:{fixture_port}/schema.json"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "spawn_blocking admission must avoid runtime-thread block_on panic: {body}"
+    );
+    fixture_thread.join().expect("external-ref fixture thread");
+
+    let (list_status, list_body) = client.get_json("/api-specs").await;
+    assert_eq!(list_status, reqwest::StatusCode::OK);
+    let summary = list_body["items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["proxy_id"].as_str() == Some(proxy_id.as_str()))
+        })
+        .expect("external-ref API-spec list summary");
+    let digest = summary["external_ref_digest"]
+        .as_str()
+        .expect("list summary must return the external-ref digest");
+    assert_eq!(digest.len(), 64);
+    assert!(
+        digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    assert!(summary.get("external_ref_snapshot").is_none());
+    assert!(summary.get("external_ref_snapshot_base64").is_none());
+}
+
+#[tokio::test]
+async fn external_ref_put_failure_and_delete_preserve_last_good_snapshot_lifecycle() {
+    const FIRST_URI: &str = "https://schemas.example.com/first.json";
+    const SECOND_URI: &str = "https://schemas.example.com/second.json";
+    const REJECTED_URI: &str = "https://schemas.example.com/rejected.json";
+
+    fn spec(proxy_id: &str, version: &str, reference: &str) -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": {"title": "External lifecycle", "version": version},
+            "x-ferrum-validate": true,
+            "x-ferrum-external-refs": true,
+            "x-ferrum-proxy": {
+                "id": proxy_id,
+                "backend_host": "backend.internal",
+                "backend_port": 443,
+                "listen_path": format!("/{proxy_id}")
+            },
+            "paths": {
+                "/items": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"$ref": reference}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let mut state = make_admin_state(store.clone(), 25);
+    state.external_ref_policy = Arc::new(ferrum_edge::admin::api_specs::ExternalRefProcessPolicy {
+        enabled: true,
+        allowed_origins: vec!["https://schemas.example.com:443".to_string()],
+        ..Default::default()
+    });
+    let mut loader = ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default();
+    loader.fixtures.insert(
+        FIRST_URI.to_string(),
+        br#"{"type":"object","required":["first"],"properties":{"first":{"type":"string"}}}"#
+            .to_vec(),
+    );
+    loader.fixtures.insert(
+        SECOND_URI.to_string(),
+        br#"{"type":"object","required":["second"],"properties":{"second":{"type":"integer"}}}"#
+            .to_vec(),
+    );
+    // The fixture is deterministic and performs no I/O, but its nested file
+    // reference is outside the effective policy and must fail closed.
+    loader.fixtures.insert(
+        REJECTED_URI.to_string(),
+        br#"{"$ref":"file:///outside-policy.json"}"#.to_vec(),
+    );
+    state.external_ref_loader = Arc::new(loader);
+
+    let (base, _shutdown) = start_admin(state).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("proxy-external-ref-lifecycle");
+    let (post_status, post_body) = client
+        .post_json("/api-specs", &spec(&proxy_id, "1", FIRST_URI))
+        .await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "initial external-ref spec failed: {post_body}"
+    );
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("POST response must include spec id")
+        .to_string();
+    let initial = store
+        .get_api_spec("ferrum", &spec_id)
+        .await
+        .expect("read initial external-ref spec")
+        .expect("initial external-ref spec must exist");
+    let initial_snapshot = initial
+        .external_ref_snapshot
+        .as_deref()
+        .expect("POST must persist the admitted external snapshot");
+    let initial_snapshot = ferrum_edge::admin::api_specs::ExternalRefSnapshot::from_gzip_bytes(
+        initial_snapshot,
+        1024 * 1024,
+    )
+    .expect("decode initial external snapshot");
+    assert_eq!(initial_snapshot.documents.len(), 1);
+    assert_eq!(
+        initial_snapshot.documents[0].document["required"],
+        json!(["first"])
+    );
+
+    let (put_status, put_body) = client
+        .put_json(
+            &format!("/api-specs/{spec_id}"),
+            &spec(&proxy_id, "2", SECOND_URI),
+        )
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::OK,
+        "accepted external-ref PUT failed: {put_body}"
+    );
+    let accepted = store
+        .get_api_spec("ferrum", &spec_id)
+        .await
+        .expect("read replaced external-ref spec")
+        .expect("replaced external-ref spec must exist");
+    assert_ne!(accepted.content_hash, initial.content_hash);
+    assert_ne!(accepted.resource_hash, initial.resource_hash);
+    assert_ne!(accepted.external_ref_digest, initial.external_ref_digest);
+    assert_ne!(
+        accepted.external_ref_snapshot,
+        initial.external_ref_snapshot
+    );
+    assert_eq!(accepted.created_at, initial.created_at);
+    let accepted_snapshot_bytes = accepted
+        .external_ref_snapshot
+        .as_deref()
+        .expect("accepted PUT must replace the persisted external snapshot");
+    let accepted_snapshot = ferrum_edge::admin::api_specs::ExternalRefSnapshot::from_gzip_bytes(
+        accepted_snapshot_bytes,
+        1024 * 1024,
+    )
+    .expect("decode replaced external snapshot");
+    assert_eq!(
+        accepted_snapshot.snapshot_digest,
+        accepted
+            .external_ref_digest
+            .as_deref()
+            .expect("accepted PUT must persist the external snapshot digest")
+    );
+    assert_eq!(
+        accepted_snapshot.documents[0].document["required"],
+        json!(["second"])
+    );
+    let accepted_validator = store
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("read accepted generated plugins")
+        .into_iter()
+        .find(|plugin| plugin.plugin_name == "openapi_validator")
+        .expect("accepted generation must include openapi_validator");
+    assert_eq!(
+        accepted_validator.config["operations"][0]["responses"]["200"]["application/json"]["required"],
+        json!(["second"])
+    );
+
+    let (rejected_status, rejected_body) = client
+        .put_json(
+            &format!("/api-specs/{spec_id}"),
+            &spec(&proxy_id, "3", REJECTED_URI),
+        )
+        .await;
+    assert_eq!(
+        rejected_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "policy-invalid nested external ref must fail closed: {rejected_body}"
+    );
+    assert_eq!(rejected_body["code"], "UnsupportedExternalRef");
+
+    let after_rejected = store
+        .get_api_spec("ferrum", &spec_id)
+        .await
+        .expect("read spec after rejected external-ref PUT")
+        .expect("last accepted spec must survive rejected external-ref PUT");
+    assert_eq!(after_rejected.content_hash, accepted.content_hash);
+    assert_eq!(after_rejected.resource_hash, accepted.resource_hash);
+    assert_eq!(after_rejected.spec_content, accepted.spec_content);
+    assert_eq!(after_rejected.info_version, accepted.info_version);
+    assert_eq!(after_rejected.updated_at, accepted.updated_at);
+    assert_eq!(
+        after_rejected.external_ref_digest,
+        accepted.external_ref_digest
+    );
+    assert_eq!(
+        after_rejected.external_ref_snapshot,
+        accepted.external_ref_snapshot
+    );
+    let validator_after_rejected = store
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("read generated plugins after rejected PUT")
+        .into_iter()
+        .find(|plugin| plugin.plugin_name == "openapi_validator")
+        .expect("last accepted validator must survive rejected PUT");
+    assert_eq!(validator_after_rejected.id, accepted_validator.id);
+    assert_eq!(validator_after_rejected.config, accepted_validator.config);
+
+    let delete_status = client.delete(&format!("/api-specs/{spec_id}")).await;
+    assert_eq!(delete_status, reqwest::StatusCode::NO_CONTENT);
+    assert!(
+        store
+            .get_api_spec("ferrum", &spec_id)
+            .await
+            .expect("read API spec after DELETE")
+            .is_none(),
+        "DELETE must remove the API-spec row that owns the persisted snapshot"
+    );
+    let (get_status, _) = client.get_json(&format!("/api-specs/{spec_id}")).await;
+    assert_eq!(get_status, reqwest::StatusCode::NOT_FOUND);
 }

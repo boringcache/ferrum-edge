@@ -182,15 +182,15 @@ need them, or because they are blocked upstream / architecturally:
   (`http1MaxPendingRequests` IS enforced — a 503-on-overflow pending-request gate
   on the HTTP/1.1 dispatch path; see the DR table in `docs/mesh.md`.)
 - **LB `MAGLEV` / `PASSTHROUGH`** — niche; `PASSTHROUGH` approximates to round-robin.
-- **VirtualService `tcp[]` / `tls[]` unsupported L4 match predicates** —
+- **VirtualService `tcp[]` / `tls[]` weighted multi-destination splitting** —
   `tls[]` SNI passthrough (`sniHosts` + port → passthrough stream proxy) and
-  plain `tcp[]` port routing **are supported** (see `docs/mesh.md` L4 routing
-  and `tests/integration/mesh_l7_routing_tests.rs`). Residual fail-closed
-  predicates the stream layer cannot express:
+  plain `tcp[]` port routing **are supported**, including L4 match predicates
   `sourceLabels` / `sourceSubnets` / `destinationSubnets` / `gateways` /
-  `sourceNamespace`, plus weighted multi-destination splitting. Model those
-  with an explicit stream `Proxy` or upstream-backed split — do not treat
-  TLS-SNI itself as roadmap work.
+  `sourceNamespace` via precomputed `Proxy.stream_match` (see `docs/mesh.md`
+  L4 routing and `tests/integration/mesh_l7_routing_tests.rs` /
+  `tests/conformance/istio_virtual_service.rs`). Residual fail-closed gap:
+  weighted multi-destination L4 splitting. Model splits with an upstream-backed
+  stream proxy — do not treat TLS-SNI or the L4 match predicates as roadmap work.
 - **Active-active multi-cluster endpoint discovery at scale** — minority need;
   targets verified-Beta, not GA.
 

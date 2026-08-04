@@ -320,14 +320,22 @@ fn env_policy_ignores_a_blank_dtls_path() {
 }
 
 #[test]
-fn env_policy_accepts_provider_routed_mongodb_config_store() {
-    let env_config = EnvConfig {
-        db_type: Some("mongodb".to_string()),
-        db_url: Some("mongodb://db.example/ferrum?tls=true".to_string()),
-        ..EnvConfig::default()
-    };
-    policy::check_env_config_enforced(&env_config)
-        .expect("MongoDB TLS follows the selected build-profile provider");
+fn env_policy_rejects_every_mongodb_config_store_shape() {
+    for db_url in [
+        None,
+        Some("mongodb://db.example/ferrum?tls=true"),
+        Some("mongodb://user:secret@db.example/ferrum?tlsAllowInvalidCertificates=true"),
+    ] {
+        let env_config = EnvConfig {
+            db_type: Some("mongodb".to_string()),
+            db_url: db_url.map(str::to_string),
+            ..EnvConfig::default()
+        };
+        let err = policy::check_env_config_enforced(&env_config).expect_err("MongoDB is refused");
+        assert!(err.contains("FERRUM_DB_TYPE=mongodb"), "{err}");
+        assert!(err.contains("database-driver cryptography"), "{err}");
+        assert!(!err.contains("user:secret"), "database URL leaked: {err}");
+    }
 }
 
 #[test]

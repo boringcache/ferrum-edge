@@ -2,10 +2,11 @@
 //!
 //! The CNI binary (`bin/ferrum-cni`) implements the minimal CNI spec on the
 //! wire (stdin JSON + CNI_* env vars + stdout JSON) and forwards each ADD /
-//! DEL / CHECK invocation to the long-lived node-agent over a Unix domain
-//! socket. The node-agent owns BPF program lifecycle, map maintenance, and
-//! metrics; the CNI binary is the thin per-pod hook the kubelet drives during
-//! sandbox setup.
+//! DEL / CHECK / STATUS / GC invocation to the long-lived node-agent over a
+//! Unix domain socket. The node-agent owns BPF program lifecycle, map
+//! maintenance, and metrics; the CNI binary is the thin per-pod hook the
+//! kubelet drives during sandbox setup, readiness probing, and periodic
+//! garbage collection.
 //!
 //! Two distinct on-wire shapes live in this module:
 //!
@@ -30,5 +31,6 @@
 
 pub mod client;
 pub mod install;
+pub mod ownership;
 pub mod rpc;
 pub mod spec;

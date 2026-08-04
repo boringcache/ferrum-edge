@@ -115,6 +115,8 @@ fn create_http3_test_proxy() -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -851,6 +853,8 @@ async fn test_http3_streaming_decision_logic() {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };

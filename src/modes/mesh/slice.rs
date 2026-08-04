@@ -230,6 +230,17 @@ pub struct MeshSlice {
     /// when unset so non-ambiguous slices stay byte-identical on the wire.
     #[serde(default, skip_serializing_if = "is_false")]
     pub labels_ambiguous: bool,
+    /// Namespace-projected Istio VirtualService L4 proxies carried to mesh data
+    /// planes. `GatewayConfig` proxies do not otherwise ride `MeshSlice`, so the
+    /// full serialized proxy objects are retained as JSON and decoded through
+    /// the ordinary `Proxy` admission path at apply time. Only translator-owned
+    /// `istio-vs-l4_` ids with non-empty `stream_match` criteria are admitted.
+    ///
+    /// Keeping this field in slice content equality is load-bearing: an update
+    /// or deletion must rebuild the listener candidates instead of retaining a
+    /// stale route or stale materialized local-workload selector decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_service_l4_proxies: Vec<serde_json::Value>,
     pub version: String,
     /// Authoritative, CP-replica-shared config revision this slice was built
     /// from (issue #2473).
@@ -631,6 +642,7 @@ impl MeshSlice {
             // re-broadcast and the DP stops deferring to (or starts deferring
             // to) its local labels; omitting it would keep the stale precedence.
             && self.labels_ambiguous == other.labels_ambiguous
+            && self.virtual_service_l4_proxies == other.virtual_service_l4_proxies
             && self.workloads == other.workloads
             && self.ambient_udp_source_workloads == other.ambient_udp_source_workloads
             && self.node_waypoint_assertors == other.node_waypoint_assertors
@@ -899,6 +911,33 @@ impl MeshSlice {
         // authoritative revision, so a DP comparing two CPs' slices compares
         // their config generations rather than their wall clocks.
         let revision = config.mesh_revision.clone();
+        let virtual_service_l4_proxies = config
+            .proxies
+            .iter()
+            .filter(|proxy| {
+                proxy.namespace == request.namespace
+                    && proxy
+                        .id
+                        .starts_with(crate::proxy::stream_match::ISTIO_VS_L4_PROXY_ID_PREFIX)
+                    && proxy
+                        .stream_match
+                        .as_ref()
+                        .is_some_and(|criteria| !criteria.is_empty())
+            })
+            .filter_map(|proxy| match serde_json::to_value(proxy) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        error = %error,
+                        "Failed to serialize a VirtualService L4 proxy into the mesh slice; \
+                         dropping the route fail-closed"
+                    );
+                    None
+                }
+            })
+            .collect();
+
         let Some(mesh) = config.mesh.as_ref() else {
             return Self {
                 node_id: request.node_id,
@@ -906,6 +945,7 @@ impl MeshSlice {
                 workload_spiffe_id: request.workload_spiffe_id,
                 waypoint_name: request.waypoint_name,
                 labels: request.labels,
+                virtual_service_l4_proxies,
                 version,
                 revision,
                 ..Self::default()
@@ -1482,6 +1522,7 @@ impl MeshSlice {
             waypoint_name: request.waypoint_name,
             labels: effective_labels,
             labels_ambiguous,
+            virtual_service_l4_proxies,
             version,
             revision,
             workloads,
@@ -3826,6 +3867,7 @@ mod tests {
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
             destination_rules: Vec::new(),
             virtual_service_cors_policies: Vec::new(),
+            virtual_service_l4_proxies: Vec::new(),
             proxy_configs: Vec::new(),
             request_authentications: vec![make_request_auth("ra1", "ns", PolicyScope::MeshWide)],
             telemetry_resources: vec![make_telemetry("t1", "ns", PolicyScope::MeshWide)],

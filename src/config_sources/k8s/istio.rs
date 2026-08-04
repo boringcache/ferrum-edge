@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -2438,34 +2438,235 @@ fn dispatch_rules_carry_transform(dispatch_rules: &[Value], field: &str) -> bool
     })
 }
 
-/// Reject the L4 (`tcp[]`/`tls[]`) match predicates Ferrum's stream layer cannot
-/// express. A stream proxy routes by `listen_port` (plus SNI for passthrough
-/// TLS) and has no source-identity or CIDR matching, so silently dropping these
-/// would mis-route — fail closed instead. `sniHosts`/`port` are consumed by the
-/// caller.
-fn reject_unsupported_l4_match(
+/// Parse one VirtualService L4 (`tcp[]`/`tls[]`) match object's optional
+/// identity / CIDR / gateway predicates into a single [`StreamMatchArm`].
+/// Invalid shapes fail closed with field-specific diagnostics — never silently
+/// drop or broaden a route. `sniHosts` / `port` are consumed by the caller.
+fn parse_l4_match_arm(
     object: &K8sObject,
     m: &Value,
     kind: &str,
-) -> Result<(), K8sTranslateError> {
-    for field in [
-        "sourceLabels",
-        "sourceSubnets",
-        "destinationSubnets",
-        "gateways",
-        "sourceNamespace",
-    ] {
-        if m.get(field).is_some() {
+    vs_gateways: &[String],
+) -> Result<Option<crate::proxy::stream_match::StreamMatchArm>, K8sTranslateError> {
+    use crate::proxy::stream_match::{
+        MAX_STREAM_MATCH_GATEWAY_LENGTH, MAX_STREAM_MATCH_GATEWAYS, MAX_STREAM_MATCH_LABELS,
+        StreamMatchArm, canonicalize_gateway_name, valid_kubernetes_label_key,
+        valid_kubernetes_label_value,
+    };
+
+    let mut arm = StreamMatchArm::default();
+
+    if let Some(labels_val) = m.get("sourceLabels") {
+        let Some(labels) = labels_val.as_object() else {
             return Err(invalid_resource(
                 object,
                 format!(
-                    "VirtualService {kind}[] match.{field} is not supported (Ferrum stream routing keys on port{} only); remove it or model the route as an explicit stream Proxy",
-                    if kind == "tls" { " and SNI" } else { "" }
+                    "VirtualService {kind}[] match.sourceLabels must be an object of string label keys to string values"
+                ),
+            ));
+        };
+        if labels.is_empty() {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.sourceLabels must not be empty when set"),
+            ));
+        }
+        if labels.len() > MAX_STREAM_MATCH_LABELS {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[] match.sourceLabels must contain at most {MAX_STREAM_MATCH_LABELS} entries"
                 ),
             ));
         }
+        for (index, (key, value)) in labels.iter().enumerate() {
+            if !valid_kubernetes_label_key(key) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService {kind}[] match.sourceLabels entry {index} has an invalid Kubernetes label key"
+                    ),
+                ));
+            }
+            let Some(value) = value.as_str() else {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService {kind}[] match.sourceLabels entry {index} must have a string value"
+                    ),
+                ));
+            };
+            if !valid_kubernetes_label_value(value) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService {kind}[] match.sourceLabels entry {index} has an invalid Kubernetes label value"
+                    ),
+                ));
+            }
+            arm.source_labels.insert(key.clone(), value.to_string());
+        }
     }
-    Ok(())
+
+    if let Some(ns_val) = m.get("sourceNamespace") {
+        let Some(ns) = ns_val.as_str() else {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.sourceNamespace must be a string"),
+            ));
+        };
+        if ns.is_empty() || ns.chars().all(char::is_whitespace) {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.sourceNamespace must not be empty"),
+            ));
+        }
+        crate::proxy::stream_match::validate_kubernetes_namespace(ns).map_err(|e| {
+            invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.sourceNamespace: {e}"),
+            )
+        })?;
+        arm.source_namespace = Some(ns.to_string());
+    }
+
+    if let Some(subnets_val) = m.get("sourceSubnets") {
+        arm.source_subnets = parse_l4_cidr_list(object, kind, "sourceSubnets", subnets_val)?;
+    }
+
+    if let Some(subnets_val) = m.get("destinationSubnets") {
+        arm.destination_subnets =
+            parse_l4_cidr_list(object, kind, "destinationSubnets", subnets_val)?;
+    }
+
+    // Effective gateways: match-level overrides VS-level; omitted match-level
+    // inherits VS-level; omitted VS-level defaults to mesh (Istio).
+    let match_gateways = m.get("gateways");
+    arm.gateways = if let Some(g) = match_gateways {
+        let Some(arr) = g.as_array() else {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.gateways must be an array of strings"),
+            ));
+        };
+        if arr.is_empty() {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.gateways must not be empty when set"),
+            ));
+        }
+        if arr.len() > MAX_STREAM_MATCH_GATEWAYS {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[] match.gateways must contain at most {MAX_STREAM_MATCH_GATEWAYS} entries"
+                ),
+            ));
+        }
+        let mut out = Vec::with_capacity(arr.len());
+        for (i, entry) in arr.iter().enumerate() {
+            let Some(raw) = entry.as_str() else {
+                return Err(invalid_resource(
+                    object,
+                    format!("VirtualService {kind}[] match.gateways[{i}] must be a string"),
+                ));
+            };
+            if raw.len() > MAX_STREAM_MATCH_GATEWAY_LENGTH {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService {kind}[] match.gateways[{i}] must be at most {MAX_STREAM_MATCH_GATEWAY_LENGTH} characters"
+                    ),
+                ));
+            }
+            let canonical =
+                canonicalize_gateway_name(raw, &object.metadata.namespace).map_err(|e| {
+                    invalid_resource(
+                        object,
+                        format!("VirtualService {kind}[] match.gateways[{i}]: {e}"),
+                    )
+                })?;
+            out.push(canonical);
+        }
+        out
+    } else {
+        // The top-level field was strictly parsed and canonicalized once by
+        // `parse_l4_virtual_service_gateways`; omission alone produced mesh.
+        vs_gateways.to_vec()
+    };
+
+    Ok(Some(arm))
+}
+
+fn parse_l4_cidr_list(
+    object: &K8sObject,
+    kind: &str,
+    field: &str,
+    value: &Value,
+) -> Result<Vec<String>, K8sTranslateError> {
+    let Some(arr) = value.as_array() else {
+        return Err(invalid_resource(
+            object,
+            format!("VirtualService {kind}[] match.{field} must be an array of CIDR strings"),
+        ));
+    };
+    if arr.is_empty() {
+        return Err(invalid_resource(
+            object,
+            format!("VirtualService {kind}[] match.{field} must not be empty when set"),
+        ));
+    }
+    if arr.len() > crate::proxy::stream_match::MAX_STREAM_MATCH_SUBNETS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService {kind}[] match.{field} must contain at most {} entries",
+                crate::proxy::stream_match::MAX_STREAM_MATCH_SUBNETS
+            ),
+        ));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let Some(raw) = entry.as_str() else {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.{field}[{i}] must be a string CIDR or IP"),
+            ));
+        };
+        if raw.trim().is_empty() {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.{field}[{i}] must not be empty"),
+            ));
+        }
+        if raw.len() > crate::proxy::stream_match::MAX_STREAM_MATCH_CIDR_LENGTH {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[] match.{field}[{i}] must be at most {} characters",
+                    crate::proxy::stream_match::MAX_STREAM_MATCH_CIDR_LENGTH
+                ),
+            ));
+        }
+        crate::util::cidr::CidrSet::parse_strict(raw).map_err(|_| {
+            invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.{field}[{i}] is not a valid CIDR or IP"),
+            )
+        })?;
+        out.push(raw.to_string());
+    }
+    Ok(out)
+}
+
+fn attach_l4_stream_match(
+    proxy: &mut Proxy,
+    arm: Option<crate::proxy::stream_match::StreamMatchArm>,
+) {
+    if let Some(arm) = arm {
+        proxy.stream_match =
+            Some(crate::proxy::stream_match::StreamMatchCriteria { arms: vec![arm] });
+    }
 }
 
 /// Resolve the single backend `(host, port)` of an L4 route block. Weighted
@@ -2518,7 +2719,24 @@ fn l4_route_destination(
             ),
         )
     })?;
-    Ok((host.to_string(), port))
+    // A short Istio destination is resolved relative to the VirtualService's
+    // namespace, not the namespace of a sidecar/gateway that consumes an
+    // exported route. Qualify recognized Kubernetes service forms before L4
+    // visibility projection changes `Proxy.namespace`; external hosts remain
+    // byte-for-byte unchanged.
+    let backend_host = service_host_components(
+        host,
+        &object.metadata.namespace,
+        &acc.options.cluster_domain,
+    )
+    .map(|(service, namespace)| {
+        format!(
+            "{service}.{namespace}.svc.{}",
+            acc.options.cluster_domain.trim_end_matches('.')
+        )
+    })
+    .unwrap_or_else(|| host.to_string());
+    Ok((backend_host, port))
 }
 
 fn virtual_service_l4_proxy_id(
@@ -2533,8 +2751,362 @@ fn virtual_service_l4_proxy_id(
     // underscores, and the generated numeric suffix does not either, so HTTP
     // VirtualService IDs built as `istio-vs-<namespace>-<name>-<suffix>` cannot
     // collide with L4 IDs for hyphenated names such as `foo-tls`.
-    format!("istio-vs-l4_{route_kind}__{namespace}__{vs_name}__{block_index}-{match_index}")
-        .replace(['/', '.'], "-")
+    format!(
+        "{}{route_kind}__{namespace}__{vs_name}__{block_index}-{match_index}",
+        crate::proxy::stream_match::ISTIO_VS_L4_PROXY_ID_PREFIX
+    )
+    .replace(['/', '.'], "-")
+}
+
+/// Strictly parse top-level `spec.gateways` for the L4 translation path.
+/// Presence is materially different from omission: malformed, mixed, or empty
+/// values must never collapse to the empty result that means Istio's `mesh`
+/// default.
+fn parse_l4_virtual_service_gateways(object: &K8sObject) -> Result<Vec<String>, K8sTranslateError> {
+    use crate::proxy::stream_match::{MESH_GATEWAY_TOKEN, canonicalize_gateway_name};
+
+    let Some(value) = object.spec.get("gateways") else {
+        return Ok(vec![MESH_GATEWAY_TOKEN.to_string()]);
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(invalid_resource(
+            object,
+            "VirtualService spec.gateways must be a non-empty array of strings for L4 routing",
+        ));
+    };
+    if entries.is_empty() {
+        return Err(invalid_resource(
+            object,
+            "VirtualService spec.gateways must not be empty when set for L4 routing",
+        ));
+    }
+    if entries.len() > crate::proxy::stream_match::MAX_STREAM_MATCH_GATEWAYS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService spec.gateways must contain at most {} entries for L4 routing",
+                crate::proxy::stream_match::MAX_STREAM_MATCH_GATEWAYS
+            ),
+        ));
+    }
+    let mut gateways = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(raw) = entry.as_str() else {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService spec.gateways[{index}] must be a string"),
+            ));
+        };
+        if raw.len() > crate::proxy::stream_match::MAX_STREAM_MATCH_GATEWAY_LENGTH {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService spec.gateways[{index}] must be at most {} characters",
+                    crate::proxy::stream_match::MAX_STREAM_MATCH_GATEWAY_LENGTH
+                ),
+            ));
+        }
+        gateways.push(
+            canonicalize_gateway_name(raw, &object.metadata.namespace).map_err(|error| {
+                invalid_resource(
+                    object,
+                    format!("VirtualService spec.gateways[{index}]: {error}"),
+                )
+            })?,
+        );
+    }
+    Ok(gateways)
+}
+
+/// Count every materialized L4 match candidate before allocating proxies or
+/// compiling matchers. A VirtualService route list is ordered as one semantic
+/// unit, so the serialized matcher-arm bound also caps the number of generated
+/// candidates an untrusted CRD can place on shared listeners.
+fn virtual_service_l4_candidate_count(object: &K8sObject) -> Result<usize, K8sTranslateError> {
+    let mut total = 0usize;
+    for kind in ["tls", "tcp"] {
+        let Some(value) = object.spec.get(kind) else {
+            continue;
+        };
+        let Some(blocks) = value.as_array() else {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService spec.{kind} must be an array"),
+            ));
+        };
+        for block in blocks {
+            let count = match block.get("match") {
+                Some(matches) => {
+                    let Some(matches) = matches.as_array() else {
+                        return Err(invalid_resource(
+                            object,
+                            format!("VirtualService {kind}[].match must be an array"),
+                        ));
+                    };
+                    if matches.is_empty() { 1 } else { matches.len() }
+                }
+                None => 1,
+            };
+            total = total.checked_add(count).ok_or_else(|| {
+                invalid_resource(object, "VirtualService L4 match candidate count overflow")
+            })?;
+            if total > crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService tcp[]/tls[] may contain at most {} total match candidates",
+                        crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn parse_l4_hosts(
+    object: &K8sObject,
+    value: Option<&Value>,
+    field: &str,
+    allow_global_wildcard: bool,
+) -> Result<Vec<String>, K8sTranslateError> {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return Err(invalid_resource(
+            object,
+            format!("VirtualService {field} must be a non-empty array of hostnames"),
+        ));
+    };
+    if entries.is_empty() {
+        return Err(invalid_resource(
+            object,
+            format!("VirtualService {field} must not be empty"),
+        ));
+    }
+    if entries.len() > crate::config::types::MAX_HOSTS_PER_PROXY {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService {field} must contain at most {} entries",
+                crate::config::types::MAX_HOSTS_PER_PROXY
+            ),
+        ));
+    }
+    let mut hosts = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(host) = entry.as_str() else {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {field}[{index}] must be a string"),
+            ));
+        };
+        if host.len() > crate::config::types::MAX_HOST_LENGTH {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {field}[{index}] must be at most {} characters",
+                    crate::config::types::MAX_HOST_LENGTH
+                ),
+            ));
+        }
+        let valid_virtual_service_scope =
+            allow_global_wildcard && (host == "*" || host.parse::<std::net::IpAddr>().is_ok());
+        if !valid_virtual_service_scope && crate::config::types::validate_host_entry(host).is_err()
+        {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {field}[{index}] is not a valid hostname"),
+            ));
+        }
+        hosts.push(host.to_string());
+    }
+    Ok(hosts)
+}
+
+fn sni_host_is_subset_of_virtual_service_host(sni_host: &str, vs_host: &str) -> bool {
+    if vs_host == "*" || sni_host == vs_host {
+        return true;
+    }
+    match (sni_host.strip_prefix("*."), vs_host.strip_prefix("*.")) {
+        (None, Some(vs_suffix)) => {
+            sni_host == vs_suffix || sni_host.ends_with(&format!(".{vs_suffix}"))
+        }
+        (Some(sni_suffix), Some(vs_suffix)) => {
+            sni_suffix == vs_suffix || sni_suffix.ends_with(&format!(".{vs_suffix}"))
+        }
+        _ => false,
+    }
+}
+
+fn expand_istio_sni_hosts(
+    object: &K8sObject,
+    sni_hosts: Vec<String>,
+) -> Result<Vec<String>, K8sTranslateError> {
+    let expanded_len = sni_hosts
+        .iter()
+        .try_fold(0usize, |count, host| {
+            count.checked_add(1 + usize::from(host.starts_with("*.")))
+        })
+        .ok_or_else(|| invalid_resource(object, "VirtualService SNI host count overflow"))?;
+    if expanded_len > crate::config::types::MAX_HOSTS_PER_PROXY {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService tls[].match.sniHosts expands to more than {} runtime entries",
+                crate::config::types::MAX_HOSTS_PER_PROXY
+            ),
+        ));
+    }
+    let mut expanded = Vec::with_capacity(expanded_len);
+    for host in sni_hosts {
+        if let Some(suffix) = host.strip_prefix("*.") {
+            // Istio's TLS wildcard includes the suffix apex, whereas Ferrum's
+            // generic stream wildcard intentionally does not. Carry the apex
+            // explicitly so VirtualService semantics remain exact without
+            // changing hand-authored passthrough routing.
+            expanded.push(suffix.to_string());
+        }
+        expanded.push(host);
+    }
+    Ok(expanded)
+}
+
+fn l4_export_namespaces(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+) -> Result<(BTreeSet<String>, bool), K8sTranslateError> {
+    let Some(value) = object.spec.get("exportTo") else {
+        return Ok((acc.known_namespaces.iter().cloned().collect(), true));
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(invalid_resource(
+            object,
+            "VirtualService spec.exportTo must be an array of namespace strings",
+        ));
+    };
+    // Istio treats an omitted/empty exportTo as public. Keep that distinction
+    // from the mesh model's native empty-list convention at this boundary.
+    if entries.is_empty() {
+        return Ok((acc.known_namespaces.iter().cloned().collect(), true));
+    }
+    if entries.len() > crate::proxy::stream_match::MAX_STREAM_MATCH_GATEWAYS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService spec.exportTo must contain at most {} entries for L4 routing",
+                crate::proxy::stream_match::MAX_STREAM_MATCH_GATEWAYS
+            ),
+        ));
+    }
+    let mut namespaces = BTreeSet::new();
+    let mut public = false;
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(namespace) = entry.as_str() else {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService spec.exportTo[{index}] must be a string"),
+            ));
+        };
+        match namespace {
+            "*" => {
+                public = true;
+                namespaces.extend(acc.known_namespaces.iter().cloned());
+            }
+            "." => {
+                namespaces.insert(object.metadata.namespace.clone());
+            }
+            namespace => {
+                if crate::proxy::stream_match::validate_kubernetes_namespace(namespace).is_err() {
+                    return Err(invalid_resource(
+                        object,
+                        format!("VirtualService spec.exportTo[{index}] is not a valid namespace"),
+                    ));
+                }
+                namespaces.insert(namespace.to_string());
+            }
+        }
+    }
+    Ok((namespaces, public))
+}
+
+fn project_l4_proxy_visibility(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    proxies: Vec<Proxy>,
+) -> Result<Vec<Proxy>, K8sTranslateError> {
+    let (mut export_namespaces, public) = l4_export_namespaces(object, acc)?;
+    if public {
+        export_namespaces.insert(object.metadata.namespace.clone());
+        // A public VirtualService must reach a named gateway even when no
+        // other watched object happened to make that gateway namespace part of
+        // `known_namespaces` yet.
+        for gateway in proxies
+            .iter()
+            .filter_map(|proxy| proxy.stream_match.as_ref())
+            .flat_map(|criteria| criteria.arms.iter())
+            .flat_map(|arm| arm.gateways.iter())
+            .filter(|gateway| gateway.as_str() != crate::proxy::stream_match::MESH_GATEWAY_TOKEN)
+        {
+            if let Some((namespace, _)) = gateway.split_once('/') {
+                export_namespaces.insert(namespace.to_string());
+            }
+        }
+    }
+
+    let mut projected = Vec::new();
+    for proxy in proxies {
+        let Some(criteria) = proxy.stream_match.as_ref() else {
+            continue;
+        };
+        for namespace in &export_namespaces {
+            let mut criteria = criteria.clone();
+            let mut projected_arms = Vec::with_capacity(criteria.arms.len().saturating_mul(2));
+            for arm in criteria.arms.drain(..) {
+                if arm
+                    .gateways
+                    .iter()
+                    .any(|gateway| gateway == crate::proxy::stream_match::MESH_GATEWAY_TOKEN)
+                {
+                    let mut mesh_arm = arm.clone();
+                    mesh_arm.gateways =
+                        vec![crate::proxy::stream_match::MESH_GATEWAY_TOKEN.to_string()];
+                    projected_arms.push(mesh_arm);
+                }
+
+                let named_gateways: Vec<String> = arm
+                    .gateways
+                    .iter()
+                    .filter(|gateway| {
+                        gateway
+                            .split_once('/')
+                            .is_some_and(|(gateway_namespace, _)| gateway_namespace == namespace)
+                    })
+                    .cloned()
+                    .collect();
+                if !named_gateways.is_empty() {
+                    let mut gateway_arm = arm;
+                    gateway_arm.gateways = named_gateways;
+                    // Istio defines sourceLabels/sourceNamespace as workload
+                    // selectors, not runtime gateway predicates; match-level
+                    // gateways are explicitly independent of sourceLabels.
+                    // They remain enforced on the mesh arm above and are
+                    // removed only from this named-gateway projection.
+                    gateway_arm.source_labels.clear();
+                    gateway_arm.source_namespace = None;
+                    projected_arms.push(gateway_arm);
+                }
+            }
+            criteria.arms = projected_arms;
+            if criteria.arms.is_empty() {
+                continue;
+            }
+            let mut projected_proxy = proxy.clone();
+            projected_proxy.namespace = namespace.clone();
+            projected_proxy.stream_match = Some(criteria);
+            projected_proxy.compiled_stream_match = None;
+            projected.push(projected_proxy);
+        }
+    }
+    Ok(projected)
 }
 
 /// Translate VirtualService L4 routes into Ferrum stream proxies, reusing the
@@ -2545,15 +3117,24 @@ fn virtual_service_l4_proxy_id(
 ///   - `spec.tcp[]` → a plain TCP proxy keyed by `listen_port`.
 ///
 /// `match.port` selects the listen port (falling back to the destination port
-/// when omitted). Unsupported match predicates (source-identity / CIDR /
-/// gateways) and weighted splitting fail closed via the helpers above.
+/// when omitted). Optional L4 predicates (`sourceLabels`, `sourceSubnets`,
+/// `destinationSubnets`, `gateways`, `sourceNamespace`) compile onto
+/// `Proxy.stream_match` and are evaluated from trustworthy connection /
+/// workload metadata before route selection. Weighted splitting still fails
+/// closed via `l4_route_destination`.
 fn virtual_service_l4_proxies(
     object: &K8sObject,
     acc: &K8sAccumulator,
 ) -> Result<Vec<Proxy>, K8sTranslateError> {
     let namespace = &object.metadata.namespace;
     let vs_name = &object.metadata.name;
-    let mut proxies = Vec::new();
+    let candidate_count = virtual_service_l4_candidate_count(object)?;
+    if candidate_count == 0 {
+        return Ok(Vec::new());
+    }
+    let vs_hosts = parse_l4_hosts(object, object.spec.get("hosts"), "spec.hosts", true)?;
+    let vs_gateways = parse_l4_virtual_service_gateways(object)?;
+    let mut proxies = Vec::with_capacity(candidate_count);
 
     if let Some(blocks) = object.spec.get("tls").and_then(Value::as_array) {
         for (bi, block) in blocks.iter().enumerate() {
@@ -2569,14 +3150,22 @@ fn virtual_service_l4_proxies(
                     )
                 })?;
             for (mi, m) in matches.iter().enumerate() {
-                reject_unsupported_l4_match(object, m, "tls")?;
-                let sni_hosts = string_array(m, "sniHosts");
-                if sni_hosts.is_empty() {
-                    return Err(invalid_resource(
-                        object,
-                        "VirtualService tls[] match requires sniHosts for SNI routing",
-                    ));
+                let stream_arm = parse_l4_match_arm(object, m, "tls", &vs_gateways)?;
+                let sni_hosts =
+                    parse_l4_hosts(object, m.get("sniHosts"), "tls[].match.sniHosts", false)?;
+                for (index, sni_host) in sni_hosts.iter().enumerate() {
+                    if !vs_hosts.iter().any(|vs_host| {
+                        sni_host_is_subset_of_virtual_service_host(sni_host, vs_host)
+                    }) {
+                        return Err(invalid_resource(
+                            object,
+                            format!(
+                                "VirtualService tls[].match.sniHosts[{index}] must be a subset of spec.hosts"
+                            ),
+                        ));
+                    }
                 }
+                let sni_hosts = expand_istio_sni_hosts(object, sni_hosts)?;
                 let listen_port = optional_port_field(object, m.get("port"), "tls[].match.port")?
                     .unwrap_or(backend_port);
                 let mut proxy = super::proxy_for_route(super::RouteProxySpec {
@@ -2595,6 +3184,7 @@ fn virtual_service_l4_proxies(
                     backend_read_timeout_ms: None,
                 });
                 proxy.passthrough = true;
+                attach_l4_stream_match(&mut proxy, stream_arm);
                 proxies.push(proxy);
             }
         }
@@ -2603,29 +3193,13 @@ fn virtual_service_l4_proxies(
     if let Some(blocks) = object.spec.get("tcp").and_then(Value::as_array) {
         for (bi, block) in blocks.iter().enumerate() {
             let (backend_host, backend_port) = l4_route_destination(object, block, "tcp", acc)?;
-            let listen_ports: Vec<u16> = match block.get("match").and_then(Value::as_array) {
-                Some(ms) if !ms.is_empty() => {
-                    let mut ports = Vec::with_capacity(ms.len());
-                    for m in ms {
-                        reject_unsupported_l4_match(object, m, "tcp")?;
-                        if m.get("sniHosts").is_some() {
-                            return Err(invalid_resource(
-                                object,
-                                "VirtualService tcp[] match must not set sniHosts; use tls[] for SNI routing",
-                            ));
-                        }
-                        ports.push(
-                            optional_port_field(object, m.get("port"), "tcp[].match.port")?
-                                .unwrap_or(backend_port),
-                        );
-                    }
-                    ports
-                }
-                _ => vec![backend_port],
+            let match_entries: Vec<&Value> = match block.get("match").and_then(Value::as_array) {
+                Some(ms) if !ms.is_empty() => ms.iter().collect(),
+                _ => Vec::new(),
             };
-            for (mi, port) in listen_ports.into_iter().enumerate() {
-                let proxy = super::proxy_for_route(super::RouteProxySpec {
-                    id: virtual_service_l4_proxy_id("tcp", namespace, vs_name, bi, mi),
+            if match_entries.is_empty() {
+                let mut proxy = super::proxy_for_route(super::RouteProxySpec {
+                    id: virtual_service_l4_proxy_id("tcp", namespace, vs_name, bi, 0),
                     namespace: namespace.clone(),
                     hosts: Vec::new(),
                     listen_path: None,
@@ -2635,16 +3209,53 @@ fn virtual_service_l4_proxies(
                     backend_port,
                     upstream_id: None,
                     backend_scheme: crate::config::types::BackendScheme::Tcp,
-                    listen_port: Some(port),
+                    listen_port: Some(backend_port),
                     retry: None,
                     backend_read_timeout_ms: None,
                 });
+                // No match block: still inherit VS-level / default mesh gateways.
+                let arm = parse_l4_match_arm(
+                    object,
+                    &Value::Object(serde_json::Map::new()),
+                    "tcp",
+                    &vs_gateways,
+                )?;
+                attach_l4_stream_match(&mut proxy, arm);
                 proxies.push(proxy);
+            } else {
+                for (mi, m) in match_entries.into_iter().enumerate() {
+                    let stream_arm = parse_l4_match_arm(object, m, "tcp", &vs_gateways)?;
+                    if m.get("sniHosts").is_some() {
+                        return Err(invalid_resource(
+                            object,
+                            "VirtualService tcp[] match must not set sniHosts; use tls[] for SNI routing",
+                        ));
+                    }
+                    let port = optional_port_field(object, m.get("port"), "tcp[].match.port")?
+                        .unwrap_or(backend_port);
+                    let mut proxy = super::proxy_for_route(super::RouteProxySpec {
+                        id: virtual_service_l4_proxy_id("tcp", namespace, vs_name, bi, mi),
+                        namespace: namespace.clone(),
+                        hosts: Vec::new(),
+                        listen_path: None,
+                        strip_listen_path: false,
+                        preserve_host_header: false,
+                        backend_host: backend_host.clone(),
+                        backend_port,
+                        upstream_id: None,
+                        backend_scheme: crate::config::types::BackendScheme::Tcp,
+                        listen_port: Some(port),
+                        retry: None,
+                        backend_read_timeout_ms: None,
+                    });
+                    attach_l4_stream_match(&mut proxy, stream_arm);
+                    proxies.push(proxy);
+                }
             }
         }
     }
 
-    Ok(proxies)
+    project_l4_proxy_visibility(object, acc, proxies)
 }
 
 fn virtual_service_routes(
@@ -2653,9 +3264,9 @@ fn virtual_service_routes(
 ) -> Result<VsRouteResult, K8sTranslateError> {
     // L4 routing: `spec.tls[]` (SNI passthrough) and `spec.tcp[]` (port) are
     // materialized into Ferrum stream proxies below, reusing the gateway /
-    // east-west stream + SNI machinery. Match predicates Ferrum's stream layer
-    // cannot express (source-identity / CIDR / gateways) and weighted splitting
-    // fail closed inside `virtual_service_l4_proxies`.
+    // east-west stream + SNI machinery. Optional L4 match predicates compile
+    // onto `Proxy.stream_match`; weighted splitting fails closed inside
+    // `virtual_service_l4_proxies`.
     let hosts = string_array(&object.spec, "hosts");
     let mut proxies = virtual_service_l4_proxies(object, acc)?;
     let mut upstreams = Vec::new();
@@ -10439,6 +11050,138 @@ extensionProviders:
             proxy.listen_path.is_none(),
             "stream proxy has no listen_path"
         );
+        let arm = &proxy
+            .stream_match
+            .as_ref()
+            .expect("default mesh gateways project onto stream_match")
+            .arms[0];
+        assert_eq!(arm.gateways, vec!["mesh".to_string()]);
+    }
+
+    #[test]
+    fn virtual_service_l4_match_predicates_project_onto_stream_match() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "tcp": [{
+                        "match": [{
+                            "port": 3306,
+                            "sourceLabels": {"app": "billing"},
+                            "sourceNamespace": "prod",
+                            "sourceSubnets": ["10.1.0.0/16"],
+                            "destinationSubnets": ["10.2.0.0/16"],
+                            "gateways": ["mesh"]
+                        }],
+                        "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("L4 match predicates translate");
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_port == Some(3306))
+            .expect("tcp proxy");
+        let arm = &proxy.stream_match.as_ref().unwrap().arms[0];
+        assert_eq!(
+            arm.source_labels.get("app").map(String::as_str),
+            Some("billing")
+        );
+        assert_eq!(arm.source_namespace.as_deref(), Some("prod"));
+        assert_eq!(arm.source_subnets, vec!["10.1.0.0/16".to_string()]);
+        assert_eq!(arm.destination_subnets, vec!["10.2.0.0/16".to_string()]);
+        assert_eq!(arm.gateways, vec!["mesh".to_string()]);
+
+        let slice = crate::modes::mesh::slice::MeshSlice::from_gateway_config(
+            &result.config,
+            crate::modes::mesh::slice::MeshSliceRequest {
+                node_id: "sidecar-a".to_string(),
+                namespace: "default".to_string(),
+                workload_spiffe_id: Some(
+                    "spiffe://cluster.local/ns/default/sa/billing".to_string(),
+                ),
+                ..crate::modes::mesh::slice::MeshSliceRequest::default()
+            },
+        );
+        assert_eq!(
+            slice.virtual_service_l4_proxies.len(),
+            1,
+            "namespace-projected VirtualService L4 proxies must ride MeshSlice"
+        );
+    }
+
+    #[test]
+    fn virtual_service_l4_malformed_cidr_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "tcp": [{
+                        "match": [{"port": 3306, "sourceSubnets": ["999.0.0.0/8"]}],
+                        "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("bad CIDR must fail closed");
+        assert!(format!("{err}").contains("sourceSubnets"), "got {err}");
+        assert!(
+            !format!("{err}").contains("999.0.0.0"),
+            "diagnostic must not echo the rejected operand: {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_l4_match_bounds_fail_at_translation_boundary() {
+        let too_many_subnets = vec![
+            serde_json::Value::String("10.0.0.1/32".to_string());
+            crate::proxy::stream_match::MAX_STREAM_MATCH_SUBNETS + 1
+        ];
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "tcp": [{
+                        "match": [{"port": 3306, "sourceSubnets": too_many_subnets}],
+                        "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("over-bound sourceSubnets must fail before matcher allocation");
+        assert!(
+            format!("{err}").contains("sourceSubnets must contain at most"),
+            "got {err}"
+        );
+
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "gateways": [" ingress"],
+                    "tcp": [{
+                        "match": [{"port": 3306}],
+                        "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("whitespace-padded gateway must not be normalized into a trust binding");
+        assert!(
+            format!("{err}").contains("surrounding whitespace"),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -10468,6 +11211,159 @@ extensionProviders:
         assert_eq!(proxy.hosts, vec!["secure.example.com".to_string()]);
         assert_eq!(proxy.backend_host, "backend.default.svc.cluster.local");
         assert_eq!(proxy.backend_port, 443);
+    }
+
+    #[test]
+    fn virtual_service_tls_sni_hosts_must_be_subset_of_virtual_service_hosts() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["*.example.com"],
+                    "tls": [{
+                        "match": [{"sniHosts": ["secure.other.test"]}],
+                        "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 443}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("out-of-scope SNI must not widen the VirtualService host binding");
+        assert!(
+            format!("{err}").contains("must be a subset of spec.hosts"),
+            "got {err}"
+        );
+
+        let translated = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["*.example.com"],
+                    "tls": [{
+                        "match": [{"sniHosts": ["*.internal.example.com"]}],
+                        "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 443}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("a narrower wildcard SNI is within the VirtualService host");
+        let proxy = translated
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.listen_port == Some(443))
+            .expect("TLS proxy");
+        assert_eq!(
+            proxy.hosts,
+            vec![
+                "internal.example.com".to_string(),
+                "*.internal.example.com".to_string()
+            ],
+            "Istio wildcard SNI includes its suffix apex"
+        );
+    }
+
+    #[test]
+    fn virtual_service_l4_total_candidate_bound_is_checked_before_materialization() {
+        let matches = (0..=crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS)
+            .map(|_| serde_json::json!({"port": 3306}))
+            .collect::<Vec<_>>();
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "tcp": [{
+                        "match": matches,
+                        "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("an unbounded shared-listener candidate list must fail closed");
+        assert!(
+            format!("{err}").contains("at most 64 total match candidates"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_l4_export_to_projects_runtime_namespace() {
+        let translated = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "exportTo": ["consumer"],
+                    "tcp": [{
+                        "match": [{"port": 3306, "gateways": ["mesh"]}],
+                        "route": [{"destination": {"host": "mysql", "port": {"number": 3306}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("explicit exportTo recipient receives the L4 proxy");
+        let proxies: Vec<&Proxy> = translated
+            .config
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.listen_port == Some(3306))
+            .collect();
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].namespace, "consumer");
+        assert_eq!(
+            proxies[0].backend_host, "mysql.default.svc.cluster.local",
+            "short destinations remain relative to the VirtualService namespace"
+        );
+    }
+
+    #[test]
+    fn virtual_service_l4_public_export_reaches_named_gateway_namespace() {
+        let translated = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["secure.example.com"],
+                    "gateways": ["edge/ingress"],
+                    "tls": [{
+                        "match": [{
+                            "sniHosts": ["secure.example.com"],
+                            "sourceLabels": {"app": "client"},
+                            "sourceNamespace": "consumer"
+                        }],
+                        "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 443}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("default public export reaches the named gateway namespace");
+        let proxy = translated
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.listen_port == Some(443))
+            .expect("named-gateway TLS proxy");
+        assert_eq!(proxy.namespace, "edge");
+        assert_eq!(
+            proxy.stream_match.as_ref().unwrap().arms[0].gateways,
+            vec!["edge/ingress".to_string()]
+        );
+        assert!(
+            proxy.stream_match.as_ref().unwrap().arms[0]
+                .source_labels
+                .is_empty(),
+            "sourceLabels is a mesh workload selector, independent of named gateways"
+        );
+        assert!(
+            proxy.stream_match.as_ref().unwrap().arms[0]
+                .source_namespace
+                .is_none(),
+            "sourceNamespace is a mesh workload selector, independent of named gateways"
+        );
     }
 
     #[test]

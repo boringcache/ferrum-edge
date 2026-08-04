@@ -211,6 +211,22 @@ fn create_private_file(path: &Path) -> io::Result<File> {
 /// restore failure as secondary context and no rollback parent sync is
 /// attempted.
 pub(crate) fn replace_private_file(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let previous = read_previous_snapshot(final_path)?;
+    replace_private_file_with_snapshot(final_path, bytes, previous.as_deref())
+}
+
+/// Atomically publish `bytes` using a caller-supplied snapshot of the prior
+/// destination.
+///
+/// Security-sensitive callers that validate and read an existing file through
+/// an `O_NOFOLLOW` descriptor use this entry point so publication does not
+/// reopen the destination pathname between validation and replacement. The
+/// snapshot is used only to roll back a post-rename durability failure.
+pub(crate) fn replace_private_file_with_snapshot(
+    final_path: &Path,
+    bytes: &[u8],
+    previous: Option<&[u8]>,
+) -> io::Result<()> {
     let parent = final_path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -229,8 +245,6 @@ pub(crate) fn replace_private_file(final_path: &Path, bytes: &[u8]) -> io::Resul
         Uuid::new_v4().simple()
     ));
 
-    let previous = read_previous_snapshot(final_path)?;
-
     write_private_file(&tmp_path, bytes)?;
 
     if let Err(error) = rename_temp_into_place(&tmp_path, final_path) {
@@ -238,7 +252,7 @@ pub(crate) fn replace_private_file(final_path: &Path, bytes: &[u8]) -> io::Resul
     }
 
     if let Err(error) = sync_parent_dir(parent) {
-        return restore_previous_after_publish_failure(final_path, previous.as_deref(), error);
+        return restore_previous_after_publish_failure(final_path, previous, error);
     }
 
     Ok(())
