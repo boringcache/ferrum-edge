@@ -67,7 +67,7 @@
 //! aid `ALTER TABLE DROP CONSTRAINT` but do not change enforcement behavior.
 //! The inline tests below regression-guard this cross-dialect consistency.
 
-use sqlx::AnyConnection;
+use sqlx::{AnyConnection, Row};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SqlDialect {
@@ -139,9 +139,81 @@ impl V001SqlBuilder {
         sqlx::query(self.create_config_changes_sql())
             .execute(&mut *connection)
             .await?;
+        sqlx::query(self.create_audit_events_sql())
+            .execute(&mut *connection)
+            .await?;
+        self.ensure_audit_event_context_columns(connection).await?;
+        self.create_audit_event_indexes(connection).await?;
         self.create_full_load_indexes(connection).await?;
         self.create_config_change_indexes(connection).await?;
         Ok(())
+    }
+
+    async fn ensure_audit_event_context_columns(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        let columns = if self.is_mysql() {
+            [
+                (
+                    "source_address",
+                    "VARCHAR(128) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''",
+                ),
+                (
+                    "request_id",
+                    "VARCHAR(128) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''",
+                ),
+                (
+                    "outcome",
+                    "VARCHAR(64) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''",
+                ),
+            ]
+        } else {
+            [
+                ("source_address", "TEXT NOT NULL DEFAULT ''"),
+                ("request_id", "TEXT NOT NULL DEFAULT ''"),
+                ("outcome", "TEXT NOT NULL DEFAULT ''"),
+            ]
+        };
+
+        for (name, definition) in columns {
+            if self.audit_event_column_exists(connection, name).await? {
+                continue;
+            }
+
+            let sql = format!("ALTER TABLE audit_events ADD COLUMN {name} {definition}");
+            if let Err(error) = sqlx::query(&sql).execute(&mut *connection).await {
+                // Concurrent gateway startups can both observe an old schema.
+                // Accept a racing ALTER only after confirming the column now exists.
+                if !self.audit_event_column_exists(connection, name).await? {
+                    return Err(error.into());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn audit_event_column_exists(
+        &self,
+        connection: &mut AnyConnection,
+        column: &str,
+    ) -> Result<bool, anyhow::Error> {
+        if self.is_sqlite() {
+            let rows = sqlx::query("PRAGMA table_info(audit_events)")
+                .fetch_all(&mut *connection)
+                .await?;
+            return Ok(rows.iter().any(|row| {
+                row.try_get::<String, _>("name")
+                    .is_ok_and(|name| name == column)
+            }));
+        }
+
+        Ok(sqlx::query(self.audit_event_column_exists_sql())
+            .bind(column)
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_some())
     }
 
     async fn enable_sqlite_foreign_keys(
@@ -249,14 +321,12 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_proxies_api_spec_id ON proxies (api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_api_spec_id ON plugin_configs (api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_api_spec_id ON upstreams (api_spec_id)",
-            "CREATE INDEX IF NOT EXISTS idx_audit_events_namespace_ts_id ON audit_events (namespace, ts, id)",
-            "CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events (actor)",
-            "CREATE INDEX IF NOT EXISTS idx_audit_events_resource_type ON audit_events (resource_type)",
         ];
 
         for idx_sql in indexes {
             self.execute_index_sql(connection, idx_sql).await?;
         }
+        self.create_audit_event_indexes(connection).await?;
 
         Ok(())
     }
@@ -287,6 +357,25 @@ impl V001SqlBuilder {
         }
 
         Ok(())
+    }
+
+    async fn create_audit_event_indexes(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        for idx_sql in self.audit_event_index_sqls() {
+            self.execute_index_sql(connection, idx_sql).await?;
+        }
+
+        Ok(())
+    }
+
+    fn audit_event_index_sqls(&self) -> &'static [&'static str] {
+        &[
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_namespace_ts_id ON audit_events (namespace, ts, id)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events (actor)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_resource_type ON audit_events (resource_type)",
+        ]
     }
 
     async fn create_full_load_indexes(
@@ -342,6 +431,20 @@ impl V001SqlBuilder {
 
     fn is_sqlite(&self) -> bool {
         matches!(self.dialect, SqlDialect::Sqlite)
+    }
+
+    fn audit_event_column_exists_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'audit_events' \
+             AND column_name = ?"
+        } else {
+            // Postgres native placeholders are $1..$n; a trailing `?` is parsed
+            // as an incomplete operator and fails with "syntax error at end of input".
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'audit_events' \
+             AND column_name = $1"
+        }
     }
 
     fn api_specs_title_index_sql(&self) -> &'static str {
@@ -1124,6 +1227,29 @@ mod tests {
     // MongoDB's `partialFilterExpression: {enabled: true}`), full on
     // MySQL which lacks SQL-standard partial indexes.
     // ------------------------------------------------------------------
+
+    #[test]
+    fn test_audit_event_column_exists_sql_uses_dialect_placeholders() {
+        let mysql_sql = V001SqlBuilder::new("mysql").audit_event_column_exists_sql();
+        assert!(
+            mysql_sql.contains("column_name = ?"),
+            "MySQL information_schema probe must use `?` placeholders"
+        );
+        assert!(
+            !mysql_sql.contains("$1"),
+            "MySQL information_schema probe must not use Postgres `$1` placeholders"
+        );
+
+        let postgres_sql = V001SqlBuilder::new("postgres").audit_event_column_exists_sql();
+        assert!(
+            postgres_sql.contains("column_name = $1"),
+            "Postgres information_schema probe must use `$1` placeholders"
+        );
+        assert!(
+            !postgres_sql.contains("column_name = ?"),
+            "Postgres information_schema probe must not leave a trailing `?` operator"
+        );
+    }
 
     #[test]
     fn test_mysql_mesh_route_dispatch_index_is_full() {
