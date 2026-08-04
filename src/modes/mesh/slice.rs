@@ -1121,8 +1121,13 @@ impl MeshSlice {
         // Sidecar-only indexes: skip the full scan over `mesh.services` and
         // `mesh.service_entries` when no Sidecar applies (default-off feature,
         // or an enforced workload that no Sidecar resource targets). The
-        // destination-rules filter is the only consumer and short-circuits
-        // before reading these when `applicable_sidecar` is `None`.
+        // destination-rules filter and the VirtualService L4 proxy filter are
+        // the only consumers, and both short-circuit before reading these when
+        // `applicable_sidecar` is `None`. That short-circuit is what makes the
+        // empty sets safe: `applicable_sidecar` is `resolved_sidecar` except
+        // under dry-run (where it is `None`), so a consumer can only reach
+        // these sets on a path where `resolved_sidecar` was `Some` and they
+        // were therefore populated.
         let (mesh_service_identities, service_entry_hosts) = if resolved_sidecar.is_some() {
             (
                 mesh_service_identities(mesh),
