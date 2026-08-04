@@ -14,7 +14,8 @@ documents that contract even though no request hook ever fires.
 
 `__mesh_bpf_metrics` is a reserved, mesh-auto-injected plugin (NodeWaypoint
 topology). Operators should not configure it directly; the mesh runtime injects
-it so the BPF SOCK_OPS event consumer can expose TCP-layer Prometheus counters.
+it so the BPF event consumer can expose TCP-layer Prometheus counters and
+SOCK_OPS+SK_SKB accept-to-first-application-byte latency.
 It declares all protocols so an accidental non-mesh attachment is not silently
 dropped, but it implements no request/response/stream hooks.
 
@@ -1252,7 +1253,7 @@ Given all built-in plugins enabled, the execution order is:
   priority value itself is not used for request-phase ordering because the instance
   is discarded after registry staging.
 - `__mesh_bpf_metrics` (9365) is reserved for NodeWaypoint mesh auto-injection. It is
-  a passive Prometheus surface fed by the BPF SOCK_OPS consumer and intentionally
+  a passive Prometheus surface fed by the BPF event consumer and intentionally
   overrides no lifecycle hooks.
 
 
