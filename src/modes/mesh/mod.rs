@@ -1163,6 +1163,7 @@ fn prepare_normalized_gateway_config_for_mesh(
         ));
     }
 
+    materialize_sidecar_l4_source_selectors(&mut config, runtime, mesh_slice);
     inject_mesh_global_plugins(&mut config, runtime, mesh_slice);
     materialize_east_west_gateway_proxies(&mut config, runtime, mesh_slice);
     materialize_egress_gateway_proxies(&mut config, runtime, mesh_slice);
@@ -1910,14 +1911,14 @@ fn plugin_config_content_eq_ignoring_persistence(
 /// byte-identical. Comparing it here bumps the upstream's `updated_at` so the LB
 /// cache (and `ConfigDelta`) reflect the change.
 ///
-/// NOTE (#1816): immediate route-TABLE rebuild on a DR-only edit is DEFERRED.
-/// `ProxyState::delta_routes_changed` keys on PROXY add/modify/remove, and the
-/// route table holds the `Arc<Proxy>` carrying the projected fallback — a
-/// shared characteristic of ALL `#[serde(skip)]` DR-derived proxy fields (incl.
-/// the established per-port `dispatch_port_overrides`), not unique to the
-/// fallback. Until #1816 wires a proxy-side route-rebuild signal for these
-/// derived fields, an SD `connectionPool.http` edit applies on the next route
-/// rebuild (proxy change / full reload).
+/// Route-table rebuild for the projected proxy fields does not wait on this
+/// timestamp alone (#3243 / #1826): `ProxyState::delta_routes_changed` and the
+/// empty-delta publish path consult
+/// `projected_route_proxy_content_changed`, which compares the `#[serde(skip)]`
+/// DR-derived proxy projections (`dispatch_port_overrides`,
+/// `dispatch_port_override_fallback`, `resolved_tls`, and mesh stream-relay
+/// dispatch maps) so route-held `Arc<Proxy>` values cannot stay stale until an
+/// unrelated proxy edit.
 fn upstream_content_eq(a: &Upstream, b: &Upstream) -> bool {
     fn content_value(upstream: &Upstream) -> serde_json::Value {
         let mut normalized = upstream.clone();
@@ -2082,7 +2083,9 @@ fn gateway_config_from_mesh_slice_with_federation(
     });
     let materialization_slice = merged_slice.as_ref().unwrap_or(slice);
 
+    let proxies = decode_virtual_service_l4_proxies(slice)?;
     let config = GatewayConfig {
+        proxies,
         mesh: Some(Box::new(MeshConfig {
             workloads,
             services,
@@ -2107,6 +2110,145 @@ fn gateway_config_from_mesh_slice_with_federation(
         ..GatewayConfig::default()
     };
     prepare_gateway_config_for_native_slice(config, runtime, materialization_slice)
+}
+
+fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, anyhow::Error> {
+    slice
+        .virtual_service_l4_proxies
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let proxy: Proxy = serde_json::from_value(value.clone()).map_err(|error| {
+                anyhow::anyhow!(
+                    "Mesh slice VirtualService L4 proxy {index} is malformed: {error}"
+                )
+            })?;
+            if proxy.namespace != slice.namespace
+                || !proxy
+                    .id
+                    .starts_with(crate::proxy::stream_match::ISTIO_VS_L4_PROXY_ID_PREFIX)
+                || !proxy
+                    .stream_match
+                    .as_ref()
+                    .is_some_and(|criteria| !criteria.is_empty())
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice VirtualService L4 proxy {index} has invalid ownership or matcher identity"
+                ));
+            }
+            Ok(proxy)
+        })
+        .collect()
+}
+
+/// Resolve Istio `sourceLabels` / `sourceNamespace` as Sidecar-applicability
+/// selectors at the immutable slice-apply boundary. An ordinary outbound
+/// capture connection comes from the co-located application and has no peer
+/// SVID, so evaluating these fields as authenticated-peer predicates on the TCP
+/// hot path would deny every applicable rule. Named-gateway arms are left
+/// untouched (the translator removes these selectors from those projections),
+/// and non-Sidecar topologies retain the exact runtime source-workload evidence
+/// path used by NodeWaypoint / ambient traffic.
+fn materialize_sidecar_l4_source_selectors(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    if runtime.topology != MeshTopology::Sidecar {
+        return;
+    }
+
+    let local = authoritative_sidecar_l4_source(runtime, mesh_slice);
+    config.proxies.retain_mut(|proxy| {
+        let Some(criteria) = proxy.stream_match.as_mut() else {
+            return true;
+        };
+        criteria.arms.retain_mut(|arm| {
+            if !arm
+                .gateways
+                .iter()
+                .any(|gateway| gateway == crate::proxy::stream_match::MESH_GATEWAY_TOKEN)
+            {
+                return true;
+            }
+            if arm.source_labels.is_empty() && arm.source_namespace.is_none() {
+                return true;
+            }
+            let Some(local) = local.as_ref() else {
+                return false;
+            };
+            if arm
+                .source_namespace
+                .as_deref()
+                .is_some_and(|expected| expected != local.namespace)
+            {
+                return false;
+            }
+            if !arm.source_labels.is_empty() {
+                let Some(labels) = local.labels else {
+                    return false;
+                };
+                if !arm
+                    .source_labels
+                    .iter()
+                    .all(|(key, value)| labels.get(key) == Some(value))
+                {
+                    return false;
+                }
+            }
+            // The selector has been proven against this exact slice's local
+            // workload. Keep every connection-time predicate on the arm so
+            // subnets + gateway (+ SNI on the proxy) retain AND semantics.
+            arm.source_labels.clear();
+            arm.source_namespace = None;
+            true
+        });
+        !criteria.arms.is_empty()
+    });
+}
+
+struct SidecarL4Source<'a> {
+    namespace: &'a str,
+    labels: Option<&'a std::collections::BTreeMap<String, String>>,
+}
+
+fn authoritative_sidecar_l4_source<'a>(
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &'a MeshSlice,
+) -> Option<SidecarL4Source<'a>> {
+    let local_spiffe = runtime.workload_spiffe_id.as_deref()?;
+    if mesh_slice.workload_spiffe_id.as_deref() != Some(local_spiffe) {
+        return None;
+    }
+    let source = mesh_slice
+        .local_inbound_workloads
+        .as_deref()
+        .unwrap_or(mesh_slice.workloads.as_slice());
+    let local_cluster = mesh_slice
+        .multi_cluster
+        .as_ref()
+        .and_then(|multi_cluster| multi_cluster.local_cluster.as_deref());
+    let workloads = crate::modes::mesh::slice::resolve_local_workloads(
+        source,
+        local_spiffe,
+        &mesh_slice.labels,
+        local_cluster,
+    );
+    let first = *workloads.first()?;
+    let namespace = first.namespace.as_str();
+    let identity_namespace =
+        crate::proxy::stream_match::source_namespace_from_spiffe(local_spiffe)?;
+    if identity_namespace != namespace
+        || workloads
+            .iter()
+            .any(|workload| workload.namespace != namespace)
+    {
+        return None;
+    }
+    Some(SidecarL4Source {
+        namespace,
+        labels: (!mesh_slice.labels_ambiguous).then_some(&mesh_slice.labels),
+    })
 }
 
 async fn wait_for_initial_mesh_config(
@@ -2339,6 +2481,8 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         tcp_idle_timeout_seconds: None,
         websocket_idle_timeout_seconds: None,
         allowed_methods: None,
@@ -2523,14 +2667,14 @@ pub(crate) fn matched_local_service_workloads<'a>(
     for workload_ref in &service.workloads {
         let has_matching_service_metadata = workloads.iter().any(|workload| {
             workload.spiffe_id == workload_ref.spiffe_id
-                && workload.namespace == service.namespace
+                && workload.attached_service_namespace() == service.namespace
                 && workload.service_name == service.name
         });
         let Some((workload_index, workload)) =
             workloads.iter().enumerate().find(|(idx, workload)| {
                 !used_workload_indices.contains(idx)
                     && workload.spiffe_id == workload_ref.spiffe_id
-                    && workload.namespace == service.namespace
+                    && workload.attached_service_namespace() == service.namespace
                     && (workload.service_name == service.name || !has_matching_service_metadata)
                     && !crate::modes::mesh::multicluster::workload_is_remote(
                         workload,
@@ -2580,7 +2724,7 @@ fn matched_remote_service_workloads<'a>(
     for workload_ref in &service.workloads {
         let has_matching_service_metadata = workloads.iter().any(|workload| {
             workload.spiffe_id == workload_ref.spiffe_id
-                && workload.namespace == service.namespace
+                && workload.attached_service_namespace() == service.namespace
                 && workload.service_name == service.name
         });
         // Collect EVERY not-yet-used remote workload this ref matches (one ref
@@ -2588,7 +2732,7 @@ fn matched_remote_service_workloads<'a>(
         for (workload_index, workload) in workloads.iter().enumerate() {
             if !used_workload_indices.contains(&workload_index)
                 && workload.spiffe_id == workload_ref.spiffe_id
-                && workload.namespace == service.namespace
+                && workload.attached_service_namespace() == service.namespace
                 && (workload.service_name == service.name || !has_matching_service_metadata)
                 && crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster)
             {
@@ -2850,6 +2994,8 @@ fn east_west_service_proxy(
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         tcp_idle_timeout_seconds: None,
         websocket_idle_timeout_seconds: None,
         allowed_methods: None,
@@ -3809,7 +3955,7 @@ fn materialize_sidecar_inbound_proxies(
         // the Service. The backend targets the workload's own app port.
         for service in inbound_services.iter().filter(|s| {
             s.name == workload.service_name
-                && s.namespace == workload.namespace
+                && s.namespace == workload.attached_service_namespace()
                 // Require the Service to actually back the local workload. Other
                 // mesh resolution paths treat `MeshService.workloads[]` as the
                 // authoritative backing set, so a service whose refs omit this
@@ -4310,6 +4456,8 @@ fn mesh_inbound_loopback_proxy_to(
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
         allowed_methods: None,
@@ -4389,6 +4537,8 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
         allowed_methods: None,
@@ -4474,6 +4624,8 @@ pub(crate) fn mesh_inbound_hbone_relay_proxy(host: &str, port: u16) -> Proxy {
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
         allowed_methods: None,
@@ -5289,6 +5441,8 @@ fn mesh_outbound_tcp_relay_proxy_with_id(
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         // Matches the repo's stream-proxy idle default; long-lived idle DB
         // connections past this are closed by the relay's idle watchdog.
         tcp_idle_timeout_seconds: Some(300),
@@ -6645,6 +6799,8 @@ fn mesh_outbound_route_proxy(
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
         allowed_methods: None,
@@ -8659,6 +8815,8 @@ fn egress_gateway_proxy(
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         tcp_idle_timeout_seconds: None,
         websocket_idle_timeout_seconds: None,
         allowed_methods: None,
@@ -8780,6 +8938,8 @@ fn stream_egress_gateway_proxy(
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         tcp_idle_timeout_seconds: None,
         websocket_idle_timeout_seconds: None,
         allowed_methods: None,
@@ -11090,6 +11250,14 @@ fn start_mesh_admin_listeners(
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
         admin_request_limits: crate::admin::AdminRequestLimits::from_env_config(env_config),
         backend_allow_ips: env_config.backend_allow_ips.clone(),
+        external_ref_policy: std::sync::Arc::new(env_config.admin_spec_external_ref_policy.clone()),
+        external_ref_loader: std::sync::Arc::new(
+            crate::admin::api_specs::DefaultExternalDocumentLoader {
+                egress: env_config.backend_allow_ips.clone(),
+                dns_cache: None,
+                fixtures: std::collections::HashMap::new(),
+            },
+        ),
     };
 
     let mut handles = Vec::new();
@@ -11330,7 +11498,7 @@ fn selectable_inbound_peer_auth_ports(
         );
         for service in services.iter().filter(|service| {
             service.name == workload.service_name
-                && service.namespace == workload.namespace
+                && service.namespace == workload.attached_service_namespace()
                 && service
                     .workloads
                     .iter()
@@ -14505,7 +14673,7 @@ pub mod startup_rollback_test_seams {
     }
 
     fn ensure_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crate::fips::base_crypto_provider().install_default();
     }
 
     fn probe_runtime_config() -> MeshRuntimeConfig {
@@ -14871,7 +15039,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn ensure_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crate::fips::base_crypto_provider().install_default();
     }
 
     /// The SVID slot `load_mesh_frontend_server_identity` resolves the
@@ -15650,6 +15818,7 @@ mod tests {
                 namespace: Some("default".to_string()),
             },
             service_name: name.to_string(),
+            service_namespace: None,
             addresses: Vec::new(),
             ports: vec![WorkloadPort {
                 port: 8080,
@@ -15715,6 +15884,187 @@ mod tests {
             request_auth_require_exp: true,
             locality_lb_strict: false,
         }
+    }
+
+    fn slice_l4_proxy(id: &str, arm: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "namespace": "default",
+            "backend_scheme": "tcp",
+            "backend_host": "db.default.svc.cluster.local",
+            "backend_port": 3306,
+            "listen_port": 3306,
+            "stream_match": {"arms": [arm]}
+        })
+    }
+
+    fn sidecar_l4_slice(labels: BTreeMap<String, String>) -> MeshSlice {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/client";
+        let mut local = workload("client", "billing");
+        local.selector.labels = labels
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            workload_spiffe_id: Some(spiffe.to_string()),
+            labels,
+            version: "test".to_string(),
+            workloads: vec![local],
+            virtual_service_l4_proxies: vec![
+                slice_l4_proxy(
+                    "istio-vs-l4_tcp__default__db__0-0",
+                    serde_json::json!({
+                        "source_labels": {"app": "billing"},
+                        "source_namespace": "default",
+                        "source_subnets": ["10.0.0.0/8"],
+                        "destination_subnets": ["192.168.0.0/16"],
+                        "gateways": ["mesh"]
+                    }),
+                ),
+                slice_l4_proxy(
+                    "istio-vs-l4_tcp__default__db__1-0",
+                    serde_json::json!({"gateways": ["mesh"]}),
+                ),
+            ],
+            ..MeshSlice::default()
+        }
+    }
+
+    #[test]
+    fn sidecar_l4_source_selectors_materialize_from_local_workload_without_peer_spiffe() {
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = sidecar_l4_slice(BTreeMap::from([
+            ("app".to_string(), "billing".to_string()),
+            ("tier".to_string(), "batch".to_string()),
+        ]));
+
+        let prepared = gateway_config_from_mesh_slice(&slice, &runtime, None, None)
+            .expect("sidecar L4 slice prepares");
+        let l4: Vec<_> = prepared
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id.starts_with("istio-vs-l4_"))
+            .collect();
+        assert_eq!(l4.len(), 2);
+        assert_eq!(l4[0].id, "istio-vs-l4_tcp__default__db__0-0");
+        let arm = &l4[0].stream_match.as_ref().unwrap().arms[0];
+        assert!(arm.source_labels.is_empty());
+        assert!(arm.source_namespace.is_none());
+        assert_eq!(arm.source_subnets, vec!["10.0.0.0/8".to_string()]);
+        assert_eq!(arm.destination_subnets, vec!["192.168.0.0/16".to_string()]);
+        assert_eq!(arm.gateways, vec!["mesh".to_string()]);
+        assert!(l4[0].compiled_stream_match.is_some());
+    }
+
+    #[test]
+    fn sidecar_l4_nonmatching_or_ambiguous_local_selectors_fall_through_in_order() {
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let nonmatching =
+            sidecar_l4_slice(BTreeMap::from([("app".to_string(), "other".to_string())]));
+        let prepared = gateway_config_from_mesh_slice(&nonmatching, &runtime, None, None)
+            .expect("nonmatching selector falls through");
+        let l4: Vec<_> = prepared
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id.starts_with("istio-vs-l4_"))
+            .collect();
+        assert_eq!(l4.len(), 1);
+        assert_eq!(l4[0].id, "istio-vs-l4_tcp__default__db__1-0");
+
+        let mut namespace_mismatch =
+            sidecar_l4_slice(BTreeMap::from([("app".to_string(), "billing".to_string())]));
+        namespace_mismatch.virtual_service_l4_proxies[0]["stream_match"]["arms"][0]["source_namespace"] =
+            serde_json::json!("other");
+        let prepared = gateway_config_from_mesh_slice(&namespace_mismatch, &runtime, None, None)
+            .expect("nonmatching namespace falls through");
+        let l4: Vec<_> = prepared
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id.starts_with("istio-vs-l4_"))
+            .collect();
+        assert_eq!(l4.len(), 1);
+        assert_eq!(l4[0].id, "istio-vs-l4_tcp__default__db__1-0");
+
+        let shared = "spiffe://cluster.local/ns/default/sa/client";
+        let mut replica_a = workload("client", "billing");
+        let mut replica_b = workload("client", "other");
+        replica_a.spiffe_id = SpiffeId::new(shared).unwrap();
+        replica_b.spiffe_id = SpiffeId::new(shared).unwrap();
+        let mut ambiguous = sidecar_l4_slice(BTreeMap::new());
+        ambiguous.labels_ambiguous = true;
+        ambiguous.workloads = vec![replica_a, replica_b];
+        let prepared = gateway_config_from_mesh_slice(&ambiguous, &runtime, None, None)
+            .expect("ambiguous replica labels fail closed per arm");
+        let l4: Vec<_> = prepared
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id.starts_with("istio-vs-l4_"))
+            .collect();
+        assert_eq!(l4.len(), 1);
+        assert_eq!(l4[0].id, "istio-vs-l4_tcp__default__db__1-0");
+    }
+
+    #[test]
+    fn sidecar_l4_slice_update_and_delete_withdraw_local_selector_state() {
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let matching =
+            sidecar_l4_slice(BTreeMap::from([("app".to_string(), "billing".to_string())]));
+        let mut updated =
+            sidecar_l4_slice(BTreeMap::from([("app".to_string(), "other".to_string())]));
+        assert!(!matching.content_eq(&updated));
+        let prepared = gateway_config_from_mesh_slice(&updated, &runtime, None, None)
+            .expect("updated selector state prepares");
+        assert!(
+            prepared
+                .proxies
+                .iter()
+                .all(|proxy| proxy.id != "istio-vs-l4_tcp__default__db__0-0")
+        );
+
+        updated.virtual_service_l4_proxies.clear();
+        assert!(!matching.content_eq(&updated));
+        let deleted = gateway_config_from_mesh_slice(&updated, &runtime, None, None)
+            .expect("deleted L4 routes prepare");
+        assert!(
+            deleted
+                .proxies
+                .iter()
+                .all(|proxy| !proxy.id.starts_with("istio-vs-l4_"))
+        );
+    }
+
+    #[test]
+    fn non_sidecar_l4_source_selectors_remain_runtime_evidence_predicates() {
+        let runtime = MeshRuntimeConfig {
+            topology: MeshTopology::NodeWaypoint,
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = sidecar_l4_slice(BTreeMap::from([("app".to_string(), "billing".to_string())]));
+        let prepared = gateway_config_from_mesh_slice(&slice, &runtime, None, None)
+            .expect("NodeWaypoint slice keeps runtime selectors");
+        let first = prepared
+            .proxies
+            .iter()
+            .find(|proxy| proxy.id == "istio-vs-l4_tcp__default__db__0-0")
+            .expect("L4 proxy remains");
+        let arm = &first.stream_match.as_ref().unwrap().arms[0];
+        assert_eq!(
+            arm.source_labels.get("app").map(String::as_str),
+            Some("billing")
+        );
+        assert_eq!(arm.source_namespace.as_deref(), Some("default"));
     }
 
     /// Build a single-HTTP-port service backed by the named workload's SPIFFE id.
@@ -21886,6 +22236,7 @@ mod tests {
             waypoint_name: None,
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             labels_ambiguous: false,
+            virtual_service_l4_proxies: Vec::new(),
             version: "test".to_string(),
             revision: None,
             workloads: Vec::new(),

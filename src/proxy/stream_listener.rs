@@ -259,7 +259,7 @@ impl BackendTlsReloadKey {
 /// listeners whose cached verifier compiled the old revocation list. Cold
 /// path — computed once per reconcile, never per connection.
 fn crl_list_fingerprint(crls: &crate::tls::CrlList) -> Option<String> {
-    use sha2::{Digest, Sha256};
+    use crate::fips::approved::Sha256;
     if crls.is_empty() {
         return None;
     }
@@ -486,6 +486,77 @@ fn merge_bind_failures(base: &mut Vec<StreamBindFailure>, additional: &[StreamBi
     }
 }
 
+/// Proxy fields needed to derive the same runtime listener key that
+/// [`StreamListenerManager::reconcile`] uses in `effective_desired`.
+struct StreamListenerKeyCandidate {
+    identity: NamespacedResourceId,
+    port: u16,
+    scheme: BackendScheme,
+    frontend_tls: bool,
+    passthrough: bool,
+    has_hosts: bool,
+    has_stream_match: bool,
+}
+
+/// Returns `(sni_group_ports, l4_group_ports)` using the same grouping rules
+/// as `reconcile`'s `passthrough_groups` / `l4_match_groups` construction.
+fn stream_listener_group_ports(
+    candidates: &[StreamListenerKeyCandidate],
+) -> (
+    std::collections::HashSet<u16>,
+    std::collections::HashSet<u16>,
+) {
+    let mut passthrough_by_port: std::collections::HashMap<u16, (usize, bool)> =
+        std::collections::HashMap::new();
+    let mut l4_by_port: std::collections::HashMap<u16, (usize, bool)> =
+        std::collections::HashMap::new();
+
+    for candidate in candidates {
+        if candidate.passthrough {
+            let entry = passthrough_by_port.entry(candidate.port).or_default();
+            entry.0 += 1;
+            entry.1 |= candidate.has_hosts;
+        } else if matches!(candidate.scheme, BackendScheme::Tcp | BackendScheme::Tcps) {
+            let entry = l4_by_port.entry(candidate.port).or_default();
+            entry.0 += 1;
+            entry.1 |= candidate.has_stream_match;
+        }
+    }
+
+    let sni_ports: std::collections::HashSet<u16> = passthrough_by_port
+        .into_iter()
+        .filter(|(_, (count, has_hosts))| *count > 1 || *has_hosts)
+        .map(|(port, _)| port)
+        .collect();
+
+    let l4_ports: std::collections::HashSet<u16> = l4_by_port
+        .into_iter()
+        .filter(|(port, (count, has_constrained))| {
+            *count > 1 && *has_constrained && !sni_ports.contains(port)
+        })
+        .map(|(port, _)| port)
+        .collect();
+
+    (sni_ports, l4_ports)
+}
+
+fn stream_listener_runtime_key(
+    candidate: &StreamListenerKeyCandidate,
+    sni_ports: &std::collections::HashSet<u16>,
+    l4_ports: &std::collections::HashSet<u16>,
+) -> String {
+    if candidate.passthrough && sni_ports.contains(&candidate.port) {
+        format!("__sni_{}", candidate.port)
+    } else if !candidate.passthrough
+        && matches!(candidate.scheme, BackendScheme::Tcp | BackendScheme::Tcps)
+        && l4_ports.contains(&candidate.port)
+    {
+        format!("__l4_{}", candidate.port)
+    } else {
+        candidate.identity.runtime_key()
+    }
+}
+
 #[cfg(test)]
 mod bind_failure_snapshot_tests {
     use super::*;
@@ -549,13 +620,20 @@ mod bind_failure_snapshot_tests {
 /// during [`StreamListenerManager::reconcile`] and keyed by its
 /// `(namespace, id)` identity.
 struct DesiredStreamProxy {
+    /// Stable declaration priority captured before the desired-map erases
+    /// `GatewayConfig.proxies` order. Lower values resolve first.
+    declaration_order: usize,
     port: u16,
     scheme: BackendScheme,
     frontend_tls: bool,
     passthrough: bool,
+    stream_proxy_protocol: bool,
     /// Whether the proxy declares `hosts`; a lone passthrough proxy with hosts
     /// still needs SNI resolution so its host predicates are enforced.
     has_hosts: bool,
+    /// Whether the proxy carries compiled L4 stream_match predicates. Shared
+    /// non-passthrough ports with stream_match form an L4 match group.
+    has_stream_match: bool,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
 }
 
@@ -564,9 +642,10 @@ struct DesiredStreamProxy {
 /// `__sni_{port}`).
 struct DesiredStreamListener {
     /// Exact owning identity for this listener's representative proxy. For SNI
-    /// groups this is the first (sorted) candidate; per-connection resolution
-    /// picks the concrete tenant from [`Self::sni_ids`]. Never inferred and
-    /// never defaulted — it is carried from the config entry that produced it.
+    /// groups this is the first semantic-priority candidate; per-connection
+    /// resolution picks the concrete tenant from [`Self::sni_ids`]. Never
+    /// inferred and never defaulted — it is carried from the config entry that
+    /// produced it.
     identity: NamespacedResourceId,
     port: u16,
     scheme: BackendScheme,
@@ -708,6 +787,9 @@ pub struct StreamListenerManager {
     /// — readers short-circuit on the contained `Option::None`.
     mesh_outbound_enforcement:
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    /// Immutable trusted gateway binding parsed during EnvConfig admission.
+    /// Cloned into TCP listener/accept state as an `Arc` pointer only.
+    stream_gateway_ref: Option<Arc<str>>,
     /// Node-waypoint identity resolver shared with `ProxyState`. Present only
     /// in `NodeWaypoint` topology; `None` everywhere else. When set, each
     /// spawned **TCP** stream accept loop resolves the accepted connection's
@@ -869,6 +951,7 @@ impl StreamListenerManager {
             0,
             Arc::new(HealthChecker::new()),
             crate::modes::mesh::outbound_enforcement::empty_slot(),
+            None,
             trusted_proxies,
         )
     }
@@ -908,6 +991,7 @@ impl StreamListenerManager {
         health_checker: Arc<HealthChecker>,
         mesh_outbound_enforcement:
             crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+        stream_gateway_ref: Option<Arc<str>>,
         trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
     ) -> Self {
         Self {
@@ -951,6 +1035,7 @@ impl StreamListenerManager {
             global_shutdown_rx: arc_swap::ArcSwap::new(Arc::new(None)),
             backend_tls_reload_epoch: Arc::new(AtomicU64::new(0)),
             mesh_outbound_enforcement,
+            stream_gateway_ref,
             node_waypoint_identity_resolver: arc_swap::ArcSwap::new(Arc::new(None)),
             trusted_proxies,
         }
@@ -1196,8 +1281,9 @@ impl StreamListenerManager {
             current_config
                 .proxies
                 .iter()
-                .filter(|p| p.dispatch_kind.is_stream())
-                .filter_map(|p| {
+                .enumerate()
+                .filter(|(_, p)| p.dispatch_kind.is_stream())
+                .filter_map(|(declaration_order, p)| {
                     p.listen_port.map(|port| {
                         // Passthrough proxies relay raw bytes and never build the
                         // cached backend TLS config, so they carry no reload key:
@@ -1218,17 +1304,38 @@ impl StreamListenerManager {
                         (
                             NamespacedResourceId::new(p.namespace.clone(), p.id.clone()),
                             DesiredStreamProxy {
+                                declaration_order,
                                 port,
                                 scheme: p.effective_scheme(),
                                 frontend_tls: p.frontend_tls,
                                 passthrough: p.passthrough,
+                                stream_proxy_protocol: p.stream_proxy_protocol.unwrap_or(false),
                                 has_hosts: !p.hosts.is_empty(),
+                                has_stream_match: p
+                                    .stream_match
+                                    .as_ref()
+                                    .is_some_and(|m| !m.is_empty()),
                                 backend_tls_reload_key,
                             },
                         )
                     })
                 })
                 .collect();
+        let listener_candidates_compatible = |ids: &[NamespacedResourceId]| {
+            let Some(first) = ids.first().and_then(|id| desired.get(id)) else {
+                return false;
+            };
+            ids.iter().all(|id| {
+                desired.get(id).is_some_and(|entry| {
+                    entry.scheme == first.scheme
+                        && entry.frontend_tls == first.frontend_tls
+                        && entry.stream_proxy_protocol == first.stream_proxy_protocol
+                        && entry.backend_tls_reload_key == first.backend_tls_reload_key
+                })
+            })
+        };
+        let mut incompatible_shared_ids: std::collections::HashSet<NamespacedResourceId> =
+            std::collections::HashSet::new();
 
         // Detect passthrough port groups that must be resolved by SNI.
         // Multiple passthrough proxies sharing a port need one shared listener keyed by
@@ -1250,21 +1357,101 @@ impl StreamListenerManager {
                     .push(identity.clone());
             }
         }
+        for ids in passthrough_groups.values() {
+            if ids.len() > 1 && !listener_candidates_compatible(ids) {
+                incompatible_shared_ids.extend(ids.iter().cloned());
+            }
+        }
         passthrough_groups.retain(|_, ids| {
-            ids.len() > 1
-                || ids
-                    .iter()
-                    .any(|id| desired.get(id).is_some_and(|entry| entry.has_hosts))
+            listener_candidates_compatible(ids)
+                && (ids.len() > 1
+                    || ids
+                        .iter()
+                        .any(|id| desired.get(id).is_some_and(|entry| entry.has_hosts)))
         });
-        // Sort identities for stable comparison on reconcile.
+        // Preserve config/translator declaration order for semantic
+        // first-match-wins resolution. Identity is only a deterministic tie
+        // breaker for synthetic/hand-authored inputs that somehow share a
+        // declaration priority.
         for ids in passthrough_groups.values_mut() {
-            ids.sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
+            ids.sort_by(|a, b| {
+                let a_entry = desired.get(a);
+                let b_entry = desired.get(b);
+                a_entry
+                    .map(|entry| entry.declaration_order)
+                    .cmp(&b_entry.map(|entry| entry.declaration_order))
+                    .then_with(|| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)))
+            });
         }
 
-        // Build the effective desired map: individual proxies + SNI group entries.
-        // Proxies in a group are replaced by a single "__sni_{port}" entry.
+        // Non-passthrough TCP L4 match groups: every compatible proxy on a port
+        // participates once at least one candidate is constrained. This keeps
+        // the single validated catch-all inside the shared listener instead of
+        // letting it collide with the constrained listener at bind time.
+        let mut l4_match_groups: std::collections::HashMap<u16, Vec<NamespacedResourceId>> =
+            std::collections::HashMap::new();
+        for (identity, entry) in &desired {
+            if !entry.passthrough
+                && matches!(entry.scheme, BackendScheme::Tcp | BackendScheme::Tcps)
+            {
+                l4_match_groups
+                    .entry(entry.port)
+                    .or_default()
+                    .push(identity.clone());
+            }
+        }
+        for ids in l4_match_groups.values() {
+            let has_constrained = ids
+                .iter()
+                .any(|id| desired.get(id).is_some_and(|entry| entry.has_stream_match));
+            if ids.len() > 1 && has_constrained && !listener_candidates_compatible(ids) {
+                incompatible_shared_ids.extend(ids.iter().cloned());
+            }
+        }
+        l4_match_groups.retain(|port, ids| {
+            ids.len() > 1
+                && ids
+                    .iter()
+                    .any(|id| desired.get(id).is_some_and(|entry| entry.has_stream_match))
+                && listener_candidates_compatible(ids)
+                && !passthrough_groups.contains_key(port)
+        });
+        for ids in l4_match_groups.values_mut() {
+            ids.sort_by(|a, b| {
+                let a_entry = desired.get(a);
+                let b_entry = desired.get(b);
+                // VirtualService tcp[] rules are evaluated in declaration
+                // order. An unconstrained rule is normally authored last, but
+                // if it is authored first it intentionally shadows later
+                // rules; silently moving it behind constrained candidates
+                // changes Istio's first-match semantics.
+                a_entry
+                    .map(|entry| entry.declaration_order)
+                    .cmp(&b_entry.map(|entry| entry.declaration_order))
+                    .then_with(|| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)))
+            });
+        }
+
+        // Build the effective desired map: individual proxies + SNI/L4 group entries.
+        // Proxies in a group are replaced by a single shared-port entry.
         let grouped_proxy_ids: std::collections::HashSet<&NamespacedResourceId> =
-            passthrough_groups.values().flatten().collect();
+            passthrough_groups
+                .values()
+                .chain(l4_match_groups.values())
+                .flatten()
+                .chain(incompatible_shared_ids.iter())
+                .collect();
+
+        for identity in &incompatible_shared_ids {
+            if let Some(entry) = desired.get(identity) {
+                degraded.push(StreamBindFailure::new(
+                    identity,
+                    entry.port,
+                    "Shared stream listener candidates disagree on pre-routing listener behavior; refusing the entire port",
+                    StreamListenerDegradation::BindFailed,
+                ));
+            }
+        }
 
         let mut effective_desired: std::collections::HashMap<String, DesiredStreamListener> =
             std::collections::HashMap::new();
@@ -1288,19 +1475,44 @@ impl StreamListenerManager {
         }
         for (port, ids) in &passthrough_groups {
             let key = format!("__sni_{}", port);
-            // Use the first proxy's scheme for the listener. `ids[0]` is also the
-            // listener's *representative* identity: the accept path re-resolves
-            // the concrete tenant per connection from `sni_ids`.
-            if let Some(entry) = desired.get(&ids[0]) {
+            // Use the first semantic-priority candidate as the listener's
+            // representative; the accept path re-resolves the concrete tenant
+            // per connection from `sni_ids`.
+            let Some(representative) = ids.first() else {
+                continue;
+            };
+            if let Some(entry) = desired.get(representative) {
                 effective_desired.insert(
                     key,
                     DesiredStreamListener {
-                        identity: ids[0].clone(),
+                        identity: representative.clone(),
                         port: entry.port,
                         scheme: entry.scheme,
                         frontend_tls: entry.frontend_tls,
                         passthrough: entry.passthrough,
                         backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
+                        sni_ids: Some(ids.clone()),
+                    },
+                );
+            }
+        }
+        for (port, ids) in &l4_match_groups {
+            let key = format!("__l4_{}", port);
+            let Some(representative) = ids.first() else {
+                continue;
+            };
+            if let Some(entry) = desired.get(representative) {
+                effective_desired.insert(
+                    key,
+                    DesiredStreamListener {
+                        identity: representative.clone(),
+                        port: entry.port,
+                        scheme: entry.scheme,
+                        frontend_tls: entry.frontend_tls,
+                        passthrough: false,
+                        backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
+                        // Reuse the candidate-id channel; tcp_proxy distinguishes
+                        // L4 match groups from SNI groups via passthrough=false.
                         sni_ids: Some(ids.clone()),
                     },
                 );
@@ -1377,8 +1589,8 @@ impl StreamListenerManager {
                 // SNI-group membership change on a shared passthrough
                 // port: the running listener captured the old candidate
                 // ID list at spawn, so it must be restarted. IDs are
-                // sorted at group construction, making this a stable
-                // comparison.
+                // semantically ordered at group construction, making this a
+                // stable comparison that preserves declaration priority.
                 || handle.sni_ids != *sni_ids;
             let backend_tls_changed = handle.backend_tls_reload_key != *backend_tls_reload_key;
 
@@ -1802,6 +2014,7 @@ impl StreamListenerManager {
                 let record_mesh_mtls_metric = self.record_mesh_mtls_metric;
                 let global_shutdown_for_listener = global_shutdown.clone();
                 let mesh_outbound_enforcement = self.mesh_outbound_enforcement.clone();
+                let stream_gateway_ref = self.stream_gateway_ref.clone();
                 // Snapshot the node-waypoint resolver slot once per listener
                 // spawn. `None` outside NodeWaypoint topology; when present the
                 // accept loop resolves each connection's source pod identity to
@@ -1853,6 +2066,7 @@ impl StreamListenerManager {
                         io_uring_splice_enabled,
                         record_mesh_mtls_metric,
                         mesh_outbound_enforcement,
+                        stream_gateway_ref,
                         node_waypoint_identity_resolver,
                         trusted_proxies,
                     })
@@ -2068,65 +2282,40 @@ impl StreamListenerManager {
 
         loop {
             let current_config = self.config.load();
-            let desired: Vec<(NamespacedResourceId, u16, BackendScheme, bool, bool, bool)> =
-                current_config
-                    .proxies
-                    .iter()
-                    .filter(|p| p.dispatch_kind.is_stream())
-                    .filter_map(|p| {
-                        p.listen_port.map(|port| {
-                            (
-                                NamespacedResourceId::new(p.namespace.clone(), p.id.clone()),
-                                port,
-                                p.effective_scheme(),
-                                p.frontend_tls,
-                                p.passthrough,
-                                !p.hosts.is_empty(),
-                            )
-                        })
+            let candidates: Vec<StreamListenerKeyCandidate> = current_config
+                .proxies
+                .iter()
+                .filter(|p| p.dispatch_kind.is_stream())
+                .filter_map(|p| {
+                    p.listen_port.map(|port| StreamListenerKeyCandidate {
+                        identity: NamespacedResourceId::new(p.namespace.clone(), p.id.clone()),
+                        port,
+                        scheme: p.effective_scheme(),
+                        frontend_tls: p.frontend_tls,
+                        passthrough: p.passthrough,
+                        has_hosts: !p.hosts.is_empty(),
+                        has_stream_match: p.stream_match.as_ref().is_some_and(|m| !m.is_empty()),
                     })
-                    .collect();
+                })
+                .collect();
 
-            if desired.is_empty() {
+            if candidates.is_empty() {
                 return Ok(());
             }
 
-            // Detect SNI port groups to map proxy_ids to their listener key.
-            let mut pt_ports: std::collections::HashMap<u16, (usize, bool)> =
-                std::collections::HashMap::new();
-            for (_, port, _, _, passthrough, has_hosts) in &desired {
-                if *passthrough {
-                    let entry = pt_ports.entry(*port).or_default();
-                    entry.0 += 1;
-                    entry.1 |= *has_hosts;
-                }
-            }
+            let (sni_ports, l4_ports) = stream_listener_group_ports(&candidates);
 
             let all_started = {
                 let listeners = self.listeners.lock().await;
-                desired
-                    .iter()
-                    .all(|(identity, port, scheme, frontend_tls, passthrough, _)| {
-                        // For SNI groups the listener key is "__sni_{port}";
-                        // individual listeners are keyed by the namespace-
-                        // qualified `namespace|id` runtime key, matching
-                        // `reconcile`'s `effective_desired`.
-                        let key = if *passthrough
-                            && pt_ports
-                                .get(port)
-                                .is_some_and(|(count, has_hosts)| *count > 1 || *has_hosts)
-                        {
-                            format!("__sni_{}", port)
-                        } else {
-                            identity.runtime_key()
-                        };
-                        listeners.get(&key).is_some_and(|handle| {
-                            handle.listen_port == *port
-                                && handle.scheme == *scheme
-                                && handle.frontend_tls == *frontend_tls
-                                && handle.started.load(Ordering::Acquire)
-                        })
+                candidates.iter().all(|candidate| {
+                    let key = stream_listener_runtime_key(candidate, &sni_ports, &l4_ports);
+                    listeners.get(&key).is_some_and(|handle| {
+                        handle.listen_port == candidate.port
+                            && handle.scheme == candidate.scheme
+                            && handle.frontend_tls == candidate.frontend_tls
+                            && handle.started.load(Ordering::Acquire)
                     })
+                })
             };
 
             if all_started {

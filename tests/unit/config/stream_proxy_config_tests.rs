@@ -2,9 +2,13 @@
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    ActiveHealthCheck, AuthMode, BackendScheme, DispatchKind, GatewayConfig, HealthProbeType,
-    MAX_TCP_IDLE_TIMEOUT, Proxy,
+    ActiveHealthCheck, AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig,
+    HealthProbeType, MAX_TCP_IDLE_TIMEOUT, Proxy,
 };
+use ferrum_edge::proxy::stream_match::{
+    MAX_STREAM_MATCH_ARMS, StreamMatchArm, StreamMatchCriteria,
+};
+use std::collections::BTreeMap;
 
 fn make_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
     Proxy {
@@ -66,6 +70,8 @@ fn make_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -131,6 +137,8 @@ fn make_http_proxy(id: &str, listen_path: &str) -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -147,6 +155,15 @@ fn test_config(proxies: Vec<Proxy>) -> GatewayConfig {
         known_namespaces: Vec::new(),
         ..Default::default()
     }
+}
+
+fn add_stream_match(proxy: &mut Proxy) {
+    proxy.stream_match = Some(StreamMatchCriteria {
+        arms: vec![StreamMatchArm {
+            source_subnets: vec!["10.0.0.0/8".to_string()],
+            ..Default::default()
+        }],
+    });
 }
 
 // --- BackendScheme helper method tests ---
@@ -240,6 +257,133 @@ fn test_validate_stream_proxy_duplicate_port() {
     let err = config.validate_stream_proxies().unwrap_err();
     assert_eq!(err.len(), 1);
     assert!(err[0].contains("Duplicate listen_port"));
+}
+
+#[test]
+fn test_shared_l4_listener_rejects_incompatible_listener_behavior() {
+    let mut matched = make_stream_proxy("matched", BackendScheme::Tcp, 5432);
+    add_stream_match(&mut matched);
+    let mut different_scheme = make_stream_proxy("different-scheme", BackendScheme::Tcps, 5432);
+    let errors = test_config(vec![matched.clone(), different_scheme.clone()])
+        .validate_stream_proxies()
+        .unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("mixes backend schemes"))
+    );
+
+    different_scheme = make_stream_proxy("different-frontend", BackendScheme::Tcp, 5432);
+    different_scheme.frontend_tls = true;
+    let errors = test_config(vec![matched, different_scheme])
+        .validate_stream_proxies()
+        .unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("mixes frontend_tls"))
+    );
+
+    let mut tls_matched = make_stream_proxy("tls-matched", BackendScheme::Tcps, 5432);
+    add_stream_match(&mut tls_matched);
+    tls_matched.resolved_tls = BackendTlsConfig::default_verify();
+    let mut different_tls = make_stream_proxy("different-tls", BackendScheme::Tcps, 5432);
+    different_tls.resolved_tls = BackendTlsConfig::default_verify();
+    different_tls.resolved_tls.server_ca_cert_path = Some("/different/ca.pem".to_string());
+    let errors = test_config(vec![tls_matched, different_tls])
+        .validate_stream_proxies()
+        .unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("mixes backend TLS listener settings"))
+    );
+}
+
+#[test]
+fn test_stream_match_is_rejected_for_unimplemented_datagram_path() {
+    for scheme in [BackendScheme::Udp, BackendScheme::Dtls] {
+        let mut proxy = make_stream_proxy("datagram-match", scheme, 5353);
+        add_stream_match(&mut proxy);
+        let errors = proxy.validate_fields().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("only valid for tcp/tcps")),
+            "{scheme} must not silently ignore stream_match: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn test_direct_stream_match_rejects_invalid_kubernetes_identity_fields() {
+    let invalid_arms = [
+        StreamMatchArm {
+            source_labels: BTreeMap::from([("bad key".to_string(), "ok".to_string())]),
+            ..Default::default()
+        },
+        StreamMatchArm {
+            source_labels: BTreeMap::from([("app".to_string(), "bad/value".to_string())]),
+            ..Default::default()
+        },
+        StreamMatchArm {
+            source_namespace: Some("Team_A".to_string()),
+            ..Default::default()
+        },
+        StreamMatchArm {
+            gateways: vec!["ingress".to_string()],
+            ..Default::default()
+        },
+        StreamMatchArm {
+            gateways: vec!["team-a/Bad_Name".to_string()],
+            ..Default::default()
+        },
+        StreamMatchArm {
+            source_subnets: vec!["10.0.0.0/999".to_string()],
+            ..Default::default()
+        },
+    ];
+
+    for arm in invalid_arms {
+        let mut proxy = make_stream_proxy("invalid-direct-match", BackendScheme::Tcp, 5432);
+        proxy.stream_match = Some(StreamMatchCriteria { arms: vec![arm] });
+        let errors = proxy.validate_fields().unwrap_err();
+        assert!(
+            errors.iter().any(|error| error.contains("stream_match")),
+            "direct config must reject invalid matcher fields: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn test_direct_stream_match_accepts_empty_kubernetes_label_value() {
+    let mut proxy = make_stream_proxy("empty-label-value", BackendScheme::Tcp, 5432);
+    proxy.stream_match = Some(StreamMatchCriteria {
+        arms: vec![StreamMatchArm {
+            source_labels: BTreeMap::from([("app.kubernetes.io/name".to_string(), String::new())]),
+            ..Default::default()
+        }],
+    });
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_direct_stream_match_enforces_public_arm_bound() {
+    let mut proxy = make_stream_proxy("too-many-arms", BackendScheme::Tcp, 5432);
+    proxy.stream_match = Some(StreamMatchCriteria {
+        arms: (0..=MAX_STREAM_MATCH_ARMS)
+            .map(|_| StreamMatchArm {
+                gateways: vec!["mesh".to_string()],
+                ..Default::default()
+            })
+            .collect(),
+    });
+    let errors = proxy.validate_fields().unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("at most") && error.contains("arms"))
+    );
 }
 
 #[test]
@@ -624,6 +768,26 @@ fn test_passthrough_port_sharing_allowed() {
 }
 
 #[test]
+fn test_passthrough_shared_listener_rejects_mixed_scheme() {
+    let mut plain = make_stream_proxy("pt-plain", BackendScheme::Tcp, 8444);
+    plain.passthrough = true;
+    plain.hosts = vec!["a.example.com".to_string()];
+
+    let mut tls_scheme = make_stream_proxy("pt-tcps", BackendScheme::Tcps, 8444);
+    tls_scheme.passthrough = true;
+    tls_scheme.hosts = vec!["b.example.com".to_string()];
+
+    let errors = test_config(vec![plain, tls_scheme])
+        .validate_stream_proxies()
+        .unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("mixes backend schemes"))
+    );
+}
+
+#[test]
 fn test_passthrough_port_sharing_with_catchall() {
     let mut p1 = make_stream_proxy("pt-specific", BackendScheme::Tcp, 8444);
     p1.passthrough = true;
@@ -676,6 +840,22 @@ fn test_passthrough_port_sharing_overlapping_hosts_rejected() {
     assert!(result.is_err());
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.contains("overlapping hosts")));
+}
+
+#[test]
+fn test_passthrough_overlapping_hosts_with_l4_match_preserve_order() {
+    let mut first = make_stream_proxy("pt-first", BackendScheme::Tcp, 8444);
+    first.passthrough = true;
+    first.hosts = vec!["*.example.com".to_string()];
+    add_stream_match(&mut first);
+
+    let mut second = make_stream_proxy("pt-second", BackendScheme::Tcp, 8444);
+    second.passthrough = true;
+    second.hosts = vec!["secure.example.com".to_string()];
+    add_stream_match(&mut second);
+
+    let config = test_config(vec![first, second]);
+    assert!(config.validate_stream_proxies().is_ok());
 }
 
 #[test]

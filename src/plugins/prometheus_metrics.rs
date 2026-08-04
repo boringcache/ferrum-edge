@@ -2048,6 +2048,169 @@ impl MetricsRegistry {
             render_process_counter(&mut output, name, value, &ns_label);
         }
 
+        // Admin audit delivery pipeline (issue #2421). Process-wide counters
+        // and bounded-backlog gauges so an operator can reconcile committed
+        // mutations against durable audit rows. Values only — no actor subject,
+        // token, diff, resource id, or spool path ever reaches the exposition,
+        // and the single `reason` label comes from a closed `&'static str` set.
+        let audit_pipeline = crate::admin::audit::pipeline_metrics_snapshot();
+        for (name, help, value) in [
+            (
+                "ferrum_admin_audit_events_accepted_total",
+                "Admin audit events accepted from a committed admin mutation.",
+                audit_pipeline.accepted_total,
+            ),
+            (
+                "ferrum_admin_audit_intents_prepared_total",
+                "Pre-mutation admin audit intents made durable (fsynced) before the configuration mutation was invoked.",
+                audit_pipeline.prepared_total,
+            ),
+            (
+                "ferrum_admin_audit_events_finalized_total",
+                "Admin audit intents durably finalized with the mutation's known outcome.",
+                audit_pipeline.finalized_total,
+            ),
+            (
+                "ferrum_admin_audit_unknown_outcome_total",
+                "Prepared admin audit records whose trustworthy outcome observer was lost to process exit or request cancellation.",
+                audit_pipeline.unknown_outcome_total,
+            ),
+            (
+                "ferrum_admin_audit_events_enqueued_total",
+                "Admin audit events admitted to the bounded in-memory delivery queue.",
+                audit_pipeline.enqueued_total,
+            ),
+            (
+                "ferrum_admin_audit_events_delivered_total",
+                "Admin audit events accepted by the configured database backend.",
+                audit_pipeline.delivered_total,
+            ),
+            (
+                "ferrum_admin_audit_events_replayed_total",
+                "Durable admin audit records re-read from the spool for delivery (restart, queue overflow, or an expired shutdown drain).",
+                audit_pipeline.replayed_total,
+            ),
+            (
+                "ferrum_admin_audit_delivery_retries_total",
+                "Bounded-backoff retries scheduled after a transient admin audit delivery failure.",
+                audit_pipeline.retries_total,
+            ),
+            (
+                "ferrum_admin_audit_delivery_failures_total",
+                "Admin audit delivery attempts that returned an error from the database backend.",
+                audit_pipeline.delivery_failures_total,
+            ),
+            (
+                "ferrum_admin_audit_events_retained_total",
+                "Admin audit events that exhausted the delivery-attempt budget and were retained for operator remediation.",
+                audit_pipeline.retained_total,
+            ),
+            (
+                "ferrum_admin_audit_corrupt_records_total",
+                "Durable admin audit records quarantined as corrupt (bad version, unparseable, oversized, or id mismatch).",
+                audit_pipeline.corrupt_records_total,
+            ),
+            (
+                "ferrum_admin_audit_destination_mismatch_total",
+                "Durable admin audit records quarantined because they target a different database or namespace destination.",
+                audit_pipeline.destination_mismatch_total,
+            ),
+            (
+                "ferrum_admin_audit_truncated_diffs_total",
+                "Admin audit events whose diff was replaced by a redacted marker because it exceeded the durable record ceiling.",
+                audit_pipeline.truncated_diffs_total,
+            ),
+            (
+                "ferrum_admin_audit_fail_closed_rejections_total",
+                "Admin mutations refused up front because the audit pipeline is unavailable under the fail_closed policy.",
+                audit_pipeline.fail_closed_rejections_total,
+            ),
+            (
+                "ferrum_admin_audit_fail_open_unaudited_mutations_total",
+                "Admin mutations allowed to proceed without durable pre-mutation audit evidence under the fail_open policy.",
+                audit_pipeline.fail_open_unaudited_mutations_total,
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            render_process_counter(&mut output, name, value, &ns_label);
+        }
+        output.push_str(
+            "# HELP ferrum_admin_audit_events_dropped_total Admin audit events lost without a durable record, by reason.\n",
+        );
+        output.push_str("# TYPE ferrum_admin_audit_events_dropped_total counter\n");
+        // Emit every reason bucket even at zero so dashboards can pin them.
+        for (reason, value) in [
+            (
+                "durable_handoff_failed",
+                audit_pipeline.dropped_durable_handoff_failed_total,
+            ),
+            (
+                "no_durable_spool",
+                audit_pipeline.dropped_no_durable_spool_total,
+            ),
+            (
+                "retained_capacity",
+                audit_pipeline.dropped_retained_capacity_total,
+            ),
+        ] {
+            output.push_str(&format!(
+                "ferrum_admin_audit_events_dropped_total{{reason=\"{reason}\"{ns_label}}} {value}\n"
+            ));
+        }
+        let audit_status = crate::admin::audit::pipeline_status();
+        for (name, help, value) in [
+            (
+                "ferrum_admin_audit_queue_depth",
+                "Admin audit events currently waiting in the bounded in-memory delivery queue.",
+                audit_pipeline.queue_depth as i64,
+            ),
+            (
+                "ferrum_admin_audit_queue_capacity",
+                "Configured depth of the bounded in-memory admin audit delivery queue.",
+                audit_status.queue_capacity as i64,
+            ),
+            (
+                "ferrum_admin_audit_delivery_in_flight",
+                "Admin audit delivery attempts currently in flight.",
+                audit_pipeline.delivery_in_flight as i64,
+            ),
+            (
+                "ferrum_admin_audit_spool_prepared_records",
+                "Durable pre-mutation admin audit intents awaiting finalization.",
+                audit_pipeline.spool_prepared_records as i64,
+            ),
+            (
+                "ferrum_admin_audit_spool_pending_records",
+                "Durable admin audit records awaiting delivery (O(1) admission counter; a saturated background scan reports a floor).",
+                audit_pipeline.spool_pending_records as i64,
+            ),
+            (
+                "ferrum_admin_audit_retained_records",
+                "Durable admin audit records retained as unrecoverable for operator remediation.",
+                audit_pipeline.spool_retained_records as i64,
+            ),
+            (
+                "ferrum_admin_audit_available",
+                "Whether the admin audit pipeline can durably record committed mutations (1) or not (0).",
+                i64::from(audit_status.available),
+            ),
+            (
+                "ferrum_admin_audit_degraded",
+                "Sticky evidence that admin audit records were corrupted, retained as unrecoverable, or permanently discarded (1) or not (0). A later successful delivery does not clear it.",
+                i64::from(audit_status.degraded),
+            ),
+            (
+                "ferrum_admin_audit_evidence_lost",
+                "Whether admin audit evidence has been permanently discarded (1) or not (0). Never clears.",
+                i64::from(audit_status.evidence_lost),
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} gauge\n"));
+            render_process_gauge(&mut output, name, value, &ns_label);
+        }
+
         output.push_str(
             "# HELP ferrum_ai_federation_circuits_open Current ai_federation provider circuits in open or half-open recovery state.\n",
         );
@@ -2867,6 +3030,32 @@ impl MetricsRegistry {
                         ns_label,
                         value,
                     ));
+                }
+            }
+
+            output.push_str(
+                "# HELP ferrum_node_agent_cni_calls_total Node-agent CNI plugin RPC outcomes by verb.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_cni_calls_total counter\n");
+            for verb in crate::ebpf::CniCallVerb::all() {
+                for outcome in crate::ebpf::CniCallOutcome::all() {
+                    let value = snapshot.cni_calls[verb as usize][outcome as usize];
+                    if ns_label.is_empty() {
+                        output.push_str(&format!(
+                            "ferrum_node_agent_cni_calls_total{{verb=\"{}\",outcome=\"{}\"}} {}\n",
+                            verb.label(),
+                            outcome.label(),
+                            value,
+                        ));
+                    } else {
+                        output.push_str(&format!(
+                            "ferrum_node_agent_cni_calls_total{{verb=\"{}\",outcome=\"{}\"{}}} {}\n",
+                            verb.label(),
+                            outcome.label(),
+                            ns_label,
+                            value,
+                        ));
+                    }
                 }
             }
 

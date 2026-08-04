@@ -66,13 +66,13 @@ cat ferrum-backup.json | jq '.counts'
   "plugin_configs": [ ... ],
   "upstreams": [ ... ],
   "api_specs": {
-    "section_version": "1",
+    "section_version": "2",
     "items": [ ... ]
   }
 }
 ```
 
-The `api_specs` field is a **versioned section** (`section_version`) carrying raw gzip-compressed documents as `spec_content_base64` plus the ownership/generated-resource metadata needed to reproduce managed relationships (`proxy_id`, `resource_hash`, timestamps, and companion `api_spec_id` tags on restored proxies/upstreams/plugin configs). `resource_hash` is either empty for legacy records or exactly 64 lowercase hexadecimal characters. Database-backed exports always include the section (possibly with an empty `items` array).
+The `api_specs` field is a **versioned section** (`section_version`) carrying raw gzip-compressed documents as `spec_content_base64` plus the ownership/generated-resource metadata needed to reproduce managed relationships (`proxy_id`, `resource_hash`, timestamps, and companion `api_spec_id` tags on restored proxies/upstreams/plugin configs). `resource_hash` is either empty for legacy records or exactly 64 lowercase hexadecimal characters. Section version `"2"` may also carry optional `external_ref_snapshot_base64` / `external_ref_digest` for specs admitted with external `$ref` resolution; the two fields must be present together, stay within the fixed 64 MiB compressed / 128 MiB decompressed caps, and match the snapshot's recomputed document and aggregate digests. Restore still accepts version `"1"` (no snapshot fields). Database-backed exports always include the section (possibly with an empty `items` array).
 
 An export that cannot carry spec documents also clears the `api_spec_id` tags on the resources it does export, so the payload never references specs it does not contain (restore rejects that shape). Two cases:
 
@@ -140,7 +140,7 @@ Accepts the same JSON format produced by `GET /backup`. All resource arrays are 
   "plugin_configs": [ ... ],
   "upstreams": [ ... ],
   "api_specs": {
-    "section_version": "1",
+    "section_version": "2",
     "items": [ ... ]
   }
 }

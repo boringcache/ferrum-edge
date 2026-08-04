@@ -189,7 +189,8 @@ paths:
 
         **Unauthenticated** callers receive only `status` and `ready` (suitable
         for readiness probes). The **detailed** diagnostics — `mode`, `database`
-        connectivity/pool stats, `cached_config` proxy/consumer counts,
+        connectivity/pool stats, `fips` deployment-mode metadata,
+        `cached_config` proxy/consumer counts,
         `database_polling` degradation, `config_rejected`, mesh state,
         `logging`, `kafka_logging`, and `ai_transcript_audit` admitted capture
         ceilings — are
@@ -407,6 +408,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/acme/certificates/{id}:
     get:
@@ -461,6 +464,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       operationId: deleteAcmeCertificate
       summary: Delete an unreferenced ACME-issued TLS certificate
@@ -480,6 +485,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/acme/orders:
     get:
@@ -554,6 +561,8 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/acme/accounts:
     get:
@@ -632,6 +641,8 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/acme/orders/{id}:
     get:
@@ -672,6 +683,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/acme/orders/{id}/finalize:
     post:
@@ -733,6 +746,8 @@ paths:
           $ref: "#/components/responses/NotImplemented"
         "502":
           $ref: "#/components/responses/BadGateway"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/certificates:
     get:
@@ -791,6 +806,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/certificates/{id}:
     get:
@@ -855,6 +872,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       operationId: deleteManagedTlsCertificate
       summary: Delete an unreferenced admin-managed TLS certificate
@@ -876,6 +895,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/ca-bundles:
     get:
@@ -933,6 +954,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/ca-bundles/{id}:
     get:
@@ -995,6 +1018,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       operationId: deleteManagedTlsCaBundle
       summary: Delete an unreferenced admin-managed TLS CA bundle
@@ -1016,6 +1041,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/crls:
     get:
@@ -1073,6 +1100,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/crls/{id}:
     get:
@@ -1133,6 +1162,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       operationId: deleteManagedTlsCrl
       summary: Delete an unreferenced admin-managed TLS CRL bundle
@@ -1154,6 +1185,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/ocsp-responses:
     get:
@@ -1211,6 +1244,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/ocsp-responses/{id}:
     get:
@@ -1271,6 +1306,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       operationId: deleteManagedTlsOcspResponse
       summary: Delete an unreferenced admin-managed OCSP response
@@ -1292,6 +1329,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/jwks:
     get:
@@ -1349,6 +1388,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/jwks/{id}:
     get:
@@ -1409,6 +1450,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       operationId: deleteManagedTlsJwks
       summary: Delete an unreferenced admin-managed JWKS document
@@ -1430,6 +1473,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/rotate/{surface}:
     post:
@@ -1439,7 +1484,9 @@ paths:
         Enqueues an immediate source poll for an active TLS source watcher.
         This is an operational reload rather than a persisted configuration
         mutation, so it is available in read-only file, DP, and mesh modes with
-        an operator or admin JWT.
+        an operator or admin JWT. When ordinary admin mutation auditing is
+        enabled, its audit intent is durably admitted before the reload request;
+        a fail-closed audit outage returns `503` without requesting the reload.
         Supported surfaces are `proxy_https`, `backend_tls`, `admin_https`,
         `dtls`, `database_tls`, `cp_grpc`, `dp_grpc`, `svid`, and `all`. Aliases
         `frontend`, `backend`, `admin`, `frontend_dtls`, `db`, `database`,
@@ -1500,6 +1547,8 @@ paths:
                     type: array
                     items:
                       type: string
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/validate:
     post:
@@ -5342,7 +5391,19 @@ paths:
           auto-generate a proxy-scoped `openapi_validator` plugin from the
           document's request/response schemas and media types. Local `$ref`s are resolved
           into plugin config; external `$ref`s are rejected with
-          `UnsupportedExternalRef`.
+          `UnsupportedExternalRef` unless both the process gate
+          (`FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED`) and the per-spec
+          `x-ferrum-external-refs` extension opt in. Absent process policy
+          still yields `UnsupportedExternalRef` (fail-closed).
+        - **`x-ferrum-external-refs`** (optional) — `true` or an object
+          (`enabled`, optional `document_base`, optional `allowed_origins`)
+          to opt this document into external / cross-document `$ref`
+          resolution when the process gate is also enabled. Admitted
+          external documents are snapshotted at import (`external_ref_digest`
+          / stored snapshot bytes); runtime validation never re-fetches. A
+          present external response Content-Type must be valid UTF-8 and on
+          the documented OpenAPI media allowlist; only an absent header uses
+          bounded JSON/YAML format detection.
 
         **Forbidden**: `x-ferrum-consumers` is rejected — use `POST /consumers`
         separately. Plugin `config` values must not contain credential or
@@ -6093,7 +6154,13 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     ServiceUnavailable:
-      description: Database unavailable and no cached config
+      description: >-
+        The admin write gate refused the mutation. Either the configured
+        database is unavailable with no cached config, or — with
+        `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` — the audit pipeline
+        could not durably record the pre-mutation intent, in which case the body
+        carries a closed-set `audit_unavailable_reason`. The mutation was not
+        performed.
       content:
         application/json:
           schema:
@@ -6136,6 +6203,27 @@ components:
         error:
           type: [string, "null"]
           description: Human-readable error message
+        audit_unavailable_reason:
+          type: string
+          description: |
+            Present only on the `503` returned by the admin write gate when
+            `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` and the audit
+            pipeline cannot durably record events (issue #2421). The mutation
+            was **not** performed. Closed set of static labels — never a
+            filesystem path, an OS error string, or actor metadata.
+          enum:
+            - spool_unavailable
+            - spool_saturated
+            - spool_io_error
+            - invalid_record
+            - corrupt_record
+            - queue_saturated
+            - worker_unavailable
+            - delivery_exhausted
+            - retained_capacity
+            - no_durable_spool
+            - destination_mismatch
+            - prepare_failed
 
     AcmeCertificateRecordListResponse:
       type: object
@@ -6931,13 +7019,20 @@ components:
           type: string
           enum:
             - success
+            - failure
             - denied
             - validation_failed
             - unavailable
+            - unknown_outcome
           description: >-
-            Fixed-cardinality result for security-sensitive events:
-            `success`, `denied`, `validation_failed`, or `unavailable`.
-            Omitted when empty (legacy mutation events).
+            Fixed-cardinality result: `success`, `failure`, `denied`,
+            `validation_failed`, `unavailable`, or `unknown_outcome`.
+            `unknown_outcome` marks an audited mutation whose trustworthy
+            outcome observer was lost to process exit or request cancellation
+            after preparation and before durable finalize (issue #2421): the
+            change may or may not have taken effect, and the outcome is recorded
+            as unknowable rather than inferred. Omitted when empty (legacy
+            mutation events).
         diff:
           type: object
           additionalProperties: true
@@ -7402,6 +7497,24 @@ components:
             proxies produces a validation error (PROXY protocol is TCP-borne).
 
             Default: null / false (disabled; socket peer is always used as client_ip).
+        stream_match:
+          oneOf:
+            - $ref: "#/components/schemas/StreamMatchCriteria"
+            - type: "null"
+          description: |
+            Optional bounded L4 connection matcher for TCP/TCP+TLS proxies.
+            Predicates within one arm are ANDed; arms are ORed in declaration
+            order. Any predicate whose trusted connection evidence is absent
+            denies that arm. Source IP is the canonical authoritative client IP
+            after trusted PROXY-protocol processing, never an untrusted
+            application header.
+            Destination IP comes from trusted original-destination capture.
+            Gateway identity is trusted listener configuration only.
+
+            Omitted, null, `{}`, or `{ "arms": [] }` means no additional matcher.
+            A non-empty arm must contain at least one predicate. Invalid or
+            uncompiled configured matchers fail closed. Only valid for TCP-borne
+            stream proxies; UDP and DTLS configurations are rejected.
         websocket_idle_timeout_seconds:
           type: [integer, "null"]
           format: uint64
@@ -7531,6 +7644,90 @@ components:
       required:
         - backend_host
         - backend_port
+
+    StreamMatchCriteria:
+      type: object
+      additionalProperties: false
+      properties:
+        arms:
+          type: array
+          maxItems: 64
+          default: []
+          items:
+            $ref: "#/components/schemas/StreamMatchArm"
+          description: |
+            OR-ordered match arms. Declaration order is semantic both within
+            this list and across proxies sharing a stream listener; an earlier
+            unconstrained candidate shadows later candidates. Empty means no
+            additional L4 matcher.
+
+    StreamMatchArm:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        source_labels:
+          type: object
+          minProperties: 1
+          maxProperties: 64
+          propertyNames:
+            minLength: 1
+            maxLength: 317
+            pattern: "^(?:(?=.{1,253}/)[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)*/)?[A-Za-z0-9](?:[-_.A-Za-z0-9]{0,61}[A-Za-z0-9])?$"
+          additionalProperties:
+            type: string
+            maxLength: 63
+            pattern: "^$|^[A-Za-z0-9](?:[-_.A-Za-z0-9]{0,61}[A-Za-z0-9])?$"
+          description: |
+            Kubernetes label key/value pairs that must all match trustworthy
+            workload identity evidence. Empty label values are valid. Missing,
+            ambiguous, or unauthenticated label evidence denies the arm.
+        source_namespace:
+          type: string
+          minLength: 1
+          maxLength: 63
+          pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+          description: |
+            Exact Kubernetes source namespace from authenticated SPIFFE/workload
+            identity. Missing authenticated namespace evidence denies the arm.
+        source_subnets:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+            minLength: 1
+            maxLength: 64
+          description: |
+            IPv4/IPv6 CIDRs or individual IP addresses. Entries are parsed
+            strictly at admission. The authoritative canonical client IP after
+            the trusted PROXY boundary must belong to at least one entry.
+        destination_subnets:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+            minLength: 1
+            maxLength: 64
+          description: |
+            IPv4/IPv6 CIDRs or individual IP addresses, parsed strictly at
+            admission. The trusted captured original destination must belong to
+            at least one entry; missing capture evidence denies the arm.
+        gateways:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+            minLength: 1
+            maxLength: 127
+            pattern: "^(mesh|[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?/[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)$"
+          description: |
+            Exact trusted gateway bindings: `mesh` or canonical
+            `namespace/name`. Short names are rejected outside translation
+            because no namespace can be inferred safely. Missing listener
+            binding denies the arm; the value is never wire-derived.
 
     BackendScheme:
       type: string
@@ -10819,9 +11016,9 @@ components:
       description: |
         Tiered: unauthenticated callers receive only `status` and `ready`. The
         remaining detailed fields (`timestamp`, `mode`, `database`,
-        `admin_writes_enabled`, `cached_config`, `database_polling`,
+        `admin_writes_enabled`, `fips`, `cached_config`, `database_polling`,
         `config_rejected`, `mesh`, `listener_failures`, `logging`,
-        `kafka_logging`, `ai_transcript_audit`) are
+        `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`) are
         present only when the caller is authenticated (admin JWT, metrics bearer
         token, or allowlisted CIDR).
       required: [status, ready]
@@ -10837,8 +11034,9 @@ components:
             for that, not `status`.
             `degraded` — ready but the configured database is currently
             unavailable (still 200; the gateway continues to serve from
-            cached config). Intentional read-only mode does NOT set
-            `degraded`.
+            cached config), or the admin audit pipeline cannot durably record
+            committed mutations (see `audit_pipeline`). Intentional read-only
+            mode does NOT set `degraded`.
             `starting` — startup not yet complete (returned with 503 and
             `ready: false`).
             `unavailable` — the gateway became ready but a supervised serving
@@ -10937,6 +11135,81 @@ components:
                       type: integer
             failover_topology:
               $ref: "#/components/schemas/DatabaseFailoverTopology"
+        fips:
+          type: object
+          description: |
+            FIPS 140-2/140-3 deployment-mode metadata. Authenticated detail tier
+            only.
+
+            Ferrum Edge is **not** a validated cryptographic module and is not
+            independently FIPS-certified; `certified` is therefore always
+            `false`. `enforcing: true` means Ferrum is applying its fail-closed
+            FIPS admission policy, not that the deployment is compliant —
+            compliance additionally requires the exact validated module, build,
+            operating environment, and operational controls documented in
+            `docs/fips.md`.
+
+            No key material, module internal state, file path, or
+            operator-supplied value appears in this object.
+          required:
+            [
+              mode,
+              enforcing,
+              build_capable,
+              build_profile,
+              provider,
+              module_self_test_passed,
+              provider_algorithms_approved,
+              certified,
+              boundary_documentation,
+            ]
+          properties:
+            mode:
+              type: string
+              # Quoted: bare `off` is a YAML 1.1 boolean.
+              enum: ["off", "enforce"]
+              description: Resolved `FERRUM_FIPS_MODE` request.
+            enforcing:
+              type: boolean
+              description: Whether the fail-closed FIPS policy is being applied.
+            build_capable:
+              type: boolean
+              description: |
+                Whether this binary links the validated cryptographic module.
+                When `false`, a `FERRUM_FIPS_MODE=enforce` request fails closed
+                at startup rather than downgrading to a non-validated provider.
+            build_profile:
+              type: string
+              enum: [crypto-ring, fips]
+              description: |
+                The mutually exclusive cargo feature this binary was built with.
+                `crypto-ring` is the ordinary, non-FIPS build; `fips` links the
+                validated AWS-LC-FIPS module. This is the field an operator
+                compares against the artifact they intended to deploy.
+            provider:
+              type: string
+              enum: [ring, aws-lc-fips]
+              description: Identifier of the active cryptographic integration.
+            module_self_test_passed:
+              type: boolean
+              description: |
+                Whether the validated module reported that its power-on
+                self-tests passed. Always `false` when `build_capable` is
+                `false` — there is no module to have tested.
+            provider_algorithms_approved:
+              type: boolean
+              description: |
+                Whether rustls classifies the installed provider's algorithms as
+                FIPS-approved.
+            certified:
+              type: boolean
+              enum: [false]
+              description: |
+                Always `false`. Ferrum Edge makes no independent certification
+                claim about itself.
+            boundary_documentation:
+              type: string
+              description: Repository path documenting the module boundary.
         cached_config:
           type: object
           required: [available]
@@ -10985,6 +11258,8 @@ components:
           $ref: "#/components/schemas/MeshHealthResponse"
         listener_failures:
           $ref: "#/components/schemas/ServingListenerFailureSnapshot"
+        audit_pipeline:
+          $ref: "#/components/schemas/AuditPipelineStatus"
         logging:
           $ref: "#/components/schemas/LoggingSinkSnapshot"
         ai_transcript_audit:
@@ -11204,6 +11479,225 @@ components:
               kind:
                 type: string
                 enum: [serve_failed]
+
+    AuditPipelineStatus:
+      type: object
+      description: |
+        Admin audit delivery pipeline state (issue #2421). Present only when
+        `FERRUM_ADMIN_AUDIT_ENABLED=true`, and only in the authenticated
+        detailed `/health` + `/status` tier.
+
+        Counts and closed-set reason labels only. Never contains an actor
+        subject, a bearer token, a request body, an audit diff, a resource id,
+        an OS error string, a database connection string, or a spool filesystem
+        path.
+
+        Reads are O(1): every field comes from a process atomic or cached
+        background state, so an authenticated probe never triggers a filesystem
+        walk or a database query.
+
+        When `available` or `degraded` forces it, `status` is reported as
+        `degraded`, and under
+        `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` audited admin
+        mutations are refused with `503` **before** they are performed.
+      required:
+        - enabled
+        - durability
+        - policy
+        - available
+        - last_unavailable_reason
+        - degraded
+        - degraded_reason
+        - evidence_lost
+        - queue_capacity
+        - spool_max_records
+        - retained_max_records
+        - max_delivery_attempts
+        - accepted_total
+        - prepared_total
+        - finalized_total
+        - unknown_outcome_total
+        - enqueued_total
+        - delivered_total
+        - retries_total
+        - delivery_failures_total
+        - retained_total
+        - replayed_total
+        - corrupt_records_total
+        - destination_mismatch_total
+        - truncated_diffs_total
+        - dropped_durable_handoff_failed_total
+        - dropped_no_durable_spool_total
+        - dropped_retained_capacity_total
+        - fail_open_unaudited_mutations_total
+        - fail_closed_rejections_total
+        - queue_depth
+        - delivery_in_flight
+        - spool_prepared_records
+        - spool_pending_records
+        - spool_retained_records
+      properties:
+        enabled:
+          type: boolean
+        durability:
+          type: string
+          enum: [spool, memory, disabled]
+          description: |
+            `spool` — a pre-mutation intent is fsynced before the mutation
+            runs and finalized with its outcome afterwards.
+            `memory` — no usable durable spool; a crash can lose committed
+            mutations' audit events. `disabled` — auditing is off.
+        policy:
+          type: string
+          enum: [fail_open, fail_closed]
+        available:
+          type: boolean
+          description: >-
+            Whether an audited mutation can currently be durably prepared before
+            it runs. Drives the `fail_closed` write gate.
+        last_unavailable_reason:
+          type: string
+          enum:
+            - none
+            - spool_unavailable
+            - spool_saturated
+            - spool_io_error
+            - invalid_record
+            - corrupt_record
+            - queue_saturated
+            - worker_unavailable
+            - delivery_exhausted
+            - retained_capacity
+            - no_durable_spool
+            - destination_mismatch
+            - prepare_failed
+        degraded:
+          type: boolean
+          description: >-
+            Sticky evidence that durable records were corrupted, retained as
+            unrecoverable, or permanently discarded. A later successful delivery
+            does not clear it; only resolving the retained evidence under
+            `<spool>/failed/` does.
+        degraded_reason:
+          type: string
+          enum:
+            - none
+            - spool_unavailable
+            - spool_saturated
+            - spool_io_error
+            - invalid_record
+            - corrupt_record
+            - queue_saturated
+            - worker_unavailable
+            - delivery_exhausted
+            - retained_capacity
+            - no_durable_spool
+            - destination_mismatch
+            - prepare_failed
+        evidence_lost:
+          type: boolean
+          description: >-
+            Audit evidence was permanently discarded (retained capacity
+            exhausted, or a memory-only drop). Never clears while the process
+            runs.
+        queue_capacity:
+          type: integer
+          format: uint64
+        spool_max_records:
+          type: integer
+          format: uint64
+        retained_max_records:
+          type: integer
+          format: uint64
+        max_delivery_attempts:
+          type: integer
+          format: uint32
+        accepted_total:
+          type: integer
+          format: uint64
+        prepared_total:
+          type: integer
+          format: uint64
+          description: >-
+            Pre-mutation intents made durable (fsynced) before the configuration
+            mutation was invoked.
+        finalized_total:
+          type: integer
+          format: uint64
+          description: Intents durably finalized with the mutation's known outcome.
+        unknown_outcome_total:
+          type: integer
+          format: uint64
+          description: >-
+            Prepared records whose trustworthy outcome observer was lost to
+            process exit or request cancellation before the mutation outcome
+            was known. Stored with `outcome = unknown_outcome`; never inferred
+            as success or failure.
+        enqueued_total:
+          type: integer
+          format: uint64
+        delivered_total:
+          type: integer
+          format: uint64
+        retries_total:
+          type: integer
+          format: uint64
+        delivery_failures_total:
+          type: integer
+          format: uint64
+        retained_total:
+          type: integer
+          format: uint64
+          description: Events that exhausted the delivery budget and are retained for operator remediation.
+        replayed_total:
+          type: integer
+          format: uint64
+        corrupt_records_total:
+          type: integer
+          format: uint64
+        destination_mismatch_total:
+          type: integer
+          format: uint64
+          description: >-
+            Durable records quarantined because they were bound to a different
+            audit destination (database/namespace) than this process.
+        truncated_diffs_total:
+          type: integer
+          format: uint64
+          description: Events whose diff exceeded the durable record ceiling and was replaced by a redacted marker.
+        dropped_durable_handoff_failed_total:
+          type: integer
+          format: uint64
+        dropped_no_durable_spool_total:
+          type: integer
+          format: uint64
+        dropped_retained_capacity_total:
+          type: integer
+          format: uint64
+        fail_open_unaudited_mutations_total:
+          type: integer
+          format: uint64
+          description: >-
+            Mutations allowed to proceed with no durable pre-mutation evidence
+            under `fail_open`. Any non-zero value is an audit gap by policy.
+        fail_closed_rejections_total:
+          type: integer
+          format: uint64
+        queue_depth:
+          type: integer
+          format: uint64
+        delivery_in_flight:
+          type: integer
+          format: uint64
+        spool_prepared_records:
+          type: integer
+          format: uint64
+        spool_pending_records:
+          type: integer
+          format: uint64
+        spool_retained_records:
+          type: integer
+          format: uint64
 
     # ── Overload ──────────────────────────────────────────────────
     OverloadNoProxyState:
@@ -12585,8 +13079,11 @@ components:
       properties:
         section_version:
           type: string
-          description: Section contract version
-          example: "1"
+          description: |
+            Section contract version. Current exports use `"2"` (optional
+            external-`$ref` snapshot fields). Restore also accepts `"1"`
+            (no snapshot fields).
+          example: "2"
         items:
           type: array
           items:
@@ -12663,6 +13160,19 @@ components:
           type: string
           pattern: "^$|^[0-9a-f]{64}$"
           description: Empty for legacy records or lowercase hex SHA-256 of the generated resource bundle
+        external_ref_snapshot_base64:
+          type: string
+          description: |
+            Optional standard Base64 of the gzip-compressed external-`$ref`
+            admission snapshot (section version `"2"`+). Omitted on version
+            `"1"` backups and when external refs were not enabled for the
+            import. Do not log this field.
+        external_ref_digest:
+          type: string
+          description: |
+            Optional aggregate digest of the external-`$ref` admission
+            snapshot. Present together with `external_ref_snapshot_base64`
+            when external refs were admitted.
         created_at:
           type: string
           format: date-time
@@ -22316,8 +22826,8 @@ components:
         provider:
           type: string
           default: auto
-          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock]
-          description: "Exact lowercase LLM provider format; surrounding whitespace and alternate casing are rejected"
+          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock, tgi]
+          description: "Exact lowercase LLM provider format; surrounding whitespace and alternate casing are rejected. `tgi` selects Hugging Face TGI native `/generate` shapes (`details.generated_tokens`)."
         include_model:
           type: boolean
           default: true
@@ -22503,17 +23013,27 @@ components:
             on the rejection-path after_proxy.
         provider:
           type: string
-          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock]
+          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock, tgi]
           default: auto
           description: >-
             LLM provider format for token extraction. Accepted values: auto,
-            openai, anthropic, google, cohere, mistral, bedrock. Gemini/Vertex
-            payloads use `google`.
+            openai, anthropic, google, cohere, mistral, bedrock, tgi.
+            Gemini/Vertex payloads use `google`; Hugging Face TGI native
+            `/generate` and `/generate_stream` shapes use `tgi`, whose
+            authoritative counter is `details.generated_tokens` (TGI's
+            OpenAI-compatible surface stays `openai`).
         on_unmetered_response:
           type: string
           enum: [reject, charge_estimate, warn]
           default: charge_estimate
-          description: Action for successful responses without usage metadata. charge_estimate keeps the pre-request reservation, reject returns a 502 and keeps the reservation, warn logs and releases the reservation.
+          description: >-
+            Action for successful responses without usage metadata.
+            charge_estimate keeps the pre-request reservation, reject returns a
+            502 and keeps the reservation, warn logs and releases the
+            reservation. On a STREAMED response the headers are already
+            committed, so reject cannot substitute a 502; it degrades to its
+            fail-closed accounting half (the reservation stays charged) and logs
+            the violation.
         sync_mode:
           type: string
           enum: [local, redis]
@@ -25835,6 +26355,12 @@ components:
         content_hash:
           type: string
           description: Lowercase hex SHA-256 digest of the uncompressed spec content. Used as ETag value.
+        external_ref_digest:
+          type: [string, "null"]
+          description: |
+            Aggregate digest of the external-`$ref` admission snapshot when
+            external refs were enabled for this import; omitted/`null`
+            otherwise. Snapshot bytes stay internal (storage/backup only).
         content_encoding:
           type: string
           enum: [gzip]
@@ -25997,7 +26523,7 @@ components:
             - `PluginContainsCredentials` — a plugin's `config` contains a forbidden key (`credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, or `consumers`)
             - `ProxyUpstreamIdMismatch` — `x-ferrum-proxy.upstream_id` conflicts with the `id` of the inline `x-ferrum-upstream`
             - `InvalidTagName` — a `tags[].name` contains a forbidden character (`"`, `%`, `_`, or `\`) that would break the SQL `has_tag` LIKE filter
-            - `UnsupportedExternalRef` — `x-ferrum-validate` references an external `$ref`; only local refs are resolved into generated plugin config
+            - `UnsupportedExternalRef` — an external / cross-document `$ref` was encountered while process policy and/or `x-ferrum-external-refs` leave resolution disabled (fail-closed default); only local refs are resolved into generated plugin config when external refs stay off
             - `SchemaReference` — a local schema `$id`, `$anchor`, URI fragment, or `$ref` is malformed, duplicated, or unresolved
             - `SchemaTooDeep` — `x-ferrum-validate` schema refs exceed the resolver depth limit
             - `SchemaReferenceCycle` — a local `$ref` chain re-enters a target that is still being

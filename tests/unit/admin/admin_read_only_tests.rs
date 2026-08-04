@@ -77,6 +77,12 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     }
 }
 
@@ -218,6 +224,12 @@ async fn test_admin_state_mode_field() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     assert_eq!(admin_state_prod.mode, "production");
 }
@@ -270,6 +282,12 @@ async fn test_check_write_allowed_permits_when_db_available() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -314,6 +332,12 @@ async fn test_check_write_allowed_blocks_when_db_unavailable() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -364,6 +388,12 @@ async fn test_check_write_allowed_blocks_when_read_only() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -413,6 +443,12 @@ async fn test_check_write_allowed_permits_when_no_db_flag() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -457,6 +493,12 @@ async fn test_db_available_flag_transitions() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
 
     // Initially available
@@ -529,6 +571,12 @@ async fn test_check_write_allowed_blocks_on_failover_without_opt_in() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
 
     assert!(
@@ -603,6 +651,12 @@ async fn test_check_write_allowed_opt_in_is_policy_pure() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
 
     assert!(
@@ -691,6 +745,12 @@ async fn test_admit_write_pins_and_blocks_on_failover_without_opt_in() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
 
     let Err(err) = state.admit_write().await else {
@@ -701,6 +761,7 @@ async fn test_admit_write_pins_and_blocks_on_failover_without_opt_in() {
     // Independent TLS/ACME stores must not inherit sticky DB failover policy.
     state
         .admit_non_config_db_write()
+        .await
         .expect("admit_non_config_db_write must ignore failover topology");
 }
 
@@ -741,8 +802,14 @@ async fn test_admit_non_config_db_write_keeps_read_only_and_db_unavailable_gates
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
-    let Err(read_only_err) = read_only_state.admit_non_config_db_write() else {
+    let Err(read_only_err) = read_only_state.admit_non_config_db_write().await else {
         panic!("admit_non_config_db_write must honor read-only mode");
     };
     assert_eq!(read_only_err.status(), hyper::StatusCode::FORBIDDEN);
@@ -752,7 +819,7 @@ async fn test_admit_non_config_db_write_keeps_read_only_and_db_unavailable_gates
         db_available: Some(db_flag),
         ..read_only_state
     };
-    let Err(unavailable_err) = unavailable_state.admit_non_config_db_write() else {
+    let Err(unavailable_err) = unavailable_state.admit_non_config_db_write().await else {
         panic!("admit_non_config_db_write must honor database-unavailable");
     };
     assert_eq!(
@@ -821,6 +888,12 @@ async fn test_admit_write_retains_pin_for_mutation_lifetime_on_primary() {
         admin_tls_handshake_timeout_seconds: 10,
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: std::sync::Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
     };
 
     let permit = state
@@ -915,12 +988,46 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
         "config-database mutation handlers must call admit_write"
     );
     assert!(
-        tls_source.contains("admit_non_config_db_write()"),
+        tls_source.contains("admit_non_config_db_write().await"),
         "managed TLS/ACME handlers must call admit_non_config_db_write"
+    );
+    assert!(
+        tls_source.contains("admit_audited_operation().await"),
+        "audited TLS rotation must take the durable audit handoff before running"
     );
     assert!(
         !tls_source.contains("admit_write().await"),
         "managed TLS/ACME handlers must not pin sticky config-DB failover topology"
+    );
+
+    let admin_source = include_str!("../../../src/admin/mod.rs");
+    let config_admission = admin_source
+        .split("pub async fn admit_write")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn prepare_audit_intent").next())
+        .expect("config-database admission method remains inspectable");
+    assert!(
+        config_admission.contains("evaluate_independent_store_write_gate")
+            && config_admission.contains("prepare_audit_intent().await")
+            && !config_admission.contains("evaluate_non_topology_write_gate"),
+        "mutation admission must re-attempt durable prepare so fail-closed recovers after transient spool errors"
+    );
+    let independent_admission = admin_source
+        .split("pub async fn admit_non_config_db_write")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub(super) async fn admit_audited_operation")
+                .next()
+        })
+        .expect("independent-store admission method remains inspectable");
+    assert!(
+        independent_admission.contains("evaluate_independent_store_write_gate"),
+        "managed TLS/ACME admission must retain read-only and database-availability gates"
+    );
+    assert!(
+        independent_admission.contains("prepare_audit_intent().await")
+            && !independent_admission.contains("evaluate_non_topology_write_gate"),
+        "managed TLS/ACME audit events must be durably prepared before their independent-store mutation"
     );
 
     // Config-DB handler call sites must not use the sync gate alone.

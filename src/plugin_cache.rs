@@ -1047,6 +1047,10 @@ impl Plugin for PriorityOverridePlugin {
     fn may_replace_rejection_response(&self) -> bool {
         self.inner.may_replace_rejection_response()
     }
+    fn rejection_replacement_is_final_body_policy_terminal(&self) -> bool {
+        self.inner
+            .rejection_replacement_is_final_body_policy_terminal()
+    }
     fn warn_on_rejection_response_replacement(&self) -> bool {
         self.inner.warn_on_rejection_response_replacement()
     }
@@ -1210,6 +1214,16 @@ impl Plugin for PriorityOverridePlugin {
             .on_final_request_body_with_context(ctx, headers, body)
             .await
     }
+    fn enforces_final_request_body_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+    ) -> bool {
+        // Security phase declarations must survive a priority-only wrapper.
+        self.inner
+            .enforces_final_request_body_policy(ctx, headers, body)
+    }
     fn needs_final_request_body_context(&self) -> bool {
         self.inner.needs_final_request_body_context()
     }
@@ -1257,6 +1271,37 @@ impl Plugin for PriorityOverridePlugin {
     /// exactly the replays `ResponsePolicyProvenance` exists to retire.
     fn response_presentation_policy(&self) -> Option<ResponsePresentationPolicy> {
         self.inner.response_presentation_policy()
+    }
+    fn applies_response_transport_encoding(&self) -> bool {
+        self.inner.applies_response_transport_encoding()
+    }
+    fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
+        self.inner.enforces_final_client_visible_response_body(ctx)
+    }
+    async fn finalize_client_visible_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.inner
+            .finalize_client_visible_response_body(ctx, response_status, response_headers, body)
+            .await
+    }
+    fn enforces_final_client_visible_response_headers(&self, ctx: &RequestContext) -> bool {
+        self.inner
+            .enforces_final_client_visible_response_headers(ctx)
+    }
+    async fn finalize_client_visible_response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> PluginResult {
+        self.inner
+            .finalize_client_visible_response_headers(ctx, response_status, response_headers)
+            .await
     }
     fn enforces_response_body_policy(
         &self,

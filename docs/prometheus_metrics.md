@@ -57,6 +57,39 @@ Scrape rendering stays allocation-light: the inventory is a documentation/CI con
 
 **Suggested alert:** `sum(rate(ferrum_mesh_tcp_egress_connections_total{result="failure"}[5m]))` above baseline. Investigate orig-dst capture, outbound registry admits, and HBONE/mTLS dial failures for stream-family ports.
 
+### Admin audit delivery
+
+| Family | Type | Labels | Guidance |
+|--------|------|--------|----------|
+| `ferrum_admin_audit_available` | gauge | `namespace` | `0` means an audited admin mutation currently has no durable pre-mutation handoff. Under `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` such mutations are refused with `503` before they run. |
+| `ferrum_admin_audit_degraded` | gauge | `namespace` | Sticky: durable records were corrupted, retained as unrecoverable, or discarded. A later successful delivery does **not** clear it — only resolving `<spool>/failed/` does. |
+| `ferrum_admin_audit_evidence_lost` | gauge | `namespace` | Permanent: audit evidence was discarded (retained capacity exhausted, or a memory-only drop). Never clears while the process runs. |
+| `ferrum_admin_audit_spool_prepared_records` | gauge | `namespace` | Pre-mutation intents awaiting finalization. A steady non-zero floor means mutations are in flight; a growing value means finalization is failing. |
+| `ferrum_admin_audit_spool_pending_records` | gauge | `namespace` | Durable backlog awaiting insertion into `audit_events`. A steadily rising value means the configured database is rejecting or slow-walking audit inserts. |
+| `ferrum_admin_audit_retained_records` | gauge | `namespace` | Records that exhausted `FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS`, were corrupt, or targeted a different audit destination. These are held under `<spool>/failed/` for manual reconciliation and are never replayed automatically. |
+| `ferrum_admin_audit_unknown_outcome_total` | counter | `namespace` | Intents whose trustworthy outcome observer was lost because a prior process exited or a request/settlement task was cancelled before an outcome was observed. The mutation may or may not have taken effect; the event is stored with `outcome = unknown_outcome` and must be reconciled by hand. |
+| `ferrum_admin_audit_destination_mismatch_total` | counter | `namespace` | Durable records bound to a different audit destination (database/namespace) were quarantined rather than delivered. Expect this after repointing a gateway at a new database while a backlog existed. |
+| `ferrum_admin_audit_fail_open_unaudited_mutations_total` | counter | `namespace` | Mutations that proceeded with no durable pre-mutation evidence under `fail_open`. Any non-zero value is an audit gap by policy choice. |
+| `ferrum_admin_audit_events_dropped_total` | counter | `reason`, `namespace` | Any non-zero value is an audit gap. `durable_handoff_failed` = the spool write failed; `no_durable_spool` = the deployment runs memory-only; `retained_capacity` = retained storage is full. Foreign-destination records are still durable in quarantine and are reported only by `ferrum_admin_audit_destination_mismatch_total`, not as dropped. |
+
+**Suggested alerts:** `min_over_time(ferrum_admin_audit_available[5m]) == 0`;
+`ferrum_admin_audit_degraded == 1`;
+`increase(ferrum_admin_audit_events_dropped_total[15m]) > 0`;
+`increase(ferrum_admin_audit_unknown_outcome_total[15m]) > 0`;
+`increase(ferrum_admin_audit_fail_open_unaudited_mutations_total[15m]) > 0`;
+`ferrum_admin_audit_retained_records > 0`.
+
+**Reconciliation:** the intent is fsynced before the mutation runs and the same
+stable id is finalized after it returns, so a committed mutation always has
+durable evidence. Delivery is at-least-once on that id and every backend insert
+is insert-only and idempotent, so a replayed record converges to exactly one
+immutable `audit_events` row — a duplicate delivery is success, never
+replacement. To reconcile a gap, compare
+`ferrum_admin_audit_intents_prepared_total` against
+`ferrum_admin_audit_events_delivered_total`, query `audit_events` for
+`outcome = 'unknown_outcome'`, and inspect
+`<FERRUM_ADMIN_AUDIT_SPOOL_DIR>/failed/`.
+
 ## Complete family inventory
 
 Sorted by family name. Optional namespace labels are listed when the emitter supports them.
@@ -83,10 +116,10 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `chargeback_sink_snapshot_overflow_spooled_total` | counter | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Snapshot charges durably spooled through the bounded async delivery worker after accumulator cardinality or byte budget overflow. |
 | `chargeback_sink_snapshot_retained_bytes` | gauge | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Estimated snapshot accumulator retained bytes under configured max_retained_bytes. |
 | `chargeback_sink_spool_available` | gauge | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Whether committed spool storage is currently writable (1) or unavailable (0). Aggregate is 1 only when every spool-enabled live instance is available. |
-| `chargeback_sink_spool_bytes` | gauge | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files). |
+| `chargeback_sink_spool_bytes` | gauge | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink on-disk owned spool bytes (active, temp, in-flight claim, corrupt, and dead-lettered files). |
 | `chargeback_sink_spool_drops_total` | counter | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink spool files dropped to enforce max_bytes. |
 | `chargeback_sink_spool_events_lost_total` | counter | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink events lost with dropped spool delivery jobs. |
-| `chargeback_sink_spool_files` | gauge | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink on-disk owned spool file count (active, temp, corrupt, and dead-lettered files). |
+| `chargeback_sink_spool_files` | gauge | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink on-disk owned spool file count (active, temp, in-flight claim, corrupt, and dead-lettered files). |
 | `chargeback_sink_spool_jobs_enqueued_total` | counter | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink jobs accepted by the async spool delivery worker. |
 | `chargeback_sink_spool_jobs_lost_total` | counter | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink spool delivery jobs dropped under saturation or write failure. |
 | `chargeback_sink_spool_jobs_written_total` | counter | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink jobs successfully written by the async spool delivery worker. |
@@ -94,6 +127,31 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `chargeback_sink_spool_unbound_files` | gauge | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Retained spool records not bound to a live destination identity. Never replayed or deleted; an observed lower bound when the bounded aggregate scan is truncated. |
 | `chargeback_sink_spool_unbound_namespaces` | gauge | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Managed spool namespaces still holding records for a destination identity no live instance owns; an observed lower bound when the bounded aggregate scan is truncated. |
 | `ferrum_admin_active_connections` | gauge | `namespace` | `admin` | `documented_only` | `conditional` | Admin/management-plane connections currently in flight. |
+| `ferrum_admin_audit_available` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Whether the admin audit pipeline can durably record committed mutations (1) or not (0). |
+| `ferrum_admin_audit_corrupt_records_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records quarantined as corrupt (bad version, unparseable, oversized, or id mismatch). |
+| `ferrum_admin_audit_degraded` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Sticky evidence that admin audit records were corrupted, retained as unrecoverable, or permanently discarded (1) or not (0). A later successful delivery does not clear it. |
+| `ferrum_admin_audit_delivery_failures_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit delivery attempts that returned an error from the database backend. |
+| `ferrum_admin_audit_delivery_in_flight` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit delivery attempts currently in flight. |
+| `ferrum_admin_audit_delivery_retries_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Bounded-backoff retries scheduled after a transient admin audit delivery failure. |
+| `ferrum_admin_audit_destination_mismatch_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records quarantined because they target a different database or namespace destination. |
+| `ferrum_admin_audit_events_accepted_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events accepted from a committed admin mutation. |
+| `ferrum_admin_audit_events_delivered_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events accepted by the configured database backend. |
+| `ferrum_admin_audit_events_dropped_total` | counter | `reason`, `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events lost without a durable record, by reason. |
+| `ferrum_admin_audit_events_enqueued_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events admitted to the bounded in-memory delivery queue. |
+| `ferrum_admin_audit_events_finalized_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit intents durably finalized with the mutation's known outcome. |
+| `ferrum_admin_audit_events_replayed_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records re-read from the spool for delivery (restart, queue overflow, or an expired shutdown drain). |
+| `ferrum_admin_audit_events_retained_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events that exhausted the delivery-attempt budget and were retained for operator remediation. |
+| `ferrum_admin_audit_evidence_lost` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Whether admin audit evidence has been permanently discarded (1) or not (0). Never clears. |
+| `ferrum_admin_audit_fail_closed_rejections_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin mutations refused up front because the audit pipeline is unavailable under the fail_closed policy. |
+| `ferrum_admin_audit_fail_open_unaudited_mutations_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin mutations allowed to proceed without durable pre-mutation audit evidence under the fail_open policy. |
+| `ferrum_admin_audit_intents_prepared_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Pre-mutation admin audit intents made durable (fsynced) before the configuration mutation was invoked. |
+| `ferrum_admin_audit_queue_capacity` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Configured depth of the bounded in-memory admin audit delivery queue. |
+| `ferrum_admin_audit_queue_depth` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events currently waiting in the bounded in-memory delivery queue. |
+| `ferrum_admin_audit_retained_records` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records retained as unrecoverable for operator remediation. |
+| `ferrum_admin_audit_spool_pending_records` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records awaiting delivery (O(1) admission counter; a saturated background scan reports a floor). |
+| `ferrum_admin_audit_spool_prepared_records` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Durable pre-mutation admin audit intents awaiting finalization. |
+| `ferrum_admin_audit_truncated_diffs_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events whose diff was replaced by a redacted marker because it exceeded the durable record ceiling. |
+| `ferrum_admin_audit_unknown_outcome_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Prepared admin audit records whose trustworthy outcome observer was lost to process exit or request cancellation. |
 | `ferrum_admin_max_connections` | gauge | `namespace` | `admin` | `documented_only` | `conditional` | Configured admin connection cap (0 = unlimited). |
 | `ferrum_admin_max_connections_per_ip` | gauge | `namespace` | `admin` | `documented_only` | `conditional` | Configured per-source-IP admin connection cap (0 = unlimited). |
 | `ferrum_admin_rejected_connections_total` | counter | `reason`, `namespace` | `admin` | `documented_only` | `conditional` | Admin connections rejected by the connection limiter, by reason. |
@@ -203,6 +261,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_mesh_trust_bundle_version` | gauge | `trust_domain`, `source`, `gateway_namespace` | `mesh` | `dashboard` | `conditional` | Monotonic version of observed mesh trust bundles. |
 | `ferrum_node_agent_attach_errors_total` | counter | `namespace` | `node_agent` | `documented_only` | `conditional` | Node-agent BPF attachment or map update errors. |
 | `ferrum_node_agent_capture_state` | gauge | `state`, `namespace` | `node_agent` | `documented_only` | `conditional` | Node-agent capture backend condition. Exactly one state label is 1. |
+| `ferrum_node_agent_cni_calls_total` | counter | `verb`, `outcome`, `namespace` | `node_agent` | `documented_only` | `conditional` | Node-agent CNI plugin RPC outcomes by verb. |
 | `ferrum_node_agent_cni_socket_lifecycle_total` | counter | `reason`, `namespace` | `node_agent` | `documented_only` | `conditional` | Node-agent CNI socket lifecycle failures by bounded reason. |
 | `ferrum_node_agent_pod_annotation_updates_applied_total` | counter | `namespace` | `node_agent` | `documented_only` | `conditional` | Mid-life pod includeOutboundPorts annotation changes re-applied to the BPF map. |
 | `ferrum_node_agent_pod_annotation_updates_failed_total` | counter | `namespace` | `node_agent` | `documented_only` | `conditional` | Mid-life pod includeOutboundPorts annotation changes that failed to re-apply (annotation parse error or BPF map write error). Cgroup-id-unavailable retries are intentionally not counted here because they are routinely observed during early pod startup and are retried on the next Apply event. |

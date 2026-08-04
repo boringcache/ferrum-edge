@@ -2277,6 +2277,10 @@ fn row_mappers_use_strict_nullable_decodes_for_tls_and_routing_columns() {
         row_to_proxy.contains("try_get::<Option<i32>, _>(\"stream_proxy_protocol\")?"),
         "stream_proxy_protocol must keep the strict Option decode"
     );
+    assert!(
+        row_to_proxy.contains("optional_utf8_text_column(row, \"stream_match\")?"),
+        "stream_match must keep strict nullable UTF-8 and JSON decoding"
+    );
 
     let proxy_columns = [
         "backend_tls_client_cert_path",
@@ -2314,6 +2318,26 @@ fn row_mappers_use_strict_nullable_decodes_for_tls_and_routing_columns() {
             && !row_to_upstream.contains("\"backend_tls_sni\").ok()"),
         "row_to_upstream must not swallow backend_tls_sni decode errors with .ok()"
     );
+}
+
+#[test]
+fn every_sql_proxy_write_path_persists_stream_match() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    assert_eq!(
+        source
+            .matches("let stream_match_json = serialize_stream_match(")
+            .count(),
+        5,
+        "create, update, bulk insert, spec submit, and spec replace must serialize stream_match"
+    );
+    assert_eq!(
+        source.matches(".bind(&stream_match_json)").count(),
+        5,
+        "every SQL proxy write path must bind serialized stream_match"
+    );
+    assert!(source.contains("stream_proxy_protocol, stream_match, \\"));
+    assert!(source.contains("stream_proxy_protocol=?, stream_match=?, updated_at=?"));
+    assert!(source.contains("stream_proxy_protocol = ?, stream_match = ?, \\"));
 }
 
 #[test]

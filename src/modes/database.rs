@@ -1756,6 +1756,12 @@ pub async fn run(
         env_config.admin_max_connections_per_ip,
     ));
 
+    // Start durable audit delivery now (issue #2421): discovery, adoption of
+    // records abandoned by a prior process generation, and replay must not wait
+    // for a later mutation to lazily spawn the worker. A process that receives
+    // no new mutations still has to drain the backlog it inherited.
+    crate::admin::audit::start_delivery(env_config.admin_audit_enabled, db.clone());
+
     let admin_state = AdminState {
         db: Some(db.clone()),
         jwt_manager,
@@ -1789,6 +1795,14 @@ pub async fn run(
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
         admin_request_limits: crate::admin::AdminRequestLimits::from_env_config(&env_config),
         backend_allow_ips: env_config.backend_allow_ips.clone(),
+        external_ref_policy: std::sync::Arc::new(env_config.admin_spec_external_ref_policy.clone()),
+        external_ref_loader: std::sync::Arc::new(
+            crate::admin::api_specs::DefaultExternalDocumentLoader {
+                egress: env_config.backend_allow_ips.clone(),
+                dns_cache: None,
+                fixtures: std::collections::HashMap::new(),
+            },
+        ),
     };
     // Clone admin_state before the HTTP listener moves it, so we can reuse
     // the same JwtManager instance for the HTTPS listener (instead of calling
@@ -2715,6 +2729,15 @@ pub async fn run(
     // `Drop for HealthChecker` abort that fires at process exit.
     background_handles.extend(proxy_state.health_checker.take_active_check_handles());
     join_background_handles(background_handles, Duration::from_secs(5)).await;
+    // Drain accepted audit events while the database Arc is still alive (issue
+    // #2421). Bounded by the graceful-shutdown drain budget: anything still
+    // undelivered when the deadline expires stays in the durable spool and is
+    // replayed by the next process. Explicit memory-only mode instead accounts
+    // any deadline loss and latches degraded health.
+    crate::admin::audit::shutdown(Duration::from_secs(
+        env_config.shutdown_drain_seconds.clamp(5, 60),
+    ))
+    .await;
     crate::observability_delivery::shutdown(Duration::from_millis(
         env_config.log_shutdown_drain_timeout_ms,
     ))

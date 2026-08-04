@@ -428,6 +428,8 @@ fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -8416,6 +8418,7 @@ fn test_priority_override_delegates_spec_rejection_replacement_capability() {
     assert_eq!(plugins[0].priority(), 211);
     assert!(plugins[0].applies_after_proxy_on_reject());
     assert!(plugins[0].may_replace_rejection_response());
+    assert!(plugins[0].rejection_replacement_is_final_body_policy_terminal());
     assert!(!plugins[0].warn_on_rejection_response_replacement());
 }
 
@@ -8667,6 +8670,60 @@ fn test_priority_override_delegates_response_trailer_policy() {
             "/internal/metrics"
         )),
         "the priority-override wrapper must delegate the request exemption predicate"
+    );
+}
+
+#[tokio::test]
+async fn test_priority_override_delegates_final_client_visible_response_headers() {
+    // The priority-override wrapper must forward the authoritative final header
+    // phase. Falling back to the trait defaults (`false` / `Continue`) would
+    // let a later response_transformer or route finalizer mutate the map behind
+    // an enforcing WAF that was reordered via `priority_override`.
+    let mut waf = enforcing_response_header_waf("waf1", "p1", json!({}));
+    waf.priority_override = Some(324);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["waf1"])], vec![waf]);
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("ferrum", "p1");
+    let waf_plugin = &plugins[0];
+
+    assert_eq!(waf_plugin.priority(), 324);
+
+    let ctx = trailer_policy_ctx("GET", "/api/orders");
+    assert!(
+        waf_plugin.enforces_final_client_visible_response_headers(&ctx),
+        "priority_override must not hide final response-header enforcement from the \
+         authoritative header phase"
+    );
+
+    let mut clean_ctx = trailer_policy_ctx("GET", "/api/orders");
+    let clean_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    assert!(
+        matches!(
+            waf_plugin
+                .finalize_client_visible_response_headers(&mut clean_ctx, 200, &clean_headers)
+                .await,
+            PluginResult::Continue
+        ),
+        "the priority-override wrapper must reach the inner final header hook"
+    );
+
+    let mut enforcing_ctx = trailer_policy_ctx("GET", "/api/orders");
+    let hostile_headers =
+        HashMap::from([("x-debug-info".to_string(), "leak-secret-token".to_string())]);
+    let result = waf_plugin
+        .finalize_client_visible_response_headers(&mut enforcing_ctx, 200, &hostile_headers)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "the priority-override wrapper must preserve the inner enforcement decision"
+    );
+    assert_eq!(
+        enforcing_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .map(String::as_str),
+        Some("CUSTOM-RESP-HEADER-WAF1")
     );
 }
 

@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use crate::fips::approved::Sha256;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::tls::source::subscription::{MaterialFingerprintEntry, WatchedMaterialSource};

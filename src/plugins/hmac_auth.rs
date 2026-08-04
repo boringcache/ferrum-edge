@@ -42,11 +42,10 @@
 //! Consumer credentials should include:
 //!   { "hmac_auth": { "secret": "<shared-secret>" } }
 
+use crate::fips::approved::{HmacSha256, HmacSha512, Sha256, Sha512};
 use async_trait::async_trait;
 use base64::Engine as _;
-use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
-use sha2::{Digest, Sha256, Sha512};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
@@ -57,9 +56,6 @@ use super::utils::auth_flow::{
 use super::{RequestContext, strip_auth_scheme};
 use crate::config::types::Consumer;
 use crate::consumer_index::ConsumerIndex;
-
-type HmacSha256 = Hmac<Sha256>;
-type HmacSha512 = Hmac<Sha512>;
 
 const HMAC_REQUEST_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const HMAC_SIGNING_VERSION: &str = "ferrum-hmac-v1";
@@ -490,7 +486,7 @@ impl HmacAuth {
     fn authorization_fingerprint(ctx: &RequestContext) -> Option<[u8; 32]> {
         ctx.headers
             .get("authorization")
-            .map(|header| Sha256::digest(header.as_bytes()).into())
+            .map(|header| Sha256::digest(header.as_bytes()))
     }
 
     fn digest_header_ref(ctx: &RequestContext) -> Option<&str> {
@@ -755,10 +751,10 @@ impl AuthMechanism for HmacAuth {
             digest_header,
             request_body_sha256: ctx
                 .request_body_sha256
-                .unwrap_or_else(|| Sha256::digest([]).into()),
+                .unwrap_or_else(|| Sha256::digest([])),
             request_body_sha512: ctx
                 .request_body_sha512
-                .unwrap_or_else(|| Sha512::digest([]).into()),
+                .unwrap_or_else(|| Sha512::digest([])),
         }))
     }
 
@@ -930,8 +926,8 @@ mod tests {
     //! `tests/unit/plugins/hmac_auth_tests.rs`.
 
     use super::HmacAuth;
+    use crate::fips::approved::{Sha256, Sha512};
     use base64::Engine as _;
-    use sha2::{Digest, Sha256, Sha512};
 
     fn sha256_digest_header(body: &[u8]) -> String {
         let mut hasher = Sha256::new();

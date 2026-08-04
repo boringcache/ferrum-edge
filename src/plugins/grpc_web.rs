@@ -104,7 +104,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 use crate::proxy::headers::{
-    is_backend_response_strip_header, is_proxy_owned_forwarding_header,
+    is_backend_response_strip_header, is_forbidden_backend_request_trailer_name,
     parse_connection_listed_from_str_map,
 };
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -710,61 +710,16 @@ fn parse_request_trailer_block(payload: &[u8]) -> Result<Vec<(String, String)>, 
 /// header block, or Ferrum-owned forwarding identity (`X-Forwarded-*` and RFC
 /// 7239 `Forwarded`). The initial header block already carries the
 /// gateway-authored forwarding identity; a trailer must not restate or
-/// contradict it for backends that read trailing metadata. `Forwarded` is
-/// rejected unconditionally (`is_proxy_owned_forwarding_header(name, true)`)
-/// even when primary generation is disabled on a route — trailer parsing has
-/// no config object, and failing closed is correct.
+/// contradict it for backends that read trailing metadata. The shared backend
+/// request-trailer predicate rejects `Forwarded` unconditionally even when
+/// primary generation is disabled on a route — trailer parsing has no config
+/// object, and failing closed is correct.
 #[inline]
 fn is_forbidden_grpc_web_request_trailer_name(name: &str) -> bool {
     name.starts_with(':')
-        // PROTOCOL-HTTP2 reserves the entire grpc-* namespace. Known request
-        // and response control fields are listed below for documentation, but
-        // an unknown future control field must fail closed too.
-        || name.starts_with("grpc-")
         || is_internal_grpc_web_bridge_header(name)
         || name == HEADER_GRPC_WEB_MODE
-        // Reserved gateway assertions the gRPC header merge re-adds from
-        // trusted plugin state only.
-        || name.starts_with("x-consumer-")
-        || name.starts_with("x-ferrum-")
-        // Gateway-owned forwarding identity: reuse the canonical strip
-        // predicate so this list cannot drift from primary dispatch.
-        || is_proxy_owned_forwarding_header(name, true)
-        || matches!(
-            name,
-            // Framing / connection control.
-            "connection"
-                | "keep-alive"
-                | "proxy-connection"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "transfer-encoding"
-                | "upgrade"
-                | "te"
-                | "trailer"
-                | "content-length"
-                | "content-type"
-                | "content-encoding"
-                | "host"
-                // Initial-metadata-only gRPC call parameters. Honoring these at
-                // end of stream is always too late and lets a trailer
-                // contradict the validated header block.
-                | "grpc-timeout"
-                | "grpc-encoding"
-                | "grpc-accept-encoding"
-                | "grpc-message-type"
-                | "user-agent"
-                | "x-grpc-web"
-                // Response-side terminal metadata has no request meaning.
-                | "grpc-status"
-                | "grpc-message"
-                | "grpc-status-details-bin"
-                // Credentials and gateway-authoritative results.
-                | "authorization"
-                | "cookie"
-                | "x-api-key"
-                | "x-geo-country"
-        )
+        || is_forbidden_backend_request_trailer_name(name)
 }
 
 /// Whether a `-bin` gRPC metadata value is base64, with or without padding.

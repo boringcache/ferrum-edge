@@ -1,7 +1,7 @@
+use crate::fips::approved::Sha256;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -3084,6 +3084,7 @@ mod tests {
                 namespace: Some("clients".to_string()),
             },
             service_name: "client".to_string(),
+            service_namespace: None,
             addresses: vec!["10.2.0.11".to_string()],
             ports: Vec::new(),
             trust_domain: TrustDomain::new("cluster.local").expect("source trust domain"),

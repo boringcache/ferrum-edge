@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
+  `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
+  compile onto a shared precomputed `Proxy.stream_match` carrier and are
+  evaluated from trustworthy connection/workload metadata before stream route
+  selection (issues #3246–#3250). Shared-SPIFFE label evidence is bound to an
+  exact pod/IP or identical-label replica set. AND semantics apply within one
+  match arm; OR across match candidates on a shared listen port. Missing
+  identity, label, subnet, or gateway evidence denies the requiring predicate;
+  candidates retain VirtualService declaration order, including an explicitly
+  earlier catch-all that shadows later rules;
+  `exportTo` projects routes into eligible sidecar/named-gateway namespaces,
+  where workload selectors remain mesh-only and gateway selection stays
+  independent;
+  malformed label keys/values, namespaces, gateway names, and CIDRs fail closed
+  at translation with field-specific `FerrumAccepted=False`/`Invalid`
+  diagnostics. Istio
+  gateway scope defaults to the reserved `mesh` token; named-gateway data
+  planes set `FERRUM_STREAM_GATEWAY_REF`. Existing SNI/port routing and
+  weighted-split fail-closed behavior are preserved.
+
+- Audited admin mutations are durable **before they run** (issue #2421).
+  The admin write gate fsyncs a pre-mutation audit intent — a stable event id
+  plus the authenticated actor, method, sanitized path / namespace, canonical
+  socket source address, and bounded request id — into
+  `FERRUM_ADMIN_AUDIT_SPOOL_DIR` before the
+  configuration mutation is invoked, and durably finalizes that same id with
+  `success` or `failure` once the mutation returns. A crash between commit and
+  finalize replays as an explicit `outcome: unknown_outcome` event, never a
+  silent deletion and never an inferred outcome. Records live under
+  per-process-generation instance directories whose ownership lock is held
+  exclusively for the process lifetime, so several gateways may share one spool
+  root and no process can classify its own in-flight record; every record is
+  bound to a non-secret audit-destination identity (backend type, namespace, and
+  a digest of the redacted connection URL) so a reconfigured gateway cannot
+  replay another deployment's evidence into the wrong database. Discovery and
+  replay start with the mode's database backend rather than waiting for a later
+  mutation. Mutation settlement tasks explicitly carry the request audit slot
+  across `tokio::spawn`, and cancellation ownership transfers before spawn so a
+  disconnected client cannot race the detailed outcome against a generic
+  fallback record. The blocking prepare/fsync is itself detached and settles a
+  cancellation that arrived mid-write as `unknown_outcome`, so the newly
+  durable intent cannot remain dormant in a live process generation. Delivery
+  is at-least-once on the stable id and every backend
+  insert is insert-only and idempotent (PostgreSQL/SQLite `ON CONFLICT (id) DO
+  NOTHING`, MySQL `ON DUPLICATE KEY UPDATE id = id`, MongoDB `insert_one` with
+  duplicate-key treated as success), so a duplicate delivery converges to the
+  existing immutable row instead of replacing it. Directory fsync failures are
+  treated as durability failures; corrupt, unrecoverable, and
+  foreign-destination records are quarantined under `<spool>/failed/` and that
+  degradation is sticky until the evidence is resolved. Health and metrics reads
+  are O(1) from atomics and cached background state. Graceful shutdown closes
+  admission, drains every accepted queue entry, interrupts retry waits, and
+  explicitly aborts **and joins** the delivery worker rather than detaching it;
+  a memory-only deadline loss is counted and latches degraded health. Managed
+  TLS/ACME file-store mutations and explicit TLS rotation actions, which also
+  emit audit events, now take the same durable pre-action handoff without
+  inheriting config-database topology gates. New `FERRUM_ADMIN_AUDIT_{SPOOL_DIR,
+  UNAVAILABLE_POLICY,QUEUE_CAPACITY,SPOOL_MAX_RECORDS,RETAINED_MAX_RECORDS,
+  MAX_DELIVERY_ATTEMPTS}` settings, `ferrum_admin_audit_*` Prometheus families,
+  and an authenticated `/health` `audit_pipeline` object.
+
 - Admin audit events gain optional `source_address`, `request_id`, and
   `outcome` fields (folded into the baseline `audit_events` schema).
   `GET /backup` always admits a durable security record before releasing
@@ -98,6 +159,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- DestinationRule-only create/update/removal now atomically republishes the
+  affected route table (and LB) before mesh status/revision reports the
+  generation programmed (#3243). `#[serde(skip)]` DR-derived proxy projections
+  (`dispatch_port_overrides`, `dispatch_port_override_fallback`, `resolved_tls`,
+  and mesh stream-relay dispatch maps) are compared even when serialized proxy
+  `updated_at` is unchanged — including the empty-`ConfigDelta` publish path —
+  so route-held `Arc<Proxy>` values cannot stay stale until an unrelated event.
 - Durable `api_chargeback_sink` ClickHouse requests now pin
   `wait_for_async_insert=1` whenever the setting is omitted, even when Ferrum
   also omits `async_insert`. This prevents a ClickHouse user/profile default

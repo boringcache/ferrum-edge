@@ -206,7 +206,7 @@
   {
     "name": "chargeback_sink_spool_bytes",
     "type": "gauge",
-    "help": "Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files).",
+    "help": "Chargeback sink on-disk owned spool bytes (active, temp, in-flight claim, corrupt, and dead-lettered files).",
     "labels": [],
     "subsystem": "api_chargeback_sink",
     "export_surface": "/metrics",
@@ -236,7 +236,7 @@
   {
     "name": "chargeback_sink_spool_files",
     "type": "gauge",
-    "help": "Chargeback sink on-disk owned spool file count (active, temp, corrupt, and dead-lettered files).",
+    "help": "Chargeback sink on-disk owned spool file count (active, temp, in-flight claim, corrupt, and dead-lettered files).",
     "labels": [],
     "subsystem": "api_chargeback_sink",
     "export_surface": "/metrics",
@@ -314,6 +314,307 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "conditional"
+  },
+  {
+    "name": "ferrum_admin_audit_available",
+    "type": "gauge",
+    "help": "Whether the admin audit pipeline can durably record committed mutations (1) or not (0).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_corrupt_records_total",
+    "type": "counter",
+    "help": "Durable admin audit records quarantined as corrupt (bad version, unparseable, oversized, or id mismatch).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_degraded",
+    "type": "gauge",
+    "help": "Sticky evidence that admin audit records were corrupted, retained as unrecoverable, or permanently discarded (1) or not (0). A later successful delivery does not clear it.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_delivery_failures_total",
+    "type": "counter",
+    "help": "Admin audit delivery attempts that returned an error from the database backend.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_delivery_in_flight",
+    "type": "gauge",
+    "help": "Admin audit delivery attempts currently in flight.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_delivery_retries_total",
+    "type": "counter",
+    "help": "Bounded-backoff retries scheduled after a transient admin audit delivery failure.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_destination_mismatch_total",
+    "type": "counter",
+    "help": "Durable admin audit records quarantined because they target a different database or namespace destination.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_events_accepted_total",
+    "type": "counter",
+    "help": "Admin audit events accepted from a committed admin mutation.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_events_delivered_total",
+    "type": "counter",
+    "help": "Admin audit events accepted by the configured database backend.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_events_dropped_total",
+    "type": "counter",
+    "help": "Admin audit events lost without a durable record, by reason.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_events_enqueued_total",
+    "type": "counter",
+    "help": "Admin audit events admitted to the bounded in-memory delivery queue.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_events_finalized_total",
+    "type": "counter",
+    "help": "Admin audit intents durably finalized with the mutation's known outcome.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_events_replayed_total",
+    "type": "counter",
+    "help": "Durable admin audit records re-read from the spool for delivery (restart, queue overflow, or an expired shutdown drain).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_events_retained_total",
+    "type": "counter",
+    "help": "Admin audit events that exhausted the delivery-attempt budget and were retained for operator remediation.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_evidence_lost",
+    "type": "gauge",
+    "help": "Whether admin audit evidence has been permanently discarded (1) or not (0). Never clears.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_fail_closed_rejections_total",
+    "type": "counter",
+    "help": "Admin mutations refused up front because the audit pipeline is unavailable under the fail_closed policy.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_fail_open_unaudited_mutations_total",
+    "type": "counter",
+    "help": "Admin mutations allowed to proceed without durable pre-mutation audit evidence under the fail_open policy.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_intents_prepared_total",
+    "type": "counter",
+    "help": "Pre-mutation admin audit intents made durable (fsynced) before the configuration mutation was invoked.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_queue_capacity",
+    "type": "gauge",
+    "help": "Configured depth of the bounded in-memory admin audit delivery queue.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_queue_depth",
+    "type": "gauge",
+    "help": "Admin audit events currently waiting in the bounded in-memory delivery queue.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_retained_records",
+    "type": "gauge",
+    "help": "Durable admin audit records retained as unrecoverable for operator remediation.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_spool_pending_records",
+    "type": "gauge",
+    "help": "Durable admin audit records awaiting delivery (O(1) admission counter; a saturated background scan reports a floor).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_spool_prepared_records",
+    "type": "gauge",
+    "help": "Durable pre-mutation admin audit intents awaiting finalization.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_truncated_diffs_total",
+    "type": "counter",
+    "help": "Admin audit events whose diff was replaced by a redacted marker because it exceeded the durable record ceiling.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_unknown_outcome_total",
+    "type": "counter",
+    "help": "Prepared admin audit records whose trustworthy outcome observer was lost to process exit or request cancellation.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
   },
   {
     "name": "ferrum_admin_max_connections",
@@ -1751,6 +2052,20 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_node_agent_cni_calls_total",
+    "type": "counter",
+    "help": "Node-agent CNI plugin RPC outcomes by verb.",
+    "labels": [
+      "verb",
+      "outcome",
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_node_agent_cni_socket_lifecycle_total",
     "type": "counter",
     "help": "Node-agent CNI socket lifecycle failures by bounded reason.",
@@ -2216,7 +2531,7 @@
   {
     "name": "ferrum_request_mirror_request_failures_total",
     "type": "counter",
-    "help": "request_mirror pre-response transport failures (DNS, refused, reset, TLS, \u2026).",
+    "help": "request_mirror pre-response transport failures (DNS, refused, reset, TLS, …).",
     "labels": [
       "namespace"
     ],

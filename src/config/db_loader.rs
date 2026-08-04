@@ -32,12 +32,13 @@ use crate::config::validation_pipeline::{
     ConfigValidationRejection, ValidationAction, ValidationPipeline,
     collect_rejecting_runtime_config_errors, validate_plugin_file_dependencies_off_thread,
 };
+use crate::fips::approved::Sha256;
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
+use crate::proxy::stream_match::StreamMatchCriteria;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use dashmap::DashMap;
-use sha2::{Digest, Sha256};
 use sqlx::Executor;
 use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
@@ -2896,7 +2897,7 @@ impl DatabaseStore {
     // column.  The `replace_api_spec_bundle` path uses UPDATE so it is out of scope.
     // ── Drift-prevention contract for proxy INSERT call sites ────────────────
     //
-    // The 45-column proxy column list is canonical and shared by THREE INSERT
+    // The 52-column proxy column list is canonical and shared by THREE INSERT
     // sites and ONE UPDATE site. When you add a new column to the `proxies`
     // table, it must be added — in the same position — to ALL of:
     //
@@ -2918,20 +2919,20 @@ impl DatabaseStore {
     // such helpers verbose without meaningful runtime benefit.
 
     /// Number of `?` placeholders in `PROXY_INSERT_SQL` (no api_spec_id).
-    /// 48 base columns + `created_at` + `updated_at` = 50.
+    /// 50 resource columns + `created_at` + `updated_at` = 52.
     ///
     /// Used only by the drift-catcher tests in `proxy_insert_sql_drift_tests`;
     /// kept available outside `#[cfg(test)]` so it remains a visible
     /// drift-prevention anchor when reading the SQL definition.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 51;
+    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 52;
 
     /// Number of `?` placeholders in the `submit_api_spec_bundle` proxy
     /// INSERT statement (which adds `api_spec_id` between
-    /// `stream_proxy_protocol` and `created_at`).
-    /// 51 base + 1 (api_spec_id) = 52.
+    /// `stream_match` and `created_at`).
+    /// 52 base + 1 (api_spec_id) = 53.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 52;
+    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 53;
 
     /// Proxy INSERT SQL without `api_spec_id` (direct admin path and bulk import).
     ///
@@ -2956,12 +2957,12 @@ impl DatabaseStore {
          listen_port, frontend_tls, passthrough, \
          udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
          allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
-         stream_proxy_protocol, \
+         stream_proxy_protocol, stream_match, \
          upstream_subset, \
          created_at, updated_at) \
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                ?, ?, ?, ?, ?, ?)";
+                ?, ?, ?, ?, ?, ?, ?)";
 
     // ---- CRUD for Admin API ----
 
@@ -2981,6 +2982,7 @@ impl DatabaseStore {
             ResponseBodyMode::Buffer => "buffer",
             ResponseBodyMode::Stream => "stream",
         };
+        let stream_match_json = serialize_stream_match(proxy)?;
 
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, &proxy.namespace)
@@ -3088,6 +3090,7 @@ impl DatabaseStore {
                     .stream_proxy_protocol
                     .map(|v| if v { 1i32 } else { 0 }),
             )
+            .bind(&stream_match_json)
             .bind(&proxy.upstream_subset)
             .bind(proxy.created_at.to_rfc3339())
             .bind(proxy.updated_at.to_rfc3339())
@@ -3162,9 +3165,10 @@ impl DatabaseStore {
             .await?;
 
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
+        let stream_match_json = serialize_stream_match(proxy)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, updated_at=? WHERE id=? AND namespace=?")
+            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, stream_match=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&proxy.name)
         .bind(&hosts_json)
@@ -3213,6 +3217,7 @@ impl DatabaseStore {
         .bind(if proxy.allowed_ws_origins.is_empty() { None } else { Some(serde_json::to_string(&proxy.allowed_ws_origins)?) })
         .bind(proxy.udp_max_response_amplification_factor.map(|v| v as f64))
         .bind(proxy.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
+        .bind(&stream_match_json)
         .bind(proxy.updated_at.to_rfc3339())
         .bind(&proxy.id)
         .bind(&proxy.namespace)
@@ -5451,7 +5456,12 @@ impl DatabaseStore {
         for row in &rows {
             let id: String = row.try_get("id")?;
             let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
-            proxies.push(row_to_proxy(row, id, plugins)?);
+            let mut proxy = row_to_proxy(row, id, plugins)?;
+            // Match get_proxy / full-load admission: compiled_stream_match and
+            // host canonicalization are serde-skipped / derived, so incremental
+            // point-loads must normalize before publishing the delta.
+            proxy.normalize_fields();
+            proxies.push(proxy);
         }
         Self::ensure_no_unmatched_proxy_plugin_associations(
             "load_incremental_config",
@@ -5468,7 +5478,13 @@ impl DatabaseStore {
         let rows = self
             .load_rows_by_ids("consumers", namespace, ids, "load_consumers_by_ids")
             .await?;
-        rows.iter().map(row_to_consumer).collect()
+        let mut consumers = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut consumer = row_to_consumer(row)?;
+            consumer.normalize_fields();
+            consumers.push(consumer);
+        }
+        Ok(consumers)
     }
 
     async fn load_plugin_configs_by_ids(
@@ -5484,7 +5500,13 @@ impl DatabaseStore {
                 "load_plugin_configs_by_ids",
             )
             .await?;
-        rows.iter().map(row_to_plugin_config).collect()
+        let mut configs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut plugin_config = row_to_plugin_config(row)?;
+            plugin_config.normalize_fields();
+            configs.push(plugin_config);
+        }
+        Ok(configs)
     }
 
     async fn load_upstreams_by_ids(
@@ -5495,7 +5517,13 @@ impl DatabaseStore {
         let rows = self
             .load_rows_by_ids("upstreams", namespace, ids, "load_upstreams_by_ids")
             .await?;
-        rows.iter().map(row_to_upstream).collect()
+        let mut upstreams = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut upstream = row_to_upstream(row)?;
+            upstream.normalize_fields();
+            upstreams.push(upstream);
+        }
+        Ok(upstreams)
     }
 
     async fn load_rows_by_ids(
@@ -5856,6 +5884,7 @@ impl DatabaseStore {
                 ResponseBodyMode::Stream => "stream",
             };
             let hosts_json = serde_json::to_string(&proxy.hosts)?;
+            let stream_match_json = serialize_stream_match(proxy)?;
 
             sqlx::query(&insert_sql)
                 .bind(&proxy.id)
@@ -5955,6 +5984,7 @@ impl DatabaseStore {
                         .stream_proxy_protocol
                         .map(|v| if v { 1i32 } else { 0 }),
                 )
+                .bind(&stream_match_json)
                 .bind(&proxy.upstream_subset)
                 .bind(proxy.created_at.to_rfc3339())
                 .bind(proxy.updated_at.to_rfc3339())
@@ -7528,6 +7558,7 @@ impl DatabaseStore {
                 ResponseBodyMode::Buffer => "buffer",
                 ResponseBodyMode::Stream => "stream",
             };
+            let stream_match_json = serialize_stream_match(p)?;
 
             sqlx::query(&self.q("INSERT INTO proxies \
                  (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, \
@@ -7546,11 +7577,11 @@ impl DatabaseStore {
                   listen_port, frontend_tls, passthrough, \
                   udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
                   allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
-                  stream_proxy_protocol, \
+                  stream_proxy_protocol, stream_match, \
                   api_spec_id, created_at, updated_at) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                         ?, ?, ?, ?, ?, ?, ?)"))
+                         ?, ?, ?, ?, ?, ?, ?, ?)"))
             .bind(&p.id)
             .bind(&p.namespace)
             .bind(&p.name)
@@ -7625,6 +7656,7 @@ impl DatabaseStore {
             })
             .bind(p.udp_max_response_amplification_factor.map(|v| v as f64))
             .bind(p.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
+            .bind(&stream_match_json)
             .bind(&spec.id)
             .bind(p.created_at.to_rfc3339())
             .bind(p.updated_at.to_rfc3339())
@@ -7746,6 +7778,14 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         use crate::config::types::{AuthMode, ResponseBodyMode};
 
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+            spec.external_ref_snapshot.as_deref(),
+            spec.external_ref_digest.as_deref(),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+        })?;
+
         // --- Resource no-op shortcut (Wave 5 Feature A) -----------------------
         // Compare the current spec-owned resource graph to the incoming bundle
         // inside the SAME transaction as any subsequent write. If they already
@@ -7796,6 +7836,7 @@ impl DatabaseStore {
             sqlx::query(&self.q("UPDATE api_specs SET \
                  spec_content = ?, content_encoding = ?, content_hash = ?, \
                  uncompressed_size = ?, resource_hash = ?, \
+                 external_ref_snapshot = ?, external_ref_digest = ?, \
                  spec_format = ?, spec_version = ?, title = ?, info_version = ?, \
                  description = ?, contact_name = ?, contact_email = ?, \
                  license_name = ?, license_identifier = ?, \
@@ -7807,6 +7848,8 @@ impl DatabaseStore {
             .bind(&spec.content_hash)
             .bind(spec.uncompressed_size as i64)
             .bind(&spec.resource_hash)
+            .bind(&spec.external_ref_snapshot)
+            .bind(&spec.external_ref_digest)
             .bind(spec_format_str)
             .bind(&spec.spec_version)
             .bind(&spec.title)
@@ -7962,6 +8005,7 @@ impl DatabaseStore {
                 ResponseBodyMode::Buffer => "buffer",
                 ResponseBodyMode::Stream => "stream",
             };
+            let stream_match_json = serialize_stream_match(p)?;
 
             sqlx::query(&self.q("UPDATE proxies SET \
                  namespace = ?, name = ?, hosts = ?, listen_path = ?, backend_scheme = ?, \
@@ -7989,7 +8033,7 @@ impl DatabaseStore {
                  websocket_idle_timeout_seconds = ?, \
                  allowed_methods = ?, allowed_ws_origins = ?, \
                  udp_max_response_amplification_factor = ?, \
-                 stream_proxy_protocol = ?, \
+                 stream_proxy_protocol = ?, stream_match = ?, \
                  api_spec_id = ?, updated_at = ? \
                  WHERE id = ? AND namespace = ?"))
             .bind(&p.namespace)
@@ -8065,6 +8109,7 @@ impl DatabaseStore {
             })
             .bind(p.udp_max_response_amplification_factor.map(|v| v as f64))
             .bind(p.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
+            .bind(&stream_match_json)
             .bind(&spec.id)
             .bind(p.updated_at.to_rfc3339())
             // WHERE clause — match by primary key
@@ -8159,6 +8204,7 @@ impl DatabaseStore {
              description = ?, contact_name = ?, contact_email = ?, \
              license_name = ?, license_identifier = ?, \
              tags = ?, server_urls = ?, operation_count = ?, resource_hash = ?, \
+             external_ref_snapshot = ?, external_ref_digest = ?, \
              updated_at = ? \
              WHERE namespace = ? AND id = ?"))
         .bind(&spec.proxy_id)
@@ -8179,6 +8225,8 @@ impl DatabaseStore {
         .bind(&server_urls_json)
         .bind(spec.operation_count as i64)
         .bind(&spec.resource_hash)
+        .bind(&spec.external_ref_snapshot)
+        .bind(&spec.external_ref_digest)
         .bind(spec.updated_at.to_rfc3339())
         .bind(&spec.namespace)
         .bind(&spec.id)
@@ -8406,6 +8454,13 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         spec: &crate::config::types::ApiSpec,
     ) -> Result<(), anyhow::Error> {
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+            spec.external_ref_snapshot.as_deref(),
+            spec.external_ref_digest.as_deref(),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+        })?;
         let spec_format_str = match spec.spec_format {
             crate::config::types::SpecFormat::Json => "json",
             crate::config::types::SpecFormat::Yaml => "yaml",
@@ -8418,8 +8473,9 @@ impl DatabaseStore {
               content_encoding, uncompressed_size, content_hash, title, info_version, \
               description, contact_name, contact_email, license_name, license_identifier, \
               tags, server_urls, operation_count, resource_hash, \
+              external_ref_snapshot, external_ref_digest, \
               created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
         .bind(&spec.id)
         .bind(&spec.namespace)
         .bind(&spec.proxy_id)
@@ -8440,6 +8496,8 @@ impl DatabaseStore {
         .bind(&server_urls_json)
         .bind(spec.operation_count as i64)
         .bind(&spec.resource_hash)
+        .bind(&spec.external_ref_snapshot)
+        .bind(&spec.external_ref_digest)
         .bind(spec.created_at.to_rfc3339())
         .bind(spec.updated_at.to_rfc3339())
         .execute(&mut **tx)
@@ -8631,7 +8689,7 @@ impl DatabaseStore {
              content_encoding, uncompressed_size, content_hash, title, \
              info_version, description, contact_name, contact_email, \
              license_name, license_identifier, tags, server_urls, \
-             operation_count, created_at, updated_at \
+             operation_count, external_ref_digest, created_at, updated_at \
              FROM api_specs WHERE {where_clause} \
              ORDER BY {order_col} {order_dir} LIMIT ? OFFSET ?"
         ));
@@ -8873,10 +8931,29 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let start = std::time::Instant::now();
         let diff = serde_json::to_string(&event.diff)?;
-        sqlx::query(&self.q("INSERT INTO audit_events \
+        // Insert-only and idempotent on the primary key (issue #2421).
+        // Durable-spool replay after a crash, a partial failure, or a shutdown
+        // deadline re-delivers the *same* `id`, so a second delivery must
+        // converge to the one already-durable row instead of raising a
+        // duplicate-key error the retry loop would keep burning attempts on.
+        // Neither branch ever mutates an existing audit row: PostgreSQL/SQLite
+        // use `DO NOTHING`, and MySQL's `ON DUPLICATE KEY UPDATE id = id`
+        // assigns the primary key to itself, which is a no-op write of no
+        // column. `INSERT IGNORE` is deliberately not used because it also
+        // downgrades unrelated errors (truncation, bad values) to warnings and
+        // would silently accept a malformed audit row. This is a single
+        // statement, so it needs no transaction.
+        let on_conflict = if self.db_type == "mysql" {
+            " ON DUPLICATE KEY UPDATE id = id"
+        } else {
+            " ON CONFLICT (id) DO NOTHING"
+        };
+        sqlx::query(&self.q(&format!(
+            "INSERT INTO audit_events \
              (id, ts, actor, action, resource_type, resource_id, namespace, \
               source_address, request_id, outcome, diff) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?){on_conflict}"
+        )))
         .bind(&event.id)
         .bind(audit_ts_string(&event.ts))
         .bind(&event.actor)
@@ -9980,6 +10057,21 @@ pub(crate) fn parse_auth_mode(s: &str) -> AuthMode {
 }
 
 /// Parse a proxy row into a Proxy struct (shared by load_proxies and get_proxy).
+fn serialize_stream_match(proxy: &Proxy) -> Result<Option<String>, anyhow::Error> {
+    proxy
+        .stream_match
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Proxy {}: failed to serialize stream_match JSON: {}",
+                proxy.id,
+                e
+            )
+        })
+}
+
 fn row_to_proxy(
     row: &AnyRow,
     id: String,
@@ -10212,6 +10304,15 @@ fn row_to_proxy_inner(
         stream_proxy_protocol: row
             .try_get::<Option<i32>, _>("stream_proxy_protocol")?
             .map(|v| v != 0),
+        stream_match: match optional_utf8_text_column(row, "stream_match")? {
+            Some(s) => Some(
+                serde_json::from_str::<StreamMatchCriteria>(&s).map_err(|_| {
+                    anyhow::anyhow!("Proxy {}: failed to parse stream_match JSON", pid)
+                })?,
+            ),
+            None => None,
+        },
+        compiled_stream_match: None,
         // api_spec_id: PRESERVE here. This row mapper is shared between
         // admin GET/list paths (which need the real owning spec id to
         // serialise per the OpenAPI schema) and the runtime config loader
@@ -10604,7 +10705,7 @@ pub(crate) fn strip_api_spec_id_from_runtime_config(config: &mut GatewayConfig) 
 fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
     // spec_content is stored as BLOB/BYTEA — sqlx returns Vec<u8>.
     let spec_content: Vec<u8> = row.try_get("spec_content")?;
-    row_to_api_spec_with_content(row, spec_content)
+    row_to_api_spec_with_content(row, spec_content, true)
 }
 
 /// Parse an api_specs list row into an [`ApiSpec`] summary.
@@ -10613,12 +10714,13 @@ fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow
 /// every row. Keep `spec_content` empty here; full document retrieval goes
 /// through [`row_to_api_spec`].
 fn row_to_api_spec_summary(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
-    row_to_api_spec_with_content(row, Vec::new())
+    row_to_api_spec_with_content(row, Vec::new(), false)
 }
 
 fn row_to_api_spec_with_content(
     row: &AnyRow,
     spec_content: Vec<u8>,
+    snapshot_projected: bool,
 ) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
     use crate::config::types::{ApiSpec, SpecFormat};
 
@@ -10643,6 +10745,26 @@ fn row_to_api_spec_with_content(
     let resource_hash: String = row
         .try_get::<String, _>("resource_hash")
         .unwrap_or_default();
+    let external_ref_snapshot: Option<Vec<u8>> = if snapshot_projected {
+        row.try_get("external_ref_snapshot")?
+    } else {
+        None
+    };
+    let external_ref_digest: Option<String> = row.try_get("external_ref_digest")?;
+    if snapshot_projected {
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+            external_ref_snapshot.as_deref(),
+            external_ref_digest.as_deref(),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+        })?;
+    } else {
+        crate::admin::api_specs::external_refs::validate_external_ref_summary_digest(
+            external_ref_digest.as_deref(),
+        )
+        .map_err(|_| anyhow::anyhow!("api_specs external-ref digest validation failed"))?;
+    }
 
     Ok(ApiSpec {
         id: row.try_get("id")?,
@@ -10667,6 +10789,8 @@ fn row_to_api_spec_with_content(
         server_urls,
         operation_count,
         resource_hash,
+        external_ref_snapshot,
+        external_ref_digest,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })
@@ -10807,7 +10931,7 @@ mod proxy_insert_sql_drift_tests {
         // change there.
         let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                                     ?, ?, ?, ?, ?, ?, ?)";
+                                     ?, ?, ?, ?, ?, ?, ?, ?)";
         let placeholders = values_clause.matches('?').count();
         assert_eq!(
             placeholders,

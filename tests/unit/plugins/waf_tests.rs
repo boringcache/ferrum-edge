@@ -406,7 +406,7 @@ async fn body_encoding_specials_trigger_buffering_without_body_rules() {
     assert!(plugin.requires_response_body_buffering());
     assert!(plugin.should_buffer_response_body(&resp_ctx));
     let result = plugin
-        .on_final_response_body(
+        .finalize_client_visible_response_body(
             &mut resp_ctx,
             200,
             &response_headers,
@@ -425,7 +425,7 @@ async fn body_encoding_specials_trigger_buffering_without_body_rules() {
         "application/octet-stream".to_string(),
     )]);
     let result = plugin
-        .on_final_response_body(
+        .finalize_client_visible_response_body(
             &mut binary_resp_ctx,
             200,
             &response_headers,
@@ -1217,7 +1217,7 @@ async fn response_body_scan_detects_sensitive_data_when_enabled() {
     let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
 
     let result = plugin
-        .on_final_response_body(
+        .finalize_client_visible_response_body(
             &mut ctx,
             200,
             &headers,
@@ -1266,7 +1266,7 @@ async fn response_luhn_and_cidr_rules_scan_decoded_variants() {
 
     let mut luhn_ctx = ctx("GET", "/debug");
     let result = plugin
-        .on_final_response_body(
+        .finalize_client_visible_response_body(
             &mut luhn_ctx,
             200,
             &headers,
@@ -1284,7 +1284,12 @@ async fn response_luhn_and_cidr_rules_scan_decoded_variants() {
 
     let mut cidr_ctx = ctx("GET", "/debug");
     let result = plugin
-        .on_final_response_body(&mut cidr_ctx, 200, &headers, b"ip=10&#46;2&#46;3&#46;4")
+        .finalize_client_visible_response_body(
+            &mut cidr_ctx,
+            200,
+            &headers,
+            b"ip=10&#46;2&#46;3&#46;4",
+        )
         .await;
 
     assert!(matches!(result, PluginResult::Reject { .. }));
@@ -1318,7 +1323,7 @@ async fn decoded_response_body_rules_scan_lossy_utf8_bodies() {
     let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
 
     let result = plugin
-        .on_final_response_body(&mut ctx, 200, &headers, b"\xffq=%3Cscript%3E")
+        .finalize_client_visible_response_body(&mut ctx, 200, &headers, b"\xffq=%3Cscript%3E")
         .await;
 
     assert!(matches!(result, PluginResult::Reject { .. }));
@@ -3381,7 +3386,12 @@ async fn scoring_preserves_same_instance_accumulation_across_lifecycle_phases() 
 
     assert!(matches!(
         plugin
-            .on_final_response_body(&mut ctx, 200, &response_headers, br#"{"out":"rbhit"}"#)
+            .finalize_client_visible_response_body(
+                &mut ctx,
+                200,
+                &response_headers,
+                br#"{"out":"rbhit"}"#
+            )
             .await,
         PluginResult::Continue
     ));
@@ -4811,7 +4821,12 @@ async fn oversize_response_body_fails_closed_by_default() {
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     let result = plugin
-        .on_final_response_body(&mut ctx, 200, &response_headers, &padded_body("secret"))
+        .finalize_client_visible_response_body(
+            &mut ctx,
+            200,
+            &response_headers,
+            &padded_body("secret"),
+        )
         .await;
 
     assert!(
@@ -4845,7 +4860,12 @@ async fn monitor_only_response_body_rule_prefix_scans_oversize_response_body() {
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     let result = plugin
-        .on_final_response_body(&mut ctx, 200, &response_headers, &padded_body("secret"))
+        .finalize_client_visible_response_body(
+            &mut ctx,
+            200,
+            &response_headers,
+            &padded_body("secret"),
+        )
         .await;
 
     assert!(matches!(result, PluginResult::Continue));
@@ -4877,7 +4897,12 @@ async fn enforcing_request_body_rule_does_not_fail_close_the_response_body() {
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     let result = plugin
-        .on_final_response_body(&mut ctx, 200, &response_headers, &padded_body("secret"))
+        .finalize_client_visible_response_body(
+            &mut ctx,
+            200,
+            &response_headers,
+            &padded_body("secret"),
+        )
         .await;
 
     assert!(matches!(result, PluginResult::Continue));

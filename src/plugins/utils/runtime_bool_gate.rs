@@ -31,8 +31,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::fips::approved::Sha256;
 use arc_swap::ArcSwap;
-use sha2::{Digest, Sha256};
 
 use crate::modes::mesh::config::MeshRuntimeOverlay;
 
@@ -80,7 +80,7 @@ impl GatePolicyStamp {
             digest.update([u8::from(gates.get(scope).copied().unwrap_or(false))]);
         }
         Self(Arc::new(GatePublication {
-            fingerprint: digest.finalize().into(),
+            fingerprint: digest.finalize(),
         }))
     }
 

@@ -194,6 +194,7 @@
 //!   over HTTPS.
 //! - **rustls**: Enables TLS functionality provided by `rustls`.
 //! - **rustls-no-provider**: Enables TLS provided by `rustls` without specifying a crypto provider.
+//! - **__rustls-ring**: Internal provider-selection arm for applications that pair reqwest with `rustls/ring`.
 //! - **native-tls**: Enables TLS functionality provided by `native-tls`.
 //! - **native-tls-vendored**: Enables the `vendored` feature of `native-tls`.
 //! - **native-tls-no-alpn**: Enables `native-tls` without its `alpn` feature.

@@ -913,7 +913,7 @@ mod tests {
 
     fn ensure_crypto_provider() {
         INIT_CRYPTO.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            let _ = crate::fips::base_crypto_provider().install_default();
         });
     }
 
@@ -1056,6 +1056,8 @@ mod tests {
             udp_idle_timeout_seconds: 60,
             udp_max_response_amplification_factor: None,
             stream_proxy_protocol: None,
+            stream_match: None,
+            compiled_stream_match: None,
             tcp_idle_timeout_seconds: None,
             websocket_idle_timeout_seconds: None,
             allowed_methods: None,
@@ -1129,7 +1131,7 @@ mod tests {
     }
 
     fn new_test_client_config() -> rustls::ClientConfig {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(crate::fips::base_crypto_provider());
         rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .expect("default protocol versions")
@@ -1138,12 +1140,18 @@ mod tests {
     }
 
     fn quic_incompatible_policy() -> TlsPolicy {
-        let base_provider = rustls::crypto::ring::default_provider();
+        let base_provider = crate::fips::base_crypto_provider();
         let provider = rustls::crypto::CryptoProvider {
             cipher_suites: vec![
-                rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                crate::fips::cipher_suite(
+                    rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                )
+                .expect("provider implements ECDHE-RSA-AES256-GCM-SHA384"),
             ],
-            kx_groups: vec![rustls::crypto::ring::kx_group::X25519],
+            kx_groups: vec![
+                crate::fips::kx_group(rustls::NamedGroup::X25519)
+                    .expect("provider implements X25519"),
+            ],
             ..base_provider
         };
 

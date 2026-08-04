@@ -1,5 +1,5 @@
+use crate::fips::approved::Sha256;
 use prost::Message;
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tracing::warn;
 

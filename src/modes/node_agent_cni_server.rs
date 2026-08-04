@@ -3,8 +3,9 @@
 //!
 //! Architecture:
 //! - The CNI binary (`bin/ferrum-cni`) is invoked by kubelet during pod
-//!   sandbox setup. It hands the call (ADD/DEL/CHECK + pod identity) to us
-//!   over a Unix socket using the length-prefixed JSON wire format in
+//!   sandbox setup (and periodically for CNI 1.1 STATUS/GC). It hands the
+//!   call (ADD/DEL/CHECK/STATUS/GC + pod identity or valid attachments) to
+//!   us over a Unix socket using the length-prefixed JSON wire format in
 //!   [`crate::cni::rpc`].
 //! - This server runs as a tokio task spawned from
 //!   [`crate::modes::node_agent::run_with_backend`]. It accepts one
@@ -55,6 +56,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 #[cfg(unix)]
+use tokio::sync::Semaphore;
+#[cfg(unix)]
 use tokio::time::timeout;
 #[cfg(unix)]
 use tracing::{debug, error, info};
@@ -97,6 +100,12 @@ pub fn cni_work_channel() -> (CniWorkSender, CniWorkReceiver) {
 /// binary sees a structured error rather than the kubelet killing it.
 #[cfg(unix)]
 const MAIN_LOOP_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound peers that are framing or awaiting one request so stalled local
+/// clients cannot create unbounded tasks or aggregate frame allocations.
+#[cfg(unix)]
+const MAX_CONCURRENT_CNI_CONNECTIONS: usize = 64;
+#[cfg(unix)]
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// A legacy generation may predate the lifetime lock. Refuse to unlink its
 /// socket when a short local connect probe succeeds or cannot be resolved
 /// promptly; only a definitive refused/missing endpoint is stale.
@@ -300,11 +309,12 @@ pub fn spawn_cni_listener(
         }
         info!(
             socket_path = %socket_path,
-            "Node-agent CNI listener bound; ferrum-cni binary may now forward ADD/DEL/CHECK calls"
+            "Node-agent CNI listener bound; ferrum-cni binary may now forward ADD/DEL/CHECK/STATUS/GC calls"
         );
 
         let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
         let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
+        let connection_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_CNI_CONNECTIONS));
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -316,9 +326,16 @@ pub fn spawn_cni_listener(
                     match accept {
                         Ok((stream, _addr)) => {
                             accept_backoff.on_success();
+                            let Ok(connection_slot) = connection_slots.clone().try_acquire_owned()
+                            else {
+                                // Dropping the accepted stream is the bounded
+                                // back-pressure signal; the CNI runtime retries.
+                                continue;
+                            };
                             let work_sender = work_sender.clone();
                             let metrics = metrics.clone();
                             tokio::spawn(async move {
+                                let _connection_slot = connection_slot;
                                 handle_one_connection(stream, work_sender, metrics).await;
                             });
                         }
@@ -688,9 +705,9 @@ fn unix_path_len(path: &Path) -> usize {
 
 #[cfg(unix)]
 fn random_stage_suffix() -> u64 {
-    use ring::rand::SecureRandom;
+    use crate::fips::backend::rand::SecureRandom;
 
-    let rng = ring::rand::SystemRandom::new();
+    let rng = crate::fips::backend::rand::SystemRandom::new();
     let mut bytes = [0u8; 8];
     if rng.fill(&mut bytes).is_ok() {
         return u64::from_ne_bytes(bytes);
@@ -711,23 +728,28 @@ fn cleanup_private_socket_stage(stage: &PrivateSocketStage) {
 /// Read one RPC, ship it to the main loop, write the response.
 ///
 /// Connection is closed after one round-trip. Any error before we have a
-/// response logs a `warn!`, increments the `error` outcome counter, and
-/// returns — the client side reports the IPC error to kubelet and the
-/// kube-rs watcher reconciliation path is unaffected.
+/// decoded verb is logged only at debug level and cannot affect per-verb
+/// metrics; attributed queue/processing errors increment the bounded outcome
+/// counter. The client reports IPC failure to kubelet and the kube-rs watcher
+/// reconciliation path remains available.
 #[cfg(unix)]
 async fn handle_one_connection(
     mut stream: UnixStream,
     work_sender: CniWorkSender,
     metrics: Arc<NodeAgentMetrics>,
 ) {
-    let request = match read_request_frame(&mut stream).await {
-        Ok(req) => req,
-        Err(err) => {
-            warn!(error = %err, "Failed to read CNI RPC request");
+    let request = match timeout(REQUEST_READ_TIMEOUT, read_request_frame(&mut stream)).await {
+        Ok(Ok(req)) => req,
+        Ok(Err(err)) => {
+            debug!(error = %err, "Rejected malformed CNI RPC request");
             // We cannot attribute to a specific verb because parsing failed;
             // bump the "error" outcome on each verb? Instead, log only —
             // bad framing means a misconfigured client, not a node-agent
             // signal worth alerting on.
+            return;
+        }
+        Err(_elapsed) => {
+            debug!("Timed out reading CNI RPC request");
             return;
         }
     };
@@ -736,7 +758,14 @@ async fn handle_one_connection(
         RpcVerb::Add => CniCallVerb::Add,
         RpcVerb::Del => CniCallVerb::Del,
         RpcVerb::Check => CniCallVerb::Check,
+        RpcVerb::Status => CniCallVerb::Status,
+        RpcVerb::Gc => CniCallVerb::Gc,
     };
+    if let Err(reason) = request.validate() {
+        metrics.record_cni_call(metric_verb, CniCallOutcome::Rejected);
+        let _ = write_response_frame(&mut stream, &CniRpcResponse::Rejected { reason }).await;
+        return;
+    }
 
     let (resp_tx, resp_rx) = oneshot::channel();
     let work = CniWorkItem {
@@ -807,7 +836,10 @@ async fn read_request_frame(stream: &mut UnixStream) -> Result<CniRpcRequest, St
         .read_exact(&mut body)
         .await
         .map_err(|e| format!("read body: {e}"))?;
-    decode_body(&body)
+    if crate::util::json_dup_keys::slice_ambiguity(&body).is_some() {
+        return Err("ambiguous CNI RPC JSON".to_string());
+    }
+    decode_body(&body).map_err(|_| "invalid CNI RPC JSON".to_string())
 }
 
 #[cfg(unix)]
@@ -897,12 +929,15 @@ mod tests {
     fn pod_event_from_request_strips_optional_fields() {
         let request = CniRpcRequest {
             verb: RpcVerb::Add,
+            network_name: "ferrum-mesh".to_string(),
             pod_namespace: "demo".to_string(),
             pod_name: "alpha".to_string(),
             pod_uid: Some("uid-1".to_string()),
             container_id: "ctr-1".to_string(),
+            ifname: None,
             netns_path: Some("/var/run/netns/cni-1".to_string()),
             args: HashMap::new(),
+            valid_attachments: Vec::new(),
         };
         let labels = HashMap::new();
         let annotations = HashMap::new();
@@ -922,12 +957,15 @@ mod tests {
     fn pod_event_handles_missing_pod_uid_with_empty_string() {
         let request = CniRpcRequest {
             verb: RpcVerb::Del,
+            network_name: "ferrum-mesh".to_string(),
             pod_namespace: "demo".to_string(),
             pod_name: "alpha".to_string(),
             pod_uid: None,
             container_id: "ctr-1".to_string(),
+            ifname: None,
             netns_path: None,
             args: HashMap::new(),
+            valid_attachments: Vec::new(),
         };
         let labels = HashMap::new();
         let annotations = HashMap::new();
@@ -1190,12 +1228,15 @@ mod tests {
             let item = CniWorkItem {
                 request: CniRpcRequest {
                     verb: RpcVerb::Add,
+                    network_name: "ferrum-mesh".to_string(),
                     pod_namespace: "demo".to_string(),
                     pod_name: "alpha".to_string(),
                     pod_uid: None,
                     container_id: "c".to_string(),
+                    ifname: None,
                     netns_path: None,
                     args: HashMap::new(),
+                    valid_attachments: Vec::new(),
                 },
                 respond: _resp,
             };
@@ -1205,12 +1246,15 @@ mod tests {
         let overflow = CniWorkItem {
             request: CniRpcRequest {
                 verb: RpcVerb::Add,
+                network_name: "ferrum-mesh".to_string(),
                 pod_namespace: "demo".to_string(),
                 pod_name: "overflow".to_string(),
                 pod_uid: None,
                 container_id: "c".to_string(),
+                ifname: None,
                 netns_path: None,
                 args: HashMap::new(),
+                valid_attachments: Vec::new(),
             },
             respond: resp_tx,
         };

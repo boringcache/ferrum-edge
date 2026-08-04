@@ -12,6 +12,8 @@ use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::{ConsumerIndex, PluginCache, RouterCache};
 use tracing::info;
 
+use crate::scaffolding::clients::{bind_quinn_client_endpoint, bind_quinn_server_endpoint};
+
 // Initialize rustls crypto provider for tests
 fn init_crypto_provider() {
     // Try to install the crypto provider, but don't panic if it fails
@@ -113,6 +115,8 @@ fn create_http3_test_proxy() -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -849,6 +853,8 @@ async fn test_http3_streaming_decision_logic() {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -1775,7 +1781,7 @@ fn h3_mtls_server_endpoint(fixture: &H3MtlsFixture) -> quinn::Endpoint {
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).expect("quic cfg");
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic));
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("bind addr");
-    quinn::Endpoint::server(server_config, addr).expect("bind QUIC server")
+    bind_quinn_server_endpoint(server_config, addr).expect("bind QUIC server")
 }
 
 /// Build a quinn client endpoint that presents the fixture's client certificate.
@@ -1795,7 +1801,7 @@ fn h3_mtls_client_endpoint(fixture: &H3MtlsFixture) -> quinn::Endpoint {
 
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).expect("quic cfg");
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("bind addr");
-    let mut endpoint = quinn::Endpoint::client(addr).expect("bind QUIC client");
+    let mut endpoint = bind_quinn_client_endpoint(addr).expect("bind QUIC client");
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
     endpoint
 }

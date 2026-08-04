@@ -4,13 +4,13 @@
 //! HBONE listener. Each request opens a CONNECT stream to the application port
 //! and then speaks ordinary HTTP over the resulting byte tunnel.
 
+use crate::fips::approved::Sha256;
 use bytes::{Buf, Bytes};
 use dashmap::DashMap;
 use futures_util::FutureExt;
 use h2::client::SendRequest;
 use h2::{RecvStream, SendStream};
 use http::{Method, Request, StatusCode, Version};
-use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::pin::Pin;
@@ -2473,6 +2473,8 @@ mod tests {
             allowed_ws_origins: vec![],
             udp_max_response_amplification_factor: None,
             stream_proxy_protocol: None,
+            stream_match: None,
+            compiled_stream_match: None,
             created_at: now,
             updated_at: now,
         }

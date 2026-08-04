@@ -425,12 +425,12 @@ pub struct NodeAgentMetrics {
     /// explicit node-global fallback.
     pub capture_state: ArcSwap<&'static str>,
     /// CNI plugin RPC counts split by `(verb, outcome)` where verb is one
-    /// of `add`/`del`/`check` and outcome is `success`/`rejected`/`error`.
-    /// Bounded cardinality (3 × 3 = 9 series at most). Lets operators see
-    /// whether the CNI plugin is the primary enrollment path or the
-    /// kube-rs watcher fallback is doing all the work. Read by the
-    /// Prometheus render path and reset only on process restart.
-    pub cni_calls: [[AtomicU64; 3]; 3],
+    /// of `add`/`del`/`check`/`status`/`gc` and outcome is
+    /// `success`/`rejected`/`error`. Bounded cardinality (5 × 3 = 15 series
+    /// at most). Lets operators see whether the CNI plugin is the primary
+    /// enrollment path or the kube-rs watcher fallback is doing all the work.
+    /// Read by the Prometheus render path and reset only on process restart.
+    pub cni_calls: [[AtomicU64; 3]; 5],
     /// CNI socket lifecycle failures split by a closed reason set. These
     /// process-lifetime counters distinguish a refused live-owner overlap from
     /// stale cleanup, publication/identity, and shutdown cleanup failures.
@@ -448,9 +448,9 @@ pub struct NodeAgentMetricsSnapshot {
     pub capture_state: &'static str,
     /// Snapshot of [`NodeAgentMetrics::cni_calls`]. Same `[verb][outcome]`
     /// layout as the source atomics. The outer axis is verb
-    /// (`add`/`del`/`check`); the inner axis is outcome
+    /// (`add`/`del`/`check`/`status`/`gc`); the inner axis is outcome
     /// (`success`/`rejected`/`error`).
-    pub cni_calls: [[u64; 3]; 3],
+    pub cni_calls: [[u64; 3]; 5],
     /// Snapshot of [`NodeAgentMetrics::cni_socket_lifecycle`], indexed by
     /// [`CniSocketLifecycleReason`].
     pub cni_socket_lifecycle: [u64; 6],
@@ -464,6 +464,8 @@ pub enum CniCallVerb {
     Add = 0,
     Del = 1,
     Check = 2,
+    Status = 3,
+    Gc = 4,
 }
 
 impl CniCallVerb {
@@ -472,11 +474,13 @@ impl CniCallVerb {
             Self::Add => "add",
             Self::Del => "del",
             Self::Check => "check",
+            Self::Status => "status",
+            Self::Gc => "gc",
         }
     }
 
-    pub fn all() -> [Self; 3] {
-        [Self::Add, Self::Del, Self::Check]
+    pub fn all() -> [Self; 5] {
+        [Self::Add, Self::Del, Self::Check, Self::Status, Self::Gc]
     }
 }
 
@@ -541,7 +545,7 @@ impl CniSocketLifecycleReason {
 
 impl NodeAgentMetrics {
     pub fn snapshot(&self) -> NodeAgentMetricsSnapshot {
-        let mut cni_calls = [[0u64; 3]; 3];
+        let mut cni_calls = [[0u64; 3]; 5];
         for verb in CniCallVerb::all() {
             for outcome in CniCallOutcome::all() {
                 cni_calls[verb as usize][outcome as usize] =
@@ -618,6 +622,8 @@ impl Default for NodeAgentMetrics {
             topology_degraded_reason: ArcSwap::from_pointee(None),
             capture_state: ArcSwap::from_pointee(NODE_AGENT_CAPTURE_STATE_STARTING),
             cni_calls: [
+                [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+                [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
@@ -1051,6 +1057,9 @@ pub struct MockEbpfBackend {
     /// so removal tests can prove a successful pod-IP map delete that cannot
     /// clear the bounded scope map stays pending and retryable.
     pub fail_clear_pod_inbound_ports: bool,
+    /// When `true`, `detach_pod` fails so removal/GC tests can prove partial BPF
+    /// teardown retains Ferrum CNI ownership until retry succeeds.
+    pub fail_detach_pod: bool,
     /// When `true`, `validate_startup_ready` fails even though every earlier
     /// step succeeded, so tests can drive the post-attach startup-validation
     /// unwind (classifier detached, then Ferrum-owned routing removed).
@@ -1123,6 +1132,9 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn detach_pod(&mut self, pod_uid: &str) -> Result<(), String> {
+        if self.fail_detach_pod {
+            return Err(format!("injected pod BPF detach failure for {pod_uid}"));
+        }
         self.detached_pods.push(pod_uid.to_string());
         Ok(())
     }
