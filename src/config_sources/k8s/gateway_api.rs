@@ -1137,6 +1137,19 @@ enum CrossKindListener {
 /// cross-kind traffic on the conflicting one, so the conservative whole-Route
 /// withdrawal is the fail-closed choice.
 fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApiRouteConflict> {
+    // HTTPRoute and GRPCRoute cannot contend unless both kinds are present.
+    // Skip claim materialization and the greedy acceptance scan when only one
+    // kind is in the snapshot — every comparison would reject same-kind pairs.
+    let has_http = entries
+        .iter()
+        .any(|entry| entry.candidate.resource.kind == "HTTPRoute");
+    let has_grpc = entries
+        .iter()
+        .any(|entry| entry.candidate.resource.kind == "GRPCRoute");
+    if !has_http || !has_grpc {
+        return Vec::new();
+    }
+
     // Build each Route's concrete listener -> hostname claims once. Two
     // different parentRef shapes selecting one listener land in the same
     // bucket; unresolved selectors retain their literal parentRef identity.
@@ -4745,7 +4758,10 @@ fn listener_allowed_route_kind<'a>(kind: &Value, protocol_kinds: &'a [&str]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_sources::k8s::{K8sMetadata, K8sTranslationOptions, translate_k8s_objects};
+    use crate::config_sources::k8s::{
+        K8sMetadata, K8sTranslationOptions, gateway_api_status_conflict_context,
+        translate_k8s_objects,
+    };
     use crate::identity::spiffe::TrustDomain;
 
     fn options() -> K8sTranslationOptions {
@@ -9024,6 +9040,112 @@ mod tests {
         route.metadata.name = "grpc".to_string();
         route.metadata.creation_timestamp = Some("2026-02-01T00:00:00Z".to_string());
         route
+    }
+
+    fn cross_kind_route_conflicts_only(
+        conflicts: &[GatewayApiRouteConflict],
+    ) -> Vec<&GatewayApiRouteConflict> {
+        conflicts
+            .iter()
+            .filter(|conflict| conflict.winner.kind != conflict.loser.kind)
+            .collect()
+    }
+
+    /// Cross-kind arbitration is impossible when only one Route kind is present.
+    /// Regression for the O(n²) same-kind scan that hung the 10k-route status
+    /// planning fixture (#2397).
+    #[test]
+    fn same_kind_only_snapshots_emit_no_cross_kind_conflicts() {
+        let gateway = cross_kind_gateway(serde_json::json!([{
+            "name": "web",
+            "port": 80,
+            "protocol": "HTTP",
+            "allowedRoutes": {
+                "namespaces": {"from": "All"},
+                "kinds": [{"kind": "HTTPRoute"}, {"kind": "GRPCRoute"}]
+            }
+        }]));
+
+        let mut http_routes = Vec::new();
+        for index in 0..8 {
+            let mut route = cross_kind_http_route(serde_json::json!({"name": "edge"}), None);
+            route.metadata.name = format!("http-{index}");
+            route.metadata.creation_timestamp = Some(format!("2026-01-{:02}T00:00:00Z", index + 1));
+            http_routes.push(route);
+        }
+        let http_objects: Vec<K8sObject> = std::iter::once(gateway.clone())
+            .chain(http_routes)
+            .collect();
+        let http_acc = gateway_api_status_conflict_context(&http_objects, options());
+        let http_conflicts = route_conflicts(&http_objects, &options(), Some(&http_acc));
+        assert!(
+            cross_kind_route_conflicts_only(&http_conflicts).is_empty(),
+            "all-HTTP snapshots must not yield cross-kind conflicts: {:?}",
+            http_conflicts
+        );
+        assert!(
+            http_conflicts
+                .iter()
+                .any(|conflict| conflict.winner.kind == conflict.loser.kind),
+            "same-kind overlap must still be collected: {:?}",
+            http_conflicts
+        );
+
+        let mut grpc_routes = Vec::new();
+        for index in 0..8 {
+            // Identical method predicate so these claim the same conflict key;
+            // distinct methods intentionally do not conflict (see
+            // `distinct_grpc_predicates_on_one_listener_do_not_conflict`).
+            let mut route = cross_kind_grpc_route(
+                serde_json::json!({"name": "edge"}),
+                serde_json::json!({"method": "SayHello"}),
+            );
+            route.metadata.name = format!("grpc-{index}");
+            route.metadata.creation_timestamp = Some(format!("2026-01-{:02}T00:00:00Z", index + 1));
+            grpc_routes.push(route);
+        }
+        let grpc_objects: Vec<K8sObject> = std::iter::once(gateway.clone())
+            .chain(grpc_routes)
+            .collect();
+        let grpc_acc = gateway_api_status_conflict_context(&grpc_objects, options());
+        let grpc_conflicts = route_conflicts(&grpc_objects, &options(), Some(&grpc_acc));
+        assert!(
+            cross_kind_route_conflicts_only(&grpc_conflicts).is_empty(),
+            "all-gRPC snapshots must not yield cross-kind conflicts: {:?}",
+            grpc_conflicts
+        );
+        assert!(
+            grpc_conflicts
+                .iter()
+                .any(|conflict| conflict.winner.kind == conflict.loser.kind),
+            "same-kind overlap must still be collected: {:?}",
+            grpc_conflicts
+        );
+
+        let http_route = cross_kind_http_route(serde_json::json!({"name": "edge"}), None);
+        let grpc_route = cross_kind_grpc_route(
+            serde_json::json!({"name": "edge"}),
+            serde_json::json!({"method": "SayHello"}),
+        );
+        let mixed_objects = vec![gateway, http_route, grpc_route];
+        let mixed_acc = gateway_api_status_conflict_context(&mixed_objects, options());
+        let mixed_conflicts = route_conflicts(&mixed_objects, &options(), Some(&mixed_acc));
+        let cross_kind = cross_kind_route_conflicts_only(&mixed_conflicts);
+        assert!(
+            cross_kind
+                .iter()
+                .all(|conflict| conflict.winner.kind == "HTTPRoute"
+                    && conflict.loser.kind == "GRPCRoute"),
+            "mixed overlapping snapshot must arbitrate cross-kind: {:?}",
+            cross_kind
+        );
+        assert!(
+            cross_kind
+                .iter()
+                .any(|conflict| conflict.winner.name == "web" && conflict.loser.name == "grpc"),
+            "older HTTPRoute must beat newer GRPCRoute: {:?}",
+            cross_kind
+        );
     }
 
     /// A parentRef is a *selector*, not a listener identity. A wildcard

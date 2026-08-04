@@ -27,7 +27,7 @@
 //!   the six proxy/upstream `backend_tls_*` material path/PEM columns
 //!   (`MAX_TLS_INLINE_PEM_LENGTH` = 1 MiB), `upstreams.subsets` (uncapped
 //!   label-set serialization), and `proxies.allowed_ws_origins` (uncapped
-//!   admitted JSON).
+//!   admitted JSON), and `proxies.stream_match` (bounded matcher JSON).
 //!
 //! The proxy schema intentionally omits a *unique* index on
 //! `(namespace, listen_path)`: path uniqueness is host-scoped, so only
@@ -588,6 +588,7 @@ impl V001SqlBuilder {
                 allowed_ws_origins MEDIUMTEXT,
                 udp_max_response_amplification_factor REAL,
                 stream_proxy_protocol INTEGER,
+                stream_match MEDIUMTEXT,
                 api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL,
@@ -652,6 +653,7 @@ impl V001SqlBuilder {
                 allowed_ws_origins TEXT,
                 udp_max_response_amplification_factor REAL,
                 stream_proxy_protocol INTEGER,
+                stream_match TEXT,
                 api_spec_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -916,6 +918,8 @@ impl V001SqlBuilder {
                 server_urls LONGTEXT NOT NULL,
                 operation_count INTEGER NOT NULL DEFAULT 0,
                 resource_hash VARCHAR(64) NOT NULL DEFAULT '',
+                external_ref_snapshot LONGBLOB NULL,
+                external_ref_digest VARCHAR(64) COLLATE utf8mb4_0900_bin NULL,
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL,
                 CONSTRAINT fk_api_specs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
@@ -944,6 +948,8 @@ impl V001SqlBuilder {
                 server_urls TEXT NOT NULL DEFAULT '[]',
                 operation_count INTEGER NOT NULL DEFAULT 0,
                 resource_hash TEXT NOT NULL DEFAULT '',
+                external_ref_snapshot BLOB NULL,
+                external_ref_digest TEXT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
@@ -972,6 +978,8 @@ impl V001SqlBuilder {
                 server_urls TEXT NOT NULL DEFAULT '[]',
                 operation_count INTEGER NOT NULL DEFAULT 0,
                 resource_hash TEXT NOT NULL DEFAULT '',
+                external_ref_snapshot BYTEA NULL,
+                external_ref_digest TEXT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )

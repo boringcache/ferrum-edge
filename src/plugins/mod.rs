@@ -7026,6 +7026,14 @@ pub struct StreamConnectionContext {
     /// record that the transport was terminated even when no application bytes
     /// were read.
     pub first_bytes_kind: Option<StreamBytesKind>,
+    /// Original destination IP from `SO_ORIGINAL_DST` / capture metadata when
+    /// available. Used by VirtualService L4 `destinationSubnets` matching.
+    /// Never inferred from client-controlled headers.
+    pub destination_ip: Option<std::net::IpAddr>,
+    /// Listener-configured gateway binding for VirtualService L4 `gateways`
+    /// matching (`mesh` or `namespace/name`). Never inferred from untrusted
+    /// wire data.
+    pub trusted_gateway_ref: Option<Arc<str>>,
 }
 
 impl StreamConnectionContext {
@@ -7069,6 +7077,8 @@ impl StreamConnectionContext {
             node_waypoint_policy_scope: None,
             first_bytes: None,
             first_bytes_kind: None,
+            destination_ip: None,
+            trusted_gateway_ref: None,
         }
     }
 

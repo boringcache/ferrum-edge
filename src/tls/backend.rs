@@ -1067,6 +1067,8 @@ mod tests {
             udp_idle_timeout_seconds: 60,
             udp_max_response_amplification_factor: None,
             stream_proxy_protocol: None,
+            stream_match: None,
+            compiled_stream_match: None,
             tcp_idle_timeout_seconds: None,
             websocket_idle_timeout_seconds: None,
             allowed_methods: None,

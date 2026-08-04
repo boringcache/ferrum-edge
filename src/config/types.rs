@@ -868,9 +868,10 @@ pub(crate) fn dispatch_port_override_fallback_from_upstream(
     // while ordinary targets key by their resolved dial port.
     // We deliberately do NOT fold the upstream's `port_overrides` into this fallback:
     // a multi-port upstream would cross-leak one port's `connectionPool.http` onto a
-    // different port (codex r3). Immediate route-rebuild on a DR-only edit remains
-    // tracked separately because this is a `#[serde(skip)]` DR-derived field, like
-    // the established per-port `dispatch_port_overrides`.
+    // different port (codex r3). Immediate route rebuild on a DR-only edit of this
+    // `#[serde(skip)]` field (and the sibling per-port `dispatch_port_overrides`)
+    // is handled by `ProxyState::projected_route_proxy_content_changed` (#3243 /
+    // #1826) so route-held `Arc<Proxy>` values cannot stay stale.
     upstream
         .dispatch_port_override_fallback
         .as_ref()
@@ -2346,6 +2347,16 @@ pub struct Proxy {
     /// Default: `false` (PROXY protocol disabled; socket peer is always used).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_proxy_protocol: Option<bool>,
+    /// Optional VirtualService L4 (`tcp[]`/`tls[]`) match predicates evaluated
+    /// from trustworthy connection / workload metadata before the stream route
+    /// is selected. `None` / empty arms = port (and SNI for passthrough) alone.
+    /// Compiled into [`compiled_stream_match`] during `normalize_fields`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_match: Option<crate::proxy::stream_match::StreamMatchCriteria>,
+    /// Hot-path compiled form of [`stream_match`]. Populated by
+    /// `normalize_fields`; never serialized.
+    #[serde(skip)]
+    pub compiled_stream_match: Option<crate::proxy::stream_match::CompiledStreamMatch>,
     /// WebSocket relay idle timeout in seconds for upgraded sessions on this
     /// proxy. After this duration with no activity in EITHER direction (frames,
     /// including Ping/Pong, or transport bytes), the session is closed. Applies
@@ -2530,6 +2541,13 @@ pub struct ApiSpec {
     /// metadata timestamps. Used to short-circuit idempotent PUT writes.
     #[serde(default)]
     pub resource_hash: String,
+    /// Gzip-compressed immutable external-`$ref` admission snapshot bytes.
+    /// Present when external-ref resolution was enabled for this import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref_snapshot: Option<Vec<u8>>,
+    /// Aggregate digest of the external-`$ref` admission snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref_digest: Option<String>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -5238,17 +5256,23 @@ impl GatewayConfig {
                 continue; // No conflict for single-proxy ports
             }
 
-            // All proxies sharing a port must have passthrough: true
             let all_passthrough = proxies_on_port.iter().all(|p| p.passthrough);
-            if !all_passthrough {
+            let stream_match_group = proxies_on_port.iter().all(|p| {
+                !p.passthrough
+                    && matches!(p.dispatch_kind, DispatchKind::TcpRaw | DispatchKind::TcpTls)
+            }) && proxies_on_port
+                .iter()
+                .any(|p| p.stream_match.as_ref().is_some_and(|m| !m.is_empty()));
+
+            if !all_passthrough && !stream_match_group {
                 let non_pt: Vec<&str> = proxies_on_port
                     .iter()
                     .filter(|p| !p.passthrough)
                     .map(|p| p.id.as_str())
                     .collect();
                 errors.push(format!(
-                    "Duplicate listen_port {} — all proxies sharing a port must have passthrough: true, \
-                     but {} do not",
+                    "Duplicate listen_port {} — all proxies sharing a port must have passthrough: true \
+                     (SNI routing), or participate in an L4 stream_match group, but {} do not",
                     port,
                     non_pt.join(", ")
                 ));
@@ -5257,8 +5281,8 @@ impl GatewayConfig {
 
             // All proxies sharing a port must agree on stream_proxy_protocol:
             // the PROXY header is read from the raw stream BEFORE the TLS
-            // ClientHello, so SNI-based proxy resolution has not happened yet
-            // and the accept loop can only apply one per-listener decision.
+            // ClientHello / L4 match resolution, so the accept loop can only
+            // apply one per-listener decision.
             let pp_enabled: Vec<&str> = proxies_on_port
                 .iter()
                 .filter(|p| p.stream_proxy_protocol == Some(true))
@@ -5267,14 +5291,85 @@ impl GatewayConfig {
             if !pp_enabled.is_empty() && pp_enabled.len() != proxies_on_port.len() {
                 errors.push(format!(
                     "Shared listen_port {} mixes stream_proxy_protocol settings ({} enable it) — \
-                     the PROXY header is parsed before SNI resolution, so every proxy sharing a \
+                     the PROXY header is parsed before SNI/L4 match resolution, so every proxy sharing a \
                      port must agree on stream_proxy_protocol",
                     port,
                     pp_enabled.join(", ")
                 ));
             }
 
-            // At most one proxy per port may have empty hosts (catch-all)
+            // A shared socket is constructed from one representative proxy,
+            // before route resolution can select a candidate. Every property
+            // consumed at that listener boundary must therefore agree. Do not
+            // let hash/config order choose which candidate's behavior wins.
+            let Some(representative) = proxies_on_port.first().copied() else {
+                continue;
+            };
+            let mixed_scheme = proxies_on_port
+                .iter()
+                .any(|p| p.effective_scheme() != representative.effective_scheme());
+            if mixed_scheme {
+                errors.push(format!(
+                    "Shared listen_port {} mixes backend schemes — every candidate must use the same tcp/tcps listener scheme",
+                    port
+                ));
+            }
+            let mixed_frontend_tls = proxies_on_port
+                .iter()
+                .any(|p| p.frontend_tls != representative.frontend_tls);
+            if mixed_frontend_tls {
+                errors.push(format!(
+                    "Shared listen_port {} mixes frontend_tls settings — every candidate must agree before route resolution",
+                    port
+                ));
+            }
+            if representative.effective_scheme() == BackendScheme::Tcps
+                && !representative.passthrough
+            {
+                let representative_tls = &representative.resolved_tls;
+                let mixed_backend_tls = proxies_on_port.iter().any(|p| {
+                    let tls = &p.resolved_tls;
+                    tls.verify_server_cert != representative_tls.verify_server_cert
+                        || tls.server_ca_cert_path != representative_tls.server_ca_cert_path
+                        || tls.client_cert_path != representative_tls.client_cert_path
+                        || tls.client_key_path != representative_tls.client_key_path
+                        || tls.san_allow_list != representative_tls.san_allow_list
+                });
+                if mixed_backend_tls {
+                    errors.push(format!(
+                        "Shared listen_port {} mixes backend TLS listener settings — every tcps candidate must use the same verifier and client identity sources",
+                        port
+                    ));
+                }
+            }
+
+            if stream_match_group && !all_passthrough {
+                // Non-passthrough L4 match groups: at most one catch-all
+                // (empty / absent stream_match) so OR selection stays deterministic.
+                let catch_all = proxies_on_port
+                    .iter()
+                    .filter(|p| {
+                        p.stream_match
+                            .as_ref()
+                            .map(|m| m.is_empty())
+                            .unwrap_or(true)
+                    })
+                    .count();
+                if catch_all > 1 {
+                    errors.push(format!(
+                        "L4 stream_match port {} has {catch_all} catch-all proxies — at most one unconstrained match is allowed",
+                        port
+                    ));
+                }
+                continue;
+            }
+
+            // Passthrough SNI groups: at most one empty-hosts catch-all, and
+            // host overlap is forbidden unless both overlapping proxies carry
+            // non-empty stream_match criteria (SNI + L4 AND). In that ordered
+            // route form, equal criteria are valid too: Istio keeps the later
+            // duplicate as an ineffective rule rather than rejecting the
+            // VirtualService, and declaration order resolves it safely.
             let catch_all_count = proxies_on_port
                 .iter()
                 .filter(|p| p.hosts.is_empty())
@@ -5286,16 +5381,23 @@ impl GatewayConfig {
                 ));
             }
 
-            // Check for host overlap between every pair
             for (i, a) in proxies_on_port.iter().enumerate() {
                 for b in &proxies_on_port[i + 1..] {
-                    if hosts_overlap(&a.hosts, &b.hosts) {
-                        errors.push(format!(
-                            "Passthrough proxies '{}' and '{}' on port {} have overlapping hosts — \
-                             each SNI hostname must route to exactly one proxy",
-                            a.id, b.id, port
-                        ));
+                    if !hosts_overlap(&a.hosts, &b.hosts) {
+                        continue;
                     }
+                    let a_match = a.stream_match.as_ref().filter(|m| !m.is_empty());
+                    let b_match = b.stream_match.as_ref().filter(|m| !m.is_empty());
+                    if a_match.is_some() && b_match.is_some() {
+                        // Ordered L4 predicates (equal or distinct) make the
+                        // first matching SNI candidate deterministic.
+                        continue;
+                    }
+                    errors.push(format!(
+                        "Passthrough proxies '{}' and '{}' on port {} have overlapping hosts — \
+                         each SNI hostname must route to exactly one matcher-free proxy (or ordered stream_match criteria)",
+                        a.id, b.id, port
+                    ));
                 }
             }
         }
@@ -7003,6 +7105,14 @@ impl Proxy {
         self.backend_host = self.backend_host.to_ascii_lowercase();
 
         self.resolve_dispatch_kind_fields();
+
+        // Compile L4 stream match predicates once so the accept path stays
+        // allocation-free. Invalid criteria clear the compiled form; validation
+        // surfaces the error separately so we never run with a partial matcher.
+        self.compiled_stream_match = match self.stream_match.as_ref() {
+            Some(criteria) if !criteria.is_empty() => criteria.compile().ok(),
+            _ => None,
+        };
     }
 
     /// Human-readable scheme for error messages. Returns `"<unset>"` before
@@ -7127,6 +7237,19 @@ impl Proxy {
                 "stream_proxy_protocol is only valid for tcp/tcps stream proxies                  (PROXY protocol is TCP-borne)"
                     .to_string(),
             );
+        }
+
+        // L4 stream match predicates are implemented by the TCP accept path
+        // only and must compile. Admitting them on UDP/DTLS would silently
+        // turn a configured matcher into an unconstrained datagram route.
+        if let Some(criteria) = self.stream_match.as_ref() {
+            if !matches!(effective_scheme, BackendScheme::Tcp | BackendScheme::Tcps) {
+                errors.push("stream_match is only valid for tcp/tcps stream proxies".to_string());
+            } else if !criteria.is_empty()
+                && let Err(e) = criteria.compile()
+            {
+                errors.push(format!("stream_match: {e}"));
+            }
         }
 
         // Passthrough mode validation

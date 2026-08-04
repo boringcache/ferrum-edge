@@ -31,6 +31,7 @@ fn workload(name: &str, app: &str) -> Workload {
             namespace: Some("default".to_string()),
         },
         service_name: name.to_string(),
+        service_namespace: None,
         addresses: Vec::new(),
         ports: vec![WorkloadPort {
             port: 8080,

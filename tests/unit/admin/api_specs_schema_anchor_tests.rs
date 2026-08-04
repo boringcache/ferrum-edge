@@ -518,14 +518,16 @@ fn inline_schema_ref_uses_its_own_id_as_base() {
         proxy = proxy_block()
     );
     let schema = first_request_schema(&spec);
-    // `$id` beside `$ref` stays on the referring Schema Object; the target is
-    // composed under `allOf` so adjacent identifiers cannot overwrite it.
-    assert_eq!(schema["$id"], "https://example.com/scopes/wrapper.json");
-    assert_eq!(schema["allOf"][0]["$anchor"], "Target");
-    assert_eq!(schema["allOf"][0]["required"], json!(["scoped"]));
-    assert_eq!(
-        schema["allOf"][0]["$id"],
-        "https://example.com/scopes/target.json"
+    // A bare `$id` beside `$ref` only rebases the reference. After the target
+    // is materialized the wrapper `$id` is not retained via `allOf`, so
+    // referenced assertions stay at the schema root. The target's own
+    // identifiers travel with the inlined schema.
+    assert_eq!(schema["required"], json!(["scoped"]));
+    assert_eq!(schema["$anchor"], "Target");
+    assert_eq!(schema["$id"], "https://example.com/scopes/target.json");
+    assert!(
+        schema.get("allOf").is_none(),
+        "bare $id+$ref must not bury the target under allOf: {schema}"
     );
 }
 
