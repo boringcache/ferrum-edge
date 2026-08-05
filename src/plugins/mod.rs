@@ -8251,6 +8251,24 @@ pub trait Plugin: Send + Sync {
     /// rule. Enrolled `Static`: `response_transformer`, `sse` — both rewrite
     /// bodies purely from accepted configuration and hold no interior mutable
     /// presentation state. Enrolled `Dynamic`: `mcp_gateway`.
+    ///
+    /// `a2a_gateway` is enrolled in **both** arms, chosen per instance from its
+    /// accepted configuration. Its Agent Card rewrite is `Static` — a digest of
+    /// the whole accepted config, covering `discovery.public_base_url`,
+    /// `endpoint.path`, `endpoint.agent_card_path`,
+    /// `endpoint.protocol_versions`, and `discovery.rewrite_agent_card_urls` —
+    /// whenever a public base is configured, which is also the only arm that can
+    /// be composed with `request_deduplication`. With no configured base and
+    /// `discovery.trust_forwarded_headers` enabled it reports `Dynamic`: the
+    /// rewritten origin is then shaped by `X-Forwarded-*` / `Host` *and* by
+    /// whether the connection carried a TLS SNI hostname
+    /// (`RequestContext::frontend_sni_hostname`), and the deduplication
+    /// fingerprint binds neither, so no construction-time digest describes what
+    /// a replayed card would have advertised. Admission refuses that pairing
+    /// per instance
+    /// (`request_deduplication::CONDITIONALLY_DYNAMIC_RESPONSE_PRESENTATION_PLUGINS`),
+    /// leaving configured-public-base deployments replaying normally.
+    ///
     /// Deliberately not enrolled, and why the skip drops no live decision:
     ///
     /// - `compression` — content coding, not presentation. A replay is

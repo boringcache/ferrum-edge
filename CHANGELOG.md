@@ -46,17 +46,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `icon_url`, `protocol_version` was removed) and proto3 cannot distinguish an
   unset field from `""` — guessing would flatten each interface submessage
   into a bare URL and re-serve the card under its now-invalid original
-  signature. Every known 0.3 field is schema-validated before any rewrite, so
-  a wrong wire type or a duplicated singular field can no longer be preserved
-  verbatim beside rewritten siblings, and the protobuf decoder rejects
-  over-long / out-of-range / non-canonical varints, field numbers outside
-  `1..=2^29-1`, and unrepresentable length prefixes. As defense in depth, a
-  URL field that is not an absolute `http`/`https` URL fails closed with
+  signature. All seventeen known 0.3 top-level fields are schema-validated
+  before any rewrite — the declared wire type (including a canonical `0`/`1`
+  varint for `supports_authenticated_extended_card`), at-most-once
+  multiplicity for every singular field, and UTF-8 for every known string that
+  gets re-emitted — so a malformed known field can no longer be preserved
+  verbatim beside rewritten siblings once the signature block is dropped. The
+  submessages the rewriter preserves rather than parses (`provider`,
+  `capabilities`, `security_schemes`, `security`, `skills`, `signatures`) are
+  checked for shape only and are not claimed to be deeply validated; the one
+  nested exception is every `AgentInterface`, whose `url` is required and
+  proven, because an interface without a usable URL would otherwise be the only
+  evidence a "rewritten" card advertised an endpoint at all. The protobuf
+  decoder rejects over-long / out-of-range / non-canonical varints, field
+  numbers outside `1..=2^29-1`, and unrepresentable length prefixes. Every
+  rewritable URL field must parse as a bounded absolute `http`/`https` URL with
+  a real host and no embedded credentials — a scheme prefix is not proof — and
+  anything else fails closed with
   `agent_card_protobuf_url_layout_mismatch`. A card the plugin admitted whose
   rewrite never reaches the client fails closed with
   `agent_card_grpc_rewrite_not_applied`. Operators fronting a non-0.3 A2A
   backend should set `discovery.rewrite_agent_card_urls: false`; leaving it
   enabled refuses such cards rather than serving un-rewritten internal URLs.
+- `a2a_gateway` now enrolls in `request_deduplication` replay presentation
+  provenance, because its Agent Card rewrite is a client-facing transform that
+  a finalized replay deliberately skips (issue #3297). Every retained response
+  is stamped with a content digest of the plugin's whole accepted
+  configuration, so a change to `discovery.public_base_url`, `endpoint.path`,
+  `endpoint.agent_card_path`, `endpoint.protocol_versions`,
+  `discovery.rewrite_agent_card_urls`, or `enabled` retires representations
+  captured under the old settings instead of replaying a card that advertises
+  a superseded endpoint. The request-derived mode is the exception:
+  with `discovery.public_base_url` unset and
+  `discovery.trust_forwarded_headers` enabled, the rewritten origin comes from
+  per-request forwarded headers and from the connection's TLS SNI, neither of
+  which the deduplication fingerprint binds, so configuration admission now
+  rejects that pairing with HTTP 400 and the runtime retains and replays
+  nothing. The refusal is per instance — a configured-public-base
+  `a2a_gateway` composes with `request_deduplication` exactly as before.
 - `ai_semantic_firewall` streamed `inspect` mode now accepts
   `streaming.window: tokens` with an explicitly selected bounded tokenizer
   (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft

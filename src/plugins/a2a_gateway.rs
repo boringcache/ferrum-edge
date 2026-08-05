@@ -14,10 +14,16 @@ use std::sync::{Arc, Mutex};
 use tracing::warn;
 use url::Url;
 
+use super::utils::policy_digest;
 use super::{
     A2aGrpcCardRewriteState, HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext,
     ResponseStreamAction, ResponseStreamInspector,
 };
+
+/// Domain separator and schema version for [`A2aGateway`] replay provenance.
+/// Bumping the version invalidates every previously persisted representation
+/// rather than letting an old digest match new semantics.
+const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.a2a_gateway.static.v1";
 
 const DEFAULT_ENDPOINT_PATH: &str = "/a2a";
 const DEFAULT_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
@@ -27,9 +33,13 @@ const DEFAULT_MAX_DETECTION_BODY_BYTES: u64 = 1024 * 1024;
 const DEFAULT_GRPC_SERVICE: &str = "lf.a2a.v1.A2AService";
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 
-/// A2A 0.3.x `AgentCard` protobuf field numbers used for URL rewriting.
-/// Wire surgery preserves every other field verbatim so skills/security/etc.
-/// survive re-encoding without embedding a full descriptor set.
+/// The complete A2A 0.3.x `AgentCard` top-level field table (`a2aproject/A2A`
+/// at tag `v0.3.0`, `specification/grpc/a2a.proto`, "Next ID: 18"). Wire surgery
+/// mutates only the endpoint fields and preserves every other field verbatim, so
+/// skills/security/provider survive re-encoding without embedding a full
+/// descriptor set — but every number below is still *known*, because a known
+/// field carrying an unexpected shape must fail closed rather than be preserved
+/// beside rewritten siblings after the signature block was dropped.
 ///
 /// These numbers are layout-specific, NOT stable across A2A releases. A2A 1.0
 /// renumbered `AgentCard`: field 3 became `repeated AgentInterface
@@ -39,13 +49,23 @@ const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 /// 1.0 card would replace each interface submessage with a bare URL string while
 /// leaving the real signatures untouched, so the rewrite path must first prove
 /// the 0.3 layout — see [`supports_agent_card_protobuf_layout`].
+const AGENT_CARD_PB_NAME: u32 = 1;
+const AGENT_CARD_PB_DESCRIPTION: u32 = 2;
 const AGENT_CARD_PB_URL: u32 = 3;
+const AGENT_CARD_PB_PROVIDER: u32 = 4;
+const AGENT_CARD_PB_VERSION: u32 = 5;
+const AGENT_CARD_PB_DOCUMENTATION_URL: u32 = 6;
+const AGENT_CARD_PB_CAPABILITIES: u32 = 7;
+const AGENT_CARD_PB_SECURITY_SCHEMES: u32 = 8;
+const AGENT_CARD_PB_SECURITY: u32 = 9;
+const AGENT_CARD_PB_DEFAULT_INPUT_MODES: u32 = 10;
+const AGENT_CARD_PB_DEFAULT_OUTPUT_MODES: u32 = 11;
+const AGENT_CARD_PB_SKILLS: u32 = 12;
+const AGENT_CARD_PB_SUPPORTS_AUTHENTICATED_EXTENDED_CARD: u32 = 13;
 const AGENT_CARD_PB_PREFERRED_TRANSPORT: u32 = 14;
 const AGENT_CARD_PB_ADDITIONAL_INTERFACES: u32 = 15;
 const AGENT_CARD_PB_PROTOCOL_VERSION: u32 = 16;
 const AGENT_CARD_PB_SIGNATURES: u32 = 17;
-const AGENT_CARD_PB_NAME: u32 = 1;
-const AGENT_CARD_PB_DESCRIPTION: u32 = 2;
 const AGENT_INTERFACE_PB_URL: u32 = 1;
 const AGENT_INTERFACE_PB_TRANSPORT: u32 = 2;
 const PROTO_WIRE_VARINT: u8 = 0;
@@ -203,6 +223,14 @@ pub struct A2aGateway {
     discovery: A2aDiscoveryConfig,
     observability: A2aObservabilityConfig,
     policy: A2aPolicyConfig,
+    /// Content-derived digest of this instance's whole accepted static config,
+    /// used as replay provenance (see `Plugin::response_presentation_policy`).
+    ///
+    /// Computed once at construction from the canonical form of the validated
+    /// configuration, so it covers every present and future static knob without
+    /// an enumeration that could silently fall behind a new field. Only the
+    /// digest is ever exposed; the source config is not retained.
+    static_policy_digest: [u8; 32],
     pending_stream_observations: Arc<DashMap<u64, A2aStreamObservationSlot>>,
 }
 
@@ -408,6 +436,15 @@ impl A2aGateway {
         let discovery = parse_discovery(object)?;
         let observability = parse_observability(object)?;
         let policy = parse_policy(object)?;
+        // Digest the accepted configuration as a whole. Every knob that shapes a
+        // client-visible Agent Card — `discovery.public_base_url`,
+        // `endpoint.path`, `endpoint.agent_card_path`,
+        // `endpoint.protocol_versions`, `discovery.rewrite_agent_card_urls`, and
+        // the `enabled` switch itself — is in here by construction, so enabling,
+        // disabling, or editing any of them moves the provenance a persisted
+        // replay is bound to.
+        let static_policy_digest =
+            policy_digest::static_config_digest(STATIC_POLICY_DIGEST_DOMAIN, config);
         Ok(Self {
             enabled,
             endpoint,
@@ -415,6 +452,7 @@ impl A2aGateway {
             discovery,
             observability,
             policy,
+            static_policy_digest,
             pending_stream_observations: Arc::new(DashMap::with_shard_amount(
                 crate::util::sharding::pool_shard_amount(0),
             )),
@@ -728,6 +766,20 @@ impl A2aGateway {
             && ctx.a2a_gateway_binding == Some("grpc")
     }
 
+    /// The public origin every rewritten Agent Card URL is built from.
+    ///
+    /// Two effective modes, and the difference between them is exactly what
+    /// [`Plugin::response_presentation_policy`] reports:
+    ///
+    /// - **Configured.** `discovery.public_base_url` is accepted static
+    ///   configuration, so the rewritten base is a pure function of it.
+    /// - **Request/transport-derived.** With no configured base and
+    ///   `trust_forwarded_headers` enabled, the base comes from
+    ///   `X-Forwarded-Proto` / `X-Forwarded-Host` / `Host` **and**, when no
+    ///   forwarded scheme is present, from whether this connection carried a TLS
+    ///   SNI hostname (`ctx.frontend_sni_hostname`). That last input belongs to
+    ///   the transport, not to any request field a replay fingerprint binds —
+    ///   see [`discovery_is_request_derived`].
     fn public_base_url(&self, ctx: &RequestContext) -> Option<String> {
         if let Some(configured) = self.discovery.public_base_url.as_deref() {
             return Some(configured.trim_end_matches('/').to_string());
@@ -827,6 +879,50 @@ impl Plugin for A2aGateway {
             && ctx.method.eq_ignore_ascii_case("POST")
             && ctx.path == self.endpoint.path
             && content_type_is_json(&ctx.headers)
+    }
+
+    /// Agent Card rewriting is a presentation policy a finalized replay skips,
+    /// so this instance enrolls in replay provenance — unconditionally, in one
+    /// of two arms.
+    ///
+    /// `transform_response_body_with_context` is what makes enrollment
+    /// mandatory: `request_deduplication` deliberately skips ordinary
+    /// presentation transforms on a finalized replay, so without a contribution
+    /// here a retained Agent Card could be replayed under a public base,
+    /// `endpoint.path`, admitted `endpoint.protocol_versions`, or
+    /// `rewrite_agent_card_urls` setting that has since changed.
+    ///
+    /// **`Static`** is reported for every configuration whose rewritten card is
+    /// a pure function of accepted configuration — which is every deployment
+    /// with a configured `discovery.public_base_url`, plus every deployment that
+    /// does no rewriting at all. The digest covers the whole accepted config, so
+    /// enabling, disabling, adding, removing, or editing an instance always
+    /// moves it. Enrollment is unconditional (an internally disabled instance
+    /// still contributes) for the same reason `response_transformer` and `sse`
+    /// enroll unconditionally: "this instance rewrites nothing" is itself the
+    /// policy a stored representation must be bound to, and a conditional
+    /// contribution would make the per-proxy digest depend on live request state.
+    ///
+    /// **`Dynamic`** is reported for the request/transport-derived mode
+    /// ([`discovery_is_request_derived`]): with no configured base and
+    /// `trust_forwarded_headers` on, the rewritten origin is shaped by
+    /// `X-Forwarded-*` / `Host` *and* by whether the connection carried a TLS
+    /// SNI hostname. The deduplication fingerprint binds neither the complete
+    /// forwarded header set nor `frontend_sni_hostname`, so two requests that
+    /// share a replay key can legitimately deserve `https://…` and `http://…`
+    /// cards. No construction-time digest can describe that, and the honest
+    /// answer is that this proxy has no provable presentation policy at all.
+    /// Config admission refuses the composition outright
+    /// (`request_deduplication::validate_composition`); this is the runtime
+    /// backstop for the admission paths that only warn. A configured
+    /// public-base deployment is unaffected and keeps replaying normally.
+    fn response_presentation_policy(&self) -> Option<super::ResponsePresentationPolicy> {
+        if self.enabled && discovery_is_request_derived(&self.discovery) {
+            return Some(super::ResponsePresentationPolicy::Dynamic);
+        }
+        Some(super::ResponsePresentationPolicy::Static(
+            self.static_policy_digest,
+        ))
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -1321,6 +1417,49 @@ fn parse_discovery(object: &Map<String, Value>) -> Result<A2aDiscoveryConfig, St
         trust_forwarded_headers: optional_bool_from_object(discovery, "trust_forwarded_headers")?
             .unwrap_or(false),
     })
+}
+
+/// Whether this discovery configuration selects the request/transport-derived
+/// public base rather than a configured one.
+///
+/// This is the single definition of "A2A's Agent Card presentation is not a pure
+/// function of accepted configuration". With no `public_base_url` and
+/// `trust_forwarded_headers` enabled, [`A2aGateway::public_base_url`] falls back
+/// to `X-Forwarded-Proto` / `X-Forwarded-Host` / `Host`, and — when no forwarded
+/// scheme is present — to whether the connection carried a TLS SNI hostname.
+/// `frontend_sni_hostname` is transport state, so the same request bytes on a
+/// TLS and a cleartext listener yield `https://…` and `http://…` respectively;
+/// no request fingerprint (and therefore no `request_deduplication` replay key)
+/// witnesses the difference.
+fn discovery_is_request_derived(discovery: &A2aDiscoveryConfig) -> bool {
+    discovery.rewrite_agent_card_urls
+        && discovery.public_base_url.is_none()
+        && discovery.trust_forwarded_headers
+}
+
+/// Config-admission mirror of [`discovery_is_request_derived`], answered from
+/// raw plugin configuration before any instance exists.
+///
+/// Admission (`request_deduplication::validate_composition`) works on
+/// `PluginConfig` JSON, while the runtime backstop
+/// (`Plugin::response_presentation_policy`) works on a constructed instance.
+/// Both route through the same parser and the same predicate here, so the two
+/// surfaces cannot drift; a configuration this parser rejects is not classified
+/// at all, because the plugin constructor refuses it independently.
+pub fn presentation_policy_is_request_derived(config: &Value) -> bool {
+    let Some(object) = config.as_object() else {
+        return false;
+    };
+    // Mirrors `A2aGateway::new`: `enabled` defaults to true, and a non-boolean
+    // value is a configuration the constructor refuses outright.
+    let enabled = match optional_bool(object, "enabled") {
+        Ok(value) => value.unwrap_or(true),
+        Err(_) => return false,
+    };
+    let Ok(discovery) = parse_discovery(object) else {
+        return false;
+    };
+    enabled && discovery_is_request_derived(&discovery)
 }
 
 fn parse_observability(object: &Map<String, Value>) -> Result<A2aObservabilityConfig, String> {
@@ -2214,23 +2353,68 @@ fn is_a2a_03_family(version: &str) -> bool {
     version == "0.3" || version.starts_with("0.3.")
 }
 
-/// Defense in depth for the URL-bearing fields the rewriter mutates.
+/// Upper bound, in bytes, on a rewritable Agent Card URL field before it is
+/// refused without being handed to the URL parser at all.
+///
+/// The response body is already bounded by the retained-response ceiling, but a
+/// single field inside it can still be megabytes of `http://`-prefixed text. An
+/// endpoint URL that no client could put in a request line is not a URL this
+/// gateway needs to identify, so the bound is applied first and the parse only
+/// ever runs over a small, fixed amount of input.
+const MAX_AGENT_CARD_URL_BYTES: usize = 4096;
+
+/// Proof that a URL-bearing field the rewriter mutates really holds an absolute
+/// `http`/`https` URL.
 ///
 /// In the 0.3 layout `AgentCard.url` (field 3) and `AgentInterface.url`
-/// (field 1) always hold an absolute `http`/`https` URL. UTF-8 validity alone
-/// does not prove that: a serialized `AgentInterface` — which is what field 3
-/// holds in the A2A 1.0 layout — is frequently valid UTF-8, because its tag
-/// bytes (`0x0a`, `0x12`), short length prefixes, and ASCII URL/transport
-/// strings all stay below `0x80`. The scheme check is what actually
-/// distinguishes a URL string from a submessage, so a value that is not an
-/// absolute http(s) URL is treated as a layout mismatch and the rewrite fails
-/// closed rather than guessing.
+/// (field 1) always hold one. UTF-8 validity alone does not prove that: a
+/// serialized `AgentInterface` — which is what field 3 holds in the A2A 1.0
+/// layout — is frequently valid UTF-8, because its tag bytes (`0x0a`, `0x12`),
+/// short length prefixes, and ASCII URL/transport strings all stay below `0x80`.
+/// So a value that is not an absolute http(s) URL is treated as a layout
+/// mismatch and the rewrite fails closed rather than guessing.
+///
+/// A scheme *prefix* test is not that proof. `http://` followed by anything at
+/// all — an empty authority, a bare `?`, a control character, a nested
+/// `http://` — begins with those bytes without being a URL, and a submessage
+/// whose first field happens to carry such a string would pass. This therefore
+/// parses with the same `url::Url` the configured `discovery.public_base_url`
+/// is validated against, under a fixed set of requirements:
+///
+/// - The input is bounded ([`MAX_AGENT_CARD_URL_BYTES`]) and free of ASCII
+///   whitespace and control characters. The WHATWG parser silently strips
+///   leading/trailing C0 and space and removes embedded tabs/newlines, so
+///   without this a value that is *not* the URL it parses as would be accepted
+///   and then re-emitted verbatim.
+/// - The parsed scheme is exactly `http` or `https` — never `file`, `data`, or
+///   an unknown scheme that merely embeds one of them.
+/// - A real, non-empty host is present.
+/// - No embedded credentials. `http://user:pass@host/` is a URL, but publishing
+///   one in a rewritten Agent Card would advertise a credential to every
+///   discovery client, and Ferrum rejects embedded credentials at every other
+///   boundary (`validate_public_base_url` does the same for the configured
+///   base).
+///
+/// Only the boolean verdict leaves this function: the parsed/normalized form is
+/// never emitted, so the backend's own bytes are what get preserved when no
+/// rewrite is needed.
 fn is_absolute_http_url(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    ["https://", "http://"].iter().any(|scheme| {
-        let scheme = scheme.as_bytes();
-        bytes.len() > scheme.len() && bytes[..scheme.len()].eq_ignore_ascii_case(scheme)
-    })
+    if value.is_empty() || value.len() > MAX_AGENT_CARD_URL_BYTES {
+        return false;
+    }
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        return false;
+    }
+    let Ok(parsed) = Url::parse(value) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some_and(|host| !host.is_empty())
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
 }
 
 /// Decode a rewritable URL field, rejecting anything that is not an absolute
@@ -2463,6 +2647,33 @@ fn expect_len_wire(wire: u8) -> Result<(), &'static str> {
     }
 }
 
+fn expect_varint_wire(wire: u8) -> Result<(), &'static str> {
+    if wire == PROTO_WIRE_VARINT {
+        Ok(())
+    } else {
+        Err("agent_card_protobuf_field_wire_mismatch")
+    }
+}
+
+/// Every singular top-level `AgentCard` field, so a second occurrence of any of
+/// them is refused instead of silently taking proto3 last-wins semantics.
+///
+/// One `bool` per singular field rather than a bitmask: the compiler then
+/// catches a field added to the wire table but never claimed here.
+#[derive(Default)]
+struct AgentCardSingularFields {
+    name: bool,
+    description: bool,
+    url: bool,
+    provider: bool,
+    version: bool,
+    documentation_url: bool,
+    capabilities: bool,
+    supports_authenticated_extended_card: bool,
+    preferred_transport: bool,
+    protocol_version: bool,
+}
+
 /// Claim a singular field, refusing a second occurrence.
 fn claim_singular_field(seen: &mut bool) -> Result<(), &'static str> {
     if *seen {
@@ -2476,45 +2687,121 @@ fn decode_protobuf_string(value: &[u8]) -> Result<&str, &'static str> {
     std::str::from_utf8(value).map_err(|_| "agent_card_protobuf_string_invalid")
 }
 
+/// Decode a protobuf `bool` field from the raw varint bytes the decoder
+/// captured.
+///
+/// [`for_each_protobuf_field`] already proved the varint is canonical, so a
+/// conforming `bool` is exactly one byte: `0x00` or `0x01`. Anything else — a
+/// `2`, a `0xff`, or a longer encoding — is a value no conforming protobuf
+/// encoder emits for this type, which makes it exactly the kind of
+/// wire-representable-but-unrepresentable value this module refuses everywhere
+/// else (over-long varints, group wire types, out-of-range field numbers). The
+/// field is preserved verbatim beside rewritten siblings once the signature
+/// block is dropped, so accepting a shape the backend's own parser would read
+/// differently is not a difference this gateway may paper over.
+fn decode_protobuf_bool(value: &[u8]) -> Result<bool, &'static str> {
+    match value {
+        [0x00] => Ok(false),
+        [0x01] => Ok(true),
+        _ => Err("agent_card_protobuf_bool_invalid"),
+    }
+}
+
 /// Prove `message` is a schema-valid A2A 0.3 `AgentCard` before any field is
 /// rewritten.
 ///
-/// Validation covers EVERY known field the 0.3 layout gate and the rewriter rely
-/// on, not merely the ones whose values are read. A known field carrying an
-/// unexpected wire type — `url` as a varint, `additional_interfaces` as a fixed32
-/// — would otherwise fall through the rewriter's catch-all arm and be PRESERVED
-/// verbatim while its siblings were rewritten and the signature block was
-/// dropped, publishing a half-rewritten card under no signature at all. A
-/// singular field that appears twice is ambiguous for the same reason: proto3
-/// last-wins semantics would let a backend hide the URL that actually gets
-/// served behind a decoy earlier in the message. Both fail closed.
+/// # What is actually validated, and where the boundary is
+///
+/// EVERY known top-level field of the 0.3 `AgentCard` is checked — all
+/// seventeen, not just the ones whose values the rewriter reads. Three
+/// properties are enforced, and the boundary past them is stated exactly so this
+/// is not read as a deep validation it is not:
+///
+/// 1. **Wire type.** Each known number must carry the wire type the 0.3 schema
+///    declares: length-delimited for every string, submessage, map entry, and
+///    repeated string; a varint for the one `bool`
+///    (`supports_authenticated_extended_card`, field 13), whose value must also
+///    be a canonical `0`/`1` (see [`decode_protobuf_bool`]). A known field with
+///    an unexpected wire type — `url` as a varint, `additional_interfaces` as a
+///    fixed32 — would otherwise fall through the rewriter's catch-all arm and be
+///    PRESERVED verbatim while its siblings were rewritten and the signature
+///    block was dropped, publishing a half-rewritten card under no signature at
+///    all.
+/// 2. **Multiplicity.** Every singular field is claimed once
+///    ([`AgentCardSingularFields`]); a second occurrence is ambiguous, because
+///    proto3 last-wins semantics would let a backend hide the URL that actually
+///    gets served behind a decoy earlier in the message. The genuinely repeated
+///    fields — `security_schemes` (map entries), `security`,
+///    `default_input_modes`, `default_output_modes`, `skills`,
+///    `additional_interfaces`, `signatures` — may of course repeat.
+/// 3. **UTF-8 for every known string that is re-emitted.** `name`,
+///    `description`, `version`, `documentation_url`, `default_input_modes`,
+///    `default_output_modes`, `preferred_transport`, and `protocol_version` are
+///    all copied into the rebuilt card, so a value the gateway cannot even
+///    represent as text must not be republished as though it had been
+///    inspected. `url` is held to the stronger absolute-URL proof.
+///
+/// **The boundary:** the opaque submessages this rewriter deliberately preserves
+/// — `provider` (4), `capabilities` (7), each `security_schemes` map entry (8),
+/// each `security` (9), each `skills` (12), and each `signatures` (17) — are
+/// checked for wire type and multiplicity ONLY. Their contents are never
+/// decoded, and nothing here claims they are well formed. The single nested
+/// exception is `additional_interfaces` (15), which the rewriter itself parses
+/// and can mutate, so each `AgentInterface` gets its own required-shape check in
+/// [`validate_agent_interface_protobuf`].
 ///
 /// Unknown fields with any valid wire type are untouched and preserved, so a
-/// newer 0.3.x point release that adds a scalar still round-trips.
+/// newer 0.3.x point release that adds a field still round-trips.
 ///
 /// The identity/endpoint requirement (a `name` or `description`, plus a `url` or
-/// at least one `additional_interfaces`) is what distinguishes an Agent Card
-/// from an arbitrary protobuf message that happens to decode.
+/// at least one usable `additional_interfaces`) is what distinguishes an Agent
+/// Card from an arbitrary protobuf message that happens to decode.
 fn validate_agent_card_protobuf(message: &[u8]) -> Result<AgentCardSchema<'_>, &'static str> {
     let mut preferred_transport = None;
-    let mut name_seen = false;
-    let mut description_seen = false;
-    let mut url_seen = false;
-    let mut transport_seen = false;
-    let mut version_seen = false;
+    let mut seen = AgentCardSingularFields::default();
+    let mut has_identity = false;
     let mut has_endpoint = false;
     for_each_protobuf_field(message, |field, wire, value| {
         match field {
+            // ── Singular strings ─────────────────────────────────────────
             AGENT_CARD_PB_NAME => {
-                claim_singular_field(&mut name_seen)?;
+                claim_singular_field(&mut seen.name)?;
                 expect_len_wire(wire)?;
+                decode_protobuf_string(value)?;
+                has_identity = true;
             }
             AGENT_CARD_PB_DESCRIPTION => {
-                claim_singular_field(&mut description_seen)?;
+                claim_singular_field(&mut seen.description)?;
                 expect_len_wire(wire)?;
+                decode_protobuf_string(value)?;
+                has_identity = true;
             }
+            AGENT_CARD_PB_VERSION => {
+                claim_singular_field(&mut seen.version)?;
+                expect_len_wire(wire)?;
+                decode_protobuf_string(value)?;
+            }
+            // Not held to the absolute-URL proof: `documentation_url` is human
+            // documentation the gateway never rewrites or fronts, and the 0.3
+            // schema places no absoluteness requirement on it.
+            AGENT_CARD_PB_DOCUMENTATION_URL => {
+                claim_singular_field(&mut seen.documentation_url)?;
+                expect_len_wire(wire)?;
+                decode_protobuf_string(value)?;
+            }
+            AGENT_CARD_PB_PREFERRED_TRANSPORT => {
+                claim_singular_field(&mut seen.preferred_transport)?;
+                expect_len_wire(wire)?;
+                preferred_transport = Some(decode_protobuf_string(value)?);
+            }
+            AGENT_CARD_PB_PROTOCOL_VERSION => {
+                claim_singular_field(&mut seen.protocol_version)?;
+                expect_len_wire(wire)?;
+                decode_protobuf_string(value)?;
+            }
+            // ── Endpoint fields ──────────────────────────────────────────
             AGENT_CARD_PB_URL => {
-                claim_singular_field(&mut url_seen)?;
+                claim_singular_field(&mut seen.url)?;
                 expect_len_wire(wire)?;
                 // Validated even when `preferred_transport` means this field is
                 // not rewritten: field 3 holding something that is not an
@@ -2523,27 +2810,44 @@ fn validate_agent_card_protobuf(message: &[u8]) -> Result<AgentCardSchema<'_>, &
                 decode_rewritable_url_field(value)?;
                 has_endpoint = true;
             }
-            AGENT_CARD_PB_PREFERRED_TRANSPORT => {
-                claim_singular_field(&mut transport_seen)?;
-                expect_len_wire(wire)?;
-                preferred_transport = Some(decode_protobuf_string(value)?);
-            }
             AGENT_CARD_PB_ADDITIONAL_INTERFACES => {
                 expect_len_wire(wire)?;
+                // Every interface must carry a usable URL, so reaching this line
+                // really does prove the card advertises an endpoint.
                 validate_agent_interface_protobuf(value)?;
                 has_endpoint = true;
             }
-            AGENT_CARD_PB_PROTOCOL_VERSION => {
-                claim_singular_field(&mut version_seen)?;
+            // ── Repeated strings ─────────────────────────────────────────
+            AGENT_CARD_PB_DEFAULT_INPUT_MODES | AGENT_CARD_PB_DEFAULT_OUTPUT_MODES => {
                 expect_len_wire(wire)?;
                 decode_protobuf_string(value)?;
             }
-            AGENT_CARD_PB_SIGNATURES => expect_len_wire(wire)?,
+            // ── The one varint field ─────────────────────────────────────
+            AGENT_CARD_PB_SUPPORTS_AUTHENTICATED_EXTENDED_CARD => {
+                claim_singular_field(&mut seen.supports_authenticated_extended_card)?;
+                expect_varint_wire(wire)?;
+                decode_protobuf_bool(value)?;
+            }
+            // ── Singular opaque submessages (shape only; see the doc) ─────
+            AGENT_CARD_PB_PROVIDER => {
+                claim_singular_field(&mut seen.provider)?;
+                expect_len_wire(wire)?;
+            }
+            AGENT_CARD_PB_CAPABILITIES => {
+                claim_singular_field(&mut seen.capabilities)?;
+                expect_len_wire(wire)?;
+            }
+            // ── Repeated opaque submessages / map entries ────────────────
+            AGENT_CARD_PB_SECURITY_SCHEMES
+            | AGENT_CARD_PB_SECURITY
+            | AGENT_CARD_PB_SKILLS
+            | AGENT_CARD_PB_SIGNATURES => expect_len_wire(wire)?,
+            // Unknown, valid future fields: preserved verbatim.
             _ => {}
         }
         Ok(())
     })?;
-    if !(name_seen || description_seen) || !has_endpoint {
+    if !has_identity || !has_endpoint {
         return Err("agent_card_protobuf_shape_unrecognized");
     }
     Ok(AgentCardSchema {
@@ -2551,7 +2855,18 @@ fn validate_agent_card_protobuf(message: &[u8]) -> Result<AgentCardSchema<'_>, &
     })
 }
 
-/// The `AgentInterface` counterpart of [`validate_agent_card_protobuf`].
+/// The `AgentInterface` counterpart of [`validate_agent_card_protobuf`], for the
+/// one nested message the rewriter actually parses and can mutate.
+///
+/// `url` is REQUIRED here even though the 0.3 proto carries no
+/// `field_behavior` annotation on it. An interface without a URL is not a usable
+/// endpoint: it can never be the JSON-RPC endpoint the gateway fronts, so
+/// [`agent_interface_needs_rewrite`] would leave it untouched, and it would then
+/// be preserved verbatim inside a card published as "rewritten" with its
+/// signatures removed — while also being the only thing that made the card look
+/// like it advertised an endpoint at all. Requiring the field means reaching the
+/// end of this function proves a usable endpoint, and an explicitly-encoded
+/// empty URL is already refused by the absolute-URL proof.
 fn validate_agent_interface_protobuf(
     message: &[u8],
 ) -> Result<AgentInterfaceSchema<'_>, &'static str> {
@@ -2575,6 +2890,9 @@ fn validate_agent_interface_protobuf(
         }
         Ok(())
     })?;
+    if url.is_none() {
+        return Err("agent_card_protobuf_interface_url_missing");
+    }
     Ok(AgentInterfaceSchema { url, transport })
 }
 
