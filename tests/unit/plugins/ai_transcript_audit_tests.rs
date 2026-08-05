@@ -10243,7 +10243,8 @@ fn grpc_frame_budgets_are_bounded_by_deployment_maxima() {
 
         let over_bound = config(key, hard_max + 1);
         let error = AiTranscriptAudit::new(&over_bound, loopback_http_client())
-            .expect_err("above the deployment hard maximum must fail closed");
+            .err()
+            .expect("above the deployment hard maximum must fail closed");
         assert!(
             error.contains(key) && error.contains(&hard_max.to_string()),
             "the diagnostic must name the field and its ceiling: {error}"
