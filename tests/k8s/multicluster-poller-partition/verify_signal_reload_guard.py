@@ -23,7 +23,8 @@ FORBIDDEN_PATTERNS = (
 )
 
 REQUIRED_INNER_PATTERNS = (
-    re.compile(r"/proc/\[0-9\]\*/cmdline"),
+    re.compile(r"for\s+process_dir\s+in\s+/proc/\[0-9\]\*;\s+do"),
+    re.compile(r'done\s*<\s*"\$process_dir/cmdline"'),
     re.compile(r"\$\{argv0##\*/\}\s*=\s*\"ferrum-edge\""),
     re.compile(r'\[ "\$argv1" = "run" \]'),
     re.compile(r"multiple ferrum-edge run processes found"),
@@ -69,9 +70,12 @@ GOOD_INNER = """
 """
 
 
+class GuardFailure(Exception):
+    """One static guard or guard-self-test invariant failed."""
+
+
 def fail(message: str) -> None:
-    print(f"signal_reload guard: {message}", file=sys.stderr)
-    raise SystemExit(1)
+    raise GuardFailure(message)
 
 
 def extract_signal_reload_inner(text: str) -> str:
@@ -136,11 +140,27 @@ def self_test() -> None:
     if not rejects(bad_argv):
         fail("self-test: exact run subcommand check must be required")
 
+    bad_scan_root = good.replace(
+        "for process_dir in /proc/[0-9]*; do",
+        "for process_dir in /tmp/[0-9]*; do",
+        1,
+    )
+    if not rejects(bad_scan_root):
+        fail("self-test: the process scan must stay rooted under /proc")
+
+    bad_cmdline_source = good.replace(
+        'done < "$process_dir/cmdline"',
+        'done < "$process_dir/status"',
+        1,
+    )
+    if not rejects(bad_cmdline_source):
+        fail("self-test: argv parsing must read the process cmdline")
+
 
 def rejects(text: str) -> bool:
     try:
         verify_run_sh_from_text(text)
-    except SystemExit:
+    except GuardFailure:
         return True
     return False
 
@@ -161,13 +181,21 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
-    if args.self_test:
+    try:
+        # Always prove the guard accepts its canonical good fixture and rejects
+        # every protected regression before trusting it to judge run.sh. The
+        # previous guard skipped this path during ordinary preflight and blocked
+        # the live topology with an impossible combined-path regex.
         self_test()
-        print("verify_signal_reload_guard self-test passed")
+        if args.self_test:
+            print("verify_signal_reload_guard self-test passed")
+            return 0
+        verify_run_sh(Path(args.run_sh))
+        print(f"signal_reload guard ok: {args.run_sh}")
         return 0
-    verify_run_sh(Path(args.run_sh))
-    print(f"signal_reload guard ok: {args.run_sh}")
-    return 0
+    except GuardFailure as error:
+        print(f"signal_reload guard: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
