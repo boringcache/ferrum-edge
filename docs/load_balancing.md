@@ -408,7 +408,7 @@ upstreams:
 
 If `hash_on_cookie_config` is omitted, sensible defaults are used (path `/`, 1 hour TTL, `HttpOnly` enabled).
 
-The sticky session cookie is injected on HTTP, gRPC, and WebSocket (101 Upgrade) responses.
+The sticky session cookie is injected on HTTP, gRPC, and WebSocket (101 Upgrade) responses. For gRPC this covers both the buffered response path and the fully-streaming fast path (a server-streaming RPC with no response-body-buffering plugin), where the cookie is written into the initial HEADERS frame before it is committed.
 
 When a target is removed or added, only a fraction of *unbound* keys are remapped — this minimizes cache invalidation across backends. Sessions already bound to a surviving target keep their exact target; sessions bound to the removed target re-select and are re-issued a cookie.
 

@@ -843,6 +843,227 @@ fn port_lane_precedence_composes_with_subset_scoping() {
 }
 
 // ---------------------------------------------------------------------------
+// The shared mint site — and with it the fully-streaming native-gRPC fast path
+// ---------------------------------------------------------------------------
+//
+// The direct H1/H2 native-gRPC dispatch has two response arms. The BUFFERED arm
+// minted the affinity cookie; the FULLY-STREAMING arm committed its HEADERS
+// frame and returned first, so a GRPCRoute with no response-body-buffering
+// plugin and no retry selected a backend and never issued the initial cookie —
+// session persistence silently did nothing for exactly the RPC shape gRPC is
+// used for. Both arms now write through the one shared mint site exercised here,
+// composed the same way the call sites compose it.
+
+/// Mint exactly as the streaming native-gRPC fast path does: derive the reissue
+/// target from the post-dispatch derivation, then hand it (and nothing else) to
+/// the shared mint site.
+fn mint_like_a_grpc_dispatch_arm(
+    proxy: &Proxy,
+    balancers: &ferrum_edge::load_balancer::LoadBalancerCacheInner,
+    selection_needs_set: bool,
+    selected: Option<&UpstreamTarget>,
+    served: Option<&UpstreamTarget>,
+    response_headers: &mut HashMap<String, String>,
+) -> bool {
+    let reissue_target = ferrum_edge::_test_support::sticky_cookie_reissue_target_for_test(
+        selection_needs_set,
+        selected,
+        served,
+    );
+    ferrum_edge::_test_support::inject_sticky_affinity_cookie_for_test(
+        proxy,
+        balancers,
+        reissue_target,
+        reissue_target.is_some(),
+        response_headers,
+    )
+}
+
+/// The `Set-Cookie` line the production builder emits for `target`.
+fn expected_affinity_cookie(target: &UpstreamTarget) -> String {
+    ferrum_edge::_test_support::build_sticky_cookie_header_for_test(
+        COOKIE_NAME,
+        NAMESPACE,
+        UPSTREAM_ID,
+        target,
+        &ferrum_edge::config::types::HashOnCookieConfig::default(),
+    )
+}
+
+#[test]
+fn a_streaming_dispatch_mints_the_initial_affinity_cookie() {
+    // No usable cookie was presented, so selection asked for a fresh binding and
+    // the streaming response owes the client one. On 0e9f3c31 this arm wrote
+    // nothing at all.
+    let served = target("10.1.0.10", 8080);
+    let upstream = sticky_upstream(vec![served.clone(), target("10.1.0.11", 8080)]);
+    let (cache, proxy) = resolved_fixture(upstream, 8080, None);
+    let snapshot = cache.load();
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    assert!(
+        mint_like_a_grpc_dispatch_arm(
+            &proxy,
+            &snapshot,
+            true,
+            Some(&served),
+            Some(&served),
+            &mut response_headers,
+        ),
+        "a first-ever streaming gRPC response must issue the affinity cookie"
+    );
+    assert_eq!(
+        response_headers.get("set-cookie"),
+        Some(&expected_affinity_cookie(&served)),
+        "the minted cookie must name the backend that produced the response"
+    );
+
+    // End-to-end: the emitted cookie is the token that steers the NEXT request
+    // back to this exact backend, so the mint is usable and not merely present.
+    let minted_value = response_headers["set-cookie"]
+        .split(';')
+        .next()
+        .and_then(|pair| pair.split_once('='))
+        .map(|(_, value)| value.to_string())
+        .expect("minted Set-Cookie carries a name=value pair");
+    let rebound = ferrum_edge::_test_support::resolve_sticky_binding_for_test(
+        &proxy,
+        &snapshot,
+        UPSTREAM_ID,
+        &minted_value,
+        COOKIE_NAME,
+        None,
+        None,
+    )
+    .expect("the minted token must resolve back to a backend");
+    assert_eq!((rebound.host.as_str(), rebound.port), ("10.1.0.10", 8080));
+}
+
+#[test]
+fn a_streaming_dispatch_does_not_reissue_an_honored_binding() {
+    // The client presented a valid cookie, selection honored it, and no retry
+    // rotated: re-minting the identical token would be pure wire noise, and a
+    // reissue here is how a "mint on every response" regression would show up.
+    let served = target("10.1.0.10", 8080);
+    let bound = distinct_clone(&served);
+    let upstream = sticky_upstream(vec![served.clone(), target("10.1.0.11", 8080)]);
+    let (cache, proxy) = resolved_fixture(upstream, 8080, None);
+    let snapshot = cache.load();
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    assert!(
+        !mint_like_a_grpc_dispatch_arm(
+            &proxy,
+            &snapshot,
+            false,
+            Some(&bound),
+            Some(&served),
+            &mut response_headers,
+        ),
+        "an honored binding that served its own backend must not be re-issued"
+    );
+    assert!(
+        !response_headers.contains_key("set-cookie"),
+        "no gateway cookie may be written when the binding was honored"
+    );
+}
+
+#[test]
+fn a_streaming_dispatch_appends_beside_a_backend_set_cookie() {
+    // RFC 6265 forbids folding Set-Cookie into one value; the proxy keeps the
+    // lines newline-separated and every response builder splits them back out.
+    // A backend cookie must survive the affinity append untouched.
+    let served = target("10.1.0.10", 8080);
+    let upstream = sticky_upstream(vec![served.clone()]);
+    let (cache, proxy) = resolved_fixture(upstream, 8080, None);
+    let snapshot = cache.load();
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    response_headers.insert(
+        "set-cookie".to_string(),
+        "backend_session=abc; Path=/".to_string(),
+    );
+    assert!(mint_like_a_grpc_dispatch_arm(
+        &proxy,
+        &snapshot,
+        true,
+        Some(&served),
+        Some(&served),
+        &mut response_headers,
+    ));
+
+    let expected = expected_affinity_cookie(&served);
+    let lines: Vec<&str> = response_headers["set-cookie"].split('\n').collect();
+    assert_eq!(
+        lines,
+        vec!["backend_session=abc; Path=/", expected.as_str()],
+        "the affinity cookie is appended as its own line, leaving the backend's intact"
+    );
+}
+
+#[test]
+fn a_streaming_dispatch_writes_nothing_for_a_non_cookie_lane() {
+    // The served target's OWN per-port policy lane decides the mint. A rotation
+    // (or an upstream whose landing lane is round-robin) must not hand the
+    // client a token that lane would never honor.
+    let cookie_lane = target("10.1.0.10", 8080);
+    let round_robin_lane = target("10.1.0.11", 9090);
+    let mut upstream = sticky_upstream(vec![cookie_lane.clone(), round_robin_lane.clone()]);
+    upstream.port_overrides.insert(
+        9090,
+        port_override(Some(LoadBalancerAlgorithm::RoundRobin), None),
+    );
+    let (cache, proxy) = resolved_fixture(upstream, 8080, None);
+    let snapshot = cache.load();
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    assert!(
+        !mint_like_a_grpc_dispatch_arm(
+            &proxy,
+            &snapshot,
+            true,
+            Some(&round_robin_lane),
+            Some(&round_robin_lane),
+            &mut response_headers,
+        ),
+        "a non-cookie landing lane must not mint an affinity cookie"
+    );
+    assert!(response_headers.is_empty());
+}
+
+#[test]
+fn a_streaming_dispatch_that_served_nothing_never_pins_a_client() {
+    // A gateway-synthesized refusal that dialed no backend passes `None`, and a
+    // route with no upstream has no binding scope at all. Neither may write.
+    let served = target("10.1.0.10", 8080);
+    let upstream = sticky_upstream(vec![served.clone()]);
+    let (cache, mut proxy) = resolved_fixture(upstream, 8080, None);
+    let snapshot = cache.load();
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    assert!(!mint_like_a_grpc_dispatch_arm(
+        &proxy,
+        &snapshot,
+        true,
+        Some(&served),
+        None,
+        &mut response_headers,
+    ));
+    assert!(response_headers.is_empty());
+
+    proxy.upstream_id = None;
+    assert!(!mint_like_a_grpc_dispatch_arm(
+        &proxy,
+        &snapshot,
+        true,
+        Some(&served),
+        Some(&served),
+        &mut response_headers,
+    ));
+    assert!(response_headers.is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // Anti-drift: every mint site routes through the shared derivation
 // ---------------------------------------------------------------------------
 
@@ -873,14 +1094,51 @@ fn every_retry_capable_mint_site_uses_the_shared_reissue_derivation() {
         );
     }
 
-    // `build_sticky_cookie_header` mint sites: 3 calls + 1 definition in
-    // proxy/mod.rs (plain H1/H2, buffered gRPC, WebSocket), 1 call in the H3
-    // injector, 1 call on the H3 WebSocket upgrade. The H3 cross-protocol
-    // bridges mint through `http3::server::inject_sticky_cookie*`, never
-    // directly.
+    // `build_sticky_cookie_header` is reached from exactly ONE place: the shared
+    // `inject_sticky_affinity_cookie` mint site in proxy/mod.rs. So proxy/mod.rs
+    // holds 1 definition + that 1 call, and every other dispatch file holds
+    // none — the H1/H2, gRPC (buffered AND fully-streaming), WebSocket, and H3
+    // paths all append through the shared site. A new count here means a path
+    // grew its own copy, which is how the streaming gRPC arm came to omit the
+    // cookie entirely.
     let mint_sites = |src: &str| src.matches("build_sticky_cookie_header(").count();
-    assert_eq!(mint_sites(proxy_src), 4);
-    assert_eq!(mint_sites(h3_server_src), 1);
-    assert_eq!(mint_sites(h3_ws_src), 1);
+    assert_eq!(mint_sites(proxy_src), 2);
+    assert_eq!(mint_sites(h3_server_src), 0);
+    assert_eq!(mint_sites(h3_ws_src), 0);
     assert_eq!(mint_sites(h3_cross_src), 0);
+}
+
+#[test]
+fn both_direct_grpc_response_arms_inject_the_affinity_cookie() {
+    // The regression this locks: the direct H1/H2 native-gRPC dispatch returns
+    // its FULLY-STREAMING response from its own match arm, ahead of the buffered
+    // arm's injection. An arm that stops calling the shared mint site ships a
+    // GRPCRoute that selects a backend and never binds the client to it.
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+
+    let streaming_arm = proxy_src
+        .split_once("Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {")
+        .expect("direct gRPC dispatch keeps a fully-streaming response arm")
+        .1;
+    let (streaming_arm, buffered_arm) = streaming_arm
+        .split_once("Ok(GrpcResponseKind::Buffered(grpc_resp)) => {")
+        .expect("direct gRPC dispatch keeps a buffered response arm");
+    // Bound the buffered arm at the sibling `Err` arm of the same match;
+    // otherwise the slice runs to end-of-file and the plain H1/H2 mint site
+    // would satisfy the assertion for it.
+    let buffered_arm = buffered_arm
+        .split_once("\n            Err(e) => {")
+        .expect("direct gRPC dispatch keeps an error arm after the buffered arm")
+        .0;
+
+    for (label, arm) in [
+        ("fully-streaming", streaming_arm),
+        ("buffered", buffered_arm),
+    ] {
+        assert!(
+            arm.contains("inject_sticky_affinity_cookie_with_deadline_provenance("),
+            "the direct gRPC {label} response arm must inject the sticky-affinity \
+             cookie through the shared mint site before its headers are committed"
+        );
+    }
 }

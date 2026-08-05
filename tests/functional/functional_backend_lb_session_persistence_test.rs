@@ -332,9 +332,10 @@ plugin_configs: []
 ///    carries a FRESH cookie for the backend that actually served it;
 /// 3. that fresh cookie returns the client to the live backend.
 ///
-/// Deterministic: the dead target is a port that was bound and released, so
-/// every dial is an immediate `ECONNREFUSED` (no sleeps, no polling, no
-/// retry-until-pass).
+/// Deterministic: the refusing target is a socket this test OWNS for its whole
+/// lifetime — bound, never listening — so every dial is an immediate
+/// `ECONNREFUSED` with no bind/reuse window another process could win, and no
+/// sleeps, polling, or retry-until-pass anywhere.
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backend_lb_session_persistence_reissues_after_retry_rotation() {
@@ -344,15 +345,33 @@ async fn backend_lb_session_persistence_reissues_after_retry_rotation() {
         .await
         .expect("spawn sticky-rotation-live");
 
-    // A port nothing listens on: bind to :0, take the port, drop the listener.
-    // Every connect to it is refused immediately, which is exactly the
-    // connect-class failure `retry_on_connect_failure` retries on.
-    let dead_port = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("reserve a dead port");
-        listener.local_addr().expect("dead port addr").port()
-    };
+    // A backend that deterministically REFUSES, with no bind/reuse window: a TCP
+    // socket bound to an ephemeral port and deliberately never moved into the
+    // listening state. Two properties make it exact:
+    //
+    // - the bind is held for the whole test (RAII — the socket lives to the end
+    //   of this body and closes with it), so no parallel test or unrelated
+    //   process can claim the port and start answering on it. Taking a port by
+    //   binding and immediately dropping the listener would be a TOCTOU race:
+    //   between the release and the request, anything may bind it, and the
+    //   "refusing" backend would accept instead;
+    // - a bound socket that never called `listen(2)` has no accept queue, so the
+    //   kernel answers every SYN with RST. The gateway's real connect attempt
+    //   fails ECONNREFUSED before any request byte reaches a backend — the
+    //   pre-wire, `connection_error` class that `retry_on_connect_failure`
+    //   replays (`retry::should_retry`), and the only class that lets the retry
+    //   loop rotate onto the live target.
+    //
+    // No sleeps, no retry-until-pass: the refusal is a property of the socket
+    // state, observed identically on every attempt.
+    let refusing_backend = tokio::net::TcpSocket::new_v4().expect("refusing-backend socket");
+    refusing_backend
+        .bind("127.0.0.1:0".parse().expect("refusing-backend bind addr"))
+        .expect("reserve the refusing-backend port");
+    let refusing_port = refusing_backend
+        .local_addr()
+        .expect("refusing-backend addr")
+        .port();
 
     let upstream_id = "rotation-sticky-upstream";
     let config = format!(
@@ -385,13 +404,13 @@ upstreams:
         port: {live}
         weight: 1
       - host: "127.0.0.1"
-        port: {dead}
+        port: {refusing}
         weight: 1
 consumers: []
 plugin_configs: []
 "#,
         live = backend_live.port,
-        dead = dead_port,
+        refusing = refusing_port,
         upstream_id = upstream_id,
         cookie_name = COOKIE_NAME,
     );
@@ -400,7 +419,7 @@ plugin_configs: []
         .mode_file(config)
         .log_level("warn")
         .reserve_listener_port(backend_live.port)
-        .reserve_listener_port(dead_port)
+        .reserve_listener_port(refusing_port)
         .spawn()
         .await
         .expect("start sticky rotation gateway");
@@ -429,7 +448,7 @@ plugin_configs: []
         )
     };
     let live_cookie = format!("{COOKIE_NAME}={}", token_for_port(backend_live.port));
-    let dead_cookie = format!("{COOKIE_NAME}={}", token_for_port(dead_port));
+    let refusing_cookie = format!("{COOKIE_NAME}={}", token_for_port(refusing_port));
 
     // --- Control: an honored binding that needed no rotation is NOT re-issued
     let honored = client
@@ -456,7 +475,7 @@ plugin_configs: []
     // --- A valid binding whose backend refuses: rotate, then RE-ISSUE --------
     let rotated = client
         .get(gateway.proxy_url("/rotation/rotated"))
-        .header(reqwest::header::COOKIE, &dead_cookie)
+        .header(reqwest::header::COOKIE, &refusing_cookie)
         .send()
         .await
         .expect("rotated binding request");
@@ -471,7 +490,7 @@ plugin_configs: []
     );
     let rebound = cookie_pair_from_set_cookie(&reissued, COOKIE_NAME);
     assert_ne!(
-        rebound, dead_cookie,
+        rebound, refusing_cookie,
         "the re-issued binding must not point back at the refusing backend"
     );
     assert_eq!(
@@ -499,4 +518,11 @@ plugin_configs: []
         parse_server_name(&confirm.text().await.expect("rebound body")),
         "sticky-rotation-live"
     );
+
+    // Release the refusing backend's port only now that every request that had
+    // to be refused has been made. Explicit rather than implicit so a future
+    // edit cannot reorder the drop above the traffic and quietly reintroduce the
+    // bind/reuse race; `EchoServer` and `TestGateway` clean up through their own
+    // `Drop` after this.
+    drop(refusing_backend);
 }

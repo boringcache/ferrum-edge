@@ -35,7 +35,6 @@ use super::peer_identity::{
 };
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
-use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
     RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, ResponseStreamAction,
@@ -8263,44 +8262,15 @@ pub(crate) fn inject_sticky_cookie(
     reissue_needed: bool,
     response_headers: &mut HashMap<String, String>,
 ) -> bool {
-    if reissue_needed
-        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, served_target)
-    {
-        let strategy = crate::proxy::backend_dispatch::hash_on_strategy_for_selected_target(
-            proxy,
-            &epoch.load_balancer,
-            upstream_id,
-            target,
-        );
-        if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(
-                &epoch.load_balancer,
-                &proxy.namespace,
-                upstream_id,
-            );
-            let default_cc = crate::config::types::HashOnCookieConfig::default();
-            let cookie_config = upstream
-                .as_ref()
-                .and_then(|u| u.hash_on_cookie_config.as_ref())
-                .unwrap_or(&default_cc);
-            let cookie_val = crate::proxy::build_sticky_cookie_header(
-                cookie_name,
-                &proxy.namespace,
-                upstream_id,
-                target,
-                cookie_config,
-            );
-            response_headers
-                .entry("set-cookie".to_string())
-                .and_modify(|v| {
-                    v.push('\n');
-                    v.push_str(&cookie_val);
-                })
-                .or_insert(cookie_val);
-            return true;
-        }
-    }
-    false
+    // Thin H3 adapter over the one shared mint site, so an H3 relay cannot drift
+    // from the H1/H2 and native-gRPC paths.
+    crate::proxy::inject_sticky_affinity_cookie(
+        proxy,
+        &epoch.load_balancer,
+        served_target,
+        reissue_needed,
+        response_headers,
+    )
 }
 
 /// Inject the sticky-affinity cookie on a BUFFERED H3 response and, when one was
@@ -8323,24 +8293,14 @@ pub(crate) fn inject_sticky_cookie_with_deadline_provenance(
     reissue_needed: bool,
     response_headers: &mut HashMap<String, String>,
 ) -> bool {
-    if !inject_sticky_cookie(
-        epoch,
+    crate::proxy::inject_sticky_affinity_cookie_with_deadline_provenance(
+        ctx,
         proxy,
+        &epoch.load_balancer,
         served_target,
         reissue_needed,
         response_headers,
-    ) {
-        return false;
-    }
-    // The injection APPENDS onto any co-present backend cookie, so it records
-    // mutations rather than declaring ownership — ownership means whole-value
-    // replacement and retires the backend cookie baseline, which would credit a
-    // backend cookie as gateway output. `record_deadline_response_header_…`
-    // returns immediately when no deadline provenance is being tracked, so
-    // ordinary sticky traffic pays nothing here (same shape as the H1/H2
-    // buffered sites in `src/proxy/mod.rs`).
-    ctx.record_deadline_response_header_mutations(response_headers);
-    true
+    )
 }
 
 /// Whether an H3 dispatch failure counts as a connect-class (pre-wire) backend

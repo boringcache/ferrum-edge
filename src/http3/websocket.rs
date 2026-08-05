@@ -1233,40 +1233,21 @@ pub(crate) async fn handle_h3_websocket(
     // This response is only built after a successful upgrade, so the retry
     // loop's final `current_target` is the backend that actually served the
     // handshake. Re-derive the binding against it so a rotation reissues.
-    if let (Some(upstream_id), Some(target)) = (
-        &proxy.upstream_id,
-        crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
+    {
+        let ws_sticky_target = crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
             sticky_cookie_needed,
             sticky_selected_target.as_deref(),
             current_target.as_deref(),
-        ),
-    ) {
-        let strategy = crate::proxy::backend_dispatch::hash_on_strategy_for_selected_target(
+        );
+        // The upgrade response goes straight on the wire, so this is the
+        // non-provenance variant of the one shared mint site.
+        crate::proxy::inject_sticky_affinity_cookie(
             &proxy,
             &epoch.load_balancer,
-            upstream_id,
-            target,
+            ws_sticky_target,
+            ws_sticky_target.is_some(),
+            &mut response_headers,
         );
-        if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = crate::load_balancer::LoadBalancerCache::get_upstream_from(
-                &epoch.load_balancer,
-                &proxy.namespace,
-                upstream_id,
-            );
-            let default_cc = crate::config::types::HashOnCookieConfig::default();
-            let cookie_config = upstream
-                .as_ref()
-                .and_then(|u| u.hash_on_cookie_config.as_ref())
-                .unwrap_or(&default_cc);
-            let cookie_val = crate::proxy::build_sticky_cookie_header(
-                cookie_name,
-                &proxy.namespace,
-                upstream_id,
-                target,
-                cookie_config,
-            );
-            crate::proxy::headers::append_set_cookie_header(&mut response_headers, cookie_val);
-        }
     }
     let mut response_builder = crate::proxy::headers::apply_response_headers(
         Response::builder().status(StatusCode::OK),

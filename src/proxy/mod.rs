@@ -12055,40 +12055,21 @@ async fn handle_websocket_request_authenticated(
     // after a successful upgrade, so it is the backend that actually served the
     // handshake. Re-derive the binding decision against it so a retry that moved
     // off the client's bound backend reissues for the one that answered.
-    if let (Some(upstream_id), Some(target)) = (
-        &proxy.upstream_id,
-        backend_dispatch::sticky_cookie_reissue_target(
+    // The upgrade response's headers go straight on the wire, so this is the
+    // non-provenance variant (no committed-hook deadline rebuild can follow).
+    {
+        let ws_sticky_target = backend_dispatch::sticky_cookie_reissue_target(
             sticky_cookie_needed,
             sticky_selected_target.as_deref(),
             current_target.as_deref(),
-        ),
-    ) {
-        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
+        );
+        inject_sticky_affinity_cookie(
             &proxy,
             &epoch.load_balancer,
-            upstream_id,
-            target,
+            ws_sticky_target,
+            ws_sticky_target.is_some(),
+            &mut response_headers,
         );
-        if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(
-                &epoch.load_balancer,
-                &proxy.namespace,
-                upstream_id,
-            );
-            let default_cc = crate::config::types::HashOnCookieConfig::default();
-            let cookie_config = upstream
-                .as_ref()
-                .and_then(|u| u.hash_on_cookie_config.as_ref())
-                .unwrap_or(&default_cc);
-            let cookie_val = build_sticky_cookie_header(
-                cookie_name,
-                &proxy.namespace,
-                upstream_id,
-                target,
-                cookie_config,
-            );
-            headers_mod::append_set_cookie_header(&mut response_headers, cookie_val);
-        }
     }
 
     // Build the upgrade response.
@@ -28233,6 +28214,48 @@ async fn handle_proxy_request_inner(
                     &response_headers,
                 );
 
+                // Gateway API session persistence on the FULLY-STREAMING native
+                // gRPC fast path. This arm commits its HEADERS frame and returns
+                // without ever reaching the buffered branch's mint site, so a
+                // GRPCRoute with no response-body-buffering plugin and no retry
+                // would select a backend and never issue the initial affinity
+                // cookie — the client would then be re-spread on every RPC.
+                //
+                // `grpc_final_upstream_target` is the backend that actually
+                // produced these headers: this arm is reached only once a
+                // response began, and the retry loop's never-dispatched rotation
+                // arms restore the pre-rotation target and surface as `Err`, so
+                // they cannot land here. Without a retry config the loop cannot
+                // rotate at all, which is exactly why the derivation still has to
+                // run — `sticky_cookie_needed` carries the first-request /
+                // invalid-cookie / stale-binding mint that this path owes the
+                // client.
+                //
+                // Written here, after every response-header phase and BEFORE the
+                // trailer-policy capture below, because a gateway-authored
+                // `set-cookie` is a header-phase write: the streaming trailer
+                // governor must see it in the final header view so a backend
+                // `set-cookie` TRAILER cannot contradict it on the wire.
+                // Deadline provenance is recorded for parity with the buffered
+                // branch; this arm runs no `response_committed` hooks, so the
+                // recorder is a no-op unless one is already being tracked.
+                {
+                    let grpc_streaming_sticky_target =
+                        backend_dispatch::sticky_cookie_reissue_target(
+                            sticky_cookie_needed,
+                            upstream_target.as_deref(),
+                            grpc_final_upstream_target.as_deref(),
+                        );
+                    inject_sticky_affinity_cookie_with_deadline_provenance(
+                        &mut ctx,
+                        &proxy,
+                        &epoch.load_balancer,
+                        grpc_streaming_sticky_target,
+                        grpc_streaming_sticky_target.is_some(),
+                        &mut response_headers,
+                    );
+                }
+
                 // Check if the streaming request body exceeded the size limit
                 // BEFORE logging — otherwise the transaction summary captures a
                 // success status while we're about to return RESOURCE_EXHAUSTED.
@@ -29250,64 +29273,24 @@ async fn handle_proxy_request_inner(
                 // is restored to the pre-rotation target whenever a rotated
                 // candidate was never dispatched to (its breaker rejected);
                 // every other rotated refusal returns before reaching here.
-                if let (Some(upstream_id), Some(target)) = (
-                    &proxy.upstream_id,
-                    backend_dispatch::sticky_cookie_reissue_target(
+                // The provenance variant records the write before this branch's
+                // `response_committed` hooks below, which can exhaust the RPC
+                // deadline and rebuild the DEADLINE_EXCEEDED response from
+                // gateway-authored output only.
+                {
+                    let grpc_sticky_target = backend_dispatch::sticky_cookie_reissue_target(
                         sticky_cookie_needed,
                         upstream_target.as_deref(),
                         grpc_final_upstream_target.as_deref(),
-                    ),
-                ) {
-                    let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
+                    );
+                    inject_sticky_affinity_cookie_with_deadline_provenance(
+                        &mut ctx,
                         &proxy,
                         &epoch.load_balancer,
-                        upstream_id,
-                        target,
+                        grpc_sticky_target,
+                        grpc_sticky_target.is_some(),
+                        &mut response_headers,
                     );
-                    if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-                        let upstream = LoadBalancerCache::get_upstream_from(
-                            &epoch.load_balancer,
-                            &proxy.namespace,
-                            upstream_id,
-                        );
-                        let default_cc = crate::config::types::HashOnCookieConfig::default();
-                        let cookie_config = upstream
-                            .as_ref()
-                            .and_then(|u| u.hash_on_cookie_config.as_ref())
-                            .unwrap_or(&default_cc);
-                        let cookie_val = build_sticky_cookie_header(
-                            cookie_name,
-                            &proxy.namespace,
-                            upstream_id,
-                            target,
-                            cookie_config,
-                        );
-                        response_headers
-                            .entry("set-cookie".to_string())
-                            .and_modify(|v| {
-                                v.push('\n');
-                                v.push_str(&cookie_val);
-                            })
-                            .or_insert(cookie_val);
-                        // Record the gateway-authored affinity cookie in deadline
-                        // provenance: it is injected here (not by a plugin
-                        // mutation), so a later response-committed hook that
-                        // exhausts the RPC deadline would otherwise rebuild the
-                        // DEADLINE_EXCEEDED response without it and the client
-                        // would not stay pinned. Line-granular recording keeps
-                        // any co-present backend cookie out of gateway output.
-                        //
-                        // This is an APPEND, so it deliberately does not declare
-                        // ownership: ownership means whole-value replacement and
-                        // retires the backend cookie baseline, which here would
-                        // credit a co-present backend cookie as gateway output.
-                        // The injection always changes the field (`or_insert`
-                        // into an absent slot, or `and_modify` adding a line), so
-                        // mutation tracking sees it unconditionally, and the
-                        // occurrence partition credits the affinity line even
-                        // when it is byte-identical to a backend cookie.
-                        ctx.record_deadline_response_header_mutations(&response_headers);
-                    }
                 }
 
                 if capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
@@ -31397,50 +31380,18 @@ async fn handle_proxy_request_inner(
     //
     // `sticky_cookie_needed` here is the post-dispatch derivation above — true
     // only when this response must (re)bind the client — and
-    // `sticky_served_target` is the backend that actually served it.
-    if sticky_cookie_needed
-        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, sticky_served_target)
-    {
-        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
-            &proxy,
-            &epoch.load_balancer,
-            upstream_id,
-            target,
-        );
-        if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(
-                &epoch.load_balancer,
-                &proxy.namespace,
-                upstream_id,
-            );
-            let default_cc = crate::config::types::HashOnCookieConfig::default();
-            let cookie_config = upstream
-                .as_ref()
-                .and_then(|u| u.hash_on_cookie_config.as_ref())
-                .unwrap_or(&default_cc);
-            let cookie_val = build_sticky_cookie_header(
-                cookie_name,
-                &proxy.namespace,
-                upstream_id,
-                target,
-                cookie_config,
-            );
-            response_headers
-                .entry("set-cookie".to_string())
-                .and_modify(|v| {
-                    v.push('\n');
-                    v.push_str(&cookie_val);
-                })
-                .or_insert(cookie_val);
-            // Record the gateway-authored affinity cookie in deadline provenance
-            // before the committed-hook phase can exhaust the RPC deadline and
-            // rebuild the response from gateway-owned output only. Line-granular
-            // recording keeps any co-present backend cookie out of gateway output.
-            // An APPEND, so it records mutations rather than declaring ownership
-            // (which means whole-value replacement) — see the sibling site above.
-            ctx.record_deadline_response_header_mutations(&response_headers);
-        }
-    }
+    // `sticky_served_target` is the backend that actually served it. The
+    // provenance variant records the write before the committed-hook phase can
+    // exhaust an RPC deadline and rebuild the response from gateway-authored
+    // output only.
+    inject_sticky_affinity_cookie_with_deadline_provenance(
+        &mut ctx,
+        &proxy,
+        &epoch.load_balancer,
+        sticky_served_target,
+        sticky_cookie_needed,
+        &mut response_headers,
+    );
 
     // Observe the response only after final-body rejection replacement. The
     // precomputed capability bit keeps this phase to one predictable branch
@@ -36205,6 +36156,106 @@ pub(crate) fn build_sticky_cookie_header(
         cookie.push_str(same_site);
     }
     cookie
+}
+
+/// Append the gateway-authored Gateway API session-persistence `Set-Cookie` to
+/// `response_headers`, when this response must (re)bind the client to a backend.
+///
+/// This is the single mint site every protocol path shares — H1/H2 plain,
+/// buffered and fully-streaming native gRPC, WebSocket upgrades, and (through
+/// the thin `http3::server` wrappers) every HTTP/3 relay. Keeping one
+/// implementation is what stops a response path from silently shipping without
+/// an affinity cookie, or from minting one for a backend that did not serve it.
+///
+/// `served_target` must be the backend that ACTUALLY produced this response, and
+/// `reissue_needed` the already-derived binding decision. On a retry-capable path
+/// that decision must come from
+/// [`backend_dispatch::sticky_cookie_reissue_target`] — selection's pre-dispatch
+/// flag is stale once retry rotates off the bound target. Paths that cannot
+/// rotate pass the selection flag and their only target directly, which still
+/// honors the first/invalid/stale-cookie cases the flag was set for.
+///
+/// Nothing is written unless the served target's own per-port policy lane
+/// resolves to [`HashOnStrategy::Cookie`], so a rotation into a non-cookie lane
+/// is a no-op. The append uses the proxy's newline-separated multi-value
+/// representation, which [`crate::proxy::headers::apply_response_headers`] emits as
+/// distinct `Set-Cookie` field lines (RFC 6265), so a co-present backend cookie
+/// survives untouched.
+///
+/// Returns whether a cookie was written. Buffered callers must use
+/// [`inject_sticky_affinity_cookie_with_deadline_provenance`] instead.
+pub(crate) fn inject_sticky_affinity_cookie(
+    proxy: &Proxy,
+    balancers: &LoadBalancerCacheInner,
+    served_target: Option<&UpstreamTarget>,
+    reissue_needed: bool,
+    response_headers: &mut HashMap<String, String>,
+) -> bool {
+    if !reissue_needed {
+        return false;
+    }
+    let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), served_target) else {
+        return false;
+    };
+    let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
+        proxy,
+        balancers,
+        upstream_id,
+        target,
+    );
+    let HashOnStrategy::Cookie(ref cookie_name) = strategy else {
+        return false;
+    };
+    let upstream = LoadBalancerCache::get_upstream_from(balancers, &proxy.namespace, upstream_id);
+    let default_cc = crate::config::types::HashOnCookieConfig::default();
+    let cookie_config = upstream
+        .as_ref()
+        .and_then(|u| u.hash_on_cookie_config.as_ref())
+        .unwrap_or(&default_cc);
+    let cookie_val = build_sticky_cookie_header(
+        cookie_name,
+        &proxy.namespace,
+        upstream_id,
+        target,
+        cookie_config,
+    );
+    headers_mod::append_set_cookie_header(response_headers, cookie_val);
+    true
+}
+
+/// [`inject_sticky_affinity_cookie`] for a response whose headers are NOT yet on
+/// the wire, recording the write in gRPC-deadline response-header provenance.
+///
+/// A `response_committed` hook that exhausts the RPC deadline rebuilds the
+/// response from gateway-authored output only; without this record the freshly
+/// injected affinity cookie is dropped from that rebuild and the client silently
+/// loses stickiness. The injection APPENDS, so it records mutations rather than
+/// declaring ownership — ownership means whole-value replacement and would
+/// retire the backend cookie baseline, crediting a co-present backend cookie as
+/// gateway output. The recorder returns immediately when no deadline provenance
+/// is being tracked, so ordinary sticky traffic pays nothing.
+///
+/// Streaming callers keep using [`inject_sticky_affinity_cookie`]: their headers
+/// reach the wire before any deadline rebuild can run.
+pub(crate) fn inject_sticky_affinity_cookie_with_deadline_provenance(
+    ctx: &mut RequestContext,
+    proxy: &Proxy,
+    balancers: &LoadBalancerCacheInner,
+    served_target: Option<&UpstreamTarget>,
+    reissue_needed: bool,
+    response_headers: &mut HashMap<String, String>,
+) -> bool {
+    if !inject_sticky_affinity_cookie(
+        proxy,
+        balancers,
+        served_target,
+        reissue_needed,
+        response_headers,
+    ) {
+        return false;
+    }
+    ctx.record_deadline_response_header_mutations(response_headers);
+    true
 }
 
 pub(crate) fn strip_query_params(url: &str) -> &str {

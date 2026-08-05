@@ -130,6 +130,30 @@ pub mod _test_support {
         )
     }
 
+    /// Test-only view of the SINGLE sticky-affinity `Set-Cookie` mint site every
+    /// response path shares (#3278).
+    ///
+    /// H1/H2 plain, buffered AND fully-streaming native gRPC, WebSocket
+    /// upgrades, and the HTTP/3 relays all reach the wire through this function,
+    /// so a test here covers the streaming gRPC fast path — which returns before
+    /// the buffered branch ever runs — as well as the append semantics that keep
+    /// a co-present backend `Set-Cookie` intact.
+    pub fn inject_sticky_affinity_cookie_for_test(
+        proxy: &crate::config::types::Proxy,
+        balancers: &crate::load_balancer::LoadBalancerCacheInner,
+        served_target: Option<&crate::config::types::UpstreamTarget>,
+        reissue_needed: bool,
+        response_headers: &mut HashMap<String, String>,
+    ) -> bool {
+        crate::proxy::inject_sticky_affinity_cookie(
+            proxy,
+            balancers,
+            served_target,
+            reissue_needed,
+            response_headers,
+        )
+    }
+
     /// Test-only view of the sticky-binding lookup used by
     /// `backend_dispatch::select_upstream_target`'s early return (#3278).
     ///
