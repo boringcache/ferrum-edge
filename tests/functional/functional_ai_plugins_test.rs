@@ -526,13 +526,19 @@ async fn test_ai_federation_streams_first_token_before_provider_completes() {
 
     let text = String::from_utf8(received).expect("stream is UTF-8");
     assert!(text.contains("\"content\":\"llo\""), "second event: {text}");
-    assert!(text.contains("\"total_tokens\":5"), "terminal usage: {text}");
+    assert!(
+        text.contains("\"total_tokens\":5"),
+        "terminal usage: {text}"
+    );
     assert_eq!(
         text.matches("[DONE]").count(),
         1,
         "exactly one terminal marker: {text}"
     );
-    assert!(text.ends_with("data: [DONE]\n\n"), "terminal ordering: {text}");
+    assert!(
+        text.ends_with("data: [DONE]\n\n"),
+        "terminal ordering: {text}"
+    );
     assert!(!text.contains("event: error"), "clean stream: {text}");
 
     assert_eq!(provider_hits.load(Ordering::Relaxed), 1);

@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test;
+use ferrum_edge::PluginCache;
 use ferrum_edge::plugins::ai_federation;
 use ferrum_edge::plugins::ai_federation::test_helpers;
 use ferrum_edge::plugins::ai_token_metrics::AiTokenMetrics;
@@ -8,7 +9,6 @@ use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, priority,
 };
-use ferrum_edge::PluginCache;
 use ferrum_edge::{
     config::{BackendAllowIps, PoolConfig},
     dns::{DnsCache, DnsConfig},
@@ -336,7 +336,10 @@ async fn streaming_request_commits_provider_route_and_skips_buffered_egress() {
     });
     let mut ctx = post_json_ctx(&body);
     let mut headers = json_headers();
-    headers.insert("authorization".to_string(), "Bearer client-secret".to_string());
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer client-secret".to_string(),
+    );
     headers.insert("cookie".to_string(), "session=abc".to_string());
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -372,7 +375,10 @@ async fn streaming_request_commits_provider_route_and_skips_buffered_egress() {
         headers.get("accept-encoding").map(String::as_str),
         Some("identity")
     );
-    assert_eq!(headers.get("host").map(String::as_str), Some("api.openai.com"));
+    assert_eq!(
+        headers.get("host").map(String::as_str),
+        Some("api.openai.com")
+    );
 
     // The buffered terminate-and-respond path must stand down entirely.
     let result = run_federation_final_body(&plugin, &mut ctx, &headers).await;
@@ -413,7 +419,10 @@ async fn final_backend_header_policy_reasserts_provider_boundary() {
         Some("Bearer sk-test")
     );
     assert!(!headers.contains_key("x-consumer-username"));
-    assert_eq!(headers.get("host").map(String::as_str), Some("api.openai.com"));
+    assert_eq!(
+        headers.get("host").map(String::as_str),
+        Some("api.openai.com")
+    );
 }
 
 /// The final backend-visible body must still be the committed generation and
@@ -652,7 +661,10 @@ async fn streaming_falls_back_across_providers_only_before_commit() {
     ));
     let (provider, _, _) =
         test_helpers::owned_stream_claim_for_test(&plugin, &ctx).expect("committed provider");
-    assert_eq!(provider, "openai", "must fall back to the eligible provider");
+    assert_eq!(
+        provider, "openai",
+        "must fall back to the eligible provider"
+    );
     assert_eq!(
         ctx.metadata
             .get("ai_federation.streaming_provider_attempts")
@@ -780,8 +792,14 @@ async fn sse_guard_forwards_events_incrementally_and_preserves_terminal_usage() 
     .await;
     assert!(!terminated, "a well-formed stream must not be truncated");
     let text = String::from_utf8(out).unwrap();
-    assert!(text.contains("\"total_tokens\":7"), "usage must survive: {text}");
-    assert!(text.ends_with("data: [DONE]\n\n"), "terminal marker: {text}");
+    assert!(
+        text.contains("\"total_tokens\":7"),
+        "usage must survive: {text}"
+    );
+    assert!(
+        text.ends_with("data: [DONE]\n\n"),
+        "terminal marker: {text}"
+    );
     assert_eq!(text.matches("[DONE]").count(), 1);
 }
 
@@ -797,8 +815,11 @@ async fn sse_guard_holds_partial_events_until_complete() {
         }
         other => panic!("expected hold, got {other:?}"),
     }
-    let (out, terminated) =
-        drive_guard(&mut guard, &["ta\":{\"content\":\"hi\"}}]}\n\n", "data: [DONE]\n\n"]).await;
+    let (out, terminated) = drive_guard(
+        &mut guard,
+        &["ta\":{\"content\":\"hi\"}}]}\n\n", "data: [DONE]\n\n"],
+    )
+    .await;
     assert!(!terminated);
     let text = String::from_utf8(out).unwrap();
     assert!(text.starts_with("data: {\"choices\":[{\"delta\""), "{text}");
@@ -814,7 +835,11 @@ async fn sse_guard_enforces_exactly_one_terminal_marker() {
     let mut guard = test_helpers::sse_guard_for_test(default_bytes);
     let (out, terminated) = drive_guard(
         &mut guard,
-        &["data: {\"a\":1}\n\n", "data: [DONE]\n\n", "data: [DONE]\n\n"],
+        &[
+            "data: {\"a\":1}\n\n",
+            "data: [DONE]\n\n",
+            "data: [DONE]\n\n",
+        ],
     )
     .await;
     assert!(
@@ -822,7 +847,11 @@ async fn sse_guard_enforces_exactly_one_terminal_marker() {
         "a duplicated terminal marker must fail closed, not be silently dropped"
     );
     let text = String::from_utf8(out).unwrap();
-    assert_eq!(text.matches("[DONE]").count(), 1, "duplicate marker: {text}");
+    assert_eq!(
+        text.matches("[DONE]").count(),
+        1,
+        "duplicate marker: {text}"
+    );
     assert!(text.contains("event: error"), "{text}");
 
     let mut guard = test_helpers::sse_guard_for_test(default_bytes);
@@ -831,9 +860,15 @@ async fn sse_guard_enforces_exactly_one_terminal_marker() {
         &["data: [DONE]\n\n", "data: {\"smuggled\":true}\n\n"],
     )
     .await;
-    assert!(terminated, "data after the terminal marker must fail closed");
+    assert!(
+        terminated,
+        "data after the terminal marker must fail closed"
+    );
     let text = String::from_utf8(out).unwrap();
-    assert!(!text.contains("smuggled"), "post-terminal data leaked: {text}");
+    assert!(
+        !text.contains("smuggled"),
+        "post-terminal data leaked: {text}"
+    );
     assert!(text.contains("upstream_error"), "{text}");
 }
 
@@ -897,8 +932,11 @@ async fn sse_guard_handles_cr_lf_and_crlf_event_boundaries() {
 
     // A boundary split across transport reads is still recognized.
     let mut guard = test_helpers::sse_guard_for_test(default_bytes);
-    let (out, terminated) =
-        drive_guard(&mut guard, &["data: {\"a\":1}\r", "\n\r\ndata: [DONE]\r\n\r\n"]).await;
+    let (out, terminated) = drive_guard(
+        &mut guard,
+        &["data: {\"a\":1}\r", "\n\r\ndata: [DONE]\r\n\r\n"],
+    )
+    .await;
     assert!(!terminated, "a split CRLFCRLF boundary must be recognized");
     let text = String::from_utf8(out).unwrap();
     assert!(text.ends_with("data: [DONE]\r\n\r\n"), "{text}");
@@ -932,7 +970,10 @@ async fn sse_guard_fails_closed_on_truncated_stream() {
     assert!(terminated);
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("event: error"), "{text}");
-    assert!(!text.contains("[DONE]"), "a truncated stream is not complete: {text}");
+    assert!(
+        !text.contains("[DONE]"),
+        "a truncated stream is not complete: {text}"
+    );
 }
 
 /// An event larger than the configured ceiling fails closed instead of growing
@@ -978,7 +1019,10 @@ async fn sse_guard_retained_state_is_bounded_and_release_is_linear() {
     let mut probe = test_helpers::SseGuardProbe::new(min_bytes);
     let hostile = vec![b'A'; min_bytes * 64];
     let (out, terminated) = probe.on_chunk(&hostile).await;
-    assert!(terminated, "an unterminated oversized event must fail closed");
+    assert!(
+        terminated,
+        "an unterminated oversized event must fail closed"
+    );
     assert_eq!(
         probe.retained_bytes(),
         0,
@@ -1106,7 +1150,9 @@ async fn streaming_claim_consumes_and_returns_one_concurrency_permit() {
 
     // Response headers alone are not terminal proof, so the permit stays held.
     let mut response_headers = event_stream_response_headers();
-    let after = plugin.after_proxy(&mut ctx, 200, &mut response_headers).await;
+    let after = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
     assert!(matches!(after, PluginResult::Continue), "{after:?}");
     assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 0);
     assert_eq!(test_helpers::stream_outcome_for_test(&plugin, &ctx), None);
@@ -1212,7 +1258,9 @@ async fn streaming_half_open_admits_exactly_one_probe() {
             "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 30, "success_threshold": 1}
         }))]
     }));
-    assert!(test_helpers::open_and_cool_down_circuit_for_test(&plugin, 0));
+    assert!(test_helpers::open_and_cool_down_circuit_for_test(
+        &plugin, 0
+    ));
 
     let (mut first, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
     assert!(matches!(result, PluginResult::Continue), "{result:?}");
@@ -1235,7 +1283,9 @@ async fn streaming_half_open_admits_exactly_one_probe() {
     // The probe resolves only on terminal proof, and a success closes the
     // circuit so the next request is admitted normally.
     let mut response_headers = event_stream_response_headers();
-    let after = plugin.after_proxy(&mut first, 200, &mut response_headers).await;
+    let after = plugin
+        .after_proxy(&mut first, 200, &mut response_headers)
+        .await;
     assert!(matches!(after, PluginResult::Continue), "{after:?}");
     assert_eq!(
         test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
@@ -1269,7 +1319,9 @@ async fn streaming_cancellation_frees_the_half_open_probe_slot() {
             "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 30, "success_threshold": 1}
         }))]
     }));
-    assert!(test_helpers::open_and_cool_down_circuit_for_test(&plugin, 0));
+    assert!(test_helpers::open_and_cool_down_circuit_for_test(
+        &plugin, 0
+    ));
 
     let (ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
     assert!(matches!(result, PluginResult::Continue), "{result:?}");
@@ -1312,7 +1364,10 @@ async fn streaming_circuit_outcome_matches_the_buffered_status_policy() {
             .after_proxy(&mut ctx, status, &mut response_headers)
             .await;
         let rejected = reject_status(&after).map(|(status, _)| status);
-        (test_helpers::stream_outcome_for_test(&plugin, &ctx), rejected)
+        (
+            test_helpers::stream_outcome_for_test(&plugin, &ctx),
+            rejected,
+        )
     }
 
     assert_eq!(
@@ -1349,14 +1404,19 @@ async fn streaming_truncation_scores_a_circuit_failure_after_a_2xx_header() {
     let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
     assert!(matches!(result, PluginResult::Continue), "{result:?}");
     let mut response_headers = event_stream_response_headers();
-    let after = plugin.after_proxy(&mut ctx, 200, &mut response_headers).await;
+    let after = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
     assert!(matches!(after, PluginResult::Continue), "{after:?}");
 
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("guard");
     let (out, terminated) = drive_guard(&mut inspector, &["data: {\"a\":1}\n\n"]).await;
-    assert!(terminated, "a stream without a terminal marker is truncated");
+    assert!(
+        terminated,
+        "a stream without a terminal marker is truncated"
+    );
     assert!(!String::from_utf8_lossy(&out).contains("[DONE]"));
     assert_eq!(
         test_helpers::stream_outcome_for_test(&plugin, &ctx),
@@ -1409,7 +1469,10 @@ async fn streaming_rewrites_the_provider_visible_model_from_model_mapping() {
     let (status, text) = reject_status(&refused).expect("an unmapped model must fail closed");
     assert_eq!(status, 400);
     assert!(text.contains("model_policy_violation"), "{text}");
-    assert!(!text.contains("gpt-4o"), "the model must never be echoed: {text}");
+    assert!(
+        !text.contains("gpt-4o"),
+        "the model must never be echoed: {text}"
+    );
 }
 
 /// `default_model` is the same resolution path and is applied identically.
@@ -1718,7 +1781,9 @@ fn provider_stream_response_headers_are_reduced_to_the_bounded_safe_set() {
     }
     assert_eq!(headers.get("retry-after").map(String::as_str), Some("3"));
     assert_eq!(
-        headers.get("x-ratelimit-remaining-requests").map(String::as_str),
+        headers
+            .get("x-ratelimit-remaining-requests")
+            .map(String::as_str),
         Some("9")
     );
     assert_eq!(
@@ -1730,9 +1795,14 @@ fn provider_stream_response_headers_are_reduced_to_the_bounded_safe_set() {
         headers.get("content-type").map(String::as_str),
         Some("text/event-stream")
     );
-    assert_eq!(headers.get("content-length").map(String::as_str), Some("12"));
+    assert_eq!(
+        headers.get("content-length").map(String::as_str),
+        Some("12")
+    );
     assert!(
-        headers.keys().all(|name| !name.chars().any(|c| c.is_ascii_uppercase())),
+        headers
+            .keys()
+            .all(|name| !name.chars().any(|c| c.is_ascii_uppercase())),
         "names must be normalized: {headers:?}"
     );
 }
@@ -1765,7 +1835,9 @@ async fn streaming_after_proxy_authors_the_event_stream_representation() {
         "text/event-stream; charset=utf-8".to_string(),
     );
     response_headers.insert("content-length".to_string(), "999".to_string());
-    let after = plugin.after_proxy(&mut ctx, 200, &mut response_headers).await;
+    let after = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
     assert!(matches!(after, PluginResult::Continue), "{after:?}");
     assert_eq!(
         response_headers.get("content-type").map(String::as_str),
@@ -1794,7 +1866,11 @@ async fn origin_header_reduction_precedes_gateway_response_decorations() {
         priority: 4090,
         name: "x-late-gateway",
     });
-    let plugins = vec![Arc::clone(&early), Arc::clone(&federation), Arc::clone(&late)];
+    let plugins = vec![
+        Arc::clone(&early),
+        Arc::clone(&federation),
+        Arc::clone(&late),
+    ];
 
     let mut ctx = post_json_ctx(&streaming_body("gpt-4o"));
     let mut request_headers = json_headers();
@@ -1925,7 +2001,9 @@ async fn streaming_provider_and_credential_follow_the_published_generation() {
     // NEW requests follow the new generation.
     let mut fresh = post_json_ctx(&streaming_body("gpt-4o"));
     let mut fresh_headers = json_headers();
-    let claim = new_plugin.before_proxy(&mut fresh, &mut fresh_headers).await;
+    let claim = new_plugin
+        .before_proxy(&mut fresh, &mut fresh_headers)
+        .await;
     assert!(matches!(claim, PluginResult::Continue), "{claim:?}");
     assert_eq!(
         fresh.route_override_backend_host.as_deref(),
@@ -2037,7 +2115,11 @@ async fn disabling_or_deleting_the_instance_stops_new_streaming_claims() {
         !terminated,
         "a retired generation's in-flight stream must still complete cleanly"
     );
-    assert!(String::from_utf8(out).unwrap().ends_with("data: [DONE]\n\n"));
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .ends_with("data: [DONE]\n\n")
+    );
 }
 
 /// Minimal stand-in for the gateway response plugins that decorate around

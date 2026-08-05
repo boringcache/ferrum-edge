@@ -5874,7 +5874,11 @@ impl ResponseStreamInspector for FederationSseGuard {
             // is applied by `admit_event` and by the trailing check below, both
             // of which run BEFORE any of these bytes are copied anywhere.
             let pending = self.carry.len().saturating_add(index + 1 - segment_start);
-            if pending > self.max_event_bytes.saturating_add(SSE_TERMINATOR_MAX_BYTES) {
+            if pending
+                > self
+                    .max_event_bytes
+                    .saturating_add(SSE_TERMINATOR_MAX_BYTES)
+            {
                 return self.fail_closed(STREAM_REASON_OVERSIZED_EVENT, released);
             }
             match self.frame.step(chunk[index]) {
@@ -6340,15 +6344,14 @@ impl AiFederation {
             apply_stream_boundary_headers(provider, &target.authority, headers);
 
             let committed_tls = ctx.route_override_resolved_tls.clone();
-            let lifecycle: Arc<dyn std::any::Any + Send + Sync> =
-                Arc::new(FederationStreamLifecycle::new(
-                    FederationStreamReservation {
-                        _permit: permit,
-                        circuit: provider.circuit.clone(),
-                        admission,
-                        provider_name: Arc::from(provider.name.as_str()),
-                    },
-                ));
+            let lifecycle: Arc<dyn std::any::Any + Send + Sync> = Arc::new(
+                FederationStreamLifecycle::new(FederationStreamReservation {
+                    _permit: permit,
+                    circuit: provider.circuit.clone(),
+                    admission,
+                    provider_name: Arc::from(provider.name.as_str()),
+                }),
+            );
             // The circuit reservation now belongs to the lifecycle, which
             // releases or scores it exactly once. Disarm the pre-commit
             // cancellation guard so it cannot double-release the probe slot.
