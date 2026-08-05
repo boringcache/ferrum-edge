@@ -364,6 +364,56 @@ pub struct GatewayApiBackendTlsPolicyStatus {
     pub resolved_refs_message: String,
 }
 
+/// Ceiling on the per-Service port metadata retained for BackendTLSPolicy.
+///
+/// Kubernetes places no hard limit on `Service.spec.ports`, and this index is
+/// built from untrusted cluster input, so the retained view is bounded. A
+/// Service that exceeds the cap is marked [`ServicePortIndex::truncated`] and
+/// every BackendTLSPolicy targeting it is rejected: an incomplete port view
+/// cannot prove a target port is not UDP, and guessing would be the exact
+/// failure this index exists to prevent.
+pub(crate) const MAX_INDEXED_SERVICE_PORTS: usize = 64;
+
+/// One `Service.spec.ports[]` entry, reduced to what BackendTLSPolicy needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexedServicePort {
+    pub port: u16,
+    /// `spec.ports[].name` — what a policy `targetRefs[].sectionName` names.
+    pub name: Option<String>,
+    /// `spec.ports[].protocol` is `UDP`.
+    ///
+    /// Every other value — the `TCP` default and `SCTP` alike — records
+    /// `false`. Gateway API GEP-1897 singles out UDP and nothing else, so this
+    /// stays a UDP predicate rather than a general transport enum: widening it
+    /// would change behaviour the contract does not ask Ferrum to change.
+    pub udp: bool,
+}
+
+/// Bounded, deterministic port view of one collected `Service`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ServicePortIndex {
+    /// Ports ordered by `(port, name)` so translation outcomes never depend on
+    /// the order Kubernetes happened to serialize `spec.ports`.
+    pub ports: Vec<IndexedServicePort>,
+    /// The Service declared more than [`MAX_INDEXED_SERVICE_PORTS`] ports, so
+    /// `ports` is an incomplete view and no transport conclusion is sound.
+    pub truncated: bool,
+}
+
+impl ServicePortIndex {
+    /// The indexed entry for a numeric Service port.
+    pub(crate) fn port(&self, port: u16) -> Option<&IndexedServicePort> {
+        self.ports.iter().find(|entry| entry.port == port)
+    }
+
+    /// The indexed entry a `sectionName` names (`spec.ports[].name`).
+    pub(crate) fn named(&self, section_name: &str) -> Option<&IndexedServicePort> {
+        self.ports
+            .iter()
+            .find(|entry| entry.name.as_deref() == Some(section_name))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceKind {
     Istio,
@@ -532,6 +582,15 @@ pub(crate) struct K8sAccumulator {
     /// directly — no per-lookup `.to_string()` allocations.
     service_port_names: HashMap<String, HashMap<String, HashMap<String, u16>>>,
     service_ports: HashMap<String, HashMap<String, HashSet<u16>>>,
+    /// Bounded per-Service port metadata (`namespace → service → ports`) that
+    /// retains the L4 transport of `spec.ports[].protocol`.
+    ///
+    /// Deliberately a third index rather than a change to the two above: those
+    /// are consumed by unrelated translation (VirtualService port-name
+    /// resolution, backendRef port existence) whose shape and behaviour must
+    /// not shift. Gateway API `BackendTLSPolicy` is the only consumer here, and
+    /// it needs the transport — TLS must never be originated to a UDP port.
+    service_port_specs: HashMap<String, HashMap<String, ServicePortIndex>>,
     pub(crate) mesh_config_registry: mesh_config::MeshConfigProviderRegistry,
     core: core::CoreState,
     explicit_workload_services: HashSet<K8sServiceKey>,
@@ -574,6 +633,7 @@ impl K8sAccumulator {
             known_namespaces: HashSet::new(),
             service_port_names: HashMap::new(),
             service_ports: HashMap::new(),
+            service_port_specs: HashMap::new(),
             mesh_config_registry: mesh_config::MeshConfigProviderRegistry::default(),
             core: core::CoreState::default(),
             explicit_workload_services: HashSet::new(),
@@ -626,22 +686,21 @@ impl K8sAccumulator {
             .is_some_and(|ports| ports.contains(&port))
     }
 
-    /// Reverse-lookup a Service port name for a numeric port when the Service
-    /// was collected. Used by BackendTLSPolicy `sectionName` matching.
-    pub(crate) fn lookup_service_port_name(
+    /// Bounded port metadata for a collected `Service`, including each port's
+    /// L4 transport. `None` means the Service was never collected (external
+    /// host, foreign namespace, absent object) — which is distinct from a
+    /// collected Service that declares no ports.
+    ///
+    /// Used by Gateway API `BackendTLSPolicy` to resolve `sectionName` to a
+    /// real port and to refuse originating TLS to a UDP port.
+    pub(crate) fn service_port_index(
         &self,
         namespace: &str,
         service: &str,
-        port: u16,
-    ) -> Option<&str> {
-        self.service_port_names
+    ) -> Option<&ServicePortIndex> {
+        self.service_port_specs
             .get(namespace)
-            .and_then(|by_svc| by_svc.get(service))
-            .and_then(|ports| {
-                ports
-                    .iter()
-                    .find_map(|(name, number)| (*number == port).then_some(name.as_str()))
-            })
+            .and_then(|by_service| by_service.get(service))
     }
 
     pub(crate) fn has_observed_services(&self) -> bool {
@@ -1350,6 +1409,8 @@ pub(crate) fn collect_service(
         .unwrap_or(&[]);
     let mut port_names: HashMap<String, u16> = HashMap::new();
     let mut port_numbers: HashSet<u16> = HashSet::new();
+    let mut port_specs: Vec<IndexedServicePort> = Vec::new();
+    let mut port_specs_truncated = false;
     for port_entry in ports {
         let Some(raw) = port_entry.get("port").and_then(Value::as_u64) else {
             continue;
@@ -1359,7 +1420,27 @@ pub(crate) fn collect_service(
         if let Some(name) = string_field(port_entry, "name") {
             port_names.insert(name.to_string(), port);
         }
+        if port_specs.len() < MAX_INDEXED_SERVICE_PORTS {
+            port_specs.push(IndexedServicePort {
+                port,
+                name: string_field(port_entry, "name").map(ToOwned::to_owned),
+                // `protocol` defaults to TCP when absent. Compare
+                // case-insensitively so a non-canonical spelling cannot slip a
+                // UDP port past the check as "not UDP".
+                udp: string_field(port_entry, "protocol")
+                    .is_some_and(|protocol| protocol.eq_ignore_ascii_case("UDP")),
+            });
+        } else {
+            port_specs_truncated = true;
+        }
     }
+    // Deterministic order: the same Service must produce the same policy
+    // verdict no matter how the API server serialized `spec.ports`.
+    port_specs.sort_by(|left, right| {
+        left.port
+            .cmp(&right.port)
+            .then_with(|| left.name.cmp(&right.name))
+    });
     acc.service_port_names
         .entry(object.metadata.namespace.clone())
         .or_default()
@@ -1368,6 +1449,16 @@ pub(crate) fn collect_service(
         .entry(object.metadata.namespace.clone())
         .or_default()
         .insert(object.metadata.name.clone(), port_numbers);
+    acc.service_port_specs
+        .entry(object.metadata.namespace.clone())
+        .or_default()
+        .insert(
+            object.metadata.name.clone(),
+            ServicePortIndex {
+                ports: port_specs,
+                truncated: port_specs_truncated,
+            },
+        );
 
     // GAMMA Waypoint binding: a Service with the `istio.io/use-waypoint`
     // annotation routes through the named waypoint. We append the binding

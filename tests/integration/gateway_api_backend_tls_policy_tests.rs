@@ -1370,3 +1370,287 @@ fn backend_tls_policy_both_ca_sources_fails_closed() {
     }));
     assert!(translated.config.upstreams.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Service port existence and L4 transport (Gateway API v1.5.1 / GEP-1897)
+//
+// Two normative clauses drive this block.
+//
+// `LocalPolicyTargetReferenceWithSectionName`: "If a SectionName is specified,
+// but does not exist on the targeted object, the Policy must fail to attach,
+// and the policy implementation should record a `ResolvedRefs` or similar
+// Condition in the Policy's status."
+//
+// GEP-1897: "BackendTLSPolicy applies only to TCP traffic. If a policy
+// explicitly attaches to a UDP port of a Service (that is, the `targetRef` has
+// a `sectionName` specifying a single port or the service has only 1 port), the
+// `Accepted: False` Condition with `Reason: Invalid` MUST be set." and "If the
+// policy attaches to a mix of TCP and UDP ports, implementations SHOULD include
+// a warning in the `Accepted` condition message (`ancestors.conditions`); the
+// policy will only be effective for the TCP ports."
+// ---------------------------------------------------------------------------
+
+/// A Service whose only port speaks UDP.
+fn single_udp_port_service(name: &str) -> K8sObject {
+    object(
+        "Service",
+        name,
+        serde_json::json!({
+            "ports": [
+                { "name": "quic", "port": 8443, "targetPort": 8443, "protocol": "UDP" }
+            ]
+        }),
+    )
+}
+
+/// A Service with one TCP port (`http`, 8080) and one UDP port (`quic`, 8443).
+fn mixed_transport_service(name: &str) -> K8sObject {
+    object(
+        "Service",
+        name,
+        serde_json::json!({
+            "ports": [
+                { "name": "http", "port": 8080, "targetPort": 8080, "protocol": "TCP" },
+                { "name": "quic", "port": 8443, "targetPort": 8443, "protocol": "UDP" }
+            ]
+        }),
+    )
+}
+
+/// `http_route` with a caller-chosen listen path so two routes can coexist in
+/// one snapshot without colliding on the conflict key.
+fn http_route_at(name: &str, service_name: &str, port: u16, path: &str) -> K8sObject {
+    object(
+        "HTTPRoute",
+        name,
+        serde_json::json!({
+            "parentRefs": [{ "name": "edge" }],
+            "hostnames": ["app.example.com"],
+            "rules": [{
+                "matches": [{ "path": { "type": "PathPrefix", "value": path } }],
+                "backendRefs": [{ "name": service_name, "port": port }]
+            }]
+        }),
+    )
+}
+
+fn upstream_sni_for(
+    translated: &ferrum_edge::config_sources::k8s::K8sTranslation,
+    proxy_listen_path: &str,
+) -> Option<String> {
+    let upstream_id = translated
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_path.as_deref() == Some(proxy_listen_path))
+        .and_then(|proxy| proxy.upstream_id.clone())?;
+    translated
+        .config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == upstream_id)
+        .and_then(|upstream| upstream.backend_tls_sni.clone())
+}
+
+#[test]
+fn backend_tls_policy_nonexistent_section_name_reports_target_not_found() {
+    // `htps` is a typo for the real `https` port. Before this check the policy
+    // was reported Accepted=True purely because the Service existed, while it
+    // applied nowhere.
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        multi_port_service("api"),
+        http_route("api-route", "api", 8443),
+        sectioned_policy("api-tls", "api", "htps", "secure.example.com"),
+    ];
+
+    let update = policy_status_update(&objects, "api-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    assert_eq!(ancestors.len(), 1);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("False"),
+        "a sectionName that names no Service port must not be Accepted"
+    );
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("TargetNotFound")
+    );
+    assert!(
+        accepted
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("sectionName") && message.contains("htps")),
+        "the message must name the offending field and value: {accepted}"
+    );
+    // The CA refs resolved fine; ResolvedRefs is reserved for those outcomes.
+    let resolved = condition(&ancestors[0], "ResolvedRefs");
+    assert_eq!(resolved.get("status").and_then(Value::as_str), Some("True"));
+
+    // "The Policy must fail to attach" — and it must not spill onto the real
+    // `https` port the operator meant, nor fail that unrelated port closed.
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(
+        translated.config.upstreams.is_empty(),
+        "an unattached policy must not project backend TLS"
+    );
+    assert!(
+        translated
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_scheme == Some(BackendScheme::Http)),
+        "the valid sibling port must keep serving, not fail closed"
+    );
+    assert!(
+        !fault_body_mentions(&translated),
+        "a policy that attaches to nothing must not fault unrelated ports"
+    );
+}
+
+#[test]
+fn backend_tls_policy_explicit_udp_section_is_invalid_and_fails_closed() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        mixed_transport_service("edge-svc"),
+        http_route("udp-route", "edge-svc", 8443),
+        sectioned_policy("udp-tls", "edge-svc", "quic", "secure.example.com"),
+    ];
+
+    let update = policy_status_update(&objects, "udp-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("False"),
+        "GEP-1897 MUST: a policy explicitly attached to a UDP port is not Accepted"
+    );
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("Invalid")
+    );
+
+    // Route traffic that actually selects the UDP-targeted policy fails closed
+    // rather than originating HTTPS over a UDP port or dropping to plaintext.
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(
+        translated.config.upstreams.is_empty(),
+        "no HTTPS upstream may be projected onto a UDP Service port"
+    );
+    assert!(
+        fault_body_mentions(&translated),
+        "the covered backend must fail closed with the BackendTLSPolicy 500 fault"
+    );
+}
+
+#[test]
+fn backend_tls_policy_udp_section_leaves_the_tcp_sibling_port_alone() {
+    // Same policy as above, but the route selects the Service's TCP port. The
+    // section-scoped rejection must stay scoped to the port it named.
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        mixed_transport_service("edge-svc"),
+        http_route("tcp-route", "edge-svc", 8080),
+        sectioned_policy("udp-tls", "edge-svc", "quic", "secure.example.com"),
+    ];
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(
+        !fault_body_mentions(&translated),
+        "a UDP-scoped rejection must not fail an unrelated TCP port closed"
+    );
+    assert!(
+        translated
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_scheme == Some(BackendScheme::Http)),
+        "the TCP port keeps its pre-policy behaviour"
+    );
+}
+
+#[test]
+fn backend_tls_policy_on_single_udp_port_service_is_invalid_and_fails_closed() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        single_udp_port_service("telemetry"),
+        http_route("telemetry-route", "telemetry", 8443),
+        // No sectionName: GEP-1897's "the service has only 1 port" clause.
+        backend_tls_policy_system("telemetry-tls", "telemetry"),
+    ];
+
+    let update = policy_status_update(&objects, "telemetry-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("False")
+    );
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("Invalid")
+    );
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(translated.config.upstreams.is_empty());
+    assert!(
+        fault_body_mentions(&translated),
+        "a single-UDP-port Service under a BackendTLSPolicy must fail closed"
+    );
+}
+
+#[test]
+fn backend_tls_policy_mixed_tcp_udp_warns_and_applies_to_tcp_only() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        mixed_transport_service("edge-svc"),
+        http_route_at("tcp-route", "edge-svc", 8080, "/tcp"),
+        http_route_at("udp-route", "edge-svc", 8443, "/udp"),
+        backend_tls_policy_system("edge-tls", "edge-svc"),
+    ];
+
+    // SHOULD: accepted, with a warning carried in the Accepted message.
+    let update = policy_status_update(&objects, "edge-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(accepted.get("status").and_then(Value::as_str), Some("True"));
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("Accepted")
+    );
+    let message = accepted
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        message.contains("warning") && message.contains("TCP"),
+        "the Accepted message must warn about the mixed-transport Service: {message}"
+    );
+
+    // "the policy will only be effective for the TCP ports"
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert_eq!(
+        upstream_sni_for(&translated, "/tcp").as_deref(),
+        Some("backend.example.com"),
+        "the TCP port must receive the policy's TLS identity"
+    );
+    assert!(
+        translated
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.listen_path.as_deref() == Some("/udp")
+                && proxy.backend_scheme == Some(BackendScheme::Http)),
+        "the UDP port must not be promoted to HTTPS: {:?}",
+        translated.config.proxies
+    );
+    assert!(
+        !fault_body_mentions(&translated),
+        "a mixed-transport Service is a warning, not a rejection"
+    );
+}

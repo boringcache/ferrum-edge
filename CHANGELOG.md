@@ -58,6 +58,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upstream carrying one backend scheme and one TLS identity, so the previous
   behavior originated TLS — with the covered Service's SNI and trust anchors —
   to Services no policy covered.
+- `BackendTLSPolicy` `targetRefs[].sectionName` is now resolved against the
+  target Service's real `spec.ports[].name`. A `sectionName` that names no port
+  reports `Accepted=False, reason=TargetNotFound` with a field-specific message
+  and fails to attach, instead of being reported `Accepted=True` on Service
+  existence alone while applying nowhere; it deliberately does not spill onto,
+  or fail closed, the Service's other valid ports.
+- `BackendTLSPolicy` now enforces the Gateway API GEP-1897 transport contract.
+  Translation retains a bounded, deterministic per-Service port index carrying
+  each port's L4 transport, so a policy that explicitly attaches to a UDP port
+  (a `sectionName` naming a UDP port, or a Service whose ports are all UDP)
+  reports `Accepted=False, reason=Invalid` and route traffic selecting it fails
+  closed with the HTTP 500 fault rather than originating HTTPS over UDP or
+  dropping to plaintext. A Service mixing TCP and UDP ports is accepted with a
+  warning in the `Accepted` condition message and takes effect only on its TCP
+  ports. A Service declaring more than 64 ports cannot have its port transport
+  proven and is rejected fail closed.
+- Health-check clients no longer fall back to the system trust roots when a
+  configured backend CA cannot be loaded or parsed. A configured CA is the sole
+  trust anchor, so HTTP probes now fail closed (report unhealthy) and gRPC
+  probes fail the probe instead of silently verifying against the public webpki
+  roots — reachable through a `BackendTLSPolicy` `caCertificateRefs` Secret
+  whose `k8s://…#ca.crt` source becomes unreadable after translation accepted
+  it. Multi-certificate CA bundles are now parsed as bundles, which is the
+  ordinary shape of a Kubernetes `ca.crt`.
 - `ai_semantic_firewall` streamed `inspect` mode now accepts
   `streaming.window: tokens` with an explicitly selected bounded tokenizer
   (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft

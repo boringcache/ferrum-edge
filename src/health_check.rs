@@ -369,7 +369,8 @@ impl HealthChecker {
     /// rebuilt by [`set_global_tls_config`] before traffic flows.
     pub fn with_pool_config(pool_config: &PoolConfig, dns_cache: DnsCache) -> Self {
         let client = accept_health_check_client(
-            build_health_check_client(pool_config, Some(dns_cache.clone()), false),
+            build_health_check_client(pool_config, Some(dns_cache.clone()), false)
+                .map_err(HealthCheckClientError::from),
             "default health-check HTTP client",
         );
         Self {
@@ -414,7 +415,8 @@ impl HealthChecker {
         // through the no-TLS-config path honour the operator opt-in.
         if tls_no_verify {
             self.default_http_client = accept_health_check_client(
-                build_health_check_client(&self.pool_config, self.dns_cache.clone(), tls_no_verify),
+                build_health_check_client(&self.pool_config, self.dns_cache.clone(), tls_no_verify)
+                    .map_err(HealthCheckClientError::from),
                 "default health-check HTTP client (tls_no_verify rebuild)",
             );
         }
@@ -423,7 +425,8 @@ impl HealthChecker {
     /// Create a health checker without DNS cache (for tests).
     fn without_dns_cache(pool_config: &PoolConfig) -> Self {
         let client = accept_health_check_client(
-            build_health_check_client(pool_config, None, false),
+            build_health_check_client(pool_config, None, false)
+                .map_err(HealthCheckClientError::from),
             "default health-check HTTP client",
         );
         Self {
@@ -1839,7 +1842,13 @@ async fn grpc_probe(
                     tonic_tls = tonic_tls.ca_certificate(cert);
                 }
                 Err(e) => {
-                    debug!("gRPC health probe: failed to load CA: {}", e);
+                    // The configured CA is the sole trust anchor. Proceeding
+                    // without it leaves tonic on its default roots, so a
+                    // publicly-trusted certificate would pass a probe for a
+                    // backend pinned to a private CA. Fail the probe instead.
+                    return ProbeOutcome::failure(format!(
+                        "gRPC health probe: configured backend CA is the sole trust anchor but could not be loaded ({e})"
+                    ));
                 }
             }
         } else {
@@ -2103,6 +2112,53 @@ fn build_health_check_client(
     }
 }
 
+/// Why a health-check HTTP client could not be produced.
+///
+/// Split from a bare `reqwest::Error` because the two failures are not the same
+/// event: a builder failure is degraded-but-neutral, while an unusable
+/// exclusive CA is a *trust policy* failure that must never be downgraded into
+/// "build something that verifies against different roots".
+#[derive(Debug)]
+enum HealthCheckClientError {
+    /// `reqwest` refused to build the client.
+    Build(reqwest::Error),
+    /// A configured exclusive backend CA could not be loaded or parsed.
+    ///
+    /// Ferrum's documented CA exclusivity (`docs/backend_mtls.md`) makes a
+    /// configured CA the *sole* trust anchor. Continuing without it would build
+    /// a probe client that trusts the public webpki roots instead, so a backend
+    /// presenting any publicly-trusted certificate would pass health checks for
+    /// an upstream pinned to a private CA — the probe would then keep marking a
+    /// target healthy that proxy traffic correctly refuses.
+    ///
+    /// Reachable through Gateway API `BackendTLSPolicy`: a `caCertificateRefs`
+    /// Secret projects a `k8s://…#ca.crt` source whose load happens here, not
+    /// at translation time, and can fail afterwards (Secret deleted, RBAC
+    /// revoked, API server unavailable).
+    ExclusiveTrustUnavailable(String),
+}
+
+impl std::fmt::Display for HealthCheckClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Build(error) => write!(f, "{error}"),
+            // `details` carries a source identifier and loader message, never
+            // material: `MaterialError` reports `display_source_id`, so no PEM
+            // or secret bytes reach this string.
+            Self::ExclusiveTrustUnavailable(details) => write!(
+                f,
+                "configured backend CA is the sole trust anchor but could not be used ({details})"
+            ),
+        }
+    }
+}
+
+impl From<reqwest::Error> for HealthCheckClientError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Build(error)
+    }
+}
+
 /// Build a minimal `reqwest::Client` that still uses the gateway's DNS cache.
 ///
 /// Used as a fallback when a fully-configured builder fails (e.g., due to
@@ -2163,7 +2219,7 @@ fn build_dns_cached_fallback_client(
 
 /// Accept a built health-check client or log and return `None` so probes fail closed.
 fn accept_health_check_client(
-    result: Result<reqwest::Client, reqwest::Error>,
+    result: Result<reqwest::Client, HealthCheckClientError>,
     context: &str,
 ) -> Option<Arc<reqwest::Client>> {
     match result {
@@ -2189,7 +2245,7 @@ fn build_health_check_client_with_tls(
     global_cert_path: &Option<String>,
     global_key_path: &Option<String>,
     global_no_verify: bool,
-) -> Result<reqwest::Client, reqwest::Error> {
+) -> Result<reqwest::Client, HealthCheckClientError> {
     let skip_verify = !tls_config.verify_server_cert
         || (global_no_verify && tls_config.allows_global_no_verify());
 
@@ -2212,19 +2268,44 @@ fn build_health_check_client_with_tls(
     // the cluster-global bundle.
     let ca_path = tls_config.effective_ca_source(global_ca_path.as_deref());
     if let Some(ca_path) = ca_path {
-        if let Ok(ca_data) =
+        // A configured CA is EXCLUSIVE: it replaces the trust store rather than
+        // adding to it. So there is no "continue without it" outcome here — a
+        // client built after a failed load would verify against the public
+        // webpki roots, which is a different (and weaker) trust policy than the
+        // one configured. Fail closed instead and let the probe report
+        // unhealthy. Only when verification is disabled outright is the CA moot.
+        // `from_pem_bundle` accepts multi-certificate bundles; a root plus
+        // intermediates is the ordinary shape of a Kubernetes `ca.crt`.
+        let ca_bundle =
             load_probe_tls_material(ca_path, MaterialKind::CaBundle, "Health check CA")
-        {
-            if let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_data) {
+                .and_then(|ca_data| {
+                    reqwest::Certificate::from_pem_bundle(&ca_data)
+                        .map_err(|e| format!("Health check CA: failed to parse CA bundle: {e}"))
+                })
+                .and_then(|certs| {
+                    // An empty trust store would reject every handshake anyway;
+                    // reporting it here keeps the cause legible.
+                    if certs.is_empty() {
+                        Err("Health check CA: bundle contains no certificates".to_string())
+                    } else {
+                        Ok(certs)
+                    }
+                });
+        match ca_bundle {
+            Ok(ca_certs) => {
                 // reqwest 0.13: `tls_certs_only` replaces the trust store entirely,
                 // matching the project's "CA exclusivity" rule (no webpki mixing
                 // when a custom CA is provided).
-                builder = builder.tls_certs_only([ca_cert]);
-            } else {
-                tracing::warn!("Health check: failed to parse CA cert, using system roots");
+                builder = builder.tls_certs_only(ca_certs);
             }
-        } else {
-            tracing::warn!("Health check: failed to load CA cert, using system roots");
+            // Verification is already disabled by explicit configuration, so no
+            // trust decision is being downgraded here.
+            Err(details) if skip_verify => {
+                tracing::warn!("Health check: {details}; verification is disabled");
+            }
+            Err(details) => {
+                return Err(HealthCheckClientError::ExclusiveTrustUnavailable(details));
+            }
         }
     }
 
@@ -2277,14 +2358,22 @@ fn build_health_check_client_with_tls(
 
     match builder.build() {
         Ok(client) => Ok(client),
-        Err(e) => {
+        // The minimal fallback carries no trust store, so it verifies against
+        // the default roots. That is only acceptable when this upstream was not
+        // pinned to an exclusive CA in the first place; otherwise it is the
+        // same trust downgrade the CA arm above refuses, just later.
+        Err(e) if ca_path.is_none() || skip_verify => {
             tracing::error!(
                 "Failed to build TLS health check HTTP client: {}. \
                  Falling back to a minimal DNS-cached client (TLS-specific settings will not apply).",
                 e
             );
             build_dns_cached_fallback_client(dns_cache, "TLS health check")
+                .map_err(HealthCheckClientError::from)
         }
+        Err(e) => Err(HealthCheckClientError::ExclusiveTrustUnavailable(format!(
+            "TLS health check client could not be built with the configured CA: {e}"
+        ))),
     }
 }
 

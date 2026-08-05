@@ -31,7 +31,7 @@ use crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE;
 
 use super::{
     FERRUM_GATEWAY_CONTROLLER_NAME, GatewayApiBackendTlsPolicyStatus, K8sAccumulator, K8sObject,
-    K8sResourceKey, K8sTranslateError, RouteBackend,
+    K8sResourceKey, K8sTranslateError, MAX_INDEXED_SERVICE_PORTS, RouteBackend, ServicePortIndex,
 };
 
 /// Maximum admitted `caCertificateRefs` entries. Bounds hostile input before
@@ -169,6 +169,19 @@ pub(super) enum BackendTlsPolicyRejection {
     /// The policy itself is malformed or unrepresentable
     /// (`Accepted=False`, `reason: Invalid`).
     Invalid,
+    /// The policy names a target that does not exist — today, a
+    /// `targetRefs[].sectionName` that names no port on the target Service
+    /// (`Accepted=False`, `reason: TargetNotFound`).
+    ///
+    /// Gateway API v1.5.1 `LocalPolicyTargetReferenceWithSectionName`: "If a
+    /// SectionName is specified, but does not exist on the targeted object,
+    /// the Policy must fail to attach, and the policy implementation should
+    /// record a `ResolvedRefs` or similar Condition in the Policy's status."
+    /// `TargetNotFound` is the vocabulary's "policy is attached to an invalid
+    /// target resource" reason and is field-specific here; `ResolvedRefs` on
+    /// BackendTLSPolicy is reserved for `caCertificateRefs` outcomes, which
+    /// resolved fine, so overloading it would misreport them.
+    TargetNotFound,
     /// A `caCertificateRefs` entry names a ConfigMap/Secret that is missing or
     /// carries no usable `ca.crt` PEM bundle
     /// (`ResolvedRefs=False`, `reason: InvalidCACertificateRef`).
@@ -185,12 +198,12 @@ impl BackendTlsPolicyRejection {
     /// Whether this rejection is about a *reference* (surfaces on
     /// `ResolvedRefs`) rather than the policy body (surfaces on `Accepted`).
     fn is_reference_failure(self) -> bool {
-        !matches!(self, Self::Invalid)
+        !matches!(self, Self::Invalid | Self::TargetNotFound)
     }
 
     fn resolved_refs_reason(self) -> &'static str {
         match self {
-            Self::Invalid => "ResolvedRefs",
+            Self::Invalid | Self::TargetNotFound => "ResolvedRefs",
             Self::InvalidCaCertificateRef => "InvalidCACertificateRef",
             Self::InvalidKind => "InvalidKind",
             Self::RefNotPermitted => "RefNotPermitted",
@@ -228,14 +241,180 @@ enum BackendTlsPolicyRecord {
     Invalid(BackendTlsPolicyError),
 }
 
+/// Which Service ports one indexed policy governs, resolved once against the
+/// observed Service rather than re-derived per backend lookup.
+///
+/// Gateway API v1.5.1 GEP-1897: "BackendTLSPolicy applies only to TCP traffic."
+/// The transport of the target port is therefore part of the attachment
+/// decision, not an afterthought — which is why this is resolved at collect
+/// time, where the complete Service index exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyPortScope {
+    /// Governs every port of the target Service.
+    ///
+    /// Also the scope used to fail a whole Service closed when the target is
+    /// unrepresentable, so a rejection cannot be narrowed away by a port match.
+    AllPorts,
+    /// Governs only the target Service's non-UDP ports.
+    ///
+    /// GEP-1897: "If the policy attaches to a mix of TCP and UDP ports,
+    /// implementations SHOULD include a warning in the `Accepted` condition
+    /// message (`ancestors.conditions`); the policy will only be effective for
+    /// the TCP ports."
+    NonUdpPorts,
+    /// Governs exactly this Service port number (a resolved `sectionName`).
+    Port(u16),
+    /// Governs nothing: the `sectionName` names no port on the Service, so the
+    /// policy "must fail to attach" and must not leak onto sibling ports.
+    NoPorts,
+    /// The Service was never observed, so its ports are unknown. Preserves the
+    /// pre-existing behaviour: a Service-wide policy still matches, a
+    /// section-scoped one does not.
+    ServiceNotObserved,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IndexedBackendTlsPolicy {
     policy_namespace: String,
     policy_name: String,
     /// Optional Service port name (`targetRefs[].sectionName`).
     section_name: Option<String>,
+    /// Ports this policy governs, resolved against the target Service.
+    port_scope: PolicyPortScope,
     creation_timestamp: Option<DateTime<Utc>>,
     record: BackendTlsPolicyRecord,
+}
+
+impl IndexedBackendTlsPolicy {
+    /// Whether this policy governs the Service port a backend selected.
+    ///
+    /// `service_port` is `None` when the backend never resolved to a numeric
+    /// Service port. A port-scoped policy cannot claim such a backend; a
+    /// Service-wide one still does, exactly as before this port model existed.
+    fn governs(&self, index: Option<&ServicePortIndex>, service_port: Option<u16>) -> bool {
+        match self.port_scope {
+            PolicyPortScope::AllPorts => true,
+            PolicyPortScope::NonUdpPorts => match (index, service_port) {
+                (Some(index), Some(port)) => index.port(port).is_none_or(|entry| !entry.udp),
+                // Unknown port on a mixed-transport Service: keep the
+                // Service-wide answer rather than silently dropping to
+                // plaintext. Ferrum only reaches here for an HTTP-family
+                // backend, which cannot be the UDP port in practice.
+                _ => true,
+            },
+            PolicyPortScope::Port(scoped) => service_port == Some(scoped),
+            PolicyPortScope::NoPorts => false,
+            PolicyPortScope::ServiceNotObserved => self.section_name.is_none(),
+        }
+    }
+}
+
+/// Outcome of resolving one targetRef's Service-port scope.
+struct TargetPortScope {
+    scope: PolicyPortScope,
+    /// Set when the Gateway API contract requires `Accepted=False`.
+    rejection: Option<BackendTlsPolicyError>,
+    /// Set when the contract asks for an `Accepted` condition *warning* while
+    /// still accepting the policy (the mixed TCP/UDP SHOULD).
+    warning: Option<String>,
+}
+
+/// Resolve a targetRef against the observed Service's ports.
+///
+/// Implements the Gateway API v1.5.1 GEP-1897 transport contract verbatim:
+///
+/// * "If a policy explicitly attaches to a UDP port of a Service (that is, the
+///   `targetRef` has a `sectionName` specifying a single port or the service
+///   has only 1 port), the `Accepted: False` Condition with `Reason: Invalid`
+///   MUST be set."
+/// * "If the policy attaches to a mix of TCP and UDP ports, implementations
+///   SHOULD include a warning in the `Accepted` condition message
+///   (`ancestors.conditions`); the policy will only be effective for the TCP
+///   ports."
+///
+/// A Service-wide policy on a Service whose ports are *all* UDP with more than
+/// one port is not literally either clause. Ferrum rejects it the same way as
+/// the single-port case: there is no TCP port for the policy to "only be
+/// effective for", so the mixed clause degenerates to "effective nowhere", and
+/// reporting `Accepted=True` for a policy that governs nothing is exactly the
+/// misreport this resolver exists to remove.
+fn resolve_target_port_scope(
+    acc: &K8sAccumulator,
+    service_namespace: &str,
+    service_name: &str,
+    section_name: Option<&str>,
+) -> TargetPortScope {
+    let Some(index) = acc.service_port_index(service_namespace, service_name) else {
+        return TargetPortScope {
+            scope: PolicyPortScope::ServiceNotObserved,
+            rejection: None,
+            warning: None,
+        };
+    };
+
+    if index.truncated {
+        // An incomplete port view cannot prove the target port is not UDP.
+        // Fail the whole Service closed rather than assume TCP.
+        return TargetPortScope {
+            scope: PolicyPortScope::AllPorts,
+            rejection: Some(BackendTlsPolicyError::invalid(format!(
+                "Service '{service_namespace}/{service_name}' declares more than {MAX_INDEXED_SERVICE_PORTS} ports, so Ferrum cannot determine the transport of the targeted port"
+            ))),
+            warning: None,
+        };
+    }
+
+    if let Some(section_name) = section_name {
+        let Some(entry) = index.named(section_name) else {
+            return TargetPortScope {
+                scope: PolicyPortScope::NoPorts,
+                rejection: Some(BackendTlsPolicyError::of(
+                    BackendTlsPolicyRejection::TargetNotFound,
+                    format!(
+                        "spec.targetRefs[].sectionName '{section_name}' does not name a port on Service '{service_namespace}/{service_name}', so this BackendTLSPolicy attaches to nothing"
+                    ),
+                )),
+                warning: None,
+            };
+        };
+        let rejection = entry.udp.then(|| {
+            BackendTlsPolicyError::invalid(format!(
+                "spec.targetRefs[].sectionName '{section_name}' names UDP port {} on Service '{service_namespace}/{service_name}'; BackendTLSPolicy applies only to TCP traffic",
+                entry.port
+            ))
+        });
+        return TargetPortScope {
+            scope: PolicyPortScope::Port(entry.port),
+            rejection,
+            warning: None,
+        };
+    }
+
+    // An empty `ports` list also lands here: no UDP port, so nothing to reject.
+    let udp_ports = index.ports.iter().filter(|entry| entry.udp).count();
+    if udp_ports == 0 {
+        return TargetPortScope {
+            scope: PolicyPortScope::AllPorts,
+            rejection: None,
+            warning: None,
+        };
+    }
+    if udp_ports == index.ports.len() {
+        return TargetPortScope {
+            scope: PolicyPortScope::AllPorts,
+            rejection: Some(BackendTlsPolicyError::invalid(format!(
+                "Service '{service_namespace}/{service_name}' declares only UDP ports ({udp_ports}); BackendTLSPolicy applies only to TCP traffic"
+            ))),
+            warning: None,
+        };
+    }
+    TargetPortScope {
+        scope: PolicyPortScope::NonUdpPorts,
+        rejection: None,
+        warning: Some(format!(
+            "Service '{service_namespace}/{service_name}' mixes TCP and UDP ports; this BackendTLSPolicy is effective only for its TCP ports"
+        )),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -308,6 +487,7 @@ pub(super) fn collect(
             object,
             Err(&BackendTlsPolicyError::invalid(message)),
             None,
+            None,
             &[],
             false,
         );
@@ -323,6 +503,7 @@ pub(super) fn collect(
             acc,
             object,
             Err(&BackendTlsPolicyError::invalid(message)),
+            None,
             None,
             &[],
             false,
@@ -382,11 +563,46 @@ pub(super) fn collect(
     let mut target_services: Vec<(String, String)> = Vec::new();
     let mut any_target_resolved = false;
     let mut target_error: Option<BackendTlsPolicyError> = None;
+    let mut accepted_warning: Option<String> = None;
     for target_ref in target_refs.iter().take(MAX_ADMITTED_TARGET_REFS) {
         match parse_service_target_ref(object, target_ref) {
             Ok((service_name, section_name)) => {
                 any_target_resolved = true;
                 let namespace = object.metadata.namespace.clone();
+                // The Service port view is complete by now: Services are
+                // collected in the pass before BackendTLSPolicy, so the
+                // transport of the targeted port is decided once, here, rather
+                // than re-derived per backend lookup.
+                let port_scope = resolve_target_port_scope(
+                    acc,
+                    &namespace,
+                    &service_name,
+                    section_name.as_deref(),
+                );
+                if let Some(warning) = &port_scope.warning {
+                    acc.warnings.push(format!(
+                        "Gateway API BackendTLSPolicy {}/{}: {warning}",
+                        object.metadata.namespace, object.metadata.name
+                    ));
+                    if accepted_warning.is_none() {
+                        accepted_warning = Some(warning.clone());
+                    }
+                }
+                if let Some(error) = &port_scope.rejection {
+                    acc.warnings.push(format!(
+                        "Gateway API BackendTLSPolicy {}/{} is invalid: {}",
+                        object.metadata.namespace, object.metadata.name, error.message
+                    ));
+                    if target_error.is_none() {
+                        target_error = Some(error.clone());
+                    }
+                }
+                // A port-scope rejection overrides an otherwise valid body: the
+                // policy must not govern the port it named.
+                let record = match &port_scope.rejection {
+                    Some(error) => BackendTlsPolicyRecord::Invalid(error.clone()),
+                    None => record.clone(),
+                };
                 if !target_services
                     .iter()
                     .any(|(ns, name)| ns == &namespace && name == &service_name)
@@ -400,8 +616,9 @@ pub(super) fn collect(
                         policy_namespace: namespace,
                         policy_name: object.metadata.name.clone(),
                         section_name,
+                        port_scope: port_scope.scope,
                         creation_timestamp,
-                        record: record.clone(),
+                        record,
                     },
                 );
             }
@@ -435,6 +652,12 @@ pub(super) fn collect(
                             policy_namespace: namespace,
                             policy_name: object.metadata.name.clone(),
                             section_name,
+                            // Service-wide, matching the recovery rule above:
+                            // the only errors that leave the core Service
+                            // identity intact are sectionName errors, and those
+                            // surrender the section, so there is no port to
+                            // narrow to and narrowing would require guessing.
+                            port_scope: PolicyPortScope::AllPorts,
                             creation_timestamp,
                             record: BackendTlsPolicyRecord::Invalid(error),
                         },
@@ -449,6 +672,7 @@ pub(super) fn collect(
         object,
         parsed.as_ref().map(|_| ()),
         target_error.as_ref(),
+        accepted_warning.as_deref(),
         &target_services,
         any_target_resolved,
     );
@@ -503,6 +727,7 @@ fn record_status(
     object: &K8sObject,
     parsed: Result<(), &BackendTlsPolicyError>,
     target_error: Option<&BackendTlsPolicyError>,
+    accepted_warning: Option<&str>,
     target_services: &[(String, String)],
     any_target_resolved: bool,
 ) {
@@ -524,18 +749,33 @@ fn record_status(
                         | BackendTlsPolicyRejection::RefNotPermitted
                 )
             });
+            // A `TargetNotFound` rejection means the policy attaches to
+            // nothing, so no backend is failed closed on its account. Saying
+            // otherwise would send an operator hunting for traffic Ferrum never
+            // faulted.
+            let attaches_to_nothing =
+                matches!(error.kind, BackendTlsPolicyRejection::TargetNotFound);
             GatewayApiBackendTlsPolicyStatus {
                 policy: K8sResourceKey::from_object(object),
                 accepted: false,
-                accepted_reason: if no_valid_ca {
+                accepted_reason: if attaches_to_nothing {
+                    "TargetNotFound".to_string()
+                } else if no_valid_ca {
                     "NoValidCACertificate".to_string()
                 } else {
                     "Invalid".to_string()
                 },
-                accepted_message: format!(
-                    "Ferrum rejected this BackendTLSPolicy and fails matching backends closed: {}",
-                    error.message
-                ),
+                accepted_message: if attaches_to_nothing {
+                    format!(
+                        "Ferrum rejected this BackendTLSPolicy and it governs no backend: {}",
+                        error.message
+                    )
+                } else {
+                    format!(
+                        "Ferrum rejected this BackendTLSPolicy and fails matching backends closed: {}",
+                        error.message
+                    )
+                },
                 resolved_refs: reference_error.is_none(),
                 resolved_refs_reason: reference_error
                     .map(|reference| reference.kind.resolved_refs_reason())
@@ -570,11 +810,19 @@ fn record_status(
             resolved_refs_reason: "ResolvedRefs".to_string(),
             resolved_refs_message: "All BackendTLSPolicy references accepted by Ferrum".to_string(),
         },
+        // GEP-1897 asks for a *warning inside the Accepted condition message*
+        // for a mixed TCP/UDP Service, not a rejection: the policy is accepted
+        // and effective for the TCP ports only.
         None => GatewayApiBackendTlsPolicyStatus {
             policy: K8sResourceKey::from_object(object),
             accepted: true,
             accepted_reason: "Accepted".to_string(),
-            accepted_message: "Ferrum accepted this BackendTLSPolicy".to_string(),
+            accepted_message: match accepted_warning {
+                Some(warning) => {
+                    format!("Ferrum accepted this BackendTLSPolicy; warning: {warning}")
+                }
+                None => "Ferrum accepted this BackendTLSPolicy".to_string(),
+            },
             resolved_refs: true,
             resolved_refs_reason: "ResolvedRefs".to_string(),
             resolved_refs_message: "All BackendTLSPolicy references accepted by Ferrum".to_string(),
@@ -966,22 +1214,23 @@ pub(super) fn lookup_for_service(
         return BackendTlsPolicyLookup::None;
     }
 
-    let port_name = service_port
-        .and_then(|port| acc.lookup_service_port_name(service_namespace, service_name, port));
+    // The port scope was resolved once, at collect time, against the complete
+    // Service index — including each port's L4 transport. Matching here is a
+    // pure predicate over that decision, so runtime attachment and the
+    // published status cannot drift apart.
+    let port_index = acc.service_port_index(service_namespace, service_name);
 
     let mut matching: Vec<&IndexedBackendTlsPolicy> = entries
         .iter()
-        .filter(|entry| match (entry.section_name.as_deref(), port_name) {
-            (None, _) => true,
-            (Some(section), Some(name)) => section == name,
-            (Some(_), None) => false,
-        })
+        .filter(|entry| entry.governs(port_index, service_port))
         .collect();
 
     if matching.is_empty() {
-        // sectionName-scoped policies exist but none match this port — treat as
-        // no policy for this backend rather than applying a mismatched port TLS
-        // identity.
+        // Policies exist for this Service but none governs this port — a
+        // sectionName scoped elsewhere, a sectionName that resolves to nothing,
+        // or the UDP port of a mixed-transport Service. Treat it as no policy
+        // for this backend rather than applying a TLS identity the operator
+        // scoped to a different port.
         return BackendTlsPolicyLookup::None;
     }
 

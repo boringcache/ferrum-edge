@@ -91,6 +91,29 @@ semantics remain undefined. Non-empty `spec.options` are not supported. These
 and malformed optional field shapes are rejected fail closed rather than
 silently broadening a targeted backend to plaintext.
 
+`targetRefs[].sectionName` names a Service **port name**, and Ferrum resolves it
+against the Service's actual `spec.ports`. A `sectionName` that matches no port
+makes the policy fail to attach (`Accepted=False`, `reason: TargetNotFound`); it
+does not silently apply elsewhere, and it does not fault the Service's other
+valid ports, because the port the operator meant cannot be inferred.
+
+BackendTLSPolicy applies only to TCP traffic (Gateway API GEP-1897). A policy
+that explicitly attaches to a UDP Service port — a `sectionName` naming a UDP
+port, or a Service whose ports are all UDP — is rejected with
+`Accepted=False`, `reason: Invalid`, and any route backend that selects it fails
+closed with an HTTP 500 fault instead of originating TLS to a UDP port or
+falling back to plaintext. A Service that mixes TCP and UDP ports is accepted
+with a warning in the `Accepted` condition message and the policy takes effect
+only on its TCP ports.
+
+Health probes follow the same trust policy as proxy traffic. A configured
+backend CA is the **sole** trust anchor, so when it cannot be loaded or parsed
+— including a `caCertificateRefs` Secret whose `k8s://…#ca.crt` source becomes
+unreadable after translation accepted it — the probe client is not built and
+HTTP probes report unhealthy. Ferrum never falls back to the system roots for a
+backend pinned to a private CA, because that would let any publicly-trusted
+certificate keep a target marked healthy.
+
 **CA exclusivity**: When a custom CA is configured, it is the sole trust anchor. This prevents a backend pinned to an internal CA from being MITMed via any publicly-trusted certificate. If you need both internal and public CAs trusted, combine them into a single PEM bundle file.
 
 No-verify changes handshake verification only. Ferrum still materializes and
