@@ -30181,12 +30181,7 @@ async fn handle_proxy_request_inner(
                     );
                     break;
                 }
-                if !retry_attempt_allowed_for_target(
-                    route_retry_ceiling,
-                    &proxy,
-                    &next,
-                    attempt,
-                ) {
+                if !retry_attempt_allowed_for_target(route_retry_ceiling, &proxy, &next, attempt) {
                     warn!(
                         proxy_id = %proxy.id,
                         attempt = attempt,
@@ -53159,7 +53154,10 @@ mod tests {
         let target = target_for_test(8080);
         let after = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&target));
         let route_max = route_retry_ceiling(&after).unwrap();
-        assert_eq!(route_max, 5, "original route ceiling must remain on Proxy.retry");
+        assert_eq!(
+            route_max, 5,
+            "original route ceiling must remain on Proxy.retry"
+        );
         assert_eq!(
             effective_retry_max_retries_for_target(route_max, &after, &target),
             2
