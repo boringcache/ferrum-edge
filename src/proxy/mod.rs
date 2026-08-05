@@ -12067,7 +12067,13 @@ async fn handle_websocket_request_authenticated(
                 .as_ref()
                 .and_then(|u| u.hash_on_cookie_config.as_ref())
                 .unwrap_or(&default_cc);
-            let cookie_val = build_sticky_cookie_header(cookie_name, target, cookie_config);
+            let cookie_val = build_sticky_cookie_header(
+                cookie_name,
+                &proxy.namespace,
+                upstream_id,
+                target,
+                cookie_config,
+            );
             headers_mod::append_set_cookie_header(&mut response_headers, cookie_val);
         }
     }
@@ -29247,8 +29253,13 @@ async fn handle_proxy_request_inner(
                             .as_ref()
                             .and_then(|u| u.hash_on_cookie_config.as_ref())
                             .unwrap_or(&default_cc);
-                        let cookie_val =
-                            build_sticky_cookie_header(cookie_name, target, cookie_config);
+                        let cookie_val = build_sticky_cookie_header(
+                            cookie_name,
+                            &proxy.namespace,
+                            upstream_id,
+                            target,
+                            cookie_config,
+                        );
                         response_headers
                             .entry("set-cookie".to_string())
                             .and_modify(|v| {
@@ -31351,7 +31362,13 @@ async fn handle_proxy_request_inner(
                 .as_ref()
                 .and_then(|u| u.hash_on_cookie_config.as_ref())
                 .unwrap_or(&default_cc);
-            let cookie_val = build_sticky_cookie_header(cookie_name, target, cookie_config);
+            let cookie_val = build_sticky_cookie_header(
+                cookie_name,
+                &proxy.namespace,
+                upstream_id,
+                target,
+                cookie_config,
+            );
             response_headers
                 .entry("set-cookie".to_string())
                 .and_modify(|v| {
@@ -36084,20 +36101,31 @@ fn buffered_collect_retain_failure(
 
 /// Build a `Set-Cookie` header value for sticky session cookie injection.
 ///
-/// The cookie value is a SHA-256 hash of the backend `host:port`, not the
-/// raw address itself. This prevents leaking internal backend topology to
-/// clients while remaining deterministic across gateway instances and
-/// restarts (no keyed HMAC, no per-process state).
+/// The cookie value is the opaque backend-bound token from
+/// [`crate::load_balancer::sticky_session_token`]: a SHA-256 digest over the
+/// namespace-qualified upstream identity and the selected `host:port`, never
+/// the address itself. It therefore leaks no backend topology, credential, or
+/// secret to the client, and it is scoped — a token minted for one upstream
+/// (Gateway API materializes one route-scoped upstream per persistent route
+/// rule) cannot resolve inside another upstream's binding index.
+///
+/// Callers must pass the target that ACTUALLY served the successful response.
+/// Every call site sits after retry rotation for exactly that reason: a client
+/// must never be pinned to a backend that did not produce its response.
+///
+/// The derivation is unkeyed and deterministic, so affinity survives a gateway
+/// restart and is identical across replicas of a horizontally scaled gateway.
 pub(crate) fn build_sticky_cookie_header(
     cookie_name: &str,
+    namespace: &str,
+    upstream_id: &str,
     target: &UpstreamTarget,
     config: &crate::config::types::HashOnCookieConfig,
 ) -> String {
-    use crate::fips::approved::Sha256;
-    use crate::load_balancer::target_host_port_key;
-
-    let raw = target_host_port_key(target);
-    let value = hex::encode(Sha256::digest(raw.as_bytes()));
+    let value = crate::load_balancer::sticky_session_token(
+        &crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id),
+        target,
+    );
     let mut cookie = format!("{}={}; Path={}", cookie_name, value, config.path);
     if !config.session_cookie {
         cookie.push_str("; Max-Age=");

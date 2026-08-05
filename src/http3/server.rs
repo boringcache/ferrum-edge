@@ -8250,8 +8250,13 @@ pub(crate) fn inject_sticky_cookie(
                 .as_ref()
                 .and_then(|u| u.hash_on_cookie_config.as_ref())
                 .unwrap_or(&default_cc);
-            let cookie_val =
-                crate::proxy::build_sticky_cookie_header(cookie_name, target, cookie_config);
+            let cookie_val = crate::proxy::build_sticky_cookie_header(
+                cookie_name,
+                &proxy.namespace,
+                upstream_id,
+                target,
+                cookie_config,
+            );
             response_headers
                 .entry("set-cookie".to_string())
                 .and_modify(|v| {

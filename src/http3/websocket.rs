@@ -1245,8 +1245,13 @@ pub(crate) async fn handle_h3_websocket(
                 .as_ref()
                 .and_then(|u| u.hash_on_cookie_config.as_ref())
                 .unwrap_or(&default_cc);
-            let cookie_val =
-                crate::proxy::build_sticky_cookie_header(cookie_name, target, cookie_config);
+            let cookie_val = crate::proxy::build_sticky_cookie_header(
+                cookie_name,
+                &proxy.namespace,
+                upstream_id,
+                target,
+                cookie_config,
+            );
             crate::proxy::headers::append_set_cookie_header(&mut response_headers, cookie_val);
         }
     }

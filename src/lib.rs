@@ -108,12 +108,26 @@ pub mod _test_support {
     }
 
     /// Test-only view of sticky-session `Set-Cookie` construction (#3278).
+    ///
+    /// `namespace` / `upstream_id` are the scope the emitted token is bound to;
+    /// the value must equal
+    /// [`crate::load_balancer::sticky_session_token`] over the same scope and
+    /// target, which is what makes the cookie resolvable back to that exact
+    /// backend by `LoadBalancer::select_sticky`.
     pub fn build_sticky_cookie_header_for_test(
         cookie_name: &str,
+        namespace: &str,
+        upstream_id: &str,
         target: &crate::config::types::UpstreamTarget,
         config: &crate::config::types::HashOnCookieConfig,
     ) -> String {
-        crate::proxy::build_sticky_cookie_header(cookie_name, target, config)
+        crate::proxy::build_sticky_cookie_header(
+            cookie_name,
+            namespace,
+            upstream_id,
+            target,
+            config,
+        )
     }
 
     /// Public mirror of the crate-private TCP SO_REUSEPORT accept-loop peer class.

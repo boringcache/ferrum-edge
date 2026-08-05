@@ -2850,8 +2850,13 @@ pub(crate) fn upstream_for_route(
     upstream_for_route_with_session(id, namespace, backends, None)
 }
 
-/// Build a route Upstream, optionally applying Gateway API session persistence
-/// (cookie/header consistent hashing).
+/// Build a route Upstream, optionally applying Gateway API session persistence.
+///
+/// Only `sessionPersistence.type: Cookie` is representable: it projects onto a
+/// consistent-hashing upstream whose `hash_on` names the route-scoped session
+/// cookie, and the request path then resolves that cookie's opaque token back
+/// to the exact backend that issued it. `type: Header` is rejected at
+/// translation because Ferrum cannot synthesize the response session token.
 pub(crate) fn upstream_for_route_with_session(
     id: String,
     namespace: String,

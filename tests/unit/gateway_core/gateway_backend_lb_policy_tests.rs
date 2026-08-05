@@ -2,8 +2,18 @@
 //! XBackendTrafficPolicy session persistence (#3278).
 //!
 //! Translation alone is covered in `gateway_api.rs`. These tests feed the
-//! translated Upstream through `LoadBalancerCache` so sticky cookie hashing
-//! actually selects the same target — the data path that changes traffic.
+//! translated Upstream through `LoadBalancerCache` so the persistence data path
+//! is exercised end to end:
+//!
+//! - the token the gateway would emit on the initial response resolves back to
+//!   the EXACT target that produced it (`LoadBalancer::select_sticky`), which is
+//!   what Gateway API session persistence actually requires;
+//! - the consistent-hash ring underneath stays deterministic, which is the
+//!   *fallback* used for unbound requests — deterministic re-hashing is NOT by
+//!   itself session persistence and is asserted as such.
+//!
+//! Token validation, foreign/stale/removed/unhealthy bindings, and
+//! subset/port isolation live in `sticky_session_binding_tests.rs`.
 
 use std::collections::HashMap;
 
@@ -41,6 +51,14 @@ fn object(kind: &str, api_version: &str, name: &str, spec: serde_json::Value) ->
         spec,
         status: serde_json::Value::Object(serde_json::Map::new()),
     }
+}
+
+/// Extract the `name=value` pair's value from a `Set-Cookie` header value.
+fn set_cookie_value(header: &str, name: &str) -> String {
+    let pair = header.split(';').next().map(str::trim).expect("cookie pair");
+    pair.strip_prefix(&format!("{name}="))
+        .unwrap_or_else(|| panic!("expected cookie named {name}, got {header}"))
+        .to_string()
 }
 
 #[test]
@@ -147,6 +165,46 @@ fn backend_lb_policy_cookie_affinity_selects_stable_target_on_lb_path() {
         .load()
         .get_balancer(&upstream.namespace, &upstream.id)
         .expect("translated upstream must be in LB cache");
+
+    // The real persistence contract: for EVERY target the initial response
+    // could have been served by, the cookie the gateway would emit must resolve
+    // back to that same target. Determinism of the ring below is a weaker,
+    // separate property.
+    let cookie_config = upstream
+        .hash_on_cookie_config
+        .clone()
+        .expect("cookie config projected");
+    for target in &upstream.targets {
+        let header = ferrum_edge::_test_support::build_sticky_cookie_header_for_test(
+            cookie_name,
+            &upstream.namespace,
+            &upstream.id,
+            target,
+            &cookie_config,
+        );
+        let token = set_cookie_value(&header, cookie_name);
+        // Opaque: a fixed-width lowercase hex digest that cannot contain the
+        // backend address (target hosts carry `.` / `:`, which hex cannot).
+        assert!(
+            ferrum_edge::load_balancer::is_sticky_session_token(&token),
+            "token must be an opaque hex digest: {token}"
+        );
+        assert!(
+            !token.contains(&target.host),
+            "token must not disclose backend topology: {token}"
+        );
+        for _ in 0..5 {
+            let bound = lb
+                .select_sticky(&token, None, None, None)
+                .expect("emitted token must resolve to its backend");
+            assert_eq!(bound.host, target.host);
+            assert_eq!(bound.port, target.port);
+        }
+    }
+
+    // Fallback ring: an UNBOUND opaque value still hashes deterministically so
+    // an unbound client is not reshuffled request to request. This is the
+    // fallback path, not session persistence.
     let first = lb
         .select("cookie-value-abc", None)
         .expect("selection succeeds");
@@ -190,6 +248,8 @@ fn sticky_session_cookie_omits_max_age_on_set_cookie() {
     };
     let header = ferrum_edge::_test_support::build_sticky_cookie_header_for_test(
         "lb-affinity",
+        &ferrum_edge::config::types::default_namespace(),
+        "u1",
         &target,
         &session,
     );
@@ -211,6 +271,8 @@ fn sticky_session_cookie_omits_max_age_on_set_cookie() {
     };
     let permanent_header = ferrum_edge::_test_support::build_sticky_cookie_header_for_test(
         "lb-affinity",
+        &ferrum_edge::config::types::default_namespace(),
+        "u1",
         &target,
         &permanent,
     );

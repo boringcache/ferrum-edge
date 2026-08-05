@@ -1596,6 +1596,26 @@ impl LoadBalancerCache {
         balancer.select_passthrough(orig_dst, port, subset_name, health)
     }
 
+    /// Gateway API session persistence from a snapshot: resolve an opaque
+    /// sticky-session token to the exact target that minted it, scoped to the
+    /// same `(subset ∩ port)` candidate pool and health filtering ordinary
+    /// selection uses. `None` means the caller must fall back to ordinary
+    /// load-balanced selection and mint a fresh binding — see
+    /// [`LoadBalancer::select_sticky`].
+    #[inline]
+    pub fn select_sticky_from(
+        snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
+        upstream_id: &str,
+        token: &str,
+        port: Option<u16>,
+        subset_name: Option<&str>,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let balancer = snapshot.balancer(namespace, upstream_id)?;
+        balancer.select_sticky(token, port, subset_name, health)
+    }
+
     /// Select next target, excluding a previously tried target (for retries).
     pub fn select_next_target(
         &self,
@@ -1885,9 +1905,71 @@ pub fn target_key(upstream_id: &str, target: &UpstreamTarget) -> String {
     key
 }
 
+/// Domain-separation prefix for backend-bound sticky-session tokens. Bumping
+/// this string invalidates every outstanding token (clients transparently
+/// re-pin on their next request), so it doubles as a format version.
+const STICKY_SESSION_TOKEN_DOMAIN: &str = "ferrum-sticky-session-v1";
+
+/// A sticky-session token is a lowercase hex SHA-256 digest: 64 characters.
+pub const STICKY_SESSION_TOKEN_LEN: usize = 64;
+
+/// Derive the opaque sticky-session token that binds a client to one concrete
+/// backend target.
+///
+/// `upstream_runtime_key` must be the namespace-qualified upstream identity
+/// (`namespace|upstream_id`) — the SAME string
+/// [`LoadBalancerCache`] keys its balancers by. That is what scopes a token:
+/// Gateway API session persistence materializes a route-scoped upstream
+/// (`gwapi-route-upstream-<ns>-<route>-<rule>`), so a token minted for one
+/// route/service/namespace/policy cannot resolve inside another upstream's
+/// binding index even when both front the same pod IPs.
+///
+/// The token is the digest of `domain \x1f namespace|upstream_id::host:port`,
+/// so it discloses no backend address, port, credential, or secret. It is
+/// unkeyed on purpose: stickiness must survive a gateway restart and must be
+/// identical across every replica of a horizontally scaled gateway, and there
+/// is no cluster-wide shared secret available in every operating mode. The
+/// value is therefore an obfuscated — not authenticated — binding: presenting
+/// a forged token can only steer a client to a target the same upstream would
+/// already have selected for some other client, never outside the
+/// health/subset/port-scoped candidate pool (see [`LoadBalancer::select_sticky`]).
+pub fn sticky_session_token(upstream_runtime_key: &str, target: &UpstreamTarget) -> String {
+    sticky_session_token_from_target_key(&target_key(upstream_runtime_key, target))
+}
+
+/// Token derivation from an already-built `namespace|upstream_id::host:port`
+/// key, so the per-balancer index can reuse its precomputed `target_keys`.
+fn sticky_session_token_from_target_key(scoped_target_key: &str) -> String {
+    let mut hasher = crate::fips::approved::Sha256::new();
+    hasher.update(STICKY_SESSION_TOKEN_DOMAIN.as_bytes());
+    hasher.update([0x1fu8]);
+    hasher.update(scoped_target_key.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Cheap boundary validation for an untrusted cookie value before it is used as
+/// a sticky-session token.
+///
+/// Bounded work: an exact length check short-circuits any oversized value
+/// (a 64-byte comparison at most), then one pass over 64 ASCII bytes. Nothing
+/// is allocated and nothing is logged, so a client cannot spend gateway CPU or
+/// memory by sending large or high-cardinality cookie values.
+#[inline]
+pub fn is_sticky_session_token(value: &str) -> bool {
+    value.len() == STICKY_SESSION_TOKEN_LEN
+        && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `true` when a resolved hash-on strategy is the cookie form that mints
+/// backend-bound session tokens.
+#[inline]
+fn strategy_mints_sticky_tokens(strategy: &HashOnStrategy) -> bool {
+    matches!(strategy, HashOnStrategy::Cookie(_))
+}
+
 /// Build a plain "host:port" key for a target (no upstream scoping).
-/// Used for sticky session cookies, active connection tracking, latency EWMA,
-/// and other contexts where the key is already scoped to a single LoadBalancer.
+/// Used for active connection tracking, latency EWMA, and other contexts where
+/// the key is already scoped to a single LoadBalancer.
 pub fn target_host_port_key(target: &UpstreamTarget) -> String {
     let mut key = String::with_capacity(target.host.len() + 6);
     write_target_host_port_key(&mut key, target);
@@ -2217,6 +2299,22 @@ pub struct LoadBalancer {
     /// "host:port" format as `host_port_keys`, enabling zero-allocation lookup
     /// via `write!()` into a thread-local buffer.
     target_index: HashMap<String, usize>,
+    /// O(1) reverse lookup from an opaque sticky-session token to the index of
+    /// the target it was minted for. This is what makes Gateway API session
+    /// persistence *backend-bound*: a returning client resolves to the exact
+    /// target that produced its cookie instead of re-hashing an opaque value
+    /// through the consistent-hash ring (which has no reason to land on the
+    /// same target).
+    ///
+    /// Materialized at construction — i.e. rebuilt on config reload / service
+    /// discovery update alongside the hash ring — so the request path is one
+    /// hash-map probe, never an O(n) target scan. Empty (and therefore free)
+    /// unless some effective hash-on strategy on this upstream is `Cookie`,
+    /// which is the only configuration that mints tokens.
+    ///
+    /// Degenerate duplicate `host:port` targets collapse to one entry; the
+    /// FIRST index wins so the mapping stays deterministic across rebuilds.
+    sticky_token_index: HashMap<String, usize>,
     algorithm: LoadBalancerAlgorithm,
     /// Round-robin / random / least-latency warm-up selection counters.
     /// Sharded and cache-line padded; see [`SelectionCounterShards`].
@@ -2621,6 +2719,31 @@ impl LoadBalancer {
             "at most one destination port can cover every target in one upstream"
         );
 
+        // Materialize the sticky-session binding index only when this upstream
+        // can actually mint tokens — i.e. some effective hash-on strategy
+        // (upstream, subset, or per-port lane) is `Cookie`. Every other
+        // upstream keeps an empty map and pays nothing at reload or at request
+        // time. Duplicate `host:port` targets share one scoped target key, so
+        // `or_insert` keeps the first index for a stable mapping.
+        let mut mints_sticky_tokens = strategy_mints_sticky_tokens(&hash_on_strategy);
+        for strategy in subset_hash_on_strategies.values() {
+            mints_sticky_tokens |= strategy_mints_sticky_tokens(strategy);
+        }
+        for state in port_states.values() {
+            mints_sticky_tokens |= strategy_mints_sticky_tokens(&state.hash_on_strategy);
+            if let Some(ref overridden) = state.hash_on_override_strategy {
+                mints_sticky_tokens |= strategy_mints_sticky_tokens(overridden);
+            }
+        }
+        let mut sticky_token_index: HashMap<String, usize> = HashMap::new();
+        if mints_sticky_tokens {
+            sticky_token_index.reserve(target_keys.len());
+            for (i, key) in target_keys.iter().enumerate() {
+                let token = sticky_session_token_from_target_key(key);
+                sticky_token_index.entry(token).or_insert(i);
+            }
+        }
+
         // Pre-compute per-target distribute weights and failover-region matches
         // against the source locality so the request path stays branch-light.
         // `enabled: false` disables every locality-aware path; `distribute`
@@ -2653,6 +2776,7 @@ impl LoadBalancer {
             host_port_keys,
             target_locality_ranks,
             target_index,
+            sticky_token_index,
             algorithm,
             rr_counter: new_selection_counters(),
             wrr_state: if algorithm == LoadBalancerAlgorithm::WeightedRoundRobin {
@@ -4364,6 +4488,144 @@ impl LoadBalancer {
         }
     }
 
+    /// Resolve the `(port, subset)` candidate-pool index slices a
+    /// direct-selection path must stay inside, mirroring the scoping the
+    /// `select*` family applies.
+    ///
+    /// Returns `(subset_indices, port_indices)`; `None` in a slot means "not
+    /// scoped by that dimension". Returns the outer `None` when a subset was
+    /// named but is unknown/empty — that pool has no candidates at all.
+    #[inline]
+    fn candidate_pool_indices(
+        &self,
+        port: Option<u16>,
+        subset_name: Option<&str>,
+    ) -> Option<(Option<&[usize]>, Option<&[usize]>)> {
+        let port_indices = port
+            .and_then(|p| self.port_overrides.get(&p))
+            .map(|ps| ps.target_indices.as_slice());
+        let subset_indices = subset_name.and_then(|name| {
+            self.subset_indices
+                .get(name)
+                .filter(|indices| !indices.is_empty())
+                .map(Vec::as_slice)
+        });
+        if subset_name.is_some() && subset_indices.is_none() {
+            return None;
+        }
+        Some((subset_indices, port_indices))
+    }
+
+    /// Is `idx` currently healthy *within* the given candidate pool?
+    ///
+    /// Health (active + passive) is computed over the SAME pool the
+    /// load-balanced path would select from, so the passive
+    /// `max_ejection_percent` cap is sized against THAT pool — mirroring
+    /// `select_from_subset` / `select_for_port` / `select_for_port_from_subset`.
+    /// Scoping the match to the pool but the cap to the whole upstream would let
+    /// ejections OUTSIDE the pool dilute the cap and wrongly readmit (or keep
+    /// ejected) the matched target, contrary to the outlier policy. The Vec path
+    /// covers the rare >128-target pool the bitset can't represent.
+    fn index_healthy_in_pool(
+        &self,
+        idx: usize,
+        subset_indices: Option<&[usize]>,
+        port_indices: Option<&[usize]>,
+        health: Option<&HealthContext<'_>>,
+    ) -> bool {
+        if self.targets.len() > MAX_BITSET_TARGETS {
+            // >128 targets: cap against the candidate-pool index set.
+            match (subset_indices, port_indices) {
+                (Some(s), Some(p)) => {
+                    let intersection = self.subset_port_intersection_vec(s, p);
+                    self.healthy_targets_vec_for_indices(health, &intersection)
+                        .iter()
+                        .any(|(i, _)| *i == idx)
+                }
+                (Some(indices), None) | (None, Some(indices)) => self
+                    .healthy_targets_vec_for_indices(health, indices)
+                    .iter()
+                    .any(|(i, _)| *i == idx),
+                (None, None) => self
+                    .healthy_targets_vec(health)
+                    .iter()
+                    .any(|(i, _)| *i == idx),
+            }
+        } else {
+            // ≤128 targets: cap against the candidate-pool bitset/mask
+            // (alloc-free stack `u128`s, no per-request `Vec`).
+            match (subset_indices, port_indices) {
+                (Some(s), Some(p)) => {
+                    let intersection = self.subset_port_mask(s, p);
+                    self.compute_health_bitset_for_mask(health, &intersection)
+                        .contains(idx)
+                }
+                (Some(indices), None) | (None, Some(indices)) => self
+                    .compute_health_bitset_for_indices(health, indices)
+                    .contains(idx),
+                (None, None) => self.compute_health_bitset(health).contains(idx),
+            }
+        }
+    }
+
+    /// Gateway API session persistence: resolve an opaque sticky-session token
+    /// back to the EXACT backend target that minted it.
+    ///
+    /// This is the read side of [`sticky_session_token`]. The write side runs
+    /// once, on the initial response, against the target that actually served
+    /// it; this side must therefore never "re-derive" a target by hashing —
+    /// hashing an opaque token through the consistent-hash ring has no reason
+    /// to reproduce the selected backend, which is exactly the defect this
+    /// replaces.
+    ///
+    /// Every safety property of ordinary selection still applies:
+    ///
+    /// - the token is validated at the boundary ([`is_sticky_session_token`])
+    ///   with bounded work before it ever reaches the index;
+    /// - an unknown token — malformed, foreign-scope (minted for another
+    ///   route/service/namespace/policy, therefore another upstream identity),
+    ///   or stale after the backend was removed — simply misses the map;
+    /// - a resolved target is still gated on `(subset ∩ port)` pool membership
+    ///   and on active + passive health, so a pinned client can never be sent
+    ///   to an ejected, removed, out-of-subset, or wrong-port endpoint.
+    ///
+    /// `None` means "no usable binding": the caller falls back to ordinary
+    /// load-balanced selection and mints a fresh cookie. Nothing about
+    /// TLS, authorization, retry, or connection-limit handling is bypassed —
+    /// this only chooses which pool member to dial.
+    ///
+    /// Locality preference is deliberately not re-applied, exactly as in
+    /// [`Self::select_passthrough`]: an established session names one concrete
+    /// endpoint, and re-running locality weighting would either be a no-op or
+    /// break the persistence contract. The endpoint is still health- and
+    /// pool-gated, so an unreachable one falls back and re-selects with full
+    /// locality preference.
+    ///
+    /// Hot path: one hash-map probe plus the same pool/health validation
+    /// passthrough already performs. No allocation, no target scan.
+    pub fn select_sticky(
+        &self,
+        token: &str,
+        port: Option<u16>,
+        subset_name: Option<&str>,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if self.sticky_token_index.is_empty() || !is_sticky_session_token(token) {
+            return None;
+        }
+        let idx = *self.sticky_token_index.get(token)?;
+        let (subset_indices, port_indices) = self.candidate_pool_indices(port, subset_name)?;
+        if !port_indices.is_none_or(|p| p.contains(&idx))
+            || !subset_indices.is_none_or(|s| s.contains(&idx))
+        {
+            return None;
+        }
+        if !self.index_healthy_in_pool(idx, subset_indices, port_indices, health) {
+            return None;
+        }
+        Some(Arc::clone(&self.targets[idx]))
+    }
+
     /// PASSTHROUGH selection: dial the target whose canonical `(IP, port)`
     /// equals the captured original destination, bypassing load balancing
     /// (Istio `loadBalancer.simple=PASSTHROUGH`).
@@ -4402,19 +4664,8 @@ impl LoadBalancer {
 
         // Restrict the candidate pool to the subset∩port the caller would have
         // load-balanced over, so passthrough never escapes subset/port scoping.
-        let port_indices = port
-            .and_then(|p| self.port_overrides.get(&p))
-            .map(|ps| ps.target_indices.as_slice());
-        let subset_indices = subset_name.and_then(|name| {
-            self.subset_indices
-                .get(name)
-                .filter(|indices| !indices.is_empty())
-                .map(Vec::as_slice)
-        });
         // A named-but-unknown/empty subset has no candidate pool at all.
-        if subset_name.is_some() && subset_indices.is_none() {
-            return None;
-        }
+        let (subset_indices, port_indices) = self.candidate_pool_indices(port, subset_name)?;
 
         let in_pool = |idx: usize| -> bool {
             port_indices.is_none_or(|p| p.contains(&idx))
@@ -4435,49 +4686,9 @@ impl LoadBalancer {
         })?;
 
         // Respect active + passive health: never dial an ejected orig-dst
-        // target. Compute health over the SAME candidate pool the load-balanced
-        // path would select from (subset / port / subset∩port), so the passive
-        // `max_ejection_percent` cap is sized against THAT pool — mirroring
-        // `select_from_subset` / `select_for_port` / `select_for_port_from_subset`.
-        // Scoping the match to the pool but the cap to the whole upstream would
-        // let ejections OUTSIDE the pool dilute the cap and wrongly readmit (or
-        // keep ejected) the matched orig-dst target, contrary to the outlier
-        // policy. The Vec path covers the rare >128-target pool the bitset
-        // can't represent.
-        let matched_healthy = if self.targets.len() > MAX_BITSET_TARGETS {
-            // >128 targets: cap against the candidate-pool index set.
-            match (subset_indices, port_indices) {
-                (Some(s), Some(p)) => {
-                    let intersection = self.subset_port_intersection_vec(s, p);
-                    self.healthy_targets_vec_for_indices(health, &intersection)
-                        .iter()
-                        .any(|(idx, _)| *idx == matched_idx)
-                }
-                (Some(indices), None) | (None, Some(indices)) => self
-                    .healthy_targets_vec_for_indices(health, indices)
-                    .iter()
-                    .any(|(idx, _)| *idx == matched_idx),
-                (None, None) => self
-                    .healthy_targets_vec(health)
-                    .iter()
-                    .any(|(idx, _)| *idx == matched_idx),
-            }
-        } else {
-            // ≤128 targets: cap against the candidate-pool bitset/mask
-            // (alloc-free stack `u128`s, no per-request `Vec`).
-            match (subset_indices, port_indices) {
-                (Some(s), Some(p)) => {
-                    let intersection = self.subset_port_mask(s, p);
-                    self.compute_health_bitset_for_mask(health, &intersection)
-                        .contains(matched_idx)
-                }
-                (Some(indices), None) | (None, Some(indices)) => self
-                    .compute_health_bitset_for_indices(health, indices)
-                    .contains(matched_idx),
-                (None, None) => self.compute_health_bitset(health).contains(matched_idx),
-            }
-        };
-        if !matched_healthy {
+        // target. See `index_healthy_in_pool` for why the cap is sized against
+        // the candidate pool rather than the whole upstream.
+        if !self.index_healthy_in_pool(matched_idx, subset_indices, port_indices, health) {
             return None;
         }
 

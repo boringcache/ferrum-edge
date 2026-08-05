@@ -370,8 +370,9 @@ upstreams:
 
 When `hash_on` is `cookie:<name>`, the gateway establishes sticky sessions automatically:
 
-1. **First request** (no cookie): The gateway selects a target using the client IP as a fallback key, then injects a `Set-Cookie` response header with the selected target's identifier.
-2. **Subsequent requests** (cookie present): The cookie value is used as the hash key, routing the request to the same target.
+1. **First request** (no cookie): The gateway selects a target using the client IP as a fallback key, then injects a `Set-Cookie` response header carrying an **opaque token bound to the target that served that response**. The token is a SHA-256 digest over the namespace-qualified upstream identity and the selected `host:port`, so it discloses no backend address, credential, or secret. It is unkeyed and deterministic, so affinity survives a gateway restart and is identical across gateway replicas.
+2. **Subsequent requests** (cookie present): The token is resolved through a per-upstream binding index that is materialized at config reload, returning the client to that **exact** target — not merely to a deterministic one.
+3. **Fallback**: a cookie value that is malformed, oversized, scoped to another upstream (Gateway API materializes one route-scoped upstream per persistent route rule, so a token cannot steer across routes, Services, namespaces, or policies), stale after the backend was removed, outside the selected subset/port lane, or currently unhealthy is treated as **no session**: the request falls through to ordinary load-balanced selection and a fresh, correctly bound cookie is issued on the response. Health, subset, port, TLS, authorization, retry, and connection-limit semantics are never bypassed.
 
 ```yaml
 upstreams:
@@ -407,7 +408,7 @@ If `hash_on_cookie_config` is omitted, sensible defaults are used (path `/`, 1 h
 
 The sticky session cookie is injected on HTTP, gRPC, and WebSocket (101 Upgrade) responses.
 
-When a target is removed or added, only a fraction of keys are remapped — this minimizes cache invalidation across backends.
+When a target is removed or added, only a fraction of *unbound* keys are remapped — this minimizes cache invalidation across backends. Sessions already bound to a surviving target keep their exact target; sessions bound to the removed target re-select and are re-issued a cookie.
 
 **Best for:** Session affinity, caching backends, stateful applications, multi-tenant routing.
 

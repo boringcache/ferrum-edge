@@ -272,23 +272,85 @@ pub(crate) fn select_upstream_target(
         port_scope,
         subset_name,
     );
-    let (hash_key, needs_set) = resolve_hash_key(&strategy, client_ip, proxy_headers);
+    let (mut hash_key, mut needs_set) = resolve_hash_key(&strategy, client_ip, proxy_headers);
 
     let selected_balancer = balancers.get_balancer(&proxy.namespace, upstream_id);
+
+    let effective_algorithm = LoadBalancerCache::effective_algorithm_from(
+        balancers,
+        &proxy.namespace,
+        upstream_id,
+        port_scope,
+        subset_name,
+    );
+
+    // Gateway API session persistence (BackendLBPolicy / XBackendTrafficPolicy
+    // `sessionPersistence: Cookie`): a request that presents the affinity
+    // cookie must return to the EXACT backend that produced the initial
+    // response, not merely to a deterministic one. `resolve_hash_key` has
+    // already extracted the cookie value; resolve it through the balancer's
+    // precomputed token→target binding index instead of feeding an opaque token
+    // into the consistent-hash ring (which has no reason to land back on the
+    // minting target).
+    //
+    // Fallback contract — documented because Gateway API only requires
+    // persistence for a *valid* session and explicitly permits re-selection
+    // once the pinned endpoint is no longer eligible: when the token is
+    // missing, malformed/oversized, scoped to another route/service/namespace/
+    // policy, stale after the backend was removed, outside the current
+    // subset/port pool, or currently unhealthy, the request falls through to
+    // ordinary load-balanced selection (hashing on client IP, exactly as a
+    // first-ever request does) and a fresh, correctly bound cookie is minted on
+    // the response. This never dials an ineligible target and never bypasses
+    // health, subset, port, TLS, authorization, retry, or connection-limit
+    // semantics — it only decides which pool member to prefer.
+    //
+    // Restricted to consistent-hashing lanes so PASSTHROUGH and the other
+    // algorithms keep their existing behavior unchanged.
+    let mut sticky_rebind_needed = false;
+    if !needs_set
+        && effective_algorithm == Some(LoadBalancerAlgorithm::ConsistentHashing)
+        && matches!(strategy, HashOnStrategy::Cookie(_))
+    {
+        match LoadBalancerCache::select_sticky_from(
+            balancers,
+            &proxy.namespace,
+            upstream_id,
+            &hash_key,
+            port_scope,
+            subset_name,
+            Some(&health_ctx),
+        ) {
+            Some(target) => {
+                return UpstreamSelection {
+                    lb_hash_key: Some(hash_key),
+                    target: Some(target),
+                    balancer: selected_balancer,
+                    is_fallback: false,
+                    sticky_cookie_needed: false,
+                };
+            }
+            None => {
+                // Never log or echo the presented token.
+                debug!(
+                    proxy_id = %proxy.id,
+                    upstream_id = %upstream_id,
+                    "Session persistence: presented affinity cookie has no usable \
+                     backend binding, re-selecting and re-issuing"
+                );
+                hash_key = client_ip.to_owned();
+                needs_set = true;
+                sticky_rebind_needed = true;
+            }
+        }
+    }
 
     // PASSTHROUGH (Istio `loadBalancer.simple=PASSTHROUGH`): when this upstream's
     // effective algorithm is Passthrough, dial the captured original destination
     // if it matches a healthy target in the (subset∩port-scoped) candidate pool,
     // bypassing load balancing. Absent or unmatched orig-dst falls through to the
     // normal selection below, which treats Passthrough as round-robin.
-    if LoadBalancerCache::effective_algorithm_from(
-        balancers,
-        &proxy.namespace,
-        upstream_id,
-        port_scope,
-        subset_name,
-    ) == Some(LoadBalancerAlgorithm::Passthrough)
-    {
+    if effective_algorithm == Some(LoadBalancerAlgorithm::Passthrough) {
         match orig_dst {
             Some(dst) => {
                 if let Some(target) = LoadBalancerCache::select_passthrough_from(
@@ -408,7 +470,10 @@ pub(crate) fn select_upstream_target(
                     tp_override.then_some(tp),
                     subset_name,
                 );
-                resolve_hash_key(&tp_strategy, client_ip, proxy_headers).1
+                // A stale/foreign binding still has to be re-issued even when
+                // the landing port lane would consider the presented cookie
+                // "already set" — that cookie no longer binds a usable target.
+                resolve_hash_key(&tp_strategy, client_ip, proxy_headers).1 || sticky_rebind_needed
             } else {
                 needs_set
             };
