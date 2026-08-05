@@ -302,35 +302,104 @@ fn translated_config_yaml(objects: &[K8sObject]) -> String {
 // Gateway harness
 // ---------------------------------------------------------------------------
 
-async fn alloc_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
+/// Ephemeral-port reservations held until the moment the child binds them.
+///
+/// Root cause of the flake this replaces: the previous `alloc_port()` did
+/// `TcpListener::bind("127.0.0.1:0").await.expect(..).local_addr()..port()`, so
+/// the listener was a temporary dropped at the end of that expression. Every
+/// port was released before anything owned it, which produced two distinct
+/// `Address already in use` child deaths:
+///
+/// 1. **Self-collision, which no retry could fix.** The kernel may immediately
+///    re-offer a just-released ephemeral port, and the four ports were allocated
+///    by four independent calls with no exclusion between them. So
+///    `FERRUM_PROXY_HTTP_PORT` and `FERRUM_PROXY_HTTPS_PORT` (or either admin
+///    port) could be handed the *same* number. That collision is internal to the
+///    attempt, so retrying only re-rolled the same dice.
+/// 2. **Cross-test theft.** A concurrently running functional test's own fixture
+///    could bind the released port during the gap before this child started.
+///
+/// Holding each reservation until just before `spawn()` fixes both: the four
+/// ports are distinct *by construction* (the kernel cannot offer a port that is
+/// still bound), and the unavoidable release-to-bind window — unavoidable
+/// because a subprocess binds by port number, so the reservation must be
+/// released first — shrinks to the spawn call itself, with every environment
+/// variable already staged.
+///
+/// The residual window is covered, not slept on:
+/// * the attempt loop below retries with **fresh** ports and a fresh reservation
+///   set, per `.claude/rules/testing.md` ("every retry needs fresh ports"), and
+/// * `TestGateway`'s spawn barrier binds readiness to **that child**: it requires
+///   the authenticated `/health` detail tier with `ready: true` (which flips only
+///   after every listener bind, so a competitor that stole the port cannot
+///   satisfy it) and polls `Child::try_wait`, so a child that died on a lost race
+///   is detected immediately instead of being waited out.
+struct PortReservations {
+    /// Kept alive purely so the kernel cannot re-offer these ports. Released as
+    /// a set by [`Self::release`].
+    listeners: Vec<TcpListener>,
+    ports: Vec<u16>,
+}
+
+impl PortReservations {
+    async fn take(count: usize) -> Self {
+        let mut listeners = Vec::with_capacity(count);
+        let mut ports = Vec::with_capacity(count);
+        for _ in 0..count {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind ephemeral port reservation");
+            ports.push(listener.local_addr().expect("addr").port());
+            listeners.push(listener);
+        }
+        Self { listeners, ports }
+    }
+
+    fn port(&self, index: usize) -> u16 {
+        self.ports[index]
+    }
+
+    /// Release every reservation, immediately before the child binds them.
+    fn release(self) {
+        drop(self.listeners);
+    }
 }
 
 /// Spawn a file-mode gateway on the rendered config, retrying with fresh ports
 /// when a spawn loses an ephemeral-port race.
 async fn start_gateway(config_yaml: &str, extra_env: Vec<(String, String)>) -> (TestGateway, u16) {
     const MAX_ATTEMPTS: u32 = 3;
+    const PROXY_HTTP: usize = 0;
+    const PROXY_HTTPS: usize = 1;
+    const ADMIN_HTTP: usize = 2;
+    const ADMIN_HTTPS: usize = 3;
     let mut last_error = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
-        let proxy_http = alloc_port().await;
+        let ports = PortReservations::take(4).await;
+        let proxy_http = ports.port(PROXY_HTTP);
         let mut builder = TestGateway::builder()
             .mode_file(config_yaml.to_string())
+            // The outer loop owns retries so each attempt gets a fresh
+            // reservation set; an inner retry would reuse these ports.
             .max_attempts(1)
             .capture_output()
             .env("FERRUM_PROXY_HTTP_PORT", proxy_http.to_string())
-            .env("FERRUM_PROXY_HTTPS_PORT", alloc_port().await.to_string())
-            .env("FERRUM_ADMIN_HTTP_PORT", alloc_port().await.to_string())
-            .env("FERRUM_ADMIN_HTTPS_PORT", alloc_port().await.to_string())
+            .env(
+                "FERRUM_PROXY_HTTPS_PORT",
+                ports.port(PROXY_HTTPS).to_string(),
+            )
+            .env("FERRUM_ADMIN_HTTP_PORT", ports.port(ADMIN_HTTP).to_string())
+            .env(
+                "FERRUM_ADMIN_HTTPS_PORT",
+                ports.port(ADMIN_HTTPS).to_string(),
+            )
             .env("FERRUM_POOL_WARMUP_ENABLED", "false")
             .env("FERRUM_TLS_NO_VERIFY", "false");
         for (key, value) in &extra_env {
             builder = builder.env(key.clone(), value.clone());
         }
+        // Everything the child needs is staged; hand the ports over now.
+        ports.release();
         match builder.spawn().await {
             Ok(gateway) => return (gateway, proxy_http),
             Err(error) => {

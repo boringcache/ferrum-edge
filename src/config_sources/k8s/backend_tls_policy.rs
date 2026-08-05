@@ -255,13 +255,17 @@ enum PolicyPortScope {
     /// Also the scope used to fail a whole Service closed when the target is
     /// unrepresentable, so a rejection cannot be narrowed away by a port match.
     AllPorts,
-    /// Governs only the target Service's non-UDP ports.
+    /// Governs only the target Service's **TCP** ports.
     ///
     /// GEP-1897: "If the policy attaches to a mix of TCP and UDP ports,
     /// implementations SHOULD include a warning in the `Accepted` condition
     /// message (`ancestors.conditions`); the policy will only be effective for
     /// the TCP ports."
-    NonUdpPorts,
+    ///
+    /// Named for what it *admits* (TCP), not for what it excludes: the excluded
+    /// set is every non-TCP transport — UDP, SCTP, and any unrecognized
+    /// `protocol` — not UDP alone.
+    TcpPortsOnly,
     /// Governs exactly this Service port number (a resolved `sectionName`).
     Port(u16),
     /// Governs nothing: the `sectionName` names no port on the Service, so the
@@ -294,12 +298,18 @@ impl IndexedBackendTlsPolicy {
     fn governs(&self, index: Option<&ServicePortIndex>, service_port: Option<u16>) -> bool {
         match self.port_scope {
             PolicyPortScope::AllPorts => true,
-            PolicyPortScope::NonUdpPorts => match (index, service_port) {
-                (Some(index), Some(port)) => index.port(port).is_none_or(|entry| !entry.udp),
-                // Unknown port on a mixed-transport Service: keep the
-                // Service-wide answer rather than silently dropping to
-                // plaintext. Ferrum only reaches here for an HTTP-family
-                // backend, which cannot be the UDP port in practice.
+            PolicyPortScope::TcpPortsOnly => match (index, service_port) {
+                // A port present in a COMPLETE index must be TCP. UDP, SCTP,
+                // and any unrecognized `protocol` are all excluded here — the
+                // predicate is "is TCP", not "is not UDP".
+                (Some(index), Some(port)) => {
+                    index.port(port).is_none_or(|entry| entry.transport.is_tcp())
+                }
+                // The backend did not resolve to any port on this Service (the
+                // index is complete, so the port genuinely is not a Service
+                // port). Keep the Service-wide answer rather than silently
+                // dropping this backend to plaintext: Ferrum only reaches here
+                // for an HTTP-family backend, which is TCP by construction.
                 _ => true,
             },
             PolicyPortScope::Port(scoped) => service_port == Some(scoped),
@@ -321,7 +331,7 @@ struct TargetPortScope {
 
 /// Resolve a targetRef against the observed Service's ports.
 ///
-/// Implements the Gateway API v1.5.1 GEP-1897 transport contract verbatim:
+/// Implements the Gateway API v1.5.1 GEP-1897 transport contract:
 ///
 /// * "If a policy explicitly attaches to a UDP port of a Service (that is, the
 ///   `targetRef` has a `sectionName` specifying a single port or the service
@@ -332,12 +342,23 @@ struct TargetPortScope {
 ///   (`ancestors.conditions`); the policy will only be effective for the TCP
 ///   ports."
 ///
-/// A Service-wide policy on a Service whose ports are *all* UDP with more than
-/// one port is not literally either clause. Ferrum rejects it the same way as
-/// the single-port case: there is no TCP port for the policy to "only be
-/// effective for", so the mixed clause degenerates to "effective nowhere", and
-/// reporting `Accepted=True` for a policy that governs nothing is exactly the
-/// misreport this resolver exists to remove.
+/// Both clauses are applied as the **TCP-eligibility** rule they express, not as
+/// a UDP-exclusion rule. GEP-1897 names UDP because UDP is the transport a
+/// Gateway API Service is otherwise likely to carry, but the normative statement
+/// it is drawn from is that BackendTLSPolicy configures TLS for *TCP* traffic.
+/// So a port is eligible only when its transport is proven `TCP`; `SCTP` and any
+/// unrecognized `protocol` value are treated exactly like `UDP`. Reading the
+/// clauses literally as "not UDP" is what let an `SCTP` port be accepted and
+/// have backend TLS projected onto it — an implementation cannot start a TLS
+/// handshake on an SCTP or unknown-transport port, so accepting one is a
+/// misreport, and projecting TLS onto it is worse.
+///
+/// A Service-wide policy on a Service with more than one port and *no* TCP port
+/// is not literally either clause. Ferrum rejects it the same way as the
+/// single-port case: there is no TCP port for the policy to "only be effective
+/// for", so the mixed clause degenerates to "effective nowhere", and reporting
+/// `Accepted=True` for a policy that governs nothing is exactly the misreport
+/// this resolver exists to remove.
 fn resolve_target_port_scope(
     acc: &K8sAccumulator,
     service_namespace: &str,
@@ -353,7 +374,7 @@ fn resolve_target_port_scope(
     };
 
     if index.truncated {
-        // An incomplete port view cannot prove the target port is not UDP.
+        // An incomplete port view cannot prove the target port IS TCP.
         // Fail the whole Service closed rather than assume TCP.
         return TargetPortScope {
             scope: PolicyPortScope::AllPorts,
@@ -377,42 +398,58 @@ fn resolve_target_port_scope(
                 warning: None,
             };
         };
-        let rejection = entry.udp.then(|| {
+        // Section-scoped: the named port must be proven TCP. UDP, SCTP, and an
+        // unrecognized `protocol` are all `Accepted=False`/`Invalid` — a
+        // section-scoped policy governs exactly this one port, so an ineligible
+        // transport means the policy can never be effective.
+        let rejection = (!entry.transport.is_tcp()).then(|| {
             BackendTlsPolicyError::invalid(format!(
-                "spec.targetRefs[].sectionName '{section_name}' names UDP port {} on Service '{service_namespace}/{service_name}'; BackendTLSPolicy applies only to TCP traffic",
-                entry.port
+                "spec.targetRefs[].sectionName '{section_name}' names port {} on Service '{service_namespace}/{service_name}', whose protocol is {}; BackendTLSPolicy applies only to TCP traffic",
+                entry.port,
+                entry.transport.label()
             ))
         });
         return TargetPortScope {
+            // Scope stays `Port` so a rejection cannot be narrowed away and a
+            // sibling TCP port never inherits this policy.
             scope: PolicyPortScope::Port(entry.port),
             rejection,
             warning: None,
         };
     }
 
-    // An empty `ports` list also lands here: no UDP port, so nothing to reject.
-    let udp_ports = index.ports.iter().filter(|entry| entry.udp).count();
-    if udp_ports == 0 {
+    // Service-wide. Count TCP ports rather than non-TCP ones so the "all
+    // eligible" test is an equality against the port count: an empty `ports`
+    // list then lands on `AllPorts` (nothing to reject) through the same arm.
+    let tcp_ports = index
+        .ports
+        .iter()
+        .filter(|entry| entry.transport.is_tcp())
+        .count();
+    if tcp_ports == index.ports.len() {
         return TargetPortScope {
             scope: PolicyPortScope::AllPorts,
             rejection: None,
             warning: None,
         };
     }
-    if udp_ports == index.ports.len() {
+    if tcp_ports == 0 {
         return TargetPortScope {
+            // `AllPorts` is the REJECTION scope: it fails the whole Service
+            // closed so no port match can narrow the rejection away.
             scope: PolicyPortScope::AllPorts,
             rejection: Some(BackendTlsPolicyError::invalid(format!(
-                "Service '{service_namespace}/{service_name}' declares only UDP ports ({udp_ports}); BackendTLSPolicy applies only to TCP traffic"
+                "Service '{service_namespace}/{service_name}' declares no TCP ports ({} non-TCP port(s)); BackendTLSPolicy applies only to TCP traffic",
+                index.ports.len()
             ))),
             warning: None,
         };
     }
     TargetPortScope {
-        scope: PolicyPortScope::NonUdpPorts,
+        scope: PolicyPortScope::TcpPortsOnly,
         rejection: None,
         warning: Some(format!(
-            "Service '{service_namespace}/{service_name}' mixes TCP and UDP ports; this BackendTLSPolicy is effective only for its TCP ports"
+            "Service '{service_namespace}/{service_name}' mixes TCP and non-TCP ports; this BackendTLSPolicy is effective only for its TCP ports"
         )),
     }
 }

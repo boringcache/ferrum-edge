@@ -1654,3 +1654,526 @@ fn backend_tls_policy_mixed_tcp_udp_warns_and_applies_to_tcp_only() {
         "a mixed-transport Service is a warning, not a rejection"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Transport eligibility beyond UDP.
+//
+// GEP-1897's normative statement is "BackendTLSPolicy applies only to TCP
+// traffic"; its two examples happen to name UDP. Ferrum therefore models the
+// port transport explicitly and admits only a port proven to be TCP. These
+// tests pin the transports a `udp: bool` predicate got wrong: `SCTP` and any
+// unrecognized `protocol` value both used to classify as "not UDP" and were
+// silently eligible for backend TLS.
+// ---------------------------------------------------------------------------
+
+/// A Service whose only port speaks SCTP.
+fn single_sctp_port_service(name: &str) -> K8sObject {
+    object(
+        "Service",
+        name,
+        serde_json::json!({
+            "ports": [
+                { "name": "sigtran", "port": 8443, "targetPort": 8443, "protocol": "SCTP" }
+            ]
+        }),
+    )
+}
+
+/// A Service with one TCP port (`http`, 8080) and one SCTP port (`sigtran`, 8443).
+fn mixed_tcp_sctp_service(name: &str) -> K8sObject {
+    object(
+        "Service",
+        name,
+        serde_json::json!({
+            "ports": [
+                { "name": "http", "port": 8080, "targetPort": 8080, "protocol": "TCP" },
+                { "name": "sigtran", "port": 8443, "targetPort": 8443, "protocol": "SCTP" }
+            ]
+        }),
+    )
+}
+
+/// A Service whose only port carries a `protocol` Ferrum does not recognize.
+///
+/// Kubernetes validates this field, so reaching Ferrum means either a future
+/// protocol or a tampered/unvalidated object. Either way the transport cannot be
+/// proven to be TCP.
+fn unrecognized_protocol_service(name: &str) -> K8sObject {
+    object(
+        "Service",
+        name,
+        serde_json::json!({
+            "ports": [
+                { "name": "weird", "port": 8443, "targetPort": 8443, "protocol": "QUIC" }
+            ]
+        }),
+    )
+}
+
+/// A Service with one TCP port and two *different* non-TCP ports.
+fn tcp_udp_sctp_service(name: &str) -> K8sObject {
+    object(
+        "Service",
+        name,
+        serde_json::json!({
+            "ports": [
+                { "name": "http", "port": 8080, "targetPort": 8080, "protocol": "TCP" },
+                { "name": "quic", "port": 8443, "targetPort": 8443, "protocol": "UDP" },
+                { "name": "sigtran", "port": 8444, "targetPort": 8444, "protocol": "SCTP" }
+            ]
+        }),
+    )
+}
+
+/// A Service whose ports are all non-TCP but of *different* non-TCP kinds.
+///
+/// Exercises the "no TCP port at all" rejection without letting a single-kind
+/// count shortcut stand in for it.
+fn udp_and_sctp_only_service(name: &str) -> K8sObject {
+    object(
+        "Service",
+        name,
+        serde_json::json!({
+            "ports": [
+                { "name": "quic", "port": 8443, "targetPort": 8443, "protocol": "UDP" },
+                { "name": "sigtran", "port": 8444, "targetPort": 8444, "protocol": "SCTP" }
+            ]
+        }),
+    )
+}
+
+/// A Service that spells its TCP protocol in lower case.
+///
+/// `protocol` is compared case-insensitively, so this must still be TCP — the
+/// case-insensitive comparison must not be the only thing standing between a
+/// non-canonical spelling and the `Unrecognized` (fail-closed) arm.
+fn lowercase_tcp_service(name: &str) -> K8sObject {
+    object(
+        "Service",
+        name,
+        serde_json::json!({
+            "ports": [
+                { "name": "https", "port": 8443, "targetPort": 8443, "protocol": "tcp" }
+            ]
+        }),
+    )
+}
+
+#[test]
+fn backend_tls_policy_explicit_sctp_section_is_invalid_and_fails_closed() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        mixed_tcp_sctp_service("edge-svc"),
+        http_route("sctp-route", "edge-svc", 8443),
+        sectioned_policy("sctp-tls", "edge-svc", "sigtran", "secure.example.com"),
+    ];
+
+    let update = policy_status_update(&objects, "sctp-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("False"),
+        "BackendTLSPolicy applies only to TCP traffic: an SCTP port is not Accepted"
+    );
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("Invalid")
+    );
+    assert!(
+        accepted
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("SCTP")),
+        "the message must name the ineligible transport: {accepted}"
+    );
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(
+        translated.config.upstreams.is_empty(),
+        "no HTTPS upstream may be projected onto an SCTP Service port"
+    );
+    assert!(
+        fault_body_mentions(&translated),
+        "the covered backend must fail closed with the BackendTLSPolicy 500 fault"
+    );
+}
+
+#[test]
+fn backend_tls_policy_sctp_section_leaves_the_tcp_sibling_port_alone() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        mixed_tcp_sctp_service("edge-svc"),
+        http_route("tcp-route", "edge-svc", 8080),
+        sectioned_policy("sctp-tls", "edge-svc", "sigtran", "secure.example.com"),
+    ];
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(
+        !fault_body_mentions(&translated),
+        "an SCTP-scoped rejection must not fail an unrelated TCP port closed"
+    );
+    assert!(
+        translated
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_scheme == Some(BackendScheme::Http)),
+        "the TCP port keeps its pre-policy behaviour"
+    );
+}
+
+#[test]
+fn backend_tls_policy_on_single_sctp_port_service_is_invalid_and_fails_closed() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        single_sctp_port_service("sigtran-svc"),
+        http_route("sigtran-route", "sigtran-svc", 8443),
+        // No sectionName: a Service-wide policy may still apply only to TCP
+        // ports, and this Service has none.
+        backend_tls_policy_system("sigtran-tls", "sigtran-svc"),
+    ];
+
+    let update = policy_status_update(&objects, "sigtran-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("False"),
+        "a Service-wide policy must not treat SCTP as TCP"
+    );
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("Invalid")
+    );
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(translated.config.upstreams.is_empty());
+    assert!(
+        fault_body_mentions(&translated),
+        "a single-SCTP-port Service under a BackendTLSPolicy must fail closed"
+    );
+}
+
+#[test]
+fn backend_tls_policy_unrecognized_port_protocol_is_invalid_and_fails_closed() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        unrecognized_protocol_service("odd-svc"),
+        http_route("odd-route", "odd-svc", 8443),
+        backend_tls_policy_system("odd-tls", "odd-svc"),
+    ];
+
+    let update = policy_status_update(&objects, "odd-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("False"),
+        "an unprovable transport must not be assumed to be TCP"
+    );
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("Invalid")
+    );
+    // The raw, cluster-supplied protocol string is untrusted input on a status
+    // surface and must not be echoed back into the condition message.
+    assert!(
+        !accepted
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("QUIC"),
+        "the status message must not echo the raw protocol value: {accepted}"
+    );
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(translated.config.upstreams.is_empty());
+    assert!(
+        fault_body_mentions(&translated),
+        "an unrecognized-transport port under a BackendTLSPolicy must fail closed"
+    );
+}
+
+#[test]
+fn backend_tls_policy_unrecognized_protocol_section_is_invalid() {
+    // Section-scoped variant: the named port itself carries the unrecognized
+    // protocol, so the policy governs exactly one ineligible port.
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        unrecognized_protocol_service("odd-svc"),
+        http_route("odd-route", "odd-svc", 8443),
+        sectioned_policy("odd-tls", "odd-svc", "weird", "secure.example.com"),
+    ];
+
+    let update = policy_status_update(&objects, "odd-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("False")
+    );
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("Invalid")
+    );
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(translated.config.upstreams.is_empty());
+    assert!(fault_body_mentions(&translated));
+}
+
+#[test]
+fn backend_tls_policy_service_with_only_non_tcp_ports_of_mixed_kinds_is_invalid() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        udp_and_sctp_only_service("l4-svc"),
+        http_route("l4-route", "l4-svc", 8443),
+        backend_tls_policy_system("l4-tls", "l4-svc"),
+    ];
+
+    let update = policy_status_update(&objects, "l4-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("False"),
+        "a Service with no TCP port governs nothing and must not report Accepted"
+    );
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("Invalid")
+    );
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(translated.config.upstreams.is_empty());
+    assert!(fault_body_mentions(&translated));
+}
+
+#[test]
+fn backend_tls_policy_mixed_tcp_sctp_warns_and_applies_to_tcp_only() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        mixed_tcp_sctp_service("edge-svc"),
+        http_route_at("tcp-route", "edge-svc", 8080, "/tcp"),
+        http_route_at("sctp-route", "edge-svc", 8443, "/sctp"),
+        backend_tls_policy_system("edge-tls", "edge-svc"),
+    ];
+
+    let update = policy_status_update(&objects, "edge-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("True"),
+        "a Service with at least one TCP port is accepted with a warning"
+    );
+    let message = accepted
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        message.contains("warning") && message.contains("TCP"),
+        "the Accepted message must warn about the mixed-transport Service: {message}"
+    );
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert_eq!(
+        upstream_sni_for(&translated, "/tcp").as_deref(),
+        Some("backend.example.com"),
+        "the TCP port must receive the policy's TLS identity"
+    );
+    assert!(
+        translated
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.listen_path.as_deref() == Some("/sctp")
+                && proxy.backend_scheme == Some(BackendScheme::Http)),
+        "the SCTP port must not be promoted to HTTPS: {:?}",
+        translated.config.proxies
+    );
+    assert!(
+        !fault_body_mentions(&translated),
+        "a mixed-transport Service is a warning, not a rejection"
+    );
+}
+
+#[test]
+fn backend_tls_policy_mixed_tcp_udp_sctp_applies_to_the_tcp_port_only() {
+    // Three transports in one Service: the TCP port takes the policy, and
+    // neither non-TCP port is promoted to HTTPS.
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        tcp_udp_sctp_service("edge-svc"),
+        http_route_at("tcp-route", "edge-svc", 8080, "/tcp"),
+        http_route_at("udp-route", "edge-svc", 8443, "/udp"),
+        http_route_at("sctp-route", "edge-svc", 8444, "/sctp"),
+        backend_tls_policy_system("edge-tls", "edge-svc"),
+    ];
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert_eq!(
+        upstream_sni_for(&translated, "/tcp").as_deref(),
+        Some("backend.example.com")
+    );
+    for plaintext_path in ["/udp", "/sctp"] {
+        assert!(
+            translated
+                .config
+                .proxies
+                .iter()
+                .any(|proxy| proxy.listen_path.as_deref() == Some(plaintext_path)
+                    && proxy.backend_scheme == Some(BackendScheme::Http)),
+            "{plaintext_path} must keep its pre-policy plaintext behaviour: {:?}",
+            translated.config.proxies
+        );
+        assert!(
+            upstream_sni_for(&translated, plaintext_path).is_none(),
+            "{plaintext_path} must not receive the policy's TLS identity"
+        );
+    }
+    assert!(!fault_body_mentions(&translated));
+}
+
+#[test]
+fn backend_tls_policy_omitted_port_protocol_defaults_to_tcp_and_applies() {
+    // `spec.ports[].protocol` is optional and Kubernetes defaults it to TCP, so
+    // an omitted value must stay eligible — the fail-closed `Unrecognized` arm
+    // must not swallow the ordinary case.
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        // `multi_port_service` omits `protocol` on both ports.
+        multi_port_service("api"),
+        http_route("api-route", "api", 8443),
+        backend_tls_policy_system("api-tls", "api"),
+    ];
+
+    let update = policy_status_update(&objects, "api-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("True"),
+        "an omitted `protocol` defaults to TCP and stays eligible"
+    );
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("Accepted")
+    );
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    let upstream = translated
+        .config
+        .upstreams
+        .first()
+        .expect("a default-protocol Service port must receive backend TLS");
+    assert_eq!(
+        upstream.backend_tls_sni.as_deref(),
+        Some("backend.example.com")
+    );
+    assert!(!fault_body_mentions(&translated));
+}
+
+#[test]
+fn backend_tls_policy_lowercase_tcp_protocol_is_recognized_as_tcp() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        lowercase_tcp_service("api"),
+        http_route("api-route", "api", 8443),
+        sectioned_policy("api-tls", "api", "https", "secure.example.com"),
+    ];
+
+    let update = policy_status_update(&objects, "api-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("True"),
+        "`protocol: tcp` is TCP; case must not push it onto the fail-closed arm"
+    );
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    let upstream = translated
+        .config
+        .upstreams
+        .first()
+        .expect("a lower-case TCP port must receive backend TLS");
+    assert_eq!(
+        upstream.backend_tls_sni.as_deref(),
+        Some("secure.example.com")
+    );
+    assert!(!fault_body_mentions(&translated));
+}
+
+#[test]
+fn backend_tls_policy_section_name_on_explicit_tcp_port_applies() {
+    // sectionName hit on an explicitly-`TCP` port: the transport model must not
+    // have made the explicit spelling any less eligible than the omitted one.
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        mixed_tcp_sctp_service("edge-svc"),
+        http_route("tcp-route", "edge-svc", 8080),
+        sectioned_policy("tcp-tls", "edge-svc", "http", "secure.example.com"),
+    ];
+
+    let update = policy_status_update(&objects, "tcp-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(accepted.get("status").and_then(Value::as_str), Some("True"));
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    let upstream = translated
+        .config
+        .upstreams
+        .first()
+        .expect("a sectionName-matched TCP port must receive backend TLS");
+    assert_eq!(
+        upstream.backend_tls_sni.as_deref(),
+        Some("secure.example.com")
+    );
+    assert!(!fault_body_mentions(&translated));
+}
+
+#[test]
+fn backend_tls_policy_section_name_miss_on_non_tcp_service_reports_target_not_found() {
+    // A `sectionName` that names no port is `TargetNotFound` regardless of the
+    // transports the Service does declare: the miss is diagnosed before any
+    // transport conclusion, so it must not be reported as `Invalid`.
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        mixed_tcp_sctp_service("edge-svc"),
+        http_route("tcp-route", "edge-svc", 8080),
+        sectioned_policy("typo-tls", "edge-svc", "sigtan", "secure.example.com"),
+    ];
+
+    let update = policy_status_update(&objects, "typo-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("False")
+    );
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("TargetNotFound"),
+        "a sectionName miss is TargetNotFound, not an Invalid transport verdict"
+    );
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(
+        !fault_body_mentions(&translated),
+        "a policy that attaches to nothing must not fault the Service's valid ports"
+    );
+}

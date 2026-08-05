@@ -64,24 +64,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and fails to attach, instead of being reported `Accepted=True` on Service
   existence alone while applying nowhere; it deliberately does not spill onto,
   or fail closed, the Service's other valid ports.
-- `BackendTLSPolicy` now enforces the Gateway API GEP-1897 transport contract.
-  Translation retains a bounded, deterministic per-Service port index carrying
-  each port's L4 transport, so a policy that explicitly attaches to a UDP port
-  (a `sectionName` naming a UDP port, or a Service whose ports are all UDP)
-  reports `Accepted=False, reason=Invalid` and route traffic selecting it fails
-  closed with the HTTP 500 fault rather than originating HTTPS over UDP or
-  dropping to plaintext. A Service mixing TCP and UDP ports is accepted with a
-  warning in the `Accepted` condition message and takes effect only on its TCP
-  ports. A Service declaring more than 64 ports cannot have its port transport
-  proven and is rejected fail closed.
-- Health-check clients no longer fall back to the system trust roots when a
-  configured backend CA cannot be loaded or parsed. A configured CA is the sole
-  trust anchor, so HTTP probes now fail closed (report unhealthy) and gRPC
-  probes fail the probe instead of silently verifying against the public webpki
-  roots — reachable through a `BackendTLSPolicy` `caCertificateRefs` Secret
-  whose `k8s://…#ca.crt` source becomes unreadable after translation accepted
-  it. Multi-certificate CA bundles are now parsed as bundles, which is the
-  ordinary shape of a Kubernetes `ca.crt`.
+- `BackendTLSPolicy` now enforces the Gateway API GEP-1897 transport contract on
+  an explicitly modeled port transport. Translation retains a bounded,
+  deterministic per-Service port index recording each port's classified
+  transport, and a port is eligible only when its `spec.ports[].protocol` is
+  proven `TCP` (omitted counts as TCP, matching the Kubernetes default;
+  comparison is case-insensitive). `UDP`, `SCTP`, and any unrecognized protocol
+  value are all ineligible — the previous `udp: bool` predicate treated SCTP and
+  unrecognized values as "not UDP" and therefore silently admitted them to
+  backend TLS. A policy that explicitly attaches to an ineligible port reports
+  `Accepted=False, reason=Invalid` scoped to that port, leaving sibling TCP ports
+  alone; a Service-wide policy on a Service with no TCP port is rejected the same
+  way because it would govern nothing. Route traffic selecting a rejected policy
+  fails closed with the HTTP 500 fault rather than originating TLS over a non-TCP
+  transport or dropping to plaintext. A Service mixing TCP and non-TCP ports is
+  accepted with a warning in the `Accepted` condition message and takes effect
+  only on its TCP ports. A Service declaring more than 64 ports cannot have its
+  port transport proven and is rejected fail closed. Condition messages name the
+  transport from a fixed set and never echo the raw cluster-supplied `protocol`
+  string.
+- Health probes now fail closed on **any** explicitly configured backend TLS
+  material that cannot be used, in both verified and no-verify modes and on both
+  the HTTP and gRPC probe paths. Previously a configured CA was only enforced
+  when verification was enabled, and a configured mTLS client identity was never
+  enforced at all.
+  - A configured backend CA is the sole trust anchor, so an unloadable or
+    unparseable CA fails the probe instead of silently verifying against the
+    public webpki roots — reachable through a `BackendTLSPolicy`
+    `caCertificateRefs` Secret whose `k8s://…#ca.crt` source becomes unreadable
+    after translation accepted it. Multi-certificate CA bundles are parsed as
+    bundles, the ordinary shape of a Kubernetes `ca.crt`.
+  - A configured backend mTLS client certificate/key pair that cannot be loaded
+    or parsed now fails the probe rather than downgrading it to an anonymous
+    handshake, which measures something real requests never perform: a backend
+    that merely *prefers* client certificates answers the anonymous probe while
+    refusing proxy traffic, marking a target healthy that no request can use. A
+    half-configured pair (certificate without key, or key without certificate)
+    fails for the same reason instead of being ignored.
+  - Disabling verification is a statement about whether the peer certificate is
+    checked, not a licence to ignore material the operator named, so neither rule
+    is relaxed by `backend_tls_verify_server_cert: false` or
+    `FERRUM_TLS_NO_VERIFY=true`. Probe diagnostics carry the material's source
+    identifier and a failure class only, never certificate or key bytes.
+- Backend TLS SNI overrides (`backend_tls_sni` — the projection target of both
+  DestinationRule `trafficPolicy.tls.sni` and `BackendTLSPolicy`
+  `validation.hostname`) are now honored on the reqwest **HTTP/1.1** transport,
+  not only on the direct-H2, gRPC, and native-H3 pools. An HTTP/1.1-only TLS
+  backend — the ordinary `BackendTLSPolicy` case — previously returned a terminal
+  `502` with `gateway-error-reason: backend_tls_sni_requires_direct_h2`, and the
+  reqwest retry path and the H3→HTTP cross-protocol bridge rejected the override
+  outright. reqwest exposes no per-request server-name hook (its connector
+  derives the rustls server name from the request URL host), so the dial carries
+  the override in the URL **authority** while pinning the pooled client's
+  resolver to the selected target's already-resolved, already-egress-screened
+  address; because that resolver answers every name with the pinned address, the
+  override hostname is never itself resolved and the selected backend target
+  stays authoritative for where the socket connects. ALPN is restricted to
+  `http/1.1` on that client so HTTP/2 cannot derive `:authority` from the server
+  name — the backend reads the authority from the explicit `Host` header instead
+  — and both the pinned address and the force-H1 discriminator join the existing
+  SNI/CA/SAN/mTLS/verification components of the reqwest pool key, so an SNI dial
+  shares a client with neither a default h2-capable client nor another target's
+  pin. Retries, timeouts, and streaming bodies are unchanged because the dial
+  reuses the ordinary reqwest path, and the retry path rebuilds the dial against
+  the newly selected target so an LB rotation between attempts still dials the
+  rotated target. The `502` remains the fail-closed answer only where the dial
+  genuinely cannot be constructed (no resolved target address to pin, or a
+  backend URL whose authority does not carry the selected target host). Note that
+  config admission still rejects SNI combined with effective retry,
+  request-body-buffering plugins, or `pool_enable_http2: false`; that check is now
+  conservative rather than protective and its relaxation is a follow-up.
 - `ai_semantic_firewall` streamed `inspect` mode now accepts
   `streaming.window: tokens` with an explicitly selected bounded tokenizer
   (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft

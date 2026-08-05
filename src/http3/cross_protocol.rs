@@ -1294,47 +1294,14 @@ where
         return Ok(Err(outcome));
     }
 
-    if dispatch_proxy.resolved_tls.sni.is_some() {
-        warn!(
-            proxy_id = %dispatch_proxy.id,
-            backend_tls_sni = ?dispatch_proxy.resolved_tls.sni,
-            reason = crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
-            "cross-protocol H3→HTTP bridge cannot honor backend TLS SNI override; returning 502"
-        );
-        record_backend_outcome_no_conn_end(
-            state,
-            dispatch_proxy,
-            &epoch.load_balancer,
-            upstream_balancer,
-            current_target,
-            current_cb_target_key,
-            502,
-            false,
-            Some(ErrorClass::DispatchPolicyRejected),
-            cb_is_half_open_probe,
-            false,
-            backend_start.elapsed(),
-        );
-        if halt_request_body_before_reject {
-            crate::http3::stream_util::halt_request_body(stream);
-        }
-        let mut outcome = write_plain_gateway_error(
-            stream,
-            ctx,
-            StatusCode::BAD_GATEWAY,
-            r#"{"error":"Bad Gateway"}"#,
-            Some((
-                "gateway-error-reason",
-                crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
-            )),
-            backend_start,
-            bytes_sent,
-        )
-        .await?;
-        outcome.backend_target = Some(strip_query_from_backend_url(current_url));
-        outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
-        return Ok(Err(outcome));
-    }
+    // A backend TLS SNI override is NOT rejected here any more. The H3→HTTP
+    // plain bridge dispatches through the same reqwest pool as the H1/H2 path,
+    // so it honors an overridden TLS server name the same way: the override goes
+    // in the dial URL's authority and the pooled client's resolver is pinned to
+    // the selected target's resolved address (`dispatch_plain` builds that dial
+    // via `crate::proxy::backend_tls_sni_reqwest_dial`). Rejecting here would
+    // make every BackendTLSPolicy-covered backend a guaranteed 502 for HTTP/3
+    // clients while the identical route worked over HTTP/1.1 and HTTP/2.
 
     let pending_cap =
         crate::proxy::resolve_backend_http1_max_pending_requests(dispatch_proxy, dispatch_port)
@@ -1777,11 +1744,40 @@ where
                         current_target.as_deref(),
                     );
 
+                    // Honor a backend TLS SNI override on this bridge exactly as
+                    // the H1/H2 dispatch path does: the overridden server name
+                    // goes in the dial URL's authority and the pooled client's
+                    // resolver is pinned to THIS target's resolved address, so an
+                    // LB retry rotation still dials the newly selected target.
+                    // Resolution runs only for an SNI route. `dispatch_proxy` and
+                    // `current_url` stay the real target for circuit-breaker /
+                    // load-balancer keys and for `outcome.backend_target`.
+                    let sni_dial = if dispatch_proxy.resolved_tls.sni.is_some() {
+                        let resolved = resolve_cross_protocol_backend_ip(
+                            state,
+                            dispatch_proxy,
+                            current_target.as_deref(),
+                        )
+                        .await;
+                        crate::proxy::backend_tls_sni_reqwest_dial(
+                            dispatch_proxy,
+                            &current_url,
+                            effective_host,
+                            resolved.as_deref(),
+                        )
+                    } else {
+                        None
+                    };
+                    let (dial_proxy, dial_url): (&Proxy, &str) = match sni_dial.as_ref() {
+                        Some((sni_proxy, sni_url)) => (sni_proxy, sni_url.as_str()),
+                        None => (dispatch_proxy, current_url.as_str()),
+                    };
+
                     let client_result = match crate::plugins::await_grpc_deadline(
                         grpc_web_deadline_at,
                         get_cross_protocol_client(
                             state,
-                            dispatch_proxy,
+                            dial_proxy,
                             epoch,
                             upstream_balancer,
                             current_target.as_deref(),
@@ -1838,7 +1834,7 @@ where
                             dispatch_proxy,
                             req_method.clone(),
                             proxy_headers,
-                            &current_url,
+                            dial_url,
                             effective_host,
                             client_ip,
                             xff_append_ip,
@@ -2231,11 +2227,34 @@ where
                     current_target.as_deref(),
                 );
 
+                // Same backend-TLS-SNI dial as the retry-rotation attempt above;
+                // see that call site for the full rationale.
+                let sni_dial = if dispatch_proxy.resolved_tls.sni.is_some() {
+                    let resolved = resolve_cross_protocol_backend_ip(
+                        state,
+                        dispatch_proxy,
+                        current_target.as_deref(),
+                    )
+                    .await;
+                    crate::proxy::backend_tls_sni_reqwest_dial(
+                        dispatch_proxy,
+                        &current_url,
+                        effective_host,
+                        resolved.as_deref(),
+                    )
+                } else {
+                    None
+                };
+                let (dial_proxy, dial_url): (&Proxy, &str) = match sni_dial.as_ref() {
+                    Some((sni_proxy, sni_url)) => (sni_proxy, sni_url.as_str()),
+                    None => (dispatch_proxy, current_url.as_str()),
+                };
+
                 let client_result = match crate::plugins::await_grpc_deadline(
                     grpc_web_deadline_at,
                     get_cross_protocol_client(
                         state,
-                        dispatch_proxy,
+                        dial_proxy,
                         epoch,
                         upstream_balancer,
                         current_target.as_deref(),
@@ -2291,7 +2310,7 @@ where
                     dispatch_proxy,
                     req_method,
                     proxy_headers,
-                    &current_url,
+                    dial_url,
                     effective_host,
                     client_ip,
                     xff_append_ip,

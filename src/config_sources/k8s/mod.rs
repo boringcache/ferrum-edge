@@ -370,9 +370,68 @@ pub struct GatewayApiBackendTlsPolicyStatus {
 /// built from untrusted cluster input, so the retained view is bounded. A
 /// Service that exceeds the cap is marked [`ServicePortIndex::truncated`] and
 /// every BackendTLSPolicy targeting it is rejected: an incomplete port view
-/// cannot prove a target port is not UDP, and guessing would be the exact
+/// cannot prove a target port *is* TCP, and guessing would be the exact
 /// failure this index exists to prevent.
 pub(crate) const MAX_INDEXED_SERVICE_PORTS: usize = 64;
+
+/// Transport of one `Service.spec.ports[]` entry.
+///
+/// Modeled as an explicit transport rather than a `udp: bool` predicate.
+/// Gateway API `BackendTLSPolicy` governs **TCP** traffic, so the question a
+/// policy has to answer is "is this port TCP?", not "is this port UDP?" — and
+/// those two differ for `SCTP` and for any `protocol` value Ferrum does not
+/// recognize. Collapsing them onto `!udp` made an SCTP port (and a typo'd or
+/// future protocol) silently *eligible* for backend TLS, which is the one
+/// answer the transport check exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServicePortTransport {
+    /// `protocol: TCP`, or the field omitted (Kubernetes defaults it to TCP).
+    Tcp,
+    Udp,
+    Sctp,
+    /// A `protocol` value that is present but is not one of the three
+    /// Kubernetes core protocols. Never TCP-eligible: an unrecognized transport
+    /// cannot be *proven* to be TCP, so it fails closed.
+    Unrecognized,
+}
+
+impl ServicePortTransport {
+    /// Classify `Service.spec.ports[].protocol`.
+    ///
+    /// `None` is [`Self::Tcp`]: the field is optional and Kubernetes defaults it
+    /// to TCP. Comparison is ASCII-case-insensitive so a non-canonical spelling
+    /// cannot slip a non-TCP port past the check by failing an exact match —
+    /// and, unlike the previous `!udp` model, an unmatched spelling lands on
+    /// [`Self::Unrecognized`] rather than on TCP.
+    pub(crate) fn from_protocol_field(protocol: Option<&str>) -> Self {
+        match protocol {
+            None => Self::Tcp,
+            Some(value) if value.eq_ignore_ascii_case("TCP") => Self::Tcp,
+            Some(value) if value.eq_ignore_ascii_case("UDP") => Self::Udp,
+            Some(value) if value.eq_ignore_ascii_case("SCTP") => Self::Sctp,
+            Some(_) => Self::Unrecognized,
+        }
+    }
+
+    /// Whether a `BackendTLSPolicy` may govern a port with this transport.
+    pub(crate) fn is_tcp(self) -> bool {
+        matches!(self, Self::Tcp)
+    }
+
+    /// Operator-facing transport name for a policy status message.
+    ///
+    /// A fixed, bounded set — deliberately never the raw `protocol` string,
+    /// which is untrusted cluster input and would otherwise be echoed verbatim
+    /// onto a `status.ancestors[].conditions[].message` surface.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Tcp => "TCP",
+            Self::Udp => "UDP",
+            Self::Sctp => "SCTP",
+            Self::Unrecognized => "not a recognized Kubernetes protocol",
+        }
+    }
+}
 
 /// One `Service.spec.ports[]` entry, reduced to what BackendTLSPolicy needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,13 +439,8 @@ pub(crate) struct IndexedServicePort {
     pub port: u16,
     /// `spec.ports[].name` — what a policy `targetRefs[].sectionName` names.
     pub name: Option<String>,
-    /// `spec.ports[].protocol` is `UDP`.
-    ///
-    /// Every other value — the `TCP` default and `SCTP` alike — records
-    /// `false`. Gateway API GEP-1897 singles out UDP and nothing else, so this
-    /// stays a UDP predicate rather than a general transport enum: widening it
-    /// would change behaviour the contract does not ask Ferrum to change.
-    pub udp: bool,
+    /// Classified `spec.ports[].protocol`.
+    pub transport: ServicePortTransport,
 }
 
 /// Bounded, deterministic port view of one collected `Service`.
@@ -1424,11 +1478,9 @@ pub(crate) fn collect_service(
             port_specs.push(IndexedServicePort {
                 port,
                 name: string_field(port_entry, "name").map(ToOwned::to_owned),
-                // `protocol` defaults to TCP when absent. Compare
-                // case-insensitively so a non-canonical spelling cannot slip a
-                // UDP port past the check as "not UDP".
-                udp: string_field(port_entry, "protocol")
-                    .is_some_and(|protocol| protocol.eq_ignore_ascii_case("UDP")),
+                transport: ServicePortTransport::from_protocol_field(string_field(
+                    port_entry, "protocol",
+                )),
             });
         } else {
             port_specs_truncated = true;

@@ -10148,9 +10148,17 @@ components:
           maxLength: 253
           description: >-
             Optional backend TLS Server Name Indication override. Mesh
-            DestinationRule `trafficPolicy.tls.sni` projects to this field.
-            Stored/projected only — backend handshake SNI consumption is not
-            yet enforced (tracked by GAP-1B).
+            DestinationRule `trafficPolicy.tls.sni` and Gateway API
+            `BackendTLSPolicy` `validation.hostname` both project to this
+            field. Enforced at the backend handshake on every path where
+            Ferrum owns TLS: direct HTTP/2, gRPC over H2, native H3, and the
+            reqwest HTTP/1.1 dial (which carries the override in the request
+            URL authority while pinning the socket to the selected target).
+            It also partitions backend connection pools, so two values never
+            share a connection. Must be an exact DNS hostname — not a
+            wildcard and not an IP literal (RFC 6066 §3). Direct WebSocket
+            (`wss://`) transport cannot apply it and refuses such an upgrade
+            with 502; see `docs/backend_mtls.md`.
         backend_tls_san_allow_list:
           type: array
           maxItems: 256
@@ -10161,9 +10169,13 @@ components:
           description: >-
             Optional allow-list of backend certificate Subject Alternative
             Names. Entries may be exact DNS names, IP literals, or SPIFFE URI
-            SANs. Mesh DestinationRule `trafficPolicy.tls.subjectAltNames`
-            projects to this field. Stored/projected only — SAN allow-list
-            verification is not yet enforced (tracked by GAP-1C).
+            SANs. Mesh DestinationRule `trafficPolicy.tls.subjectAltNames` and
+            Gateway API `BackendTLSPolicy` `validation.subjectAltNames` both
+            project to this field. Enforced by the backend server verifier on
+            the rustls-based backend paths, and part of the backend pool key
+            (as a digest) so two allow-lists never share a connection. Not
+            enforced when per-proxy or global no-verify is enabled, which is
+            warned about at startup; see `docs/backend_mtls.md`.
         locality_lb_strict:
           type: boolean
           default: false

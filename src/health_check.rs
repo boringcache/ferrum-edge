@@ -1855,30 +1855,48 @@ async fn grpc_probe(
             tonic_tls = tonic_tls.with_enabled_roots();
         }
 
-        // Load mTLS client identity
+        // Load mTLS client identity. Fail-closed, matching the no-verify gRPC
+        // branch (`build_grpc_probe_channel_no_verify`) and the HTTP probe: a
+        // configured identity that cannot be loaded must fail the probe rather
+        // than silently downgrade it to an anonymous handshake the backend
+        // answers differently than it answers proxy traffic. Errors carry the
+        // loader's source identifier and failure class, never key material.
         let cert_path = tls_config.client_cert_path.as_deref().or(global_cert_path);
         let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
-        if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-            match (
-                load_probe_tls_material(
+        match (cert_path, key_path) {
+            (Some(cert_path), Some(key_path)) => {
+                let pair = load_probe_tls_material(
                     cert_path,
                     MaterialKind::Cert,
                     "gRPC health probe client cert",
-                ),
-                load_probe_tls_material(
-                    key_path,
-                    MaterialKind::Key,
-                    "gRPC health probe client key",
-                ),
-            ) {
-                (Ok(cert_pem), Ok(key_pem)) => {
-                    let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
-                    tonic_tls = tonic_tls.identity(identity);
-                }
-                (Err(e), _) | (_, Err(e)) => {
-                    debug!("gRPC health probe: failed to load client cert/key: {}", e);
+                )
+                .and_then(|cert_pem| {
+                    load_probe_tls_material(
+                        key_path,
+                        MaterialKind::Key,
+                        "gRPC health probe client key",
+                    )
+                    .map(|key_pem| (cert_pem, key_pem))
+                });
+                match pair {
+                    Ok((cert_pem, key_pem)) => {
+                        let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+                        tonic_tls = tonic_tls.identity(identity);
+                    }
+                    Err(e) => {
+                        return ProbeOutcome::failure(format!(
+                            "gRPC health probe: configured backend mTLS client identity could not be loaded ({e})"
+                        ));
+                    }
                 }
             }
+            (Some(_), None) | (None, Some(_)) => {
+                return ProbeOutcome::failure(
+                    "gRPC health probe: backend mTLS client certificate and private key must be configured together"
+                        .to_string(),
+                );
+            }
+            (None, None) => {}
         }
 
         let endpoint = match endpoint.tls_config(tonic_tls) {
@@ -2136,6 +2154,20 @@ enum HealthCheckClientError {
     /// at translation time, and can fail afterwards (Secret deleted, RBAC
     /// revoked, API server unavailable).
     ExclusiveTrustUnavailable(String),
+    /// A configured backend mTLS client identity could not be loaded or parsed.
+    ///
+    /// A health probe must authenticate to the backend exactly as proxy traffic
+    /// does. Continuing without the configured certificate/key produces an
+    /// *anonymous* probe: a backend enforcing client authentication rejects it
+    /// (so the probe reports a failure the operator cannot explain from the
+    /// backend's perspective), and a backend that merely *prefers* client certs
+    /// answers the anonymous probe successfully while refusing real proxy
+    /// traffic — marking a target healthy that no request can actually use.
+    ///
+    /// A half-configured pair (cert without key, or key without cert) is the
+    /// same fault: it is an operator error that must surface, never an implicit
+    /// "authenticate anonymously".
+    ClientIdentityUnavailable(String),
 }
 
 impl std::fmt::Display for HealthCheckClientError {
@@ -2148,6 +2180,12 @@ impl std::fmt::Display for HealthCheckClientError {
             Self::ExclusiveTrustUnavailable(details) => write!(
                 f,
                 "configured backend CA is the sole trust anchor but could not be used ({details})"
+            ),
+            // Same disclosure contract as above: `details` names the source
+            // identifier and failure class, never key or certificate material.
+            Self::ClientIdentityUnavailable(details) => write!(
+                f,
+                "configured backend mTLS client identity could not be used ({details})"
             ),
         }
     }
@@ -2273,35 +2311,40 @@ fn build_health_check_client_with_tls(
         // client built after a failed load would verify against the public
         // webpki roots, which is a different (and weaker) trust policy than the
         // one configured. Fail closed instead and let the probe report
-        // unhealthy. Only when verification is disabled outright is the CA moot.
+        // unhealthy.
+        //
+        // This holds even when `skip_verify` is set. Explicitly configured
+        // material that cannot be loaded or parsed is a *configuration* fault,
+        // and the repository's atomic TLS-material invariant says such a fault
+        // must surface rather than be absorbed. Reading it as "no-verify makes
+        // the CA moot" conflated two independent operator statements — "do not
+        // verify the peer" and "here is the trust anchor" — and let a deleted
+        // Secret, revoked RBAC, or corrupt `ca.crt` pass silently on exactly the
+        // deployments least able to detect it. `skip_verify` still governs
+        // *verification*; it does not license ignoring named material.
+        //
         // `from_pem_bundle` accepts multi-certificate bundles; a root plus
         // intermediates is the ordinary shape of a Kubernetes `ca.crt`.
-        let ca_bundle =
-            load_probe_tls_material(ca_path, MaterialKind::CaBundle, "Health check CA")
-                .and_then(|ca_data| {
-                    reqwest::Certificate::from_pem_bundle(&ca_data)
-                        .map_err(|e| format!("Health check CA: failed to parse CA bundle: {e}"))
-                })
-                .and_then(|certs| {
-                    // An empty trust store would reject every handshake anyway;
-                    // reporting it here keeps the cause legible.
-                    if certs.is_empty() {
-                        Err("Health check CA: bundle contains no certificates".to_string())
-                    } else {
-                        Ok(certs)
-                    }
-                });
+        let ca_bundle = load_probe_tls_material(ca_path, MaterialKind::CaBundle, "Health check CA")
+            .and_then(|ca_data| {
+                reqwest::Certificate::from_pem_bundle(&ca_data)
+                    .map_err(|e| format!("Health check CA: failed to parse CA bundle: {e}"))
+            })
+            .and_then(|certs| {
+                // An empty trust store would reject every handshake anyway;
+                // reporting it here keeps the cause legible.
+                if certs.is_empty() {
+                    Err("Health check CA: bundle contains no certificates".to_string())
+                } else {
+                    Ok(certs)
+                }
+            });
         match ca_bundle {
             Ok(ca_certs) => {
                 // reqwest 0.13: `tls_certs_only` replaces the trust store entirely,
                 // matching the project's "CA exclusivity" rule (no webpki mixing
                 // when a custom CA is provided).
                 builder = builder.tls_certs_only(ca_certs);
-            }
-            // Verification is already disabled by explicit configuration, so no
-            // trust decision is being downgraded here.
-            Err(details) if skip_verify => {
-                tracing::warn!("Health check: {details}; verification is disabled");
             }
             Err(details) => {
                 return Err(HealthCheckClientError::ExclusiveTrustUnavailable(details));
@@ -2318,28 +2361,58 @@ fn build_health_check_client_with_tls(
         .client_key_path
         .as_ref()
         .or(global_key_path.as_ref());
-    if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        match (
-            load_probe_tls_material(cert_path, MaterialKind::Cert, "Health check client cert"),
-            load_probe_tls_material(key_path, MaterialKind::Key, "Health check client key"),
-        ) {
-            (Ok(cert_data), Ok(key_data)) => {
+    // A configured backend mTLS identity is mandatory for the probe, exactly as
+    // it is for proxy traffic: every failure below is fail-closed rather than
+    // warn-and-continue, because an anonymous probe measures a different
+    // handshake than the one real requests perform. None of these arms
+    // interpolate certificate or key bytes — `load_probe_tls_material` reports
+    // through `MaterialError`, which carries `display_source_id` and a failure
+    // class only, and `reqwest::Identity::from_pem` errors describe the parse
+    // failure, not the input.
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let material = load_probe_tls_material(
+                cert_path,
+                MaterialKind::Cert,
+                "Health check client cert",
+            )
+            .and_then(|cert_data| {
+                load_probe_tls_material(key_path, MaterialKind::Key, "Health check client key")
+                    .map(|key_data| (cert_data, key_data))
+            })
+            .and_then(|(cert_data, key_data)| {
                 let mut combined = cert_data;
                 combined.extend_from_slice(b"\n");
                 combined.extend_from_slice(&key_data);
-                match reqwest::Identity::from_pem(&combined) {
-                    Ok(identity) => {
-                        builder = builder.identity(identity);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Health check: failed to parse client identity: {}", e);
-                    }
+                reqwest::Identity::from_pem(&combined).map_err(|e| {
+                    format!("Health check client identity: failed to parse cert/key pair: {e}")
+                })
+            });
+            match material {
+                Ok(identity) => {
+                    builder = builder.identity(identity);
+                }
+                Err(details) => {
+                    return Err(HealthCheckClientError::ClientIdentityUnavailable(details));
                 }
             }
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::warn!("Health check: failed to load client cert/key: {}", e);
-            }
         }
+        // A half-configured pair cannot authenticate. Silently skipping it built
+        // an anonymous probe for an upstream the operator explicitly gave an
+        // identity to, so report the misconfiguration instead.
+        (Some(_), None) => {
+            return Err(HealthCheckClientError::ClientIdentityUnavailable(
+                "a backend mTLS client certificate is configured without a matching private key"
+                    .to_string(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(HealthCheckClientError::ClientIdentityUnavailable(
+                "a backend mTLS private key is configured without a matching client certificate"
+                    .to_string(),
+            ));
+        }
+        (None, None) => {}
     }
 
     if pool_config.enable_http_keep_alive {
@@ -2356,13 +2429,17 @@ fn build_health_check_client_with_tls(
             ));
     }
 
+    // The minimal fallback carries neither a trust store nor a client identity,
+    // so it verifies against the default roots and connects anonymously. That is
+    // only acceptable when this upstream named no exclusive CA and no client
+    // identity in the first place; otherwise it is the same downgrade the arms
+    // above refuse, just later. `skip_verify` is deliberately NOT an escape here
+    // either — see the CA block for why disabling verification does not license
+    // discarding explicitly configured material.
+    let has_explicit_material = ca_path.is_some() || cert_path.is_some() || key_path.is_some();
     match builder.build() {
         Ok(client) => Ok(client),
-        // The minimal fallback carries no trust store, so it verifies against
-        // the default roots. That is only acceptable when this upstream was not
-        // pinned to an exclusive CA in the first place; otherwise it is the
-        // same trust downgrade the CA arm above refuses, just later.
-        Err(e) if ca_path.is_none() || skip_verify => {
+        Err(e) if !has_explicit_material => {
             tracing::error!(
                 "Failed to build TLS health check HTTP client: {}. \
                  Falling back to a minimal DNS-cached client (TLS-specific settings will not apply).",
@@ -2372,7 +2449,7 @@ fn build_health_check_client_with_tls(
                 .map_err(HealthCheckClientError::from)
         }
         Err(e) => Err(HealthCheckClientError::ExclusiveTrustUnavailable(format!(
-            "TLS health check client could not be built with the configured CA: {e}"
+            "TLS health check client could not be built with the configured backend TLS material: {e}"
         ))),
     }
 }
@@ -3079,6 +3156,157 @@ mod tests {
         assert!(
             accept_health_check_client(Ok(client), "test").is_some(),
             "successful builds must remain available to HTTP probes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Explicit backend TLS material is mandatory for HTTP probes.
+    //
+    // `build_health_check_client_with_tls` is private, so these stay inline.
+    // A path under a fresh temp dir that was never created is guaranteed
+    // unloadable without depending on ambient filesystem state.
+    // -----------------------------------------------------------------------
+
+    fn unloadable_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("ferrum-health-probe-absent-{name}"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn tls_client_result(
+        tls_config: &BackendTlsConfig,
+        global_no_verify: bool,
+    ) -> Result<reqwest::Client, HealthCheckClientError> {
+        build_health_check_client_with_tls(
+            &PoolConfig::default(),
+            None,
+            tls_config,
+            &None,
+            &None,
+            &None,
+            global_no_verify,
+        )
+    }
+
+    #[test]
+    fn probe_client_fails_closed_when_configured_ca_cannot_be_loaded() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.server_ca_cert_path = Some(unloadable_path("ca"));
+        assert!(
+            matches!(
+                tls_client_result(&tls, false),
+                Err(HealthCheckClientError::ExclusiveTrustUnavailable(_))
+            ),
+            "an unloadable exclusive CA must not fall back to the default roots"
+        );
+    }
+
+    #[test]
+    fn probe_client_fails_closed_on_unloadable_ca_even_without_verification() {
+        // The defect this pins: `verify_server_cert: false` used to downgrade an
+        // unloadable CA to a warning and build a client on the default roots.
+        // Explicitly named material that cannot be loaded is a configuration
+        // fault in both verification modes.
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.server_ca_cert_path = Some(unloadable_path("ca-noverify"));
+        tls.verify_server_cert = false;
+        assert!(
+            matches!(
+                tls_client_result(&tls, false),
+                Err(HealthCheckClientError::ExclusiveTrustUnavailable(_))
+            ),
+            "per-upstream no-verify must not absorb an unloadable configured CA"
+        );
+
+        // Same through the global `FERRUM_TLS_NO_VERIFY` opt-in.
+        let mut global = BackendTlsConfig::default_verify();
+        global.server_ca_cert_path = Some(unloadable_path("ca-global-noverify"));
+        assert!(
+            matches!(
+                tls_client_result(&global, true),
+                Err(HealthCheckClientError::ExclusiveTrustUnavailable(_))
+            ),
+            "global no-verify must not absorb an unloadable configured CA"
+        );
+    }
+
+    #[test]
+    fn probe_client_fails_closed_when_configured_identity_cannot_be_loaded() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.client_cert_path = Some(unloadable_path("cert"));
+        tls.client_key_path = Some(unloadable_path("key"));
+        assert!(
+            matches!(
+                tls_client_result(&tls, false),
+                Err(HealthCheckClientError::ClientIdentityUnavailable(_))
+            ),
+            "an unloadable client identity must not produce an anonymous probe"
+        );
+    }
+
+    #[test]
+    fn probe_client_fails_closed_on_unloadable_identity_even_without_verification() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.client_cert_path = Some(unloadable_path("cert-noverify"));
+        tls.client_key_path = Some(unloadable_path("key-noverify"));
+        tls.verify_server_cert = false;
+        assert!(
+            matches!(
+                tls_client_result(&tls, false),
+                Err(HealthCheckClientError::ClientIdentityUnavailable(_))
+            ),
+            "no-verify governs server verification, not whether the probe authenticates"
+        );
+    }
+
+    #[test]
+    fn probe_client_fails_closed_on_half_configured_identity() {
+        let mut cert_only = BackendTlsConfig::default_verify();
+        cert_only.client_cert_path = Some(unloadable_path("cert-only"));
+        assert!(
+            matches!(
+                tls_client_result(&cert_only, false),
+                Err(HealthCheckClientError::ClientIdentityUnavailable(_))
+            ),
+            "a client certificate without a key must fail rather than be ignored"
+        );
+
+        let mut key_only = BackendTlsConfig::default_verify();
+        key_only.client_key_path = Some(unloadable_path("key-only"));
+        assert!(
+            matches!(
+                tls_client_result(&key_only, false),
+                Err(HealthCheckClientError::ClientIdentityUnavailable(_))
+            ),
+            "a private key without a certificate must fail rather than be ignored"
+        );
+    }
+
+    #[test]
+    fn probe_client_error_text_names_no_material() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.client_cert_path = Some(unloadable_path("cert-redaction"));
+        tls.client_key_path = Some(unloadable_path("key-redaction"));
+        let rendered = tls_client_result(&tls, false)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        for marker in ["BEGIN CERTIFICATE", "BEGIN PRIVATE KEY", "BEGIN RSA"] {
+            assert!(
+                !rendered.contains(marker),
+                "probe TLS diagnostics must never carry credential material: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_client_builds_when_no_backend_tls_material_is_configured() {
+        // The ordinary case must stay unaffected: no CA, no identity, so there is
+        // nothing explicit to fail closed on.
+        assert!(
+            tls_client_result(&BackendTlsConfig::default_verify(), false).is_ok(),
+            "an upstream with no configured backend TLS material still gets a probe client"
         );
     }
 

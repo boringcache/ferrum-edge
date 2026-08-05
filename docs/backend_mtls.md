@@ -97,22 +97,58 @@ makes the policy fail to attach (`Accepted=False`, `reason: TargetNotFound`); it
 does not silently apply elsewhere, and it does not fault the Service's other
 valid ports, because the port the operator meant cannot be inferred.
 
-BackendTLSPolicy applies only to TCP traffic (Gateway API GEP-1897). A policy
-that explicitly attaches to a UDP Service port — a `sectionName` naming a UDP
-port, or a Service whose ports are all UDP — is rejected with
-`Accepted=False`, `reason: Invalid`, and any route backend that selects it fails
-closed with an HTTP 500 fault instead of originating TLS to a UDP port or
-falling back to plaintext. A Service that mixes TCP and UDP ports is accepted
-with a warning in the `Accepted` condition message and the policy takes effect
-only on its TCP ports.
+BackendTLSPolicy applies only to TCP traffic (Gateway API GEP-1897). Eligibility
+is decided on the **port's transport**, and a port is eligible only when its
+`spec.ports[].protocol` is proven to be `TCP` — omitted counts as TCP, since
+Kubernetes defaults the field, and the comparison is case-insensitive. `UDP`,
+`SCTP`, and any protocol value Ferrum does not recognize are all ineligible:
+GEP-1897 names UDP in its examples, but the rule it states is that the policy
+configures TLS for TCP traffic, and no TLS handshake can be originated on an
+SCTP or unknown-transport port.
 
-Health probes follow the same trust policy as proxy traffic. A configured
-backend CA is the **sole** trust anchor, so when it cannot be loaded or parsed
-— including a `caCertificateRefs` Secret whose `k8s://…#ca.crt` source becomes
-unreadable after translation accepted it — the probe client is not built and
-HTTP probes report unhealthy. Ferrum never falls back to the system roots for a
-backend pinned to a private CA, because that would let any publicly-trusted
-certificate keep a target marked healthy.
+* A policy that explicitly attaches to an ineligible port — a `sectionName`
+  naming a `UDP`, `SCTP`, or unrecognized-protocol port — is rejected with
+  `Accepted=False`, `reason: Invalid`. The rejection stays scoped to the port the
+  `sectionName` named; sibling TCP ports keep their pre-policy behaviour.
+* A Service-wide policy on a Service with **no** TCP port is rejected the same
+  way: it would govern nothing, so reporting it Accepted would be a misreport.
+* A Service that mixes TCP and non-TCP ports is accepted with a warning in the
+  `Accepted` condition message, and the policy takes effect only on its TCP
+  ports. The non-TCP ports keep their pre-policy behaviour.
+* A Service declaring more than 64 ports exceeds Ferrum's bounded port index, so
+  the transport of the targeted port cannot be proven and every policy targeting
+  that Service is rejected fail closed.
+
+In every rejection case, a route backend that actually selects the policy fails
+closed with an HTTP 500 fault rather than originating TLS onto an ineligible
+transport or falling back to plaintext. Status condition messages name the
+transport from a fixed set (`TCP` / `UDP` / `SCTP` / "not a recognized Kubernetes
+protocol") and never echo the raw, cluster-supplied `protocol` string.
+
+Health probes follow the same trust policy **and the same identity** as proxy
+traffic, and both are fail-closed on explicitly configured material:
+
+* A configured backend CA is the **sole** trust anchor, so when it cannot be
+  loaded or parsed — including a `caCertificateRefs` Secret whose
+  `k8s://…#ca.crt` source becomes unreadable after translation accepted it — the
+  probe client is not built and probes report unhealthy. Ferrum never falls back
+  to the system roots for a backend pinned to a private CA, because that would
+  let any publicly-trusted certificate keep a target marked healthy.
+* A configured backend mTLS client certificate/key pair that cannot be loaded or
+  parsed also fails the probe. Continuing anonymously would measure a different
+  handshake than real requests perform: a backend that merely *prefers* client
+  certificates answers the anonymous probe while refusing proxy traffic, marking
+  a target healthy that no request can use. A **half-configured** pair (a
+  certificate without a key, or a key without a certificate) fails for the same
+  reason instead of being silently ignored.
+* Both rules hold **regardless of verification mode**. Disabling verification
+  (`backend_tls_verify_server_cert: false` or `FERRUM_TLS_NO_VERIFY=true`) is a
+  statement about whether the peer certificate is *checked*; it is not a licence
+  to ignore material the operator explicitly named. An unloadable CA or identity
+  is a configuration fault and surfaces as one in both modes. This applies to the
+  HTTP and gRPC probe paths alike, in their verified and no-verify branches.
+* Probe diagnostics carry the material's source identifier and a failure class
+  only — never certificate or key bytes.
 
 **CA exclusivity**: When a custom CA is configured, it is the sole trust anchor. This prevents a backend pinned to an internal CA from being MITMed via any publicly-trusted certificate. If you need both internal and public CAs trusted, combine them into a single PEM bundle file.
 

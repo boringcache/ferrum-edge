@@ -12718,6 +12718,97 @@ fn rewrite_backend_url_authority_host(url: &str, from_host: &str, to_host: &str)
     }
 }
 
+/// Reqwest dial identity that carries an overridden backend TLS server name.
+///
+/// # Why the URL authority
+///
+/// reqwest derives the rustls server name from the request URL's host and
+/// exposes no per-request server-name hook — the vendored connector builds
+/// `ServerName::try_from(dst.host())`
+/// (`vendor/reqwest-0.13.3-ferrum-patched/src/connect.rs`). So the only way to
+/// present an overridden server name on the reqwest path is to put the override
+/// in the URL authority. The socket must nevertheless land on the
+/// load-balanced target, which is what the returned proxy's `dns_override`
+/// guarantees: [`crate::dns::DnsCacheResolver::with_dns_override`] answers
+/// **every** name with the pinned address, so the SNI hostname is never itself
+/// resolved and a request host can never redirect the dial. `backend_tls_sni` is
+/// separately validated to be a DNS hostname and never an IP literal
+/// ([`crate::config::types::validate_backend_tls_sni`]), so it also cannot
+/// become a hyper-util URL-literal dial that would bypass the resolver.
+///
+/// # What this preserves by construction
+///
+/// * **Backend-visible authority.** ALPN is restricted to `http/1.1`, so the
+///   backend reads the authority from the `Host` header — which dispatch sets
+///   explicitly from the effective target host, and which hyper-util preserves
+///   (`headers_mut().entry(HOST).or_insert_with(..)`) rather than deriving from
+///   the URL. HTTP/2 would take `:authority` from the URL, i.e. from the server
+///   name, which is precisely why h2 must not be negotiated here. H2-capable
+///   targets are unaffected: they keep using the direct-H2 pool, which owns its
+///   own handshake and sets the server name natively while keeping the real
+///   backend authority.
+/// * **Pool partitioning.** `dns_override` and the force-H1 `h1` discriminator
+///   both enter the reqwest pool key, and `resolved_tls.sni` (plus CA / SAN
+///   digest / mTLS / verification) already do. The client is therefore keyed per
+///   (server name, pinned target, ALPN) and can be shared neither with a default
+///   h2-capable client nor with another target's pin.
+/// * **Egress screening.** `ConnectionPool::create_client` screens the pinned
+///   `dns_override` against the backend egress policy before building the
+///   client, and the pin is the address dispatch already resolved *and* screened
+///   for the selected target.
+/// * **Retries, timeouts, streaming bodies.** Nothing else about the dial
+///   changes, so the ordinary reqwest path's per-request connect/read timeouts,
+///   body streaming, and retry replay all apply unchanged.
+///
+/// # Cost
+///
+/// Pinning to one resolved address partitions the reqwest client per target
+/// (a Service with N endpoints materializes up to N clients for an SNI-override
+/// route) and gives up in-client multi-address failover for that dial. Both are
+/// inherent to expressing a server name through the URL, and both are bounded by
+/// the existing pool cleanup. Only SNI-override routes pay it.
+///
+/// Returns `None` when the override cannot be honored on this path; the caller
+/// keeps its terminal 502 rather than dialing with the wrong server name.
+pub(crate) fn backend_tls_sni_reqwest_dial(
+    proxy: &Proxy,
+    backend_url: &str,
+    effective_host: &str,
+    resolved_ip: Option<&str>,
+) -> Option<(Proxy, String)> {
+    let sni = proxy.resolved_tls.sni.as_deref()?;
+    // Only a TLS backend has a server name to override.
+    if !proxy
+        .backend_scheme
+        .is_some_and(|scheme| scheme.is_tls_backend())
+    {
+        return None;
+    }
+    // The pin must be the address the gateway already resolved and
+    // egress-screened for the SELECTED target. Without it nothing keeps the
+    // socket on that target, and letting reqwest resolve the SNI hostname
+    // instead would be exactly the request-host DNS escape this must not allow.
+    // When the operator also configured `dns_override`, that override is what
+    // produced `resolved_ip`, so pinning the result honors it and narrows it.
+    let pinned: std::net::IpAddr = resolved_ip?.parse().ok()?;
+    let url = rewrite_backend_url_authority_host(backend_url, effective_host, sni);
+    // `rewrite_backend_url_authority_host` returns its input unchanged when the
+    // authority does not start with the rendered `effective_host`. An unchanged
+    // URL would hand rustls the target's own name as the server name, so fail
+    // closed unless the two are already the same name anyway.
+    if url == backend_url && !effective_host.eq_ignore_ascii_case(sni) {
+        return None;
+    }
+    let mut effective = proxy.clone();
+    effective.dns_override = Some(pinned.to_string());
+    // Restrict this client's ALPN to `http/1.1` and mark it `h1` in the pool
+    // key. `BackendTlsConfigBuilder::build_reqwest_with_http2_enabled` reads
+    // `forces_backend_http1_only()` regardless of the resolved `enable_http2`,
+    // so this is load-bearing, not a hint.
+    effective.h2_upgrade_policy = Some(crate::config::types::H2UpgradePolicy::DoNotUpgrade);
+    Some((effective, url))
+}
+
 /// Host used for WebSocket transaction-log DNS resolution. Load-balanced
 /// WebSocket sessions dial the selected target host, not the proxy's static
 /// `backend_host`, so `backend_resolved_ip` must follow the same effective
@@ -32895,18 +32986,17 @@ pub(crate) async fn proxy_to_backend_retry(
         return backend_egress_denied_response(effective_host);
     }
 
-    if let Some(conflict) = reqwest_dns_override_literal_conflict(effective_host, proxy) {
+    // A backend TLS SNI override is exempt: its URL authority carries the
+    // overridden server name, which `validate_backend_tls_sni` guarantees is a
+    // DNS hostname and never an IP literal, so reqwest's resolver IS consulted
+    // and the pinned address IS what the socket dials. See
+    // `backend_tls_sni_reqwest_dial` and the identical exemption on the
+    // first-attempt path.
+    if proxy.resolved_tls.sni.is_none()
+        && let Some(conflict) = reqwest_dns_override_literal_conflict(effective_host, proxy)
+    {
         warn_reqwest_dns_override_literal_conflict(proxy, effective_host, conflict);
         return backend_dns_override_literal_conflict_response(conflict);
-    }
-
-    if proxy.resolved_tls.sni.is_some() {
-        warn!(
-            proxy_id = %proxy.id,
-            backend_tls_sni = ?proxy.resolved_tls.sni,
-            "Backend TLS SNI override cannot be replayed through reqwest retry path; returning 502"
-        );
-        return backend_tls_sni_requires_direct_h2_response(None);
     }
 
     // Resolve backend IP from DNS cache (O(1) cached lookup).
@@ -32936,9 +33026,43 @@ pub(crate) async fn proxy_to_backend_retry(
         }
     };
 
+    // Honor a backend TLS SNI override on the retry path exactly as the first
+    // attempt does: the overridden server name goes in the URL authority and the
+    // client's resolver is pinned to THIS retry target's resolved address, so an
+    // LB rotation between attempts still dials the newly selected target. Retry
+    // body replay is precisely the case the direct-H2 sender cannot serve, so
+    // rejecting here would make every retry-enabled BackendTLSPolicy route a
+    // guaranteed 502 on its second attempt.
+    let sni_reqwest_dial = if proxy.resolved_tls.sni.is_some() {
+        match backend_tls_sni_reqwest_dial(
+            proxy,
+            backend_url,
+            effective_host,
+            resolved_ip.as_deref(),
+        ) {
+            Some(dial) => Some(dial),
+            None => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_tls_sni = ?proxy.resolved_tls.sni,
+                    "Backend TLS SNI override cannot be expressed on the reqwest retry path; returning 502"
+                );
+                return backend_tls_sni_requires_direct_h2_response(resolved_ip);
+            }
+        }
+    } else {
+        None
+    };
+    // Only the dial is rewritten; the logging sites below keep naming the real
+    // backend target the socket reaches.
+    let (dial_proxy, dial_url): (&Proxy, &str) = match sni_reqwest_dial.as_ref() {
+        Some((sni_proxy, sni_url)) => (sni_proxy, sni_url.as_str()),
+        None => (proxy, backend_url),
+    };
+
     let client_result = crate::plugins::await_grpc_deadline(
         request_ctx.grpc_deadline_at(),
-        state.connection_pool.get_client(proxy),
+        state.connection_pool.get_client(dial_proxy),
     )
     .await;
     let client = match client_result {
@@ -32982,7 +33106,7 @@ pub(crate) async fn proxy_to_backend_retry(
         }
     };
 
-    let mut req_builder = client.request(req_method, backend_url);
+    let mut req_builder = client.request(req_method, dial_url);
 
     // Per-request timeout overrides. The shared `reqwest::Client` intentionally
     // has no client-level connect or read timeout (see
@@ -33060,6 +33184,17 @@ pub(crate) async fn proxy_to_backend_retry(
     }
     if let Some(value) = remaining_grpc_timeout_header {
         req_builder = req_builder.header("grpc-timeout", value);
+    }
+    // A backend TLS SNI override moved the server name into the URL authority,
+    // so hyper-util's `headers_mut().entry(HOST).or_insert_with(..)` would derive
+    // `Host` from the *server name* for a request that carried none — an
+    // HTTP/1.0 request, or any request whose frontend could not synthesize an
+    // authority. Every other request already had its `Host` set from
+    // `effective_host` (or preserved) in the loop above, and hyper-util keeps an
+    // explicit value. The backend must see the real target authority, never the
+    // TLS server name.
+    if sni_reqwest_dial.is_some() && !headers.contains_key("host") {
+        req_builder = req_builder.header("Host", effective_host);
     }
 
     // Add proxy-managed forwarding metadata.
@@ -34657,6 +34792,13 @@ async fn proxy_to_backend(
         return backend_dispatch_response(resp, body_bytes, backend_admission_permits);
     }
 
+    // Set when a backend TLS SNI override could not take the direct-H2 pool and
+    // must instead be honored on the reqwest/HTTP-1.1 path. Carries the
+    // target-pinned, ALPN-restricted effective proxy the pool must key and build
+    // on, plus the backend URL whose authority is the overridden TLS server name.
+    // See `backend_tls_sni_reqwest_dial`.
+    let mut sni_reqwest_dial: Option<(Proxy, String)> = None;
+
     // Use the direct HTTP/2 pool only when the capability registry has already
     // classified this concrete backend target as H2-capable and the request
     // body path is compatible with the hyper sender.
@@ -34712,17 +34854,40 @@ async fn proxy_to_backend(
             direct_h2_proxy.h2_upgrade_policy,
         );
         if requires_direct_h2_for_sni && direct_h2_known_unsupported {
-            debug!(
-                proxy_id = %proxy.id,
-                backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
-                "H2 pool required for backend TLS SNI override but capability registry already marks this backend target H2/TLS unsupported"
-            );
-            return backend_dispatch_response(
-                backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
-                None,
-                None,
-            );
+            // A backend proven to speak only HTTP/1.1 over TLS is the ordinary
+            // BackendTLSPolicy case, not an error: honor the overridden TLS
+            // server name on the reqwest/H1 path instead of failing the request.
+            match backend_tls_sni_reqwest_dial(
+                direct_h2_proxy,
+                backend_url,
+                effective_host,
+                resolved_ip.as_deref(),
+            ) {
+                Some(dial) => {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                        "Backend target is known H2/TLS-unsupported; honoring the backend TLS SNI override on the reqwest HTTP/1.1 path"
+                    );
+                    sni_reqwest_dial = Some(dial);
+                }
+                None => {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                        "H2 pool required for backend TLS SNI override, capability registry marks this backend target H2/TLS unsupported, and the override cannot be expressed on the reqwest path"
+                    );
+                    return backend_dispatch_response(
+                        backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
+                        None,
+                        None,
+                    );
+                }
+            }
         }
+        // A resolved reqwest/H1 SNI dial supersedes the direct-H2 fork: the
+        // registry already proved this target cannot serve h2 over TLS.
+        let direct_h2_dispatch = direct_h2_dispatch && sni_reqwest_dial.is_none();
         if direct_h2_dispatch {
             // 413 on an oversized declared Content-Length BEFORE dial/admission,
             // matching HBONE/mesh-mTLS ordering so a capacity 503 cannot mask a
@@ -34784,34 +34949,54 @@ async fn proxy_to_backend(
                             upstream_target,
                         );
                         if requires_direct_h2_for_sni {
-                            if downgraded {
-                                warn!(
-                                    proxy_id = %proxy.id,
-                                    error = %e,
-                                    backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
-                                    "HTTP/2 pool negotiated HTTP/1.1 backend but backend TLS SNI override cannot fall back to reqwest; marking backend H2/TLS unsupported and returning 502"
-                                );
-                            } else {
-                                debug!(
-                                    proxy_id = %proxy.id,
-                                    error = %e,
-                                    backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
-                                    "HTTP/2 pool negotiated HTTP/1.1 backend but backend TLS SNI override cannot fall back to reqwest"
-                                );
+                            match backend_tls_sni_reqwest_dial(
+                                direct_h2_proxy,
+                                backend_url,
+                                effective_host,
+                                resolved_ip.as_deref(),
+                            ) {
+                                Some(dial) => {
+                                    debug!(
+                                        proxy_id = %proxy.id,
+                                        error = %e,
+                                        capability_downgraded = downgraded,
+                                        backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                                        "HTTP/2 pool negotiated HTTP/1.1 backend; honoring the backend TLS SNI override on the reqwest HTTP/1.1 path"
+                                    );
+                                    sni_reqwest_dial = Some(dial);
+                                    // ALPN negotiated H1 — a capability mismatch,
+                                    // not a backend failure. Leave
+                                    // `h2_admission_permits` to drop on
+                                    // fall-through so the reqwest path re-admits
+                                    // and records the real backend outcome there.
+                                    None
+                                }
+                                None => {
+                                    warn!(
+                                        proxy_id = %proxy.id,
+                                        error = %e,
+                                        capability_downgraded = downgraded,
+                                        backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                                        "HTTP/2 pool negotiated HTTP/1.1 backend and the backend TLS SNI override cannot be expressed on the reqwest path; returning 502"
+                                    );
+                                    // The override cannot be honored anywhere, so
+                                    // this request terminates at the H2 pool:
+                                    // record the pool failure so the adaptive
+                                    // limiter learns it.
+                                    record_h2_pool_admission_failure(
+                                        &mut h2_admission_permits,
+                                        backend_admission_started_at,
+                                        &e,
+                                    );
+                                    return backend_dispatch_response(
+                                        backend_tls_sni_requires_direct_h2_response(
+                                            resolved_ip.clone(),
+                                        ),
+                                        None,
+                                        None,
+                                    );
+                                }
                             }
-                            // SNI override cannot fall back to reqwest, so this
-                            // request terminates at the H2 pool: record the pool
-                            // failure so the adaptive limiter learns it.
-                            record_h2_pool_admission_failure(
-                                &mut h2_admission_permits,
-                                backend_admission_started_at,
-                                &e,
-                            );
-                            return backend_dispatch_response(
-                                backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
-                                None,
-                                None,
-                            );
                         } else {
                             debug!(
                                 proxy_id = %proxy.id,
@@ -34909,20 +35094,44 @@ async fn proxy_to_backend(
                 "H2 pool bypassed because body-size limits are enabled"
             );
         }
-        if requires_direct_h2_for_sni {
-            warn!(
-                proxy_id = %proxy.id,
-                backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
-                retain_request_body = retain_request_body,
-                requires_request_body_buffering = requires_request_body_buffering,
-                enable_http2 = pool_config.enable_http2,
-                "H2 pool required for backend TLS SNI override but request is not compatible with direct H2 dispatch"
-            );
-            return backend_dispatch_response(
-                backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
-                None,
-                None,
-            );
+        if requires_direct_h2_for_sni && sni_reqwest_dial.is_none() {
+            // Retry body replay, a request-body-buffering plugin, or
+            // `pool_enable_http2: false` makes this request incompatible with the
+            // direct-H2 sender. The reqwest/H1 path supports all three, so honor
+            // the overridden TLS server name there rather than failing closed.
+            match backend_tls_sni_reqwest_dial(
+                direct_h2_proxy,
+                backend_url,
+                effective_host,
+                resolved_ip.as_deref(),
+            ) {
+                Some(dial) => {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                        retain_request_body = retain_request_body,
+                        requires_request_body_buffering = requires_request_body_buffering,
+                        enable_http2 = pool_config.enable_http2,
+                        "Request is not compatible with direct H2 dispatch; honoring the backend TLS SNI override on the reqwest HTTP/1.1 path"
+                    );
+                    sni_reqwest_dial = Some(dial);
+                }
+                None => {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                        retain_request_body = retain_request_body,
+                        requires_request_body_buffering = requires_request_body_buffering,
+                        enable_http2 = pool_config.enable_http2,
+                        "H2 pool required for backend TLS SNI override, request is not compatible with direct H2 dispatch, and the override cannot be expressed on the reqwest path"
+                    );
+                    return backend_dispatch_response(
+                        backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
+                        None,
+                        None,
+                    );
+                }
+            }
         }
         if pool_config.enable_http2 && (retain_request_body || requires_request_body_buffering) {
             debug!(
@@ -34939,7 +35148,15 @@ async fn proxy_to_backend(
     // telemetry but not used for the socket dial. Direct H2/H3/HBONE branches
     // above resolve independently and may honor that combination; reject only
     // now that dispatch has fallen through to reqwest.
-    if let Some(conflict) = reqwest_dns_override_literal_conflict(effective_host, proxy) {
+    //
+    // A resolved backend TLS SNI dial is exempt because the premise does not
+    // hold for it: its URL authority carries the overridden server name, which
+    // `validate_backend_tls_sni` guarantees is a DNS hostname and never an IP
+    // literal, so the resolver IS consulted and the pinned address IS what the
+    // socket dials.
+    if sni_reqwest_dial.is_none()
+        && let Some(conflict) = reqwest_dns_override_literal_conflict(effective_host, proxy)
+    {
         warn_reqwest_dns_override_literal_conflict(proxy, effective_host, conflict);
         return backend_dispatch_response(
             backend_dns_override_literal_conflict_response(conflict),
@@ -34947,6 +35164,15 @@ async fn proxy_to_backend(
             None,
         );
     }
+
+    // A backend TLS SNI override dials through a target-pinned, ALPN-restricted
+    // client and a URL whose authority is the overridden TLS server name. Only
+    // the dial is rewritten: the logging/telemetry sites below keep using
+    // `backend_url`, which names the real backend target the socket reaches.
+    let (dial_proxy, dial_url): (&Proxy, &str) = match sni_reqwest_dial.as_ref() {
+        Some((sni_proxy, sni_url)) => (sni_proxy, sni_url.as_str()),
+        None => (proxy, backend_url),
+    };
 
     // Get client from connection pool for HTTP/1.1 and HTTP/2.
     // The client uses our DnsCacheResolver for transparent DNS cache lookups.
@@ -34966,7 +35192,7 @@ async fn proxy_to_backend(
     // `proxy_to_backend_retry` rebinds identically for the retry path.
     let client_result = crate::plugins::await_grpc_deadline(
         request_ctx.grpc_deadline_at(),
-        state.connection_pool.get_client(proxy),
+        state.connection_pool.get_client(dial_proxy),
     )
     .await;
     let client = match client_result {
@@ -35025,7 +35251,7 @@ async fn proxy_to_backend(
         }
     };
 
-    let mut req_builder = client.request(req_method, backend_url);
+    let mut req_builder = client.request(req_method, dial_url);
 
     // Per-request timeout overrides. The shared `reqwest::Client` intentionally
     // has no client-level connect or read timeout (see
@@ -35101,6 +35327,17 @@ async fn proxy_to_backend(
     }
     if let Some(value) = remaining_grpc_timeout_header {
         req_builder = req_builder.header("grpc-timeout", value);
+    }
+    // A backend TLS SNI override moved the server name into the URL authority,
+    // so hyper-util's `headers_mut().entry(HOST).or_insert_with(..)` would derive
+    // `Host` from the *server name* for a request that carried none — an
+    // HTTP/1.0 request, or any request whose frontend could not synthesize an
+    // authority. Every other request already had its `Host` set from
+    // `effective_host` (or preserved) in the loop above, and hyper-util keeps an
+    // explicit value. The backend must see the real target authority, never the
+    // TLS server name.
+    if sni_reqwest_dial.is_some() && !headers.contains_key("host") {
+        req_builder = req_builder.header("Host", effective_host);
     }
 
     // Add proxy-managed forwarding metadata.
@@ -51919,6 +52156,162 @@ mod tests {
             },
         )]));
         proxy
+    }
+
+    // -----------------------------------------------------------------------
+    // Backend TLS SNI override on the reqwest / HTTP-1.1 dial.
+    //
+    // `backend_tls_sni_reqwest_dial` is `pub(crate)`, so these stay inline.
+    // -----------------------------------------------------------------------
+
+    fn sni_dial_proxy(sni: &str) -> Proxy {
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        proxy.backend_scheme = Some(crate::config::types::BackendScheme::Https);
+        proxy.resolved_tls.sni = Some(sni.to_string());
+        proxy
+    }
+
+    #[test]
+    fn sni_reqwest_dial_moves_the_server_name_into_the_url_authority() {
+        let proxy = sni_dial_proxy("secure.example.com");
+        let (effective, url) = backend_tls_sni_reqwest_dial(
+            &proxy,
+            "https://10.4.1.9:8443/api/test?q=1",
+            "10.4.1.9",
+            Some("10.4.1.9"),
+        )
+        .expect("an HTTPS backend with a resolved target must produce a dial");
+
+        // reqwest derives the rustls server name from the URL host, so the
+        // override has to land in the authority — path and query untouched.
+        assert_eq!(url, "https://secure.example.com:8443/api/test?q=1");
+        // ...while the socket still goes to the selected target.
+        assert_eq!(effective.dns_override.as_deref(), Some("10.4.1.9"));
+        // ...over HTTP/1.1 only, so `:authority` can never carry the server name.
+        assert!(
+            effective.forces_backend_http1_only(),
+            "an SNI dial must restrict ALPN to http/1.1"
+        );
+    }
+
+    #[test]
+    fn sni_reqwest_dial_pins_the_resolved_target_not_the_request_host() {
+        // The dial address comes from the address dispatch already resolved and
+        // egress-screened for the SELECTED target. A different target host in the
+        // URL must not change where the socket lands.
+        let proxy = sni_dial_proxy("secure.example.com");
+        let (effective, url) = backend_tls_sni_reqwest_dial(
+            &proxy,
+            "https://pod-a.internal:8443/",
+            "pod-a.internal",
+            Some("10.4.1.42"),
+        )
+        .expect("dial");
+        assert_eq!(url, "https://secure.example.com:8443/");
+        assert_eq!(
+            effective.dns_override.as_deref(),
+            Some("10.4.1.42"),
+            "the pin must be the resolved target address, never the URL host"
+        );
+    }
+
+    #[test]
+    fn sni_reqwest_dial_fails_closed_without_a_resolved_target_address() {
+        // With nothing to pin, reqwest would resolve the SNI hostname itself —
+        // the request-host DNS escape this must never allow.
+        let proxy = sni_dial_proxy("secure.example.com");
+        assert!(
+            backend_tls_sni_reqwest_dial(&proxy, "https://10.4.1.9:8443/", "10.4.1.9", None)
+                .is_none()
+        );
+        // A non-IP "resolved" value is equally unusable as a pin.
+        assert!(
+            backend_tls_sni_reqwest_dial(
+                &proxy,
+                "https://10.4.1.9:8443/",
+                "10.4.1.9",
+                Some("not-an-ip")
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn sni_reqwest_dial_fails_closed_when_the_authority_cannot_be_rewritten() {
+        // The URL authority does not start with `effective_host`, so the rewrite
+        // is a no-op and the dial would present the target's own name as the
+        // server name.
+        let proxy = sni_dial_proxy("secure.example.com");
+        assert!(
+            backend_tls_sni_reqwest_dial(
+                &proxy,
+                "https://other.host:8443/",
+                "10.4.1.9",
+                Some("10.4.1.9")
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn sni_reqwest_dial_is_only_for_tls_backends() {
+        let mut proxy = sni_dial_proxy("secure.example.com");
+        proxy.backend_scheme = Some(crate::config::types::BackendScheme::Http);
+        assert!(
+            backend_tls_sni_reqwest_dial(
+                &proxy,
+                "http://10.4.1.9:8080/",
+                "10.4.1.9",
+                Some("10.4.1.9")
+            )
+            .is_none(),
+            "a plaintext backend has no server name to override"
+        );
+    }
+
+    #[test]
+    fn sni_reqwest_dial_is_absent_without_an_override() {
+        let mut proxy = sni_dial_proxy("secure.example.com");
+        proxy.resolved_tls.sni = None;
+        assert!(
+            backend_tls_sni_reqwest_dial(
+                &proxy,
+                "https://10.4.1.9:8443/",
+                "10.4.1.9",
+                Some("10.4.1.9")
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn sni_reqwest_dial_admits_a_target_already_named_by_the_override() {
+        // `effective_host == sni`: the rewrite is a no-op but the server name is
+        // already correct, so this must NOT be treated as the fail-closed case.
+        let proxy = sni_dial_proxy("secure.example.com");
+        let (effective, url) = backend_tls_sni_reqwest_dial(
+            &proxy,
+            "https://secure.example.com:8443/",
+            "secure.example.com",
+            Some("10.4.1.9"),
+        )
+        .expect("an already-matching authority is still a valid dial");
+        assert_eq!(url, "https://secure.example.com:8443/");
+        assert_eq!(effective.dns_override.as_deref(), Some("10.4.1.9"));
+    }
+
+    #[test]
+    fn sni_reqwest_dial_leaves_the_source_proxy_untouched() {
+        let proxy = sni_dial_proxy("secure.example.com");
+        let _ = backend_tls_sni_reqwest_dial(
+            &proxy,
+            "https://10.4.1.9:8443/",
+            "10.4.1.9",
+            Some("10.4.1.9"),
+        )
+        .expect("dial");
+        assert!(proxy.dns_override.is_none(), "source proxy is not mutated");
+        assert!(!proxy.forces_backend_http1_only());
     }
 
     #[test]
