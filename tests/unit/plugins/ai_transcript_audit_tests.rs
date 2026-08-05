@@ -10963,7 +10963,7 @@ async fn grpc_final_hook_headers_are_authoritative_for_request_framing() {
         "decoded gzip excerpt must still redact the email: {request_body}"
     );
     assert!(
-        request_body.contains("[REDACTED]"),
+        request_body.contains("[REDACTED:email"),
         "decoded gzip excerpt must export a redacted placeholder, not merely omit the secret: {request_body}"
     );
     assert!(
