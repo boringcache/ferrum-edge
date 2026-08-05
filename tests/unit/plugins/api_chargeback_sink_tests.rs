@@ -5789,19 +5789,27 @@ fn contended_claim_returns_none_instead_of_stealing() {
         "peer maintenance must not reclaim a live claim"
     );
 
-    // After the winner disappears, the peer recovers the record for delivery.
+    // After the winner disappears, no descriptor remains that can authorize
+    // restoring the claim pathname. The peer leaves it inert for an operator
+    // rather than promoting an unproven artifact into the replayable namespace.
     drop(winner);
     new_gen.prepare_live_storage_for_tests().unwrap();
-    assert!(!claim_path.exists(), "an orphaned claim must be recovered");
-    assert_eq!(
-        new_gen.list_replayable_spool_files_for_tests().unwrap(),
-        vec![record],
-        "safe handoff returns the record to the surviving generation"
+    assert!(
+        claim_path.exists(),
+        "a descriptor-free orphaned claim must remain inert"
     );
+    assert!(
+        new_gen
+            .list_replayable_spool_files_for_tests()
+            .unwrap()
+            .is_empty(),
+        "descriptor-free maintenance must not publish a claim for replay"
+    );
+    assert!(!record.exists());
 }
 
 #[test]
-fn unexpired_peer_claim_is_left_alone_and_expired_one_is_recovered() {
+fn peer_claims_are_never_restored_without_a_live_descriptor() {
     let temp = tempfile::tempdir().unwrap();
     let settings = spool_settings(temp.path(), 1024 * 1024);
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -5827,12 +5835,12 @@ fn unexpired_peer_claim_is_left_alone_and_expired_one_is_recovered() {
         "a peer process's unexpired lease must not be reclaimed"
     );
     assert!(
-        !expired_claim.exists(),
-        "an expired peer lease must be recovered"
+        expired_claim.exists(),
+        "an expired lease is not pathname authority and must remain inert"
     );
     assert!(
-        day.join(&expired_name).exists(),
-        "recovery restores the durable replayable name"
+        !day.join(&expired_name).exists(),
+        "descriptor-free maintenance must not restore the replayable name"
     );
 }
 
@@ -5913,7 +5921,7 @@ fn claiming_a_foreign_or_non_replayable_spool_file_is_refused() {
 }
 
 #[test]
-fn unattributed_claim_is_recovered_only_after_its_lease_horizon() {
+fn unattributed_claim_is_never_restored_without_a_live_descriptor() {
     let temp = tempfile::tempdir().unwrap();
     let spec = test_owner_spec("node-a");
     // A long lease horizon: an unparseable claim marker is treated as a peer's
@@ -5943,7 +5951,8 @@ fn unattributed_claim_is_recovered_only_after_its_lease_horizon() {
         "nothing may be published back to the replayable name yet"
     );
 
-    // The same marker past its horizon is recovered to the durable name.
+    // The same marker past its horizon is reported but remains inert. Age is
+    // not proof that the pathname still names the originally claimed artifact.
     let impatient = SpoolManager::for_tests_with_owner_faults_and_ages(
         spool_settings(temp.path(), 1 << 20),
         &spec,
@@ -5954,17 +5963,19 @@ fn unattributed_claim_is_recovered_only_after_its_lease_horizon() {
     )
     .unwrap();
     assert!(
-        !mangled.exists(),
-        "an unattributable claim past its lease horizon is recovered"
+        mangled.exists(),
+        "an unattributable descriptor-free claim must remain inert"
     );
     assert!(
-        day.join(&data_name).exists(),
-        "recovery restores the durable replayable name"
+        !day.join(&data_name).exists(),
+        "maintenance must not restore an unproven replayable name"
     );
-    assert_eq!(
-        impatient.list_replayable_spool_files_for_tests().unwrap(),
-        vec![day.join(&data_name)],
-        "the recovered record becomes replayable again"
+    assert!(
+        impatient
+            .list_replayable_spool_files_for_tests()
+            .unwrap()
+            .is_empty(),
+        "the unproven record must never become replayable"
     );
 }
 
@@ -8302,6 +8313,25 @@ async fn claim_substituted_after_the_validated_replay_open_is_never_mutated() {
         after.files >= before.files && after.bytes >= before.bytes,
         "no owned-file or owned-byte accounting may be released for a pathname that stopped resolving to the pinned artifact"
     );
+    spool
+        .prepare_live_storage_for_tests()
+        .expect("maintenance reports the abandoned claim without restoring it");
+    assert_eq!(
+        fs::read(&claim).unwrap(),
+        PLANTED_CLAIM_SUBSTITUTE,
+        "descriptor-free maintenance must leave the substitute inert under the claim name"
+    );
+    assert!(
+        !source.exists(),
+        "maintenance must never promote the substitute into the replayable namespace"
+    );
+    assert!(
+        spool
+            .list_replayable_spool_files_for_tests()
+            .unwrap()
+            .is_empty(),
+        "the substituted artifact must remain absent from the replay worklist"
+    );
 }
 
 #[cfg(unix)]
@@ -9031,11 +9061,12 @@ async fn spool_replay_continues_when_quarantine_rename_is_blocked() {
     );
     spool
         .prepare_live_storage_for_tests()
-        .expect("the next prepare restores an abandoned same-process claim");
+        .expect("the next prepare reports the abandoned claim without restoring it");
     assert!(
-        source.exists(),
-        "the unquarantinable poison row must return to its durable name for operator intervention"
+        retained_claims[0].exists(),
+        "the unquarantinable poison row must remain inert under its claim name"
     );
+    assert!(!source.exists());
 }
 
 #[cfg(unix)]

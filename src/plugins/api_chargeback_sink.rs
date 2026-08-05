@@ -6477,6 +6477,7 @@ pub struct SpoolManager {
     usage: SpoolUsageCounters,
     last_drop_warn_at: AtomicI64,
     last_unbound_warn_at: AtomicI64,
+    last_stranded_claim_warn_at: AtomicI64,
     live_storage_prepared: AtomicBool,
     /// Serializes this manager before it contends for the namespace-wide file
     /// lock. Correctness never relies on this process-local guard alone.
@@ -6485,7 +6486,8 @@ pub struct SpoolManager {
     namespace_lock: OnceLock<SpoolNamespaceLock>,
     /// Foreign or unattributable temps are reconciled only once this old.
     stale_temp_age_secs: u64,
-    /// Lifetime of an in-flight replay claim before another owner may recover it.
+    /// Lifetime after which a descriptor-free in-flight claim is reported as
+    /// stranded for operator reconciliation.
     claim_lease_secs: u64,
     /// Durable-write steps; production always uses [`SpoolFsOps::REAL`].
     fs_ops: SpoolFsOps,
@@ -6528,6 +6530,7 @@ impl SpoolManager {
             usage: SpoolUsageCounters::default(),
             last_drop_warn_at: AtomicI64::new(0),
             last_unbound_warn_at: AtomicI64::new(0),
+            last_stranded_claim_warn_at: AtomicI64::new(0),
             live_storage_prepared: AtomicBool::new(false),
             write_lock: Mutex::new(()),
             namespace_lock: OnceLock::new(),
@@ -6685,8 +6688,8 @@ impl SpoolManager {
     }
 
     /// Same as [`Self::for_tests_with_owner_and_faults`] with explicit
-    /// stale-temp and claim-lease horizons, so age-gated recovery is exercised
-    /// without wall-clock sleeps.
+    /// stale-temp and claim-lease horizons, so age-gated stranded-claim
+    /// reporting is exercised without wall-clock sleeps.
     #[doc(hidden)]
     #[allow(dead_code)] // external unit tests only
     pub fn for_tests_with_owner_faults_and_ages(
@@ -7177,9 +7180,10 @@ impl SpoolManager {
             self.initialize_namespace_lock_locked()?;
             let _namespace_guard = self.acquire_namespace_lock_locked()?;
             self.validate_namespace_meta()?;
-            // Recover only claims whose owning process/generation is demonstrably
-            // gone or whose lease expired; a live delivery keeps its claim.
-            self.recover_expired_claims()?;
+            // A descriptor-free claim cannot prove that its pathname still
+            // names the artifact the former owner claimed. Leave stranded
+            // claims inert and surface them for operator reconciliation.
+            self.report_stranded_claims()?;
             return Ok(());
         }
         ensure_private_dir(&self.cfg.dir)?;
@@ -7190,9 +7194,9 @@ impl SpoolManager {
         let _namespace_guard = self.acquire_namespace_lock_locked()?;
         self.persist_or_validate_namespace_meta()?;
         self.scan_unbound_records();
-        self.recover_expired_claims()?;
+        self.report_stranded_claims()?;
         self.reconcile_stale_temp_files()?;
-        // Seed authoritative gauges from the post-recovery tree before the
+        // Seed authoritative gauges from the reconciled tree before the
         // first status/metrics scrape can observe this generation.
         self.publish_usage_from_inventory_locked()?;
         self.live_storage_prepared.store(true, Ordering::Release);
@@ -7335,8 +7339,8 @@ impl SpoolManager {
     /// Callers hold the namespace mutation lock across this proof and the
     /// destructive rename/unlink/accounting it authorizes. A classification that
     /// cannot be completed is [`ClaimMutationError::Unauthorized`] as well: an
-    /// unproven claim never authorizes a mutation, and the lease horizon already
-    /// recovers a claim this tick abandons.
+    /// unproven claim never authorizes a mutation. If the live descriptor is
+    /// later lost, the claim stays inert for operator reconciliation.
     fn require_live_claim(
         &self,
         path: &Path,
@@ -7790,23 +7794,26 @@ impl SpoolManager {
         }
     }
 
-    /// Return crash-left in-flight claims to their durable replayable names.
+    /// Report descriptor-free in-flight claims without restoring them.
     ///
-    /// Live claims held by this process are skipped outright, so in-process
-    /// exclusion is absolute. A claim written by another process (or by an
-    /// earlier run of this one) is recovered only after its lease deadline
-    /// passes. That cross-process bound is temporal, not a proof the peer
-    /// stopped: a peer stalled past its lease can still be delivering. The lease
-    /// is four times the accepted worst-case delivery budget and is renewed per
-    /// chunk so ordinary slow delivery cannot reach that window, and the
-    /// residual outcome is a duplicate insert the stable `event_id` /
-    /// `ReplacingMergeTree` contract deduplicates — never a misrouted or lost
-    /// record, because the owner tag still gates the destination.
-    fn recover_expired_claims(&self) -> Result<(), String> {
+    /// A lease horizon proves only that no live task is expected to own the
+    /// pathname. It does not prove that the pathname still names the artifact
+    /// the former task claimed: a same-UID actor can replace an abandoned claim
+    /// and preserve its ownership-bearing filename. Restoring such a pathname
+    /// would promote the replacement into the replayable namespace and let the
+    /// filename, rather than an authoritative descriptor, select the billing
+    /// destination.
+    ///
+    /// Live claim handles retain the only automatic release capability through
+    /// [`Self::release_claim_bound`]. Once that descriptor is gone, the claim is
+    /// deliberately left inert for evidence-backed operator reconciliation.
+    /// The persistent owned-file/byte inventory still counts it.
+    fn report_stranded_claims(&self) -> Result<(), String> {
         let mut claims = Vec::new();
         self.collect(&mut claims, SpoolFileClass::Inflight)?;
         let now = unix_timestamp_seconds();
         let wall_clock = SystemTime::now();
+        let mut stranded = 0u64;
         for path in claims {
             self.assert_managed_path(&path)?;
             if is_live_spool_path(&path) {
@@ -7815,42 +7822,50 @@ impl SpoolManager {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            let reason = match parse_spool_claim(name) {
+            let report = match parse_spool_claim(name) {
                 Some(claim) if claim.process_tag == spool_process_tag() => {
-                    // Our process, no live lease: the owning replay task was
-                    // aborted or its generation was dropped mid-delivery.
-                    "aborted delivery in this process"
+                    // Our process, no live descriptor: the owning replay task
+                    // was aborted or deliberately refused a mutation.
+                    true
                 }
-                Some(claim) if now >= claim.lease_deadline_unix => "expired peer claim lease",
-                Some(_) => continue,
+                Some(claim) => now >= claim.lease_deadline_unix,
                 None => {
-                    // Unparseable claim marker: treat conservatively as a peer's
-                    // and wait out a full lease horizon by mtime.
-                    if !spool_temp_is_stale(&path, wall_clock, self.claim_lease_secs)? {
-                        continue;
-                    }
-                    "expired unattributed claim"
+                    // Unparseable claim marker: treat conservatively as live
+                    // peer work until a full lease horizon has elapsed.
+                    spool_temp_is_stale(&path, wall_clock, self.claim_lease_secs)?
                 }
             };
-            let Some(restored) = self.restore_claim_path(&path)? else {
-                continue;
-            };
-            warn!(
-                plugin = PLUGIN_NAME,
-                path = %path.display(),
-                restored = %restored.display(),
-                generation = self.generation,
-                reason,
-                "Chargeback sink recovered an in-flight spool claim"
-            );
+            if report {
+                stranded = stranded.saturating_add(1);
+            }
         }
+        if stranded == 0 {
+            return Ok(());
+        }
+        let last = self.last_stranded_claim_warn_at.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < SPOOL_WARN_INTERVAL_SECS
+            || self
+                .last_stranded_claim_warn_at
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return Ok(());
+        }
+        warn!(
+            plugin = PLUGIN_NAME,
+            generation = self.generation,
+            stranded_claims = stranded,
+            spool_dir = %self.cfg.dir.display(),
+            managed_namespace = %self.namespace_root.display(),
+            "Chargeback sink left descriptor-free in-flight spool claims inert; automatic restoration is refused because their pathname identity is no longer authoritative, and an operator must verify and reconcile them (rate-limited)"
+        );
         Ok(())
     }
 
     /// Rename one claim back to its durable replayable name.
     ///
-    /// `Ok(None)` means the claim disappeared (already recovered or finalized by
-    /// its owner) and is not an error.
+    /// `Ok(None)` means the claim disappeared before its live owner completed a
+    /// bound release and is not an error.
     fn restore_claim_path(&self, claim: &Path) -> Result<Option<PathBuf>, String> {
         let restored = spool_claim_restore_path(claim)?;
         self.assert_managed_path(&restored)?;
@@ -8077,8 +8092,8 @@ impl SpoolManager {
             .map_err(ClaimMutationError::Unauthorized)?
         {
             ManagedClaimState::LiveClaim => {}
-            // A cross-process lease horizon can legitimately recover a claim
-            // this owner still held. Nothing is left to unlink or account.
+            // Another actor may already have removed the claim. Nothing is left
+            // to unlink or account, and no pathname is recreated here.
             ManagedClaimState::Missing => {
                 warn!(
                     plugin = PLUGIN_NAME,
