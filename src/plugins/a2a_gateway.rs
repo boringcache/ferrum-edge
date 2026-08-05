@@ -16,8 +16,8 @@ use url::Url;
 
 use super::utils::policy_digest;
 use super::{
-    A2aGrpcCardRewriteState, HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext,
-    ResponseStreamAction, ResponseStreamInspector,
+    A2aGrpcCardRewriteState, A2aGrpcCardSchema, HTTP_GRPC_PROTOCOLS, Plugin, PluginResult,
+    RequestContext, ResponseStreamAction, ResponseStreamInspector,
 };
 
 /// Domain separator and schema version for [`A2aGateway`] replay provenance.
@@ -30,8 +30,40 @@ const DEFAULT_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 const DEFAULT_PROTOCOL_VERSION: &str = "0.3.0";
 const DEFAULT_VERSION_HEADER: &str = "A2A-Version";
 const DEFAULT_MAX_DETECTION_BODY_BYTES: u64 = 1024 * 1024;
-const DEFAULT_GRPC_SERVICE: &str = "lf.a2a.v1.A2AService";
+/// Canonical gRPC service of the A2A protocol version this plugin implements.
+///
+/// `a2aproject/A2A` at tag `v0.3.0`, `specification/grpc/a2a.proto`, declares
+/// `package a2a.v1; service A2AService`, so the fully-qualified name is
+/// `a2a.v1.A2AService`. It is the default precisely because it is the identity
+/// whose `AgentCard` layout [`DEFAULT_PROTOCOL_VERSION`] describes; A2A 1.0's
+/// `lf.a2a.v1.A2AService` is a different package carrying a renumbered card and
+/// is never defaulted in (see [`A2A_10_GRPC_SERVICE`]).
+const DEFAULT_GRPC_SERVICE: &str = "a2a.v1.A2AService";
+/// A2A 1.0's gRPC service (`package lf.a2a.v1`). Recognized so an operator can
+/// detect and police 1.0 traffic; its Agent Card layout is not one this
+/// rewriter implements, so card rewriting on it fails closed.
+const A2A_10_GRPC_SERVICE: &str = "lf.a2a.v1.A2AService";
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+
+/// The published A2A gRPC service identities and the `AgentCard` wire layout
+/// each one carries, per the A2A specification.
+///
+/// A service name in this table has a schema fixed by the spec, so declaring a
+/// contradicting `card_schema` for one is a configuration error rather than an
+/// override — the layout is a property of the published protocol, not of the
+/// deployment. Any other (custom) service name has no published schema and must
+/// declare one explicitly to be rewritable.
+const WELL_KNOWN_GRPC_SERVICE_SCHEMAS: &[(&str, A2aGrpcCardSchema)] = &[
+    (DEFAULT_GRPC_SERVICE, A2aGrpcCardSchema::A2a03),
+    (A2A_10_GRPC_SERVICE, A2aGrpcCardSchema::A2a10),
+];
+
+/// Config spelling of [`A2aGrpcCardSchema::A2a03`].
+const CARD_SCHEMA_A2A_03: &str = "a2a-0.3";
+/// Config spelling of [`A2aGrpcCardSchema::A2a10`].
+const CARD_SCHEMA_A2A_10: &str = "a2a-1.0";
+/// Config spelling of [`A2aGrpcCardSchema::Undeclared`].
+const CARD_SCHEMA_NONE: &str = "none";
 
 /// The complete A2A 0.3.x `AgentCard` top-level field table (`a2aproject/A2A`
 /// at tag `v0.3.0`, `specification/grpc/a2a.proto`, "Next ID: 18"). Wire surgery
@@ -48,7 +80,9 @@ const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 /// `protocol_version` was removed outright. Applying the constants below to a
 /// 1.0 card would replace each interface submessage with a bare URL string while
 /// leaving the real signatures untouched, so the rewrite path must first prove
-/// the 0.3 layout — see [`supports_agent_card_protobuf_layout`].
+/// the 0.3 layout twice over: the gRPC service must be declared to carry it
+/// ([`require_rewritable_card_schema`]) and the card must claim a configured 0.3
+/// version on the wire ([`supports_agent_card_protobuf_layout`]).
 const AGENT_CARD_PB_NAME: u32 = 1;
 const AGENT_CARD_PB_DESCRIPTION: u32 = 2;
 const AGENT_CARD_PB_URL: u32 = 3;
@@ -162,7 +196,11 @@ struct A2aEndpointConfig {
     path: String,
     agent_card_path: String,
     protocol_versions: Vec<String>,
-    grpc_services: HashSet<String>,
+    /// Configured A2A gRPC services, each mapped to the `AgentCard` wire layout
+    /// it is declared to carry. Detection membership and card-layout selection
+    /// are the same lookup, so a service can never be detected without its
+    /// schema disposition also being known.
+    grpc_services: HashMap<String, A2aGrpcCardSchema>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +250,10 @@ struct A2aDetection {
     task_id_hint: Option<String>,
     streaming_hint: bool,
     is_agent_card: bool,
+    /// For the gRPC binding, the `AgentCard` layout the matched service is
+    /// configured to carry. `None` for the HTTP bindings, whose card is JSON
+    /// and carries no protobuf layout question.
+    grpc_card_schema: Option<A2aGrpcCardSchema>,
     oversized_body: bool,
     inspection_failed: bool,
 }
@@ -518,6 +560,7 @@ impl A2aGateway {
                     task_id_hint: None,
                     streaming_hint: false,
                     is_agent_card: false,
+                    grpc_card_schema: None,
                     oversized_body: true,
                     inspection_failed: false,
                 });
@@ -593,6 +636,7 @@ impl A2aGateway {
             jsonrpc_batch_response: false,
             task_id_hint: extract_task_id_from_request(value),
             is_agent_card,
+            grpc_card_schema: None,
             oversized_body: false,
             inspection_failed: false,
         })
@@ -610,6 +654,7 @@ impl A2aGateway {
             task_id_hint: None,
             streaming_hint: false,
             is_agent_card: false,
+            grpc_card_schema: None,
             oversized_body: false,
             inspection_failed: true,
         })
@@ -627,6 +672,7 @@ impl A2aGateway {
                 task_id_hint: None,
                 streaming_hint: false,
                 is_agent_card: true,
+                grpc_card_schema: None,
                 oversized_body: false,
                 inspection_failed: false,
             });
@@ -646,6 +692,7 @@ impl A2aGateway {
                     | "agent/getExtendedAgentCard"
                     | "agent/getAuthenticatedExtendedCard"
             ),
+            grpc_card_schema: None,
             oversized_body: false,
             inspection_failed: false,
         })
@@ -661,9 +708,11 @@ impl A2aGateway {
         }
         let normalized = ctx.path.strip_prefix('/').unwrap_or(ctx.path.as_str());
         let (service, grpc_method) = normalized.split_once('/')?;
-        if !self.endpoint.grpc_services.contains(service) {
-            return None;
-        }
+        // One lookup answers both "is this an A2A service?" and "which Agent
+        // Card layout does it carry?", so a detected service always has a known
+        // schema disposition and the response path never has to re-derive a
+        // service identity from a path the proxy may have rebased.
+        let card_schema = *self.endpoint.grpc_services.get(service)?;
         let (operation, streaming) = grpc_operation(grpc_method)?;
         Some(A2aDetection {
             binding: A2aBinding::Grpc,
@@ -673,6 +722,7 @@ impl A2aGateway {
             task_id_hint: None,
             streaming_hint: streaming,
             is_agent_card: is_agent_card_method(operation),
+            grpc_card_schema: Some(card_schema),
             oversized_body: false,
             inspection_failed: false,
         })
@@ -688,6 +738,7 @@ impl A2aGateway {
         ctx.a2a_gateway_binding = Some(detection.binding.as_str());
         ctx.a2a_gateway_is_agent_card = detection.is_agent_card;
         ctx.a2a_gateway_streaming = detection.streaming_hint;
+        ctx.a2a_gateway_grpc_card_schema = detection.grpc_card_schema;
 
         if !self.observability.emit_metadata {
             return;
@@ -823,6 +874,7 @@ impl A2aGateway {
         match validate_grpc_agent_card_rewrite(
             body,
             response_headers,
+            ctx.a2a_gateway_grpc_card_schema,
             &self.endpoint.protocol_versions,
         ) {
             Ok(()) => {
@@ -1228,9 +1280,11 @@ impl Plugin for A2aGateway {
         // `0 = unlimited` is folded to the retained-response fallback here; a
         // raw effective limit of 0 would make the sink refuse every write.
         let ceiling = ctx.retained_response_body_ceiling();
+        let card_schema = ctx.a2a_gateway_grpc_card_schema;
         match rewrite_grpc_agent_card_frame(
             body,
             response_headers,
+            card_schema,
             &public_base,
             &self.endpoint.path,
             &self.endpoint.protocol_versions,
@@ -1347,26 +1401,137 @@ fn parse_endpoint(object: &Map<String, Value>) -> Result<A2aEndpointConfig, Stri
             "a2a_gateway: 'endpoint.protocol_versions' entries must not be empty".to_string(),
         );
     }
-    let grpc_services = optional_string_vec_from_object(endpoint, "grpc_services")?
-        .unwrap_or_else(|| vec![DEFAULT_GRPC_SERVICE.to_string()]);
-    if grpc_services.is_empty() {
+    let grpc_services = parse_grpc_services(endpoint)?;
+    Ok(A2aEndpointConfig {
+        path,
+        agent_card_path,
+        protocol_versions,
+        grpc_services,
+    })
+}
+
+/// Parse `endpoint.grpc_services` into service name → declared Agent Card
+/// layout.
+///
+/// Two accepted item shapes, and both leave the schema relationship stated
+/// rather than inferred:
+///
+/// - A bare string. A published A2A service name resolves to the layout the
+///   specification gives it ([`WELL_KNOWN_GRPC_SERVICE_SCHEMAS`]); any other
+///   name has no published card layout, so it resolves to
+///   [`A2aGrpcCardSchema::Undeclared`] — detected and policed, never decoded.
+/// - `{service, card_schema}`. The explicit form a custom deployment uses to
+///   declare which published layout its own service actually serves.
+///
+/// Declaring a `card_schema` that contradicts a published service name is
+/// refused: the layout of `a2a.v1.A2AService` is a property of A2A 0.3, not a
+/// per-deployment choice, and silently honoring an override is exactly how a
+/// renumbered card ends up in the 0.3 decoder.
+fn parse_grpc_services(
+    endpoint: Option<&Map<String, Value>>,
+) -> Result<HashMap<String, A2aGrpcCardSchema>, String> {
+    let items = match endpoint.and_then(|endpoint| endpoint.get("grpc_services")) {
+        None | Some(Value::Null) => return Ok(default_grpc_services()),
+        Some(items) => items,
+    };
+    let items = items
+        .as_array()
+        .ok_or_else(|| "a2a_gateway: 'endpoint.grpc_services' must be an array".to_string())?;
+    if items.is_empty() {
         return Err("a2a_gateway: 'endpoint.grpc_services' must not be empty".to_string());
     }
-    let mut grpc_service_set = HashSet::with_capacity(grpc_services.len());
-    for service in grpc_services {
-        validate_grpc_service(&service)?;
-        if !grpc_service_set.insert(service.clone()) {
+    let mut services = HashMap::with_capacity(items.len());
+    for item in items {
+        let (service, declared) = parse_grpc_service_entry(item)?;
+        validate_grpc_service(service)?;
+        let published = published_card_schema(service);
+        let schema = match (published, declared) {
+            // A published A2A service: the specification fixes its layout, so a
+            // contradicting declaration is a configuration error rather than an
+            // override. Restating the correct one is allowed and is a no-op.
+            (Some(published), Some(declared)) if published != declared => {
+                let published = card_schema_name(published);
+                let declared = card_schema_name(declared);
+                return Err(format!(
+                    "a2a_gateway: endpoint.grpc_services entry {service:?} is a published A2A \
+                     service whose Agent Card layout is {published:?}; it cannot declare \
+                     card_schema {declared:?}"
+                ));
+            }
+            (Some(published), _) => published,
+            // A custom service name: whatever the operator declared, or no
+            // declared layout at all.
+            (None, Some(declared)) => declared,
+            (None, None) => A2aGrpcCardSchema::Undeclared,
+        };
+        if services.insert(service.to_string(), schema).is_some() {
             return Err(format!(
                 "a2a_gateway: duplicate endpoint.grpc_services entry {service:?}"
             ));
         }
     }
-    Ok(A2aEndpointConfig {
-        path,
-        agent_card_path,
-        protocol_versions,
-        grpc_services: grpc_service_set,
-    })
+    Ok(services)
+}
+
+fn default_grpc_services() -> HashMap<String, A2aGrpcCardSchema> {
+    let mut services = HashMap::with_capacity(1);
+    services.insert(DEFAULT_GRPC_SERVICE.to_string(), A2aGrpcCardSchema::A2a03);
+    services
+}
+
+/// The Agent Card layout the A2A specification gives this service name, when it
+/// is one of the published identities.
+fn published_card_schema(service: &str) -> Option<A2aGrpcCardSchema> {
+    WELL_KNOWN_GRPC_SERVICE_SCHEMAS
+        .iter()
+        .find(|(name, _)| *name == service)
+        .map(|(_, schema)| *schema)
+}
+
+/// Split one `endpoint.grpc_services` item into its service name and the card
+/// layout it explicitly declares, if any.
+fn parse_grpc_service_entry(item: &Value) -> Result<(&str, Option<A2aGrpcCardSchema>), String> {
+    match item {
+        Value::String(service) => Ok((service.as_str(), None)),
+        Value::Object(entry) => {
+            let service = match optional_string(entry, "service")? {
+                Some(service) => service,
+                None => return Err(GRPC_SERVICE_ENTRY_NEEDS_SERVICE.to_string()),
+            };
+            let declared = match optional_string(entry, "card_schema")? {
+                Some(value) => Some(parse_card_schema(value)?),
+                None => None,
+            };
+            Ok((service, declared))
+        }
+        other => Err(format!(
+            "a2a_gateway: 'endpoint.grpc_services' entries must be a service name string or a \
+             {{service, card_schema}} object, got {other}"
+        )),
+    }
+}
+
+const GRPC_SERVICE_ENTRY_NEEDS_SERVICE: &str =
+    "a2a_gateway: 'endpoint.grpc_services' object entries require 'service'";
+
+fn parse_card_schema(value: &str) -> Result<A2aGrpcCardSchema, String> {
+    match value {
+        CARD_SCHEMA_A2A_03 => Ok(A2aGrpcCardSchema::A2a03),
+        CARD_SCHEMA_A2A_10 => Ok(A2aGrpcCardSchema::A2a10),
+        CARD_SCHEMA_NONE => Ok(A2aGrpcCardSchema::Undeclared),
+        other => Err(format!(
+            "a2a_gateway: 'endpoint.grpc_services[].card_schema' must be {CARD_SCHEMA_A2A_03:?}, \
+             {CARD_SCHEMA_A2A_10:?}, or {CARD_SCHEMA_NONE:?}, got {other:?}"
+        )),
+    }
+}
+
+fn card_schema_name(schema: A2aGrpcCardSchema) -> &'static str {
+    match schema {
+        A2aGrpcCardSchema::A2a03 => CARD_SCHEMA_A2A_03,
+        A2aGrpcCardSchema::A2a10 => CARD_SCHEMA_A2A_10,
+        A2aGrpcCardSchema::Undeclared => CARD_SCHEMA_NONE,
+    }
 }
 
 fn parse_detection(object: &Map<String, Value>) -> Result<A2aDetectionConfig, String> {
@@ -2119,6 +2284,35 @@ enum AgentCardRewriteRefusal {
     Capacity,
 }
 
+/// Prove the gRPC SERVICE this reply came from is declared to carry the A2A 0.3
+/// `AgentCard` layout, before a single byte of it is interpreted.
+///
+/// This is the service-identity half of the gate, and it is deliberately first:
+/// a decoder is chosen by the protocol the endpoint speaks, never by whichever
+/// layout the bytes could be coerced into. A2A publishes two gRPC packages —
+/// `a2a.v1` (0.3) and `lf.a2a.v1` (1.0) — with materially different `AgentCard`
+/// field numbers, so applying the 0.3 rewriter to a 1.0 service would replace
+/// each `AgentInterface` submessage with a bare URL string and leave the real
+/// signatures in place.
+///
+/// The two refusals are distinct facts and get distinct diagnostics:
+/// `agent_card_grpc_schema_unsupported` means "this service's card layout is a
+/// known one this gateway does not implement", and
+/// `agent_card_grpc_schema_undeclared` means "this custom service never declared
+/// a layout, so there is nothing to implement against". Neither is a complaint
+/// about the card's own `protocol_version`, which is checked separately once the
+/// layout question is settled.
+fn require_rewritable_card_schema(schema: Option<A2aGrpcCardSchema>) -> Result<(), &'static str> {
+    match schema {
+        Some(A2aGrpcCardSchema::A2a03) => Ok(()),
+        Some(A2aGrpcCardSchema::A2a10) => Err("agent_card_grpc_schema_unsupported"),
+        // `None` is a gRPC Agent Card response with no recorded service
+        // detection at all — unreachable through `should_rewrite_grpc_agent_card`,
+        // and treated exactly like an undeclared layout rather than assumed 0.3.
+        Some(A2aGrpcCardSchema::Undeclared) | None => Err("agent_card_grpc_schema_undeclared"),
+    }
+}
+
 /// Decode, schema-validate, and version-gate a unary gRPC Agent Card body.
 ///
 /// This is the single admission funnel: `on_response_body` calls it to decide
@@ -2126,22 +2320,29 @@ enum AgentCardRewriteRefusal {
 /// same bytes, so the two phases can never disagree about whether a card is
 /// rewritable. It allocates nothing — every returned string borrows `body`.
 ///
-/// A card that does not carry an explicit A2A 0.3.x `protocol_version` naming a
-/// configured version is rejected with
-/// `unsupported_agent_card_protobuf_version` rather than forwarded — see
-/// [`supports_agent_card_protobuf_layout`].
+/// A card on a service that does not declare the A2A 0.3 layout is rejected
+/// before decoding ([`require_rewritable_card_schema`]); one that does not then
+/// carry an explicit A2A 0.3.x `protocol_version` naming a configured version is
+/// rejected with `unsupported_agent_card_protobuf_version` rather than forwarded
+/// — see [`supports_agent_card_protobuf_layout`].
 fn admit_grpc_agent_card_frame<'a>(
     body: &'a [u8],
     response_headers: &HashMap<String, String>,
+    card_schema: Option<A2aGrpcCardSchema>,
     configured_versions: &[String],
 ) -> Result<AdmittedAgentCard<'a>, &'static str> {
+    // Question zero, before a byte is read: does the SERVICE this reply came
+    // from declare the layout this rewriter implements? A decoder is selected by
+    // the endpoint's protocol, never by what the bytes could be read as.
+    require_rewritable_card_schema(card_schema)?;
     let message = extract_uncompressed_unary_grpc_message(body, response_headers)?;
-    // Three ordered questions, because the diagnostic a client sees should name
-    // the FIRST thing that is actually wrong:
+    // Then three ordered questions, because the diagnostic a client sees should
+    // name the FIRST thing that is actually wrong:
     //
     //   1. Does this decode as protobuf, and is it Agent-Card shaped at all?
-    //   2. Is its wire layout one this rewriter implements and the operator
-    //      configured? A renumbered A2A 1.0 card answers "no" here, and
+    //   2. Is its point release one this rewriter implements and the operator
+    //      configured? A renumbered A2A 1.0 card served over a 0.3-declared
+    //      service answers "no" here, and
     //      `unsupported_agent_card_protobuf_version` is the accurate, documented
     //      reason — not a complaint about a field 3 whose 0.3 meaning it never
     //      claimed to have.
@@ -2170,9 +2371,11 @@ fn admit_grpc_agent_card_frame<'a>(
 fn validate_grpc_agent_card_rewrite(
     body: &[u8],
     response_headers: &HashMap<String, String>,
+    card_schema: Option<A2aGrpcCardSchema>,
     configured_versions: &[String],
 ) -> Result<(), &'static str> {
-    admit_grpc_agent_card_frame(body, response_headers, configured_versions).map(|_| ())
+    admit_grpc_agent_card_frame(body, response_headers, card_schema, configured_versions)
+        .map(|_| ())
 }
 
 /// Rewrite a unary gRPC Agent Card frame straight into a ceiling-aware sink.
@@ -2202,8 +2405,10 @@ fn validate_grpc_agent_card_rewrite(
 /// Both passes are single, bounded, allocation-free walks of the input, so the
 /// CPU cost stays linear in the response size with a small constant factor.
 ///
-/// "Fail closed" includes any card that does not prove the 0.3 layout: an
-/// absent/empty or non-configured `protocol_version` yields
+/// "Fail closed" includes any card that does not prove the 0.3 layout: a gRPC
+/// service that does not declare the 0.3 card schema yields
+/// `agent_card_grpc_schema_unsupported` / `agent_card_grpc_schema_undeclared`,
+/// an absent/empty or non-configured `protocol_version` yields
 /// `unsupported_agent_card_protobuf_version`, a known field with the wrong wire
 /// type or a duplicated singular field yields
 /// `agent_card_protobuf_field_wire_mismatch` / `..._field_duplicated`, and a URL
@@ -2213,13 +2418,15 @@ fn validate_grpc_agent_card_rewrite(
 fn rewrite_grpc_agent_card_frame(
     body: &[u8],
     response_headers: &HashMap<String, String>,
+    card_schema: Option<A2aGrpcCardSchema>,
     public_base: &str,
     endpoint_path: &str,
     configured_versions: &[String],
     ceiling: usize,
 ) -> Result<Option<Vec<u8>>, AgentCardRewriteRefusal> {
-    let card = admit_grpc_agent_card_frame(body, response_headers, configured_versions)
-        .map_err(AgentCardRewriteRefusal::Diagnostic)?;
+    let admitted =
+        admit_grpc_agent_card_frame(body, response_headers, card_schema, configured_versions);
+    let card = admitted.map_err(AgentCardRewriteRefusal::Diagnostic)?;
     // The one public URL every rewritten field reuses. Built once per response,
     // never per field and never per interface.
     let new_url = format!("{}{}", public_base.trim_end_matches('/'), endpoint_path);
@@ -2310,6 +2517,12 @@ fn rewrite_grpc_agent_card_frame(
 
 /// Decide whether a decoded card may be rewritten with the 0.3.x field numbers.
 ///
+/// This runs only AFTER [`require_rewritable_card_schema`] has proved the gRPC
+/// service itself is declared to carry the 0.3 layout. The two checks answer
+/// different questions and neither substitutes for the other: the service says
+/// which `AgentCard` schema the endpoint speaks, the wire version says which
+/// point release of that schema this particular card claims.
+///
 /// Two independent conditions, both required:
 ///
 /// 1. **The wire version is one the operator configured.**
@@ -2398,6 +2611,16 @@ const MAX_AGENT_CARD_URL_BYTES: usize = 4096;
 /// Only the boolean verdict leaves this function: the parsed/normalized form is
 /// never emitted, so the backend's own bytes are what get preserved when no
 /// rewrite is needed.
+///
+/// **Where the proof stops.** This is the WHATWG grammar, not a stricter
+/// spelling rule, so a value the standard accepts is accepted here even when it
+/// looks unusual — `http:///a2a` is host `a2a`, because the
+/// special-authority-ignore-slashes state consumes the extra slash. That is
+/// correct and safe: only the verdict is used, the preserved bytes are the
+/// backend's own, and a client resolves them under the identical rule. What the
+/// checks above genuinely exclude is a value that is not a URL at all, which is
+/// what a serialized `AgentInterface` submessage is — its leading tag byte
+/// (`0x0a`) is refused by the control-character bound before parsing.
 fn is_absolute_http_url(value: &str) -> bool {
     if value.is_empty() || value.len() > MAX_AGENT_CARD_URL_BYTES {
         return false;

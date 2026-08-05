@@ -22,14 +22,30 @@
 //! 4. Assert reload behaviour: a changed public base and a withdrawn
 //!    `rewrite_agent_card_urls` both take effect on a SIGHUP'd running gateway,
 //!    so the feature is not merely correct at first construction.
+//! 5. Assert the service/payload pairing is the OFFICIAL one: the canonical A2A
+//!    0.3 service `a2a.v1.A2AService` carries the 0.3 card layout and is the
+//!    default, while A2A 1.0's `lf.a2a.v1.A2AService` can never be decoded or
+//!    rewritten as 0.3.
 //!
 //! The harness is deliberately the bounded one `functional_grpc_plugins_test` /
 //! `functional_websocket_test` use: one echo backend holding its own pre-bound
 //! listener, and one gateway child spawned onto simultaneously-held proxy/admin
 //! port reservations that are released only at the spawn call, with readiness
 //! proven by the authenticated `/health` detail tier for that attempt's own
-//! bearer token — never by a bare TCP accept or a sleep. Bounded retry on fresh
-//! reservations and a fresh token; no unbounded servers.
+//! bearer token — never by a bare TCP accept or a sleep. No unbounded servers.
+//!
+//! Two harness properties are load-bearing and covered by their own plain
+//! (non-`#[ignore]`) guards at the bottom of this file:
+//!
+//! - **Retry is positive.** The child's stdout/stderr are captured to files and
+//!   a spawn attempt is retried ONLY when those diagnostics demonstrate an
+//!   address-in-use bind race. A config parse error, a child panic, or a failed
+//!   readiness/authentication check fails immediately with the captured tail
+//!   (bearer token redacted) rather than being re-rolled into "did not start".
+//! - **Every live call is bounded.** `send_grpc_request` carries a per-call
+//!   timeout, and the reload poll loop hands each call the smaller of that
+//!   ceiling and its own remaining deadline, so a wedged gateway fails
+//!   diagnostically instead of hanging.
 //!
 //! Run with:
 //! `cargo test --test functional_tests functional_a2a_gateway_grpc_card -- --ignored --nocapture`
@@ -43,8 +59,9 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -56,7 +73,18 @@ const PUBLIC_BASE: &str = "https://agents.example.com";
 // gateway on Windows.
 #[cfg_attr(not(unix), allow(dead_code))]
 const ALTERNATE_PUBLIC_BASE: &str = "https://agents-2.example.com";
-const A2A_SERVICE: &str = "/lf.a2a.v1.A2AService";
+/// The canonical A2A **0.3** gRPC service: `a2aproject/A2A` at tag `v0.3.0`,
+/// `specification/grpc/a2a.proto`, declares `package a2a.v1; service
+/// A2AService`. It is the identity whose `AgentCard` layout these fixtures
+/// encode and whose `protocol_version` the gateway is configured to admit, so
+/// the live path exercises a real, self-consistent A2A 0.3 pairing.
+const A2A_SERVICE: &str = "/a2a.v1.A2AService";
+/// A2A **1.0**'s gRPC service (`package lf.a2a.v1`), whose `AgentCard` is
+/// renumbered. Used only to prove this identity is never fed to the 0.3
+/// decoder — never as a stand-in for the 0.3 service above.
+const A2A_10_SERVICE: &str = "/lf.a2a.v1.A2AService";
+/// `endpoint.grpc_services` as the default resolves it.
+const DEFAULT_GRPC_SERVICES: &str = r#"["a2a.v1.A2AService"]"#;
 
 // ============================================================================
 // A2A 0.3 protobuf fixtures
@@ -346,6 +374,117 @@ fn gateway_binary_path() -> &'static str {
     }
 }
 
+/// Upper bound on the child output surfaced in a failure message.
+///
+/// The child runs at `ferrum_edge=debug`, so its log can be large; only the
+/// TAIL is read (the file is seeked, not slurped) because the fault that ended
+/// startup is always the last thing written.
+const MAX_DIAGNOSTIC_BYTES: u64 = 4096;
+
+/// Per-attempt capture files for the gateway child's stdout and stderr.
+///
+/// Files rather than `Stdio::piped()` on purpose: a pipe nobody reads while the
+/// child is still starting deadlocks once the pipe buffer fills, which is
+/// exactly the window this harness spends polling for readiness. Files never
+/// block the writer, and they can be read after the child is reaped.
+struct AttemptLogs {
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+/// Bounded, secret-free child output for one failed attempt.
+struct ChildDiagnostics {
+    stdout: String,
+    stderr: String,
+}
+
+impl AttemptLogs {
+    fn create(dir: &Path, attempt: u32) -> Self {
+        Self {
+            stdout: dir.join(format!("gateway-attempt-{attempt}.out")),
+            stderr: dir.join(format!("gateway-attempt-{attempt}.err")),
+        }
+    }
+
+    fn stdio(&self) -> std::io::Result<(std::process::Stdio, std::process::Stdio)> {
+        Ok((
+            std::process::Stdio::from(std::fs::File::create(&self.stdout)?),
+            std::process::Stdio::from(std::fs::File::create(&self.stderr)?),
+        ))
+    }
+
+    /// Read the tail of both captures with the attempt's bearer token removed.
+    ///
+    /// That token is the only secret this harness injects, and it unlocks the
+    /// authenticated admin detail tier, so it must not reach a CI log even
+    /// though the attempt that minted it is already void.
+    fn read_bounded(&self, secret: &str) -> ChildDiagnostics {
+        ChildDiagnostics {
+            stdout: read_tail_redacted(&self.stdout, secret),
+            stderr: read_tail_redacted(&self.stderr, secret),
+        }
+    }
+}
+
+fn read_tail_redacted(path: &Path, secret: &str) -> String {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return format!("<unavailable: {error}>"),
+    };
+    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    if len > MAX_DIAGNOSTIC_BYTES {
+        let tail = SeekFrom::End(-(MAX_DIAGNOSTIC_BYTES as i64));
+        if file.seek(tail).is_err() {
+            return "<unavailable: could not seek to the log tail>".to_string();
+        }
+    }
+    let mut buffer = Vec::new();
+    if let Err(error) = file.read_to_end(&mut buffer) {
+        return format!("<unavailable: {error}>");
+    }
+    let text = String::from_utf8_lossy(&buffer);
+    redact_secret(&text, secret)
+}
+
+/// Replace every occurrence of the attempt's bearer token. An empty `secret`
+/// would otherwise make `replace` splice the marker between every character.
+fn redact_secret(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return text.to_string();
+    }
+    text.replace(secret, "<redacted-probe-token>")
+}
+
+/// Substrings that DEMONSTRATE the child lost a race for a port it was handed,
+/// which is the one startup failure a fresh-port retry can actually fix.
+///
+/// Both the platform-independent `std::io::Error` text and the raw errno
+/// spellings are listed, because the message a failed bind surfaces depends on
+/// whether it was formatted with `Display` or `Debug` and on the OS.
+const ADDRESS_IN_USE_MARKERS: &[&str] = &[
+    "address already in use",
+    "addrinuse",
+    // EADDRINUSE: macOS/BSD 48, Linux 98, Windows WSAEADDRINUSE 10048.
+    "os error 48",
+    "os error 98",
+    "os error 10048",
+];
+
+/// Whether the captured child output proves an address-in-use bind race.
+///
+/// Everything else — a config parse error, a rejected plugin composition, a
+/// panic, an authentication mismatch, a child that simply never became ready —
+/// is DETERMINISTIC: the next attempt would reproduce it on fresh ports, so
+/// retrying only converts an actionable failure into "did not start after 3
+/// attempts". Classification is positive: an unrecognized failure is not a bind
+/// race.
+fn bind_race_diagnosed(stdout: &str, stderr: &str) -> bool {
+    let haystack = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    ADDRESS_IN_USE_MARKERS
+        .iter()
+        .any(|marker| haystack.contains(marker))
+}
+
 /// Spawn the gateway on two ports this attempt still HOLDS.
 ///
 /// Both reservations stay live while the environment is prepared, which is what
@@ -360,9 +499,11 @@ fn start_gateway(
     gateway: PortReservation,
     admin: PortReservation,
     observability_token: &str,
+    logs: &AttemptLogs,
 ) -> Result<(std::process::Child, u16, u16), Box<dyn std::error::Error>> {
     let http_port = gateway.port;
     let admin_port = admin.port;
+    let (stdout, stderr) = logs.stdio()?;
     let mut command = std::process::Command::new(gateway_binary_path());
     command
         .env("FERRUM_MODE", "file")
@@ -377,8 +518,8 @@ fn start_gateway(
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(stdout)
+        .stderr(stderr);
 
     // Release both ports only now, immediately before the child binds them.
     drop(gateway);
@@ -461,65 +602,103 @@ async fn wait_for_owned_gateway(
     }
 }
 
-/// Bounded spawn retry. Every attempt takes fresh, simultaneously-held port
-/// reservations and a fresh ownership token, so a failed attempt never leaves a
-/// half-claimed port or a reusable credential behind.
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+/// Bounded spawn retry for the ONE non-deterministic startup failure.
+///
+/// Every attempt takes fresh, simultaneously-held port reservations and a fresh
+/// ownership token, so a failed attempt never leaves a half-claimed port or a
+/// reusable credential behind. What changed for the root review is *when* a
+/// retry happens at all: a retry is only taken when the child's own captured
+/// diagnostics DEMONSTRATE an address-in-use bind race
+/// ([`bind_race_diagnosed`]) — the race that exists because a reservation must
+/// be released before the child can bind it.
+///
+/// Every other failure is deterministic and fails immediately with the child's
+/// stdout/stderr tail attached. A config parse error, a rejected plugin
+/// composition, a panic, or an authentication mismatch reproduces identically on
+/// fresh ports, so retrying it only replaces an actionable diagnostic with
+/// "did not start after 3 attempts" — the exact failure mode this repair
+/// removes.
+async fn start_gateway_with_retry(
+    config_path: &str,
+    log_dir: &Path,
+) -> (std::process::Child, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let (gateway_reservation, admin_reservation) = match reserve_port_pair().await {
+        // `reserve_port_pair` fails only by being unable to bind a free
+        // ephemeral loopback port, which is the same contention this retry loop
+        // exists for — so it is retried, and exhausting the attempts is fatal.
+        let reserved = reserve_port_pair().await;
+        let (gateway_reservation, admin_reservation) = match reserved {
             Ok(pair) => pair,
-            Err(e) => {
-                eprintln!(
-                    "Gateway port reservation attempt {}/{} failed: {}",
-                    attempt, MAX_ATTEMPTS, e
+            Err(error) => {
+                assert!(
+                    attempt < MAX_ATTEMPTS,
+                    "no free gateway/admin port pair after {MAX_ATTEMPTS} attempts: {error}"
                 );
-                if attempt < MAX_ATTEMPTS {
-                    sleep(Duration::from_secs(1)).await;
-                }
+                eprintln!("Gateway port reservation attempt {attempt}/{MAX_ATTEMPTS}: {error}");
+                sleep(Duration::from_secs(1)).await;
                 continue;
             }
         };
         let observability_token = mint_observability_token();
+        let logs = AttemptLogs::create(log_dir, attempt);
         let started = start_gateway(
             config_path,
             gateway_reservation,
             admin_reservation,
             &observability_token,
+            &logs,
         );
+        // Spawning is deterministic: a missing or non-executable gateway binary
+        // will not become executable on the next attempt.
         let (mut child, gateway_port, admin_port) = match started {
             Ok(started) => started,
-            Err(e) => {
-                eprintln!(
-                    "Gateway spawn attempt {}/{} failed: {}",
-                    attempt, MAX_ATTEMPTS, e
+            Err(error) => {
+                let binary = gateway_binary_path();
+                panic!(
+                    "Gateway spawn failed deterministically on attempt \
+                     {attempt}/{MAX_ATTEMPTS} ({binary}): {error}"
                 );
-                if attempt < MAX_ATTEMPTS {
-                    sleep(Duration::from_secs(1)).await;
-                }
-                continue;
             }
         };
+
         match wait_for_owned_gateway(&mut child, admin_port, &observability_token, gateway_port)
             .await
         {
             Ok(()) => return (child, gateway_port, admin_port),
-            Err(e) => {
-                eprintln!(
-                    "Gateway ownership check attempt {}/{} failed: {}",
-                    attempt, MAX_ATTEMPTS, e
-                );
+            Err(readiness_error) => {
                 // A still-live child from a void attempt must not outlive it and
-                // keep holding ports the next attempt could be offered.
+                // keep holding ports the next attempt could be offered. Reaping
+                // it first also closes its capture files, so the tail read below
+                // sees everything it managed to write.
                 let _ = child.kill();
                 let _ = child.wait();
-                if attempt < MAX_ATTEMPTS {
-                    sleep(Duration::from_secs(1)).await;
-                }
+                let diagnostics = logs.read_bounded(&observability_token);
+                let stdout = diagnostics.stdout;
+                let stderr = diagnostics.stderr;
+                assert!(
+                    bind_race_diagnosed(&stdout, &stderr),
+                    "Gateway startup failed on attempt {attempt}/{MAX_ATTEMPTS} for a reason \
+                     that is NOT an address-in-use bind race, so it was not retried: \
+                     {readiness_error}\n\
+                     --- gateway stdout (last {MAX_DIAGNOSTIC_BYTES} bytes) ---\n{stdout}\n\
+                     --- gateway stderr (last {MAX_DIAGNOSTIC_BYTES} bytes) ---\n{stderr}"
+                );
+                assert!(
+                    attempt < MAX_ATTEMPTS,
+                    "Gateway lost an address-in-use race on all {MAX_ATTEMPTS} attempts \
+                     (last: {readiness_error})\n\
+                     --- gateway stderr (last {MAX_DIAGNOSTIC_BYTES} bytes) ---\n{stderr}"
+                );
+                eprintln!(
+                    "Gateway attempt {attempt}/{MAX_ATTEMPTS} lost an address-in-use race \
+                     ({readiness_error}); retrying on fresh ports"
+                );
+                sleep(Duration::from_secs(1)).await;
             }
         }
     }
-    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
+    unreachable!("every attempt either returns, retries, or asserts");
 }
 
 struct GrpcCall {
@@ -587,7 +766,51 @@ fn assert_trailers_only_failure(call: &GrpcCall, context: &str) {
     );
 }
 
+/// Hard ceiling on ONE live gRPC exchange — TCP connect, HTTP/2 handshake,
+/// request, and full body+trailer collection.
+///
+/// Every call in this file goes through [`send_grpc_request`], so nothing can
+/// block on the data path without a bound. A gateway that accepts the
+/// connection and then never answers (a wedged rewrite, a stalled reload, a
+/// half-dead child) surfaces as a named timeout error rather than as a test that
+/// hangs until the whole suite is killed and reports nothing.
+const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn send_grpc_request(
+    gateway_addr: &str,
+    path: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> Result<GrpcCall, Box<dyn std::error::Error + Send + Sync>> {
+    send_grpc_request_within(gateway_addr, path, body, extra_headers, GRPC_CALL_TIMEOUT).await
+}
+
+/// [`send_grpc_request`] under an explicit budget.
+///
+/// A polling loop passes the time it has left so one blocked call can never
+/// outlive the outer behavioral deadline: the budget is the smaller of the
+/// per-call ceiling and the loop's own remaining time.
+async fn send_grpc_request_within(
+    gateway_addr: &str,
+    path: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+    budget: Duration,
+) -> Result<GrpcCall, Box<dyn std::error::Error + Send + Sync>> {
+    let call = send_grpc_request_unbounded(gateway_addr, path, body, extra_headers);
+    match tokio::time::timeout(budget, call).await {
+        Ok(result) => result,
+        Err(_) => {
+            let message = format!(
+                "gRPC call to {path} did not complete within {budget:?} \
+                 (no response, or the connection stalled mid-stream)"
+            );
+            Err(message.into())
+        }
+    }
+}
+
+async fn send_grpc_request_unbounded(
     gateway_addr: &str,
     path: &str,
     body: &[u8],
@@ -651,6 +874,20 @@ fn config_template(
     rewrite_agent_card_urls: bool,
     protocol_versions: &str,
 ) -> String {
+    config_template_with_services(
+        public_base,
+        rewrite_agent_card_urls,
+        protocol_versions,
+        DEFAULT_GRPC_SERVICES,
+    )
+}
+
+fn config_template_with_services(
+    public_base: &str,
+    rewrite_agent_card_urls: bool,
+    protocol_versions: &str,
+    grpc_services: &str,
+) -> String {
     format!(
         r#"
 version: "1"
@@ -678,6 +915,7 @@ plugin_configs:
       endpoint:
         path: "/a2a"
         protocol_versions: {protocol_versions}
+        grpc_services: {grpc_services}
       detection:
         bindings: [grpc]
       discovery:
@@ -710,7 +948,7 @@ impl Harness {
         let config_path = temp.path().join("config.yaml");
         write_config(&config_path, &render(&template, backend_port));
         let (gateway, port, _admin) =
-            start_gateway_with_retry(config_path.to_str().expect("utf-8 path")).await;
+            start_gateway_with_retry(config_path.to_str().expect("utf-8 path"), temp.path()).await;
         Self {
             gateway,
             backend,
@@ -748,30 +986,50 @@ impl Harness {
     /// Poll the live data path until one response proves a reload has taken
     /// effect, or fail with the last observed response/error. This waits on the
     /// actual behavior under test instead of guessing how long a runner needs.
+    ///
+    /// Two bounds, and both are load-bearing. Each call gets an explicit budget
+    /// of `min(per-call ceiling, time left on the behavioral deadline)`, so a
+    /// gateway that accepts the connection and then never answers cannot make
+    /// one iteration outlive the loop. And the child is checked for death on
+    /// every iteration, so a gateway that died on the SIGHUP fails with its exit
+    /// status instead of being polled at until the deadline reports a
+    /// meaningless "behavior did not appear".
     #[cfg(unix)]
     async fn wait_for_reloaded_call(
-        &self,
+        &mut self,
         path: &str,
         body: &[u8],
         context: &str,
         mut ready: impl FnMut(&GrpcCall) -> bool,
     ) -> GrpcCall {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        const RELOAD_DEADLINE: Duration = Duration::from_secs(10);
+        let deadline = Instant::now() + RELOAD_DEADLINE;
+        let mut last_observation = String::from("no request issued yet");
         loop {
-            let last_observation = match send_grpc_request(&self.addr, path, body, &[]).await {
+            if let Ok(Some(status)) = self.gateway.try_wait() {
+                panic!(
+                    "{context}: gateway exited with {status} while waiting for the reload to take \
+                     effect (last observation: {last_observation})"
+                );
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "{context}: reloaded behavior did not appear within {RELOAD_DEADLINE:?}; \
+                 last observation: {last_observation}"
+            );
+            let budget = remaining.min(GRPC_CALL_TIMEOUT);
+            let outcome = send_grpc_request_within(&self.addr, path, body, &[], budget).await;
+            last_observation = match outcome {
                 Ok(call) if ready(&call) => return call,
-                Ok(call) => format!(
-                    "HTTP {}, grpc-status {:?}, body {} bytes",
-                    call.status,
-                    call.terminal_grpc_status(),
-                    call.body.len()
-                ),
+                Ok(call) => {
+                    let status = call.status;
+                    let terminal = call.terminal_grpc_status().to_string();
+                    let bytes = call.body.len();
+                    format!("HTTP {status}, grpc-status {terminal:?}, body {bytes} bytes")
+                }
                 Err(error) => format!("request failed: {error}"),
             };
-            assert!(
-                Instant::now() < deadline,
-                "{context}: reloaded behavior did not appear within 10 seconds; last observation: {last_observation}"
-            );
             sleep(Duration::from_millis(50)).await;
         }
     }
@@ -1005,7 +1263,7 @@ async fn a2a_grpc_non_ok_upstream_reply_is_not_mistaken_for_a_card() {
 #[tokio::test]
 #[ignore]
 async fn a2a_grpc_card_rewrite_follows_a_reloaded_public_base() {
-    let harness = Harness::start().await;
+    let mut harness = Harness::start().await;
     let path = format!("{A2A_SERVICE}/GetAgentCard");
     let body = grpc_frame(&encode_agent_card("0.3.0"));
 
@@ -1054,7 +1312,7 @@ async fn a2a_grpc_card_rewrite_follows_a_reloaded_public_base() {
 #[tokio::test]
 #[ignore]
 async fn a2a_grpc_card_rewrite_withdrawal_takes_effect_on_reload() {
-    let harness = Harness::start().await;
+    let mut harness = Harness::start().await;
     let path = format!("{A2A_SERVICE}/GetAgentCard");
     let card = encode_agent_card("0.3.0");
     let body = grpc_frame(&card);
@@ -1099,7 +1357,7 @@ async fn a2a_grpc_card_rewrite_withdrawal_takes_effect_on_reload() {
 #[tokio::test]
 #[ignore]
 async fn a2a_grpc_card_version_allow_list_reload_admits_a_new_version() {
-    let harness = Harness::start().await;
+    let mut harness = Harness::start().await;
     let path = format!("{A2A_SERVICE}/GetAgentCard");
     let body = grpc_frame(&encode_agent_card("0.3.7"));
 
@@ -1128,4 +1386,251 @@ async fn a2a_grpc_card_version_allow_list_reload_admits_a_new_version() {
         Some(format!("{PUBLIC_BASE}/a2a").as_str()),
     );
     harness.shutdown();
+}
+
+// ============================================================================
+// gRPC service identity vs Agent Card schema, on the live data path
+// ============================================================================
+
+/// The canonical A2A **1.0** identity must never be rewritten as 0.3, even when
+/// the operator configured it and the backend happens to return 0.3-shaped
+/// bytes with an admitted `protocol_version`.
+///
+/// This is the pairing the root review flagged: `lf.a2a.v1.A2AService` is
+/// package `lf.a2a.v1` with a RENUMBERED `AgentCard`, so applying 0.3 field
+/// numbers to it would replace each `AgentInterface` submessage with a bare URL
+/// string and leave the real signatures in place. The decoder follows the
+/// declared service schema, never the bytes, so the reply is refused with the
+/// accurate schema disposition instead.
+#[tokio::test]
+#[ignore]
+async fn a2a_grpc_10_service_identity_is_never_rewritten_as_0_3() {
+    let harness = Harness::start_with(config_template_with_services(
+        PUBLIC_BASE,
+        true,
+        r#"["0.3.0"]"#,
+        r#"["lf.a2a.v1.A2AService"]"#,
+    ))
+    .await;
+
+    let body = grpc_frame(&encode_agent_card("0.3.0"));
+    let call = send_grpc_request(
+        &harness.addr,
+        &format!("{A2A_10_SERVICE}/GetAgentCard"),
+        &body,
+        &[],
+    )
+    .await
+    .expect("gRPC call");
+
+    assert_trailers_only_failure(&call, "A2A 1.0 service identity");
+    assert!(
+        !call
+            .body
+            .windows(PUBLIC_BASE.len())
+            .any(|window| window == PUBLIC_BASE.as_bytes()),
+        "a 1.0 service's reply must never be re-encoded with the public base",
+    );
+    harness.shutdown();
+}
+
+/// The canonical 0.3 service is the DEFAULT, and the 1.0 service is not: a 0.3
+/// gateway left at its defaults does not treat 1.0 traffic as an Agent Card path
+/// at all, so a 1.0 card is forwarded byte for byte.
+#[tokio::test]
+#[ignore]
+async fn a2a_grpc_default_service_set_is_the_canonical_0_3_identity() {
+    let harness = Harness::start().await;
+    let body = grpc_frame(&encode_agent_card("0.3.0"));
+
+    // The canonical 0.3 identity is detected and rewritten by default.
+    let call = send_grpc_request(
+        &harness.addr,
+        &format!("{A2A_SERVICE}/GetAgentCard"),
+        &body,
+        &[],
+    )
+    .await
+    .expect("gRPC call");
+    assert_ok_message_carrying(&call, "default 0.3 service");
+    assert_eq!(
+        string_field(&single_frame_payload(&call.body), 3).as_deref(),
+        Some(format!("{PUBLIC_BASE}/a2a").as_str()),
+    );
+
+    // The 1.0 identity is not in the default set, so it is untouched.
+    let call = send_grpc_request(
+        &harness.addr,
+        &format!("{A2A_10_SERVICE}/GetAgentCard"),
+        &body,
+        &[],
+    )
+    .await
+    .expect("gRPC call");
+    assert_ok_message_carrying(&call, "undetected 1.0 service");
+    assert_eq!(
+        call.body, body,
+        "a service outside endpoint.grpc_services must be forwarded verbatim",
+    );
+    harness.shutdown();
+}
+
+// ============================================================================
+// Harness guards
+//
+// Plain (non-`#[ignore]`) tests: they exercise the harness's own decision
+// functions and its per-call bound, need no gateway binary, and run in the same
+// CI shard as the E2E cells above (`--run-ignored=all`).
+// ============================================================================
+
+/// Retry classification is POSITIVE: only a demonstrated address-in-use bind
+/// race is retried. Every deterministic startup failure must be reported, not
+/// re-rolled into "did not start after 3 attempts".
+#[test]
+fn only_a_demonstrated_address_in_use_race_is_retryable() {
+    for (stdout, stderr, label) in [
+        (
+            "",
+            "ERROR failed to bind 127.0.0.1:8080: Address already in use (os error 48)",
+            "macOS EADDRINUSE",
+        ),
+        (
+            "",
+            "Os { code: 98, kind: AddrInUse, message: \"Address already in use\" }",
+            "Linux AddrInUse debug",
+        ),
+        (
+            "bind failed: os error 10048",
+            "",
+            "Windows WSAEADDRINUSE on stdout",
+        ),
+    ] {
+        assert!(
+            bind_race_diagnosed(stdout, stderr),
+            "{label} must be classified as a retryable bind race"
+        );
+    }
+
+    for (stdout, stderr, label) in [
+        ("", "", "no diagnostics at all"),
+        (
+            "",
+            "ERROR Configuration error: a2a_gateway: 'endpoint.path' must be absolute",
+            "config parse failure",
+        ),
+        (
+            "",
+            "thread 'main' panicked at src/startup.rs:1: boom",
+            "child panic",
+        ),
+        (
+            "",
+            "ERROR admin JWT secret must be at least 32 characters",
+            "deterministic admission failure",
+        ),
+        (
+            "",
+            "WARN connection refused (os error 61)",
+            "an unrelated errno",
+        ),
+        (
+            "",
+            "ERROR backend unreachable: Connection reset by peer",
+            "a backend-side failure",
+        ),
+    ] {
+        assert!(
+            !bind_race_diagnosed(stdout, stderr),
+            "{label} is deterministic and must NOT be retried"
+        );
+    }
+}
+
+/// Child diagnostics are captured, bounded to the tail, and stripped of the
+/// attempt's bearer token before they can reach a CI log.
+#[test]
+fn child_diagnostics_are_bounded_and_redact_the_probe_token() {
+    let temp = TempDir::new().expect("temp dir");
+    let logs = AttemptLogs::create(temp.path(), 1);
+    let token = "ferrum-edge-a2a-grpc-card-probe-deadbeef";
+
+    let filler = "x".repeat(MAX_DIAGNOSTIC_BYTES as usize * 3);
+    let mut out = std::fs::File::create(&logs.stdout).expect("create stdout capture");
+    write!(out, "{filler}TAIL-MARKER").expect("write stdout capture");
+    let mut err = std::fs::File::create(&logs.stderr).expect("create stderr capture");
+    write!(err, "probing with bearer {token} -> 401").expect("write stderr capture");
+    drop(out);
+    drop(err);
+
+    let diagnostics = logs.read_bounded(token);
+    let stdout = diagnostics.stdout;
+    let stderr = diagnostics.stderr;
+    let stdout_len = stdout.len();
+    assert!(
+        stdout_len <= MAX_DIAGNOSTIC_BYTES as usize,
+        "captured stdout must be bounded, got {stdout_len} bytes"
+    );
+    assert!(
+        stdout.ends_with("TAIL-MARKER"),
+        "the TAIL is what explains a startup failure, so it must be the part kept"
+    );
+    assert!(
+        !stderr.contains(token),
+        "the per-attempt bearer token must never be surfaced in a diagnostic"
+    );
+    assert!(
+        stderr.contains("<redacted-probe-token>"),
+        "redaction must be visible rather than silently dropping the line: {stderr}"
+    );
+
+    // A missing capture is reported, never panicked on: the point of these files
+    // is to explain a failure, so reading them must not become a second one.
+    let missing = AttemptLogs::create(temp.path(), 99).read_bounded(token);
+    assert!(missing.stdout.starts_with("<unavailable"));
+}
+
+/// A peer that accepts the connection and then says nothing must fail the call
+/// within its budget, not hang. This is what keeps a wedged gateway from
+/// outliving the reload loop's behavioral deadline.
+#[tokio::test]
+async fn a_silent_peer_fails_within_the_per_call_budget() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind silent peer");
+    let addr = listener.local_addr().expect("silent peer addr").to_string();
+    // Accept and hold the connection open without ever writing an HTTP/2
+    // preface, so the client's handshake blocks indefinitely.
+    let accepted = tokio::spawn(async move {
+        let _held = listener.accept().await;
+        sleep(Duration::from_secs(30)).await;
+    });
+
+    let budget = Duration::from_millis(400);
+    let started = Instant::now();
+    let outcome = send_grpc_request_within(
+        &addr,
+        &format!("{A2A_SERVICE}/GetAgentCard"),
+        &grpc_frame(&encode_agent_card("0.3.0")),
+        &[],
+        budget,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let error = match outcome {
+        Ok(call) => {
+            let status = call.status;
+            panic!("a silent peer must not produce a gRPC response (got HTTP {status})")
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        error.to_string().contains("did not complete within"),
+        "the failure must name the per-call budget, got: {error}"
+    );
+    assert!(
+        elapsed < budget + Duration::from_secs(5),
+        "the call must be cut at its budget, took {elapsed:?}"
+    );
+    accepted.abort();
 }

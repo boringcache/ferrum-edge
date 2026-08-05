@@ -59,7 +59,7 @@ fn grpc_ctx(rpc: &str, content_type: &str) -> (RequestContext, HashMap<String, S
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
-        format!("/lf.a2a.v1.A2AService/{rpc}"),
+        format!("/a2a.v1.A2AService/{rpc}"),
     );
     ctx.headers
         .insert("content-type".to_string(), content_type.to_string());
@@ -394,7 +394,7 @@ async fn grpc_a2a_method_is_detected_without_request_buffering() {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
-        "/lf.a2a.v1.A2AService/SendStreamingMessage".to_string(),
+        "/a2a.v1.A2AService/SendStreamingMessage".to_string(),
     );
     ctx.headers
         .insert("content-type".to_string(), "application/grpc".to_string());
@@ -2088,6 +2088,329 @@ async fn grpc_a2a_10_agent_card_outcome_is_independent_of_icon_url() {
     assert_a2a_10_card_fails_closed(Some("https://cdn.example.com/planner.png")).await;
 }
 
+// ── gRPC service identity ↔ Agent Card schema ────────────────────────────────
+//
+// A gRPC service NAME and an `AgentCard` wire LAYOUT are two different facts.
+// A2A 0.3 publishes `package a2a.v1` (service `a2a.v1.A2AService`) with
+// `AgentCard` fields 1..17; A2A 1.0 publishes `package lf.a2a.v1` with a
+// renumbered card. This gateway implements the 0.3 layout, so the 0.3 identity
+// is what it defaults to, and the 1.0 identity may never reach the 0.3 decoder
+// no matter what the bytes look like.
+
+/// Build a detected gRPC Agent Card context on an arbitrary service.
+async fn detect_grpc_card_on_service(
+    plugin: &std::sync::Arc<dyn ferrum_edge::plugins::Plugin>,
+    service: &str,
+    rpc: &str,
+) -> (RequestContext, bool) {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        format!("/{service}/{rpc}"),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let detected = ctx.metadata.get("a2a.binding").map(String::as_str) == Some("grpc");
+    (ctx, detected)
+}
+
+fn a2a_03_card_fixture() -> Vec<u8> {
+    encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        "0.3.0",
+        true,
+    )
+}
+
+/// The default `endpoint.grpc_services` is the canonical A2A 0.3 identity, and
+/// it is the one that actually gets rewritten. Before this pairing was made
+/// explicit, the default named A2A 1.0's service while the rewriter implemented
+/// 0.3's payload, so genuine canonical 0.3 traffic was missed by defaults.
+#[tokio::test]
+async fn grpc_default_service_is_the_canonical_a2a_03_identity() {
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (mut ctx, detected) =
+        detect_grpc_card_on_service(&plugin, "a2a.v1.A2AService", "GetAgentCard").await;
+    assert!(detected, "a2a.v1.A2AService must be detected by default");
+
+    let body = frame_grpc_message(&a2a_03_card_fixture());
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("canonical 0.3 card must be rewritten");
+    assert_eq!(
+        proto_string_field(&rewritten[5..], 3).as_deref(),
+        Some("https://gateway.example.com/a2a"),
+    );
+}
+
+/// A2A 1.0's service is not enabled by default, so 1.0 traffic is not silently
+/// pulled into a 0.3 gateway's card path at all.
+#[tokio::test]
+async fn grpc_a2a_10_service_is_not_detected_by_default() {
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (ctx, detected) =
+        detect_grpc_card_on_service(&plugin, "lf.a2a.v1.A2AService", "GetAgentCard").await;
+    assert!(
+        !detected,
+        "lf.a2a.v1.A2AService is A2A 1.0 and must not be a 0.3 gateway's default"
+    );
+    assert!(!plugin.should_buffer_response_body(&ctx));
+}
+
+/// **The load-bearing regression.** Even when an operator explicitly configures
+/// the A2A 1.0 service, a reply on it can never be decoded or rewritten with 0.3
+/// field numbers — not even one whose bytes happen to be 0.3-shaped and carry a
+/// configured `protocol_version`. The decoder follows the declared service
+/// schema, never the bytes.
+#[tokio::test]
+async fn grpc_a2a_10_service_never_decodes_a_0_3_shaped_card() {
+    let plugin = plugin(json!({
+        "endpoint": {"grpc_services": ["lf.a2a.v1.A2AService"]},
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (mut ctx, detected) =
+        detect_grpc_card_on_service(&plugin, "lf.a2a.v1.A2AService", "GetAgentCard").await;
+    assert!(detected, "a configured 1.0 service is still detected");
+
+    let body = frame_grpc_message(&a2a_03_card_fixture());
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_grpc_schema_unsupported",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await;
+    assert!(
+        rewritten.is_none(),
+        "a 1.0 service's reply must never be re-encoded with 0.3 field numbers"
+    );
+}
+
+/// A genuine 1.0 card on the 1.0 service is refused for the SCHEMA reason, not
+/// with a complaint about a `protocol_version` the 1.0 layout does not even
+/// carry. The disposition a client sees has to name what is actually wrong.
+#[tokio::test]
+async fn grpc_a2a_10_service_refuses_with_a_schema_disposition() {
+    let plugin = plugin(json!({
+        "endpoint": {"grpc_services": ["lf.a2a.v1.A2AService"]},
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (mut ctx, _) =
+        detect_grpc_card_on_service(&plugin, "lf.a2a.v1.A2AService", "GetExtendedAgentCard").await;
+    let body = frame_grpc_message(&encode_a2a_10_agent_card(
+        "planner",
+        "planning agent",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        None,
+    ));
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_grpc_schema_unsupported",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// A custom service name has no published Agent Card layout, so an undeclared
+/// one is detected and policed but never decoded. Serving the card un-rewritten
+/// would publish the backend's internal URLs, so it fails closed.
+#[tokio::test]
+async fn grpc_undeclared_custom_service_refuses_card_rewrite() {
+    let plugin = plugin(json!({
+        "endpoint": {"grpc_services": ["acme.agents.v1.AgentService"]},
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (mut ctx, detected) =
+        detect_grpc_card_on_service(&plugin, "acme.agents.v1.AgentService", "GetAgentCard").await;
+    assert!(detected, "a custom service is still detected and policed");
+
+    let body = frame_grpc_message(&a2a_03_card_fixture());
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_grpc_schema_undeclared",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// The documented custom-deployment path: declare the published layout the
+/// service actually serves, and rewriting works exactly as on the canonical
+/// identity.
+#[tokio::test]
+async fn grpc_custom_service_declaring_a2a_03_is_rewritten() {
+    let plugin = plugin(json!({
+        "endpoint": {"grpc_services": [
+            {"service": "acme.agents.v1.AgentService", "card_schema": "a2a-0.3"}
+        ]},
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (mut ctx, _) =
+        detect_grpc_card_on_service(&plugin, "acme.agents.v1.AgentService", "GetAgentCard").await;
+    let body = frame_grpc_message(&a2a_03_card_fixture());
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("a declared 0.3 custom service must be rewritten");
+    assert_eq!(
+        proto_string_field(&rewritten[5..], 3).as_deref(),
+        Some("https://gateway.example.com/a2a"),
+    );
+}
+
+/// The documented escape for fronting a service this gateway cannot rewrite:
+/// withdraw rewriting and the card passes through untouched instead of being
+/// refused.
+#[tokio::test]
+async fn grpc_unrewritable_service_passes_through_with_rewriting_withdrawn() {
+    let cases = [
+        ("lf.a2a.v1.A2AService", json!(["lf.a2a.v1.A2AService"])),
+        ("acme.v1.Agents", json!(["acme.v1.Agents"])),
+        (
+            "acme.v1.Agents",
+            json!([{"service": "acme.v1.Agents", "card_schema": "none"}]),
+        ),
+    ];
+    for (service, services) in cases {
+        let plugin = plugin(json!({
+            "endpoint": {"grpc_services": services},
+            "discovery": {
+                "public_base_url": "https://gateway.example.com",
+                "rewrite_agent_card_urls": false
+            }
+        }));
+        let (mut ctx, _) = detect_grpc_card_on_service(&plugin, service, "GetAgentCard").await;
+        let body = frame_grpc_message(&a2a_03_card_fixture());
+        let mut response_headers = grpc_ok_response_headers();
+        let staged = plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await;
+        assert!(
+            matches!(staged, PluginResult::Continue),
+            "{service}: withdrawing the rewrite must stop the refusal too"
+        );
+        let rewritten = plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await;
+        assert!(
+            rewritten.is_none(),
+            "{service}: nothing may be rewritten with the rewrite withdrawn"
+        );
+    }
+}
+
+/// Restating a published service's own layout is a no-op; contradicting it is a
+/// configuration error, because the layout belongs to the protocol rather than
+/// to the deployment.
+#[test]
+fn grpc_service_card_schema_declarations_are_validated() {
+    let accepted = [
+        json!([{"service": "a2a.v1.A2AService", "card_schema": "a2a-0.3"}]),
+        json!([{"service": "lf.a2a.v1.A2AService", "card_schema": "a2a-1.0"}]),
+        json!([{"service": "acme.v1.Agents", "card_schema": "a2a-1.0"}]),
+        json!([{"service": "acme.v1.Agents", "card_schema": "none"}]),
+        json!([{"service": "acme.v1.Agents"}]),
+        json!(["a2a.v1.A2AService", {"service": "acme.v1.Agents"}]),
+    ];
+    for services in accepted {
+        let config = json!({"endpoint": {"grpc_services": services}});
+        assert!(
+            create_plugin("a2a_gateway", &config).is_ok(),
+            "{services} must be accepted"
+        );
+    }
+
+    let rejected = [
+        (
+            json!([{"service": "a2a.v1.A2AService", "card_schema": "a2a-1.0"}]),
+            "published A2A service",
+        ),
+        (
+            json!([{"service": "lf.a2a.v1.A2AService", "card_schema": "a2a-0.3"}]),
+            "published A2A service",
+        ),
+        (
+            json!([{"service": "a2a.v1.A2AService", "card_schema": "none"}]),
+            "published A2A service",
+        ),
+        (
+            json!([{"service": "acme.v1.Agents", "card_schema": "a2a-2.0"}]),
+            "card_schema",
+        ),
+        (json!([{"card_schema": "a2a-0.3"}]), "require 'service'"),
+        (json!([42]), "service name string"),
+    ];
+    for (services, expected) in rejected {
+        let config = json!({"endpoint": {"grpc_services": services}});
+        let error = match create_plugin("a2a_gateway", &config) {
+            Ok(_) => panic!("{services} must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains(expected),
+            "{services}: expected an error naming {expected:?}, got {error}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn grpc_agent_card_submessage_on_url_field_fails_closed() {
     let plugin = plugin(json!({
@@ -3612,7 +3935,7 @@ fn invalid_a2a_gateway_configs_are_rejected() {
             "protocol versions cannot be empty",
         ),
         (
-            json!({"endpoint": {"grpc_services": ["lf.a2a.v1.A2AService", "lf.a2a.v1.A2AService"]}}),
+            json!({"endpoint": {"grpc_services": ["a2a.v1.A2AService", "a2a.v1.A2AService"]}}),
             "duplicate endpoint.grpc_services",
             "duplicate gRPC services should reject",
         ),
@@ -3742,7 +4065,8 @@ fn grpc_agent_card_diagnostics_are_completely_documented() {
 
     // Reverse direction, restricted to the diagnostic table's own rows so an
     // unrelated parameter table in this section cannot be misread as one.
-    const STAGES: [&str; 5] = [
+    const STAGES: [&str; 6] = [
+        "Service schema",
         "Framing",
         "Version/layout",
         "Schema",
@@ -3787,6 +4111,89 @@ fn openapi_grpc_services_describes_agent_card_decoding() {
         "openapi.yaml endpoint.grpc_services must scope protobuf decoding \
          to unary Agent Card replies"
     );
+}
+
+/// The published `endpoint.grpc_services` default must be the gRPC service
+/// identity whose Agent Card layout this plugin actually implements.
+///
+/// The whole point of the repair is that a service NAME and a card LAYOUT are
+/// separate facts: the spec previously advertised A2A 1.0's
+/// `lf.a2a.v1.A2AService` as the default of a gateway that decodes A2A 0.3
+/// cards, so an operator reading the spec was told the wrong pairing. Pinning it
+/// here keeps the documented default, the runtime default, and the implemented
+/// wire layout from drifting apart again.
+#[test]
+fn openapi_grpc_services_default_is_the_canonical_a2a_03_service() {
+    const SPEC: &str = include_str!("../../../openapi.yaml");
+
+    // The schema body is every line indented deeper than the 4-space key line,
+    // so the section ends at the next sibling schema key rather than at the
+    // first nested mapping (which a naive prefix split would truncate on).
+    let mut section = String::new();
+    let mut inside = false;
+    for line in SPEC.lines() {
+        if line == "    A2aGatewayConfig:" {
+            inside = true;
+            continue;
+        }
+        if inside {
+            let is_sibling_key = line.starts_with("    ")
+                && !line.starts_with("     ")
+                && !line.trim().is_empty();
+            if is_sibling_key {
+                break;
+            }
+            section.push_str(line);
+            section.push('\n');
+        }
+    }
+    assert!(inside, "A2aGatewayConfig schema section not found");
+    let section = section.as_str();
+    assert!(
+        section.contains(r#"default: ["a2a.v1.A2AService"]"#),
+        "endpoint.grpc_services must default to the canonical A2A 0.3 service"
+    );
+    assert!(
+        !section.contains(r#"default: ["lf.a2a.v1.A2AService"]"#),
+        "A2A 1.0's service must not be the default of a 0.3 Agent Card rewriter"
+    );
+    assert!(
+        section.contains(r#"default: ["0.3.0"]"#),
+        "the default protocol version must stay the one a2a.v1.A2AService carries"
+    );
+    for enumerated in ["a2a-0.3", "a2a-1.0", "none"] {
+        assert!(
+            section.contains(enumerated),
+            "the card_schema enumeration must publish {enumerated}"
+        );
+    }
+    for diagnostic in [
+        "agent_card_grpc_schema_unsupported",
+        "agent_card_grpc_schema_undeclared",
+    ] {
+        assert!(
+            section.contains(diagnostic),
+            "openapi.yaml must document the fail-closed disposition {diagnostic}"
+        );
+    }
+}
+
+/// The runtime default and the published default are the same service, proven
+/// through detection rather than by reading a constant.
+#[tokio::test]
+async fn default_grpc_service_detection_matches_the_published_default() {
+    let plugin = plugin(json!({}));
+    for (service, expected) in [
+        ("a2a.v1.A2AService", true),
+        ("lf.a2a.v1.A2AService", false),
+        ("acme.agents.v1.AgentService", false),
+    ] {
+        let (_, detected) = detect_grpc_card_on_service(&plugin, service, "GetTask").await;
+        assert_eq!(
+            detected, expected,
+            "{service}: default gRPC service detection disagrees with openapi.yaml"
+        );
+    }
 }
 
 // ── Replay presentation provenance (issue #3297 root review) ────────────────
@@ -3968,12 +4375,19 @@ fn a2a_inert_instances_still_enroll_a_static_presentation_policy() {
 async fn grpc_agent_card_absolute_looking_urls_fail_closed() {
     let over_length = format!("https://planner.internal/{}", "a".repeat(5000));
     let cases = [
-        "http:///a2a",
+        // No authority at all — not "an empty authority", which WHATWG collapses
+        // (see `..._empty_authority_is_a_real_url` below).
+        "https://",
+        "https:///",
         "https://:8080/a2a",
         "https://user:pass@planner.internal/a2a",
         "http://token@planner.internal/a2a",
         "http://[::1/a2a",
         "https://plan ner.internal/a2a",
+        // Begins with neither scheme, so it is not absolute.
+        "//planner.internal/a2a",
+        // An absolute URL, but not an http-family one.
+        "file:///a2a",
         over_length.as_str(),
     ];
 
@@ -3989,6 +4403,68 @@ async fn grpc_agent_card_absolute_looking_urls_fail_closed() {
             ctx.metadata.get("a2a.error").map(String::as_str),
         );
     }
+}
+
+/// The boundary of the absolute-URL proof, pinned so it is not mistaken for a
+/// fail-closed case again.
+///
+/// `http:///a2a` looks like an empty authority, but WHATWG's
+/// special-authority-ignore-slashes state consumes the extra `/` and parses it
+/// as host `a2a` — it IS an absolute http URL, and `url::Url` (the same parser
+/// `discovery.public_base_url` is validated with) agrees. Admitting it is
+/// correct and safe: only the boolean verdict is used, the backend's own bytes
+/// are what get preserved when no rewrite is needed, and a client resolves the
+/// preserved value under the identical rule. The check exists to tell a URL
+/// apart from a serialized `AgentInterface` submessage, and such a submessage is
+/// already refused by the control-character bound — its leading tag byte is
+/// `0x0a`.
+#[tokio::test]
+async fn grpc_agent_card_url_with_empty_authority_is_a_real_url() {
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    let card = encode_minimal_agent_card("planner", "planning agent", "http:///a2a", |out| {
+        // Not JSONRPC, so `AgentCard.url` is PRESERVED rather than replaced —
+        // which is exactly the path where accepting the value has to be safe.
+        encode_proto_string(14, "GRPC", out);
+        encode_proto_bytes(
+            15,
+            &encode_agent_interface("https://planner.internal/a2a", "JSONRPC"),
+            out,
+        );
+        encode_proto_string(16, "0.3.0", out);
+    });
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    let staged = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert!(
+        matches!(staged, PluginResult::Continue),
+        "an empty-authority http URL is a real absolute URL and must be admitted"
+    );
+    assert_eq!(ctx.metadata.get("a2a.error"), None);
+
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("the JSONRPC interface still needs rewriting");
+    let message = &rewritten[5..];
+    assert_eq!(
+        proto_string_field(message, 3).as_deref(),
+        Some("http:///a2a"),
+        "a preserved URL must be the backend's own bytes, never a normalized form"
+    );
+    assert_eq!(
+        proto_string_field(&proto_repeated_messages(message, 15)[0], 1).as_deref(),
+        Some("https://gateway.example.com/a2a"),
+    );
 }
 
 /// The same proof applies inside every advertised interface, which is where a

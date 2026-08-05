@@ -2018,6 +2018,33 @@ pub(crate) enum A2aGrpcCardRewriteState {
     CapacityRefused,
 }
 
+/// The `AgentCard` protobuf wire layout the gRPC service a request was detected
+/// on is declared to carry (issue #3297).
+///
+/// A gRPC service NAME and an `AgentCard` wire LAYOUT are two different facts,
+/// and the A2A project has already published two of each: v0.3 defines package
+/// `a2a.v1` (service `a2a.v1.A2AService`) with `AgentCard` fields 1..17, while
+/// A2A 1.0 defines package `lf.a2a.v1` (service `lf.a2a.v1.A2AService`) with a
+/// RENUMBERED `AgentCard`. Nothing on the wire of a unary reply distinguishes
+/// them reliably, so the layout is resolved from the configured service entry
+/// rather than guessed from the bytes — `a2a_gateway`'s protobuf rewriter
+/// implements the 0.3 layout only, and every other value refuses.
+///
+/// Kept out of metadata for the same reason as [`A2aGrpcCardRewriteState`]: a
+/// plugin-writable marker could otherwise select a decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum A2aGrpcCardSchema {
+    /// Official A2A 0.3.x `AgentCard` layout (`a2a.v1` package). The only
+    /// layout this gateway decodes and rewrites.
+    A2a03,
+    /// A2A 1.0 `AgentCard` layout (`lf.a2a.v1` package). Recognized so 1.0
+    /// traffic can be detected and policed, never decoded as 0.3.
+    A2a10,
+    /// The configured service declares no Agent Card layout. Detection, method
+    /// policy, and metadata still apply; card rewriting fails closed.
+    Undeclared,
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -2648,6 +2675,11 @@ pub struct RequestContext {
     pub(crate) a2a_gateway_binding: Option<&'static str>,
     pub(crate) a2a_gateway_is_agent_card: bool,
     pub(crate) a2a_gateway_streaming: bool,
+    /// `AgentCard` wire layout the matched gRPC service is CONFIGURED to carry,
+    /// resolved once at detection so the response path never re-derives a
+    /// service identity from a `ctx.path` a route override may have rebased —
+    /// see [`A2aGrpcCardSchema`].
+    pub(crate) a2a_gateway_grpc_card_schema: Option<A2aGrpcCardSchema>,
     /// Lifecycle of a unary gRPC Agent Card rewrite `a2a_gateway` admitted in
     /// `on_response_body`. Consumed by `on_final_response_body`, which fails
     /// closed unless the transform phase reported a completed outcome — see
@@ -3161,6 +3193,7 @@ impl RequestContext {
             a2a_gateway_binding: None,
             a2a_gateway_is_agent_card: false,
             a2a_gateway_streaming: false,
+            a2a_gateway_grpc_card_schema: None,
             a2a_gateway_grpc_card_rewrite: None,
             mcp_response_resource_binding: None,
             mcp_trusted_tool_name_rewrite: None,
@@ -4270,6 +4303,7 @@ impl RequestContext {
             a2a_gateway_binding: self.a2a_gateway_binding,
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
             a2a_gateway_streaming: self.a2a_gateway_streaming,
+            a2a_gateway_grpc_card_schema: self.a2a_gateway_grpc_card_schema,
             a2a_gateway_grpc_card_rewrite: None,
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),

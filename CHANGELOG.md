@@ -21,6 +21,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callback-lock recursion, raced handoff, stale state, and `ktime` wrap from
   fabricating samples. The metric has fixed microsecond buckets with saturating
   count/bucket counters, drops sum overflow, and adds no per-flow labels (#3309).
+- **BREAKING (`a2a_gateway`)**: `endpoint.grpc_services` now defaults to the
+  canonical A2A 0.3 service `a2a.v1.A2AService` (package `a2a.v1`, from
+  `a2aproject/A2A` at tag `v0.3.0`) instead of A2A 1.0's
+  `lf.a2a.v1.A2AService`, and every configured entry now carries a declared
+  Agent Card wire layout (issue #3297). The default is the identity whose card
+  layout the default `endpoint.protocol_versions` (`0.3.0`) actually describes;
+  the previous pairing detected 1.0's service name while implementing 0.3's
+  payload, so canonical 0.3 traffic was missed by defaults and genuine 1.0
+  traffic was fed to a 0.3 decoder. Entries may still be plain service-name
+  strings — a published A2A name resolves to the layout the specification gives
+  it (`a2a.v1.A2AService` -> `a2a-0.3`, `lf.a2a.v1.A2AService` -> `a2a-1.0`) and
+  any custom name resolves to `none` — or the explicit
+  `{service, card_schema}` object form a custom deployment uses to declare
+  which published layout its own service serves. Declaring a `card_schema` that
+  contradicts a published A2A service name is rejected at admission; the layout
+  is a property of the protocol, not of the deployment. Detection, method
+  policy, and `a2a.*` metadata are unchanged for every schema, but Agent Card
+  protobuf rewriting is implemented only for `a2a-0.3` and fails closed with
+  `agent_card_grpc_schema_unsupported` (`a2a-1.0`) or
+  `agent_card_grpc_schema_undeclared` (`none`) before a byte of the reply is
+  decoded — a 1.0 card is never interpreted with 0.3 field numbers. Deployments
+  fronting a 1.0 or custom service should set
+  `discovery.rewrite_agent_card_urls: false` or declare
+  `card_schema: a2a-0.3`.
 - `a2a_gateway` rewrites unary gRPC Agent Card protobuf payloads (A2A 0.3.x
   wire layout) with the same JSON-RPC endpoint URL policy as HTTP cards,
   clears invalidated signatures, and fails closed on unsupported versions or
@@ -68,6 +92,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `agent_card_grpc_rewrite_not_applied`. Operators fronting a non-0.3 A2A
   backend should set `discovery.rewrite_agent_card_urls: false`; leaving it
   enabled refuses such cards rather than serving un-rewritten internal URLs.
+  The absolute-URL proof is the WHATWG grammar rather than a stricter spelling
+  rule, so a form the standard accepts is accepted here too — `http:///a2a` is
+  host `a2a`, because the special-authority-ignore-slashes state consumes the
+  extra slash. That is safe: only the boolean verdict is used, a preserved URL
+  is re-emitted as the backend's own bytes rather than a normalized form, and a
+  discovery client resolves it under the identical rule.
 - `a2a_gateway` now enrolls in `request_deduplication` replay presentation
   provenance, because its Agent Card rewrite is a client-facing transform that
   a finalized replay deliberately skips (issue #3297). Every retained response
@@ -84,6 +114,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejects that pairing with HTTP 400 and the runtime retains and replays
   nothing. The refusal is per instance — a configured-public-base
   `a2a_gateway` composes with `request_deduplication` exactly as before.
+- The `a2a_gateway` gRPC Agent Card functional harness no longer converts
+  deterministic startup failures into retries or blocks without a bound
+  (issue #3297). The gateway child's stdout/stderr are captured to per-attempt
+  files, and a spawn attempt is retried ONLY when those diagnostics demonstrate
+  an address-in-use bind race — the one failure a fresh port pair can fix. A
+  config parse error, a child panic, a failed readiness/authentication check, or
+  any other deterministic fault now fails immediately with a bounded tail of the
+  child's output (the per-attempt bearer token redacted) instead of being
+  re-rolled into "did not start after 3 attempts". Every live gRPC call carries
+  a per-call timeout, and the reload poll loop hands each call the smaller of
+  that ceiling and its own remaining deadline while checking the child for death
+  on every iteration, so a wedged or dead gateway fails diagnostically rather
+  than hanging. Simultaneously-held proxy/admin port reservations and
+  owned-process readiness are unchanged, and no fixed sleep became a success
+  criterion.
 - `ai_semantic_firewall` streamed `inspect` mode now accepts
   `streaming.window: tokens` with an explicitly selected bounded tokenizer
   (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft
