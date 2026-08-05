@@ -5269,10 +5269,10 @@ impl FederationStreamLifecycle {
         if !still_open {
             return;
         }
-        if let Ok(mut staged) = self.staged_outcome.lock() {
-            if staged.is_none() {
-                *staged = Some(outcome);
-            }
+        if let Ok(mut staged) = self.staged_outcome.lock()
+            && staged.is_none()
+        {
+            *staged = Some(outcome);
         }
     }
 
