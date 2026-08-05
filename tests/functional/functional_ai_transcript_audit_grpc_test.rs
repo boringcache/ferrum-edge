@@ -37,7 +37,6 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
@@ -103,13 +102,6 @@ fn gzip_grpc_frame(payload: &[u8]) -> Vec<u8> {
 // ============================================================================
 // Harness
 // ============================================================================
-
-async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    listener.local_addr().unwrap().port()
-}
 
 /// Echo backend: returns the request body as the gRPC response body. Terminal
 /// `grpc-status: 0` is emitted as an HTTP/2 TRAILERS frame after the DATA
@@ -307,8 +299,17 @@ async fn wait_for_gateway(
 async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let gateway_port = free_port().await;
-        let admin_port = free_port().await;
+        // Hold both reservations at the same time so the OS cannot hand the
+        // just-released proxy port back for the admin listener. The child
+        // cannot inherit these sockets, so release them together immediately
+        // before spawn; the bounded retry below remains the handoff guard
+        // against an unrelated process winning either port.
+        let gateway_reservation = reserve_port().await.expect("reserve gateway port");
+        let admin_reservation = reserve_port().await.expect("reserve admin port");
+        let gateway_port = gateway_reservation.port;
+        let admin_port = admin_reservation.port;
+        drop(gateway_reservation);
+        drop(admin_reservation);
         let mut child = match start_gateway(config_path, gateway_port, admin_port) {
             Ok(child) => child,
             Err(e) => {
@@ -526,7 +527,15 @@ impl Harness {
         Self::start("", "").await
     }
 
-    fn shutdown(mut self) {
+    fn shutdown(self) {
+        // Cleanup is implemented by Drop so assertion panics receive the same
+        // treatment as the ordinary success path.
+        drop(self);
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
         let _ = self.gateway.kill();
         let _ = self.gateway.wait();
         self.backend.abort();
