@@ -9695,7 +9695,9 @@ async fn aggregate_sse_transport_construction_is_streaming_without_length() {
     let (_, _, response_headers) = reject_raw(result);
     // The gateway-authored representation is what the transport adoption gate
     // checks on both the H1/H2 and the native H3 ladder.
-    assert!(reject_headers_select_event_stream_for_test(&response_headers));
+    assert!(reject_headers_select_event_stream_for_test(
+        &response_headers
+    ));
 
     let listener = take_mcp_aggregate_sse_listener_for_test(&mut ctx).unwrap();
     let built = build_aggregate_sse_reject_for_test(response_headers, listener);
@@ -9745,7 +9747,9 @@ async fn aggregate_sse_replaced_rejection_releases_the_listener_slot() {
     // instead of locking the session out.
     drop(ctx);
     let (mut retry_ctx, mut retry_headers) = sse_get(&session_id);
-    let retried = plugin.before_proxy(&mut retry_ctx, &mut retry_headers).await;
+    let retried = plugin
+        .before_proxy(&mut retry_ctx, &mut retry_headers)
+        .await;
     assert_eq!(reject_raw(retried).0, 200);
 }
 
@@ -9758,7 +9762,12 @@ async fn aggregate_sse_get_fails_closed_on_accept_session_and_duplicate() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     let (status, body, _) = reject_json(result);
     assert_eq!(status, 400);
-    assert!(body["error"].as_str().unwrap().contains("text/event-stream"));
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("text/event-stream")
+    );
     let reason = ctx.metadata.get("mcp.sse.error").map(String::as_str);
     assert_eq!(reason, Some("invalid_accept"));
 
