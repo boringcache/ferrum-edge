@@ -260,10 +260,7 @@ fn start_gateway_with_extra_env(
     let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")?
         .local_addr()?
         .port();
-    let observability_token = format!(
-        "ferrum-edge-grpc-probe-{}",
-        uuid::Uuid::new_v4().simple()
-    );
+    let observability_token = format!("ferrum-edge-grpc-probe-{}", uuid::Uuid::new_v4().simple());
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
