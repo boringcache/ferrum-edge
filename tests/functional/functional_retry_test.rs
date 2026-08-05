@@ -32,8 +32,9 @@
 #![allow(clippy::bool_assert_comparison)]
 
 use crate::scaffolding::backends::{
-    H3Step, H3TlsConfig, HttpStep, RequestMatcher, ScriptedH3Backend, ScriptedHttp1Backend,
-    ScriptedTcpBackend, ScriptedTlsBackend, TcpStep, TlsConfig,
+    H2Step, H3Step, H3TlsConfig, HttpStep, MatchHeaders, RequestMatcher, ScriptedH2Backend,
+    ScriptedH3Backend, ScriptedHttp1Backend, ScriptedTcpBackend, ScriptedTlsBackend, TcpStep,
+    TlsConfig,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http3Client;
@@ -86,6 +87,65 @@ fn write_frontend_certs(scratch: &std::path::Path, ca_name: &str) -> (String, St
         cert_path.to_string_lossy().into_owned(),
         key_path.to_string_lossy().into_owned(),
     )
+}
+
+/// Spawn the HTTP/3 gateway on a freshly reserved HTTPS port.
+///
+/// `FERRUM_PROXY_HTTPS_PORT` is fixed for one harness spawn. The harness's
+/// ordinary retry loop can replace its own proxy/admin ports, but it cannot
+/// change this env-pinned TCP+UDP port after another parallel process steals
+/// the TCP half between reservation release and gateway bind. Retry the whole
+/// spawn with a fresh reservation instead; one inner attempt avoids retrying a
+/// port that can no longer succeed.
+async fn spawn_h3_retry_gateway(
+    yaml: &str,
+    cert_path: &str,
+    key_path: &str,
+) -> (GatewayHarness, u16) {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_error = None;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let reservation = match reserve_port().await {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
+            }
+        };
+        let https_port = reservation.drop_and_take_port();
+
+        let result = GatewayHarness::builder()
+            .file_config(yaml.to_string())
+            .log_level("info")
+            .capture_output()
+            .max_attempts(1)
+            .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path.to_string())
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path.to_string())
+            .env("FERRUM_TLS_NO_VERIFY", "true")
+            .env("FERRUM_POOL_WARMUP_ENABLED", "true")
+            .spawn()
+            .await;
+
+        match result {
+            Ok(harness) => return (harness, https_port),
+            Err(error) => {
+                eprintln!(
+                    "spawn_h3_retry_gateway attempt {attempt}/{MAX_ATTEMPTS} failed \
+                     (https_port={https_port}): {error}"
+                );
+                last_error = Some(error.to_string());
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    panic!(
+        "spawn_h3_retry_gateway exhausted {MAX_ATTEMPTS} fresh HTTPS ports; last error: {}",
+        last_error.as_deref().unwrap_or("no recorded error")
+    );
 }
 
 /// File-mode YAML for one HTTP proxy with an explicit retry policy.
@@ -360,19 +420,21 @@ async fn post_h3_downgrade_subsequent_requests_route_via_cross_protocol_bridge()
         .await
         .expect("colocated tcp/udp");
 
-    // TCP+TLS side answers OK for the bridge fallback.
-    let tcp_backend = ScriptedTlsBackend::builder(
-        tcp_listener,
-        TlsConfig::new(cert.clone(), key.clone())
-            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
-    )
-    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
-    .step(TcpStep::Write(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nbridge".to_vec(),
-    ))
-    .step(TcpStep::Drop)
-    .spawn()
-    .expect("spawn tls");
+    // H2/TLS side answers OK for capability probes, warmup, and bridge fallback.
+    let tcp_backend = ScriptedH2Backend::builder_tls(tcp_listener, &cert, &key)
+        .expect("h2 tls bridge builder")
+        .repeat_script(true)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: bytes::Bytes::from_static(b"bridge"),
+            end_stream: true,
+        })
+        .spawn()
+        .expect("spawn h2 tls bridge backend");
 
     // H3 backend accepts the first stream, then closes the connection.
     let h3_backend = ScriptedH3Backend::builder(udp_socket, H3TlsConfig::new(cert, key))
@@ -381,15 +443,8 @@ async fn post_h3_downgrade_subsequent_requests_route_via_cross_protocol_bridge()
         .spawn()
         .expect("spawn h3");
 
-    // Frontend HTTPS port for the H3 client. We enable HTTP/3 on the
-    // gateway and let it send H3 to the H3 backend.
-    let reservation = reserve_port().await.expect("reserve https port");
-    let https_port = reservation.port;
-    drop(reservation);
-
     let scratch = tempfile::tempdir().expect("scratch");
     let (cert_path, key_path) = write_frontend_certs(scratch.path(), "phase8-retry-gw");
-    Box::leak(Box::new(scratch));
 
     let yaml = https_with_retry(
         backend_port,
@@ -399,19 +454,9 @@ async fn post_h3_downgrade_subsequent_requests_route_via_cross_protocol_bridge()
             "retryable_methods": ["GET"],
         }),
     );
-    let harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    let (harness, https_port) = spawn_h3_retry_gateway(&yaml, &cert_path, &key_path).await;
+    // The successful subprocess keeps using these paths for its lifetime.
+    Box::leak(Box::new(scratch));
 
     // Wait for the warmup probe to populate the registry with h3=Supported.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -471,6 +516,7 @@ async fn post_h3_downgrade_subsequent_requests_route_via_cross_protocol_bridge()
 
     // Second request: registry says h3=Unsupported → must route through
     // the cross-protocol bridge → TCP backend → 200.
+    let bridge_baseline = tcp_backend.received_streams().await.len();
     let url2 = format!("https://127.0.0.1:{https_port}/api/retry-2");
     let second = client.get(&url2).await.expect("h3 second request");
     assert_eq!(
@@ -479,12 +525,14 @@ async fn post_h3_downgrade_subsequent_requests_route_via_cross_protocol_bridge()
         "second request must route via bridge after downgrade; got {second:?}"
     );
 
-    // The TCP backend (the bridge) must have served at least one
-    // connection — proves subsequent requests went through reqwest.
-    let bridge_count = tcp_backend.accepted_connections();
+    // Require the request path itself after the warmup/probe baseline;
+    // an earlier connection alone does not prove bridge dispatch.
+    let bridge_streams = tcp_backend.received_streams().await;
     assert!(
-        bridge_count >= 1,
-        "expected the TCP+TLS bridge backend to handle at least one request after downgrade; got {bridge_count}"
+        bridge_streams[bridge_baseline..]
+            .iter()
+            .any(|stream| stream.path == "/retry-2"),
+        "expected the H2/TLS bridge backend to handle /retry-2 after downgrade; baseline={bridge_baseline} streams={bridge_streams:?}"
     );
 }
 

@@ -65,8 +65,12 @@ fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
         .find("let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(")
         .expect("H3 frontend must resolve selected-target effective proxy");
     assert!(
+        after_selection.contains("route_retry_ceiling"),
+        "H3 frontend must retain the original route retry ceiling after target selection"
+    );
+    assert!(
         after_selection[effective..].contains("&selected_base_proxy"),
-        "H3 effective proxy resolution must use the retry-capped selected base proxy"
+        "H3 effective proxy resolution must use the post-selection selected base proxy"
     );
     let has_retry = after_selection
         .find("let has_retry = match backend_http_flavor")
@@ -131,14 +135,14 @@ fn h3_native_retry_loop_resolves_effective_proxy_per_attempt() {
         .expect("buffered native-H3 retry loop must remain present");
     let loop_src = &source[retry_loop..];
 
-    // Initial attempt: resolve from the retry-capped BASE proxy (never the
+    // Initial attempt: resolve from the post-selection BASE proxy (never the
     // first target's effective proxy) before dispatching.
     let initial_resolve = loop_src
         .find("let attempt_dispatch_proxy = crate::proxy::resolve_effective_proxy_for_target(")
         .expect("native-H3 retry loop must resolve the attempt dispatch proxy");
     assert!(
         loop_src[initial_resolve..].contains("&selected_base_proxy"),
-        "per-attempt resolution must feed from the retry-capped base proxy"
+        "per-attempt resolution must feed from the post-selection base proxy"
     );
     let initial_dispatch = loop_src
         .find("proxy_to_backend_h3(")
@@ -152,6 +156,10 @@ fn h3_native_retry_loop_resolves_effective_proxy_per_attempt() {
         "proxy_to_backend_h3 must receive the per-attempt resolved proxy"
     );
 
+    assert!(
+        loop_src.contains("route_retry_ceiling"),
+        "native-H3 retry must authorize against the original route ceiling"
+    );
     // Rotated attempt: a rotation can cross from the SD fallback into a policy
     // port with its own per-port override (TLS/SNI/connectTimeout), so the
     // loop must RE-resolve after `select_next_retry_target` and before the
@@ -159,6 +167,14 @@ fn h3_native_retry_loop_resolves_effective_proxy_per_attempt() {
     let rotation = loop_src
         .find("select_next_retry_target(")
         .expect("native-H3 retry rotation must remain present");
+    assert!(
+        loop_src.contains("retry_attempt_allowed_for_target("),
+        "native-H3 retry must re-check DestinationRule maxRetries for rotated candidates"
+    );
+    assert!(
+        loop_src.contains("current_retry_attempt_allowed("),
+        "native-H3 retry must re-check DestinationRule maxRetries for the current target"
+    );
     let re_resolve = loop_src[rotation..]
         .find("let attempt_dispatch_proxy = crate::proxy::resolve_effective_proxy_for_target(")
         .expect("rotated native-H3 retry attempts must re-resolve the effective proxy");
@@ -174,13 +190,17 @@ fn h3_native_retry_loop_resolves_effective_proxy_per_attempt() {
 #[test]
 fn h3_frontend_exposes_retry_capped_base_proxy_to_plugins() {
     // H1/H2 parity: `handle_proxy_request_inner` assigns `ctx.matched_proxy`
-    // the retry-capped BASE proxy (right after `cap_proxy_retry_for_target`),
-    // so plugins/logging must not see per-port TLS/timeout overrides baked
-    // into the proxy on the H3 frontend only.
+    // the BASE proxy after the post-selection retry seam (original route
+    // ceiling retained), so plugins/logging must not see per-port TLS/timeout
+    // overrides baked into the proxy on the H3 frontend only.
     let source = include_str!("../../../src/http3/server.rs");
     assert!(
         source.contains("ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));"),
-        "H3 must expose the retry-capped base proxy via ctx.matched_proxy (H1/H2 parity)"
+        "H3 must expose the base proxy via ctx.matched_proxy (H1/H2 parity)"
+    );
+    assert!(
+        source.contains("route_retry_ceiling"),
+        "H3 must retain the original route retry ceiling for DestinationRule maxRetries"
     );
 }
 
@@ -193,7 +213,7 @@ fn h3_websocket_bridge_keeps_unresolved_base_proxy_for_retries() {
     let websocket_args = &source[websocket_call..];
     let proxy_arg = websocket_args
         .find("Arc::clone(&selected_base_proxy)")
-        .expect("H3 WebSocket bridge must receive the capped unresolved base proxy");
+        .expect("H3 WebSocket bridge must receive the post-selection unresolved base proxy");
     let effective_proxy_arg = websocket_args
         .find("\n            proxy,")
         .unwrap_or(usize::MAX);
@@ -338,6 +358,18 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         cross_protocol.contains("CrossProtocolRetryTarget::BackendPathMismatch"),
         "cross-protocol retries must distinguish a path mismatch from no target rotation"
     );
+    assert!(
+        cross_protocol.contains("CrossProtocolRetryTarget::RetryBudgetExceeded"),
+        "cross-protocol retries must distinguish a DestinationRule maxRetries miss from path mismatch"
+    );
+    assert!(
+        cross_protocol.contains("retry_attempt_allowed_for_target("),
+        "cross-protocol candidate selection must re-resolve DestinationRule maxRetries"
+    );
+    assert!(
+        cross_protocol.contains("route_retry_ceiling"),
+        "cross-protocol HTTP/gRPC retries must authorize against the original route ceiling"
+    );
     let grpc_retry = cross_protocol
         .rfind("let retry_target = select_next_cross_protocol_retry_target(")
         .expect("cross-protocol gRPC retry selection must remain present");
@@ -345,11 +377,16 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
     let mismatch = after_grpc_retry
         .find("CrossProtocolRetryTarget::BackendPathMismatch")
         .expect("cross-protocol gRPC retry must inspect the mismatch result");
+    let budget = after_grpc_retry
+        .find("CrossProtocolRetryTarget::RetryBudgetExceeded")
+        .expect("cross-protocol gRPC retry must inspect the retry-budget result");
     let failure_record = after_grpc_retry
         .find("let retry_error_class =")
         .expect("cross-protocol gRPC retry failure recording must remain present");
     assert!(
-        mismatch < failure_record && after_grpc_retry[mismatch..failure_record].contains("break;"),
+        mismatch < failure_record
+            && budget < failure_record
+            && after_grpc_retry[mismatch.min(budget)..failure_record].contains("break;"),
         "cross-protocol gRPC retries must abort before recording an intermediate retry attempt"
     );
 }
@@ -988,6 +1025,92 @@ fn h3_flavor_aware_reject_metrics_match_the_http_wire_status() {
                 "record_h3_flavor_aware_reject(&state, http_flavor, {status})"
             )),
             "H3 {phase} must record its normalized gRPC/gRPC-Web wire status"
+        );
+    }
+}
+
+#[test]
+fn h3_cross_protocol_http1_admission_uses_selected_subset_lane() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let pending_gate = source
+        .find("let pending_cap =")
+        .expect("H3-to-plain pending gate");
+    let gate_tail = &source[pending_gate..];
+    let acquisition = gate_tail
+        .find(".try_acquire_for_subset(")
+        .expect("subset-keyed H1 admission");
+    let acquisition_tail = &gate_tail[acquisition..];
+    let acquisition_end = acquisition_tail
+        .find("pending_cap,")
+        .expect("pending cap argument");
+    let acquisition_call = &acquisition_tail[..acquisition_end];
+
+    assert!(
+        acquisition_call.contains("dispatch_proxy.upstream_subset.as_deref()"),
+        "the H3-to-plain bridge must not collapse selected subsets into the unmatched H1 admission lane"
+    );
+}
+
+/// The H1 admission lane must be keyed by the DestinationRule POLICY port —
+/// `UpstreamTarget::dispatch_policy_port()`, the declared Service port under
+/// `targetPort` remapping — exactly like `proxy_to_backend` /
+/// `proxy_to_backend_retry`. Keying the bridge by the DIAL port instead splits
+/// one destination's in-flight budget across two lanes (`host|80|s…` for
+/// H1/H2, `host|8080|s…` for H3), so a cap of N admits 2N combined, and it
+/// makes an explicit `portLevelSettings[{port: 80}]` cap invisible to the
+/// bridge.
+#[test]
+fn h3_cross_protocol_http1_admission_keys_the_policy_port_not_the_dial_port() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let pending_gate = source
+        .find("let pending_cap =")
+        .expect("H3-to-plain pending gate");
+    let gate_tail = &source[pending_gate..];
+    let acquisition = gate_tail
+        .find(".try_acquire_for_subset(")
+        .expect("subset-keyed H1 admission");
+    let cap_lookup = &gate_tail[..acquisition];
+    let acquisition_tail = &gate_tail[acquisition..];
+    let acquisition_end = acquisition_tail
+        .find("pending_cap,")
+        .expect("pending cap argument");
+    let acquisition_call = &acquisition_tail[..acquisition_end];
+
+    assert!(
+        cap_lookup.contains("dispatch_policy_port"),
+        "the per-port http1MaxPendingRequests cap lookup must use the DR policy port"
+    );
+    assert!(
+        !cap_lookup.contains("dispatch_dial_port"),
+        "the dial port is a transport address, not a policy source"
+    );
+    assert!(
+        acquisition_call.contains("dispatch_policy_port,"),
+        "the H3-to-plain bridge must acquire in the policy-port lane the H1/H2 path uses"
+    );
+    assert!(
+        !acquisition_call.contains("dispatch_dial_port"),
+        "the H3 bridge must not open a dial-port-keyed second admission lane"
+    );
+
+    // Both bridge dispatch sites (buffered retry loop and streaming dispatch)
+    // must derive that port through the one shared helper.
+    let helper = "let dispatch_policy_port = crate::proxy::dispatch_policy_port_for_target(";
+    assert_eq!(
+        source.matches(helper).count(),
+        2,
+        "both H3-to-plain dispatch sites must derive the policy port via the shared helper"
+    );
+
+    // ...and the H1/H2 path must derive it through the same helper, so the two
+    // frontends cannot drift apart again.
+    let h1h2 = include_str!("../../../src/proxy/mod.rs");
+    for binding in ["pending_policy_port", "retry_policy_port"] {
+        let expected =
+            format!("let {binding} = dispatch_policy_port_for_target(proxy, upstream_target);");
+        assert!(
+            h1h2.contains(&expected),
+            "the H1/H2 H1-admission lane port `{binding}` must come from the shared helper"
         );
     }
 }
