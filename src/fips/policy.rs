@@ -558,10 +558,7 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
 /// Checks `FERRUM_DB_URL`, every `FERRUM_DB_FAILOVER_URLS` entry, and
 /// `FERRUM_DB_READ_REPLICA_URL`. Diagnostics name the env setting and the
 /// offending query-parameter key only — never the URL or its credentials.
-fn refuse_unverified_sql_url_tls(
-    env_config: &EnvConfig,
-    dialect: &str,
-) -> Result<(), String> {
+fn refuse_unverified_sql_url_tls(env_config: &EnvConfig, dialect: &str) -> Result<(), String> {
     let mut checks: Vec<(String, &str)> = Vec::new();
     if let Some(url) = env_config
         .db_url

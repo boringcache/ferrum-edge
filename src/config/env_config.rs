@@ -4822,8 +4822,7 @@ impl EnvConfig {
     fn sql_url_tls_mode_is_verifying(db_type: &str, value: &str) -> bool {
         match db_type {
             "postgres" => {
-                value.eq_ignore_ascii_case("verify-ca")
-                    || value.eq_ignore_ascii_case("verify-full")
+                value.eq_ignore_ascii_case("verify-ca") || value.eq_ignore_ascii_case("verify-full")
             }
             "mysql" => {
                 value.eq_ignore_ascii_case("VERIFY_CA")
@@ -4839,10 +4838,7 @@ impl EnvConfig {
     /// verifying value and at least one is present. Unparseable URLs fail
     /// closed as [`SqlUrlTlsPeerAuth::Absent`] — verification cannot be
     /// demonstrated. Never retains the URL or credentials.
-    pub(crate) fn sql_url_tls_peer_auth(
-        base_url: &str,
-        db_type: &str,
-    ) -> SqlUrlTlsPeerAuth {
+    pub(crate) fn sql_url_tls_peer_auth(base_url: &str, db_type: &str) -> SqlUrlTlsPeerAuth {
         let mode_params = Self::db_tls_mode_url_param_names(db_type);
         let expected_param = mode_params.first().copied().unwrap_or("sslmode");
 
@@ -4853,10 +4849,7 @@ impl EnvConfig {
         let mut found: Vec<(&'static str, String)> = Vec::new();
         for (name, value) in parsed.query_pairs() {
             let name = name.to_ascii_lowercase();
-            if let Some(&canonical) = mode_params
-                .iter()
-                .find(|known| name == **known)
-            {
+            if let Some(&canonical) = mode_params.iter().find(|known| name == **known) {
                 found.push((canonical, value.into_owned()));
             }
         }

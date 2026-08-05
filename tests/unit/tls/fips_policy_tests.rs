@@ -418,10 +418,7 @@ fn env_policy_rejects_unset_sql_db_tls_mode_without_verifying_url_params() {
                 err.contains("FERRUM_DB_URL"),
                 "diagnostic must name the setting: {err}"
             );
-            assert!(
-                err.contains("FERRUM_DB_TLS_MODE unset"),
-                "{err}"
-            );
+            assert!(err.contains("FERRUM_DB_TLS_MODE unset"), "{err}");
             assert!(
                 !err.contains("s3cret-pass")
                     && !err.contains("user:")
@@ -450,10 +447,7 @@ fn env_policy_accepts_unset_sql_db_tls_mode_with_url_owned_verifying_params() {
             "mysql",
             "mysql://user:s3cret@db.example/ferrum?ssl-mode=VERIFY_IDENTITY",
         ),
-        (
-            "mysql",
-            "mysql://db.example/ferrum?ssl_mode=VERIFY_CA",
-        ),
+        ("mysql", "mysql://db.example/ferrum?ssl_mode=VERIFY_CA"),
         (
             "POSTGRES",
             "postgres://db.example/ferrum?SSLMode=verify-full",
@@ -478,10 +472,8 @@ fn env_policy_accepts_unset_sql_db_tls_mode_with_url_owned_verifying_params() {
 fn env_policy_holds_failover_and_replica_urls_to_the_same_sql_tls_standard() {
     // A verified primary with an unverified failover or replica still admits
     // an unauthenticated peer — every configured SQL URL is checked.
-    let verified_primary =
-        "postgres://user:s3cret@primary.example/ferrum?sslmode=verify-full";
-    let weak_failover =
-        "postgres://user:failover-secret@standby.example/ferrum?sslmode=require";
+    let verified_primary = "postgres://user:s3cret@primary.example/ferrum?sslmode=verify-full";
+    let weak_failover = "postgres://user:failover-secret@standby.example/ferrum?sslmode=require";
     let plain_replica = "postgres://user:replica-secret@replica.example/ferrum";
 
     let failover_only = EnvConfig {
@@ -493,10 +485,7 @@ fn env_policy_holds_failover_and_replica_urls_to_the_same_sql_tls_standard() {
     };
     let err = policy::check_env_config_enforced(&failover_only)
         .expect_err("unverified failover is refused");
-    assert!(
-        err.contains("FERRUM_DB_FAILOVER_URLS[#1]"),
-        "{err}"
-    );
+    assert!(err.contains("FERRUM_DB_FAILOVER_URLS[#1]"), "{err}");
     assert!(err.contains("`sslmode`"), "{err}");
     assert!(
         !err.contains("failover-secret")
@@ -514,10 +503,7 @@ fn env_policy_holds_failover_and_replica_urls_to_the_same_sql_tls_standard() {
     };
     let err = policy::check_env_config_enforced(&replica_only)
         .expect_err("unverified replica is refused");
-    assert!(
-        err.contains("FERRUM_DB_READ_REPLICA_URL"),
-        "{err}"
-    );
+    assert!(err.contains("FERRUM_DB_READ_REPLICA_URL"), "{err}");
     assert!(
         !err.contains("replica-secret") && !err.contains("replica.example"),
         "URL material must never leak: {err}"
@@ -527,15 +513,11 @@ fn env_policy_holds_failover_and_replica_urls_to_the_same_sql_tls_standard() {
         db_type: Some("mysql".to_string()),
         db_tls_mode: None,
         db_url: Some(
-            "mysql://user:s3cret@primary.example/ferrum?ssl-mode=VERIFY_IDENTITY"
-                .to_string(),
+            "mysql://user:s3cret@primary.example/ferrum?ssl-mode=VERIFY_IDENTITY".to_string(),
         ),
-        db_failover_urls: vec![
-            "mysql://standby.example/ferrum?ssl-mode=VERIFY_CA".to_string(),
-        ],
+        db_failover_urls: vec!["mysql://standby.example/ferrum?ssl-mode=VERIFY_CA".to_string()],
         db_read_replica_url: Some(
-            "mysql://replica.example/ferrum?ssl_mode=VERIFY_IDENTITY"
-                .to_string(),
+            "mysql://replica.example/ferrum?ssl_mode=VERIFY_IDENTITY".to_string(),
         ),
         ..EnvConfig::default()
     };
