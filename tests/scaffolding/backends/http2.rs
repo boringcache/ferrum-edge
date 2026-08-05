@@ -1154,7 +1154,7 @@ fn build_server_config_with_alpn(
 /// Substrings for client-disconnect errors scripted TLS/H2 backends may record
 /// when a peer vanishes mid-handshake or without a clean shutdown. Closed
 /// allowlist — do not broaden to swallow genuine protocol or translation errors.
-const BENIGN_SCRIPT_STEP_ERROR_SUBSTRINGS: &[&str] = [
+const BENIGN_SCRIPT_STEP_ERROR_SUBSTRINGS: &[&str] = &[
     // Peer closed TCP during the TLS handshake (pool probe / scheduling noise).
     "tls handshake eof",
     // Post-handshake peer close without TLS `close_notify` (same benign class).
