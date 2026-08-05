@@ -28,7 +28,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
     spool_decompression_limit_for_tests, spool_index_entry_bytes_for_tests,
     spool_split_worklist_max_entries_for_tests, spool_streaming_limits_for_tests,
-    write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
+    write_dead_letter_meta_for_tests, write_private_file_atomically_for_tests,
+    write_private_file_atomically_with_fault_for_tests,
 };
 #[cfg(unix)]
 use ferrum_edge::plugins::api_chargeback_sink::{
@@ -8843,6 +8844,76 @@ fn stale_dead_letter_claim_cannot_delete_completed_handoff() {
     assert!(
         meta_path.exists(),
         "stale peer must not delete completed rejected metadata"
+    );
+}
+
+#[test]
+fn directory_at_claim_publishes_evidence_without_clearing_prior_siblings() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-dir-claim-siblings")])
+        .unwrap();
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim should be acquired");
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+    let row = br#"{"event_id":"evt-dir-claim-siblings"}"#;
+
+    let payload_path = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect("initial dead-letter payload should publish");
+    let payload_name = payload_path.file_name().unwrap().to_string_lossy();
+    let base = payload_name
+        .strip_suffix(".rejected.ndjson")
+        .expect("dead-letter payload suffix");
+    let meta_path = payload_path.with_file_name(format!("{base}.rejected.meta"));
+    let prior_payload = b"prior-rejected-payload-marker\n";
+    let prior_meta = b"{\"prior\":true}\n";
+    fs::write(&payload_path, prior_payload).unwrap();
+    fs::write(&meta_path, prior_meta).unwrap();
+
+    // Hostile race: claim path becomes a directory (present, wrong type), not
+    // a completed-handoff disappearance.
+    fs::remove_file(&claim_path).unwrap();
+    fs::create_dir(&claim_path).unwrap();
+
+    // Opening must not authorize destructive sibling cleanup.
+    let empty_error = probe_empty_dead_letter_publish_for_tests(&spool, &claim_path)
+        .expect_err("empty publish must still be refused");
+    assert!(
+        empty_error.contains("refusing to publish an empty"),
+        "unexpected empty-publish diagnostic: {empty_error}"
+    );
+    assert_eq!(
+        fs::read(&payload_path).unwrap(),
+        prior_payload,
+        "directory at claim must not delete a prior rejected payload"
+    );
+    assert_eq!(
+        fs::read(&meta_path).unwrap(),
+        prior_meta,
+        "directory at claim must not delete a prior rejected metadata sibling"
+    );
+
+    // Constructive publication must still succeed for both artifacts.
+    let published = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect("directory at claim must not block payload publish");
+    assert_eq!(published, payload_path);
+    assert_eq!(fs::read(&payload_path).unwrap(), row);
+    assert_eq!(
+        fs::read(&meta_path).unwrap(),
+        prior_meta,
+        "payload publish must leave the prior meta sibling until metadata publish"
+    );
+
+    write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, 1)
+        .expect("directory at claim must not block metadata publish");
+    let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta["rejected_rows"], 1);
+    assert!(
+        claim_path.is_dir(),
+        "constructive handoff must leave the planted directory claim untouched"
     );
 }
 

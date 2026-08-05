@@ -6145,6 +6145,18 @@ fn directory_is_within_canonical_root(canonical_root: &Path, dir: &Path) -> Resu
     Ok(())
 }
 
+/// Spool claim path shape before destructive dead-letter sibling cleanup.
+///
+/// See [`SpoolManager::managed_claim_state`]: missing and wrong-type claims are
+/// intentionally distinct so constructive evidence publication is not gated on
+/// the same predicate that protects completed `.rejected.*` siblings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedClaimState {
+    RegularFile,
+    Missing,
+    NotRegularFile,
+}
+
 /// Reject a managed path that is itself a symlink.
 ///
 /// Spool maintenance must operate on the real file it enumerated, never on a
@@ -7075,24 +7087,33 @@ impl SpoolManager {
         Ok(())
     }
 
-    /// Prove a managed spool file currently exists before treating it as the
-    /// authoritative source for destructive sibling cleanup.
-    fn assert_existing_managed_file(&self, path: &Path) -> Result<(), String> {
+    /// Classify a managed claim path before destructive `.rejected.*` cleanup.
+    ///
+    /// Constructive dead-letter publication (open writer, append, publish
+    /// payload, publish metadata) must keep working when a hostile racer
+    /// replaces the claim with a directory; otherwise the audit trail is
+    /// suppressed. Destructive cleanup of prior siblings is different for the
+    /// two non-file outcomes and must not be collapsed:
+    /// - [`ManagedClaimState::Missing`]: the handoff already completed. Do not
+    ///   unlink durable siblings, and refuse to open a new writer against the
+    ///   stale claim.
+    /// - [`ManagedClaimState::NotRegularFile`]: hostile interference at the
+    ///   claim path. Skip destructive sibling cleanup, but let constructive
+    ///   publication continue; final claim removal then fails through the
+    ///   natural `remove_file` / "failed to remove replay source" path.
+    /// Symlinks stay refused via [`Self::assert_managed_path`].
+    fn managed_claim_state(&self, path: &Path) -> Result<ManagedClaimState, String> {
         self.assert_managed_path(path)?;
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
                 "{PLUGIN_NAME}: refusing to operate on symlinked spool path '{}'",
                 path.display()
             )),
-            Ok(metadata) if metadata.is_file() => Ok(()),
-            Ok(_) => Err(format!(
-                "{PLUGIN_NAME}: managed spool source '{}' is not a regular file",
-                path.display()
-            )),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
-                "{PLUGIN_NAME}: managed spool source '{}' no longer exists",
-                path.display()
-            )),
+            Ok(metadata) if metadata.is_file() => Ok(ManagedClaimState::RegularFile),
+            Ok(_) => Ok(ManagedClaimState::NotRegularFile),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(ManagedClaimState::Missing)
+            }
             Err(error) => Err(format!(
                 "{PLUGIN_NAME}: failed to lstat managed spool source '{}': {error}",
                 path.display()
@@ -8453,7 +8474,17 @@ impl DeadLetterPayloadWriter {
         let (temp_path, final_path) = dead_letter_payload_paths(spool, source_path)?;
         let (_, prior_meta_path) = dead_letter_meta_paths(source_path)?;
         let _guard = spool.lock_spool_mutation()?;
-        spool.assert_existing_managed_file(source_path)?;
+        // Constructive open keeps namespace containment only. Existence / regular
+        // file shape gates the destructive prior-sibling cleanup below: a stale
+        // missing claim must not wipe a completed handoff, while a planted
+        // directory must not abort evidence reconstruction.
+        let claim_state = spool.managed_claim_state(source_path)?;
+        if claim_state == ManagedClaimState::Missing {
+            return Err(format!(
+                "{PLUGIN_NAME}: managed spool source '{}' no longer exists",
+                source_path.display()
+            ));
+        }
         spool.assert_managed_path(&temp_path)?;
         spool.assert_managed_path(&final_path)?;
         spool.assert_managed_path(&prior_meta_path)?;
@@ -8463,20 +8494,23 @@ impl DeadLetterPayloadWriter {
         // handoff artifacts under the namespace lock before rebuilding so
         // recovery never needs quota for two complete rejected payloads and
         // never evicts unrelated active spool data merely to duplicate one.
-        for (path, kind) in [(&prior_meta_path, "metadata"), (&final_path, "payload")] {
-            let removed_len = spool_regular_file_len(path);
-            match fs::remove_file(path) {
-                Ok(()) => {
-                    if let Some(len) = removed_len {
-                        spool.usage.account_sub(1, len);
+        // Only a live regular-file claim authorizes that destructive cleanup.
+        if claim_state == ManagedClaimState::RegularFile {
+            for (path, kind) in [(&prior_meta_path, "metadata"), (&final_path, "payload")] {
+                let removed_len = spool_regular_file_len(path);
+                match fs::remove_file(path) {
+                    Ok(()) => {
+                        if let Some(len) = removed_len {
+                            spool.usage.account_sub(1, len);
+                        }
                     }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "{PLUGIN_NAME}: failed to remove prior partial dead-letter {kind} '{}': {error}",
-                        path.display()
-                    ));
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "{PLUGIN_NAME}: failed to remove prior partial dead-letter {kind} '{}': {error}",
+                            path.display()
+                        ));
+                    }
                 }
             }
         }
@@ -8587,7 +8621,9 @@ impl DeadLetterPayloadWriter {
         };
 
         let _guard = spool.lock_spool_mutation()?;
-        spool.assert_existing_managed_file(&self.source_path)?;
+        // Constructive publish: namespace containment only. Prior-final removal
+        // below is destructive and requires a live regular-file claim.
+        spool.assert_managed_path(&self.source_path)?;
         spool.assert_managed_path(&self.temp_path)?;
         spool.assert_managed_path(&self.final_path)?;
         // Before mutating any prior partial handoff, prove the live temp path
@@ -8609,20 +8645,24 @@ impl DeadLetterPayloadWriter {
         // source removal failed. The still-present source is authoritative, so
         // discard that replaceable sibling before quota admission; otherwise
         // large recovery payloads would require space for two identical finals
-        // and could become permanently unrecoverable.
-        let replaced_payload_len = spool_regular_file_len(&self.final_path);
-        match fs::remove_file(&self.final_path) {
-            Ok(()) => {
-                if let Some(len) = replaced_payload_len {
-                    spool.usage.account_sub(1, len);
+        // and could become permanently unrecoverable. A missing or non-file
+        // claim must not authorize that unlink (completed handoff vs hostile
+        // directory plant).
+        if spool.managed_claim_state(&self.source_path)? == ManagedClaimState::RegularFile {
+            let replaced_payload_len = spool_regular_file_len(&self.final_path);
+            match fs::remove_file(&self.final_path) {
+                Ok(()) => {
+                    if let Some(len) = replaced_payload_len {
+                        spool.usage.account_sub(1, len);
+                    }
                 }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "{PLUGIN_NAME}: failed to replace prior dead-letter payload '{}': {error}",
-                    self.final_path.display()
-                ));
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "{PLUGIN_NAME}: failed to replace prior dead-letter payload '{}': {error}",
+                        self.final_path.display()
+                    ));
+                }
             }
         }
         // The temp and still-authoritative source are both present in the
@@ -8952,23 +8992,29 @@ fn write_dead_letter_meta(
     let _guard = spool.lock_spool_mutation()?;
     spool.assert_managed_path(&meta_path)?;
     spool.assert_managed_path(&tmp_path)?;
-    spool.assert_existing_managed_file(source_path)?;
+    // Constructive metadata publication keeps namespace containment only. Prior
+    // meta removal is destructive and requires a live regular-file claim so a
+    // planted directory cannot suppress the durable record, while a missing
+    // claim cannot authorize unlinking a completed sibling.
+    spool.assert_managed_path(source_path)?;
     spool.evict_until_can_admit(bytes.len() as u64)?;
     // Measured after eviction: a reclaim that already deleted this record has
     // accounted for it, so re-measuring here cannot double-subtract.
-    let replaced_meta_len = spool_regular_file_len(&meta_path);
-    match fs::remove_file(&meta_path) {
-        Ok(()) => {
-            if let Some(len) = replaced_meta_len {
-                spool.usage.account_sub(1, len);
+    if spool.managed_claim_state(source_path)? == ManagedClaimState::RegularFile {
+        let replaced_meta_len = spool_regular_file_len(&meta_path);
+        match fs::remove_file(&meta_path) {
+            Ok(()) => {
+                if let Some(len) = replaced_meta_len {
+                    spool.usage.account_sub(1, len);
+                }
             }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(format!(
-                "{PLUGIN_NAME}: failed to replace dead-letter metadata '{}': {error}",
-                meta_path.display()
-            ));
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: failed to replace dead-letter metadata '{}': {error}",
+                    meta_path.display()
+                ));
+            }
         }
     }
     let _live = LiveSpoolPathGuard::new(tmp_path.clone());
@@ -10548,6 +10594,60 @@ pub fn publish_dead_letter_payload_for_tests(
     writer.publish(spool).map(|published| published.path)
 }
 
+/// Publish one production-format dead-letter metadata record for an already
+/// published payload. External tests use this with
+/// [`publish_dead_letter_payload_for_tests`] to exercise constructive metadata
+/// publication when the claim path is no longer a regular file.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn write_dead_letter_meta_for_tests(
+    spool: &SpoolManager,
+    source_path: &Path,
+    payload_path: &Path,
+    rejected_rows: usize,
+) -> Result<PathBuf, String> {
+    let payload_file = payload_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!("{PLUGIN_NAME}: dead-letter meta probe has an invalid payload filename")
+        })?
+        .to_string();
+    let payload_bytes = fs::metadata(payload_path)
+        .map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: dead-letter meta probe failed to stat payload '{}': {error}",
+                payload_path.display()
+            )
+        })?
+        .len();
+    let payload_sha256 = {
+        let bytes = fs::read(payload_path).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: dead-letter meta probe failed to read payload '{}': {error}",
+                payload_path.display()
+            )
+        })?;
+        let mut hasher = crate::fips::approved::Sha256::new();
+        hasher.update(&bytes);
+        hex::encode(hasher.finalize())
+    };
+    let outcomes = [DeadLetterOutcomeMeta {
+        reason: DeadLetterReason::PermanentHttp.as_str(),
+        http_status: Some(400),
+        row_count: rejected_rows,
+    }];
+    let meta = DeadLetterMeta {
+        rejected_rows,
+        outcomes: &outcomes,
+        quarantined_at_unix: unix_timestamp_seconds(),
+        payload_file,
+        payload_bytes,
+        payload_sha256,
+    };
+    write_dead_letter_meta(spool, source_path, &meta)
+}
+
 /// Bytes one spool line-index / worklist entry occupies.
 #[doc(hidden)]
 #[allow(dead_code)]
@@ -11838,7 +11938,12 @@ fn finalize_replayed_spool_file(
     let meta_path = write_dead_letter_meta(spool, file, &meta)?;
     {
         let _guard = spool.lock_spool_mutation()?;
-        spool.assert_existing_managed_file(file)?;
+        // Destructive claim removal: namespace containment + symlink refusal only.
+        // Do not require a regular file here — a planted directory must still
+        // have produced durable payload/meta above, and the natural remove_file
+        // failure surfaces as "failed to remove replay source". A missing claim
+        // likewise fails remove_file rather than a premature existence refusal.
+        spool.assert_managed_path(file)?;
         published_payload.revalidate(spool)?;
         let source_len = spool_regular_file_len(file);
         fs::remove_file(file).map_err(|error| {
