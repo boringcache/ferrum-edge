@@ -279,8 +279,10 @@ streamPorts:
 
 Gateway API `TCPRoute` / `TLSRoute` listeners materialize Ferrum stream proxies
 on the Gateway listener port itself (`TLSRoute` as SNI passthrough on
-`protocol: TLS` / `tls.mode: Passthrough`). Chart installs that terminate
-north-south TCP or TLS passthrough must publish matching `streamPorts` (with
+`protocol: TLS` / `tls.mode: Passthrough`). `TLSRouteModeTerminate` is not
+implemented; non-Passthrough TLS listeners are rejected fail closed. Chart
+installs that expose north-south TCP or TLS passthrough must publish matching
+`streamPorts` (with
 `service: true` when the Service should expose them). The Gateway API
 conformance lab exercises both paths with dedicated NodePorts; see
 [`docs/gateway_api_conformance.md`](../../docs/gateway_api_conformance.md).

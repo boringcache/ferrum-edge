@@ -1142,6 +1142,8 @@ fn gateway_listener_statuses(
             };
             let accepted_message = if !gateway_accepted {
                 "Ferrum rejected this Gateway"
+            } else if !listener_protocol_mode_is_supported(listener) {
+                "Ferrum supports protocol TLS only with spec.listeners[].tls.mode=Passthrough"
             } else if !route_kinds.protocol_supported {
                 "Ferrum does not support this listener protocol"
             } else {
@@ -1241,6 +1243,13 @@ fn existing_listener_status<'a>(gateway: &'a K8sObject, listener_name: &str) -> 
 }
 
 fn listener_route_kind_status(protocol: &str, listener: &Value) -> ListenerRouteKindStatus {
+    if !listener_protocol_mode_is_supported(listener) {
+        return ListenerRouteKindStatus {
+            protocol_supported: false,
+            route_kinds_valid: false,
+            supported_kinds: Vec::new(),
+        };
+    }
     let protocol_kinds = listener_protocol_route_kinds(protocol);
     if protocol_kinds.is_empty() {
         return ListenerRouteKindStatus {
@@ -1344,6 +1353,9 @@ fn attached_route_count(
 }
 
 fn route_kind_allowed_by_listener(route: &K8sObject, listener: &Value) -> bool {
+    if !listener_protocol_mode_is_supported(listener) {
+        return false;
+    }
     let protocol_kinds = listener_protocol_route_kinds(
         listener
             .get("protocol")
@@ -1366,6 +1378,19 @@ fn route_kind_allowed_by_listener(route: &K8sObject, listener: &Value) -> bool {
     kinds
         .iter()
         .any(|kind| listener_allowed_route_kind(kind, &protocol_kinds) == Some(route.kind.as_str()))
+}
+
+fn listener_protocol_mode_is_supported(listener: &Value) -> bool {
+    let is_tls = listener
+        .get("protocol")
+        .and_then(Value::as_str)
+        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("TLS"));
+    !is_tls
+        || listener
+            .get("tls")
+            .and_then(|tls| tls.get("mode"))
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("Passthrough"))
 }
 
 fn route_allowed_by_listener(
@@ -3603,6 +3628,61 @@ mod tests {
             Some("InvalidCertificateRef")
         );
         assert_condition(conditions, "Programmed", "False");
+    }
+
+    #[test]
+    fn tls_terminate_listener_and_tlsroute_are_rejected_fail_closed() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls-terminate",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Terminate"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TLSRoute",
+            "db",
+            json!({
+                "parentRefs": [{"name": "edge", "sectionName": "tls-terminate"}],
+                "hostnames": ["db.example.com"],
+                "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
+            }),
+        );
+
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let listener = listener_status_by_name(
+            gateway_update.status["listeners"].as_array().unwrap(),
+            "tls-terminate",
+        );
+        assert_eq!(listener["attachedRoutes"].as_u64(), Some(0));
+        let listener_conditions = listener["conditions"].as_array().unwrap();
+        assert_condition(listener_conditions, "Accepted", "False");
+        assert_eq!(
+            find_condition(listener_conditions, "Accepted")["reason"].as_str(),
+            Some("UnsupportedProtocol")
+        );
+        assert_condition(listener_conditions, "Programmed", "False");
+
+        let route_update = update_for(&updates, "TLSRoute", "db");
+        let route_conditions = route_update.status["parents"][0]["conditions"]
+            .as_array()
+            .unwrap();
+        assert_condition(route_conditions, "Accepted", "False");
+        assert_eq!(
+            find_condition(route_conditions, "Accepted")["reason"].as_str(),
+            Some("NotAllowedByListeners")
+        );
+        assert_condition(route_conditions, "Programmed", "False");
     }
 
     #[test]

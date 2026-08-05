@@ -90,14 +90,13 @@ spec:
                   try:
                       with ctx.wrap_socket(conn, server_side=True) as ssock:
                           data = b""
-                          while True:
+                          while b"\n" not in data and len(data) < 65536:
                               chunk = ssock.recv(4096)
                               if not chunk:
                                   break
                               data += chunk
-                              if len(data) >= 65536:
-                                  break
-                          ssock.sendall(name + b":" + data)
+                          payload = data.partition(b"\n")[0]
+                          ssock.sendall(name + b":" + payload)
                   except Exception as exc:
                       print(f"tls echo session error: {exc}", flush=True)
                   finally:
@@ -316,8 +315,9 @@ ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
 with socket.create_connection((host, port), timeout=5) as sock:
     with ctx.wrap_socket(sock, server_hostname=sni) as ssock:
-        ssock.sendall(payload)
-        ssock.shutdown(socket.SHUT_WR)
+        # A newline frames the request. Waiting for TLS/TCP EOF here races the
+        # backend response with close-notify and made this live gate flaky.
+        ssock.sendall(payload + b"\n")
         chunks = []
         while True:
             chunk = ssock.recv(4096)
@@ -505,8 +505,13 @@ YAML
   wait_for_tls_echo "$TLS_BLACKBOX_PORT_DELETE" "$TLS_SNI_DELETE" "blackbox-tls-a" "pre-delete" | tee -a "$report"
   kubectl -n "$DP_GATEWAY_NAMESPACE" delete tlsroute blackbox-tls-delete --wait=true
   local delete_ok=0
+  local delete_body=""
   for _ in $(seq 1 30); do
-    if ! tls_exchange 127.0.0.1 "$TLS_BLACKBOX_PORT_DELETE" "$TLS_SNI_DELETE" "post-delete" >/dev/null 2>&1; then
+    if ! delete_body="$(tls_exchange 127.0.0.1 "$TLS_BLACKBOX_PORT_DELETE" "$TLS_SNI_DELETE" "post-delete" 2>/dev/null)"; then
+      delete_ok=1
+      break
+    fi
+    if ! grep -q '^blackbox-tls-a:post-delete$' <<<"$delete_body"; then
       delete_ok=1
       break
     fi
