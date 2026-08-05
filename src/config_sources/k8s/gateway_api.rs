@@ -243,9 +243,8 @@ pub(super) fn collect_backend_lb_policy(
             return Err(invalid_resource(
                 object,
                 format!(
-                    "spec.targetRefs[{index}] must target core group Service \
-                     (got group={group:?} kind={kind:?}); other backend kinds \
-                     are not supported"
+                    "spec.targetRefs[{index}] must target core group Service; \
+                     other backend kinds are not supported"
                 ),
             ));
         }
@@ -417,13 +416,12 @@ fn parse_session_persistence(
                     cookie_config.ttl_seconds =
                         parse_gateway_api_duration_secs(object, raw, "absoluteTimeout")?;
                 }
-                other => {
+                _ => {
                     return Err(invalid_resource(
                         object,
-                        format!(
-                            "sessionPersistence.cookieConfig.lifetimeType must be \
-                             Session or Permanent (got {other:?})"
-                        ),
+                        "sessionPersistence.cookieConfig.lifetimeType must be \
+                         Session or Permanent"
+                            .to_string(),
                     ));
                 }
             }
@@ -452,11 +450,9 @@ fn parse_session_persistence(
                 cookie_config: None,
             })
         }
-        other => Err(invalid_resource(
+        _ => Err(invalid_resource(
             object,
-            format!(
-                "sessionPersistence.type must be Cookie or Header (got {other:?})"
-            ),
+            "sessionPersistence.type must be Cookie or Header".to_string(),
         )),
     }
 }
