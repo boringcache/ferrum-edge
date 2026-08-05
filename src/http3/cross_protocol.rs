@@ -567,12 +567,7 @@ fn select_next_cross_protocol_retry_target(
     // Mixed-port rotation can land on a stricter DestinationRule maxRetries
     // (including zero). Refuse before any intermediate outcome is charged to
     // a candidate that will never be dispatched.
-    if !crate::proxy::retry_attempt_allowed_for_target(
-        route_max_retries,
-        proxy,
-        &next,
-        attempt,
-    ) {
+    if !crate::proxy::retry_attempt_allowed_for_target(route_max_retries, proxy, &next, attempt) {
         warn!(
             proxy_id = %proxy.id,
             attempt = attempt,

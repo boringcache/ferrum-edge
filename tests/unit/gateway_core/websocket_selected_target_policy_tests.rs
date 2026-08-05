@@ -691,12 +691,14 @@ fn websocket_retry_rotation_rechecks_destination_rule_max_retries() {
             body.contains("route_retry_ceiling"),
             "{label} WebSocket retry must authorize against the original route ceiling"
         );
-        let selection = body.find("select_next_retry_target(").unwrap_or_else(|| {
-            panic!("{label} WebSocket retry rotation must remain present")
-        });
-        let candidate_cap = body.find("retry_attempt_allowed_for_target(").unwrap_or_else(|| {
-            panic!("{label} WebSocket candidate maxRetries gate must remain present")
-        });
+        let selection = body
+            .find("select_next_retry_target(")
+            .unwrap_or_else(|| panic!("{label} WebSocket retry rotation must remain present"));
+        let candidate_cap = body
+            .find("retry_attempt_allowed_for_target(")
+            .unwrap_or_else(|| {
+                panic!("{label} WebSocket candidate maxRetries gate must remain present")
+            });
         assert!(
             selection < candidate_cap,
             "{label} WebSocket must re-resolve maxRetries after selecting the retry candidate"
