@@ -5734,10 +5734,9 @@ async fn replay_claim_is_excluded_from_eviction_and_released_on_retryable() {
         .expect_err("an in-flight claim is never an eviction candidate");
     assert!(err.contains("in-flight"), "unexpected error: {err}");
     assert!(claim_path.exists(), "in-flight claim must survive eviction");
-    drop(claim);
-
     // Retryable delivery releases the claim back to a durable replayable name.
-    let released = spool.release_inflight_file_for_tests(&claim_path).unwrap();
+    let released = spool.release_inflight_claim_for_tests(&claim).unwrap();
+    drop(claim);
     assert_eq!(released.as_deref(), Some(oldest.as_path()));
     assert!(oldest.exists());
     assert!(!claim_path.exists());
@@ -5904,9 +5903,8 @@ fn claiming_a_foreign_or_non_replayable_spool_file_is_refused() {
 
     // Releasing a path that carries no claim marker is refused rather than
     // renaming an arbitrary managed file.
-    let not_a_claim = spool
-        .release_inflight_file_for_tests(&foreign)
-        .expect_err("only claim markers can be released");
+    let not_a_claim = SpoolManager::claim_restore_path_for_tests(&foreign)
+        .expect_err("only claim markers can be restored");
     assert!(
         not_a_claim.contains("missing a claim marker"),
         "{not_a_claim}"
@@ -6003,7 +6001,7 @@ fn claim_renewal_moves_the_lease_deadline_without_releasing_the_record() {
     );
 
     let released = spool
-        .release_inflight_file_for_tests(&renewed)
+        .release_inflight_claim_for_tests(&claim)
         .unwrap()
         .expect("release restores the durable record");
     assert_eq!(released, record);
@@ -8386,7 +8384,10 @@ async fn claim_substituted_before_finalization_still_publishes_but_never_mutates
     );
     assert_eq!(
         after.bytes,
-        before.bytes.saturating_add(payload_len).saturating_add(meta_len),
+        before
+            .bytes
+            .saturating_add(payload_len)
+            .saturating_add(meta_len),
         "only the newly published evidence may change owned bytes"
     );
 }
@@ -8410,7 +8411,10 @@ async fn generic_finalize_failure_never_releases_a_substituted_claim() {
     // `replay_keeps_original_when_dead_letter_metadata_cannot_be_written`.
     let meta_temp = meta_path.with_file_name(format!(
         "{}.tmp",
-        meta_path.file_name().and_then(|name| name.to_str()).unwrap()
+        meta_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
     ));
     fs::create_dir(&meta_temp).unwrap();
     let displaced = outside.path().join("displaced-authoritative-source.ndjson");
@@ -8463,6 +8467,112 @@ async fn generic_finalize_failure_never_releases_a_substituted_claim() {
     assert!(
         dead_letter_payload_path(&source).exists(),
         "a payload published before the metadata failure remains recoverable"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn initial_ceiling_release_never_promotes_a_substituted_claim() {
+    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let spool = ceiling_spool(&temp, ceiling);
+    let source = spool
+        .write_events(&[sample_event("evt-initial-ceiling-substitution")])
+        .unwrap();
+    let day = source.parent().unwrap().to_path_buf();
+    let authoritative_bytes = fs::read(&source).unwrap();
+    let displaced = outside.path().join("displaced-before-ceiling-release.ndjson");
+
+    let clear = ClearReplayHookOnDrop;
+    let (fired, claim_slot) = install_claim_substitution_hook(
+        spool.namespace_root_for_tests().to_path_buf(),
+        displaced.clone(),
+        SpoolReplayHookPoint::BeforeInitialCeilingRelease,
+    );
+    let peer_hold = ceiling
+        .try_acquire(ceiling.max())
+        .expect("a peer reservation saturates the replay ceiling");
+
+    let error = replay_spool_once_with_ceiling_for_tests(
+        &spool,
+        "http://127.0.0.1:1/",
+        4,
+        ceiling,
+    )
+    .await
+    .expect_err("the bound initial release must refuse a substituted claim");
+    drop(peer_hold);
+    drop(clear);
+
+    assert!(fired.load(Ordering::SeqCst));
+    assert!(
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "unexpected initial-release diagnostic: {error}"
+    );
+    let claim = claim_slot
+        .lock()
+        .expect("planted claim slot")
+        .clone()
+        .expect("the race plants exactly one claim pathname");
+    assert_eq!(fs::read(&claim).unwrap(), PLANTED_CLAIM_SUBSTITUTE);
+    assert!(
+        !source.exists(),
+        "the initial ceiling path must not promote the substitute into the replayable name"
+    );
+    assert!(!spool_day_has_quarantine(&day));
+    assert_eq!(fs::read(&displaced).unwrap(), authoritative_bytes);
+    assert_eq!(ceiling.used(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn initial_unreadable_quarantine_never_renames_a_substituted_claim() {
+    let hard_limit = spool_artifact_byte_limit_for_tests();
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(
+        spool_settings(temp.path(), hard_limit.saturating_mul(2)),
+        "node-a",
+    )
+    .unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let source = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FG0"));
+    let source_file = fs::File::create(&source).unwrap();
+    source_file.set_len(hard_limit.saturating_add(1)).unwrap();
+    drop(source_file);
+    let displaced = outside.path().join("displaced-before-initial-quarantine.ndjson");
+
+    let clear = ClearReplayHookOnDrop;
+    let (fired, claim_slot) = install_claim_substitution_hook(
+        spool.namespace_root_for_tests().to_path_buf(),
+        displaced.clone(),
+        SpoolReplayHookPoint::BeforeInitialUnreadableQuarantine,
+    );
+
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+        .await
+        .expect("a refused quarantine leaves the substitute untouched and ends this candidate");
+    drop(clear);
+
+    assert!(fired.load(Ordering::SeqCst));
+    let claim = claim_slot
+        .lock()
+        .expect("planted claim slot")
+        .clone()
+        .expect("the race plants exactly one claim pathname");
+    assert_eq!(fs::read(&claim).unwrap(), PLANTED_CLAIM_SUBSTITUTE);
+    assert!(
+        !source.exists(),
+        "initial quarantine must not rename the substitute onto any durable source name"
+    );
+    assert!(!spool_day_has_quarantine(&day));
+    assert_eq!(
+        fs::metadata(&displaced).unwrap().len(),
+        hard_limit.saturating_add(1)
     );
 }
 
@@ -9648,75 +9758,55 @@ fn decode_spool_helper_and_path_swap_probe_fail_closed_on_missing_inputs() {
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
-async fn streaming_replay_refuses_a_post_preflight_path_swap_and_continues() {
+async fn streaming_replay_refuses_a_post_preflight_path_swap_without_mutating_it() {
     let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
     let spool = test_spool(&temp);
     let day = spool.namespace_root_for_tests().join("20260524");
     fs::create_dir_all(&day).unwrap();
     let source = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FFG"));
     fs::write(&source, br#"{"event_id":"validated-before-swap"}"#).unwrap();
-    let replacement = temp.path().join("replacement-after-preflight.ndjson");
-    fs::write(&replacement, br#"{"event_id":"smuggled-after-preflight"}"#).unwrap();
+    let authoritative_bytes = fs::read(&source).unwrap();
+    let displaced = outside.path().join("displaced-after-preflight.ndjson");
     let newer = spool
         .write_events(&[sample_event("evt-after-post-preflight-swap")])
         .unwrap();
 
-    let namespace_root = spool.namespace_root_for_tests().to_path_buf();
-    let replacement_for_hook = replacement.clone();
-    set_spool_replay_hook_for_tests(Some(Arc::new(move |point, claimed| {
-        if point != SpoolReplayHookPoint::AfterStreamingPreflight {
-            return;
-        }
-        if !claimed.starts_with(&namespace_root) {
-            return;
-        }
-        let _ = fs::rename(&replacement_for_hook, claimed);
-    })));
-    struct ClearReplayHook;
-    impl Drop for ClearReplayHook {
-        fn drop(&mut self) {
-            set_spool_replay_hook_for_tests(None);
-        }
-    }
-    let _clear = ClearReplayHook;
+    let clear = ClearReplayHookOnDrop;
+    let (fired, claim_slot) = install_claim_substitution_hook(
+        spool.namespace_root_for_tests().to_path_buf(),
+        displaced.clone(),
+        SpoolReplayHookPoint::AfterStreamingPreflight,
+    );
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
-    replay_spool_once_for_tests(&spool, &server.uri())
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect("a post-preflight identity change must quarantine and continue the tick");
+        .expect_err("a post-preflight substitute must not be quarantined or delivered");
+    drop(clear);
 
     assert!(
-        fs::read_dir(&day)
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_string_lossy().ends_with(".corrupt")),
-        "the swapped artifact must be retained under operator quarantine"
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "unexpected post-preflight substitution diagnostic: {error}"
     );
+    assert!(fired.load(Ordering::SeqCst));
+    let claim = claim_slot
+        .lock()
+        .expect("planted claim slot")
+        .clone()
+        .expect("the race plants exactly one claim pathname");
+    assert_eq!(fs::read(&claim).unwrap(), PLANTED_CLAIM_SUBSTITUTE);
+    assert!(!spool_day_has_quarantine(&day));
+    assert_eq!(fs::read(&displaced).unwrap(), authoritative_bytes);
     assert!(
-        !newer.exists(),
-        "later valid artifacts must still replay after a post-preflight identity refusal"
+        newer.exists(),
+        "the failed tick must preserve later records for a future replay"
     );
-    let bodies: Vec<String> = wait_for_requests(&server, 1)
-        .await
-        .into_iter()
-        .map(|request| String::from_utf8(request.body).unwrap())
-        .collect();
-    assert!(
-        bodies
-            .iter()
-            .any(|body| body.contains("evt-after-post-preflight-swap")),
-        "only the post-swap sibling may be delivered: {bodies:?}"
-    );
-    assert!(
-        bodies
-            .iter()
-            .all(|body| !body.contains("smuggled-after-preflight")),
-        "a replaced artifact must never be delivered: {bodies:?}"
-    );
+    assert!(server.received_requests().await.unwrap_or_default().is_empty());
 }
 
 #[cfg(unix)]
@@ -9784,8 +9874,9 @@ async fn streaming_replay_defers_when_ceiling_starves_between_preflight_and_reop
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
-async fn streaming_replay_reports_when_a_changed_artifact_cannot_be_quarantined() {
+async fn streaming_replay_never_uses_a_quarantine_target_for_a_substituted_claim() {
     let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
     let spool = test_spool(&temp);
     let day = spool.namespace_root_for_tests().join("20260524");
     fs::create_dir_all(&day).unwrap();
@@ -9795,45 +9886,42 @@ async fn streaming_replay_reports_when_a_changed_artifact_cannot_be_quarantined(
         br#"{"event_id":"validated-before-blocked-quarantine"}"#,
     )
     .unwrap();
-    // Quarantine renames to the durable base name + ".corrupt", never the
-    // in-flight claim name. Plant the blocker on that durable path so the
-    // post-preflight identity refusal cannot complete quarantine.
+    let authoritative_bytes = fs::read(&source).unwrap();
+    // Plant a sentinel at the quarantine destination. A substituted claim is
+    // unauthorized before destination handling, so this tree must stay intact.
     let quarantine = source.with_file_name(format!(
         "{}.corrupt",
         source.file_name().unwrap().to_string_lossy()
     ));
     fs::create_dir(&quarantine).unwrap();
     fs::write(quarantine.join("blocker"), b"x").unwrap();
-    let replacement = temp.path().join("replacement-blocked-quarantine.ndjson");
-    fs::write(&replacement, br#"{"event_id":"changed-after-preflight"}"#).unwrap();
-
-    let namespace_root = spool.namespace_root_for_tests().to_path_buf();
-    let replacement_for_hook = replacement.clone();
-    set_spool_replay_hook_for_tests(Some(Arc::new(move |point, claimed| {
-        if point != SpoolReplayHookPoint::AfterStreamingPreflight {
-            return;
-        }
-        if !claimed.starts_with(&namespace_root) {
-            return;
-        }
-        let _ = fs::rename(&replacement_for_hook, claimed);
-    })));
-    struct ClearReplayHook;
-    impl Drop for ClearReplayHook {
-        fn drop(&mut self) {
-            set_spool_replay_hook_for_tests(None);
-        }
-    }
-    let _clear = ClearReplayHook;
+    let displaced = outside.path().join("displaced-blocked-quarantine.ndjson");
+    let clear = ClearReplayHookOnDrop;
+    let (fired, claim_slot) = install_claim_substitution_hook(
+        spool.namespace_root_for_tests().to_path_buf(),
+        displaced.clone(),
+        SpoolReplayHookPoint::AfterStreamingPreflight,
+    );
 
     let error = replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
         .await
-        .expect_err("a changed artifact that cannot be quarantined must fail the tick");
+        .expect_err("a substituted artifact must fail before quarantine is authorized");
+    drop(clear);
     assert!(
-        error.contains("failed to quarantine changed spool artifact")
-            || error.contains("changed file identity")
-            || error.contains("quarantine"),
-        "unexpected blocked-quarantine diagnostic: {error}"
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "unexpected substituted-claim diagnostic: {error}"
+    );
+    assert!(fired.load(Ordering::SeqCst));
+    let claim = claim_slot
+        .lock()
+        .expect("planted claim slot")
+        .clone()
+        .expect("the race plants exactly one claim pathname");
+    assert_eq!(fs::read(&claim).unwrap(), PLANTED_CLAIM_SUBSTITUTE);
+    assert_eq!(fs::read(&displaced).unwrap(), authoritative_bytes);
+    assert!(
+        quarantine.join("blocker").exists(),
+        "the unauthorized path must not touch even an existing quarantine target"
     );
 }
 
