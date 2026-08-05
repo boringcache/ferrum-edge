@@ -576,8 +576,7 @@ fn listener_is_terminating_tls(listener: &Value) -> bool {
 }
 
 fn listener_is_tls_protocol(listener: &Value) -> bool {
-    string_field(listener, "protocol")
-        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("TLS"))
+    string_field(listener, "protocol").is_some_and(|protocol| protocol.eq_ignore_ascii_case("TLS"))
 }
 
 /// Ferrum implements the Gateway API TLSRoute core behavior: encrypted SNI
