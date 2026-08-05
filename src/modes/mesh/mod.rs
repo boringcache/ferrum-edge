@@ -64,8 +64,8 @@ use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
 use crate::modes::mesh::dns_proxy::MeshDnsProxy;
 use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::modes::mesh::slice::{
-    MeshSlice, MeshSliceRequest, ServiceEntryHostOwner,
-    destination_host_owner, index_service_entry_host_owners, mesh_service_identities,
+    MeshSlice, MeshSliceRequest, ServiceEntryHostOwner, destination_host_owner,
+    index_service_entry_host_owners, mesh_service_identities,
 };
 use crate::modes::startup_security;
 use crate::proxy::{self, ProxyState};
@@ -20832,10 +20832,7 @@ mod tests {
     /// is unavailable without trustworthy provenance — never guessed.
     #[test]
     fn destination_rule_missing_root_provenance_fails_closed_at_materialization() {
-        for (label, root) in [
-            ("absent / empty", ""),
-            ("whitespace-only", "   \t  "),
-        ] {
+        for (label, root) in [("absent / empty", ""), ("whitespace-only", "   \t  ")] {
             assert!(
                 !lookup_tier_rule_applied(&lookup_tier_slice("gamma", root)),
                 "{label}: Unscoped rule must be refused without trustworthy root provenance"

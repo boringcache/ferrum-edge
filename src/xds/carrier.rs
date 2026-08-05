@@ -1103,8 +1103,9 @@ mod tests {
     fn blank_istio_root_namespace_carrier_is_ignored() {
         for blank in ["", "   ", "\t\n"] {
             let encoded = serde_json::to_vec(blank).expect("encode blank");
-            let decoded = MeshSliceCarrier::decode(FERRUM_ECDS_ISTIO_ROOT_NAMESPACE_TYPE_URL, &encoded)
-                .expect("JSON decode succeeds");
+            let decoded =
+                MeshSliceCarrier::decode(FERRUM_ECDS_ISTIO_ROOT_NAMESPACE_TYPE_URL, &encoded)
+                    .expect("JSON decode succeeds");
             assert!(
                 decoded.is_none(),
                 "blank root carrier {blank:?} must be ignored at decode"
