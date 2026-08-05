@@ -43,6 +43,7 @@ adding, removing, or materially changing a workflow.
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
+| `multicluster-poller-partition-live.yml` | Multicluster Poller Partition Live | PRs, `merge_group`, push to `main`, manual | Release-blocking two-CP/two-DP trust/discovery partition and bounded last-good-retention validation; `Multicluster Poller Partition Live` is directly required. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
 | `fuzz.yml` | Fuzz | Weekly schedule, manual | Sanitizer-backed libFuzzer lane for hostile parser targets; see [fuzz.md](fuzz.md). |
 | `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. |
@@ -79,7 +80,8 @@ Pull Request / Merge Queue group
             ├─► Merge Coverage
             ├─► Gateway API Conformance
             ├─► Mesh E2E Sidecar Live
-            └─► Multicluster Federation Live
+            ├─► Multicluster Federation Live
+            └─► Multicluster Poller Partition Live
 
 Push to main
     ├─► Full required validation gate
@@ -92,7 +94,7 @@ Push to main
 
 ### Required checks and merge queue
 
-Branch protection / repository rulesets for `main` must require these six
+Branch protection / repository rulesets for `main` must require these seven
 GitHub Actions check names (exact spelling; source app is **GitHub Actions**,
 app id `15368`):
 
@@ -104,6 +106,7 @@ app id `15368`):
 | `Mesh E2E Sidecar Live` | `.github/workflows/mesh-e2e-sidecar-live.yml` | `gate` |
 | `Trusted Cross Build Policy` | `.github/workflows/cross-build-policy.yml` | `verify` |
 | `Multicluster Federation Live` | `.github/workflows/multicluster-federation-live.yml` | `gate` |
+| `Multicluster Poller Partition Live` | `.github/workflows/multicluster-poller-partition-live.yml` | `gate` |
 
 Each owner declares a `merge_group` (`types: [checks_requested]`) trigger in
 addition to its existing `pull_request` / `pull_request_target` / `push` /
@@ -134,8 +137,8 @@ under `pull_request_target` and rejects any change to
 `.github/scripts/verify_cross_build_policy.py`. Consequences for operators:
 
 - Do **not** follow the common "trigger required checks on `merge_group` only"
-  advice for these six owners. Every owner must keep reporting on the pull
-  request as well, and all six must stay *required* so a failing PR-side check
+  advice for these seven owners. Every owner must keep reporting on the pull
+  request as well, and all seven must stay *required* so a failing PR-side check
   blocks queue entry. `verify_required_ci.py` enforces both the `merge_group`
   trigger and an unfiltered `pull_request` / `pull_request_target` trigger for
   each owner.
@@ -153,9 +156,9 @@ it does **not** enable the merge queue or mutate branch protection.
 
 **Staged enablement (root-owned after this prerequisite merges):**
 
-1. Merge the workflow/`docs/ci_cd.md` prerequisite so all six owners report on
+1. Merge the workflow/`docs/ci_cd.md` prerequisite so all seven owners report on
    `merge_group`.
-2. Enable the `main` ruleset / branch protection with the six required checks
+2. Enable the `main` ruleset / branch protection with the seven required checks
    above, merge queue enabled, admin enforcement as intended.
 3. Open a throwaway test PR, enqueue it, confirm each required check runs on
    the synthesized SHA (not a stale PR SHA), and confirm release automation
@@ -166,7 +169,7 @@ it does **not** enable the merge queue or mutate branch protection.
 `.github/scripts/verify_required_ci.py` statically enforces merge_group
 triggers, unfiltered `pull_request` / `pull_request_target` triggers,
 check-name parity, event-aware SHA/base markers, and concurrency markers for
-all six owners.
+all seven owners.
 
 ### Release Pipeline Flow
 
@@ -276,11 +279,13 @@ and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
 
-Branch protection must require six independent PR **and** merge-queue checks:
+Branch protection must require seven independent PR **and** merge-queue checks:
 the unchanged `Tests` aggregate from `ci.yml`, `Merge Coverage` from
 `coverage.yml`, `Gateway API Conformance` from `gateway-api-conformance.yml`,
 `Mesh E2E Sidecar Live` from `mesh-e2e-sidecar-live.yml`,
-`Multicluster Federation Live` from `multicluster-federation-live.yml`, and
+`Multicluster Federation Live` from `multicluster-federation-live.yml`,
+`Multicluster Poller Partition Live` from
+`multicluster-poller-partition-live.yml`, and
 `Trusted Cross Build Policy` from `cross-build-policy.yml`. Each dedicated
 workflow triggers on every pull request and on `merge_group`, and fails closed
 on planning or validation failures. They are required directly rather than
@@ -1319,8 +1324,9 @@ On pushes to `main`, the `main-publish-gate` job runs after the native build mat
 The Release pipeline creates official releases when a version tag is pushed. It
 first verifies that the tag is exactly `v` followed by the `[package]` version
 from `Cargo.toml`. It then resolves the tag to its target commit and waits for
-successful `CI`, `Coverage`, `Mesh E2E Sidecar Live Datapath`, and
-`Multicluster Federation Live Datapath` workflow push runs for that exact SHA
+successful `CI`, `Coverage`, `Mesh E2E Sidecar Live Datapath`,
+`Multicluster Federation Live Datapath`, and `Multicluster Poller Partition Live`
+workflow push runs for that exact SHA
 before any release binary or image job starts. A version mismatch fails
 immediately, and every build and publishing job depends transitively on this
 guard.
