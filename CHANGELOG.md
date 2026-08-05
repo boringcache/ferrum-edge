@@ -49,6 +49,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed/oversized/unrepresentable frames fail closed under the existing
   stream bounds without logging credentials or oversized payloads.
 
+- A required two-control-plane/two-data-plane multicluster poller gate now uses
+  verified TLS/mTLS, audience-bound per-remote credentials, and four independent
+  Toxiproxy links to live-verify last-good retention, independent trust/endpoint
+  expiry, fail-closed traffic, same-generation recovery, bounded/redacted metric
+  parity, and in-flight `RemoteCluster` retirement without stale reinstall.
+
+- `/metrics` no longer replays stale mesh observability samples. The
+  `prometheus_metrics` render cache (`render_cache_ttl_seconds`, default 5s) is
+  invalidated only by producers the registry owns, but the mesh federation,
+  remote-discovery, mesh identity/config, and xDS families are process-static
+  and could not invalidate it — so any scrape landing inside the TTL of a
+  previous scrape replayed frozen counters and stale cached-bundle age gauges.
+  A real trust/discovery partition could therefore come and go while
+  `ferrum_mesh_federation_poll_failures_total` and
+  `ferrum_mesh_remote_discovery_poll_failures_total` reported no increment at
+  all. These families are now rendered live on every scrape, matching the
+  existing treatment of the NodeWaypoint ADR series.
+
 - Audited admin mutations are durable **before they run** (issue #2421).
   The admin write gate fsyncs a pre-mutation audit intent — a stable event id
   plus the authenticated actor, method, sanitized path / namespace, canonical
