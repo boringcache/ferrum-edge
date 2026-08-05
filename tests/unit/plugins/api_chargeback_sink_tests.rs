@@ -16,20 +16,22 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     encode_spool_bytes_for_tests, encode_spool_bytes_without_content_size_for_tests,
     encode_spool_bytes_without_ratio_padding_for_tests,
     encode_zstd_declaring_content_size_for_tests, new_ulid,
-    probe_charge_body_materialization_for_tests,
+    pin_dead_letter_claim_identity_for_tests, probe_charge_body_materialization_for_tests,
     probe_charge_body_materialization_with_projection_for_tests,
     probe_compact_recovery_retry_for_tests, probe_empty_dead_letter_publish_for_tests,
+    probe_empty_dead_letter_publish_with_identity_for_tests,
     probe_shared_spool_batch_clone_for_tests, probe_streaming_replay_batch_range_errors_for_tests,
     probe_streaming_spool_reader_defensive_paths_for_tests, publish_dead_letter_payload_for_tests,
-    publish_dead_letter_payload_replacing_prior_for_tests, reconcile_active_spool_usage_for_tests,
+    publish_dead_letter_payload_replacing_prior_for_tests,
+    publish_dead_letter_payload_with_identity_for_tests, reconcile_active_spool_usage_for_tests,
     render_prometheus, render_status_json, replay_spool_once_for_tests,
     replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
     serialize_json_each_row, serialize_json_each_row_projected, set_spool_write_hook_for_tests,
     spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
     spool_decompression_limit_for_tests, spool_index_entry_bytes_for_tests,
     spool_split_worklist_max_entries_for_tests, spool_streaming_limits_for_tests,
-    write_dead_letter_meta_for_tests, write_private_file_atomically_for_tests,
-    write_private_file_atomically_with_fault_for_tests,
+    write_dead_letter_meta_for_tests, write_dead_letter_meta_with_identity_for_tests,
+    write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
 };
 #[cfg(unix)]
 use ferrum_edge::plugins::api_chargeback_sink::{
@@ -8844,6 +8846,191 @@ fn stale_dead_letter_claim_cannot_delete_completed_handoff() {
     assert!(
         meta_path.exists(),
         "stale peer must not delete completed rejected metadata"
+    );
+}
+
+#[test]
+fn substituted_regular_file_at_claim_cannot_clear_completed_dead_letter_siblings() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-claim-identity-swap")])
+        .unwrap();
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim should be acquired");
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+    let row = br#"{"event_id":"evt-claim-identity-swap"}"#;
+    // Pinned exactly where replay pins it: while the claim path still names the
+    // authoritative artifact the bounded preflight validated.
+    let pinned = pin_dead_letter_claim_identity_for_tests(&claim_path);
+
+    let payload_path = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect("initial dead-letter payload should publish");
+    let payload_name = payload_path.file_name().unwrap().to_string_lossy();
+    let base = payload_name
+        .strip_suffix(".rejected.ndjson")
+        .expect("dead-letter payload suffix");
+    let meta_path = payload_path.with_file_name(format!("{base}.rejected.meta"));
+    let completed_payload = b"completed-rejected-payload\n";
+    let completed_meta = b"{\"completed\":true}\n";
+    fs::write(&payload_path, completed_payload).unwrap();
+    fs::write(&meta_path, completed_meta).unwrap();
+
+    // Same-UID substitution: a DIFFERENT regular file now occupies the claim
+    // pathname. Shape alone (`metadata.is_file()`) would still read as
+    // authoritative, so only exact identity can refuse this.
+    fs::remove_file(&claim_path).unwrap();
+    fs::write(&claim_path, b"planted-not-the-claimed-artifact\n").unwrap();
+    assert!(
+        claim_path.is_file(),
+        "the substitute must be a regular file for this to be the identity case"
+    );
+
+    let error = probe_empty_dead_letter_publish_with_identity_for_tests(&spool, &claim_path, pinned)
+        .expect_err("empty publish must still be refused");
+    assert!(
+        error.contains("refusing to publish an empty"),
+        "unexpected empty-publish diagnostic: {error}"
+    );
+    assert_eq!(
+        fs::read(&payload_path).unwrap(),
+        completed_payload,
+        "a substituted regular file must not delete the completed rejected payload"
+    );
+    assert_eq!(
+        fs::read(&meta_path).unwrap(),
+        completed_meta,
+        "a substituted regular file must not delete the completed rejected metadata"
+    );
+}
+
+#[test]
+fn exact_live_claim_identity_still_clears_prior_dead_letter_siblings() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-claim-identity-exact")])
+        .unwrap();
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim should be acquired");
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+    let row = br#"{"event_id":"evt-claim-identity-exact"}"#;
+    let pinned = pin_dead_letter_claim_identity_for_tests(&claim_path);
+
+    let payload_path = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect("initial dead-letter payload should publish");
+    let payload_name = payload_path.file_name().unwrap().to_string_lossy();
+    let base = payload_name
+        .strip_suffix(".rejected.ndjson")
+        .expect("dead-letter payload suffix");
+    let meta_path = payload_path.with_file_name(format!("{base}.rejected.meta"));
+    fs::write(&meta_path, b"{\"prior\":true}\n").unwrap();
+
+    // The claim is untouched, so the pinned identity still matches and the
+    // intended partial-handoff replacement must go ahead.
+    let error = probe_empty_dead_letter_publish_with_identity_for_tests(&spool, &claim_path, pinned)
+        .expect_err("empty publish must still be refused");
+    assert!(
+        error.contains("refusing to publish an empty"),
+        "unexpected empty-publish diagnostic: {error}"
+    );
+    assert!(
+        !payload_path.exists(),
+        "the exact live claim must still authorize clearing a prior rejected payload"
+    );
+    assert!(
+        !meta_path.exists(),
+        "the exact live claim must still authorize clearing a prior rejected metadata sibling"
+    );
+    assert!(claim_path.is_file(), "the live claim itself stays intact");
+}
+
+#[test]
+fn substituted_regular_file_at_claim_cannot_account_out_prior_dead_letter_artifacts() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-claim-identity-accounting")])
+        .unwrap();
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim should be acquired");
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+    let row = br#"{"event_id":"evt-claim-identity-accounting"}"#;
+    let pinned = pin_dead_letter_claim_identity_for_tests(&claim_path);
+
+    let payload_path = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect("initial dead-letter payload should publish");
+    let meta_path = write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
+        .expect("initial dead-letter metadata should publish");
+
+    // Same-UID substitution after a legitimate handoff established both siblings.
+    fs::remove_file(&claim_path).unwrap();
+    fs::write(&claim_path, b"planted-not-the-claimed-artifact\n").unwrap();
+
+    let prior_payload = b"prior-rejected-payload-marker-bytes\n";
+    let (republished, accounted_before_publish) =
+        publish_dead_letter_payload_with_identity_for_tests(
+            &spool,
+            &claim_path,
+            pinned,
+            row,
+            Some(prior_payload),
+        )
+        .expect("substituted claim must not block constructive payload publication");
+    assert_eq!(republished, payload_path);
+    assert_eq!(fs::read(&payload_path).unwrap(), row);
+    let after_payload = spool.cached_stats_for_tests();
+    assert_eq!(
+        after_payload.files,
+        accounted_before_publish.files.saturating_add(1),
+        "a substituted claim must not authorize account_sub of the prior rejected payload"
+    );
+    assert_eq!(
+        after_payload.bytes,
+        accounted_before_publish
+            .bytes
+            .saturating_add(row.len() as u64),
+        "the prior payload's bytes stay charged; only the exact claim may release them"
+    );
+
+    let before_meta = spool.cached_stats_for_tests();
+    let prior_meta_len = fs::metadata(&meta_path).unwrap().len();
+    assert!(
+        prior_meta_len > 0,
+        "prior metadata must occupy accounted bytes"
+    );
+    write_dead_letter_meta_with_identity_for_tests(
+        &spool,
+        &claim_path,
+        pinned,
+        &payload_path,
+        row,
+        2,
+    )
+    .expect("substituted claim must not block constructive metadata publication");
+    let new_meta_len = fs::metadata(&meta_path).unwrap().len();
+    let after_meta = spool.cached_stats_for_tests();
+    let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta["rejected_rows"], 2);
+    assert_eq!(
+        after_meta.files,
+        before_meta.files.saturating_add(1),
+        "a substituted claim must not authorize account_sub of the prior rejected metadata"
+    );
+    assert_eq!(
+        after_meta.bytes,
+        before_meta.bytes.saturating_add(new_meta_len),
+        "over-counting is deliberate; only the exact claim may release a prior record"
+    );
+    assert!(
+        claim_path.is_file(),
+        "refusing destructive cleanup must leave the planted claim file untouched"
     );
 }
 
