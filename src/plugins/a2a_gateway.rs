@@ -2636,10 +2636,7 @@ fn has_explicit_http_authority_spelling(value: &str) -> bool {
     let Some(rest) = http_scheme_rest(value) else {
         return false;
     };
-    let authority = rest
-        .split(|character| matches!(character, '/' | '?' | '#'))
-        .next()
-        .unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     !authority.is_empty()
         && !authority.starts_with(':')
         && !authority.bytes().any(|byte| byte == b'\\')
