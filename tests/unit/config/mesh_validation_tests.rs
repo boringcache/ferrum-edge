@@ -2867,6 +2867,7 @@ fn mesh_config_validate_rejects_combined_failover_priority_modes() {
             name: "dr".into(),
             namespace: "default".into(),
             host: "reviews.default.svc.cluster.local".into(),
+            export_to: Vec::new(),
             traffic_policy: Some(MeshTrafficPolicy {
                 locality_lb_setting: Some(MeshLocalityLbSetting {
                     enabled: true,
@@ -2900,6 +2901,7 @@ fn mesh_config_validate_rejects_malformed_failover_priority_entries() {
             name: "dr".into(),
             namespace: "default".into(),
             host: "reviews.default.svc.cluster.local".into(),
+            export_to: Vec::new(),
             traffic_policy: Some(MeshTrafficPolicy {
                 locality_lb_setting: Some(MeshLocalityLbSetting {
                     enabled: true,
@@ -2940,6 +2942,7 @@ fn mesh_config_validate_accepts_failover_priority_only() {
             name: "dr".into(),
             namespace: "default".into(),
             host: "reviews.default.svc.cluster.local".into(),
+            export_to: Vec::new(),
             traffic_policy: Some(MeshTrafficPolicy {
                 locality_lb_setting: Some(MeshLocalityLbSetting {
                     enabled: true,
