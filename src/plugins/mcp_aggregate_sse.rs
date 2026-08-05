@@ -532,10 +532,10 @@ impl SessionInner {
         let mut replayable = self.replayable_prefix(consumed);
         while replayable > 0 {
             let over_replay = replayable > bounds.max_replay_events;
-            let over_events = self.history.len().saturating_add(incoming_events)
-                > bounds.max_retained_events;
-            let over_bytes = self.history_bytes.saturating_add(incoming_bytes)
-                > bounds.max_retained_bytes;
+            let over_events =
+                self.history.len().saturating_add(incoming_events) > bounds.max_retained_events;
+            let over_bytes =
+                self.history_bytes.saturating_add(incoming_bytes) > bounds.max_retained_bytes;
             if !over_replay && !over_events && !over_bytes {
                 break;
             }

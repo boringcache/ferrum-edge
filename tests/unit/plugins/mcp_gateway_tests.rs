@@ -10146,14 +10146,23 @@ async fn aggregate_sse_multiplexes_a_synthetic_list_and_a_routed_call_on_one_lis
     let (mut list_ctx, mut list_headers) = mcp_request(&session_id, json!("list-1"), "tools/list");
     let listed = plugin.before_proxy(&mut list_ctx, &mut list_headers).await;
     let (status, body, _) = reject_raw(listed);
-    assert_eq!(status, 202, "a multiplexed response answers 202 on the POST");
+    assert_eq!(
+        status, 202,
+        "a multiplexed response answers 202 on the POST"
+    );
     assert!(body.is_empty());
     assert_eq!(
-        list_ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        list_ctx
+            .metadata
+            .get("mcp.sse.delivery")
+            .map(String::as_str),
         Some("multiplexed")
     );
     assert_eq!(
-        list_ctx.metadata.get("mcp.route_decision").map(String::as_str),
+        list_ctx
+            .metadata
+            .get("mcp.route_decision")
+            .map(String::as_str),
         Some("sse_multiplex")
     );
 
@@ -10169,7 +10178,10 @@ async fn aggregate_sse_multiplexes_a_synthetic_list_and_a_routed_call_on_one_lis
     assert_eq!(status, 202);
     assert!(body.is_empty());
     assert_eq!(
-        call_ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        call_ctx
+            .metadata
+            .get("mcp.sse.delivery")
+            .map(String::as_str),
         Some("multiplexed")
     );
     assert!(!mcp_sse_stream_is_open_for_test(&call_ctx));
@@ -10177,7 +10189,10 @@ async fn aggregate_sse_multiplexes_a_synthetic_list_and_a_routed_call_on_one_lis
     // Both identity types arrived on the SAME listener.
     let seen = sse_drain_until(&mut stream, &["list-1", "\"id\":501"], 8).await;
     assert!(seen.contains(": mcp-sse"));
-    assert!(seen.contains("github.create_pr"), "synthetic list multiplexed");
+    assert!(
+        seen.contains("github.create_pr"),
+        "synthetic list multiplexed"
+    );
     assert!(seen.contains("Partly cloudy"), "routed call multiplexed");
 }
 
@@ -10205,7 +10220,10 @@ async fn aggregate_sse_preserves_non_ok_upstream_http_status_inline() {
         "the original non-200 response must remain on the POST"
     );
     assert_eq!(
-        call_ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        call_ctx
+            .metadata
+            .get("mcp.sse.delivery")
+            .map(String::as_str),
         Some("inline")
     );
     assert!(!mcp_sse_stream_is_open_for_test(&call_ctx));
@@ -10243,7 +10261,10 @@ async fn aggregate_sse_cancellation_marks_an_open_routed_request_and_suppresses_
     let (ack, cancel_ctx) = cancel_notification(&plugin, &session_id, json!(600)).await;
     assert_eq!(reject_raw(ack).0, 202);
     assert_eq!(
-        cancel_ctx.metadata.get("mcp.sse.cancel").map(String::as_str),
+        cancel_ctx
+            .metadata
+            .get("mcp.sse.cancel")
+            .map(String::as_str),
         Some("cancelled"),
         "a genuinely open production stream must be cancellable"
     );
@@ -10258,7 +10279,10 @@ async fn aggregate_sse_cancellation_marks_an_open_routed_request_and_suppresses_
     assert_eq!(status, 202);
     assert!(body.is_empty());
     assert_eq!(
-        call_ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        call_ctx
+            .metadata
+            .get("mcp.sse.delivery")
+            .map(String::as_str),
         Some("suppressed")
     );
     assert!(!mcp_sse_stream_is_open_for_test(&call_ctx));
@@ -10303,7 +10327,10 @@ async fn aggregate_sse_policy_replacement_answers_inline_and_returns_the_identit
     assert_eq!(status, 200);
     assert_eq!(body["error"]["code"], -32012);
     assert_eq!(
-        call_ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        call_ctx
+            .metadata
+            .get("mcp.sse.delivery")
+            .map(String::as_str),
         Some("inline")
     );
     assert!(!mcp_sse_stream_is_open_for_test(&call_ctx));
@@ -10452,7 +10479,9 @@ async fn aggregate_sse_notifications_and_batches_never_open_a_stream() {
         { "jsonrpc": "2.0", "id": "b2", "method": "ping", "params": {} }
     ]));
     batch_headers.insert("mcp-session-id".to_string(), session_id.clone());
-    let batched = plugin.before_proxy(&mut batch_ctx, &mut batch_headers).await;
+    let batched = plugin
+        .before_proxy(&mut batch_ctx, &mut batch_headers)
+        .await;
     let (status, body, _) = reject_json(batched);
     assert_eq!(status, 200);
     let responses = body.as_array().expect("batches answer with an array");
