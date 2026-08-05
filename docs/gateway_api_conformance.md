@@ -86,8 +86,8 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | Backend failure | Yes | Traffic to unavailable generated backends must return an error response rather than falling through |
 | Route update and deletion | Yes | Reconciliation regenerates live proxy/upstream/plugin config; deletion removes the route from live config |
 | `GRPCRoute` | Not claimed by the `GATEWAY-HTTP` gate | Watched and translated — see [GRPCRoute predicate translation](#grpcroute-predicate-translation) — but not advertised as a passing upstream `GATEWAY-GRPC` profile until request traffic conformance is added |
-| `TCPRoute` | Yes, via Ferrum black-box live checks (not upstream `GATEWAY-TCP`) | Lab installs the pinned `v1.5.1` experimental-channel CRD bundle (one coherent channel that includes `TCPRoute`). Live kind traffic proves parent/listener attachment, same-namespace and ReferenceGrant cross-namespace backend resolution, tagged TCP echo forwarding, empty/missing/unpermitted backend fail-closed behavior, parent status (`Accepted`/`ResolvedRefs`/`Programmed`), live backendRef updates, and deletion withdrawal. Upstream profile/features remain `GATEWAY-HTTP` / `Gateway,ReferenceGrant,HTTPRoute`; `GATEWAY-TCP` is **not** claimed on this pin (the profile/tests land in later Gateway API releases). |
-| `TLSRoute` | Not claimed | Watched/translated for L4 experiments, but not advertised as a supported Gateway API conformance profile |
+| `TCPRoute` | Yes, via Ferrum black-box live checks (not upstream `GATEWAY-TCP`) | Lab installs the pinned `v1.5.1` experimental-channel CRD bundle (one coherent channel that includes `TCPRoute`/`TLSRoute`). Live kind traffic proves parent/listener attachment, same-namespace and ReferenceGrant cross-namespace backend resolution, tagged TCP echo forwarding, empty/missing/unpermitted backend fail-closed behavior, parent status (`Accepted`/`ResolvedRefs`/`Programmed`), live backendRef updates, and deletion withdrawal. Upstream profile/features remain `GATEWAY-HTTP` / `Gateway,ReferenceGrant,HTTPRoute`; `GATEWAY-TCP` is **not** claimed on this pin (the profile/tests land in later Gateway API releases). |
+| `TLSRoute` | Yes, via Ferrum black-box live checks (not upstream `GATEWAY-TLS`) | Live kind traffic proves TLS Passthrough SNI selection (distinct hostnames on one listener → distinct backends; unmatched SNI fails closed), tagged TLS echo forwarding through encrypted passthrough, same-namespace and ReferenceGrant cross-namespace backend resolution, empty/missing/unpermitted backend fail-closed behavior, parent status (`Accepted`/`ResolvedRefs`/`Programmed`) and listener `attachedRoutes`, live backendRef updates, and deletion withdrawal. Translator materializes `passthrough: true` stream proxies (`BackendScheme::Tcp`) keyed by route `hostnames` on Gateway `protocol: TLS` / `tls.mode: Passthrough` listener ports. Upstream profile/features remain `GATEWAY-HTTP` / `Gateway,ReferenceGrant,HTTPRoute`; `GATEWAY-TLS` is **not** claimed on this pin. |
 | `UDPRoute`, `BackendTLSPolicy`, `ListenerSet`, `BackendLBPolicy` | No | Not claimed as effective Gateway API conformance features |
 
 ## GRPCRoute predicate translation
@@ -310,14 +310,14 @@ single-cluster Gateway API behaviors, not cross-cluster or UDP mesh surfaces.
 The standalone `gateway-api-conformance.yml` workflow is the single owner that deploys the lab on PRs, and its `gate` job is the authoritative conformance check, required directly via branch protection (there is no mirror job in `ci.yml`). The lab consists of:
 
 - Ferrum control plane/controller with Gateway API watches enabled.
-- A routable Ferrum data-plane deployment and NodePort Service mapped to host ports 80 and 443 (HTTP/HTTPS) plus dedicated TCPRoute stream ports `9001`–`9004` in kind.
-- HTTP echo backend namespaces plus tagged TCP echo fixtures for live `TCPRoute` checks.
-- `GatewayClass`, `Gateway`, `HTTPRoute`, `GRPCRoute`, `TCPRoute`, and `ReferenceGrant` resources for direct black-box checks.
-- The upstream Gateway API conformance suite pinned by `GATEWAY_API_VERSION`, defaulting to `v1.5.1`, running the complete `GATEWAY-HTTP` profile with explicit supported features `Gateway,ReferenceGrant,HTTPRoute` (unchanged; TCPRoute is gated by Ferrum black-box evidence, not by advertising an upstream `GATEWAY-TCP` profile on this pin).
+- A routable Ferrum data-plane deployment and NodePort Service mapped to host ports 80 and 443 (HTTP/HTTPS) plus dedicated TCPRoute stream ports `9001`–`9004` and TLSRoute Passthrough stream ports `9011`–`9014` in kind.
+- HTTP echo backend namespaces plus tagged TCP and TLS echo fixtures for live `TCPRoute` / `TLSRoute` checks.
+- `GatewayClass`, `Gateway`, `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `TLSRoute`, and `ReferenceGrant` resources for direct black-box checks.
+- The upstream Gateway API conformance suite pinned by `GATEWAY_API_VERSION`, defaulting to `v1.5.1`, running the complete `GATEWAY-HTTP` profile with explicit supported features `Gateway,ReferenceGrant,HTTPRoute` (unchanged; TCPRoute/TLSRoute are gated by Ferrum black-box evidence, not by advertising upstream `GATEWAY-TCP` / `GATEWAY-TLS` profiles on this pin).
 
-Direct black-box checks cover hostname, path, method, headers, weighted backend selection, zero-weight-only HTTP 500 behavior, cross-namespace references, invalid references, backend failure, TLS, route updates, and route deletion for HTTP, plus TCPRoute parent/listener attachment, ReferenceGrant backend resolution, tagged echo traffic, fail-closed empty/missing/unpermitted backends, status, update, and deletion. Diagnostics and the upstream conformance report are uploaded from `conformance-results/` as retained CI artifacts.
+Direct black-box checks cover hostname, path, method, headers, weighted backend selection, zero-weight-only HTTP 500 behavior, cross-namespace references, invalid references, backend failure, TLS, route updates, and route deletion for HTTP, plus TCPRoute parent/listener attachment, ReferenceGrant backend resolution, tagged echo traffic, fail-closed empty/missing/unpermitted backends, status, update, and deletion, plus TLSRoute Passthrough SNI selection, ReferenceGrant backend resolution, tagged TLS echo traffic, unmatched-SNI and empty/missing/unpermitted backend fail-closed behavior, status, update, and deletion. Diagnostics and the upstream conformance report are uploaded from `conformance-results/` as retained CI artifacts.
 
-Lab bootstrap uses `scripts/gateway_api_conformance_lab_setup.sh` (kind ports, experimental CRDs, TCP listener Service ports). HTTP/GRPC upstream and black-box phases stay in `scripts/gateway_api_data_plane_conformance.sh`; TCPRoute black-box and supplemental diagnostics run via `scripts/gateway_api_tcproute_conformance.sh` so the Trusted Cross Build Policy frozen `gateway_api_data_plane_conformance.sh` surface on `main` stays untouched.
+Lab bootstrap uses `scripts/gateway_api_conformance_lab_setup.sh` (kind ports, experimental CRDs, TCP/TLS listener Service ports). HTTP/GRPC upstream and black-box phases stay in `scripts/gateway_api_data_plane_conformance.sh`; TCPRoute and TLSRoute black-box and supplemental diagnostics run via `scripts/gateway_api_tcproute_conformance.sh` and `scripts/gateway_api_tlsroute_conformance.sh` so the Trusted Cross Build Policy frozen `gateway_api_data_plane_conformance.sh` surface on `main` stays untouched.
 
 The standalone Gateway API conformance workflow triggers on every PR, but a lightweight `changes` job gates the heavy lab job internally: it runs the conformance suite only when the PR diff touches routing, Kubernetes translation/status, CP/DP sync, data-plane startup, plugins, charts, the conformance script, or related CI files, and otherwise skips it. Artifacts are retained for 90 days so the standard upstream report can be reproduced from the workflow inputs and preserved as release evidence.
 
@@ -389,15 +389,16 @@ condition **status**, not custom reason strings.
 Each run uploads a `gateway-api-conformance-<version>` bundle from
 `conformance-results/` (90-day retention), produced by
 `scripts/gateway_api_data_plane_conformance.sh diagnostics` (plus
-`scripts/gateway_api_tcproute_conformance.sh diagnostics` for TCPRoute log
+`scripts/gateway_api_tcproute_conformance.sh diagnostics` and
+`scripts/gateway_api_tlsroute_conformance.sh diagnostics` for L4 log
 snapshots and the extended `gateway-api-resources.yaml`):
 
 | File | What it is |
 | --- | --- |
 | `gateway-api-conformance-test.json` | Streaming `go test -json` events for every upstream conformance test. |
 | `gateway-api-conformance-report.yaml` | Upstream `conformance.gateway.networking.k8s.io` report; `profiles[].coreTests` has pass/fail per test. |
-| `gateway-api-blackbox.md` | Results of the direct black-box traffic checks (HTTP host/method/header/modifier/cross-namespace/redirect/weighted/invalid-500/zero-weight-500/no-endpoints/update/delete/TLS, plus TCPRoute attachment/status/echo/ReferenceGrant/fail-closed/update/delete). |
-| `gateway-api-resources.yaml` | `kubectl get gatewayclasses,gateways,httproutes,grpcroutes,tcproutes,referencegrants -A -o yaml` snapshot. |
+| `gateway-api-blackbox.md` | Results of the direct black-box traffic checks (HTTP host/method/header/modifier/cross-namespace/redirect/weighted/invalid-500/zero-weight-500/no-endpoints/update/delete/TLS, plus TCPRoute attachment/status/echo/ReferenceGrant/fail-closed/update/delete, plus TLSRoute Passthrough SNI selection/status/echo/ReferenceGrant/fail-closed/update/delete). |
+| `gateway-api-resources.yaml` | `kubectl get gatewayclasses,gateways,httproutes,grpcroutes,tcproutes,tlsroutes,referencegrants -A -o yaml` snapshot. |
 | `kubernetes-workloads.txt`, `namespaces.txt`, `ferrum-*-deployment.txt`, `ferrum-pods.txt`, `ferrum-events.txt` | Cluster/workload diagnostics. |
 | `ferrum-control-plane.log`, `ferrum-control-plane-previous.log`, `ferrum-data-plane.log`, `blackbox-*.log` | Container logs. |
 | `CONFORMANCE.md` (run-local) | Per-run metadata (version, profile, features, data-plane Service, artifact list). Generated by the script — distinct from the repo-root [`CONFORMANCE.md`](../CONFORMANCE.md). |

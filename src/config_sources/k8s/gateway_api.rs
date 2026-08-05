@@ -167,7 +167,15 @@ pub(super) fn translate(
             Ok(true)
         }
         "TLSRoute" => {
-            for proxy in l4_route_proxies(object, acc, BackendScheme::Tcps)? {
+            // Gateway API TLSRoute is SNI-matched TLS passthrough on TLS
+            // listeners (typically `tls.mode: Passthrough`): peek ClientHello
+            // SNI against route hostnames and forward encrypted bytes with no
+            // termination — same stream+SNI machinery as VirtualService tls[]
+            // and east-west passthrough. BackendScheme::Tcp + passthrough is
+            // required; Tcps without passthrough would terminate or originate
+            // TLS and ignore hostname SNI selection.
+            for mut proxy in l4_route_proxies(object, acc, BackendScheme::Tcp)? {
+                proxy.passthrough = true;
                 acc.upsert_proxy(proxy, SourceKind::GatewayApi);
             }
             Ok(true)
@@ -10236,6 +10244,51 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("only zero-weight backendRefs"))
+        );
+    }
+
+    #[test]
+    fn tls_route_materializes_sni_passthrough_on_gateway_tls_listener_port() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Passthrough"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TLSRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "tls"}],
+                "hostnames": ["db.example.com"],
+                "rules": [{
+                    "backendRefs": [{"name": "db", "port": 5432}]
+                }]
+            }),
+        );
+
+        let result =
+            translate_k8s_objects(&[gateway, route], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        let proxy = &result.config.proxies[0];
+        assert_eq!(proxy.listen_port, Some(15443));
+        assert_eq!(proxy.backend_port, 5432);
+        assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
+        assert!(
+            proxy.passthrough,
+            "TLSRoute must be SNI passthrough (encrypted bytes, no termination)"
+        );
+        assert_eq!(proxy.hosts, vec!["db.example.com".to_string()]);
+        assert!(
+            !proxy.frontend_tls,
+            "passthrough and frontend_tls are mutually exclusive"
         );
     }
 
