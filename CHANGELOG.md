@@ -130,10 +130,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the newly selected target so an LB rotation between attempts still dials the
   rotated target. The `502` remains the fail-closed answer only where the dial
   genuinely cannot be constructed (no resolved target address to pin, or a
-  backend URL whose authority does not carry the selected target host). Note that
-  config admission still rejects SNI combined with effective retry,
+  backend URL whose authority does not carry the selected target host). On the
+  H3→HTTP cross-protocol bridge that decision is taken as a **local
+  dispatch-policy** check — before backend admission, before the
+  least-connections connection-start record, and before any client is fetched —
+  so an override that cannot be expressed terminates with the same sanitized
+  `502` and `gateway-error-reason`, halting the H3 request body and dialing no
+  backend, on the buffered and streaming legs alike. A stray override on a
+  plaintext backend is ignored there exactly as it is on the HTTP/1.1 and
+  HTTP/2 forks, so no config becomes an HTTP/3-only outage. Note that config
+  admission still rejects SNI combined with effective retry,
   request-body-buffering plugins, or `pool_enable_http2: false`; that check is now
   conservative rather than protective and its relaxation is a follow-up.
+- Active **HTTP and gRPC** health probes now verify against the same effective
+  backend TLS server name as request traffic. A backend covered by
+  `backend_tls_sni` (`BackendTLSPolicy` `validation.hostname` or a
+  DestinationRule `trafficPolicy.tls.sni`) presents a certificate for the
+  override, not for the target host, so probes previously failed name
+  verification and ejected a target that served requests normally. The probe
+  still dials only the already-resolved, egress-screened target candidate and
+  the backend still sees its own authority: the HTTP probe carries the override
+  in the probe URL while pinning that client's resolver to the real target host
+  and sending an explicit `Host` (so the override hostname is never resolved),
+  and the gRPC probe sets it as the TLS `domain_name` / rustls `ServerName`
+  while tonic's `origin` keeps the target authority. An HTTPS probe with an
+  override is built per target rather than per upstream, and fails closed when
+  the dial cannot be pinned. TCP and UDP probes are unaffected.
+- The authority-host rewrite used by cross-cluster HBONE dispatch and by the
+  backend TLS SNI dial now requires a **host boundary**: a source host of
+  `foo.example` no longer matches the authority `foo.example.evil`. Callers
+  construct exact authorities, so this is defence in depth; bracketed IPv6
+  behaviour is unchanged.
 - `ai_semantic_firewall` streamed `inspect` mode now accepts
   `streaming.window: tokens` with an explicitly selected bounded tokenizer
   (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft

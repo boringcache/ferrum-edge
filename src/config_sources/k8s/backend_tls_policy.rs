@@ -302,9 +302,9 @@ impl IndexedBackendTlsPolicy {
                 // A port present in a COMPLETE index must be TCP. UDP, SCTP,
                 // and any unrecognized `protocol` are all excluded here — the
                 // predicate is "is TCP", not "is not UDP".
-                (Some(index), Some(port)) => {
-                    index.port(port).is_none_or(|entry| entry.transport.is_tcp())
-                }
+                (Some(index), Some(port)) => index
+                    .port(port)
+                    .is_none_or(|entry| entry.transport.is_tcp()),
                 // The backend did not resolve to any port on this Service (the
                 // index is complete, so the port genuinely is not a Service
                 // port). Keep the Service-wide answer rather than silently

@@ -149,6 +149,27 @@ traffic, and both are fail-closed on explicitly configured material:
   HTTP and gRPC probe paths alike, in their verified and no-verify branches.
 * Probe diagnostics carry the material's source identifier and a failure class
   only — never certificate or key bytes.
+* A backend TLS **server-name override** (`backend_tls_sni`, which
+  `BackendTLSPolicy` `validation.hostname` and a DestinationRule
+  `trafficPolicy.tls.sni` both project onto) is applied by **HTTP and gRPC
+  probes** as well. A backend whose certificate is valid only for the override
+  name would otherwise serve requests successfully while every probe failed name
+  verification against the target host and ejected it. The probe still dials
+  only the already-resolved, egress-screened target candidate, and the backend
+  still sees its own authority:
+  * the **HTTP** probe puts the override in the probe URL's authority — reqwest
+    derives the rustls server name from the URL and exposes no per-request hook,
+    the same constraint the proxy HTTP/1.1 path works around — while pinning
+    that client's DNS resolver to the **real target host**, so the override
+    hostname is never resolved and the socket cannot leave that target's
+    screened candidate set. `Host` is sent explicitly as the real target
+    authority. Because the pin names one target, an HTTPS probe with an override
+    builds one client per target instead of one per upstream, and fails closed
+    if no DNS cache is available to pin with.
+  * the **gRPC** probe sets the override as the TLS `domain_name` (verified
+    branch) and as the rustls `ServerName` (no-verify branch), while tonic's
+    `origin` keeps the real target authority for `:authority`.
+  * **TCP** and **UDP** probes perform no TLS handshake and are unaffected.
 
 **CA exclusivity**: When a custom CA is configured, it is the sole trust anchor. This prevents a backend pinned to an internal CA from being MITMed via any publicly-trusted certificate. If you need both internal and public CAs trusted, combine them into a single PEM bundle file.
 

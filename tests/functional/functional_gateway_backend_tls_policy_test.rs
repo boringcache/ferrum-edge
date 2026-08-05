@@ -17,18 +17,28 @@
 //!   private CA is refused, which is the whole point of the `system://` source.
 //! * live withdrawal: deleting the policy and SIGHUP-reloading returns the
 //!   backend to plaintext, so the TLS-only backend stops answering.
+//! * the backend-visible `Host`: the HTTP/1.1 SNI dial moves
+//!   `validation.hostname` into the request URL's authority, so the backend must
+//!   still be shown the REAL selected target's authority.
+//!
+//! Not covered, deliberately: the defensive `Host` fallback for a request that
+//! arrives with no authority at all. Every route here is hostname-bound
+//! (`hostnames: [app.example.com]`), so a request carrying no `Host` cannot
+//! match a route and never reaches backend dispatch — there is no reachable
+//! frontend shape for it in this fixture. The fallback stays as
+//! defence-in-depth for frontends that can synthesize one.
 //!
 //! Run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_gateway_backend_tls_policy --ignored --nocapture
 
-use crate::common::TestGateway;
+use crate::common::{TestGateway, captured_output_reports_listener_addr_in_use};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -37,6 +47,10 @@ use tokio::time::sleep;
 
 const BACKEND_SNI: &str = "backend.example.com";
 const ROUTE_HOST: &str = "app.example.com";
+/// Cluster DNS name the translator emits for the `reviews` Service in
+/// `default`. This is the authority the BACKEND must see, and it is distinct
+/// from `BACKEND_SNI` — which is the whole point of the Host assertion.
+const SERVICE_AUTHORITY_HOST: &str = "reviews.default.svc.cluster.local";
 
 // ---------------------------------------------------------------------------
 // Certificates
@@ -89,13 +103,21 @@ fn generate_signed_cert(ca: &GeneratedCa, cn: &str, sans: &[&str]) -> GeneratedC
 /// TLS-only echo backend. It speaks no plaintext at all, which is what makes
 /// the withdrawal assertion meaningful: once the policy is gone the gateway
 /// dials plaintext and the backend cannot answer.
+///
+/// It also records the `Host` header of every request it serves and echoes it
+/// back in the response body. That is the only place the backend-visible
+/// authority can be observed on the wire, and it is what proves the H1 SNI dial
+/// (whose URL authority is `validation.hostname`) still presents the REAL
+/// selected target to the backend.
 async fn start_https_echo_on(
     listener: TcpListener,
     cert_pem: &str,
     key_pem: &str,
-) -> tokio::task::JoinHandle<()> {
+) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
     let cert = cert_pem.to_string();
     let key = key_pem.to_string();
+    let observed_hosts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&observed_hosts);
     let handle = tokio::spawn(async move {
         let certs: Vec<_> = rustls_pemfile::certs(&mut cert.as_bytes())
             .filter_map(|r| r.ok())
@@ -114,15 +136,21 @@ async fn start_https_echo_on(
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
         while let Ok((tcp, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
+            let recorder = Arc::clone(&recorder);
             tokio::spawn(async move {
                 let Ok(mut stream) = acceptor.accept(tcp).await else {
                     return;
                 };
                 let mut buf = vec![0u8; 4096];
-                let _ = stream.read(&mut buf).await;
-                let body = r#"{"status":"ok","tls":true}"#;
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..read]).to_string();
+                let host = request_host_header(&head).unwrap_or_default();
+                let mut seen = recorder.lock().expect("host recorder lock");
+                seen.push(host.clone());
+                drop(seen);
+                let body = format!(r#"{{"status":"ok","tls":true,"host":"{host}"}}"#);
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -131,7 +159,23 @@ async fn start_https_echo_on(
             });
         }
     });
-    handle
+    (handle, observed_hosts)
+}
+
+/// Extract the `Host` header value from a raw HTTP/1.1 request head.
+fn request_host_header(head: &str) -> Option<String> {
+    for line in head.split("\r\n").skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("host") {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +319,13 @@ fn k8s_objects(
 /// `backend_tls_verify_server_cert`) is used exactly as the translator emitted
 /// it — that is what makes this a test of the translated policy and not of a
 /// hand-written config.
+///
+/// The dispatch is deliberately NOT forced onto HTTP/1.1. The echo backend
+/// offers only `http/1.1` in ALPN, so the direct-H2 pool cannot negotiate h2
+/// and the request falls through to the reqwest HTTP/1.1 SNI dial — which is
+/// exactly the path under test. Pinning `pool_enable_http2: false` would both
+/// skip that fallback and be rejected by
+/// `backend_tls_sni_direct_h2_conflict_messages` at config load.
 fn translated_config_yaml(objects: &[K8sObject]) -> String {
     let options = K8sTranslationOptions::new(
         "default".to_string(),
@@ -283,9 +334,6 @@ fn translated_config_yaml(objects: &[K8sObject]) -> String {
     let mut translated = translate_k8s_objects(objects, options).expect("translate");
     for proxy in &mut translated.config.proxies {
         proxy.dns_override = Some("127.0.0.1".to_string());
-        // Keep the dispatch on HTTP/1.1 so the assertion is about TLS trust and
-        // not about ALPN negotiation against the single-protocol echo backend.
-        proxy.pool_enable_http2 = Some(false);
     }
 
     let document = json!({
@@ -365,8 +413,18 @@ impl PortReservations {
     }
 }
 
-/// Spawn a file-mode gateway on the rendered config, retrying with fresh ports
-/// when a spawn loses an ephemeral-port race.
+/// Spawn a file-mode gateway on the rendered config.
+///
+/// A retry is admitted for exactly one failure: this child reported a listener
+/// bind that lost the ephemeral-port race documented on [`PortReservations`].
+/// `TestGatewayBuilder::spawn`'s blanket retry loop would also re-roll a
+/// rejected config, a JWT/auth failure, a parse error, or any other
+/// deterministic child fault and then report it three attempts later as
+/// "gateway failed to start", masking exactly the failures this suite exists to
+/// detect. `spawn_classified` makes one attempt and classifies structurally
+/// (see `captured_output_reports_listener_addr_in_use`); every other failure
+/// stops immediately with the child's captured diagnostics. Each retry takes a
+/// fresh reservation set, per `.claude/rules/testing.md`.
 async fn start_gateway(config_yaml: &str, extra_env: Vec<(String, String)>) -> (TestGateway, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     const PROXY_HTTP: usize = 0;
@@ -400,35 +458,62 @@ async fn start_gateway(config_yaml: &str, extra_env: Vec<(String, String)>) -> (
         }
         // Everything the child needs is staged; hand the ports over now.
         ports.release();
-        match builder.spawn().await {
+        match builder.spawn_classified().await {
             Ok(gateway) => return (gateway, proxy_http),
-            Err(error) => {
-                last_error = error.to_string();
-                eprintln!("gateway spawn attempt {attempt} failed: {last_error}");
+            Err(failure) if failure.listener_addr_in_use => {
+                last_error = failure.detail;
+                eprintln!(
+                    "gateway spawn attempt {attempt} lost an ephemeral-port race; \
+                     retrying with fresh ports: {last_error}"
+                );
+            }
+            Err(failure) => {
+                panic!(
+                    "gateway spawn failed for a reason no retry can fix (attempt {attempt}): {}",
+                    failure.detail
+                );
             }
         }
     }
-    panic!("gateway failed to start after {MAX_ATTEMPTS} attempts: {last_error}");
+    panic!("gateway failed to start after {MAX_ATTEMPTS} port races: {last_error}");
 }
 
 async fn get_status(proxy_http: u16, path: &str) -> u16 {
+    get_response(proxy_http, path).await.0
+}
+
+/// Status plus body, so a test can assert what the BACKEND saw.
+async fn get_response(proxy_http: u16, path: &str) -> (u16, String) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .expect("client");
-    client
+    let response = client
         .get(format!("http://127.0.0.1:{proxy_http}{path}"))
         .header("Host", ROUTE_HOST)
         .send()
         .await
-        .expect("gateway must answer, not hang")
-        .status()
-        .as_u16()
+        .expect("gateway must answer, not hang");
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    (status, body)
 }
 
 /// Poll through the bounded SIGHUP reload window instead of assuming a loaded
 /// hosted runner will apply the new snapshot within a fixed sleep.
-async fn wait_for_status(proxy_http: u16, path: &str, expected: u16) -> u16 {
+///
+/// The child is polled between probes: a gateway that died during the reload
+/// answers every subsequent probe with a connection error, which is
+/// indistinguishable from "not converged yet" and would otherwise be waited out
+/// for the full deadline and then reported as a convergence failure. Observing
+/// the exit turns that into an immediate, correctly-attributed failure with the
+/// child's captured output.
+async fn wait_for_status(
+    gateway: &mut TestGateway,
+    proxy_http: u16,
+    path: &str,
+    expected: u16,
+) -> u16 {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -445,6 +530,12 @@ async fn wait_for_status(proxy_http: u16, path: &str, expected: u16) -> u16 {
             Ok(response) => format!("HTTP {}", response.status()),
             Err(error) => error.to_string(),
         };
+        assert!(
+            gateway.is_running(),
+            "gateway exited during the reload instead of converging to HTTP \
+             {expected}; last observation: {last}\n--- captured gateway output ---\n{}",
+            gateway.diagnostic_captured_output()
+        );
         assert!(
             Instant::now() < deadline,
             "gateway did not converge to HTTP {expected} before the reload deadline; last observation: {last}"
@@ -465,7 +556,8 @@ async fn backend_tls_policy_performs_verified_backend_tls() {
     let backend = generate_signed_cert(&ca, "reviews", &[BACKEND_SNI]);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
-    let echo = start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
+    let (echo, observed_hosts) =
+        start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
 
     let objects = k8s_objects(
         backend_port,
@@ -477,10 +569,39 @@ async fn backend_tls_policy_performs_verified_backend_tls() {
     let (mut gateway, proxy_http) =
         start_gateway(&translated_config_yaml(&objects), Vec::new()).await;
 
+    let (status, body) = get_response(proxy_http, "/api/test").await;
     assert_eq!(
-        get_status(proxy_http, "/api/test").await,
-        200,
+        status, 200,
         "a trusted, SNI- and SAN-matching backend must be reachable over TLS"
+    );
+
+    // The H1 SNI dial puts `validation.hostname` in the request URL's AUTHORITY
+    // (reqwest derives the rustls server name from the URL and exposes no
+    // per-request hook), and relies on an explicit `Host` to keep the backend's
+    // own authority intact. Assert that on the wire, from the backend's side:
+    // the recorded `Host` must name the real selected target, never
+    // `validation.hostname`.
+    let observed = observed_hosts
+        .lock()
+        .expect("host recorder lock")
+        .last()
+        .cloned()
+        .expect("the backend must have served the request");
+    let expected_authority = format!("{SERVICE_AUTHORITY_HOST}:{backend_port}");
+    assert_eq!(
+        observed, expected_authority,
+        "the backend must see the real selected target authority, not validation.hostname"
+    );
+    assert!(
+        !observed.contains(BACKEND_SNI),
+        "validation.hostname must never reach the backend as Host: {observed}"
+    );
+    // ...and the response body the client received carries the same value, so a
+    // future change that drops the explicit Host cannot pass by recording only.
+    let expected_echo = format!(r#""host":"{expected_authority}""#);
+    assert!(
+        body.contains(&expected_echo),
+        "backend-echoed Host must be the real target authority, got body {body}"
     );
 
     gateway.shutdown();
@@ -496,7 +617,8 @@ async fn backend_tls_policy_untrusted_backend_ca_fails_closed() {
     let backend = generate_signed_cert(&rogue_ca, "reviews", &[BACKEND_SNI]);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
-    let echo = start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
+    let (echo, _observed_hosts) =
+        start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
 
     let objects = k8s_objects(
         backend_port,
@@ -524,7 +646,8 @@ async fn backend_tls_policy_hostname_mismatch_fails_closed() {
     let backend = generate_signed_cert(&ca, "reviews", &["some-other-host.example.com"]);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
-    let echo = start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
+    let (echo, _observed_hosts) =
+        start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
 
     let objects = k8s_objects(
         backend_port,
@@ -554,7 +677,8 @@ async fn backend_tls_policy_subject_alt_name_allow_list_is_enforced() {
     let backend = generate_signed_cert(&ca, "reviews", &[BACKEND_SNI]);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
-    let echo = start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
+    let (echo, _observed_hosts) =
+        start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
 
     let objects = k8s_objects(
         backend_port,
@@ -590,7 +714,8 @@ async fn backend_tls_policy_system_roots_ignore_global_ca_bundle() {
     let backend = generate_signed_cert(&cluster_ca, "reviews", &[BACKEND_SNI]);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
-    let echo = start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
+    let (echo, _observed_hosts) =
+        start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
 
     let temp = TempDir::new().expect("tempdir");
     let global_ca_path = temp.path().join("cluster-ca.pem");
@@ -624,7 +749,8 @@ async fn backend_tls_policy_system_roots_ignore_global_ca_bundle() {
     // trust-anchor selection and not about the fixture being unreachable.
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
-    let echo = start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
+    let (echo, _observed_hosts) =
+        start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
     let objects = k8s_objects(
         backend_port,
         &cluster_ca.cert_pem,
@@ -652,7 +778,8 @@ async fn backend_tls_policy_withdrawal_reaches_the_live_data_path() {
     let backend = generate_signed_cert(&ca, "reviews", &[BACKEND_SNI]);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
-    let echo = start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
+    let (echo, _observed_hosts) =
+        start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
 
     let with_policy = k8s_objects(
         backend_port,
@@ -690,11 +817,40 @@ async fn backend_tls_policy_withdrawal_reaches_the_live_data_path() {
     // The backend speaks TLS only, so a withdrawn policy — which returns the
     // route to a plaintext direct backend — must stop succeeding.
     assert_eq!(
-        wait_for_status(proxy_http, "/api/test", 502).await,
+        wait_for_status(&mut gateway, proxy_http, "/api/test", 502).await,
         502,
         "withdrawing the policy must reach the live data path, not just the config"
     );
 
     gateway.shutdown();
     echo.abort();
+}
+
+/// Deterministic, gateway-free assertion of the retry classification
+/// [`start_gateway`] depends on: only this child's own listener-bind
+/// address-in-use failure may be retried. Everything else — a rejected config,
+/// an auth failure, a parse error — must stop the suite immediately, which is
+/// what the `panic!` arm in `start_gateway` does.
+///
+/// Not `#[ignore]`d: it spawns nothing, and the functional shards run with
+/// `--run-ignored=all`, so it executes alongside the live tests.
+#[test]
+fn start_gateway_retries_only_a_listener_address_race() {
+    let port_race = r#"{"level":"ERROR","fields":{"message":"Gateway listener task 'proxy_https' failed: Address already in use (os error 98)"}}"#;
+    assert!(
+        captured_output_reports_listener_addr_in_use(port_race),
+        "a listener bind that lost the port race is the one retryable failure"
+    );
+
+    for deterministic in [
+        r#"{"level":"ERROR","fields":{"message":"Configuration validation failed: 1 invalid upstream reference(s) found"}}"#,
+        r#"{"level":"ERROR","fields":{"message":"Gateway listener task 'proxy_https' failed: Permission denied (os error 13)"}}"#,
+        r#"{"level":"ERROR","fields":{"message":"Failed to load TLS material"},"detail":"Address already in use"}"#,
+        "gateway did not prove ownership of admin port 1234 within 30s",
+    ] {
+        assert!(
+            !captured_output_reports_listener_addr_in_use(deterministic),
+            "must not be retried: {deterministic}"
+        );
+    }
 }

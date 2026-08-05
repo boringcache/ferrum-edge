@@ -83,19 +83,29 @@ async fn functional_h3_local_policy_pending_cap_rejects_before_backend_admission
     backend_task.abort();
 }
 
+/// A backend TLS SNI override whose pinned dial cannot be built must fail
+/// closed on the H3→HTTP plain bridge — **before** the backend is dialed.
+///
+/// `run_plain_attempt_local_policy_or_reject` resolves the dial as a local
+/// dispatch-policy decision: it runs before backend admission, before the
+/// least-connections connection-start record, and before
+/// `get_cross_protocol_client`. When the selected target does not resolve there
+/// is nothing to pin the socket to, so dialing `current_url` would present the
+/// TARGET-derived TLS server name for a route that mandates an overridden one.
+///
+/// `gateway-error-reason: backend_tls_sni_requires_direct_h2` is what makes this
+/// deterministic and is the evidence that no dial happened: a bridge that fell
+/// through to the reqwest client and let the send fail on DNS answers 502 too,
+/// but with no such header. This route sets `response_body_mode: buffer`, so it
+/// takes the `prebuffered_body: Some(..)` (buffered) leg; the streaming leg is
+/// covered below.
 #[ignore]
 #[tokio::test]
-async fn functional_h3_local_policy_backend_tls_sni_rejects_before_dial_and_admission() {
+async fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_buffered() {
     let (backend_port, backend_hits, release_backend, backend_task) = spawn_holding_backend().await;
     let gateway = start_h3_policy_gateway(backend_tls_sni_config(backend_port))
         .await
         .expect("start h3 backend-SNI gateway");
-
-    let hold_client = Http3Client::insecure().expect("hold h3 client");
-    let hold_url = format!("https://localhost:{}/h3-admission-hold", gateway.https_port);
-    let hold = tokio::spawn(async move { retry_h3_get(&hold_client, &hold_url).await });
-
-    wait_for_hits(&backend_hits, 1, Duration::from_secs(10)).await;
 
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!(
@@ -107,7 +117,52 @@ async fn functional_h3_local_policy_backend_tls_sni_rejects_before_dial_and_admi
     assert_eq!(
         resp.status,
         StatusCode::BAD_GATEWAY,
-        "backend TLS SNI incompatibility should return 502, got {resp:?}"
+        "an unpinnable backend TLS SNI override must fail closed, got {resp:?}"
+    );
+    assert_eq!(
+        resp.headers
+            .get("gateway-error-reason")
+            .and_then(|value| value.to_str().ok()),
+        Some("backend_tls_sni_requires_direct_h2"),
+        "the terminal outcome must be the SNI dispatch-policy rejection taken \
+         before the dial, not a generic dial failure"
+    );
+    assert_backend_hits_eq(&backend_hits, 0, Duration::from_millis(250)).await;
+
+    release_backend.release();
+    gateway.shutdown().await;
+    backend_task.abort();
+}
+
+/// Same fail-closed contract on the STREAMING leg: no retry and no body plugin,
+/// so the bridge takes the `prebuffered_body: None` branch and relays the H3
+/// request body through the bounded channel. The rejection must still terminate
+/// before the dial, and must halt the request body rather than leaving the H3
+/// recv half dangling (the caller passes
+/// `halt_request_body_before_reject = true` for exactly this leg).
+#[ignore]
+#[tokio::test]
+async fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_streaming() {
+    let (backend_port, backend_hits, release_backend, backend_task) = spawn_holding_backend().await;
+    let gateway = start_h3_policy_gateway(backend_tls_sni_config(backend_port))
+        .await
+        .expect("start h3 backend-SNI gateway");
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!(
+        "https://localhost:{}/h3-sni-stream/sni",
+        gateway.https_port
+    );
+    let resp = client
+        .post_bytes(&url, b"streamed-request-body".to_vec())
+        .await
+        .expect("gateway must answer the streaming request, not hang");
+
+    assert_eq!(
+        resp.status,
+        StatusCode::BAD_GATEWAY,
+        "an unpinnable backend TLS SNI override must fail closed on the \
+         streaming leg too, got {resp:?}"
     );
     assert_eq!(
         resp.headers
@@ -115,15 +170,44 @@ async fn functional_h3_local_policy_backend_tls_sni_rejects_before_dial_and_admi
             .and_then(|value| value.to_str().ok()),
         Some("backend_tls_sni_requires_direct_h2")
     );
-    assert_backend_hits_eq(&backend_hits, 1, Duration::from_millis(250)).await;
+    assert_backend_hits_eq(&backend_hits, 0, Duration::from_millis(250)).await;
 
     release_backend.release();
-    let hold = hold.await.expect("held h3 task joined");
-    assert_eq!(
-        hold.status,
-        StatusCode::OK,
-        "admission-saturating request should complete after release"
+    gateway.shutdown().await;
+    backend_task.abort();
+}
+
+/// A stray SNI override on a PLAINTEXT backend has no server name to override,
+/// and the H1/H2 fork ignores it (it is read only under
+/// `DispatchKind::HttpsPool`). H3 must ignore it identically rather than fail
+/// closed, or the same config is a total outage for HTTP/3 clients only.
+#[ignore]
+#[tokio::test]
+async fn functional_h3_local_policy_backend_tls_sni_on_plaintext_backend_still_dispatches() {
+    let (backend_port, backend_hits, release_backend, backend_task) = spawn_holding_backend().await;
+    release_backend.release();
+    let gateway = start_h3_policy_gateway(plaintext_backend_tls_sni_config(backend_port))
+        .await
+        .expect("start h3 plaintext-SNI gateway");
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!(
+        "https://localhost:{}/h3-local-policy/sni",
+        gateway.https_port
     );
+    let resp = retry_h3_get(&client, &url).await;
+
+    assert_eq!(
+        resp.status,
+        StatusCode::OK,
+        "a plaintext backend must keep dispatching despite a stray TLS SNI \
+         override, matching the H1/H2 fork, got {resp:?}"
+    );
+    assert!(
+        resp.headers.get("gateway-error-reason").is_none(),
+        "no dispatch-policy rejection is expected on a plaintext backend"
+    );
+    wait_for_hits(&backend_hits, 1, Duration::from_secs(10)).await;
 
     gateway.shutdown().await;
     backend_task.abort();
@@ -236,7 +320,9 @@ fn mesh_runtime_config() -> Result<MeshRuntimeConfig, String> {
 
 const H3_POLICY_NAMESPACE: &str = "ferrum";
 const H3_POLICY_UPSTREAM_ID: &str = "h3-local-policy-upstream";
-const H3_POLICY_HOLD_UPSTREAM_ID: &str = "h3-local-policy-hold-upstream";
+/// RFC 6761 reserves `.invalid`: it must never resolve, so the fail-closed
+/// backend-TLS-SNI leg is deterministic on any resolver.
+const SNI_UNRESOLVABLE_HOST: &str = "h3-local-policy-sni-target.invalid";
 const H3_POLICY_JWT_SECRET: &str = "ferrum-edge-h3-local-policy-secret-0000";
 const H3_POLICY_JWT_ISSUER: &str = "ferrum-edge-h3-local-policy";
 
@@ -244,6 +330,7 @@ fn pending_cap_config(backend_port: u16) -> GatewayConfig {
     h3_policy_config(
         backend_port,
         "http",
+        None,
         json!({
             "connection_pool_http": {
                 "http1_max_pending_requests": 1
@@ -258,10 +345,25 @@ fn pending_cap_config(backend_port: u16) -> GatewayConfig {
     )
 }
 
+/// Backend-TLS-SNI routes whose selected target CANNOT be resolved, so the
+/// pinned dial `backend_tls_sni_reqwest_dial` needs cannot be built.
+///
+/// `.invalid` is reserved by RFC 6761 and must never resolve, which is what
+/// makes the fail-closed leg deterministic rather than dependent on a
+/// particular resolver. `backend_port` is still the real backend's port so a
+/// gateway that dialed anyway would have somewhere to land; it must not.
+///
+/// Two routes on one upstream, one per bridge leg:
+/// * `/h3-local-policy` sets `response_body_mode: buffer`, which makes
+///   `needs_response_buffering` true and sends the request down the
+///   `prebuffered_body: Some(..)` (buffered) branch of `dispatch_plain`.
+/// * `/h3-sni-stream` leaves the default streaming mode, so a POST
+///   takes the `prebuffered_body: None` (streaming) branch.
 fn backend_tls_sni_config(backend_port: u16) -> GatewayConfig {
     let mut config = h3_policy_config(
         backend_port,
         "https",
+        Some(SNI_UNRESOLVABLE_HOST),
         json!({
             "tls": {
                 "sni": "backend-sni.example.com"
@@ -269,54 +371,61 @@ fn backend_tls_sni_config(backend_port: u16) -> GatewayConfig {
         }),
         None,
     );
+    for proxy in &mut config.proxies {
+        proxy.response_body_mode = ferrum_edge::config::types::ResponseBodyMode::Buffer;
+    }
     config.proxies.push(
         serde_json::from_value(json!({
-            "id": "h3-local-policy-admission-hold",
+            "id": "h3-local-policy-stream",
             "namespace": H3_POLICY_NAMESPACE,
-            "listen_path": "/h3-admission-hold",
-            "backend_scheme": "http",
-            "backend_host": "127.0.0.1",
+            "listen_path": "/h3-sni-stream",
+            "backend_scheme": "https",
+            "backend_host": SNI_UNRESOLVABLE_HOST,
             "backend_port": backend_port,
+            "backend_tls_verify_server_cert": false,
             "strip_listen_path": true,
-            "upstream_id": H3_POLICY_HOLD_UPSTREAM_ID,
-            "pool_enable_http2": false
+            "upstream_id": H3_POLICY_UPSTREAM_ID
         }))
-        .expect("hold proxy config is valid"),
-    );
-    config.upstreams.push(
-        serde_json::from_value(json!({
-            "id": H3_POLICY_HOLD_UPSTREAM_ID,
-            "namespace": H3_POLICY_NAMESPACE,
-            "name": "H3 local policy admission hold upstream",
-            "algorithm": "round_robin",
-            "targets": [{
-                "host": "127.0.0.1",
-                "port": backend_port,
-                "weight": 1
-            }]
-        }))
-        .expect("hold upstream config is valid"),
+        .expect("streaming SNI proxy config is valid"),
     );
     config
+}
+
+/// A stray SNI override on a PLAINTEXT backend. The H1/H2 fork reads the
+/// override only under `DispatchKind::HttpsPool`, so H3 must ignore it too and
+/// keep dispatching to the real backend.
+fn plaintext_backend_tls_sni_config(backend_port: u16) -> GatewayConfig {
+    h3_policy_config(
+        backend_port,
+        "http",
+        None,
+        json!({
+            "tls": {
+                "sni": "backend-sni.example.com"
+            }
+        }),
+        None,
+    )
 }
 
 fn h3_policy_config(
     backend_port: u16,
     backend_scheme: &str,
+    backend_host_override: Option<&str>,
     traffic_policy: serde_json::Value,
     retry: Option<serde_json::Value>,
 ) -> GatewayConfig {
+    let backend_host = backend_host_override.unwrap_or("127.0.0.1");
     let mut proxy = json!({
         "id": "h3-local-policy",
         "namespace": H3_POLICY_NAMESPACE,
         "listen_path": "/h3-local-policy",
         "backend_scheme": backend_scheme,
-        "backend_host": "127.0.0.1",
+        "backend_host": backend_host,
         "backend_port": backend_port,
         "backend_tls_verify_server_cert": false,
         "strip_listen_path": true,
-        "upstream_id": H3_POLICY_UPSTREAM_ID,
-        "pool_enable_http2": false
+        "upstream_id": H3_POLICY_UPSTREAM_ID
     });
     if let Some(retry) = retry {
         proxy["retry"] = retry;
@@ -331,7 +440,7 @@ fn h3_policy_config(
             "name": "H3 local policy upstream",
             "algorithm": "round_robin",
             "targets": [{
-                "host": "127.0.0.1",
+                "host": backend_host,
                 "port": backend_port,
                 "weight": 1
             }]

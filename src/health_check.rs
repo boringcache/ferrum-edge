@@ -88,6 +88,46 @@ fn grpc_probe_urls(
     )
 }
 
+/// Authority a probe must present to the backend: the REAL target, never the
+/// TLS server name. Mirrors what a plain `format_probe_url` client would put in
+/// `Host` / `:authority`, including the default-port elision reqwest performs.
+fn probe_authority(scheme: &str, host: &str, port: u16) -> String {
+    let rendered = if !host.starts_with('[') && host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let default_port = match scheme {
+        "https" => 443,
+        _ => 80,
+    };
+    if port == default_port {
+        rendered
+    } else {
+        format!("{rendered}:{port}")
+    }
+}
+
+/// Effective backend TLS server name for a probe.
+///
+/// A backend covered by `backend_tls_sni` (Gateway API `BackendTLSPolicy`
+/// `validation.hostname`, an Istio DestinationRule TLS overlay, or the upstream
+/// field directly) presents a certificate valid for THAT name, not for the
+/// target host the gateway dials. A probe that verifies against the target host
+/// therefore marks a perfectly healthy backend unhealthy — request traffic
+/// succeeds while the probe fails. Use the same identity request traffic uses.
+///
+/// Returns the bracket-stripped form: rustls/tonic want a bare DNS name, and
+/// `validate_backend_tls_sni` already guarantees an override is a hostname and
+/// never an IP literal.
+fn probe_tls_server_name<'a>(tls_config: &'a BackendTlsConfig, host: &'a str) -> &'a str {
+    let name = tls_config.sni.as_deref().unwrap_or(host);
+    match name.strip_prefix('[').and_then(|i| i.strip_suffix(']')) {
+        Some(bare) => bare,
+        None => name,
+    }
+}
+
 fn load_probe_tls_material(
     source_value: &str,
     kind: MaterialKind,
@@ -556,9 +596,28 @@ impl HealthChecker {
                 if let Some(active) = &hc_config.active {
                     // Build a per-upstream HTTP client with the upstream's TLS config
                     let tls_config = BackendTlsConfig::from_upstream(upstream);
-                    let upstream_client =
-                        self.build_upstream_health_client(&tls_config, active.use_tls);
+                    // A `backend_tls_sni` HTTPS probe puts the overridden server
+                    // name in the probe URL, so its client must pin the dial to
+                    // ONE target and is therefore built per target below. Every
+                    // other probe keeps the shared per-upstream client.
+                    let probe_pins_dial_host = active.use_tls
+                        && tls_config.sni.is_some()
+                        && matches!(active.probe_type, HealthProbeType::Http);
+                    let upstream_client = if probe_pins_dial_host {
+                        None
+                    } else {
+                        self.build_upstream_health_client(&tls_config, active.use_tls, None)
+                    };
                     for target in &upstream.targets {
+                        let target_client = if probe_pins_dial_host {
+                            self.build_upstream_health_client(
+                                &tls_config,
+                                active.use_tls,
+                                Some(target.host.as_str()),
+                            )
+                        } else {
+                            upstream_client.clone()
+                        };
                         let start = ActiveCheckStartParams {
                             target,
                             upstream_namespace: &upstream.namespace,
@@ -569,7 +628,7 @@ impl HealthChecker {
                         let handle = self.start_active_check(
                             start,
                             active,
-                            upstream_client.as_ref(),
+                            target_client.as_ref(),
                             &tls_config,
                         );
                         new_aborts.push(handle.abort_handle());
@@ -1074,10 +1133,16 @@ impl HealthChecker {
     /// Returns `None` when client construction fails closed; HTTP probes then
     /// report unhealthy without dialing (TCP/UDP/gRPC probes do not need this
     /// client).
+    ///
+    /// `dial_host_pin` is `Some(target_host)` only for a `backend_tls_sni`
+    /// HTTPS probe, which is therefore built per TARGET rather than per upstream
+    /// (the pin names the one target this client may dial). See
+    /// [`build_health_check_client_with_tls`].
     fn build_upstream_health_client(
         &self,
         tls_config: &BackendTlsConfig,
         use_tls: bool,
+        dial_host_pin: Option<&str>,
     ) -> Option<Arc<reqwest::Client>> {
         let has_tls_config = tls_config.client_cert_path.is_some()
             || tls_config.client_key_path.is_some()
@@ -1100,6 +1165,7 @@ impl HealthChecker {
                 &self.global_backend_tls_client_cert_path,
                 &self.global_backend_tls_client_key_path,
                 self.global_tls_no_verify,
+                dial_host_pin,
             ),
             "upstream TLS health-check HTTP client",
         )
@@ -1142,7 +1208,32 @@ impl HealthChecker {
         let healthy_status_codes = config.healthy_status_codes.clone();
         let client = upstream_client.cloned();
         let scheme = if config.use_tls { "https" } else { "http" };
-        let url = format_probe_url(scheme, &host, port, &config.http_path);
+        // A backend covered by `backend_tls_sni` presents a certificate for the
+        // OVERRIDE, not for the target host, so the probe must offer the same
+        // server name request traffic does or it reports a healthy backend as
+        // unhealthy. reqwest derives the server name from the URL host and has
+        // no per-request hook, so the override goes in the probe URL's authority
+        // — exactly as on the proxy path
+        // (`crate::proxy::backend_tls_sni_reqwest_dial`) — while the client
+        // built for this target pins its resolver to the real target host, so
+        // the override is never resolved and the socket cannot leave that
+        // target's egress-screened candidate set.
+        let probe_server_name = if config.use_tls {
+            tls_config.sni.as_deref()
+        } else {
+            None
+        };
+        let url = format_probe_url(
+            scheme,
+            probe_server_name.unwrap_or(host.as_str()),
+            port,
+            &config.http_path,
+        );
+        // ...and the backend must still see its OWN authority, never the server
+        // name. Sent explicitly because hyper-util only derives `Host` from the
+        // URL when the request carries none. Absent (and byte-identical to
+        // today's probe) whenever no override is configured.
+        let host_header = probe_server_name.map(|_| probe_authority(scheme, &host, port));
         let udp_payload = config
             .udp_probe_payload
             .as_deref()
@@ -1227,7 +1318,14 @@ impl HealthChecker {
                             // it and were screened by `egress_denied` above.
                             match client.as_ref() {
                                 Some(client) => {
-                                    http_probe(client, &url, timeout, &healthy_status_codes).await
+                                    http_probe(
+                                        client,
+                                        &url,
+                                        host_header.as_deref(),
+                                        timeout,
+                                        &healthy_status_codes,
+                                    )
+                                    .await
                                 }
                                 None => {
                                     warn!(
@@ -1533,13 +1631,22 @@ fn sanitized_http_probe_failure(error: &reqwest::Error) -> &'static str {
 }
 
 /// HTTP health probe — sends a GET request and checks the status code.
+///
+/// `host_header` is set only when the URL authority is a backend TLS server-name
+/// override, so the backend still receives its own authority rather than the
+/// server name.
 async fn http_probe(
     client: &reqwest::Client,
     url: &str,
+    host_header: Option<&str>,
     timeout: Duration,
     healthy_status_codes: &[u16],
 ) -> ProbeOutcome {
-    match client.get(url).timeout(timeout).send().await {
+    let mut request = client.get(url).timeout(timeout);
+    if let Some(host_header) = host_header {
+        request = request.header(reqwest::header::HOST, host_header);
+    }
+    match request.send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
             let healthy = if healthy_status_codes.is_empty() {
@@ -1821,15 +1928,14 @@ async fn grpc_probe(
             }
         }
     } else if use_tls {
-        // SNI / cert hostname stays the original `host` even though we dial the
-        // pre-screened IP via `dial_addr`, so backend cert validation is unchanged.
+        // SNI / cert hostname is the EFFECTIVE backend TLS identity — the
+        // configured `backend_tls_sni` override when present, else the original
+        // `host` — even though we dial the pre-screened IP via `dial_addr`. The
+        // `origin`/authority above deliberately keeps the real target so the
+        // backend still sees its own `:authority`, exactly as for proxy traffic.
         // rustls/tonic want a BARE SNI host, not a URI-bracketed IPv6 literal
-        // (`[fd00::1]`), so strip brackets here — the `origin`/authority above
-        // keeps the bracketed form because a URI authority requires it.
-        let sni_host = host
-            .strip_prefix('[')
-            .and_then(|h| h.strip_suffix(']'))
-            .unwrap_or(host);
+        // (`[fd00::1]`), which `probe_tls_server_name` strips.
+        let sni_host = probe_tls_server_name(tls_config, host);
         let mut tonic_tls = tonic::transport::ClientTlsConfig::new().domain_name(sni_host);
 
         // Load CA certs (upstream → global → system roots). `system://` resolves
@@ -2056,7 +2162,11 @@ async fn build_grpc_probe_channel_no_verify(
     client_config.alpn_protocols = vec![b"h2".to_vec()];
 
     let tls_connector = TlsConnector::from(Arc::new(client_config));
-    let host_owned = host.to_string();
+    // Same effective backend TLS identity the verifying branch uses: the
+    // configured `backend_tls_sni` override when present, else the target host.
+    // Only the server NAME changes — the socket still goes to the pre-screened
+    // address in `uri`, and tonic's `origin` still carries the real authority.
+    let host_owned = probe_tls_server_name(tls_config, host).to_string();
 
     let connector = tower::service_fn(move |uri: http::Uri| {
         let tls_connector = tls_connector.clone();
@@ -2067,6 +2177,8 @@ async fn build_grpc_probe_channel_no_verify(
                 uri.port_u16().unwrap_or(443),
             );
             let tcp = tokio::net::TcpStream::connect(&addr).await?;
+            // Fail closed on an unusable server name rather than handshaking
+            // with whatever rustls would otherwise infer.
             let server_name = ServerName::try_from(host)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
             let tls = tls_connector.connect(server_name, tcp).await?;
@@ -2168,6 +2280,13 @@ enum HealthCheckClientError {
     /// same fault: it is an operator error that must surface, never an implicit
     /// "authenticate anonymously".
     ClientIdentityUnavailable(String),
+    /// A `backend_tls_sni` probe was requested but the dial cannot be pinned to
+    /// the real target, because this checker has no DNS cache wired.
+    ///
+    /// The probe URL's host is the overridden TLS server name, so without the
+    /// pin reqwest would resolve THAT name and dial wherever it points —
+    /// off the egress-screened candidate set for the target being probed.
+    DialPinUnavailable,
 }
 
 impl std::fmt::Display for HealthCheckClientError {
@@ -2186,6 +2305,10 @@ impl std::fmt::Display for HealthCheckClientError {
             Self::ClientIdentityUnavailable(details) => write!(
                 f,
                 "configured backend mTLS client identity could not be used ({details})"
+            ),
+            Self::DialPinUnavailable => write!(
+                f,
+                "backend TLS server-name override requires a DNS cache to pin the probe dial to the real target"
             ),
         }
     }
@@ -2275,6 +2398,14 @@ fn accept_health_check_client(
 ///
 /// Configures the client with the upstream's CA bundle, client cert/key for mTLS,
 /// and verify settings — so health probes authenticate the same way proxy traffic does.
+///
+/// `dial_host_pin` is set only for a `backend_tls_sni` probe, whose URL host is
+/// the overridden TLS server name (reqwest derives the rustls server name from
+/// the URL and exposes no per-request hook — the same constraint the proxy path
+/// documents on `crate::proxy::backend_tls_sni_reqwest_dial`). The pin makes the
+/// resolver answer every name by resolving the REAL target instead, so the
+/// server name is never itself resolved and the socket cannot leave the
+/// egress-screened candidate set for that target.
 fn build_health_check_client_with_tls(
     pool_config: &PoolConfig,
     dns_cache: Option<DnsCache>,
@@ -2283,6 +2414,7 @@ fn build_health_check_client_with_tls(
     global_cert_path: &Option<String>,
     global_key_path: &Option<String>,
     global_no_verify: bool,
+    dial_host_pin: Option<&str>,
 ) -> Result<reqwest::Client, HealthCheckClientError> {
     let skip_verify = !tls_config.verify_server_cert
         || (global_no_verify && tls_config.allows_global_no_verify());
@@ -2296,9 +2428,22 @@ fn build_health_check_client_with_tls(
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(skip_verify);
 
-    if let Some(dns_cache) = dns_cache.clone() {
-        let resolver = DnsCacheResolver::new(dns_cache);
-        builder = builder.dns_resolver(Arc::new(resolver));
+    match (dns_cache.clone(), dial_host_pin) {
+        (Some(dns_cache), Some(pin)) => {
+            let resolver = DnsCacheResolver::with_hostname_pin(dns_cache, pin);
+            builder = builder.dns_resolver(Arc::new(resolver));
+        }
+        (Some(dns_cache), None) => {
+            let resolver = DnsCacheResolver::new(dns_cache);
+            builder = builder.dns_resolver(Arc::new(resolver));
+        }
+        // A server-name override with no DNS cache to pin would let reqwest's
+        // own resolver look up the SNI hostname and dial wherever it points.
+        // That is the escape this must never allow, so fail closed instead.
+        (None, Some(_)) => {
+            return Err(HealthCheckClientError::DialPinUnavailable);
+        }
+        (None, None) => {}
     }
 
     // Load CA bundle (upstream → global → system roots). `system://` resolves to
@@ -2790,6 +2935,76 @@ mod tests {
         assert_eq!(origin, "https://backend.internal:8443");
     }
 
+    // -----------------------------------------------------------------------
+    // Probes use the EFFECTIVE backend TLS server-name identity.
+    //
+    // `probe_tls_server_name` / `probe_authority` are private, so these stay
+    // inline. The dial itself is covered by the candidate/authority tests above
+    // and the pinned-client fail-closed test below.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn probe_server_name_follows_the_configured_backend_tls_sni() {
+        let mut tls = BackendTlsConfig::default_verify();
+        let target_only = probe_tls_server_name(&tls, "pod-a.internal");
+        assert_eq!(
+            target_only, "pod-a.internal",
+            "without an override the probe keeps verifying the target host"
+        );
+
+        tls.sni = Some("backend.example.com".to_string());
+        let overridden = probe_tls_server_name(&tls, "pod-a.internal");
+        assert_eq!(
+            overridden, "backend.example.com",
+            "a covered backend serves a certificate for the override name"
+        );
+        // Every target of the upstream resolves to the same server name — a
+        // per-upstream identity, not a per-target one.
+        let other_target = probe_tls_server_name(&tls, "pod-b.internal");
+        assert_eq!(other_target, "backend.example.com");
+    }
+
+    #[test]
+    fn probe_server_name_strips_ipv6_brackets_for_rustls() {
+        // rustls/tonic want a bare name. An override is validated to be a DNS
+        // hostname, so this only ever applies to the target-host fallback.
+        let tls = BackendTlsConfig::default_verify();
+        let bare = probe_tls_server_name(&tls, "[fd00::1]");
+        assert_eq!(bare, "fd00::1");
+    }
+
+    #[test]
+    fn probe_authority_names_the_real_target_not_the_server_name() {
+        // What the backend must see in `Host` when the URL authority carries
+        // the TLS server name instead.
+        let explicit = probe_authority("https", "pod-a.internal", 8443);
+        assert_eq!(explicit, "pod-a.internal:8443");
+        // Default ports are elided, matching what reqwest would have derived.
+        let https_default = probe_authority("https", "pod-a.internal", 443);
+        assert_eq!(https_default, "pod-a.internal");
+        let http_default = probe_authority("http", "pod-a.internal", 80);
+        assert_eq!(http_default, "pod-a.internal");
+        // IPv6 targets stay bracketed: a URI authority requires it.
+        let v6 = probe_authority("https", "fd00::1", 8443);
+        assert_eq!(v6, "[fd00::1]:8443");
+        let v6_bracketed = probe_authority("https", "[fd00::1]", 8443);
+        assert_eq!(v6_bracketed, "[fd00::1]:8443");
+    }
+
+    #[test]
+    fn sni_probe_url_carries_the_server_name_and_keeps_the_probe_path() {
+        // The pairing dispatch performs: URL authority = server name (so
+        // reqwest presents it as SNI and verifies against it), `Host` = the
+        // real target.
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.sni = Some("backend.example.com".to_string());
+        let server_name = probe_tls_server_name(&tls, "pod-a.internal");
+        let url = format_probe_url("https", server_name, 8443, "/healthz");
+        assert_eq!(url, "https://backend.example.com:8443/healthz");
+        let authority = probe_authority("https", "pod-a.internal", 8443);
+        assert_eq!(authority, "pod-a.internal:8443");
+    }
+
     #[tokio::test]
     async fn grpc_no_verify_probe_rejects_mixed_client_chain_before_connect() {
         ensure_crypto_provider();
@@ -2947,6 +3162,7 @@ mod tests {
                 &None,
                 &None,
                 false,
+                None,
             )
             .expect("TLS health-check client should build")
         };
@@ -2996,7 +3212,7 @@ mod tests {
         let url = format_probe_url("http", "::1", port, "/health");
 
         assert!(
-            http_probe(&client, &url, Duration::from_secs(2), &[200])
+            http_probe(&client, &url, None, Duration::from_secs(2), &[200])
                 .await
                 .success
         );
@@ -3186,7 +3402,32 @@ mod tests {
             &None,
             &None,
             global_no_verify,
+            None,
         )
+    }
+
+    /// A server-name override with no DNS cache to pin the dial must fail
+    /// closed: reqwest would otherwise resolve the SNI hostname from the probe
+    /// URL and dial wherever it points, off the target's screened candidates.
+    #[test]
+    fn probe_client_fails_closed_when_the_dial_cannot_be_pinned() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.sni = Some("backend.example.com".to_string());
+        let built = build_health_check_client_with_tls(
+            &PoolConfig::default(),
+            None,
+            &tls,
+            &None,
+            &None,
+            &None,
+            false,
+            Some("pod-a.internal"),
+        );
+        let pin_missing = matches!(built, Err(HealthCheckClientError::DialPinUnavailable));
+        assert!(
+            pin_missing,
+            "an unpinnable SNI probe must not build a client that resolves the server name"
+        );
     }
 
     #[test]
