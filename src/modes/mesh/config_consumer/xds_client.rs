@@ -5769,7 +5769,10 @@ mod tests {
 
     #[test]
     fn xds_round_trip_preserves_cross_namespace_destination_rule() {
-        use crate::modes::mesh::config::MeshDestinationRule;
+        use crate::config::types::H2UpgradePolicy;
+        use crate::modes::mesh::config::{
+            MeshConnectionPoolHttp, MeshDestinationRule, MeshSubset, MeshTrafficPolicy,
+        };
 
         let native = MeshSlice {
             node_id: "node-a".to_string(),
@@ -5781,7 +5784,19 @@ mod tests {
                 host: "api.other.svc.cluster.local".to_string(),
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
-                subsets: Vec::new(),
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connection_pool_http: Some(MeshConnectionPoolHttp {
+                            h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+                            max_retries: Some(2),
+                            http1_max_pending_requests: Some(7),
+                            ..MeshConnectionPoolHttp::default()
+                        }),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
                 export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()

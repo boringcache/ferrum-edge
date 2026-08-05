@@ -2068,10 +2068,11 @@ fn plugin_config_content_eq_ignoring_persistence(
 /// value, so the comparison is automatically complete over the whole `Upstream`
 /// schema (it picks up future fields with no code change) and ignores the
 /// `#[serde(skip)]` `resolved_subset_tls` derived overlay — which is safe because
-/// that overlay is a pure function of `subsets[].traffic_policy.tls`, so two
-/// upstreams with equal serialized content always resolve it identically. This is
-/// a cold-path comparison (slice apply only), so correctness/robustness wins over
-/// avoiding the clone.
+/// that overlay is a pure function of serialized `subsets[].traffic_policy`
+/// (TLS, passive health, and subset HTTP fields), so two upstreams with equal
+/// serialized content always resolve it identically. This is a cold-path
+/// comparison (slice apply only), so correctness/robustness wins over avoiding
+/// the clone.
 ///
 /// `dispatch_port_override_fallback` is a `#[serde(skip)]` field that is NOT a
 /// pure function of the serialized content (#1806): it is derived from the
@@ -7557,12 +7558,13 @@ fn apply_destination_rules(
                 }
             }
 
-            // Top-level `connectionPool.http.*` fans out to every port served
-            // by this upstream so a single DR `trafficPolicy.connectionPool`
-            // block applies uniformly across the upstream. Per-port
-            // `portLevelSettings.connectionPool.http` overrides per-port
-            // below. Mirrors the T1-D fan-out for
-            // `connectionPool.tcp.{maxConnections,tcpKeepalive}`.
+            // Top-level `connectionPool.http.*` applies uniformly across the
+            // upstream. The subset-inheritable fields (`h2UpgradePolicy`,
+            // `maxRetries`, and `http1MaxPendingRequests`) stay in the inherited
+            // fallback for every upstream so a selected subset can overlay them
+            // without losing source-tier identity. The remaining HTTP fields
+            // retain the established non-SD fan-out. Explicit per-port fields
+            // are stored separately below and win at dispatch.
             //
             // Service-discovery upstreams cannot fan out: their target ports
             // resolve at runtime, not at apply time. Instead the top-level
@@ -7583,9 +7585,20 @@ fn apply_destination_rules(
                         .get_or_insert_default();
                     apply_connection_pool_http_to_port_override(fallback, http);
                 } else {
+                    if http.h2_upgrade_policy.is_some()
+                        || http.max_retries.is_some()
+                        || http.http1_max_pending_requests.is_some()
+                    {
+                        let fallback = upstream
+                            .dispatch_port_override_fallback
+                            .get_or_insert_default();
+                        apply_subset_inheritable_connection_pool_http_to_port_override(
+                            fallback, http,
+                        );
+                    }
                     for port in &upstream_policy_ports {
                         let override_slot = upstream.port_overrides.entry(*port).or_default();
-                        apply_connection_pool_http_to_port_override(override_slot, http);
+                        apply_non_subset_connection_pool_http_to_port_override(override_slot, http);
                     }
                 }
             }
@@ -7789,6 +7802,18 @@ fn apply_destination_rules(
                                 hash_on: mesh_hash_on_to_ferrum(&sp.load_balancer),
                                 tls: sp.tls.clone(),
                                 connect_timeout_ms: sp.connect_timeout_ms,
+                                h2_upgrade_policy: sp
+                                    .connection_pool_http
+                                    .as_ref()
+                                    .and_then(|http| http.h2_upgrade_policy),
+                                max_retries: sp
+                                    .connection_pool_http
+                                    .as_ref()
+                                    .and_then(|http| http.max_retries),
+                                http1_max_pending_requests: sp
+                                    .connection_pool_http
+                                    .as_ref()
+                                    .and_then(|http| http.http1_max_pending_requests),
                                 passive_health_check,
                             }
                         }),
@@ -7918,17 +7943,16 @@ fn apply_destination_rules(
     // upstream's `resolved_subset_tls` map. Runs once after all DRs are
     // applied so subset TLS layers over the FINAL upstream-level TLS rather
     // than whatever value a mid-loop pass would have observed.
-    resolve_subset_traffic_policy_tls(config, runtime)?;
+    resolve_subset_traffic_policy(config, runtime)?;
 
     Ok(())
 }
 
-/// Compute each upstream's per-subset resolved TLS overlay against the
-/// upstream's settled `backend_tls_*` posture. Skips upstreams with no
-/// subsets and subsets with no `trafficPolicy.tls`. The result lands on
-/// `Upstream.resolved_subset_tls` keyed by subset name; consulted by
-/// [`GatewayConfig::resolve_upstream_tls`] for proxies whose
-/// `upstream_subset` selects that subset.
+/// Compute each upstream's resolved subset overlay against the settled
+/// upstream policy. The result lands on `Upstream.resolved_subset_tls` keyed by
+/// subset name; TLS is consumed by [`GatewayConfig::resolve_upstream_tls`] and
+/// HTTP connection-pool fields by
+/// [`GatewayConfig::resolve_dispatch_port_overrides`].
 ///
 /// Fail-closed: any subset whose `trafficPolicy.tls` cannot be resolved
 /// (e.g., `ISTIO_MUTUAL` requested without SVID material) rejects the entire
@@ -7936,7 +7960,7 @@ fn apply_destination_rules(
 /// upstream-level semantics. Silently degrading to upstream-level TLS would
 /// turn an operator-requested mTLS posture into whatever the upstream defaults
 /// to (potentially `SIMPLE` with a public CA).
-fn resolve_subset_traffic_policy_tls(
+fn resolve_subset_traffic_policy(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
 ) -> Result<(), anyhow::Error> {
@@ -7982,7 +8006,16 @@ fn resolve_subset_traffic_policy_tls(
             // Per-subset passive health (ejection thresholds), already resolved
             // from the subset's outlierDetection in apply_destination_rules.
             let passive = tp.and_then(|tp| tp.passive_health_check.clone());
-            if let Some(resolved) = ResolvedSubsetTrafficPolicy::new(resolved_tls, passive) {
+            let h2_upgrade_policy = tp.and_then(|tp| tp.h2_upgrade_policy);
+            let max_retries = tp.and_then(|tp| tp.max_retries);
+            let http1_max_pending_requests = tp.and_then(|tp| tp.http1_max_pending_requests);
+            if let Some(resolved) = ResolvedSubsetTrafficPolicy::new(
+                resolved_tls,
+                passive,
+                h2_upgrade_policy,
+                max_retries,
+                http1_max_pending_requests,
+            ) {
                 resolved_map.insert(subset.name.clone(), resolved);
             }
         }
@@ -8082,6 +8115,41 @@ fn apply_connection_pool_http_to_port_override(
     }
     // An explicit `Some(Default)` (port-level `DEFAULT`) overwrites an
     // inherited `Upgrade`/`DoNotUpgrade`; absent (`None`) leaves it untouched.
+    if let Some(policy) = http.h2_upgrade_policy {
+        slot.h2_upgrade_policy = Some(policy);
+    }
+    if let Some(max_retries) = http.max_retries {
+        slot.max_retries = Some(max_retries);
+    }
+    if let Some(pending) = http.http1_max_pending_requests {
+        slot.http1_max_pending_requests = Some(pending);
+    }
+}
+
+/// Project the top-level HTTP connection-pool fields that do not participate
+/// in subset inheritance onto a known non-SD port. The three subset-supported
+/// fields stay in `dispatch_port_override_fallback`; keeping them out of this
+/// fanned slot preserves enough source-tier information for cold-path
+/// `port > subset > top-level` resolution.
+fn apply_non_subset_connection_pool_http_to_port_override(
+    slot: &mut UpstreamPortOverride,
+    http: &crate::modes::mesh::config::MeshConnectionPoolHttp,
+) {
+    if let Some(idle_ms) = http.idle_timeout_ms {
+        slot.http_idle_timeout_ms = Some(idle_ms);
+    }
+    if let Some(max_streams) = http.http2_max_requests {
+        slot.h2_max_concurrent_streams = Some(max_streams);
+    }
+}
+
+/// Preserve exactly the HTTP fields supported at subset scope in the inherited
+/// fallback. The selected subset overlays this top-level base during cold-path
+/// proxy projection; explicit per-port values remain separate and win later.
+fn apply_subset_inheritable_connection_pool_http_to_port_override(
+    slot: &mut UpstreamPortOverride,
+    http: &crate::modes::mesh::config::MeshConnectionPoolHttp,
+) {
     if let Some(policy) = http.h2_upgrade_policy {
         slot.h2_upgrade_policy = Some(policy);
     }
@@ -22778,6 +22846,7 @@ mod tests {
                     ..BackendTlsConfig::default_verify()
                 }),
                 passive_health_check: None,
+                ..Default::default()
             },
         );
         let mut config = GatewayConfig {

@@ -189,3 +189,78 @@ async fn max_connections_is_not_silently_approximated_on_reqwest_h1_sockets() {
         "reqwest H1 opened multiple backend sockets despite a maxConnections=1 override; the cap is unsupported for this pooled transport and must remain documented/statused as such"
     );
 }
+
+#[test]
+fn subset_http1_pending_admission_lanes_do_not_leak() {
+    use ferrum_edge::backend_pending_limit::BackendPendingLimiter;
+
+    let limiter = BackendPendingLimiter::new();
+    let stable = limiter
+        .try_acquire_for_subset("reviews", 8080, Some("stable"), Some(1))
+        .expect("stable first slot")
+        .expect("stable guard");
+    limiter
+        .try_acquire_for_subset("reviews", 8080, Some("stable"), Some(1))
+        .expect_err("stable lane is full");
+
+    let canary = limiter
+        .try_acquire_for_subset("reviews", 8080, Some("canary"), Some(1))
+        .expect("canary has an independent slot")
+        .expect("canary guard");
+    let unmatched = limiter
+        .try_acquire_for_subset("reviews", 8080, None, Some(1))
+        .expect("unmatched destination has an independent slot")
+        .expect("unmatched guard");
+
+    assert_eq!(
+        limiter.current_for_subset("reviews", 8080, Some("stable")),
+        1
+    );
+    assert_eq!(
+        limiter.current_for_subset("reviews", 8080, Some("canary")),
+        1
+    );
+    assert_eq!(limiter.current_for_subset("reviews", 8080, None), 1);
+
+    drop((stable, canary, unmatched));
+    assert_eq!(
+        limiter.current_for_subset("reviews", 8080, Some("stable")),
+        0
+    );
+    assert_eq!(
+        limiter.current_for_subset("reviews", 8080, Some("canary")),
+        0
+    );
+    assert_eq!(limiter.current_for_subset("reviews", 8080, None), 0);
+}
+
+#[tokio::test]
+async fn subset_http1_pending_guard_releases_on_cancellation() {
+    use ferrum_edge::backend_pending_limit::BackendPendingLimiter;
+
+    let limiter = Arc::new(BackendPendingLimiter::new());
+    let task_limiter = Arc::clone(&limiter);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _guard = task_limiter
+            .try_acquire_for_subset("reviews", 8080, Some("stable"), Some(1))
+            .expect("slot")
+            .expect("guard");
+        let _ = ready_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    ready_rx.await.expect("guard acquired");
+    assert_eq!(
+        limiter.current_for_subset("reviews", 8080, Some("stable")),
+        1
+    );
+
+    task.abort();
+    let error = task.await.expect_err("task cancelled");
+    assert!(error.is_cancelled());
+    assert_eq!(
+        limiter.current_for_subset("reviews", 8080, Some("stable")),
+        0,
+        "RAII drop on cancellation must release the subset lane"
+    );
+}

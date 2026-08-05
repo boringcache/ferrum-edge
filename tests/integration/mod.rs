@@ -18,6 +18,7 @@ mod admin_namespace_claim_tests;
 mod admin_node_waypoint_identities_tests;
 mod admin_observability_auth_tests;
 mod admin_runtime_metrics_tests;
+mod admin_upstream_proxy_sni_admission_tests;
 mod ai_stream_router_normalization_tests;
 mod ai_token_metrics_contract_tests;
 mod ai_transcript_audit_grpc_contract_tests;

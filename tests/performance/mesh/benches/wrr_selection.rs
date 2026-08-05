@@ -7,8 +7,16 @@
 //!   - 1 thread:  ITERATIONS_PER_THREAD selections
 //!   - N threads: N * ITERATIONS_PER_THREAD selections
 //! The verify script converts those wall times into throughput speedup
-//! (`N * serial_ns / parallel_ns`) and asserts against a serialization floor
-//! that a single-lane `Mutex` hot path cannot clear on multi-core runners.
+//! (`N * serial_ns / parallel_ns`). Mandatory serialization floors apply to
+//! the 32- and 129-target fixtures: a single-lane schedule `Mutex` collapses
+//! near 1.0x and cannot clear the hosted floor on multi-core runners.
+//!
+//! The 4-target fixture keeps the intentional 5:1:1:1 skew (heavy Arc share
+//! 5/8). Concurrent clone/drop of the returned `Arc<UpstreamTarget>` then
+//! dominates wall time and can report parallel speedup *below* 1.0x on the
+//! wait-free path, so that fixture is a secondary small-cardinality signal
+//! (always measured; parallel speedup informational; serial wall ratio vs
+//! 32 targets gated). See `.github/scripts/verify_wrr_selection_benchmark.py`.
 //!
 //! Multi-thread samples keep a long-lived worker pool synchronized with
 //! barriers. Spawning and joining threads inside every Criterion sample was a
@@ -37,6 +45,10 @@ fn make_targets(n: usize) -> Vec<UpstreamTarget> {
             host: format!("host{i}"),
             port: 8080,
             service_port_policy_key: None,
+            // Intentional 5:1:…:1 skew. At n=4 this concentrates ~62.5% of
+            // returned Arc clones on one target and is *not* a schedule-mutex
+            // detector; larger n dilutes the hotspot so parallel speedup
+            // again discriminates single-lane serialization.
             weight: if i == 0 { 5 } else { 1 },
             tags: HashMap::new(),
             locality: None,

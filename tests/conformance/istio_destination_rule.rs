@@ -324,7 +324,7 @@ fn dr_connection_pool_http_h2_upgrade_policy() {
 /// Interpreted as a per-request retry-count CAP (an upper bound on
 /// `Proxy.retry.max_retries`), NOT Envoy's cluster-wide outstanding-retry
 /// budget. Never increases retries and never enables retries when the proxy has
-/// no retry policy. Zero/negative rejected at translate time.
+/// no retry policy. Zero disables an existing policy; negatives are rejected.
 #[test]
 fn dr_connection_pool_http_max_retries() {
     register_feature!(
@@ -348,16 +348,17 @@ fn dr_connection_pool_http_max_retries() {
 }
 
 /// `trafficPolicy.connectionPool.http.http1MaxPendingRequests` (F5.1 final knob):
-/// projected onto the HTTP overlay and enforced at runtime as a per-`(host,port)`
-/// HTTP/1.1 pending-request gate (503 "upstream overflow" when full). No longer
-/// deferred at top-level / `portLevelSettings`.
+/// projected onto the HTTP overlay and honestly reinterpreted at runtime as a
+/// per-`(host, policy port, selected subset)` concurrent in-flight HTTP/1.1 gate
+/// (503 "upstream overflow" when full). No longer deferred at top-level /
+/// `portLevelSettings`.
 #[test]
 fn dr_connection_pool_http_http1_max_pending_requests_supported() {
     register_feature!(
         category = CATEGORY,
         feature = "trafficPolicy.connectionPool.http.http1MaxPendingRequests",
         status = Status::Supported,
-        notes = "Projected onto port_overrides[port].http1_max_pending_requests → Proxy.pool_http1_max_pending_requests; enforced as a 503-on-overflow pending-request gate on the reqwest/HTTP-1.1 dispatch path (src/backend_pending_limit.rs).",
+        notes = "Projected onto port_overrides[port].http1_max_pending_requests → Proxy.pool_http1_max_pending_requests; honestly reinterpreted as a 503-on-overflow concurrent in-flight-request gate on the reqwest/HTTP-1.1 dispatch path (src/backend_pending_limit.rs).",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",
@@ -373,6 +374,95 @@ fn dr_connection_pool_http_http1_max_pending_requests_supported() {
         .as_ref()
         .expect("http overlay");
     assert_eq!(http.http1_max_pending_requests, Some(50));
+}
+
+/// All three subset-scoped HTTP pool fields are carried together on the mesh
+/// slice. Apply-time precedence and no-leakage are covered by the integration
+/// DestinationRule port-policy suite.
+#[test]
+fn dr_subset_connection_pool_http_combined() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "subsets[].trafficPolicy.connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}",
+        status = Status::Supported,
+        notes = "Preserved per subset; runtime precedence is explicit port-level > selected subset > top-level. H1 admission is keyed by subset and retry caps never synthesize retry policy.",
+    );
+    let dr = translated(json!({
+        "host": "echo.default.svc.cluster.local",
+        "subsets": [{
+            "name": "legacy",
+            "labels": {"version": "v1"},
+            "trafficPolicy": {"connectionPool": {"http": {
+                "h2UpgradePolicy": "DO_NOT_UPGRADE",
+                "maxRetries": 2,
+                "http1MaxPendingRequests": 7
+            }}}
+        }]
+    }));
+    let http = dr.subsets[0]
+        .traffic_policy
+        .as_ref()
+        .and_then(|policy| policy.connection_pool_http.as_ref())
+        .expect("subset HTTP pool overlay");
+    assert_eq!(
+        http.h2_upgrade_policy,
+        Some(ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade)
+    );
+    assert_eq!(http.max_retries, Some(2));
+    assert_eq!(http.http1_max_pending_requests, Some(7));
+}
+
+/// `subsets[].trafficPolicy.connectionPool.http.{idleTimeout,http2MaxRequests}`
+/// are validated exactly like their top-level forms but dropped by the subset
+/// apply layer (`ResolvedSubsetTrafficPolicy` carries neither), so subset scope
+/// must warn. The identical fields at top-level scope ARE applied and must stay
+/// silent — otherwise every DR with a top-level `idleTimeout` grows a spurious
+/// "not applied" warning.
+#[test]
+fn dr_subset_connection_pool_http_idle_timeout_and_h2_max_requests_deferred() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "subsets[].trafficPolicy.connectionPool.http.{idleTimeout,http2MaxRequests}",
+        status = Status::Deferred,
+        notes = "Parsed and validated, but not projected at subset scope: ResolvedSubsetTrafficPolicy carries only h2UpgradePolicy, maxRetries, and http1MaxPendingRequests. Translation warns and status reports the fields as deferred; set them at trafficPolicy or portLevelSettings scope.",
+    );
+    let result = translate_k8s_objects(
+        &[destination_rule(json!({
+            "host": "echo.default.svc.cluster.local",
+            "trafficPolicy": {
+                "connectionPool": {"http": {"idleTimeout": "30s", "http2MaxRequests": 100}}
+            },
+            "subsets": [{
+                "name": "legacy",
+                "labels": {"version": "v1"},
+                "trafficPolicy": {"connectionPool": {"http": {
+                    "idleTimeout": "45s",
+                    "http2MaxRequests": 10
+                }}}
+            }]
+        }))],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    for field in ["idleTimeout", "http2MaxRequests"] {
+        let matching: Vec<&String> = result
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains(field) && warning.contains("not applied"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly the SUBSET-scoped {field} must warn (top-level is applied): {:?}",
+            result.warnings
+        );
+        assert!(
+            matching[0].contains("subsets[].trafficPolicy.connectionPool.http"),
+            "the warning must name the subset scope: {}",
+            matching[0]
+        );
+    }
 }
 
 /// `trafficPolicy.loadBalancer.simple = ROUND_ROBIN` → `RoundRobin`.
