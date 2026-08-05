@@ -22438,9 +22438,13 @@ components:
           properties:
             window:
               type: string
-              enum: [sentence, paragraph, bytes]
+              enum: [sentence, paragraph, bytes, tokens]
               default: sentence
-              description: Window boundary detector (window=tokens is not yet supported).
+              description: "Window boundary detector. `tokens` requires an explicit `streaming.tokenizer` (`chars4`, `whitespace`, or `unicode_words`) plus optional `max_window_tokens` / `overlap_tokens`; these are bounded deterministic estimators, not provider BPE models. Soft token budgets still honor `max_window_bytes` as the hard memory/CPU cap."
+            tokenizer:
+              type: string
+              enum: [chars4, whitespace, unicode_words]
+              description: "Required when window=tokens. Explicit bounded tokenizer selection — `chars4` (~4 Unicode scalars per token, matching ai_rate_limiter / ai_prompt_compressor), `whitespace` (Unicode whitespace-delimited runs), or `unicode_words` (alphanumeric runs; each non-whitespace non-alphanumeric scalar is its own token, and CJK ideographs, kana, and Hangul syllables are one token per character rather than a joined run). Rejected when window is not tokens."
             max_window_bytes:
               type: integer
               format: uint
@@ -22451,7 +22455,19 @@ components:
               type: integer
               format: uint
               default: 256
-              description: Bytes of already-cleared text re-inspected with the next window so a violation phrase split across a boundary is still caught. Prose and tool-call tails split this aggregate budget with a reserved tool-state share. Must be less than max_window_bytes and is included within that aggregate retained-state cap.
+              description: Bytes of already-cleared text re-inspected with the next window so a violation phrase split across a boundary is still caught. Prose and tool-call tails split this aggregate budget with a reserved tool-state share. Must be less than max_window_bytes and is included within that aggregate retained-state cap. For window=tokens this remains the hard memory ceiling on retained overlap while overlap_tokens selects the prose token budget.
+            max_window_tokens:
+              type: integer
+              format: uint
+              minimum: 1
+              maximum: 65536
+              default: 256
+              description: "Only valid when window=tokens. Soft window size in complete tokens under the selected tokenizer. Omit for the default (256). Values above 65536 or 0 are rejected. The hard max_window_bytes cap still forces a window (preferring a complete-token cut) when retained state fills first."
+            overlap_tokens:
+              type: integer
+              format: uint
+              default: 32
+              description: "Only valid when window=tokens. Complete tokens of already-cleared prose re-inspected with the next window; retained overlap tokens count against the next window's max_window_tokens, so a window closes once retained + new tokens reach the budget (at least one new token is always required). Must be strictly less than max_window_tokens. When omitted, defaults to min(32, max_window_tokens-1). Still subject to the overlap_bytes memory ceiling."
             max_inspections:
               type: integer
               format: uint

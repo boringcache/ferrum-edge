@@ -34,13 +34,13 @@ Current mesh HBONE/DNS perf status lives in
 | Remote-discovery JWT audience binding | Implemented — closed [#2475](https://github.com/ferrum-edge/ferrum-edge/issues/2475) |
 | `ai_stream_router` `google_gemini` adapter | Implemented — [#3299](https://github.com/ferrum-edge/ferrum-edge/issues/3299) |
 | Subset-scoped Istio HTTP connection-pool policy | Implemented by [#3547](https://github.com/ferrum-edge/ferrum-edge/pull/3547), resolving [#3228](https://github.com/ferrum-edge/ferrum-edge/issues/3228) / [#3240](https://github.com/ferrum-edge/ferrum-edge/issues/3240)–[#3242](https://github.com/ferrum-edge/ferrum-edge/issues/3242) |
+| AI semantic-firewall token windows | Implemented — [#3302](https://github.com/ferrum-edge/ferrum-edge/issues/3302) (`streaming.window: tokens` with explicit bounded tokenizer) |
 
 ## Live dedicated trackers (current backlog)
 
 | Residual | Issue(s) | Notes |
 |---|---|---|
 | EgressGateway UDP `ServiceEntry` materialization | [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) | HTTP/TCP stream egress exists; UDP ports still skipped |
-| AI semantic-firewall token windows | [#3302](https://github.com/ferrum-edge/ferrum-edge/issues/3302) | `streaming.window: tokens` rejected |
 | Native-gRPC transcript capture | [#3304](https://github.com/ferrum-edge/ferrum-edge/issues/3304) | HTTP-only today |
 | Pre-first-byte stream-router fallback | [#3328](https://github.com/ferrum-edge/ferrum-edge/issues/3328) | Implement or explicitly reject |
 | Native SMTP/email notification channel | [#3329](https://github.com/ferrum-edge/ferrum-edge/issues/3329) | |
