@@ -18,7 +18,8 @@
 //!
 //! Mirroring how this repo honestly reinterprets DR `maxRetries` as a
 //! per-request cap (see `docs/mesh.md`), this limiter reframes the knob as a
-//! **max concurrent in-flight HTTP/1.1 requests per `(host, port)`** cap,
+//! **max concurrent in-flight HTTP/1.1 requests per
+//! `(host, DestinationRule policy port, selected subset)`** cap,
 //! measured from dispatch to response-headers. When a destination is already at
 //! its cap, the new request is shed immediately with a 503 ("upstream overflow"
 //! in Envoy terms) instead of being queued unboundedly. This bounds H1
@@ -51,14 +52,15 @@
 //! # Hot-path discipline (mirrors [`crate::backend_conn_limit`])
 //!
 //! - When no cap is configured for a destination port (`cap == None`),
-//!   [`BackendPendingLimiter::try_acquire`] returns `Ok(None)` after a single
+//!   [`BackendPendingLimiter::try_acquire_for_subset`] returns `Ok(None)` after a single
 //!   `Option` check and never touches the `DashMap`.
 //! - On the capped hit path the destination counter is looked up with a
 //!   **borrowed `&str`** key built into a reused thread-local buffer (mirroring
 //!   `backend_capabilities` / `pool` / `api_chargeback`): the `DashMap` is keyed
-//!   by a flat `host|port` `String`, and `DashMap::get_mut` accepts `&str` via
-//!   `String: Borrow<str>`, so a repeat request to a known destination allocates
-//!   nothing. Only the cold first request to a new destination allocates the
+//!   by a flat `host|port|n` or `host|port|s<length>:<subset>` `String`, and
+//!   `DashMap::get_mut` accepts `&str` via `String: Borrow<str>`, so a repeat
+//!   request to a known destination allocates nothing. Only the cold first
+//!   request to a new destination allocates the
 //!   owned key for the `entry` insert. This satisfies the hot-path no-alloc
 //!   contract (the previous `host.to_string()` probe allocated per request).
 //! - The counter map is a sharded [`dashmap::DashMap`] sized via
@@ -100,36 +102,47 @@ use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 
 thread_local! {
-    /// Reused per-thread buffer for `(host, port)` counter-key lookups on the
-    /// capped hot path. Mirrors the zero-allocation strategy of
+    /// Reused per-thread buffer for `(host, policy port, selected subset)`
+    /// counter-key lookups on the capped hot path. Mirrors the zero-allocation strategy of
     /// `backend_capabilities` / `pool` / `api_chargeback` so a repeat capped
     /// request to a known destination allocates nothing.
     static PENDING_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(96));
 }
 
-/// Build the flat `host|port` counter-key for a destination into `buf`. `|` is
-/// the codebase's pool-key delimiter; a bare host never contains it, so the
-/// flat key is unambiguous and round-trips the `(host, port)` identity.
+/// Build the flat counter key for a destination and selected subset. The subset
+/// is length-prefixed so even a hostile delimiter-bearing name cannot collide
+/// with an unmatched destination or a sibling subset.
 #[inline]
-fn write_pending_key(buf: &mut String, host: &str, port: u16) {
+fn write_pending_key(buf: &mut String, host: &str, port: u16, subset: Option<&str>) {
     buf.push_str(host);
     buf.push('|');
-    let _ = write!(buf, "{port}");
+    let _ = write!(buf, "{port}|");
+    if let Some(subset) = subset {
+        let _ = write!(buf, "s{}:", subset.len());
+        buf.push_str(subset);
+    } else {
+        buf.push('n');
+    }
 }
 
-/// Shared per-destination pending-request counter map.
+/// Shared per-destination in-flight-request counter map.
 ///
-/// Keyed by a flat `host|port` `String` (an owned key survives DNS-cache
-/// refreshes and target rotation without reborrowing from the
+/// Keyed by a flat `host|port|n` or `host|port|s<length>:<subset>` `String` (an
+/// owned key survives DNS-cache refreshes and target rotation without reborrowing from the
 /// `Proxy`/`UpstreamTarget`) and looked up on the hit path by borrowed `&str`
 /// via `String: Borrow<str>`, so the capped hot path allocates nothing on a
 /// repeat request.
 ///
 /// One instance lives on `ProxyState` and is shared across every reqwest/H1
 /// dispatch for the gateway lifetime, so the cap bounds concurrent in-flight
-/// requests per `(host, port)` across all proxies that dial the same
-/// destination — matching how the cap is materialized per upstream destination
-/// port rather than per proxy.
+/// requests per `(host, policy port, selected subset name)` across all proxies
+/// in the same admission lane. `None` is distinct from every named subset, preventing a
+/// selected subset's cap from leaking to an unmatched destination. The key has
+/// no upstream/Service identity: two Services that dial the same `host:port`
+/// under a conventionally-named subset (e.g. both `v1`) share one lane even when
+/// their caps differ — Envoy scopes this per cluster; Ferrum's pre-existing
+/// `(host, policy port)` sharing already had that residual, and the subset dimension
+/// only isolates distinct names.
 pub struct BackendPendingLimiter {
     inner: Arc<DashMap<String, Arc<BackendPendingCounter>>>,
 }
@@ -164,35 +177,23 @@ impl BackendPendingLimiter {
         }
     }
 
-    /// Try to acquire one in-flight slot for `(host, port)`.
-    ///
-    /// * `Ok(None)` — no cap configured (`cap` is `None`). Hot path: a single
-    ///   `Option` check, no `DashMap` touch, no counter held. The caller
-    ///   dispatches unconditionally.
-    /// * `Ok(Some(guard))` — a slot was reserved. The returned guard's `Drop`
-    ///   releases it. The caller holds the guard only for the in-flight window
-    ///   (dispatch until backend `send()` returns / response headers arrive).
-    /// * `Err(BackendPendingLimitExceeded)` — the destination is at its
-    ///   in-flight cap. The caller sheds the request with a 503 ("upstream
-    ///   overflow").
-    ///
-    /// `cap == Some(0)` always rejects. A `http1MaxPendingRequests: 0`
-    /// DestinationRule is rejected at translate time, so production never sees
-    /// it; the reject-on-zero behavior is defensive.
-    ///
-    /// The cap check and the slot reservation happen together in ONE DashMap
-    /// shard-locked section (`get_mut`/`entry`). Mutating the count under the
-    /// shard lock — rather than a lock-free CAS on a cloned `Arc` — is what makes
-    /// drop-time eviction race-free: a lock-free counter cannot be removed from
-    /// the map without racing an acquirer that already cloned it, which would
-    /// either orphan the counter (splitting the count across two entries and
-    /// admitting past the cap) or strand a zero-count entry. Because acquire and
-    /// the evicting release both run under the same shard lock, they are mutually
-    /// exclusive and neither race exists.
-    pub fn try_acquire(
+    #[cfg(test)]
+    fn try_acquire(
         &self,
         host: &str,
         port: u16,
+        cap: Option<u32>,
+    ) -> Result<Option<BackendPendingGuard>, BackendPendingLimitExceeded> {
+        self.try_acquire_for_subset(host, port, None, cap)
+    }
+
+    /// Subset-scoped variant used by proxy dispatch. `subset == None` is a
+    /// distinct admission lane from every named subset.
+    pub fn try_acquire_for_subset(
+        &self,
+        host: &str,
+        port: u16,
+        subset: Option<&str>,
         cap: Option<u32>,
     ) -> Result<Option<BackendPendingGuard>, BackendPendingLimitExceeded> {
         let Some(cap) = cap else {
@@ -200,7 +201,7 @@ impl BackendPendingLimiter {
         };
         let cap_u64 = u64::from(cap);
         // A zero cap rejects unconditionally — reject BEFORE touching the map.
-        // `try_acquire` never hands out a guard for a zero cap, so the drop-time
+        // `try_acquire_for_subset` never hands out a guard for a zero cap, so the drop-time
         // eviction can never fire for it; creating a counter here would leave a
         // permanent zero-count entry per unique host (the exact unbounded growth
         // this limiter guards against). `http1MaxPendingRequests: 0` is rejected
@@ -211,7 +212,7 @@ impl BackendPendingLimiter {
         let counter = PENDING_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
-            write_pending_key(&mut buf, host, port);
+            write_pending_key(&mut buf, host, port, subset);
             // Hit path: borrowed `&str` `get_mut` (write-locks only this shard,
             // no key allocation). Check the cap and reserve the slot while the
             // shard lock is held, so the reservation is atomic with a concurrent
@@ -255,13 +256,19 @@ impl BackendPendingLimiter {
     }
 
     /// Current in-flight count for a destination. Test/metrics only — the hot
-    /// path uses `try_acquire` directly.
+    /// path uses `try_acquire_for_subset` directly.
     #[allow(dead_code)]
     pub fn current(&self, host: &str, port: u16) -> u64 {
+        self.current_for_subset(host, port, None)
+    }
+
+    /// Current in-flight count for a selected subset. Test/metrics only.
+    #[allow(dead_code)]
+    pub fn current_for_subset(&self, host: &str, port: u16, subset: Option<&str>) -> u64 {
         PENDING_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
-            write_pending_key(&mut buf, host, port);
+            write_pending_key(&mut buf, host, port, subset);
             self.inner
                 .get(buf.as_str())
                 .map(|c| c.count.load(Ordering::Relaxed))
@@ -291,7 +298,7 @@ impl Drop for BackendPendingGuard {
         // Release the slot and evict the entry if this was the last one, in ONE
         // shard-locked `remove_if`. The predicate runs under the DashMap shard
         // write lock, so the decrement and the at-zero removal are atomic with
-        // respect to `try_acquire` (which checks-and-increments under the same
+        // respect to `try_acquire_for_subset` (which checks-and-increments under the same
         // lock). That mutual exclusion is what eliminates the lock-free eviction
         // races: an acquirer can never observe/clone this counter "between" the
         // decrement and the removal, so it can neither resurrect an orphan
@@ -323,7 +330,7 @@ impl std::fmt::Display for BackendPendingLimitExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "backend http1MaxPendingRequests reached: {} pending (cap {})",
+            "backend http1MaxPendingRequests reached: {} in flight (cap {})",
             self.current, self.cap
         )
     }
