@@ -12289,10 +12289,8 @@ mod tests {
         );
         newer.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let losers = super::backend_lb_policy_conflict_losers(
-            &[older.clone(), newer.clone()],
-            &options(),
-        );
+        let losers =
+            super::backend_lb_policy_conflict_losers(&[older.clone(), newer.clone()], &options());
         assert!(!losers.contains(&K8sResourceKey::from_object(&older)));
         assert!(losers.contains(&K8sResourceKey::from_object(&newer)));
 
