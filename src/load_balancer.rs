@@ -369,6 +369,7 @@ fn wrr_counter_shard() -> usize {
 /// bouncing a single shared `AtomicU64` that sat adjacent to read-per-selection
 /// neighbors (`algorithm`, `target_indices`, `distribute_groups`, …).
 type SelectionCounterShards = [CachePadded<AtomicU64>; WRR_COUNTER_SHARDS];
+type CandidatePoolIndices<'a> = (Option<&'a [usize]>, Option<&'a [usize]>);
 
 /// Odd multiplicative stride (golden-ratio fraction of 2^64) giving each
 /// selection-counter shard a distinct starting phase at construction.
@@ -4502,7 +4503,7 @@ impl LoadBalancer {
         &self,
         port: Option<u16>,
         subset_name: Option<&str>,
-    ) -> Option<(Option<&[usize]>, Option<&[usize]>)> {
+    ) -> Option<CandidatePoolIndices<'_>> {
         let port_indices = port
             .and_then(|p| self.port_overrides.get(&p))
             .map(|ps| ps.target_indices.as_slice());
