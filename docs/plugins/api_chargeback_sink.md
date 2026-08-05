@@ -399,6 +399,7 @@ identity:
 ```text
 <spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/spool.meta.json
 <spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/.spool-quota.lock
+<spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/.spool-dead-letter-credit
 <spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/<YYYYMMDD>/<ULID>.<owner_tag>.ndjson.zst
 <spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/<YYYYMMDD>/<ULID>.<owner_tag>.ndjson.zst.rejected.ndjson
 <spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/<YYYYMMDD>/<ULID>.<owner_tag>.ndjson.zst.rejected.meta
@@ -699,8 +700,10 @@ fields are never logged.
   to one owner-only (`0600` on Unix) sibling `.rejected.ndjson` temp. The temp is
   quota-admitted under the namespace-wide spool lock before each bounded replay
   batch of separators/rows is written, so an uncompressed rejected payload
-  derived from a compressed source never transiently exceeds
-  `spool.max_bytes`. A quota refusal removes the temp and restores the
+  derived from a compressed source never transiently exceeds the admission
+  ceiling described in
+  [Dead-letter source credit and peak on-disk bytes](#dead-letter-source-credit-and-peak-on-disk-bytes).
+  A quota refusal removes the temp and restores the
   authoritative source for a later/operator-assisted attempt. The completed
   temp is fsynced, atomically renamed, and directory-fsynced before the sibling
   `.rejected.meta` document is published; only then is the authoritative source
@@ -817,6 +820,77 @@ another identity), the write is **rejected** and the batch/event follows the
 existing spool-failure path (warned and not durably retained). The sink never
 silently exceeds the ceiling and never reclaims bytes by destroying an in-flight,
 actively written, or foreign-owned record.
+
+### Dead-letter source credit and peak on-disk bytes
+
+Publishing a dead letter requires the authoritative source **and** its rejected
+copy to be protected on disk at the same time. Measuring the rejected copy
+against an inventory that still contains the source makes any source larger than
+roughly half `spool.max_bytes` impossible to hand off: admission fails, the
+source is restored, and — because a claimed source keeps its protected replay
+claim — nothing behind it drains either. That is a permanent head-of-line stall
+on one oversized artifact even though the *post*-handoff footprint fits.
+
+One dead-letter handoff per managed namespace therefore holds a **source
+credit**: an accounted reservation for the bytes its terminal claim removal will
+free. Its properties are the contract:
+
+- **Exactly one, namespace-wide.** The credit lives in a
+  `.spool-dead-letter-credit` record in the namespace root whose exclusive OS
+  advisory lock is held for the claim's lifetime. A second manager instance, a
+  second plugin generation, or a second Ferrum process sharing the namespace
+  cannot obtain a second credit — it admits against the plain `spool.max_bytes`
+  ceiling and fails closed rather than double-spending capacity the first
+  handoff already promised.
+- **Taken at claim time, sized from the pinned descriptor.** The reserved byte
+  count is the length of the exact authoritative artifact the claim pinned, not
+  whatever the pathname currently names.
+- **Spent only while it is witnessed.** Every admission that uses the credit
+  re-reads the durable record through the locked descriptor and re-proves that
+  it still names this claim, that the reserved length still equals the pinned
+  artifact's length, and that the claim pathname still resolves to that
+  artifact. Anything else yields no credit; the handoff still runs, just under
+  the plain ceiling.
+- **Never a credit for ordinary writes.** `write_events` admission is unchanged.
+
+**Peak on-disk bytes.** Owned encoded bytes are bounded by:
+
+```text
+steady state   <= spool.max_bytes
+transient peak <= spool.max_bytes + reserved_source_bytes
+```
+
+`reserved_source_bytes` is the length of the one credited source, which can
+never exceed `spool.max_bytes` (a batch larger than the quota is refused at
+write admission), so the absolute worst case is `2 × spool.max_bytes` and the
+realistic case is `spool.max_bytes + your largest spool artifact`. Because at
+most one credit exists per namespace at any instant, **this bound does not grow
+with the number of concurrent handoffs, managers, generations, or processes.**
+The excursion lasts only from the first rejected-row append until the
+authoritative source is removed; the very next quota enforcement after that
+removal runs with no credit at all, so the namespace is back inside
+`spool.max_bytes`.
+
+**Crash, abort, and restart.** The credit is released by closing its descriptor,
+so a panic, an aborted replay tick, a dropped claim, a killed worker, or process
+death frees it immediately — there is no lease horizon to wait out and no
+permanently leaked capacity. A crashed holder can leave the record body behind;
+that body grants nothing to anyone, because only the lock holder reads it and
+the next holder truncates and rewrites it before spending. A full prepare
+(startup or storage re-prepare) reconciles the stale body so the durable state an
+operator inspects matches reality, and leaves a live peer's record untouched. A
+symlinked, non-regular, or hard-linked `.spool-dead-letter-credit` path is a
+substitution of shared coordination state and refuses prepare
+(`spool.available=false`), exactly as the `.spool-quota.lock` inode does. The
+record is not billing data and is excluded from quota and status counts.
+
+**Operator implications.** Size `spool.max_bytes` with headroom for one
+source-sized excursion if your filesystem has a hard capacity limit you cannot
+cross — the guidance below already asks for dead-letter headroom, and this is the
+same budget. If two nodes or generations share one namespace, expect only one of
+them to be able to hand off an oversized artifact at a time; the other retries on
+a later replay tick once the credit is free, so progress is preserved and no
+billing data is lost.
 
 Size `spool.max_bytes` for the longest ClickHouse outage you are willing to
 absorb, using **encoded** average event size (and headroom for retained

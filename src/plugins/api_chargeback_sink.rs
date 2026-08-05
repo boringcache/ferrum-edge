@@ -30,7 +30,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -274,6 +274,19 @@ const SPOOL_MAX_META_BYTES: usize = 64 * 1024;
 /// ownership-bound namespace. The zero-length coordination file is not a
 /// billing artifact and is excluded from quota/status inventory.
 const SPOOL_COORDINATION_LOCK_FILENAME: &str = ".spool-quota.lock";
+/// Durable, namespace-wide record of the single outstanding dead-letter source
+/// credit. Like the coordination inode this is not a billing artifact and is
+/// excluded from quota/status inventory; unlike it, the record carries a small
+/// JSON body so a crashed handoff's reservation is inspectable and
+/// reconstructible from on-disk state rather than from process memory.
+const SPOOL_SOURCE_CREDIT_FILENAME: &str = ".spool-dead-letter-credit";
+/// Hard bound for the fixed-shape source-credit record. The reservation is
+/// written before any dead-letter temp exists, so it is materialized against the
+/// retained-byte ceiling like every other attacker-shaped copy.
+const SPOOL_MAX_SOURCE_CREDIT_BYTES: usize = 1024;
+/// Format version of the durable source-credit record. A record written by a
+/// different version is not honoured and is reconciled rather than parsed.
+const SPOOL_SOURCE_CREDIT_FORMAT_VERSION: u32 = 1;
 /// Bound one ClickHouse attempt so the derived cross-process claim lease remains
 /// finite and representable. Ten minutes is already substantially above the
 /// default five-second export timeout.
@@ -6331,6 +6344,35 @@ fn pinned_claim_descriptor_identity(file: &File, path: &Path) -> Result<SpoolFil
     Ok(SpoolFileIdentity::from_metadata(&metadata))
 }
 
+/// Everything one dead-letter handoff needs to act on its claim pathname: the
+/// pinned authoritative descriptor that authorizes every destructive and
+/// constructive step, plus the optional namespace-wide reservation crediting the
+/// source bytes the terminal claim removal will free.
+///
+/// The two are deliberately separate concerns. The artifact is *authority*: no
+/// step runs without it. The reservation is *capacity*: without it a handoff
+/// still runs, it just admits against the plain `spool.max_bytes` ceiling and
+/// fails closed when the source and its rejected copy cannot coexist. Only a
+/// production claim carries a reservation, and at most one claim per namespace
+/// holds it at a time.
+#[derive(Clone, Copy)]
+struct DeadLetterHandoffAuthority<'a> {
+    artifact: &'a PinnedClaimArtifact,
+    reservation: Option<&'a SpoolSourceCreditReservation>,
+}
+
+impl<'a> DeadLetterHandoffAuthority<'a> {
+    /// A handoff with authority but no capacity credit. Every dead-letter step
+    /// behaves exactly as it did before reservations existed.
+    #[allow(dead_code)] // reached only from the external-test entry points
+    fn uncredited(artifact: &'a PinnedClaimArtifact) -> Self {
+        Self {
+            artifact,
+            reservation: None,
+        }
+    }
+}
+
 /// Why a destructive claim-pathname operation did not complete.
 ///
 /// The split is load-bearing on the replay error path: only [`Self::Retryable`]
@@ -6533,6 +6575,107 @@ struct SpoolMutationGuard<'a> {
     _local: MutexGuard<'a, ()>,
 }
 
+/// Durable body of the one outstanding dead-letter source credit.
+///
+/// The record is authoritative on-disk state, not a cache of a process-local
+/// number: every admission that spends the credit re-reads and re-validates it
+/// through the descriptor that holds the namespace-wide exclusive lock.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SpoolSourceCreditRecord {
+    format_version: u32,
+    /// Durable replayable file name the credited claim was renamed from. Claim
+    /// renewal renames the claim pathname but never this base, so the binding
+    /// survives a renewal chain.
+    claim_base: String,
+    /// Bytes the terminal claim removal will free, taken from the pinned
+    /// authoritative descriptor rather than from the pathname.
+    reserved_bytes: u64,
+    reserved_at_unix: i64,
+    process_tag: String,
+    generation: u64,
+}
+
+/// The namespace-wide exclusive credit for the authoritative source bytes one
+/// dead-letter handoff will free when it removes its claim.
+///
+/// Publishing a dead-letter payload requires the authoritative source *and* the
+/// rejected payload to exist at once, so the handoff is transiently allowed to
+/// sit above `spool.max_bytes` by exactly the reserved source length. That
+/// excursion is safe only if it cannot be taken twice, which is what this
+/// reservation enforces:
+///
+/// - **Exclusive.** The credit lives in one namespace-wide file whose OS
+///   advisory lock is held for the claim's lifetime. A second manager, a second
+///   generation, or a second process observes `WouldBlock` and gets no credit at
+///   all, so it admits against the plain ceiling and fails closed instead of
+///   double-spending. Peak on-disk bytes are therefore bounded by
+///   `spool.max_bytes + reserved_bytes` no matter how many handoffs run.
+/// - **Crash-safe.** The lock is owned by the kernel, so process death, an
+///   aborted tick, a dropped claim, or a panic releases it with no leaked
+///   capacity and no lease horizon to wait out.
+/// - **Reconstructible.** The durable record names the credited claim and the
+///   exact reserved byte count. A credit is spent only after the record is
+///   re-read from this descriptor and still matches both the claim base and the
+///   pinned artifact length, so a stale record left by a crashed holder grants
+///   nothing to anybody and is reconciled at the next prepare.
+struct SpoolSourceCreditReservation {
+    path: PathBuf,
+    claim_base: String,
+    reserved_bytes: u64,
+    /// Holds the exclusive advisory lock. Dropping it releases the credit.
+    file: File,
+}
+
+impl SpoolSourceCreditReservation {
+    /// Re-read the durable record through the locked descriptor.
+    ///
+    /// The credit is never taken from these in-memory fields alone: they are
+    /// only the expectation the on-disk truth has to satisfy.
+    fn read_record(&self) -> Result<SpoolSourceCreditRecord, String> {
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(0)).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to rewind spool dead-letter credit record '{}': {error}",
+                self.path.display()
+            )
+        })?;
+        let mut bytes = Vec::new();
+        let mut reader = file.take(SPOOL_MAX_SOURCE_CREDIT_BYTES as u64 + 1);
+        reader.read_to_end(&mut bytes).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to read spool dead-letter credit record '{}': {error}",
+                self.path.display()
+            )
+        })?;
+        if bytes.len() > SPOOL_MAX_SOURCE_CREDIT_BYTES {
+            return Err(format!(
+                "{PLUGIN_NAME}: spool dead-letter credit record '{}' exceeds its hard bound",
+                self.path.display()
+            ));
+        }
+        serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: invalid spool dead-letter credit record '{}': {error}",
+                self.path.display()
+            )
+        })
+    }
+}
+
+impl Drop for SpoolSourceCreditReservation {
+    /// Release the namespace-wide credit.
+    ///
+    /// Clearing the record is best effort and is not what makes release safe:
+    /// closing the descriptor drops the OS lock, and the next holder truncates
+    /// and rewrites the body before it can spend anything. A record left behind
+    /// by a failed truncate — or by a crash that never reached this point —
+    /// grants no credit to any process, because only the lock holder ever reads
+    /// it and the holder always rewrites it first.
+    fn drop(&mut self) {
+        let _ = self.file.set_len(0);
+    }
+}
+
 pub struct SpoolManager {
     cfg: SpoolSettings,
     owner: SpoolOwner,
@@ -6701,6 +6844,176 @@ impl SpoolManager {
         })
     }
 
+    fn source_credit_path(&self) -> PathBuf {
+        self.namespace_root.join(SPOOL_SOURCE_CREDIT_FILENAME)
+    }
+
+    /// Take the one namespace-wide dead-letter source credit for this claim.
+    ///
+    /// Called under the namespace mutation lock immediately after the claim
+    /// rename, so the reserved byte count is the pinned authoritative artifact's
+    /// own length. `None` means another live claim in this namespace already
+    /// holds the credit, or the record could not be published — either way the
+    /// handoff proceeds uncredited against the plain `spool.max_bytes` ceiling
+    /// and fails closed on quota rather than double-spending capacity.
+    ///
+    /// The namespace mutation lock does not make this redundant. That lock
+    /// serializes two admissions; it does not stop each of them evaluating a
+    /// snapshot that ignores the other's outstanding credit. The exclusive lock
+    /// on this record is what makes a second credit unobtainable while the first
+    /// is outstanding.
+    fn try_reserve_source_credit(
+        &self,
+        claim_path: &Path,
+        artifact: &PinnedClaimArtifact,
+    ) -> Option<SpoolSourceCreditReservation> {
+        let reserved_bytes = artifact.pinned_len()?;
+        if reserved_bytes == 0 {
+            return None;
+        }
+        let claim_base = claim_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(spool_artifact_base_name)?
+            .to_string();
+        let path = self.source_credit_path();
+        self.assert_managed_path(&path).ok()?;
+        let file = open_spool_source_credit_file(&path).ok()?;
+        let before = validate_spool_source_credit_file(&path, &file).ok()?;
+        if file.try_lock().is_err() {
+            return None;
+        }
+        // Revalidate after acquisition so a pathname replacement racing the
+        // open/lock interval never becomes a second credit domain.
+        let after = validate_spool_source_credit_file(&path, &file).ok()?;
+        if !after.same_coordination_inode(&before) {
+            return None;
+        }
+        let record = SpoolSourceCreditRecord {
+            format_version: SPOOL_SOURCE_CREDIT_FORMAT_VERSION,
+            claim_base: claim_base.clone(),
+            reserved_bytes,
+            reserved_at_unix: unix_timestamp_seconds(),
+            process_tag: spool_process_tag().to_string(),
+            generation: self.generation,
+        };
+        let reservation = SpoolSourceCreditReservation {
+            path,
+            claim_base,
+            reserved_bytes,
+            file,
+        };
+        // Publish the durable record before the credit can be spent. A failure
+        // here drops the reservation — releasing the lock — so no admission ever
+        // spends capacity that no on-disk record witnesses.
+        write_spool_source_credit_record(&reservation, &record, self.ceiling).ok()?;
+        Some(reservation)
+    }
+
+    /// Bytes this dead-letter admission may transiently spend above
+    /// `spool.max_bytes`, re-derived from authoritative on-disk state.
+    ///
+    /// Callers hold the namespace mutation lock and have already proved the
+    /// claim through [`Self::require_live_claim`]. Every unproven state yields
+    /// `0` rather than an error: no reservation, a reservation bound to another
+    /// claim, a claim that stopped resolving to the pinned artifact, a record
+    /// that does not match, or a record this format version does not own. A
+    /// handoff that loses its credit still runs — it simply admits against the
+    /// plain ceiling and fails closed if the source and its rejected copy cannot
+    /// coexist.
+    fn source_credit_bytes(
+        &self,
+        claim_path: &Path,
+        authority: DeadLetterHandoffAuthority<'_>,
+    ) -> u64 {
+        let Some(reservation) = authority.reservation else {
+            return 0;
+        };
+        let Some(base) = claim_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(spool_artifact_base_name)
+        else {
+            return 0;
+        };
+        if base != reservation.claim_base {
+            return 0;
+        }
+        // Accounting authority is the pinned descriptor, not the pathname: the
+        // credit must equal the bytes the terminal removal will actually free.
+        let Some(pinned_len) = authority.artifact.pinned_len() else {
+            return 0;
+        };
+        if pinned_len != reservation.reserved_bytes {
+            return 0;
+        }
+        if !matches!(
+            self.managed_claim_state(claim_path, authority.artifact),
+            Ok(ManagedClaimState::LiveClaim)
+        ) {
+            return 0;
+        }
+        match reservation.read_record() {
+            Ok(record)
+                if record.format_version == SPOOL_SOURCE_CREDIT_FORMAT_VERSION
+                    && record.claim_base == base
+                    && record.reserved_bytes == pinned_len =>
+            {
+                pinned_len
+            }
+            _ => 0,
+        }
+    }
+
+    /// Reconcile the durable source-credit record during a full prepare.
+    ///
+    /// A crashed or killed holder leaves the record behind with no OS lock. It
+    /// already grants nothing — only the lock holder ever reads it, and the
+    /// holder rewrites it before spending — but stale bytes would misreport what
+    /// capacity is outstanding to an operator, so clear them. A live peer still
+    /// holding the credit reports `WouldBlock` and is left completely untouched.
+    ///
+    /// Fail-closed: a symlinked, non-regular, or hard-linked reservation path is
+    /// a substitution of shared coordination state and refuses prepare, exactly
+    /// as the namespace coordination inode does.
+    fn reconcile_source_credit_record_locked(&self) -> Result<(), String> {
+        let path = self.source_credit_path();
+        self.assert_managed_path(&path)?;
+        let file = open_spool_source_credit_file(&path)?;
+        let before = validate_spool_source_credit_file(&path, &file)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            Err(TryLockError::Error(error)) => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: failed to acquire spool dead-letter credit record '{}': {error}",
+                    path.display()
+                ));
+            }
+        }
+        let after = validate_spool_source_credit_file(&path, &file)?;
+        if !after.same_coordination_inode(&before) {
+            return Err(format!(
+                "{PLUGIN_NAME}: spool dead-letter credit record changed identity while reconciling it"
+            ));
+        }
+        if after.len != 0 {
+            file.set_len(0).map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: failed to clear stale spool dead-letter credit record '{}': {error}",
+                    path.display()
+                )
+            })?;
+            file.sync_all().map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: failed to sync cleared spool dead-letter credit record '{}': {error}",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)] // external unit tests only
     pub fn for_tests(cfg: SpoolSettings, node_id: &str) -> Result<Self, String> {
         Self::for_tests_with_owner(cfg, &default_test_spool_owner_spec(node_id), 1)
@@ -6822,6 +7135,16 @@ impl SpoolManager {
     #[allow(dead_code)] // external unit tests only
     pub fn namespace_root_for_tests(&self) -> &Path {
         &self.namespace_root
+    }
+
+    /// Path of the durable namespace-wide dead-letter source-credit record.
+    ///
+    /// External tests use it to plant a crashed holder's stale record and to
+    /// assert that restart reconciliation clears it.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn source_credit_record_path_for_tests(&self) -> PathBuf {
+        self.source_credit_path()
     }
 
     #[doc(hidden)]
@@ -7288,6 +7611,10 @@ impl SpoolManager {
         self.persist_or_validate_namespace_meta()?;
         self.scan_unbound_records();
         self.report_stranded_claims()?;
+        // A crashed handoff's dead-letter source credit is released by the OS
+        // when its descriptor dies, so nothing leaks; clear the stale record so
+        // the durable state an operator inspects matches that.
+        self.reconcile_source_credit_record_locked()?;
         self.reconcile_stale_temp_files()?;
         // Seed authoritative gauges from the reconciled tree before the
         // first status/metrics scrape can observe this generation.
@@ -7635,11 +7962,41 @@ impl SpoolManager {
             .map(|_| ())
     }
 
+    /// Admit `incoming_len` against `spool.max_bytes` raised by an outstanding
+    /// dead-letter source credit.
+    ///
+    /// `credit` is the byte length of an authoritative replay source that this
+    /// handoff will remove once its rejected payload and metadata are durable.
+    /// Only a handoff holding the one namespace-wide reservation can pass a
+    /// non-zero value, so the ceiling is raised for at most one handoff at a
+    /// time and the transient peak stays `spool.max_bytes + credit` regardless
+    /// of how many managers or processes are running. Ordinary spool writes
+    /// never carry a credit.
+    fn evict_until_can_admit_with_credit(
+        &self,
+        incoming_len: u64,
+        credit: u64,
+    ) -> Result<(), String> {
+        self.evict_until_can_admit_with_report_and_credit(incoming_len, credit)
+            .map(|_| ())
+    }
+
     fn evict_until_can_admit_with_report(
         &self,
         incoming_len: u64,
     ) -> Result<QuotaEvictionReport, String> {
-        if incoming_len > self.cfg.max_bytes {
+        self.evict_until_can_admit_with_report_and_credit(incoming_len, 0)
+    }
+
+    fn evict_until_can_admit_with_report_and_credit(
+        &self,
+        incoming_len: u64,
+        credit: u64,
+    ) -> Result<QuotaEvictionReport, String> {
+        // The effective ceiling for this one admission. Diagnostics keep naming
+        // the configured `spool.max_bytes`, which is what an operator sized.
+        let admit_ceiling = self.cfg.max_bytes.saturating_add(credit);
+        if incoming_len > admit_ceiling {
             return Err(format!(
                 "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) exceeds spool.max_bytes ({})",
                 self.cfg.max_bytes
@@ -7663,7 +8020,7 @@ impl SpoolManager {
                 report.bytes_before = inventory.stats.bytes;
             }
             let mut remaining_bytes = inventory.stats.bytes;
-            if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+            if remaining_bytes.saturating_add(incoming_len) <= admit_ceiling {
                 self.notify_quota_admission_ready_for_tests();
                 return Ok(report);
             }
@@ -7682,7 +8039,7 @@ impl SpoolManager {
             let mut protected = 0u64;
             let mut inventory_stale = false;
             for entry in &inventory.entries {
-                if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+                if remaining_bytes.saturating_add(incoming_len) <= admit_ceiling {
                     self.notify_quota_admission_ready_for_tests();
                     return Ok(report);
                 }
@@ -7750,7 +8107,7 @@ impl SpoolManager {
                 ));
             }
 
-            if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+            if remaining_bytes.saturating_add(incoming_len) <= admit_ceiling {
                 self.notify_quota_admission_ready_for_tests();
                 return Ok(report);
             }
@@ -8116,10 +8473,18 @@ impl SpoolManager {
                 artifact.refresh_identity(&claim_path)?;
                 self.require_live_claim(&claim_path, &artifact)
                     .map_err(ClaimMutationError::into_message)?;
+                // Reserve the capacity this claim's bytes will free if it ever
+                // needs a dead-letter handoff. Taking it here — while the
+                // pinned length is known and the namespace mutation lock is
+                // held — is what makes the credit exclusive across managers and
+                // processes. Failing to obtain it is ordinary contention and
+                // never blocks the claim.
+                let credit = self.try_reserve_source_credit(&claim_path, &artifact);
                 Ok(ReplayClaimOutcome::Claimed(SpoolClaimHandle {
                     path: claim_path,
                     _live: guard,
                     artifact,
+                    credit,
                 }))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -8427,6 +8792,11 @@ pub struct SpoolClaimHandle {
     path: PathBuf,
     _live: LiveSpoolPathGuard,
     artifact: PinnedClaimArtifact,
+    /// The one namespace-wide dead-letter source credit, when this claim won
+    /// it. `None` is ordinary contention: the claim replays normally and only
+    /// its dead-letter handoff loses the transient excursion above
+    /// `spool.max_bytes`. Dropping the handle releases the credit.
+    credit: Option<SpoolSourceCreditReservation>,
 }
 
 impl SpoolClaimHandle {
@@ -8438,10 +8808,39 @@ impl SpoolClaimHandle {
         &self.artifact
     }
 
+    /// Authority plus capacity for this claim's dead-letter handoff.
+    fn handoff_authority(&self) -> DeadLetterHandoffAuthority<'_> {
+        DeadLetterHandoffAuthority {
+            artifact: &self.artifact,
+            reservation: self.credit.as_ref(),
+        }
+    }
+
     #[doc(hidden)]
     #[allow(dead_code)] // external unit tests only
     pub fn claim_path_for_tests(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether this claim holds the namespace-wide dead-letter source credit.
+    ///
+    /// External tests use this to prove exclusivity directly: across N managers
+    /// and N claims of one namespace, exactly one claim can hold it.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn holds_source_credit_for_tests(&self) -> bool {
+        self.credit.is_some()
+    }
+
+    /// Reserved byte count of the held credit, or `0` when this claim holds
+    /// none.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn source_credit_bytes_for_tests(&self) -> u64 {
+        match self.credit.as_ref() {
+            Some(reservation) => reservation.reserved_bytes,
+            None => 0,
+        }
     }
 }
 
@@ -9089,7 +9488,7 @@ impl DeadLetterPayloadWriter {
     fn open(
         spool: &SpoolManager,
         source_path: &Path,
-        artifact: &PinnedClaimArtifact,
+        authority: DeadLetterHandoffAuthority<'_>,
     ) -> Result<Self, ClaimMutationError> {
         let (temp_path, final_path) =
             dead_letter_payload_paths(spool, source_path).map_err(ClaimMutationError::Retryable)?;
@@ -9104,7 +9503,7 @@ impl DeadLetterPayloadWriter {
         // or substituted pathname authorizes no part of that transaction, so no
         // temp is created, no quota candidate is evicted for it, and no sibling
         // is touched.
-        spool.require_live_claim(source_path, artifact)?;
+        spool.require_live_claim(source_path, authority.artifact)?;
         spool
             .assert_managed_path(&temp_path)
             .map_err(ClaimMutationError::Retryable)?;
@@ -9178,7 +9577,7 @@ impl DeadLetterPayloadWriter {
     fn append_batch(
         &mut self,
         spool: &SpoolManager,
-        artifact: &PinnedClaimArtifact,
+        authority: DeadLetterHandoffAuthority<'_>,
         batch: &StreamingReplayBatch,
         row_indices: &[usize],
     ) -> Result<(), ClaimMutationError> {
@@ -9190,7 +9589,7 @@ impl DeadLetterPayloadWriter {
         // Admission may evict other replayable files, and the append mutates
         // this handoff's temp. Revalidate the exact claim before either action;
         // a substitution between delivery chunks authorizes neither.
-        spool.require_live_claim(&self.source_path, artifact)?;
+        spool.require_live_claim(&self.source_path, authority.artifact)?;
         spool
             .assert_managed_path(&self.temp_path)
             .map_err(ClaimMutationError::Retryable)?;
@@ -9203,8 +9602,15 @@ impl DeadLetterPayloadWriter {
         // rejected payload past the documented hard on-disk quota. Batching the
         // admission also prevents an all-poison artifact from causing one full
         // spool walk per hostile row.
+        //
+        // The source is still authoritative and still counted, but it is exactly
+        // what this handoff will remove. Spend the namespace-wide reservation
+        // for those bytes so an oversized source is not starved by its own
+        // inventory footprint; a handoff that does not hold the reservation
+        // admits against the plain ceiling and fails closed.
+        let credit = spool.source_credit_bytes(&self.source_path, authority);
         spool
-            .evict_until_can_admit(incoming_bytes)
+            .evict_until_can_admit_with_credit(incoming_bytes, credit)
             .map_err(ClaimMutationError::Retryable)?;
         self.write_rows(batch, row_indices)
             .map_err(ClaimMutationError::Retryable)
@@ -9254,7 +9660,7 @@ impl DeadLetterPayloadWriter {
     fn publish(
         mut self,
         spool: &SpoolManager,
-        artifact: &PinnedClaimArtifact,
+        authority: DeadLetterHandoffAuthority<'_>,
     ) -> Result<PublishedDeadLetterPayload, ClaimMutationError> {
         if self.rows == 0 {
             return Err(ClaimMutationError::Retryable(format!(
@@ -9289,8 +9695,8 @@ impl DeadLetterPayloadWriter {
         spool
             .assert_managed_path(&self.final_path)
             .map_err(ClaimMutationError::Retryable)?;
-        spool.require_live_claim(&self.source_path, artifact)?;
-        self.publish_authorized(spool, &expected_sha256, synced_identity)
+        spool.require_live_claim(&self.source_path, authority.artifact)?;
+        self.publish_authorized(spool, authority, &expected_sha256, synced_identity)
             .map_err(ClaimMutationError::Retryable)
     }
 
@@ -9303,6 +9709,7 @@ impl DeadLetterPayloadWriter {
     fn publish_authorized(
         &mut self,
         spool: &SpoolManager,
+        authority: DeadLetterHandoffAuthority<'_>,
         expected_sha256: &str,
         synced_identity: SpoolFileIdentity,
     ) -> Result<PublishedDeadLetterPayload, String> {
@@ -9348,8 +9755,11 @@ impl DeadLetterPayloadWriter {
         // The temp and still-authoritative source are both present in the
         // inventory. Enforce the hard on-disk ceiling before publishing; if
         // protected files leave no room, the temp is dropped and the source is
-        // restored for a later/operator-assisted attempt.
-        spool.evict_until_can_admit(0)?;
+        // restored for a later/operator-assisted attempt. The source has not
+        // been removed yet, so this handoff's reservation for its bytes is still
+        // outstanding and is spent here too.
+        let credit = spool.source_credit_bytes(&self.source_path, authority);
+        spool.evict_until_can_admit_with_credit(0, credit)?;
         let pre_rename_identity = {
             let file = self.file.as_mut().ok_or_else(|| {
                 format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
@@ -9743,7 +10153,7 @@ fn dead_letter_meta_paths(path: &Path) -> Result<(PathBuf, PathBuf), String> {
 fn write_dead_letter_meta(
     spool: &SpoolManager,
     source_path: &Path,
-    artifact: &PinnedClaimArtifact,
+    authority: DeadLetterHandoffAuthority<'_>,
     meta: &DeadLetterMeta<'_>,
 ) -> Result<PathBuf, ClaimMutationError> {
     let (tmp_path, meta_path) =
@@ -9775,8 +10185,11 @@ fn write_dead_letter_meta(
     spool
         .assert_managed_path(source_path)
         .map_err(ClaimMutationError::Retryable)?;
-    spool.require_live_claim(source_path, artifact)?;
-    write_dead_letter_meta_authorized(spool, &tmp_path, &meta_path, bytes.as_slice())
+    spool.require_live_claim(source_path, authority.artifact)?;
+    // The authoritative source is still on disk and is removed only after this
+    // record is durable, so the reservation for its bytes is still outstanding.
+    let credit = spool.source_credit_bytes(source_path, authority);
+    write_dead_letter_meta_authorized(spool, &tmp_path, &meta_path, bytes.as_slice(), credit)
         .map_err(ClaimMutationError::Retryable)
 }
 
@@ -9787,8 +10200,9 @@ fn write_dead_letter_meta_authorized(
     tmp_path: &Path,
     meta_path: &Path,
     bytes: &[u8],
+    credit: u64,
 ) -> Result<PathBuf, String> {
-    spool.evict_until_can_admit(bytes.len() as u64)?;
+    spool.evict_until_can_admit_with_credit(bytes.len() as u64, credit)?;
     // Measured after eviction: a reclaim that already deleted this record has
     // accounted for it, so re-measuring here cannot double-subtract. The
     // identity check runs under the same namespace mutation lock as the unlink.
@@ -10319,6 +10733,160 @@ impl SpoolFileIdentity {
     fn same_claim_artifact(&self, other: &Self) -> bool {
         self.same_file_node(other)
     }
+}
+
+/// Open (creating if absent) the namespace-wide dead-letter source-credit
+/// record with the same private, no-follow, reparse-point-refusing posture the
+/// coordination inode uses. Unlike that inode this file carries a body, so its
+/// length is validated by the reader rather than required to be zero.
+fn open_spool_source_credit_file(path: &Path) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to securely open spool dead-letter credit record '{}': {error}",
+            path.display()
+        )
+    })
+}
+
+/// Prove the credit record is a private regular file this namespace owns, that
+/// the pathname and the descriptor name the same node, and that no extra hard
+/// link exists on either view.
+fn validate_spool_source_credit_file(
+    path: &Path,
+    file: &File,
+) -> Result<SpoolFileIdentity, String> {
+    let mut metadata = file.metadata().map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to stat spool dead-letter credit record '{}': {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool dead-letter credit record '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.nlink() != 1 {
+            return Err(format!(
+                "{PLUGIN_NAME}: spool dead-letter credit record '{}' must have exactly one hard link",
+                path.display()
+            ));
+        }
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    format!(
+                        "{PLUGIN_NAME}: failed to secure spool dead-letter credit record '{}': {error}",
+                        path.display()
+                    )
+                })?;
+            metadata = file.metadata().map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: failed to restat spool dead-letter credit record '{}': {error}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    let path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to stat spool dead-letter credit path '{}': {error}",
+            path.display()
+        )
+    })?;
+    if !path_metadata.file_type().is_file() {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool dead-letter credit path '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.nlink() != 1 {
+            return Err(format!(
+                "{PLUGIN_NAME}: spool dead-letter credit path '{}' must have exactly one hard link",
+                path.display()
+            ));
+        }
+    }
+    let file_identity = SpoolFileIdentity::from_metadata(&metadata);
+    let path_identity = SpoolFileIdentity::from_metadata(&path_metadata);
+    if !file_identity.same_coordination_inode(&path_identity) {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool dead-letter credit path '{}' does not name the opened record",
+            path.display()
+        ));
+    }
+    Ok(file_identity)
+}
+
+/// Publish the durable body of a freshly acquired credit through its locked
+/// descriptor. The record is materialized against the retained-byte ceiling
+/// like every other attacker-shaped copy this plugin builds.
+fn write_spool_source_credit_record(
+    reservation: &SpoolSourceCreditReservation,
+    record: &SpoolSourceCreditRecord,
+    ceiling: &'static RetainedByteCeiling,
+) -> Result<(), String> {
+    let bytes = materialize_reserved_payload(ceiling, SPOOL_MAX_SOURCE_CREDIT_BYTES, |writer| {
+        serde_json::to_writer(writer, record).map_err(|error| error.to_string())
+    })
+    .map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to serialize bounded spool dead-letter credit record: {}",
+            error.reason()
+        )
+    })?;
+    let mut file = &reservation.file;
+    // Truncate first so a longer stale record from a crashed holder cannot leave
+    // trailing bytes behind this one.
+    reservation.file.set_len(0).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to truncate spool dead-letter credit record '{}': {error}",
+            reservation.path.display()
+        )
+    })?;
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to rewind spool dead-letter credit record '{}': {error}",
+            reservation.path.display()
+        )
+    })?;
+    file.write_all(bytes.as_slice()).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to write spool dead-letter credit record '{}': {error}",
+            reservation.path.display()
+        )
+    })?;
+    reservation.file.sync_all().map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to sync spool dead-letter credit record '{}': {error}",
+            reservation.path.display()
+        )
+    })
 }
 
 fn open_spool_coordination_file(path: &Path, create: bool) -> Result<File, String> {
@@ -11418,10 +11986,11 @@ pub fn probe_empty_dead_letter_publish_with_identity_for_tests(
     source_path: &Path,
     pinned: &PinnedClaimIdentityForTests,
 ) -> Result<(), String> {
-    let writer = DeadLetterPayloadWriter::open(spool, source_path, &pinned.0)
+    let authority = DeadLetterHandoffAuthority::uncredited(&pinned.0);
+    let writer = DeadLetterPayloadWriter::open(spool, source_path, authority)
         .map_err(ClaimMutationError::into_message)?;
     writer
-        .publish(spool, &pinned.0)
+        .publish(spool, authority)
         .map(|_| ())
         .map_err(ClaimMutationError::into_message)
 }
@@ -11459,6 +12028,34 @@ pub fn publish_dead_letter_payload_for_tests(
     let pinned = PinnedClaimArtifact::pin_path(source_path);
     publish_dead_letter_payload_inner_for_tests(spool, source_path, &pinned, row, None)
         .map(|(path, _)| path)
+}
+
+/// Publish one production-format dead-letter payload for a live replay claim,
+/// carrying that claim's real authority — pinned artifact *and* whichever
+/// namespace-wide source credit it actually won.
+///
+/// This is the streamed open/append/publish protocol production runs, driven
+/// from a claim the production claim path produced. External concurrency tests
+/// use it to prove that two managers sharing one namespace cannot both spend
+/// source-replacement capacity.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn publish_dead_letter_payload_for_claim_for_tests(
+    spool: &SpoolManager,
+    claim: &SpoolClaimHandle,
+    row: &[u8],
+) -> Result<PathBuf, String> {
+    let batch = single_row_replay_batch_for_tests(spool, row)?;
+    let authority = claim.handoff_authority();
+    let mut writer = DeadLetterPayloadWriter::open(spool, claim.path(), authority)
+        .map_err(ClaimMutationError::into_message)?;
+    writer
+        .append_batch(spool, authority, &batch, &[0])
+        .map_err(ClaimMutationError::into_message)?;
+    writer
+        .publish(spool, authority)
+        .map(|published| published.path)
+        .map_err(ClaimMutationError::into_message)
 }
 
 /// Publish one dead-letter payload against an identity pinned earlier,
@@ -11576,19 +12173,20 @@ pub fn probe_dead_letter_handoff_interference_for_tests(
 ) -> Result<PathBuf, String> {
     let batch = single_row_replay_batch_for_tests(spool, row)?;
     let pinned = PinnedClaimArtifact::pin_path(source_path);
-    let mut writer = DeadLetterPayloadWriter::open(spool, source_path, &pinned)
+    let authority = DeadLetterHandoffAuthority::uncredited(&pinned);
+    let mut writer = DeadLetterPayloadWriter::open(spool, source_path, authority)
         .map_err(ClaimMutationError::into_message)?;
     if stage == DeadLetterHandoffStageForTests::BeforeAppend {
         interfere(source_path);
     }
     writer
-        .append_batch(spool, &pinned, &batch, &[0])
+        .append_batch(spool, authority, &batch, &[0])
         .map_err(ClaimMutationError::into_message)?;
     if stage == DeadLetterHandoffStageForTests::BeforePublish {
         interfere(source_path);
     }
     let published = writer
-        .publish(spool, &pinned)
+        .publish(spool, authority)
         .map_err(ClaimMutationError::into_message)?;
     Ok(published.path)
 }
@@ -11601,10 +12199,11 @@ fn publish_dead_letter_payload_inner_for_tests(
     prior_payload: Option<&[u8]>,
 ) -> Result<(PathBuf, SpoolStats), String> {
     let batch = single_row_replay_batch_for_tests(spool, row)?;
-    let mut writer = DeadLetterPayloadWriter::open(spool, source_path, pinned)
+    let authority = DeadLetterHandoffAuthority::uncredited(pinned);
+    let mut writer = DeadLetterPayloadWriter::open(spool, source_path, authority)
         .map_err(ClaimMutationError::into_message)?;
     writer
-        .append_batch(spool, pinned, &batch, &[0])
+        .append_batch(spool, authority, &batch, &[0])
         .map_err(ClaimMutationError::into_message)?;
     if let Some(prior) = prior_payload {
         let (_, final_path) = dead_letter_payload_paths(spool, source_path)?;
@@ -11618,7 +12217,7 @@ fn publish_dead_letter_payload_inner_for_tests(
     }
     let accounted_before_publish = spool.cached_stats();
     let path = writer
-        .publish(spool, pinned)
+        .publish(spool, authority)
         .map_err(ClaimMutationError::into_message)?
         .path;
     Ok((path, accounted_before_publish))
@@ -11692,8 +12291,13 @@ pub fn write_dead_letter_meta_with_identity_for_tests(
         payload_bytes,
         payload_sha256,
     };
-    write_dead_letter_meta(spool, source_path, &pinned.0, &meta)
-        .map_err(ClaimMutationError::into_message)
+    write_dead_letter_meta(
+        spool,
+        source_path,
+        DeadLetterHandoffAuthority::uncredited(&pinned.0),
+        &meta,
+    )
+    .map_err(ClaimMutationError::into_message)
 }
 
 /// Bytes one spool line-index / worklist entry occupies.
@@ -12674,7 +13278,7 @@ async fn replay_spool_once(
                 match finalize_replayed_spool_file(
                     spool,
                     claim.path(),
-                    claim.artifact(),
+                    claim.handoff_authority(),
                     line_count,
                     completion,
                 ) {
@@ -13083,7 +13687,7 @@ async fn replay_stream_batch(
     append_dead_letter_rows(
         spool,
         claim.path(),
-        claim.artifact(),
+        claim.handoff_authority(),
         batch,
         &rejected_row_indices,
         payload,
@@ -13103,7 +13707,7 @@ async fn replay_stream_batch(
 fn append_dead_letter_rows(
     spool: &SpoolManager,
     source: &Path,
-    artifact: &PinnedClaimArtifact,
+    authority: DeadLetterHandoffAuthority<'_>,
     batch: &StreamingReplayBatch,
     row_indices: &[usize],
     payload: &mut Option<DeadLetterPayloadWriter>,
@@ -13115,7 +13719,7 @@ fn append_dead_letter_rows(
         if let Some(hook) = snapshot_spool_replay_hook_for_tests() {
             hook(SpoolReplayHookPoint::BeforeDeadLetterPayloadOpen, source);
         }
-        let writer = DeadLetterPayloadWriter::open(spool, source, artifact)
+        let writer = DeadLetterPayloadWriter::open(spool, source, authority)
             .map_err(|error| replay_stage_error("dead-letter payload open", error))?;
         *payload = Some(writer);
     }
@@ -13128,7 +13732,7 @@ fn append_dead_letter_rows(
         hook(SpoolReplayHookPoint::BeforeDeadLetterPayloadAppend, source);
     }
     writer
-        .append_batch(spool, artifact, batch, row_indices)
+        .append_batch(spool, authority, batch, row_indices)
         .map_err(|error| replay_stage_error("dead-letter payload append", error))
 }
 
@@ -13159,12 +13763,12 @@ fn replay_stage_error(stage: &'static str, error: ClaimMutationError) -> ReplayS
 fn finalize_replayed_spool_file(
     spool: &SpoolManager,
     file: &Path,
-    artifact: &PinnedClaimArtifact,
+    authority: DeadLetterHandoffAuthority<'_>,
     original_row_count: usize,
     completion: ReplayCompletion,
 ) -> Result<(), ClaimMutationError> {
     if completion.dead_letters.is_empty() {
-        return spool.remove_delivered_claim(file, artifact);
+        return spool.remove_delivered_claim(file, authority.artifact);
     }
 
     let rejected_rows = completion.dead_letters.rejected_rows();
@@ -13188,7 +13792,7 @@ fn finalize_replayed_spool_file(
     // the pinned claim between streaming and here is an authorization loss and
     // stays one all the way to the caller.
     let mut published_payload = payload
-        .publish(spool, artifact)
+        .publish(spool, authority)
         .map_err(|error| claim_stage_error("dead-letter payload publish", error))?;
     let payload_file = published_payload
         .path
@@ -13212,7 +13816,7 @@ fn finalize_replayed_spool_file(
     if let Some(hook) = snapshot_spool_replay_hook_for_tests() {
         hook(SpoolReplayHookPoint::BeforeDeadLetterMetaPublish, file);
     }
-    let meta_path = write_dead_letter_meta(spool, file, artifact, &meta)
+    let meta_path = write_dead_letter_meta(spool, file, authority, &meta)
         .map_err(|error| claim_stage_error("dead-letter metadata publish", error))?;
     if let Some(hook) = snapshot_spool_replay_hook_for_tests() {
         hook(SpoolReplayHookPoint::BeforeTerminalClaimRemoval, file);
@@ -13230,7 +13834,7 @@ fn finalize_replayed_spool_file(
         // the caller is told the claim is gone so it performs no release,
         // rename, quarantine, or accounting on this pathname either.
         spool
-            .require_live_claim(file, artifact)
+            .require_live_claim(file, authority.artifact)
             .map_err(|error| claim_stage_error("terminal claim removal", error))?;
         published_payload
             .revalidate(spool)
@@ -13238,7 +13842,7 @@ fn finalize_replayed_spool_file(
         // Accounted from the pinned artifact rather than a re-`lstat` of the
         // pathname, so the decrement can only ever describe the file this
         // handoff owns.
-        let source_len = artifact.pinned_len();
+        let source_len = authority.artifact.pinned_len();
         fs::remove_file(file).map_err(|error| {
             ClaimMutationError::Retryable(format!(
                 "{PLUGIN_NAME}: failed to remove replay source after durable dead-letter handoff '{}': {error}",
