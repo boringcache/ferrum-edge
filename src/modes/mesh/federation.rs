@@ -263,6 +263,14 @@ impl FederationStore {
         trust_domain: &TrustDomain,
         remove_bundle: bool,
     ) {
+        // Serialize explicit withdrawal with success-metric publication just as
+        // stale expiry does. Otherwise an in-flight successful poll can publish
+        // a last-success/bundle-age gauge after its generation is retired, or a
+        // removed bundle can remain advertised on /metrics indefinitely.
+        let _guard = self
+            .metrics_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Retire the generation FIRST so any in-flight poll task for this
         // cluster sees a mismatch in `install` and cannot reinstall after
         // removal.
@@ -300,6 +308,14 @@ impl FederationStore {
         });
         if published_snapshot {
             self.revision_tx.send_modify(|revision| *revision += 1);
+        }
+        // Inspect the committed snapshot rather than carrying a flag out of the
+        // RCU closure: the closure may retry after a lost CAS, and a flag from
+        // an earlier attempt must not decide whether the final state is fresh.
+        if remove_bundle || !self.inner.load().bundles.contains_key(trust_domain) {
+            crate::plugins::mesh::prometheus_helpers::clear_mesh_federation_poll_success(
+                trust_domain.as_str(),
+            );
         }
     }
 
@@ -2241,6 +2257,41 @@ mod tests {
         assert!(
             !rendered.contains(&format!("trust_domain=\"{}\"", domain.as_str())),
             "a record from a retired generation must not resurrect the federation gauge: {rendered}"
+        );
+    }
+
+    #[test]
+    fn explicit_withdrawal_clears_federation_freshness_metrics() {
+        let store = FederationStore::new();
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let domain = td(&format!("withdrawn-{suffix}.example.com"));
+        let cluster = format!("withdrawn-{suffix}");
+        let generation = store.register(&cluster);
+        assert!(store.install(
+            &cluster,
+            domain.clone(),
+            FederatedBundle {
+                bundle: TrustBundle {
+                    trust_domain: domain.clone(),
+                    x509_authorities: vec!["a".to_string()],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                fetched_at_unix_seconds: 100,
+                endpoint: "https://withdrawn/.well-known/spiffe".to_string(),
+                cluster_name: cluster.clone(),
+            },
+            generation,
+        ));
+        store.record_poll_success_if_live(&cluster, &domain, 100, generation);
+
+        store.remove_cluster(&cluster, &domain, true);
+
+        let mut rendered = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(&mut rendered);
+        assert!(
+            !rendered.contains(&format!("trust_domain=\"{}\"", domain.as_str())),
+            "explicit withdrawal must clear federation last-success/age metrics: {rendered}"
         );
     }
 
