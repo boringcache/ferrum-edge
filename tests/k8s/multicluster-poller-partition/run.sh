@@ -653,7 +653,7 @@ projected_config_withdrawn() {
 }
 
 signal_reload() {
-  local context="$1" pod pid
+  local context="$1" pod
   pod="$( kubectl --context "$context" -n "$NS" --request-timeout=10s \
     get pod -l app=echo --field-selector=status.phase=Running \
       -o jsonpath='{.items[0].metadata.name}')" || return 1
@@ -664,11 +664,31 @@ signal_reload() {
     annotate pod "$pod" \
       "ferrum-edge.io/projected-config-refresh=withdrawal-$SECONDS" --overwrite
   wait_for_projected_withdrawal "projected withdrawn mesh config" 30 "$context"
-  pid="$( kubectl --context "$context" -n "$NS" exec deploy/echo -c signal -- \
-    pidof ferrum-edge)" || return 1
-  [[ "$pid" =~ ^[0-9]+$ ]] || { echo "invalid ferrum-edge pid" >&2; return 1; }
-  kubectl --context "$context" -n "$NS" exec deploy/echo -c signal -- \
-    kill -HUP "$pid"
+  # The readiness probe also runs `ferrum-edge health` in this shared process
+  # namespace. `pidof ferrum-edge` can therefore return both the daemon and a
+  # transient probe process. Select exactly one executable whose subcommand is
+  # `run`, and discover + signal it in one exec to minimize the PID lifetime gap.
+  kubectl --context "$context" -n "$NS" exec "pod/$pod" -c signal -- sh -eu -c '
+    found=""
+    for process_dir in /proc/[0-9]*; do
+      [ -r "$process_dir/cmdline" ] || continue
+      executable="$(readlink "$process_dir/exe" 2>/dev/null || true)"
+      [ "${executable##*/}" = "ferrum-edge" ] || continue
+      subcommand="$(tr "\000" "\n" < "$process_dir/cmdline" | sed -n "2p")"
+      [ "$subcommand" = "run" ] || continue
+      candidate="${process_dir##*/}"
+      if [ -n "$found" ]; then
+        echo "multiple ferrum-edge run processes found: $found $candidate" >&2
+        exit 1
+      fi
+      found="$candidate"
+    done
+    [ -n "$found" ] || {
+      echo "no ferrum-edge run process found" >&2
+      exit 1
+    }
+    kill -HUP "$found"
+  '
 }
 
 deploy_topology() {
