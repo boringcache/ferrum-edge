@@ -396,7 +396,8 @@ upstreams:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `path` | string | `"/"` | Cookie `Path` attribute |
-| `ttl_seconds` | integer | `3600` | Cookie `Max-Age` in seconds (1 hour default) |
+| `ttl_seconds` | integer | `3600` | Cookie `Max-Age` in seconds (1 hour default). Ignored when `session_cookie` is true |
+| `session_cookie` | boolean | `false` | Omit `Max-Age` so the cookie is a browser session cookie (Gateway API `lifetimeType: Session`) |
 | `domain` | string | — | Optional `Domain` attribute |
 | `http_only` | boolean | `true` | Set the `HttpOnly` flag |
 | `secure` | boolean | `false` | Set the `Secure` flag |

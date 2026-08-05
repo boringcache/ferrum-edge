@@ -10,6 +10,7 @@ mod functional_ai_stream_router_test;
 mod functional_allowed_methods_logging_test;
 mod functional_allowed_methods_test;
 mod functional_auth_acl_test;
+mod functional_backend_lb_session_persistence_test;
 mod functional_body_size_limits_test;
 mod functional_body_validator_request_representation_test;
 mod functional_body_validator_response_stream_test;

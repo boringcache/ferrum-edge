@@ -191,8 +191,8 @@ const DEFAULT_SESSION_NAME: &str = "ferrum-session";
 pub(crate) struct GatewayBackendSessionPolicy {
     pub resource: K8sResourceKey,
     pub creation_timestamp: Option<DateTime<Utc>>,
-    /// `Ok(None)` = policy accepted but carries no sessionPersistence (e.g.
-    /// retryConstraint-only). `Err` = field-specific rejection reason.
+    /// `Ok(None)` = policy accepted but carries no `sessionPersistence`.
+    /// `Err` = field-specific rejection reason.
     pub session: Result<Option<GatewaySessionPersistence>, String>,
 }
 
@@ -206,7 +206,8 @@ fn backend_lb_policy_kinds(kind: &str) -> bool {
 /// v1.3+ (replaced by `XBackendTrafficPolicy` on `gateway.networking.x-k8s.io`).
 /// Ferrum watches and translates both shapes so operators on older CRDs and on
 /// the pinned v1.5.1 experimental channel get the same session-persistence
-/// semantics. `retryConstraint` is not representable today and is warned.
+/// semantics. `retryConstraint` is not representable today and rejects the
+/// entire policy fail-closed (no sessionPersistence projection either).
 pub(super) fn collect_backend_lb_policy(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -252,11 +253,14 @@ pub(super) fn collect_backend_lb_policy(
     }
 
     if object.spec.get("retryConstraint").is_some() {
-        acc.warnings.push(format!(
-            "{} {}/{} spec.retryConstraint is not supported; retries are not \
-             budget-gated and the field is ignored fail-closed for budget \
-             enforcement (sessionPersistence still applies when present)",
-            object.kind, object.metadata.namespace, object.metadata.name
+        // Unrepresentable retry budgets must not fail open: rejecting the
+        // whole policy also withholds sessionPersistence rather than applying
+        // sticky affinity while ignoring the budget constraint.
+        return Err(invalid_resource(
+            object,
+            "spec.retryConstraint is not supported; Ferrum does not enforce \
+             retry budgets and rejects the entire backend traffic policy \
+             fail-closed (sessionPersistence is not applied)",
         ));
     }
 
@@ -619,7 +623,7 @@ fn resolve_rule_session_persistence(
 ///
 /// Ancestor is the targeted Service (Direct policy attachment). Accepted is
 /// True when targetRefs and sessionPersistence are representable; False with a
-/// field-specific reason otherwise.
+/// field-specific reason otherwise (including unsupported `retryConstraint`).
 pub(crate) fn backend_lb_policy_status(object: &K8sObject) -> Value {
     let (accepted, reason, message) = match validate_backend_lb_policy_for_status(object) {
         Ok(()) => (
@@ -702,6 +706,14 @@ fn validate_backend_lb_policy_for_status(object: &K8sObject) -> Result<(), Strin
                 "spec.targetRefs[{index}] must target core group Service"
             ));
         }
+    }
+    if object.spec.get("retryConstraint").is_some() {
+        return Err(
+            "spec.retryConstraint is not supported; Ferrum does not enforce \
+             retry budgets and rejects the entire backend traffic policy \
+             fail-closed (sessionPersistence is not applied)"
+                .to_string(),
+        );
     }
     if let Some(value) = object.spec.get("sessionPersistence") {
         parse_session_persistence(object, value).map_err(|err| match err {
@@ -11802,7 +11814,7 @@ mod tests {
     }
 
     #[test]
-    fn x_backend_traffic_policy_retry_constraint_warns_but_applies_session() {
+    fn x_backend_traffic_policy_retry_constraint_rejects_entire_policy() {
         let policy = x_backend_traffic_policy(
             "budget",
             serde_json::json!({
@@ -11816,19 +11828,50 @@ mod tests {
                 }
             }),
         );
-        let result = translate_k8s_objects(&[policy, http_route_to_service("api")], options())
-            .expect("retryConstraint alone must not block sessionPersistence");
+        let err = translate_k8s_objects(&[policy.clone(), http_route_to_service("api")], options())
+            .expect_err("retryConstraint must reject the entire policy fail-closed");
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("retryConstraint")),
-            "expected retryConstraint warning, got {:?}",
-            result.warnings
+            err.to_string().contains("retryConstraint"),
+            "got: {err}"
         );
-        assert_eq!(
-            result.config.upstreams[0].hash_on.as_deref(),
-            Some("cookie:with-budget")
+        assert!(
+            err.to_string().contains("sessionPersistence is not applied"),
+            "rejection must withhold sessionPersistence, got: {err}"
         );
+
+        let status = super::backend_lb_policy_status(&policy);
+        let condition = &status["ancestors"][0]["conditions"][0];
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "UnsupportedValue");
+        let message = condition["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("retryConstraint"),
+            "status message must name the field, got: {message}"
+        );
+        assert!(
+            message.contains("sessionPersistence is not applied"),
+            "status must document that sticky affinity is withheld, got: {message}"
+        );
+    }
+
+    #[test]
+    fn x_backend_traffic_policy_retry_constraint_only_still_rejects() {
+        let policy = x_backend_traffic_policy(
+            "budget-only",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "retryConstraint": {
+                    "budget": {"percent": 10, "interval": "5s"}
+                }
+            }),
+        );
+        let err = translate_k8s_objects(&[policy.clone()], options())
+            .expect_err("retryConstraint-only policies must fail closed");
+        assert!(err.to_string().contains("retryConstraint"), "got: {err}");
+
+        let status = super::backend_lb_policy_status(&policy);
+        let condition = &status["ancestors"][0]["conditions"][0];
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "UnsupportedValue");
     }
 }
