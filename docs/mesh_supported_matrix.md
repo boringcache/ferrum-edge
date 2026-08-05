@@ -103,15 +103,19 @@ CI today."
   and destination black-hole → recover, gated on all thirteen required
   `multicluster.*` assertions by the fixture, by the workflow `gate` job's
   emitted-artifact validation, and by `release.yml` SHA validation. **Excluded
-  and still Experimental:** poller-driven cross-cluster *endpoint discovery*
-  (see below); the poller partition / last-good-retention live gate stays
-  deferred under [#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331).
+  from that GA contract but Beta:** poller-driven cross-cluster endpoint
+  discovery is independently gated by the two-CP/two-DP Toxiproxy partition suite, including bounded
+  last-good retention, expiry, same-generation recovery, and in-flight
+  withdrawal retirement.
 - **Beta.** xDS ADS (Ferrum-CP↔Ferrum-DP), `Ambient` HBONE, HTTP-family
   `EgressGateway`, `ServiceWaypoint` (GAMMA).
 - **Experimental.** `NodeWaypoint` sidecarless capture (IPv4 and IPv6 capture
   paths gated by a privileged live job; secured node-to-node transport,
   production SPIRE, stale source-IP reuse, and inbound direct-pod enforcement
-  are live-gated; the production identity profile now covers Workload API SVID
+  are live-gated; the job verifier-loads and attaches the IPv4/IPv6 captured-TCP
+  first-byte hooks while the hosted Rust suites cover timestamp rejection,
+  lifecycle bounds, ABI decoding, and the Prometheus histogram contract; the
+  production identity profile now covers Workload API SVID
   issuance, plaintext/no-client-SVID HBONE rejection, forged assertor rejection,
   SPIRE Agent plus NodeWaypoint restart recovery; the ADR observability
   counter-movement assertion IDs
@@ -124,7 +128,7 @@ CI today."
   cgroup/bpffs views and `SYS_ADMIN`/`SYS_PTRACE` netns capabilities for
   `node_waypoint`), eBPF ambient capture (Dev-only; enabled chart topologies
   auto-select `-ebpf` images and non-eBPF builds cannot report Ready),
-  cross-cluster endpoint discovery, stream-family egress.
+  stream-family egress.
 
 ## Acceptable residual / out-of-scope (the long tail)
 
@@ -202,9 +206,8 @@ ledger unless they change the support contract.
 |---|---|---|
 | EgressGateway UDP `ServiceEntry` materialization (HTTP/TCP stream egress exists; UDP ports still skipped) | [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) | `docs/mesh.md` Egress Gateway / ServiceEntry materialization |
 | Subset-scoped DestinationRule HTTP connection-pool policy (`h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`) | [#3228](https://github.com/ferrum-edge/ferrum-edge/issues/3228) / [#3240](https://github.com/ferrum-edge/ferrum-edge/issues/3240)–[#3242](https://github.com/ferrum-edge/ferrum-edge/issues/3242) | `docs/mesh.md` DestinationRule deferred_fields / subset `connectionPool.http` |
-| Multicluster poller-driven partition / last-good-retention live gate | [#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331) | `docs/mesh_multicluster_federation_runbook.md` Harness |
 
-Completed historical rows (do **not** re-list as open): Ambient UDP capture producer + privileged live source-capture e2e (#2013 / #2038); VirtualService `tls[]` SNI passthrough L4 routing; remote-discovery JWT audience binding (#2475); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
+Completed historical rows (do **not** re-list as open): Ambient UDP capture producer + privileged live source-capture e2e (#2013 / #2038); VirtualService `tls[]` SNI passthrough L4 routing; remote-discovery JWT audience binding (#2475); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
 
 ## How a feature graduates
 

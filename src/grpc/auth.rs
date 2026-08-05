@@ -341,6 +341,16 @@ pub(crate) fn verify_grpc_jwt_metadata(
     verify_grpc_jwt_metadata_with_claims(metadata, verifier, expected_issuer, None).map(|_| ())
 }
 
+/// Authenticated gRPC bearer identity: tenant namespace ceiling plus the JWT
+/// `sub` used as the canonical DP node identity (issue #3265).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedGrpcIdentity {
+    pub allowed_namespaces: AllowedNamespaces,
+    /// Non-empty JWT `sub`. Callers must treat this as the sole trusted node
+    /// identity and must not prefer any caller-supplied display field.
+    pub subject: String,
+}
+
 /// Verify the JWT and return any `ns` claim it carried. Use this variant
 /// whenever the caller needs the tenancy-claim path (CP `Subscribe` and
 /// `GetFullConfig` today). The verification logic is identical to
@@ -366,6 +376,7 @@ pub(crate) fn verify_grpc_jwt_metadata_with_claims(
         GrpcAudiencePolicy::ReservedForbidden,
         peer,
     )
+    .map(|identity| identity.allowed_namespaces)
     .map_err(|(status, _)| status)
 }
 
@@ -383,7 +394,7 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
     expected_issuer: &str,
     audience_policy: GrpcAudiencePolicy<'_>,
     peer: Option<&CpGrpcConnectInfo>,
-) -> Result<AllowedNamespaces, (Status, Option<AudienceRejectReason>)> {
+) -> Result<VerifiedGrpcIdentity, (Status, Option<AudienceRejectReason>)> {
     let token = metadata
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -455,6 +466,8 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
         ));
     }
 
+    let subject = extract_subject_claim(&token_data.claims).map_err(|status| (status, None))?;
+
     let claim = extract_ns_claim(&token_data.claims).map_err(|status| (status, None))?;
     let claim_present = claim.is_present();
     let claim_namespaces = claim.effective_namespaces().cloned();
@@ -477,7 +490,33 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
         )
     })?;
 
-    Ok(AllowedNamespaces::resolved(claim_present, effective))
+    Ok(VerifiedGrpcIdentity {
+        allowed_namespaces: AllowedNamespaces::resolved(claim_present, effective),
+        subject,
+    })
+}
+
+/// Pull the JWT `sub` claim. `sub` is already in the required-claim set, but
+/// we still fail closed on blank/whitespace subjects so they cannot become a
+/// registry key.
+fn extract_subject_claim(claims: &Value) -> Result<String, Status> {
+    let Some(raw) = claims.get("sub") else {
+        return Err(Status::unauthenticated(
+            "Invalid token: required subject claim is missing",
+        ));
+    };
+    let Some(subject) = raw.as_str() else {
+        return Err(Status::unauthenticated(
+            "Invalid token: subject claim must be a string",
+        ));
+    };
+    let trimmed = subject.trim();
+    if trimmed.is_empty() {
+        return Err(Status::unauthenticated(
+            "Invalid token: subject claim must not be empty",
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn required_grpc_claims() -> HashSet<String> {

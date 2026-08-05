@@ -12,6 +12,11 @@ service ConfigSync {
 service MeshConfigSync {
   // Mesh data planes subscribe to their canonical per-workload mesh slice.
   rpc MeshSubscribe(MeshSubscribeRequest) returns (stream MeshConfigUpdate);
+  // Data plane reports ACK/NACK for a previously delivered mesh slice version
+  // (issue #3265). Identity is the authenticated JWT `sub` only — the report
+  // carries no caller-trusted node identity field. Ordinary local-mesh
+  // audience tokens are required; remote-discovery tokens are refused.
+  rpc ReportMeshSliceStatus(MeshSliceStatusReport) returns (MeshSliceStatusResponse);
 }
 
 message SubscribeRequest {
@@ -95,7 +100,11 @@ message MeshSubscribeRequest {
   // Optional workload identity for sidecar mode. Ambient nodes may leave this
   // empty and rely on labels/topology metadata until HBONE is wired in Phase C.
   string workload_spiffe_id = 4;
-  // Workload labels used to select workload-scoped policy.
+  // Workload labels used to select workload-scoped policy. A local CP retains
+  // this selector for bounded disconnected-drift projection: more than 256
+  // labels, more than 256 namespaces in a retained scope/claim set, or more
+  // than 64 KiB aggregate retained projection context is refused rather than
+  // retained unboundedly.
   map<string, string> labels = 5;
   // Optional GAMMA ServiceWaypoint name. When set, the CP narrows the
   // returned MeshSlice to services bound to this waypoint.
@@ -148,6 +157,9 @@ message MeshSubscribeRequest {
 //   * `config_authority` / `config_sequence` MUST equal the embedded
 //     `MeshSlice.revision` (both absent, or both present and equal) — like
 //     `version`, the envelope stamp is a duplicate of the slice's own value.
+//   * Local MeshSubscribe frames carry one opaque `session_token` for the
+//     stream. It is echoed only by ReportMeshSliceStatus; it is not datapath
+//     configuration or an operator-visible identifier.
 // A frame that violates any of these is refused without mutating the
 // subscriber's last-good state.
 //
@@ -188,4 +200,35 @@ message MeshConfigUpdate {
   // survives control-plane restarts and is identical on every replica of one
   // config store.
   uint64 config_sequence = 7;
+  // Opaque generation for the local MeshSubscribe stream that delivered this
+  // non-heartbeat frame. The DP MUST echo it in MeshSliceStatusReport. It is
+  // observability-session state only and must never be logged or exposed by
+  // admin/metrics surfaces. Empty for remote-discovery and heartbeat frames.
+  string session_token = 8;
 }
+
+// DP → CP apply/reject report for a MeshSubscribe-delivered slice version.
+//
+// CONSUMER CONTRACT (enforced fail-closed by the control plane):
+//   * Authenticated JWT `sub` is the sole node identity; there is no
+//     caller-supplied node_id field by design.
+//   * `version` MUST be non-empty, at most 256 UTF-8 bytes, contain no control
+//     characters, and have no leading/trailing whitespace.
+//   * `session_token` MUST match the currently connected local MeshSubscribe
+//     session and `version` MUST equal that session's current sent version.
+//   * Empty `error_message` is an ACK. Non-empty `error_message` is a NACK;
+//     the CP discards the caller text and retains only a fixed, control-safe,
+//     low-cardinality rejection label.
+//   * The reporter MUST present the ordinary local mesh subscribe audience
+//     (`ferrum-mesh-subscribe:local`). Remote-discovery tokens are refused.
+message MeshSliceStatusReport {
+  // Slice version being acknowledged or rejected.
+  string version = 1;
+  // Empty = ACK. Non-empty = NACK diagnostic (CP-sanitised, never echoed raw).
+  string error_message = 2;
+  // Opaque token from the MeshConfigUpdate carrying `version`.
+  string session_token = 3;
+}
+
+// Empty success acknowledgement for ReportMeshSliceStatus.
+message MeshSliceStatusResponse {}

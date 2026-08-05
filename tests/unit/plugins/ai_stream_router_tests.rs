@@ -322,7 +322,7 @@ fn test_config_rejects_missing_api_key() {
 }
 
 #[test]
-fn test_config_google_gemini_not_yet_implemented() {
+fn test_config_google_gemini_is_accepted() {
     let cfg = json!({
         "providers": [{
             "name": "gemini", "provider_type": "google_gemini",
@@ -330,8 +330,7 @@ fn test_config_google_gemini_not_yet_implemented() {
             "api_key": "k", "model_patterns": ["gemini-*"]
         }]
     });
-    let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
-    assert!(err.contains("not yet implemented"), "{err}");
+    AiStreamRouter::new(&cfg, http_client()).expect("google_gemini must construct");
 }
 
 #[test]
@@ -6792,4 +6791,2304 @@ async fn only_the_owner_enforces_and_normalizes_under_a_forged_model_key() {
             .await,
         PluginResult::Continue
     ));
+}
+
+// ---------------------------------------------------------------------------
+// google_gemini adapter (issue #3299)
+// ---------------------------------------------------------------------------
+
+fn gemini_config() -> Value {
+    json!({
+        "providers": [{
+            "name": "gemini",
+            "provider_type": "google_gemini",
+            "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent",
+            "api_key": "sk-gemini-secret",
+            "model_patterns": ["gemini-*"],
+            "priority": 1
+        }]
+    })
+}
+
+const GEMINI_SSE: &str = concat!(
+    "data: {\"responseId\":\"resp_g1\",\"modelVersion\":\"gemini-1.5-flash\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]}}]}\n\n",
+    "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\" world\"}]}}]}\n\n",
+    "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"totalTokenCount\":15}}\n\n",
+);
+
+const GEMINI_JSON_ARRAY: &str = concat!(
+    "[{",
+    "\"responseId\":\"resp_g2\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Array\"}]}}]",
+    "},{",
+    "\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\" ok\"}]},\"finishReason\":\"STOP\"}],",
+    "\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":2,\"totalTokenCount\":4}",
+    "}]",
+);
+
+async fn claimed_gemini_inspector(
+    content_type: &str,
+) -> (
+    AiStreamRouter,
+    RequestContext,
+    Box<dyn ResponseStreamInspector>,
+) {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some(content_type))
+        .expect("gemini normalizer");
+    (plugin, ctx, inspector)
+}
+
+async fn run_gemini_normalizer(chunk_size: usize, body: &str, content_type: &str) -> String {
+    let (_plugin, _ctx, mut inspector) = claimed_gemini_inspector(content_type).await;
+    let mut collected = Vec::new();
+    for chunk in body.as_bytes().chunks(chunk_size.max(1)) {
+        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    String::from_utf8(collected).unwrap()
+}
+
+#[tokio::test]
+async fn test_gemini_claim_injects_alt_sse_and_goog_api_key() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    headers.insert("authorization".to_string(), "Bearer client".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("x-goog-api-key").map(String::as_str),
+        Some("sk-gemini-secret")
+    );
+    assert!(!headers.contains_key("authorization"));
+    assert_eq!(
+        headers.get("accept-encoding").map(String::as_str),
+        Some("identity")
+    );
+    let path = ctx.route_override_path.as_deref().unwrap_or("");
+    assert!(
+        path.ends_with("/v1beta/models/gemini-1.5-flash:streamGenerateContent"),
+        "route override must keep the streamGenerateContent model path, got {path}"
+    );
+    let effective = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+    assert_eq!(
+        effective, "alt=sse",
+        "committed backend query must be exactly alt=sse, got {effective}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router.provider_type")
+            .map(String::as_str),
+        Some("google_gemini")
+    );
+}
+
+#[tokio::test]
+async fn test_gemini_body_translation_and_final_revalidation() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "max_tokens": 32,
+        "temperature": 0.2,
+        "tool_choice": "auto",
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "d",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+            }
+        }],
+        "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"ok\":true}"}
+        ]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let translated = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("gemini body translation");
+    let parsed: Value = serde_json::from_slice(&translated).unwrap();
+    assert!(
+        parsed.get("model").is_none(),
+        "model is URL-scoped: {parsed}"
+    );
+    assert_eq!(
+        parsed["systemInstruction"]["parts"][0]["text"],
+        json!("be brief")
+    );
+    assert_eq!(parsed["contents"][0]["role"], json!("user"));
+    assert_eq!(parsed["contents"][1]["role"], json!("model"));
+    assert_eq!(
+        parsed["contents"][1]["parts"][0]["functionCall"]["name"],
+        json!("lookup")
+    );
+    assert_eq!(parsed["contents"][2]["role"], json!("user"));
+    assert_eq!(
+        parsed["contents"][2]["parts"][0]["functionResponse"]["name"],
+        json!("lookup")
+    );
+    assert_eq!(parsed["generationConfig"]["maxOutputTokens"], json!(32));
+    assert_eq!(
+        parsed["toolConfig"]["functionCallingConfig"]["mode"],
+        json!("AUTO")
+    );
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &translated)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_gemini_rejects_malformed_tool_choice_at_claim() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "tool_choice": "any",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(
+                body.contains("tool_choice") || body.contains("Gemini"),
+                "{body}"
+            );
+        }
+        other => panic!("expected reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_gemini_rejects_unrepresentable_message_content_at_claim() {
+    let plugin = build(gemini_config());
+
+    // Mixed text + image must not silently flatten to text.
+    let mixed = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "caption"},
+                {"type": "image_url", "image_url": {"url": "https://example.invalid/x.png"}}
+            ]
+        }]
+    });
+    let mut ctx = post_ctx(&mixed);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("invalid_request_error"), "{body}");
+            assert!(
+                body.contains("Gemini-representable") || body.contains("content"),
+                "{body}"
+            );
+            assert!(
+                !body.contains("example.invalid"),
+                "must not echo provider/client media urls: {body}"
+            );
+        }
+        other => panic!("mixed text+image must reject: {other:?}"),
+    }
+
+    // Closed text-part shape: extra/unknown fields must not silently drop.
+    let extra_fields = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "safe",
+                "image_url": {"url": "https://example.invalid/extra.png"}
+            }]
+        }]
+    });
+    let mut ctx = post_ctx(&extra_fields);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("invalid_request_error"), "{body}");
+            assert!(
+                body.contains("Gemini-representable") || body.contains("content"),
+                "{body}"
+            );
+            assert!(
+                !body.contains("example.invalid"),
+                "must not echo media urls from extra fields: {body}"
+            );
+        }
+        other => panic!("extra-field text part must reject: {other:?}"),
+    }
+
+    // Non-object array members fail closed.
+    let non_object = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": ["not-an-object", 7]
+        }]
+    });
+    let mut ctx = post_ctx(&non_object);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("invalid_request_error"), "{body}");
+            assert!(
+                body.contains("Gemini-representable") || body.contains("content"),
+                "{body}"
+            );
+        }
+        other => panic!("non-object content part must reject: {other:?}"),
+    }
+
+    // Malformed text part (non-string text) fails closed.
+    let malformed = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": 42}]
+        }]
+    });
+    let mut ctx = post_ctx(&malformed);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(
+                body.contains("malformed") || body.contains("content"),
+                "{body}"
+            );
+        }
+        other => panic!("malformed text part must reject: {other:?}"),
+    }
+
+    // System / developer non-text content must reject (not silently drop).
+    for role in ["system", "developer"] {
+        let body = json!({
+            "model": "gemini-1.5-flash",
+            "stream": true,
+            "messages": [
+                {
+                    "role": role,
+                    "content": [{"type": "image_url", "image_url": {"url": "https://example.invalid/sys.png"}}]
+                },
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400, "{role}");
+                assert!(
+                    body.contains("Gemini-representable") || body.contains("content"),
+                    "{role}: {body}"
+                );
+                assert!(!body.contains("example.invalid"), "{role}: {body}");
+            }
+            other => panic!("{role} non-text must reject: {other:?}"),
+        }
+    }
+
+    // System / developer null content must reject (string-or-text-parts only).
+    for role in ["system", "developer"] {
+        let body = json!({
+            "model": "gemini-1.5-flash",
+            "stream": true,
+            "messages": [
+                {"role": role, "content": null},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400, "{role}");
+                assert!(body.contains("invalid_request_error"), "{role}: {body}");
+                assert!(
+                    body.contains("content") || body.contains("string") || body.contains("text"),
+                    "{role}: {body}"
+                );
+            }
+            other => panic!("{role} null content must reject: {other:?}"),
+        }
+    }
+
+    // User null remains explicit and fail-closed.
+    let user_null = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": null}]
+    });
+    let mut ctx = post_ctx(&user_null);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("invalid_request_error"), "{body}");
+            assert!(
+                body.contains("content") || body.contains("string") || body.contains("text"),
+                "{body}"
+            );
+        }
+        other => panic!("user null content must reject: {other:?}"),
+    }
+
+    // Intentional assistant null content with tool_calls remains representable.
+    let with_tools = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }]
+    });
+    let mut ctx = post_ctx(&with_tools);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_gemini_2xx_content_type_lifecycle_fail_closed() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    // Missing Content-Type on 2xx: after_proxy rejects; inspector/buffered fail closed.
+    {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        let reject = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        assert_eq!(reject_status(&reject), Some(502));
+        if let PluginResult::Reject { body, .. } = &reject {
+            assert!(body.contains("without a Content-Type"), "{body}");
+            assert!(body.contains("unsupported_content_type"), "{body}");
+            assert!(!body.contains("text/plain"), "{body}");
+        }
+
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, None)
+            .expect("missing Content-Type must install fail-closed inspector");
+        let mut collected = forwarded(inspector.on_chunk(b"raw-provider-bytes").await);
+        collected.extend_from_slice(&forwarded(inspector.on_end().await));
+        let out = String::from_utf8(collected).unwrap();
+        assert!(out.contains("upstream_error"), "{out}");
+        assert!(out.contains("without a Content-Type"), "{out}");
+        assert!(!out.contains("raw-provider-bytes"), "{out}");
+
+        let buffered = plugin
+            .normalize_response_body_with_context(&mut ctx, 200, b"raw-json", None, &resp_headers)
+            .await
+            .expect("buffered missing Content-Type must fail closed");
+        let buffered_out = String::from_utf8(buffered).unwrap();
+        assert!(buffered_out.contains("upstream_error"), "{buffered_out}");
+        assert!(
+            buffered_out.contains("without a Content-Type"),
+            "{buffered_out}"
+        );
+        assert!(!buffered_out.contains("raw-json"), "{buffered_out}");
+    }
+
+    // Unexpected Content-Type on 2xx.
+    {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "text/plain".to_string());
+        let reject = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        assert_eq!(reject_status(&reject), Some(502));
+        if let PluginResult::Reject { body, .. } = &reject {
+            assert!(body.contains("unexpected Content-Type"), "{body}");
+            // Fixed-cardinality: do not echo the provider media type.
+            assert!(!body.contains("text/plain"), "{body}");
+        }
+
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/plain"))
+            .expect("unexpected Content-Type must install fail-closed inspector");
+        let mut collected = forwarded(inspector.on_chunk(b"not-normalized").await);
+        collected.extend_from_slice(&forwarded(inspector.on_end().await));
+        let out = String::from_utf8(collected).unwrap();
+        assert!(out.contains("unexpected Content-Type"), "{out}");
+        assert!(!out.contains("not-normalized"), "{out}");
+        assert!(!out.contains("text/plain"), "{out}");
+    }
+
+    // Recognized media types remain accepted.
+    for content_type in ["text/event-stream", "application/json"] {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), content_type.to_string());
+        assert!(
+            matches!(
+                plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+                PluginResult::Continue
+            ),
+            "{content_type}"
+        );
+        assert!(
+            plugin
+                .response_stream_inspector(&ctx, 200, Some(content_type))
+                .is_some(),
+            "{content_type}"
+        );
+    }
+
+    // Non-2xx provider error envelopes still pass through even without Content-Type.
+    {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 400, &mut resp_headers).await,
+            PluginResult::Continue
+        ));
+        assert!(plugin.response_stream_inspector(&ctx, 400, None).is_none());
+        assert!(
+            plugin
+                .normalize_response_body_with_context(
+                    &mut ctx,
+                    400,
+                    b"{\"error\":\"x\"}",
+                    None,
+                    &resp_headers,
+                )
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_gemini_malformed_candidate_fields_fail_closed() {
+    // Present-but-malformed index must not fall back to positional index.
+    let bad_index = "data: {\"candidates\":[{\"index\":\"0\",\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+    let out = run_gemini_normalizer(4096, bad_index, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(out.contains("malformed index"), "{out}");
+    assert!(!out.contains("\"content\":\"x\""), "{out}");
+    assert!(!out.contains("\"index\":\"0\""), "{out}");
+
+    // Present-but-malformed finishReason must not be treated as absent.
+    let bad_finish = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":1}]}\n\n";
+    let out = run_gemini_normalizer(4096, bad_finish, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(out.contains("malformed finishReason"), "{out}");
+    assert!(!out.contains("\"finish_reason\""), "{out}");
+
+    // Present-but-non-string role must not be treated as absent/model.
+    let bad_role = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":1,\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+    let out = run_gemini_normalizer(4096, bad_role, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(out.contains("content role that was not model"), "{out}");
+    assert!(!out.contains("\"content\":\"x\""), "{out}");
+
+    // Representable text plus additional unrepresentable fields must fail closed.
+    let extra_fields = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"keep\",\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"QUJD\"}}]},\"finishReason\":\"STOP\"}]}\n\n";
+    let out = run_gemini_normalizer(4096, extra_fields, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(out.contains("unrepresentable additional fields"), "{out}");
+    assert!(
+        !out.contains("\"content\":\"keep\""),
+        "must not emit representable subset: {out}"
+    );
+    assert!(!out.contains("inlineData"), "{out}");
+    assert!(!out.contains("QUJD"), "{out}");
+
+    // Missing index still uses the documented positional fallback.
+    let missing_index = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"fallback\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+    let out = run_gemini_normalizer(4096, missing_index, "text/event-stream").await;
+    assert!(out.contains("\"content\":\"fallback\""), "{out}");
+    assert!(out.contains("\"index\":0"), "{out}");
+    assert!(!out.contains("upstream_error"), "{out}");
+
+    // Empty-object metadata-only exception remains accepted.
+    let empty_meta = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{},{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+    let out = run_gemini_normalizer(4096, empty_meta, "text/event-stream").await;
+    assert!(out.contains("\"content\":\"ok\""), "{out}");
+    assert!(!out.contains("upstream_error"), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_sse_normalized_to_openai_chunks() {
+    let out = run_gemini_normalizer(4096, GEMINI_SSE, "text/event-stream").await;
+    assert!(out.contains("chat.completion.chunk"), "{out}");
+    assert!(out.contains("\"role\":\"assistant\""), "{out}");
+    assert!(out.contains("\"content\":\"Hello\""), "{out}");
+    assert!(out.contains("\"content\":\" world\""), "{out}");
+    assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+    assert!(out.contains("\"prompt_tokens\":10"), "{out}");
+    assert!(out.contains("\"completion_tokens\":5"), "{out}");
+    assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_sse_robust_to_chunk_splits() {
+    let split = run_gemini_normalizer(7, GEMINI_SSE, "text/event-stream").await;
+    let whole = run_gemini_normalizer(4096, GEMINI_SSE, "text/event-stream").await;
+    assert_eq!(strip_created(&split), strip_created(&whole));
+    assert!(split.contains("\"content\":\"Hello\""));
+}
+
+#[tokio::test]
+async fn test_gemini_json_array_stream_normalized() {
+    let out = run_gemini_normalizer(5, GEMINI_JSON_ARRAY, "application/json").await;
+    assert!(out.contains("\"content\":\"Array\""), "{out}");
+    assert!(out.contains("\"content\":\" ok\""), "{out}");
+    assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+    assert!(out.contains("\"prompt_tokens\":2"), "{out}");
+    assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_multi_candidate_and_safety_block() {
+    let multi = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"A\"}]},\"finishReason\":\"STOP\"},{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"B\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+    let out = run_gemini_normalizer(4096, multi, "text/event-stream").await;
+    assert!(out.contains("\"index\":0"), "{out}");
+    assert!(out.contains("\"index\":1"), "{out}");
+    assert!(out.contains("\"content\":\"A\""), "{out}");
+    assert!(out.contains("\"content\":\"B\""), "{out}");
+
+    let blocked = "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n";
+    let blocked_out = run_gemini_normalizer(4096, blocked, "text/event-stream").await;
+    assert!(
+        blocked_out.contains("\"finish_reason\":\"content_filter\""),
+        "{blocked_out}"
+    );
+    assert!(
+        blocked_out.trim_end().ends_with("data: [DONE]"),
+        "{blocked_out}"
+    );
+}
+
+#[tokio::test]
+async fn test_gemini_multi_candidate_incomplete_eof_fails_closed() {
+    // One finished candidate must not make clean EOF succeed while another
+    // candidate already emitted client-visible content without finishReason.
+    let body = concat!(
+        "data: {\"candidates\":[",
+        "{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"},",
+        "{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"partial\"}]}}",
+        "]}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, body, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(
+        out.contains("every candidate reached a terminal finishReason"),
+        "{out}"
+    );
+    assert!(out.contains("\"content\":\"done\""), "{out}");
+    assert!(out.contains("\"content\":\"partial\""), "{out}");
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
+    // Must not look like a success-only terminal after the incomplete candidate.
+    assert!(
+        !out.contains("\"prompt_tokens\""),
+        "incomplete multi-candidate EOF must not publish success usage: {out}"
+    );
+}
+
+#[tokio::test]
+async fn test_gemini_post_finish_candidate_data_fails_closed() {
+    let late_content = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"early\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"late\"}]}}]}\n\n",
+    );
+    let late_out = run_gemini_normalizer(4096, late_content, "text/event-stream").await;
+    assert!(late_out.contains("upstream_error"), "{late_out}");
+    assert!(
+        late_out.contains("after a terminal finishReason"),
+        "{late_out}"
+    );
+    assert!(late_out.contains("\"content\":\"early\""), "{late_out}");
+    assert!(
+        !late_out.contains("\"content\":\"late\""),
+        "must not forward post-finish content: {late_out}"
+    );
+    assert_eq!(late_out.matches("data: [DONE]").count(), 1);
+
+    let duplicate_finish = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"once\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let dup_out = run_gemini_normalizer(4096, duplicate_finish, "text/event-stream").await;
+    assert!(dup_out.contains("upstream_error"), "{dup_out}");
+    assert!(
+        dup_out.contains("after a terminal finishReason"),
+        "{dup_out}"
+    );
+    assert_eq!(dup_out.matches("\"finish_reason\":\"stop\"").count(), 1);
+}
+
+#[tokio::test]
+async fn test_gemini_unrepresentable_parts_and_duplicate_indexes_fail_closed() {
+    // Empty-object parts are the sole metadata-only exception.
+    let empty_ok = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{},{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+    let empty_out = run_gemini_normalizer(4096, empty_ok, "text/event-stream").await;
+    assert!(empty_out.contains("\"content\":\"ok\""), "{empty_out}");
+    assert!(
+        empty_out.contains("\"finish_reason\":\"stop\""),
+        "{empty_out}"
+    );
+    assert!(
+        empty_out.trim_end().ends_with("data: [DONE]"),
+        "{empty_out}"
+    );
+
+    let hostile_parts = [
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[\"scalar\"]},\"finishReason\":\"STOP\"}]}\n\n",
+            "non-object",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[42]},\"finishReason\":\"STOP\"}]}\n\n",
+            "non-object",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"QUJD\"}}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "unrepresentable",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"executableCode\":{\"language\":\"PYTHON\",\"code\":\"print(1)\"}}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "unrepresentable",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"thought\":true}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "unrepresentable",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":123}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "text part that was not a string",
+        ),
+    ];
+    for (body, needle) in hostile_parts {
+        let out = run_gemini_normalizer(4096, body, "text/event-stream").await;
+        assert!(out.contains("upstream_error"), "body={body} out={out}");
+        assert!(
+            out.contains(needle),
+            "expected diagnostic containing {needle}: {out}"
+        );
+        assert!(
+            !out.contains("QUJD") && !out.contains("print(1)") && !out.contains("image/png"),
+            "must not echo provider part payloads: {out}"
+        );
+        assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+    }
+
+    let duplicate_indexes = concat!(
+        "data: {\"candidates\":[",
+        "{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"A\"}]},\"finishReason\":\"STOP\"},",
+        "{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"B\"}]},\"finishReason\":\"STOP\"}",
+        "]}\n\n",
+    );
+    let dup_idx_out = run_gemini_normalizer(4096, duplicate_indexes, "text/event-stream").await;
+    assert!(dup_idx_out.contains("upstream_error"), "{dup_idx_out}");
+    assert!(
+        dup_idx_out.contains("duplicate Gemini candidate indexes"),
+        "{dup_idx_out}"
+    );
+    assert!(
+        !dup_idx_out.contains("\"content\":\"B\""),
+        "must not process the colliding candidate: {dup_idx_out}"
+    );
+}
+
+#[tokio::test]
+async fn test_gemini_function_call_and_tool_choice_none_fail_closed() {
+    let tools = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"x\"}}}]},\"finishReason\":\"STOP\"}]}\n\n";
+    let out = run_gemini_normalizer(4096, tools, "text/event-stream").await;
+    assert!(out.contains("\"tool_calls\""), "{out}");
+    assert!(out.contains("\"name\":\"lookup\""), "{out}");
+    assert!(out.contains("\"finish_reason\":\"tool_calls\""), "{out}");
+    assert!(!out.contains("sk-gemini"), "{out}");
+
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "tool_choice": "none",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let mut collected = Vec::new();
+    collected.extend_from_slice(&forwarded(inspector.on_chunk(tools.as_bytes()).await));
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let text = String::from_utf8(collected).unwrap();
+    assert!(text.contains("upstream_error"), "{text}");
+    assert!(
+        text.contains("tool_choice none") || text.contains("tool use"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("\"q\":\"x\""),
+        "must not echo tool args: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_gemini_provider_error_and_premature_eof_fail_closed() {
+    let err = format!(
+        "data: {{\"error\":{{\"code\":400,\"message\":\"{}\",\"status\":\"INVALID_ARGUMENT\"}}}}\n\n",
+        "A".repeat(400),
+    );
+    let out = run_gemini_normalizer(4096, &err, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+    assert!(
+        out.len() < 800,
+        "provider error message must be bounded: {}",
+        out.len()
+    );
+
+    let partial = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"partial\"}]}}]}\n\n";
+    let partial_out = run_gemini_normalizer(4096, partial, "text/event-stream").await;
+    assert!(partial_out.contains("upstream_error"), "{partial_out}");
+    assert!(
+        partial_out.contains("before every candidate reached a terminal finishReason"),
+        "{partial_out}"
+    );
+    assert_eq!(partial_out.matches("data: [DONE]").count(), 1);
+}
+
+#[tokio::test]
+async fn test_gemini_malformed_and_oversized_events_fail_closed() {
+    let malformed = "data: {not-json\n\n";
+    let out = run_gemini_normalizer(4096, malformed, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(out.contains("malformed"), "{out}");
+
+    let (_plugin, _ctx, mut inspector) = claimed_gemini_inspector("text/event-stream").await;
+    let event = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
+    match inspector.on_chunk(&event).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "oversized");
+            assert_eq!(text.matches("data: [DONE]").count(), 1, "{text}");
+        }
+        other => panic!("oversized complete event must terminate: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_gemini_reload_config_still_selects_provider() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router.claimed")
+            .map(String::as_str),
+        Some("true")
+    );
+
+    // Reconstructing from the same config (reload/update path) must keep
+    // google_gemini constructible and claimable.
+    let reloaded = build(gemini_config());
+    let mut ctx2 = post_ctx(&body);
+    let mut headers2 = json_headers();
+    assert!(matches!(
+        reloaded.before_proxy(&mut ctx2, &mut headers2).await,
+        PluginResult::Continue
+    ));
+    assert!(ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(&ctx2));
+}
+
+fn gemini_lookup_tools() -> Value {
+    json!([{
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "description": "d",
+            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+        }
+    }])
+}
+
+#[tokio::test]
+async fn test_gemini_tool_choice_and_tools_fail_closed_without_weakening() {
+    let plugin = build(gemini_config());
+
+    // auto/required/named without tools must not weaken into provider defaults.
+    for tool_choice in [
+        json!("auto"),
+        json!("required"),
+        json!({"type": "function", "function": {"name": "lookup"}}),
+    ] {
+        let body = json!({
+            "model": "gemini-1.5-flash",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": tool_choice
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        assert_eq!(
+            reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await),
+            Some(400),
+            "non-none tool_choice without tools must reject"
+        );
+    }
+
+    // Named choice that does not match a declared tool.
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": gemini_lookup_tools(),
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "other_tool"}
+        }
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), Some(400));
+    if let PluginResult::Reject { body, .. } = result {
+        assert!(
+            !body.contains("other_tool"),
+            "client error must not echo the unmatched tool name: {body}"
+        );
+    }
+
+    // Unsupported tool entry must not be silently dropped.
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}},
+            {"type": "unsupported", "name": "web_search"}
+        ],
+        "tool_choice": "auto"
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert_eq!(
+        reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await),
+        Some(400)
+    );
+
+    // tool_choice none remains valid without a tools array.
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "tool_choice": "none",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_gemini_json_array_chunk_splits_and_malformed_separators_fail_closed() {
+    let split = run_gemini_normalizer(3, GEMINI_JSON_ARRAY, "application/json").await;
+    let whole = run_gemini_normalizer(4096, GEMINI_JSON_ARRAY, "application/json").await;
+    assert_eq!(strip_created(&split), strip_created(&whole));
+    assert!(split.contains("\"content\":\"Array\""));
+    assert!(split.contains("\"finish_reason\":\"stop\""));
+
+    // Concatenated objects (non-array) remain supported.
+    let concat = concat!(
+        "{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"One\"}]}}]}",
+        "{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Two\"}]},\"finishReason\":\"STOP\"}]}",
+    );
+    let concat_out = run_gemini_normalizer(5, concat, "application/json").await;
+    assert!(concat_out.contains("\"content\":\"One\""), "{concat_out}");
+    assert!(concat_out.contains("\"content\":\"Two\""), "{concat_out}");
+    assert!(
+        concat_out.contains("\"finish_reason\":\"stop\""),
+        "{concat_out}"
+    );
+
+    let hostile = [
+        // leading comma
+        "[,{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}]",
+        // repeated commas
+        "[{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]}}]},,{\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}]",
+        // trailing comma
+        "[{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]},]",
+        // missing comma between values
+        "[{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]}}]}{\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}]",
+        // bytes after closing ]
+        "[{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}]{}",
+    ];
+    for body in hostile {
+        let out = run_gemini_normalizer(7, body, "application/json").await;
+        assert!(
+            out.contains("upstream_error"),
+            "malformed array must fail closed: {body} => {out}"
+        );
+        assert!(
+            out.contains("malformed") || out.contains("JSON array"),
+            "diagnostic must mention array framing: {out}"
+        );
+        assert!(
+            !out.contains("\"total_tokens\""),
+            "must not publish usage after hostile framing: {out}"
+        );
+    }
+}
+
+/// Provider-controlled segmentation must not change the normalized bytes.
+///
+/// The JSON-framing scanner resumes across chunk boundaries instead of
+/// re-reading the unread window, so the split points that matter are the ones
+/// that land inside a string, inside an escape sequence, and inside nested
+/// containers. All of them must agree with single-chunk delivery.
+#[tokio::test]
+async fn test_gemini_json_framing_is_split_invariant_including_strings_and_escapes() {
+    // Structural bytes hidden inside strings/escapes: `}`/`{`/`,`/`]` in text,
+    // an escaped quote, an escaped backslash, and a `\u` escape.
+    // `responseId` pins the chunk id so split runs are byte-comparable.
+    let body = concat!(
+        "[{\"responseId\":\"resp_split\",\"candidates\":[{\"index\":0,",
+        "\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"a}{b\\\"c\\\\d,[e]\\u007b\"}]}}]},",
+        "{\"responseId\":\"resp_split\",\"candidates\":[{\"index\":0,",
+        "\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"tail\"}]},\"finishReason\":\"STOP\"}]}]",
+    );
+    let whole = run_gemini_normalizer(4096, body, "application/json").await;
+    assert!(whole.contains("\"finish_reason\":\"stop\""), "{whole}");
+    assert!(!whole.contains("upstream_error"), "{whole}");
+    assert!(whole.contains("\"content\":\"tail\""), "{whole}");
+
+    // Byte-at-a-time plus a sweep of small sizes that straddle every interesting
+    // boundary in the payload above.
+    for chunk_size in [1usize, 2, 3, 5, 7, 11, 13, 17, 29, 64] {
+        let split = run_gemini_normalizer(chunk_size, body, "application/json").await;
+        assert_eq!(
+            strip_created(&split),
+            strip_created(&whole),
+            "chunk size {chunk_size} must produce identical normalized output"
+        );
+    }
+
+    // Concatenated (non-array) framing carries the same guarantee.
+    let concat_body = concat!(
+        "{\"responseId\":\"resp_cat\",\"candidates\":[{\"index\":0,",
+        "\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"x\\\"}\\\\\"}]}}]}",
+        "{\"responseId\":\"resp_cat\",\"candidates\":[{\"index\":0,",
+        "\"finishReason\":\"STOP\"}]}",
+    );
+    let concat_whole = run_gemini_normalizer(4096, concat_body, "application/json").await;
+    for chunk_size in [1usize, 2, 3, 9] {
+        let split = run_gemini_normalizer(chunk_size, concat_body, "application/json").await;
+        assert_eq!(
+            strip_created(&split),
+            strip_created(&concat_whole),
+            "concatenated framing must be split-invariant at chunk size {chunk_size}"
+        );
+    }
+    assert!(!concat_whole.contains("upstream_error"), "{concat_whole}");
+}
+
+/// Normalized Gemini JSON-array streams leave as SSE, so they must be labelled
+/// as SSE — an `application/json` label on `chat.completion.chunk` frames plus
+/// `data: [DONE]` misroutes OpenAI SDKs and content-type-keyed response plugins.
+#[tokio::test]
+async fn test_gemini_json_framing_response_is_relabelled_event_stream() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    let mut ctx = post_ctx(&body);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "17".to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        resp_headers.get("content-type").map(String::as_str),
+        Some("text/event-stream"),
+        "JSON-framed normalization must relabel the response as SSE"
+    );
+    // The existing representation repairs still apply.
+    assert!(!resp_headers.contains_key("content-length"));
+
+    // An SSE label (including its parameters) is left untouched.
+    for original in [
+        "text/event-stream",
+        "text/event-stream; charset=utf-8",
+        "TEXT/EVENT-STREAM",
+    ] {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), original.to_string());
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            resp_headers.get("content-type").map(String::as_str),
+            Some(original),
+            "an SSE label must survive normalization verbatim"
+        );
+    }
+}
+
+/// A `promptFeedback` block is a terminal like any other: it may not contradict
+/// a candidate that already finished, and it may not close a stream with the
+/// success terminal while another candidate is visible-but-unfinished.
+#[tokio::test]
+async fn test_gemini_prompt_block_respects_candidate_lifecycle() {
+    // Candidate 0 already finished with STOP: no second, contradictory terminal.
+    let after_finish = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+        "data: {\"promptFeedback\":{\"blockReason\":\"PROHIBITED_CONTENT\"}}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, after_finish, "text/event-stream").await;
+    assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+    assert!(
+        !out.contains("\"finish_reason\":\"content_filter\""),
+        "a finished choice must not receive a second terminal: {out}"
+    );
+    assert_eq!(out.matches("\"finish_reason\":\"").count(), 1, "{out}");
+    assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+
+    // Candidate 1 emitted visible output and never finished: the prompt block is
+    // a premature close, not a success.
+    let unfinished_sibling = concat!(
+        "data: {\"candidates\":[",
+        "{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"a\"}]}},",
+        "{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"b\"}]}}]}\n\n",
+        "data: {\"promptFeedback\":{\"blockReason\":\"PROHIBITED_CONTENT\"}}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, unfinished_sibling, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(
+        out.contains("before every candidate reached a terminal finishReason"),
+        "{out}"
+    );
+    assert!(!out.contains("\"total_tokens\""), "{out}");
+    assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+
+    // The single-candidate case is unchanged: the block finishes choice 0.
+    let solo = "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n";
+    let out = run_gemini_normalizer(4096, solo, "text/event-stream").await;
+    assert!(
+        out.contains("\"finish_reason\":\"content_filter\""),
+        "{out}"
+    );
+    assert!(!out.contains("upstream_error"), "{out}");
+    assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+}
+
+/// Claim admission and translation must agree on orphaned `tool_call_id`, so
+/// the client gets the precise message instead of the generic translation 400.
+#[tokio::test]
+async fn test_gemini_orphaned_tool_call_id_rejected_at_claim() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call_missing", "content": "{\"ok\":true}"}
+        ]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), Some(400));
+    if let PluginResult::Reject { body, .. } = &result {
+        assert!(
+            body.contains("tool_call_id has no matching assistant tool call"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("could not be translated safely"),
+            "admission must not fall through to the generic translation error: {body}"
+        );
+    }
+
+    // A matched id still admits and translates.
+    let paired = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"ok\":true}"}
+        ]
+    });
+    let mut ctx = post_ctx(&paired);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_gemini_keeps_claim_model_and_pins_response_id() {
+    // Provider modelVersion must not overwrite the claim-committed model.
+    let body = concat!(
+        "data: {\"responseId\":\"resp_pin\",\"modelVersion\":\"provider-other-model\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hi\"}]}}]}\n\n",
+        "data: {\"responseId\":\"resp_pin\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"!\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, body, "text/event-stream").await;
+    assert!(out.contains("\"model\":\"gemini-1.5-flash\""), "{out}");
+    assert!(!out.contains("provider-other-model"), "{out}");
+    assert!(out.contains("\"id\":\"resp_pin\""), "{out}");
+
+    // Changed responseId mid-stream fails closed.
+    let changed = concat!(
+        "data: {\"responseId\":\"resp_a\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"A\"}]}}]}\n\n",
+        "data: {\"responseId\":\"resp_b\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"B\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let changed_out = run_gemini_normalizer(4096, changed, "text/event-stream").await;
+    assert!(changed_out.contains("upstream_error"), "{changed_out}");
+    assert!(changed_out.contains("responseId"), "{changed_out}");
+
+    // Non-string / empty / oversized responseId fail closed.
+    for hostile in [
+        "data: {\"responseId\":123,\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n",
+        "data: {\"responseId\":\"\",\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n",
+        &format!(
+            "data: {{\"responseId\":\"{}\",\"candidates\":[{{\"index\":0,\"finishReason\":\"STOP\"}}]}}\n\n",
+            "r".repeat(129)
+        ),
+    ] {
+        let out = run_gemini_normalizer(4096, hostile, "text/event-stream").await;
+        assert!(out.contains("upstream_error"), "{out}");
+        assert!(out.contains("responseId"), "{out}");
+    }
+
+    // Invalid modelVersion shape fails closed without trusting it as identity.
+    let bad_model = "data: {\"modelVersion\":\"../evil\",\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n";
+    let bad_out = run_gemini_normalizer(4096, bad_model, "text/event-stream").await;
+    assert!(bad_out.contains("upstream_error"), "{bad_out}");
+    assert!(bad_out.contains("modelVersion"), "{bad_out}");
+    assert!(!bad_out.contains("../evil"), "{bad_out}");
+}
+
+#[tokio::test]
+async fn test_gemini_multi_event_tool_calls_get_distinct_ids_and_indexes() {
+    // Two events each carrying part_index 0 must still mint distinct call ids /
+    // tool indexes from the monotonic per-candidate counter.
+    let body = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"one\"}}}]}}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"two\"}}}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, body, "text/event-stream").await;
+    assert!(out.contains("\"tool_calls\""), "{out}");
+    assert!(out.contains("\"index\":0"), "{out}");
+    assert!(out.contains("\"index\":1"), "{out}");
+    assert!(out.contains("\"finish_reason\":\"tool_calls\""), "{out}");
+
+    let mut call_ids = Vec::new();
+    for line in out.lines() {
+        let Some(rest) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if rest == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(rest) else {
+            continue;
+        };
+        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+            continue;
+        };
+        for choice in choices {
+            let Some(tool_calls) = choice
+                .pointer("/delta/tool_calls")
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for call in tool_calls {
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    call_ids.push(id.to_string());
+                }
+            }
+        }
+    }
+    assert_eq!(call_ids.len(), 2, "expected two tool call ids: {out}");
+    assert_ne!(
+        call_ids[0], call_ids[1],
+        "call ids must be distinct: {call_ids:?}"
+    );
+    assert!(
+        call_ids[0].ends_with("_0_0") && call_ids[1].ends_with("_0_1"),
+        "ids must embed choice/tool indexes: {call_ids:?}"
+    );
+    assert!(!out.contains("\"q\":\"one\""), "must not echo args: {out}");
+}
+
+#[tokio::test]
+async fn test_gemini_usage_metadata_fail_closed_and_valid_shapes() {
+    // Non-object usageMetadata fails closed and never echoes the value.
+    let non_object = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":\"PROMPT_LEAK_sk-gemini-secret\"}\n\n";
+    let non_object_out = run_gemini_normalizer(4096, non_object, "text/event-stream").await;
+    assert!(
+        non_object_out.contains("upstream_error"),
+        "{non_object_out}"
+    );
+    assert!(
+        non_object_out.contains("usageMetadata") && non_object_out.contains("not an object"),
+        "{non_object_out}"
+    );
+    assert!(
+        !non_object_out.contains("PROMPT_LEAK") && !non_object_out.contains("sk-gemini-secret"),
+        "must not echo provider usageMetadata bytes: {non_object_out}"
+    );
+    assert!(
+        !non_object_out.contains("\"prompt_tokens\""),
+        "must not publish partial usage after non-object usageMetadata: {non_object_out}"
+    );
+
+    // Malformed preferred candidatesTokenCount must not fall back to a valid
+    // completionTokenCount alternate, and must not echo the bad value.
+    let preferred_vs_alt = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":\"HOSTILE_FALLBACK_42\",\"completionTokenCount\":7,\"totalTokenCount\":10}}\n\n";
+    let preferred_out = run_gemini_normalizer(4096, preferred_vs_alt, "text/event-stream").await;
+    assert!(preferred_out.contains("upstream_error"), "{preferred_out}");
+    assert!(
+        preferred_out.contains("candidatesTokenCount"),
+        "{preferred_out}"
+    );
+    assert!(
+        !preferred_out.contains("HOSTILE_FALLBACK")
+            && !preferred_out.contains("\"completion_tokens\":7"),
+        "must not fall back to alternate or echo malformed preferred: {preferred_out}"
+    );
+
+    // Present malformed recognized count fields fail closed with field-specific
+    // diagnostics (including totalTokenCount, which is validated even when the
+    // normalizer publishes checked prompt+completion totals).
+    for (body, field) in [
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":-1,\"candidatesTokenCount\":1,\"totalTokenCount\":0}}\n\n",
+            "promptTokenCount",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"completionTokenCount\":1.5,\"totalTokenCount\":2}}\n\n",
+            "completionTokenCount",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":true}}\n\n",
+            "totalTokenCount",
+        ),
+    ] {
+        let out = run_gemini_normalizer(4096, body, "text/event-stream").await;
+        assert!(out.contains("upstream_error"), "{field}: {out}");
+        assert!(out.contains(field), "{field}: {out}");
+        assert!(
+            !out.contains("\"prompt_tokens\"") && !out.contains("\"total_tokens\""),
+            "must not publish usage after malformed {field}: {out}"
+        );
+    }
+
+    // Valid usage still publishes OpenAI-shaped counts; omission still yields no
+    // usage chunk; completionTokenCount alternate works when preferred is absent.
+    let valid = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":4,\"totalTokenCount\":15}}\n\n";
+    let valid_out = run_gemini_normalizer(4096, valid, "text/event-stream").await;
+    assert!(valid_out.contains("\"prompt_tokens\":11"), "{valid_out}");
+    assert!(valid_out.contains("\"completion_tokens\":4"), "{valid_out}");
+    assert!(valid_out.contains("\"total_tokens\":15"), "{valid_out}");
+    assert!(
+        valid_out.trim_end().ends_with("data: [DONE]"),
+        "{valid_out}"
+    );
+
+    let omitted = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+    let omitted_out = run_gemini_normalizer(4096, omitted, "text/event-stream").await;
+    assert!(
+        omitted_out.contains("\"finish_reason\":\"stop\""),
+        "{omitted_out}"
+    );
+    assert!(
+        !omitted_out.contains("\"prompt_tokens\"") && !omitted_out.contains("\"usage\""),
+        "omitted usageMetadata must not invent usage: {omitted_out}"
+    );
+
+    let alternate_only = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"completionTokenCount\":9}}\n\n";
+    let alt_out = run_gemini_normalizer(4096, alternate_only, "text/event-stream").await;
+    assert!(alt_out.contains("\"prompt_tokens\":2"), "{alt_out}");
+    assert!(alt_out.contains("\"completion_tokens\":9"), "{alt_out}");
+    assert!(alt_out.contains("\"total_tokens\":11"), "{alt_out}");
+}
+
+#[tokio::test]
+async fn test_provider_usage_u64_overflow_fails_closed_without_wrapped_total() {
+    // Gemini path.
+    let gemini = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":18446744073709551615,\"candidatesTokenCount\":1,\"totalTokenCount\":0}}\n\n";
+    let gemini_out = run_gemini_normalizer(4096, gemini, "text/event-stream").await;
+    assert!(gemini_out.contains("upstream_error"), "{gemini_out}");
+    assert!(
+        gemini_out.contains("overflow") || gemini_out.contains("usage"),
+        "{gemini_out}"
+    );
+    assert!(
+        !gemini_out.contains("\"total_tokens\""),
+        "must not publish wrapped totals: {gemini_out}"
+    );
+    assert!(
+        !gemini_out.contains("18446744073709551615"),
+        "must not echo provider usage counts: {gemini_out}"
+    );
+    assert!(
+        gemini_out.trim_end().ends_with("data: [DONE]"),
+        "{gemini_out}"
+    );
+
+    // Anthropic path (shared overflow hardening).
+    let anthropic = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ovf\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":18446744073709551615,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("anthropic normalizer");
+    let mut collected = Vec::new();
+    collected.extend_from_slice(&forwarded(inspector.on_chunk(anthropic.as_bytes()).await));
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let anthropic_out = String::from_utf8(collected).unwrap();
+    assert!(anthropic_out.contains("upstream_error"), "{anthropic_out}");
+    assert!(
+        anthropic_out.contains("overflow") || anthropic_out.contains("usage"),
+        "{anthropic_out}"
+    );
+    assert!(
+        !anthropic_out.contains("\"total_tokens\""),
+        "must not publish wrapped totals: {anthropic_out}"
+    );
+}
+
+fn gemini_endpoint_with_query(query: &str) -> Value {
+    json!({
+        "providers": [{
+            "name": "gemini",
+            "provider_type": "google_gemini",
+            "endpoint": format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{{model}}:streamGenerateContent?{query}"
+            ),
+            "api_key": "sk-gemini-secret",
+            "model_patterns": ["gemini-*"],
+            "priority": 1
+        }]
+    })
+}
+
+async fn translate_gemini_body(plugin: &AiStreamRouter, body: &Value) -> Result<Value, String> {
+    let mut ctx = post_ctx(body);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Continue => {}
+        PluginResult::Reject { body, .. } => return Err(body),
+        PluginResult::RejectBinary { .. } => return Err("binary reject".to_string()),
+    }
+    let translated = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            serde_json::to_vec(body).unwrap().as_slice(),
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .ok_or_else(|| "translation returned None".to_string())?;
+    serde_json::from_slice(&translated).map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn test_gemini_legacy_function_call_and_tool_result_shapes() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "max_completion_tokens": 64,
+        "top_p": 0.9,
+        "stop": "END",
+        "tools": null,
+        "tool_choice": null,
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "sys-a"},
+                    {"type": "text", "text": "sys-b"}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "ask"},
+                    {"type": "text", "text": "more"}
+                ]
+            },
+            {
+                "role": "assistant",
+                "content": null,
+                "function_call": {
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"legacy\"}"
+                }
+            },
+            {
+                "role": "function",
+                "name": "lookup",
+                "content": "{\"ok\":true,\"n\":1}"
+            },
+            {
+                "role": "assistant",
+                "content": null,
+                "function_call": {
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"plain\"}"
+                }
+            },
+            {
+                "role": "function",
+                "name": "lookup",
+                "content": "not-json-text"
+            },
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_arr",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"arr\"}"}
+                }]
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_arr",
+                "content": "[1,2,3]"
+            }
+        ]
+    });
+    let parsed = translate_gemini_body(&plugin, &body)
+        .await
+        .expect("legacy + tool result shapes must translate");
+    assert_eq!(
+        parsed["systemInstruction"]["parts"][0]["text"],
+        json!("sys-a\nsys-b")
+    );
+    assert_eq!(
+        parsed["contents"][0]["parts"][0]["text"],
+        json!("ask\nmore")
+    );
+    assert_eq!(
+        parsed["contents"][1]["parts"][0]["functionCall"]["name"],
+        json!("lookup")
+    );
+    assert_eq!(
+        parsed["contents"][2]["parts"][0]["functionResponse"]["response"],
+        json!({"ok": true, "n": 1})
+    );
+    assert_eq!(
+        parsed["contents"][4]["parts"][0]["functionResponse"]["response"],
+        json!({"output": "not-json-text"})
+    );
+    assert_eq!(
+        parsed["contents"][6]["parts"][0]["functionResponse"]["response"],
+        json!({"output": [1, 2, 3]})
+    );
+    assert_eq!(parsed["generationConfig"]["maxOutputTokens"], json!(64));
+    assert_eq!(parsed["generationConfig"]["topP"], json!(0.9));
+    assert_eq!(parsed["generationConfig"]["stopSequences"], json!(["END"]));
+    assert!(parsed.get("toolConfig").is_none());
+    assert!(parsed.get("tools").is_none());
+
+    // Array stop sequences pass through; required tool_choice maps to ANY.
+    let stop_arr = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "stop": ["A", "B"],
+        "tool_choice": "required",
+        "tools": gemini_lookup_tools(),
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let parsed = translate_gemini_body(&plugin, &stop_arr)
+        .await
+        .expect("array stop + required tool_choice");
+    assert_eq!(
+        parsed["generationConfig"]["stopSequences"],
+        json!(["A", "B"])
+    );
+    assert_eq!(
+        parsed["toolConfig"]["functionCallingConfig"]["mode"],
+        json!("ANY")
+    );
+    assert!(
+        parsed["tools"][0]["functionDeclarations"][0]
+            .get("description")
+            .is_some()
+    );
+
+    // Empty tools array and empty/non-array stop remain representable.
+    let empty_tools = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "tools": [],
+        "stop": 7,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let parsed = translate_gemini_body(&plugin, &empty_tools)
+        .await
+        .expect("empty tools + odd stop");
+    assert!(parsed.get("tools").is_none());
+    assert_eq!(parsed["generationConfig"]["stopSequences"], json!([]));
+}
+
+#[tokio::test]
+async fn test_gemini_claim_fail_closed_roles_tools_and_legacy_pairing() {
+    let plugin = build(gemini_config());
+
+    let cases: Vec<(Value, &str)> = vec![
+        (
+            json!({
+                "model": "gemini-1.5-flash",
+                "stream": true,
+                "messages": [{"role": "critic", "content": "nope"}]
+            }),
+            "unsupported role",
+        ),
+        (
+            json!({
+                "model": "gemini-1.5-flash",
+                "stream": true,
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]},
+                    {"role": "tool", "content": "missing id"}
+                ]
+            }),
+            "tool_call_id",
+        ),
+        (
+            json!({
+                "model": "gemini-1.5-flash",
+                "stream": true,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"}
+                        }],
+                        "function_call": {"name": "lookup", "arguments": "{}"}
+                    }
+                ]
+            }),
+            "mixes",
+        ),
+        (
+            json!({
+                "model": "gemini-1.5-flash",
+                "stream": true,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "function_call": {"name": "lookup", "arguments": "{}"}
+                    }
+                ]
+            }),
+            "function result",
+        ),
+        (
+            json!({
+                "model": "gemini-1.5-flash",
+                "stream": true,
+                "messages": [
+                    {"role": "function", "name": "lookup", "content": "{}"}
+                ]
+            }),
+            "function result",
+        ),
+        (
+            json!({
+                "model": "gemini-1.5-flash",
+                "stream": true,
+                "messages": [{"role": "assistant", "content": ""}]
+            }),
+            "no Gemini-representable content",
+        ),
+        (
+            json!({
+                "model": "gemini-1.5-flash",
+                "stream": true,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": ""}]}]
+            }),
+            "no Gemini-representable content",
+        ),
+        (
+            json!({
+                "model": "gemini-1.5-flash",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": {"not": "an-array"}
+            }),
+            "tools",
+        ),
+        (
+            json!({
+                "model": "gemini-1.5-flash",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": gemini_lookup_tools(),
+                "tool_choice": {"type": "function", "function": {"name": "lookup", "extra": true}}
+            }),
+            "tool_choice",
+        ),
+        (
+            json!({
+                "model": "gemini-1.5-flash",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": gemini_lookup_tools(),
+                "tool_choice": {"type": "tool", "function": {"name": "lookup"}}
+            }),
+            "tool_choice",
+        ),
+        (
+            json!({
+                "model": "gemini-1.5-flash",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tool_choice": 3
+            }),
+            "tool_choice",
+        ),
+    ];
+
+    for (body, needle) in cases {
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400, "{needle}: {body}");
+                assert!(
+                    body.to_lowercase().contains(&needle.to_lowercase()),
+                    "expected diagnostic mentioning {needle}: {body}"
+                );
+                assert!(
+                    !body.contains("sk-gemini"),
+                    "must not leak credentials: {body}"
+                );
+            }
+            other => panic!("expected reject for {needle}, got {other:?}"),
+        }
+    }
+
+    // Matching tool_call_id is enforced at claim admission — the validator and
+    // the translator walk the same rule, so the client gets the precise
+    // `messages[i]` diagnostic rather than the generic translation failure.
+    let unknown_tool_id = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_unknown", "content": "x"}
+        ]
+    });
+    let mut ctx = post_ctx(&unknown_tool_id);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400, "{body}");
+            assert!(
+                body.contains("tool_call_id has no matching assistant tool call"),
+                "{body}"
+            );
+            assert!(body.contains("invalid_messages"), "{body}");
+            assert!(!body.contains("call_unknown"), "{body}");
+        }
+        other => panic!("orphaned tool_call_id must reject at claim, got {other:?}"),
+    }
+    // No claim was committed, so nothing downstream can translate this body.
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                serde_json::to_vec(&unknown_tool_id).unwrap().as_slice(),
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "unknown tool_call_id must not produce a provider body"
+    );
+}
+
+#[tokio::test]
+async fn test_gemini_alt_sse_query_merge_variants() {
+    // Client query is preserved and alt=sse is appended.
+    {
+        let plugin = build(gemini_config());
+        let body = json!({
+            "model": "gemini-1.5-flash",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let mut ctx = post_ctx_with_query(&body, "client=1&keep=yes");
+        let mut headers = json_headers();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        let effective = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+        assert!(
+            effective.contains("client=1") && effective.contains("keep=yes"),
+            "{effective}"
+        );
+        assert!(
+            effective
+                .split('&')
+                .any(|p| p.eq_ignore_ascii_case("alt=sse")),
+            "must append alt=sse: {effective}"
+        );
+    }
+
+    // Endpoint query without alt=sse gets &alt=sse on the absolute path.
+    {
+        let plugin = build(gemini_endpoint_with_query("api-version=v1"));
+        let body = json!({
+            "model": "gemini-1.5-flash",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        let path = ctx.route_override_path.as_deref().unwrap_or("");
+        assert!(
+            path.contains("api-version=v1") && path.contains("alt=sse"),
+            "{path}"
+        );
+        assert!(
+            path.contains("&alt=sse") || path.ends_with("alt=sse"),
+            "{path}"
+        );
+    }
+
+    // Endpoint that already negotiates alt=sse must not duplicate it.
+    {
+        let plugin = build(gemini_endpoint_with_query("alt=sse&region=us"));
+        let body = json!({
+            "model": "gemini-1.5-flash",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        let path = ctx.route_override_path.as_deref().unwrap_or("");
+        assert_eq!(
+            path.matches("alt=sse").count(),
+            1,
+            "must not duplicate alt=sse: {path}"
+        );
+        assert!(path.contains("region=us"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn test_gemini_finish_reasons_and_prompt_feedback_matrix() {
+    // Non-STOP finish reasons that map to OpenAI length / content_filter / stop.
+    for (reason, expected) in [
+        ("OTHER", "stop"),
+        ("MAX_TOKENS", "length"),
+        ("SAFETY", "content_filter"),
+        ("RECITATION", "content_filter"),
+        ("LANGUAGE", "content_filter"),
+        ("BLOCKLIST", "content_filter"),
+        ("PROHIBITED_CONTENT", "content_filter"),
+        ("SPII", "content_filter"),
+        ("MODEL_ARMOR", "content_filter"),
+        ("MALFORMED_FUNCTION_CALL", "content_filter"),
+        ("IMAGE_SAFETY", "content_filter"),
+        ("IMAGE_PROHIBITED_CONTENT", "content_filter"),
+        ("IMAGE_OTHER", "content_filter"),
+        ("NO_IMAGE", "content_filter"),
+        ("IMAGE_RECITATION", "content_filter"),
+        ("UNEXPECTED_TOOL_CALL", "content_filter"),
+    ] {
+        let body = format!(
+            "data: {{\"candidates\":[{{\"index\":0,\"content\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"x\"}}]}},\"finishReason\":\"{reason}\"}}]}}\n\n"
+        );
+        let out = run_gemini_normalizer(4096, &body, "text/event-stream").await;
+        assert!(
+            out.contains(&format!("\"finish_reason\":\"{expected}\"")),
+            "finishReason {reason} => {expected}: {out}"
+        );
+        assert!(!out.contains("upstream_error"), "{reason}: {out}");
+        assert!(out.trim_end().ends_with("data: [DONE]"), "{reason}: {out}");
+    }
+
+    let unsupported = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"TOTALLY_NEW\"}]}\n\n";
+    let out = run_gemini_normalizer(4096, unsupported, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(out.contains("unsupported Gemini finishReason"), "{out}");
+    assert!(!out.contains("TOTALLY_NEW"), "{out}");
+
+    // promptFeedback blockReason matrix + fail-closed malformed shapes.
+    for reason in [
+        "BLOCKLIST",
+        "PROHIBITED_CONTENT",
+        "MODEL_ARMOR",
+        "IMAGE_SAFETY",
+        "JAILBREAK",
+        "OTHER",
+    ] {
+        let body = format!("data: {{\"promptFeedback\":{{\"blockReason\":\"{reason}\"}}}}\n\n");
+        let out = run_gemini_normalizer(4096, &body, "text/event-stream").await;
+        assert!(
+            out.contains("\"finish_reason\":\"content_filter\""),
+            "{reason}: {out}"
+        );
+        assert!(out.trim_end().ends_with("data: [DONE]"), "{reason}: {out}");
+    }
+
+    for reason in ["BLOCK_REASON_UNSPECIFIED", "BLOCKED_REASON_UNSPECIFIED"] {
+        let body = format!(
+            "data: {{\"promptFeedback\":{{\"blockReason\":\"{reason}\"}},\"candidates\":[{{\"index\":0,\"content\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"ok\"}}]}},\"finishReason\":\"STOP\"}}]}}\n\n"
+        );
+        let out = run_gemini_normalizer(4096, &body, "text/event-stream").await;
+        assert!(out.contains("\"content\":\"ok\""), "{reason}: {out}");
+        assert!(
+            out.contains("\"finish_reason\":\"stop\""),
+            "{reason}: {out}"
+        );
+        assert!(!out.contains("content_filter"), "{reason}: {out}");
+    }
+
+    let feedback_only = concat!(
+        "data: {\"promptFeedback\":{\"safetyRatings\":[{\"category\":\"HARM_CATEGORY_DANGEROUS_CONTENT\"}]}}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, feedback_only, "text/event-stream").await;
+    assert!(out.contains("\"content\":\"ok\""), "{out}");
+    assert!(!out.contains("upstream_error"), "{out}");
+
+    for (body, needle) in [
+        (
+            "data: {\"promptFeedback\":\"HOSTILE\"}\n\n",
+            "non-object Gemini promptFeedback",
+        ),
+        (
+            "data: {\"promptFeedback\":{\"blockReason\":1}}\n\n",
+            "non-string Gemini promptFeedback.blockReason",
+        ),
+        (
+            "data: {\"promptFeedback\":{\"blockReason\":\"WEIRD\"}}\n\n",
+            "unsupported Gemini promptFeedback.blockReason",
+        ),
+    ] {
+        let out = run_gemini_normalizer(4096, body, "text/event-stream").await;
+        assert!(out.contains("upstream_error"), "{body} => {out}");
+        assert!(out.contains(needle), "{body} => {out}");
+        assert!(!out.contains("HOSTILE") && !out.contains("WEIRD"), "{out}");
+    }
+}
+
+#[tokio::test]
+async fn test_gemini_hostile_framing_identity_and_parts_fail_closed() {
+    // Unrecognized framing first byte.
+    let out = run_gemini_normalizer(4096, "not-sse-or-json", "application/json").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(
+        out.contains("unrecognized Gemini/Vertex stream framing"),
+        "{out}"
+    );
+
+    // Empty JSON array is a complete no-candidate stream → premature EOF.
+    let empty_arr = run_gemini_normalizer(4096, "[]", "application/json").await;
+    assert!(empty_arr.contains("upstream_error"), "{empty_arr}");
+    assert!(
+        empty_arr.contains("before every candidate reached a terminal finishReason"),
+        "{empty_arr}"
+    );
+
+    // JSON value with escaped quotes still frames correctly.
+    let escaped = "{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"say \\\"hi\\\"\"}]},\"finishReason\":\"STOP\"}]}";
+    let esc_out = run_gemini_normalizer(3, escaped, "application/json").await;
+    assert!(
+        esc_out.contains("say \\\"hi\\\"") || esc_out.contains("say \"hi\""),
+        "{esc_out}"
+    );
+    assert!(esc_out.contains("\"finish_reason\":\"stop\""), "{esc_out}");
+
+    // SSE comments / event-name-only / provider [DONE] are ignored; content still normalizes.
+    let sse_noise = concat!(
+        ": keepalive\n\n",
+        "event: ping\n\n",
+        "data: [DONE]\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let noise_out = run_gemini_normalizer(5, sse_noise, "text/event-stream").await;
+    assert!(noise_out.contains("\"content\":\"ok\""), "{noise_out}");
+    assert!(!noise_out.contains("upstream_error"), "{noise_out}");
+
+    // Identity / candidates / nesting / functionCall hostiles.
+    let oversized_args = format!(
+        "data: {{\"candidates\":[{{\"index\":0,\"content\":{{\"role\":\"model\",\"parts\":[{{\"functionCall\":{{\"name\":\"lookup\",\"args\":{{\"blob\":\"{}\"}}}}}}]}},\"finishReason\":\"STOP\"}}]}}\n\n",
+        "B".repeat(300_000)
+    );
+    let deep_json = format!(
+        "data: {}1{}\n\n",
+        "{\"a\":".repeat(MAX_SSE_EVENT_JSON_DEPTH + 2),
+        "}".repeat(MAX_SSE_EVENT_JSON_DEPTH + 2)
+    );
+    let hostile: [(&str, &str); 13] = [
+        (
+            "data: {\"responseId\":\"synth\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"a\"}]}}]}\n\ndata: {\"responseId\":\"other\",\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n",
+            "responseId",
+        ),
+        (
+            "data: {\"modelVersion\":123,\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n",
+            "modelVersion",
+        ),
+        (
+            "data: {\"candidates\":\"not-array\"}\n\n",
+            "candidates that were not an array",
+        ),
+        (
+            "data: {\"candidates\":[\"scalar\"]}\n\n",
+            "non-object Gemini candidate",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":\"x\",\"finishReason\":\"STOP\"}]}\n\n",
+            "non-object content",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":\"x\"},\"finishReason\":\"STOP\"}]}\n\n",
+            "parts value that was not an array",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"t\",\"functionCall\":{\"name\":\"lookup\",\"args\":{}}}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "ambiguous Gemini content part",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{}},\"thought\":true}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "unrepresentable additional fields",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"bad name!\",\"args\":{}}}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "without a valid name",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":[1]}}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "without object args",
+        ),
+        (
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{}}}]},\"finishReason\":\"SAFETY\"}]}\n\n",
+            "function calls with a non-STOP finishReason",
+        ),
+        (
+            oversized_args.as_str(),
+            "oversized Gemini functionCall args",
+        ),
+        (deep_json.as_str(), "excessive JSON nesting"),
+    ];
+    for (body, needle) in hostile {
+        let out = run_gemini_normalizer(8192, body, "text/event-stream").await;
+        assert!(out.contains("upstream_error"), "needle={needle} out={out}");
+        assert!(
+            out.contains(needle),
+            "expected diagnostic containing {needle}: {out}"
+        );
+        assert!(
+            !out.contains("sk-gemini") && !out.contains("\"blob\""),
+            "must not echo secrets/args: {out}"
+        );
+        assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+    }
+
+    // Finish-only candidate (no content) remains valid.
+    let finish_only = "data: {\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n";
+    let fo = run_gemini_normalizer(4096, finish_only, "text/event-stream").await;
+    assert!(fo.contains("\"finish_reason\":\"stop\""), "{fo}");
+    assert!(!fo.contains("upstream_error"), "{fo}");
+}
+
+#[tokio::test]
+async fn test_gemini_gzip_brotli_and_buffered_normalization() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    // Residual gzip decoding through the Gemini normalizer arm.
+    {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+            PluginResult::Continue
+        ));
+        assert!(!resp_headers.contains_key("content-encoding"));
+        assert_eq!(
+            ctx.metadata
+                .get("ai_stream_router.provider_content_encoding")
+                .map(String::as_str),
+            Some("gzip")
+        );
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("gzip gemini inspector");
+        let encoded = gzip_bytes(GEMINI_SSE.as_bytes());
+        let mut collected = forwarded(inspector.on_chunk(&encoded).await);
+        collected.extend_from_slice(&forwarded(inspector.on_end().await));
+        let out = String::from_utf8(collected).unwrap();
+        assert!(out.contains("\"content\":\"Hello\""), "{out}");
+        assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+        assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+    }
+
+    // Residual brotli + buffered Gemini normalization path.
+    {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        resp_headers.insert("content-encoding".to_string(), "br".to_string());
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+            PluginResult::Continue
+        ));
+        let encoded = brotli_bytes(GEMINI_SSE.as_bytes());
+        let buffered = plugin
+            .normalize_response_body_with_context(
+                &mut ctx,
+                200,
+                &encoded,
+                Some("text/event-stream"),
+                &resp_headers,
+            )
+            .await
+            .expect("brotli buffered gemini normalize");
+        let out = String::from_utf8(buffered).unwrap();
+        assert!(out.contains("\"content\":\"Hello\""), "{out}");
+        assert!(out.contains("\"prompt_tokens\":10"), "{out}");
+        assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+    }
+
+    // Unsupported residual encoding fails closed with a fixed diagnostic.
+    {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        resp_headers.insert("content-encoding".to_string(), "zstd".to_string());
+        let reject = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        assert_eq!(reject_status(&reject), Some(502));
+        if let PluginResult::Reject { body, .. } = reject {
+            assert!(
+                body.contains("unsupported Content-Encoding")
+                    || body.contains("unsupported_content_encoding"),
+                "{body}"
+            );
+            assert!(
+                !body.contains("zstd"),
+                "must not echo encoding token: {body}"
+            );
+        }
+    }
+
+    // Identity buffered JSON array path covers Gemini NormalizeEngine::drive_*.
+    {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "application/json".to_string());
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+            PluginResult::Continue
+        ));
+        let buffered = plugin
+            .normalize_response_body_with_context(
+                &mut ctx,
+                200,
+                GEMINI_JSON_ARRAY.as_bytes(),
+                Some("application/json"),
+                &resp_headers,
+            )
+            .await
+            .expect("buffered json array normalize");
+        let out = String::from_utf8(buffered).unwrap();
+        assert!(out.contains("\"content\":\"Array\""), "{out}");
+        assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+    }
 }

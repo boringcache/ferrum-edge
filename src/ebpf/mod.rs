@@ -83,6 +83,12 @@ pub const BPF_MAP_SOCK_OPS_EVENTS: &str = "FERRUM_SOCK_OPS_EVENTS";
 /// ringbuf could not be reserved.
 pub const BPF_MAP_SOCK_OPS_STATS: &str = "FERRUM_SOCK_OPS_STATS";
 
+/// Bounded accepted-socket set carrying the SK_SKB first-data hook.
+pub const BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS: &str = "FERRUM_ACCEPT_FIRST_BYTE_SOCKETS";
+
+/// Accept timestamp/correlation phase keyed by accepted socket cookie.
+pub const BPF_MAP_ACCEPT_FIRST_BYTE_STATE: &str = "FERRUM_ACCEPT_FIRST_BYTE_STATE";
+
 /// Pinned path for the SOCK_OPS event ringbuf. Node-agent loads + pins;
 /// mesh-proxy opens by path. Both sides agree on the constant so no IPC is
 /// required.
@@ -90,6 +96,12 @@ pub const BPF_SOCK_OPS_EVENTS_PIN_PATH: &str = "/sys/fs/bpf/ferrum/sock_ops_even
 
 /// Pinned path for the SOCK_OPS dropped-events counter array.
 pub const BPF_SOCK_OPS_STATS_PIN_PATH: &str = "/sys/fs/bpf/ferrum/sock_ops_stats";
+
+/// Pinned path for the accepted-socket SockHash. The mesh-proxy ringbuf
+/// consumer removes an entry after a bounded userspace grace period, avoiding
+/// callback-lock recursion and the ringbuf-before-verdict completion race.
+pub const BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH: &str =
+    "/sys/fs/bpf/ferrum/accept_first_byte_sockets";
 
 /// Pinned path for the IPv4 original-destination map. Node-agent loads + pins;
 /// the node-waypoint mesh-proxy opens by path through the orig-dst bridge
@@ -102,6 +114,9 @@ pub const BPF_ORIG_DST6_PIN_PATH: &str = "/sys/fs/bpf/ferrum/orig_dst6";
 
 /// Program name of the SOCK_OPS kernel program in the ELF.
 pub const BPF_PROGRAM_SOCK_OPS: &str = "ferrum_sock_ops";
+
+pub const BPF_PROGRAM_FIRST_BYTE_PARSER: &str = "ferrum_first_byte_parser";
+pub const BPF_PROGRAM_FIRST_BYTE_VERDICT: &str = "ferrum_first_byte_verdict";
 
 /// Program name of the per-pod-veth direct-inbound guard classifier.
 pub const BPF_PROGRAM_TC_INBOUND: &str = "ferrum_tc_inbound";
@@ -916,9 +931,9 @@ pub trait EbpfBackend: Send + Sync {
     fn cleanup_all(&mut self) -> Result<(), String>;
 
     /// Attach the SOCK_OPS program to the cgroup root and pin the event
-    /// ringbuf + stats map at the well-known paths
-    /// (`BPF_SOCK_OPS_EVENTS_PIN_PATH`, `BPF_SOCK_OPS_STATS_PIN_PATH`) so
-    /// the mesh-proxy can open them by path.
+    /// ringbuf, stats map, and first-byte SockHash at their well-known paths
+    /// so the mesh-proxy can drain metrics and defer hook removal until after
+    /// the kernel callback returns.
     ///
     /// The caller decides whether failure is fatal. In NodeWaypoint mode this
     /// link is part of source-identity recovery, so startup refuses readiness

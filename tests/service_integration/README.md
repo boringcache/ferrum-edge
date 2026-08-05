@@ -2,11 +2,11 @@
 
 Functional integration tests for Ferrum's **external-middleware integrations** —
 the code paths that can only be validated against the **real third-party
-software** (a service registry, a directory server, a Kafka broker, …). Each
-backend runs as a local container via [`testcontainers`](https://docs.rs/testcontainers) (Docker)
-using free, open-source images. No managed or cloud service is ever involved,
-and every fixture seeds its own fully-controlled data so the assertions are
-deterministic.
+software** (a service registry, a directory server, a Kafka broker, an identity
+provider, …). Each backend runs as a local container via
+[`testcontainers`](https://docs.rs/testcontainers) (Docker) using free,
+open-source images. No managed or cloud service is ever involved, and every
+fixture seeds its own fully-controlled data so the assertions are deterministic.
 
 This is its own `[[test]]` crate (declared in the root `Cargo.toml`, entry point
 `mod.rs`), mirroring `tests/secrets_functional/`. It is **not** part of the
@@ -24,6 +24,8 @@ their *failure* path, leaving the real client logic uncovered:
 | **LDAP** (`src/plugins/ldap_auth.rs`) | `ldap3` bind / search-then-bind / group membership, via `create_plugin` → `authenticate` | functional test only pointed the plugin at an *unreachable* server (500 / 401 paths) | live OpenLDAP: valid/invalid direct bind, search-then-bind, group-membership allow (Continue) vs deny (403) |
 | **Kafka** (`src/plugins/kafka_logging.rs`) | librdkafka produce, delivery callbacks, consume-back, bounded finalize | deterministic unit tests for admission/CRL/budgets/finalize ownership; ignored optional broker harness | live Redpanda: successful ack + key/record consume, unknown-topic reject after admission, broker oversized reject, paused-broker delivery timeout, producer-queue saturation, successful and stalled finalize, multi-instance generation isolation, Drop/reload disposal with pending records |
 | **MySQL** (`src/config/migrations/mod.rs`, `src/config/db_loader.rs`) | custom-plugin DDL plus tracking under MySQL's implicit-commit rules; cross-namespace `config_change_locks` exclusive-lock acquisition; V001 identity-column collation | SQLite covered atomic migration behavior; MySQL SQL was previously inspected only as strings | live MySQL 8.4: failure after committed V1 DDL, exact index reconstruction on retry, V2 index/tracker-gap recovery, SQLx Any text bindings used by `example_audit_plugin`, a bounded cross-namespace writer race proving zero ER_LOCK_DEADLOCK 1213, and NFC/NFD consumer username inserts under `utf8mb4_0900_bin` (#2994) |
+| **OIDC** (`src/plugins/oidc_relying_party.rs`) | discovery, authorization-code + PKCE, JWKS/UserInfo/end-session, encrypted sessions, claim headers, idle/absolute expiry, refresh, logout | unit tests with wiremock IdP | live Ory Hydra: full browser challenge → callback session, state/correlation/nonce/issuer/audience/signature negatives (subject proven positively; `azp` multi-aud remains unit-covered), reserved-header protection, idle/absolute expiry with margin sleeps, refresh proven via token-facade `refresh_token` grant counter, RP logout (#3333) |
+| **OAuth2 introspection** (`src/plugins/oauth2_introspection.rs`) | RFC 7662 outbound introspect, discovery, cache, scope/role/audience, client auth, failure policy | unit tests with wiremock | live Hydra opaque tokens: active/inactive, scope/role/issuer/audience, `client_secret_basic` + `client_secret_post` request shaping observed on a non-secret facade, discovery facade (same-origin rewrite of admin introspect), cache hit/expiry proven by upstream-call counters without token-key leaks, timeout/malformed/oversized/wiremock-auth/unavailable → 503 (Hydra admin introspect does not enforce client auth) (#3333) |
 
 ## Running locally
 
@@ -36,6 +38,8 @@ cargo test --test service_integration consul
 cargo test --test service_integration ldap
 cargo test --test service_integration kafka
 cargo test --test service_integration mysql
+cargo test --test service_integration oidc
+cargo test --test service_integration oauth2_introspection
 ```
 
 The MySQL custom-plugin recovery test requires the pedagogical example at
@@ -61,19 +65,91 @@ rather than silently passing.
 | OpenLDAP | `osixia/openldap:1.5.0` | base `dc=example,dc=org`; test tree seeded via `ldapadd` exec (readiness handled by retry) |
 | Redpanda | `redpandadata/redpanda:v24.2.4` | Kafka API on external listener `127.0.0.1:<mapped-port>`; auto-topic-create disabled; readiness via librdkafka metadata; topics created with `rpk` |
 | MySQL | `mysql:8.4` | isolated `ferrum` database; readiness polled with the same SQLx Any driver used by migrations/runtime persistence |
+| Hydra | `oryd/hydra:v2.2.0` | `serve all --dev` with `DSN=memory`; ephemeral host ports for public (4444) and admin (4445); opaque access tokens; clients seeded via admin API; login/consent accepted through admin challenge APIs (no external IdP). Readiness polled via OIDC discovery + admin API |
 
 Readiness is confirmed by **active polling** (Consul leader endpoint; LDAP
-`ldapadd` retry; Redpanda metadata fetch; a MySQL connection), not by matching a
-startup log line —
+`ldapadd` retry; Redpanda metadata fetch; a MySQL connection; Hydra discovery),
+not by matching a startup log line —
 so the helpers do not depend on which stream a given image logs to.
 
 ## CI
 
 `.github/workflows/ci.yml` job `test-service-integration` runs on
-`ubuntu-latest` (Docker available). Consul, LDAP, Kafka, and MySQL run in one nextest
-`--no-fail-fast` invocation, which preserves per-test reporting and continues
-after one backend fails without allocating a second runner. It is wired into
-the `test` aggregation gate, so it blocks merge on failure.
+`ubuntu-latest` (Docker available). Consul, LDAP, Kafka, MySQL, OIDC, and
+OAuth2 introspection run in one nextest `--no-fail-fast` invocation, which
+preserves per-test reporting and continues after one backend fails without
+allocating a second runner. It is wired into the `test` aggregation gate, so it
+blocks merge on failure. Hydra (or any provider) startup failure is a hard
+failure in CI.
+
+## Hydra / OIDC / introspection runbook (#3333)
+
+Both `oidc` and `oauth2_introspection` modules share the Hydra fixture in
+`common/hydra.rs` but remain independently filterable.
+
+### Reproduce OIDC relying-party coverage
+
+```bash
+cargo test --test service_integration oidc
+```
+
+What it drives against live Hydra:
+
+1. Plugin constructed via `create_plugin("oidc_relying_party", …)` with
+   `discovery_url` pointed at Hydra's public well-known document.
+2. Browser challenge (`authenticate` → 302) after discovery becomes ready;
+   authorization URL must carry PKCE `code_challenge` / `S256`.
+3. Test process follows Hydra redirects, accepts login/consent via the admin
+   API (subject `alice`, email/roles seeded into the token session), and feeds
+   `code` + `state` + correlation cookie into `on_request_received`.
+4. Encrypted session cookie authenticates subsequent requests; claim headers
+   fan out; reserved `Authorization` mapping is rejected at config time;
+   client-supplied claim destinations are overwritten only with verified values.
+5. Negatives: wrong state, missing correlation cookie, nonce mismatch (Hydra
+   signs a different nonce than Ferrum stored), wrong issuer via explicit live
+   endpoints (signed-token `iss` rejection), wrong audience, and live token
+   endpoint + unrelated JWKS (signature failure). Subject is proven positively
+   via successful login; multi-audience `azp` enforcement remains unit-covered.
+6. Short idle/absolute TTLs observe re-challenge after margin sleeps that do
+   not slide the cookie first; a token facade shortens `expires_in` under a
+   valid `refresh_skew_secs <= ttl/2` config and asserts a real
+   `refresh_token` grant succeeded at Hydra and produced a newly sealed session
+   cookie; logout clears the session and targets Hydra's exact discovered
+   end-session origin/path.
+
+### Reproduce OAuth2 introspection coverage
+
+```bash
+cargo test --test service_integration oauth2_introspection
+```
+
+What it drives:
+
+1. Opaque access tokens from Hydra `client_credentials` and authorization-code
+   grants (asserted not to decode as a compact JWT; opaque serialization may
+   still contain `.` delimiters).
+2. Direct admin introspection URL (`/admin/oauth2/introspect`) with
+   `client_secret_basic` and `client_secret_post` configs (Hydra admin does
+   not enforce client auth; request shaping is observed on the facade).
+3. Discovery path through a same-origin facade that rewrites Hydra's discovery
+   document so `introspection_endpoint` shares scheme/host/port with discovery
+   (Ferrum's discovery origin check) while still proxying to live admin
+   introspect. The facade counts upstream calls and Basic vs form-secret
+   presence without recording secret values.
+4. Active/inactive outcomes, required scopes/roles, issuer/audience denial,
+   `ext.*` claim-header mapping from consent session extras, positive-cache
+   hit (no second upstream call) then post-TTL upstream refresh, without
+   logging raw tokens or client secrets.
+5. Failure policy: unavailable endpoint, wiremock timeout / malformed /
+   oversized / 401 client-auth responses → HTTP 503 per plugin contract; a
+   final live Hydra call proves no cross-test contamination. Wrong secrets
+   against Hydra admin introspect are not treated as an auth-failure proof.
+
+### Safety
+
+Never log or assert on raw client secrets, access/refresh tokens, authorization
+codes, session cookie values, private keys, or full provider error bodies.
+Fixture diagnostics are status/code oriented and length-bounded.
 
 ## Kafka acceptance split
 
@@ -117,9 +193,11 @@ Follow `common/containers.rs` (and `tests/secrets_functional/` for the
 cloud-SDK variant):
 
 1. Add a `start_<svc>_container()` (+ a small fixture struct) to
-   `common/containers.rs`. Prefer **active readiness polling** over a log-line
-   wait. Seed fixtures via the container's API or an `exec` (see the Consul
-   register helper, the LDAP `ldapadd` seeder, and the Redpanda `rpk` helper).
+   `common/containers.rs` (or a dedicated `common/<svc>.rs` module as with
+   Hydra). Prefer **active readiness polling** over a log-line wait. Seed
+   fixtures via the container's API or an `exec` (see the Consul register
+   helper, the LDAP `ldapadd` seeder, the Redpanda `rpk` helper, and the Hydra
+   admin client seeder).
 2. Add a `<svc>.rs` module and register it in `mod.rs`.
 3. Drive the **real** code: construct the plugin via
    `ferrum_edge::plugins::create_plugin(name, &config)` and call the relevant
@@ -127,11 +205,6 @@ cloud-SDK variant):
    directly (as `ConsulDiscoverer` is here).
 4. Add the module filter to the `test-service-integration` nextest invocation;
    the existing job row in the `test` gate summary covers the expanded suite.
-
-### Candidates / roadmap
-
-- **OIDC relying party / OAuth2 introspection** — login/session/introspection
-  flows. Use `ory/hydra` or `keycloak`.
 
 ### Better served by in-process fakes (no container)
 

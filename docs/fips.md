@@ -231,7 +231,7 @@ walks through, so all of the following are refused:
 | Injector admission webhook | `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` |
 | Mesh stream egress | `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true` |
 | Mesh identity | `FERRUM_MESH_ALLOW_NO_CA`, `FERRUM_MESH_ALLOW_STATIC_ID`, `FERRUM_MESH_CA_BOOTSTRAP_DEV` |
-| Config database | MongoDB config stores are refused in their entirety; SQL config stores still refuse their applicable verification opt-outs |
+| Config database | MongoDB config stores are refused in their entirety. For PostgreSQL and MySQL, an explicitly configured `FERRUM_DB_TLS_MODE` of `disable`, `allow`, `prefer`, or `require` is refused — none of them authenticate the server certificate chain — leaving `verify-ca` and `verify-full` as the only admitted values. When `FERRUM_DB_TLS_MODE` is unset, each of `FERRUM_DB_URL`, `FERRUM_DB_FAILOVER_URLS`, and `FERRUM_DB_READ_REPLICA_URL` must itself select a verifying mode (`sslmode=verify-ca`/`verify-full` for PostgreSQL; `ssl-mode=VERIFY_CA`/`VERIFY_IDENTITY` for MySQL); absent or weaker URL parameters are refused |
 | Backend, per upstream/proxy | `backend_tls_verify_server_cert: false` (this also covers the mesh `DestinationRule.trafficPolicy.tls.insecureSkipVerify` override, which is projected onto it before admission) |
 | `spec_expose` | `tls_no_verify: true` |
 | `load_testing` | `gateway_tls_no_verify` — refused when `gateway_tls` is on and it is not explicitly `false`, because it **defaults open** |
