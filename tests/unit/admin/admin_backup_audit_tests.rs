@@ -772,16 +772,8 @@ async fn concurrent_security_sensitive_admits_both_succeed() {
     .with_outcome(audit::outcome::SUCCESS);
 
     let (left, right) = tokio::join!(
-        audit::admit_security_sensitive_event(
-            None,
-            &first,
-            Some(dir.path()),
-        ),
-        audit::admit_security_sensitive_event(
-            None,
-            &second,
-            Some(dir.path()),
-        ),
+        audit::admit_security_sensitive_event(None, &first, Some(dir.path()),),
+        audit::admit_security_sensitive_event(None, &second, Some(dir.path()),),
     );
 
     let left_sink = left.expect("first concurrent admit");
@@ -791,10 +783,7 @@ async fn concurrent_security_sensitive_admits_both_succeed() {
 
     let listed = list_local_fallback_events(dir.path()).expect("list");
     assert_eq!(listed.len(), 2);
-    let ids: std::collections::HashSet<_> = listed
-        .iter()
-        .map(|event| event.id.as_str())
-        .collect();
+    let ids: std::collections::HashSet<_> = listed.iter().map(|event| event.id.as_str()).collect();
     assert!(ids.contains(first.id.as_str()));
     assert!(ids.contains(second.id.as_str()));
 }

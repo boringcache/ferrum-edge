@@ -124,12 +124,10 @@ const AUDIT_LOCAL_FALLBACK_DEFAULT_DIR: &str = "./ferrum-admin-audit";
 /// turning a stuck holder into a hung admin API. Both lock acquisitions share
 /// one deadline so the caller-visible worst case stays this bound, not the
 /// product of two independent waits.
-const LOCAL_FALLBACK_LOCK_WAIT: std::time::Duration =
-    std::time::Duration::from_millis(100);
+const LOCAL_FALLBACK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 /// Sleep between non-blocking lock retries. Short enough that a just-released
 /// holder is noticed quickly; long enough to avoid a tight spin.
-const LOCAL_FALLBACK_LOCK_RETRY: std::time::Duration =
-    std::time::Duration::from_millis(1);
+const LOCAL_FALLBACK_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
 #[cfg(windows)]
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 /// Win32 `ERROR_SHARING_VIOLATION` — another handle holds exclusive share mode.
@@ -3202,9 +3200,7 @@ fn acquire_local_fallback_process_lock(
             Ok(guard) => return Ok(guard),
             Err(TryLockError::WouldBlock) => {
                 if !sleep_until_lock_deadline(deadline) {
-                    return Err(anyhow!(
-                        "audit local fallback process lock contended"
-                    ));
+                    return Err(anyhow!("audit local fallback process lock contended"));
                 }
             }
             Err(TryLockError::Poisoned(_)) => {
@@ -3225,9 +3221,7 @@ pub(crate) fn hold_local_fallback_process_lock_for_test()
         Err(TryLockError::WouldBlock) => {
             Err(anyhow!("audit local fallback process lock contended"))
         }
-        Err(TryLockError::Poisoned(_)) => {
-            Err(anyhow!("audit local fallback lock poisoned"))
-        }
+        Err(TryLockError::Poisoned(_)) => Err(anyhow!("audit local fallback lock poisoned")),
     }
 }
 
@@ -3326,9 +3320,7 @@ fn acquire_fallback_file_lock(
         // `flock` does not access Rust-managed memory. Retry `LOCK_NB` against the
         // shared deadline rather than blocking `LOCK_EX` unboundedly (or relying
         // on signal/`alarm` tricks) so the bound stays explicit and portable.
-        let result = unsafe {
-            libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
-        };
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result == 0 {
             break;
         }
@@ -3336,9 +3328,7 @@ fn acquire_fallback_file_lock(
         let errno = error.raw_os_error();
         if errno == Some(libc::EWOULDBLOCK) || errno == Some(libc::EAGAIN) {
             if !sleep_until_lock_deadline(deadline) {
-                return Err(anyhow!(
-                    "audit local fallback cross-process lock contended"
-                ));
+                return Err(anyhow!("audit local fallback cross-process lock contended"));
             }
             continue;
         }
@@ -3396,9 +3386,7 @@ fn acquire_fallback_file_lock(
             .open(lock_path)
         {
             Ok(file) => break file,
-            Err(error)
-                if error.raw_os_error() == Some(WIN32_ERROR_SHARING_VIOLATION) =>
-            {
+            Err(error) if error.raw_os_error() == Some(WIN32_ERROR_SHARING_VIOLATION) => {
                 if !sleep_until_lock_deadline(deadline) {
                     return Err(anyhow!("audit local fallback cross-process lock contended"));
                 }
