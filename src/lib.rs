@@ -182,6 +182,19 @@ pub mod _test_support {
         ctx.mcp_trusted_tool_name_rewrite.is_none()
     }
 
+    /// Take the aggregate SSE frame receiver staged by `mcp_gateway` GET attach.
+    /// Production code moves this onto the normalized reject; tests drain it
+    /// directly to exercise the live multiplex path without a full proxy.
+    pub fn take_mcp_aggregate_sse_frames_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> Option<
+        tokio::sync::mpsc::Receiver<
+            Result<http_body::Frame<bytes::Bytes>, crate::proxy::body::BoxError>,
+        >,
+    > {
+        ctx.mcp_aggregate_sse_frames.take()
+    }
+
     /// Whether a routed `tools/call` pinned a private outputSchema validator.
     pub fn mcp_validate_tool_result_is_some_for_test(ctx: &crate::plugins::RequestContext) -> bool {
         ctx.mcp_validate_tool_result.is_some()
@@ -5492,6 +5505,7 @@ pub mod _test_support {
                 status.as_u16(),
             ),
             grpc_trailers: HashMap::new(),
+            streaming_frames: None,
         };
         crate::proxy::build_response_from_normalized_reject(reject)
             .into_parts()
@@ -5755,6 +5769,7 @@ pub mod _test_support {
             failed_websocket_handshake: normalized.failed_websocket_handshake,
             body_disposition: crate::proxy::headers::RejectBodyDisposition::default(),
             grpc_trailers: normalized.grpc_trailers.clone(),
+            streaming_frames: None,
         };
         crate::proxy::framed_unary_reject_parts(&production).map(|(_, t)| t.clone())
     }

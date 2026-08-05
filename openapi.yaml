@@ -24388,7 +24388,7 @@ components:
 
     McpGatewayConfig:
       type: object
-      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate-router mode also supports multiplexed SSE sessions: GET with Accept text/event-stream attaches one generation-scoped listener per live downstream session, routes events by bounded request/stream identity with queue/replay caps, and tears down on disconnect, session DELETE, or plugin reload/update/delete. Duplicate listeners, invalid/unknown/stale identities, and oversized Last-Event-ID values fail closed with field-specific value-redacted diagnostics. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
       required: [mode, endpoint, servers]
       properties:
         enabled:
@@ -24476,6 +24476,63 @@ components:
               default: 16384
               minimum: 1
               description: Maximum downstream MCP sessions retained by this plugin instance; oldest sessions are evicted when the cap is reached.
+            sse_multiplexing:
+              type: boolean
+              default: true
+              description: >-
+                Aggregate-router only. When true, GET with Accept text/event-stream
+                attaches a multiplexed SSE listener for the downstream session.
+                When false, aggregate GET keeps a 405 rejection. Transparent mode
+                ignores this flag and continues to forward GET upstream.
+            sse_max_streams_per_session:
+              type: integer
+              format: uint64
+              default: 64
+              minimum: 1
+              maximum: 4096
+              description: Max concurrent request-stream identities retained per downstream SSE session.
+            sse_max_queue_events:
+              type: integer
+              format: uint64
+              default: 128
+              minimum: 1
+              maximum: 16384
+              description: Max queued SSE events waiting for a listener (all streams combined).
+            sse_max_queue_bytes:
+              type: integer
+              format: uint64
+              default: 1048576
+              minimum: 1
+              maximum: 16777216
+              description: Aggregate retained payload budget for pending and replay SSE events.
+            sse_max_event_bytes:
+              type: integer
+              format: uint64
+              default: 262144
+              minimum: 1
+              maximum: 2097152
+              description: Max serialized JSON-RPC payload bytes admitted for one multiplexed SSE event.
+            sse_max_replay_events:
+              type: integer
+              format: uint64
+              default: 64
+              minimum: 0
+              maximum: 4096
+              description: Replay ring capacity for Last-Event-ID resume; 0 disables replay.
+            sse_max_stream_id_bytes:
+              type: integer
+              format: uint64
+              default: 128
+              minimum: 1
+              maximum: 512
+              description: Max UTF-8 bytes admitted for a JSON-RPC request id used as a stream identity.
+            sse_max_last_event_id_bytes:
+              type: integer
+              format: uint64
+              default: 64
+              minimum: 1
+              maximum: 1024
+              description: Max accepted Last-Event-ID header bytes; values are never logged.
         capabilities:
           type: object
           properties:

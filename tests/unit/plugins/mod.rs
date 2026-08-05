@@ -62,6 +62,7 @@ mod ldap_auth_tests;
 mod load_testing_tests;
 mod logging_sink_lifecycle_tests;
 mod loki_logging_tests;
+mod mcp_aggregate_sse_tests;
 mod mcp_gateway_tests;
 mod mesh_plugins_tests;
 mod metadata_redaction_contract_tests;

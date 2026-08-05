@@ -19259,6 +19259,12 @@ pub(crate) struct NormalizedRejectResponse {
     /// terminate). Ordinary trailers-only rejects leave this empty and keep
     /// terminal metadata in `headers`.
     pub(crate) grpc_trailers: HashMap<String, String>,
+    /// Optional multiplexed SSE frame source staged by `mcp_gateway`. When
+    /// present, [`build_response_from_normalized_reject`] builds a streaming
+    /// body and uses [`ClientResponseFraming::Streaming`] so no
+    /// `Content-Length` is published for the long-lived event stream.
+    pub(crate) streaming_frames:
+        Option<tokio::sync::mpsc::Receiver<Result<http_body::Frame<Bytes>, body::BoxError>>>,
 }
 
 /// Apply route policy to a gateway-generated plain HTTP response and then
@@ -19693,6 +19699,7 @@ pub(crate) fn normalize_reject_response_with_provenance(
             failed_websocket_handshake: false,
             body_disposition: headers_mod::RejectBodyDisposition::default(),
             grpc_trailers: HashMap::new(),
+            streaming_frames: None,
         };
     }
 
@@ -19802,6 +19809,7 @@ pub(crate) fn normalize_reject_response_with_provenance(
         // `grpc_status`; the disposition is unused on that branch.
         body_disposition: headers_mod::RejectBodyDisposition::default(),
         grpc_trailers: HashMap::new(),
+        streaming_frames: None,
     }
 }
 
@@ -19887,6 +19895,7 @@ fn build_framed_grpc_unary_reject(
         failed_websocket_handshake: false,
         body_disposition: headers_mod::RejectBodyDisposition::default(),
         grpc_trailers: trailers,
+        streaming_frames: None,
     }
 }
 
@@ -20024,6 +20033,7 @@ pub(crate) fn build_response_from_normalized_reject(
     let failed_websocket_handshake = reject.failed_websocket_handshake;
     let status = reject.http_status.as_u16();
     let is_framed_unary_reject = framed_unary_reject_parts(&reject).is_some();
+    let has_streaming_frames = reject.streaming_frames.is_some();
     let mut headers = reject.headers;
     // A failed WebSocket handshake is still an ordinary HTTP response (RFC 6455
     // §4.2.2), so it keeps its negotiated HTTP version and an authoritative
@@ -20043,8 +20053,12 @@ pub(crate) fn build_response_from_normalized_reject(
     // or a no-body status) selects `Head` framing. A native gRPC error is
     // trailers-only: gRPC never frames with Content-Length, so the field is
     // removed rather than invented as `0` or preserved from a plugin.
+    // Multiplexed aggregate SSE listeners are inherently streaming: never
+    // publish Content-Length for a long-lived event stream.
     let framing = if is_grpc_error {
         headers_mod::ClientResponseFraming::TrailersOnly
+    } else if has_streaming_frames {
+        headers_mod::ClientResponseFraming::Streaming
     } else {
         headers_mod::ClientResponseFraming::for_final_reject(
             status,
@@ -20056,7 +20070,9 @@ pub(crate) fn build_response_from_normalized_reject(
     let reject_builder = Response::builder().status(reject.http_status);
     let builder = headers_mod::apply_response_headers(reject_builder, &headers);
 
-    let body = if is_framed_unary_reject {
+    let body = if let Some(rx) = reject.streaming_frames {
+        body::inspected_streaming_body(rx)
+    } else if is_framed_unary_reject {
         let trailers = grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
         ProxyBody::buffered_grpc_with_trailers(reject.body, trailers)
     } else if reject.body.is_empty() {
@@ -22345,6 +22361,10 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     // reading plugin-controlled headers.
     normalized.body_disposition =
         headers_mod::RejectBodyDisposition::for_request(&ctx.method, status.as_u16());
+    // Aggregate MCP SSE listeners stage their frame source on the request
+    // context; move it onto the normalized reject exactly once so the response
+    // builder can emit a streaming body without Content-Length.
+    normalized.streaming_frames = ctx.mcp_aggregate_sse_frames.take();
     normalized
 }
 

@@ -223,6 +223,12 @@ struct McpSessionConfig {
     initialize_upstreams: InitializeStrategy,
     session_ttl: Duration,
     max_sessions: usize,
+    /// When true (default), aggregate-router GET with `Accept: text/event-stream`
+    /// attaches a multiplexed SSE listener. When false, GET keeps the legacy
+    /// 405 rejection so operators can disable multiplexing without changing
+    /// mode. Transparent mode never uses this flag.
+    sse_multiplexing: bool,
+    sse_bounds: super::mcp_aggregate_sse::AggregateSseBounds,
 }
 
 #[derive(Debug, Clone)]
@@ -622,6 +628,10 @@ pub struct McpGateway {
     // O(1) access to the same per-session catalog used for request routing
     // without retaining or logging the raw downstream session id.
     session_catalogs_by_hash: Arc<DashMap<String, Arc<RwLock<McpCatalog>>>>,
+    /// Multiplexed aggregate SSE broker. Generation-scoped with the plugin
+    /// instance: reload/update/delete drops this Arc and tears listeners down
+    /// so events cannot cross generations.
+    sse_broker: Arc<super::mcp_aggregate_sse::AggregateSseBroker>,
     policy: McpPolicy,
     validation: McpValidationConfig,
     observability: McpObservabilityConfig,
@@ -773,6 +783,11 @@ impl McpGateway {
             session_admission_lock: Arc::new(Mutex::new(())),
             session_store: Arc::new(DashMap::with_shard_amount(session_shard_amount)),
             session_catalogs_by_hash: Arc::new(DashMap::with_shard_amount(session_shard_amount)),
+            sse_broker: Arc::new(super::mcp_aggregate_sse::AggregateSseBroker::new(
+                sessions.sse_bounds.clone(),
+                sessions.max_sessions,
+                session_shard_amount,
+            )),
             policy,
             validation,
             observability,
@@ -1236,6 +1251,10 @@ impl McpGateway {
             );
             self.session_catalogs_by_hash
                 .insert(hash_str(&downstream_session_id), catalog);
+            // Pair the MCP session with a broker slot so a later GET can attach
+            // without racing initialize. Failure here only means the broker is
+            // at capacity; the MCP session itself remains usable for POST JSON.
+            let _ = self.sse_broker.ensure_session(&downstream_session_id);
             evicted
         };
 
@@ -1516,6 +1535,9 @@ impl McpGateway {
         if session.is_some() {
             self.session_catalogs_by_hash
                 .remove(&hash_str(downstream_session_id));
+            // End any attached SSE listener for this session without awaiting;
+            // the broker generation stays isolated to this plugin instance.
+            self.sse_broker.detach_session(downstream_session_id);
         }
         session
     }
@@ -1583,6 +1605,243 @@ impl McpGateway {
         };
         self.delete_upstream_sessions(session, ctx).await;
         true
+    }
+
+    /// Aggregate-router GET: attach a multiplexed SSE listener for the live
+    /// downstream session. Transparent mode never reaches this path.
+    async fn handle_aggregate_sse_get(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> PluginResult {
+        use super::mcp_aggregate_sse::{AggregateSseError, headers_request_aggregate_sse};
+
+        if !self.sessions.sse_multiplexing {
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            return PluginResult::Reject {
+                status_code: 405,
+                body: json!({"error": "aggregate MCP SSE multiplexing is disabled"}).to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+            };
+        }
+
+        if !headers_request_aggregate_sse(headers) {
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            ctx.metadata.insert(
+                "mcp.sse.error".to_string(),
+                "invalid_accept".to_string(),
+            );
+            return PluginResult::Reject {
+                status_code: AggregateSseError::InvalidAccept.http_status(),
+                body: json!({"error": AggregateSseError::InvalidAccept.as_static_reason()})
+                    .to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+            };
+        }
+
+        let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            ctx.metadata.insert(
+                "mcp.sse.error".to_string(),
+                "missing_session".to_string(),
+            );
+            return PluginResult::Reject {
+                status_code: AggregateSseError::MissingSession.http_status(),
+                body: json!({"error": AggregateSseError::MissingSession.as_static_reason()})
+                    .to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+            };
+        };
+
+        if !self.touch_downstream_session(&session_id, ctx).await {
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            ctx.metadata
+                .insert("mcp.sse.error".to_string(), "unknown_session".to_string());
+            return session_not_found_response();
+        }
+
+        let last_event_id = header_value(headers, "last-event-id");
+        // Never retain or log the raw Last-Event-ID; only length for correlation.
+        if let Some(raw) = last_event_id {
+            ctx.metadata
+                .insert("mcp.sse.leid_present".to_string(), "true".to_string());
+            ctx.metadata.insert(
+                "mcp.sse.leid_bytes".to_string(),
+                raw.len().to_string(),
+            );
+        }
+
+        match self
+            .sse_broker
+            .attach_listener(&session_id, last_event_id)
+            .await
+        {
+            Ok(rx) => {
+                ctx.mcp_aggregate_sse_frames = Some(rx);
+                ctx.metadata.insert(
+                    "mcp.route_decision".to_string(),
+                    "sse_listener".to_string(),
+                );
+                ctx.metadata
+                    .insert("mcp.session.downstream".to_string(), hash_str(&session_id));
+                PluginResult::Reject {
+                    status_code: 200,
+                    body: String::new(),
+                    headers: HashMap::from([
+                        (
+                            "content-type".to_string(),
+                            "text/event-stream".to_string(),
+                        ),
+                        ("cache-control".to_string(), "no-cache".to_string()),
+                        ("x-accel-buffering".to_string(), "no".to_string()),
+                    ]),
+                }
+            }
+            Err(error) => {
+                ctx.metadata
+                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+                ctx.metadata.insert(
+                    "mcp.sse.error".to_string(),
+                    match error {
+                        AggregateSseError::DuplicateListener => "duplicate_listener",
+                        AggregateSseError::LastEventIdTooLarge => "last_event_id_too_large",
+                        AggregateSseError::LastEventIdInvalid => "last_event_id_invalid",
+                        AggregateSseError::QueueOverflow => "queue_overflow",
+                        AggregateSseError::StaleSession | AggregateSseError::UnknownSession => {
+                            "unknown_session"
+                        }
+                        AggregateSseError::GenerationMismatch => "generation_mismatch",
+                        AggregateSseError::SessionCardinalityOverflow => {
+                            "session_cardinality_overflow"
+                        }
+                        _ => "sse_attach_failed",
+                    }
+                    .to_string(),
+                );
+                if matches!(
+                    error,
+                    AggregateSseError::UnknownSession | AggregateSseError::StaleSession
+                ) {
+                    return session_not_found_response();
+                }
+                PluginResult::Reject {
+                    status_code: error.http_status(),
+                    body: json!({"error": error.as_static_reason()}).to_string(),
+                    headers: HashMap::from([(
+                        "content-type".to_string(),
+                        "application/json".to_string(),
+                    )]),
+                }
+            }
+        }
+    }
+
+    /// When a live SSE listener is attached, publish a gateway-authored JSON-RPC
+    /// response onto the multiplexed stream and acknowledge the POST with 202.
+    /// Returns `None` when multiplexing was not requested / unavailable so the
+    /// caller keeps the ordinary JSON Reject path.
+    async fn maybe_deliver_via_sse(
+        &self,
+        ctx: &mut RequestContext,
+        session_id: &str,
+        stream_id: Option<&Value>,
+        response_body: &Value,
+    ) -> Option<PluginResult> {
+        use super::mcp_aggregate_sse::StreamIdentity;
+
+        if !self.sessions.sse_multiplexing {
+            return None;
+        }
+        if !self.sse_broker.has_listener(session_id).await {
+            return None;
+        }
+
+        let identity = match stream_id {
+            Some(id) => {
+                match StreamIdentity::from_json_rpc_id(
+                    id,
+                    self.sessions.sse_bounds.max_stream_id_bytes,
+                ) {
+                    Ok(identity) => Some(identity),
+                    Err(error) => {
+                        ctx.metadata.insert(
+                            "mcp.sse.error".to_string(),
+                            "stream_id_invalid".to_string(),
+                        );
+                        return Some(PluginResult::Reject {
+                            status_code: error.http_status(),
+                            body: json!({"error": error.as_static_reason()}).to_string(),
+                            headers: HashMap::from([(
+                                "content-type".to_string(),
+                                "application/json".to_string(),
+                            )]),
+                        });
+                    }
+                }
+            }
+            None => None,
+        };
+
+        if let Some(ref identity) = identity {
+            // Open is idempotent-fail on duplicate; ignore DuplicateStream so a
+            // response can still land on an already-opened stream.
+            match self.sse_broker.open_stream(session_id, identity.clone()).await {
+                Ok(()) | Err(super::mcp_aggregate_sse::AggregateSseError::DuplicateStream) => {}
+                Err(error) => {
+                    ctx.metadata.insert(
+                        "mcp.sse.error".to_string(),
+                        "stream_open_failed".to_string(),
+                    );
+                    return Some(PluginResult::Reject {
+                        status_code: error.http_status(),
+                        body: json!({"error": error.as_static_reason()}).to_string(),
+                        headers: HashMap::from([(
+                            "content-type".to_string(),
+                            "application/json".to_string(),
+                        )]),
+                    });
+                }
+            }
+        }
+
+        match self
+            .sse_broker
+            .publish(session_id, identity.as_ref(), response_body)
+            .await
+        {
+            Ok(_) => {
+                ctx.metadata.insert(
+                    "mcp.route_decision".to_string(),
+                    "sse_multiplex".to_string(),
+                );
+                Some(empty_response(202))
+            }
+            Err(error) => {
+                ctx.metadata
+                    .insert("mcp.sse.error".to_string(), "publish_failed".to_string());
+                Some(PluginResult::Reject {
+                    status_code: error.http_status(),
+                    body: json!({"error": error.as_static_reason()}).to_string(),
+                    headers: HashMap::from([(
+                        "content-type".to_string(),
+                        "application/json".to_string(),
+                    )]),
+                })
+            }
+        }
     }
 
     async fn request_upstream_json(
@@ -4191,15 +4450,112 @@ impl McpGateway {
                 if envelope.message_kind == McpMessageKind::Notification {
                     return empty_response(202);
                 }
-                json_response(
-                    200,
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": envelope.id.clone().unwrap_or(Value::Null),
-                        "result": {}
-                    }),
-                    None,
-                )
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": envelope.id.clone().unwrap_or(Value::Null),
+                    "result": {}
+                });
+                if let Some(session_id) = self.downstream_session_id_from_headers(headers)
+                    && let Some(delivered) = self
+                        .maybe_deliver_via_sse(ctx, &session_id, envelope.id.as_ref(), &body)
+                        .await
+                {
+                    return delivered;
+                }
+                json_response(200, body, None)
+            }
+            "notifications/cancelled" => {
+                // Cancel a multiplexed stream by request identity. Fail closed
+                // for missing/unknown/stale identities with field-specific,
+                // value-redacted diagnostics.
+                if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
+                    if !self.touch_downstream_session(&session_id, ctx).await {
+                        return session_not_found_response();
+                    }
+                    let request_id = envelope
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("requestId"));
+                    let Some(request_id) = request_id else {
+                        ctx.metadata.insert(
+                            "mcp.sse.error".to_string(),
+                            "stream_id_missing".to_string(),
+                        );
+                        ctx.metadata.insert(
+                            "mcp.route_decision".to_string(),
+                            "deny".to_string(),
+                        );
+                        return PluginResult::Reject {
+                            status_code: 400,
+                            body: json!({
+                                "error": super::mcp_aggregate_sse::AggregateSseError::StreamIdMissing
+                                    .as_static_reason()
+                            })
+                            .to_string(),
+                            headers: HashMap::from([(
+                                "content-type".to_string(),
+                                "application/json".to_string(),
+                            )]),
+                        };
+                    };
+                    match super::mcp_aggregate_sse::StreamIdentity::from_json_rpc_id(
+                        request_id,
+                        self.sessions.sse_bounds.max_stream_id_bytes,
+                    ) {
+                        Ok(identity) => {
+                            match self.sse_broker.cancel_stream(&session_id, &identity).await {
+                                Ok(()) => {
+                                    ctx.metadata.insert(
+                                        "mcp.route_decision".to_string(),
+                                        "sse_cancel".to_string(),
+                                    );
+                                    return empty_response(202);
+                                }
+                                Err(error) => {
+                                    ctx.metadata.insert(
+                                        "mcp.sse.error".to_string(),
+                                        "cancel_failed".to_string(),
+                                    );
+                                    ctx.metadata.insert(
+                                        "mcp.route_decision".to_string(),
+                                        "deny".to_string(),
+                                    );
+                                    return PluginResult::Reject {
+                                        status_code: error.http_status(),
+                                        body: json!({"error": error.as_static_reason()}).to_string(),
+                                        headers: HashMap::from([(
+                                            "content-type".to_string(),
+                                            "application/json".to_string(),
+                                        )]),
+                                    };
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            ctx.metadata.insert(
+                                "mcp.sse.error".to_string(),
+                                "stream_id_invalid".to_string(),
+                            );
+                            ctx.metadata.insert(
+                                "mcp.route_decision".to_string(),
+                                "deny".to_string(),
+                            );
+                            return PluginResult::Reject {
+                                status_code: error.http_status(),
+                                body: json!({"error": error.as_static_reason()}).to_string(),
+                                headers: HashMap::from([(
+                                    "content-type".to_string(),
+                                    "application/json".to_string(),
+                                )]),
+                            };
+                        }
+                    }
+                }
+                ctx.metadata.insert(
+                    "mcp.route_decision".to_string(),
+                    "synthetic_response".to_string(),
+                );
+                empty_response(202)
             }
             "tools/list" => {
                 let session_id = match self
@@ -4520,17 +4876,7 @@ impl Plugin for McpGateway {
                 }
                 return PluginResult::Continue;
             }
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
-            return PluginResult::Reject {
-                status_code: 405,
-                body: json!({"error": "aggregate MCP SSE multiplexing is not supported in V1"})
-                    .to_string(),
-                headers: HashMap::from([(
-                    "content-type".to_string(),
-                    "application/json".to_string(),
-                )]),
-            };
+            return self.handle_aggregate_sse_get(ctx, headers).await;
         }
 
         if ctx.method.eq_ignore_ascii_case("DELETE") {
@@ -6669,6 +7015,37 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
         initialize_upstreams,
         session_ttl: Duration::from_secs(session_ttl_seconds),
         max_sessions,
+        sse_multiplexing: optional_bool_from_object(sessions, "sse_multiplexing")?.unwrap_or(true),
+        sse_bounds: super::mcp_aggregate_sse::AggregateSseBounds {
+            max_streams_per_session: optional_u64_from_object(
+                sessions,
+                "sse_max_streams_per_session",
+            )?
+            .unwrap_or(super::mcp_aggregate_sse::DEFAULT_MAX_STREAMS_PER_SESSION as u64)
+                as usize,
+            max_queue_events: optional_u64_from_object(sessions, "sse_max_queue_events")?
+                .unwrap_or(super::mcp_aggregate_sse::DEFAULT_MAX_QUEUE_EVENTS as u64)
+                as usize,
+            max_queue_bytes: optional_u64_from_object(sessions, "sse_max_queue_bytes")?
+                .unwrap_or(super::mcp_aggregate_sse::DEFAULT_MAX_QUEUE_BYTES as u64)
+                as usize,
+            max_event_bytes: optional_u64_from_object(sessions, "sse_max_event_bytes")?
+                .unwrap_or(super::mcp_aggregate_sse::DEFAULT_MAX_EVENT_BYTES as u64)
+                as usize,
+            max_replay_events: optional_u64_from_object(sessions, "sse_max_replay_events")?
+                .unwrap_or(super::mcp_aggregate_sse::DEFAULT_MAX_REPLAY_EVENTS as u64)
+                as usize,
+            max_stream_id_bytes: optional_u64_from_object(sessions, "sse_max_stream_id_bytes")?
+                .unwrap_or(super::mcp_aggregate_sse::DEFAULT_MAX_STREAM_ID_BYTES as u64)
+                as usize,
+            max_last_event_id_bytes: optional_u64_from_object(
+                sessions,
+                "sse_max_last_event_id_bytes",
+            )?
+            .unwrap_or(super::mcp_aggregate_sse::DEFAULT_MAX_LAST_EVENT_ID_BYTES as u64)
+                as usize,
+        }
+        .validate()?,
     })
 }
 
