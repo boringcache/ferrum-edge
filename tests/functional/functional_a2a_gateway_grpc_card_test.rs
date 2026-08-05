@@ -45,7 +45,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use tokio_stream::wrappers::ReceiverStream;
 
 const PUBLIC_BASE: &str = "https://agents.example.com";
@@ -347,6 +347,7 @@ fn start_gateway(
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+        .env("FERRUM_ACCEPT_THREADS", "1")
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
@@ -616,20 +617,63 @@ impl Harness {
         Self::start_with(config_template(PUBLIC_BASE, true, r#"["0.3.0"]"#)).await
     }
 
-    /// Rewrite the config file and SIGHUP the RUNNING child, so what follows is
-    /// an assertion about the reloaded generation and not about a fresh start.
-    /// The backend keeps its port, so only the plugin config changes.
+    /// Rewrite the config file and SIGHUP the RUNNING child. Callers then poll
+    /// the behavior that proves the new generation is active; an unconditional
+    /// sleep is not a reload-completion signal and becomes flaky under runner
+    /// contention.
     #[cfg(unix)]
     async fn reload_with(&self, template: String) {
         write_config(&self.config_path, &render(&template, self.backend_port));
         let pid = self.gateway.id();
-        let _ = std::process::Command::new("kill")
+        let output = std::process::Command::new("kill")
             .args(["-HUP", &pid.to_string()])
-            .output();
-        sleep(Duration::from_secs(2)).await;
+            .output()
+            .expect("send SIGHUP to gateway");
+        assert!(
+            output.status.success(),
+            "sending SIGHUP to gateway failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
-    fn shutdown(mut self) {
+    /// Poll the live data path until one response proves a reload has taken
+    /// effect, or fail with the last observed response/error. This waits on the
+    /// actual behavior under test instead of guessing how long a runner needs.
+    #[cfg(unix)]
+    async fn wait_for_reloaded_call(
+        &self,
+        path: &str,
+        body: &[u8],
+        context: &str,
+        mut ready: impl FnMut(&GrpcCall) -> bool,
+    ) -> GrpcCall {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let last_observation = match send_grpc_request(&self.addr, path, body, &[]).await {
+                Ok(call) if ready(&call) => return call,
+                Ok(call) => format!(
+                    "HTTP {}, grpc-status {:?}, body {} bytes",
+                    call.status,
+                    call.terminal_grpc_status(),
+                    call.body.len()
+                ),
+                Err(error) => format!("request failed: {error}"),
+            };
+            assert!(
+                Instant::now() < deadline,
+                "{context}: reloaded behavior did not appear within 10 seconds; last observation: {last_observation}"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn shutdown(self) {
+        drop(self);
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
         let _ = self.gateway.kill();
         let _ = self.gateway.wait();
         self.backend.abort();
@@ -858,7 +902,7 @@ async fn a2a_grpc_card_rewrite_follows_a_reloaded_public_base() {
 
     let call = send_grpc_request(&harness.addr, &path, &body, &[])
         .await
-        .expect("gRPC call");
+        .expect("pre-reload gRPC call");
     assert_ok_message_carrying(&call, "pre-reload");
     assert_eq!(
         string_field(&single_frame_payload(&call.body), 3).as_deref(),
@@ -869,9 +913,16 @@ async fn a2a_grpc_card_rewrite_follows_a_reloaded_public_base() {
         .reload_with(config_template(ALTERNATE_PUBLIC_BASE, true, r#"["0.3.0"]"#))
         .await;
 
-    let call = send_grpc_request(&harness.addr, &path, &body, &[])
-        .await
-        .expect("gRPC call");
+    let expected_url = format!("{ALTERNATE_PUBLIC_BASE}/a2a");
+    let call = harness
+        .wait_for_reloaded_call(&path, &body, "public-base reload", |call| {
+            call.terminal_grpc_status() == "0"
+                && call
+                    .body
+                    .windows(expected_url.len())
+                    .any(|window| window == expected_url.as_bytes())
+        })
+        .await;
     assert_ok_message_carrying(&call, "post-reload");
     let message = single_frame_payload(&call.body);
     assert_eq!(
@@ -901,7 +952,7 @@ async fn a2a_grpc_card_rewrite_withdrawal_takes_effect_on_reload() {
 
     let call = send_grpc_request(&harness.addr, &path, &body, &[])
         .await
-        .expect("gRPC call");
+        .expect("pre-reload gRPC call");
     assert_ne!(
         call.body, body,
         "the rewrite must be active before withdrawal"
@@ -911,9 +962,11 @@ async fn a2a_grpc_card_rewrite_withdrawal_takes_effect_on_reload() {
         .reload_with(config_template(PUBLIC_BASE, false, r#"["0.3.0"]"#))
         .await;
 
-    let call = send_grpc_request(&harness.addr, &path, &body, &[])
-        .await
-        .expect("gRPC call");
+    let call = harness
+        .wait_for_reloaded_call(&path, &body, "rewrite withdrawal", |call| {
+            call.terminal_grpc_status() == "0" && call.body.as_slice() == body
+        })
+        .await;
     assert_ok_message_carrying(&call, "withdrawn rewrite");
     assert_eq!(
         call.body, body,
@@ -943,16 +996,23 @@ async fn a2a_grpc_card_version_allow_list_reload_admits_a_new_version() {
 
     let call = send_grpc_request(&harness.addr, &path, &body, &[])
         .await
-        .expect("gRPC call");
+        .expect("pre-reload gRPC call");
     assert_trailers_only_failure(&call, "0.3.7 before it is configured");
 
     harness
         .reload_with(config_template(PUBLIC_BASE, true, r#"["0.3.0", "0.3.7"]"#))
         .await;
 
-    let call = send_grpc_request(&harness.addr, &path, &body, &[])
-        .await
-        .expect("gRPC call");
+    let expected_url = format!("{PUBLIC_BASE}/a2a");
+    let call = harness
+        .wait_for_reloaded_call(&path, &body, "version allow-list reload", |call| {
+            call.terminal_grpc_status() == "0"
+                && call
+                    .body
+                    .windows(expected_url.len())
+                    .any(|window| window == expected_url.as_bytes())
+        })
+        .await;
     assert_ok_message_carrying(&call, "0.3.7 after it is configured");
     assert_eq!(
         string_field(&single_frame_payload(&call.body), 3).as_deref(),
