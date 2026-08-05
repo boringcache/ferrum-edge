@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `agent_card_protobuf_url_layout_mismatch`. Operators fronting a non-0.3 A2A
   backend should set `discovery.rewrite_agent_card_urls: false`; leaving it
   enabled refuses such cards rather than serving un-rewritten internal URLs.
+- `ai_semantic_firewall` streamed `inspect` mode now accepts
+  `streaming.window: tokens` with an explicitly selected bounded tokenizer
+  (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft
+  `max_window_tokens` / `overlap_tokens` budgets, and deterministic
+  complete-token cuts under the existing `max_window_bytes` memory/CPU cap
+  (issue #3302). Invalid or non-token-window uses of the new fields fail closed
+  with field-specific diagnostics; OpenAPI and `docs/plugins.md` stay in parity.
 - VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
   compile onto a shared precomputed `Proxy.stream_match` carrier and are

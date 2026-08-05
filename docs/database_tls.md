@@ -26,7 +26,7 @@ Ferrum Edge uses one database TLS env family for every database backend that has
 
 When `FERRUM_DB_TLS_MODE` is unset, Ferrum does not add or force database TLS settings. For production network databases, set `FERRUM_DB_TLS_MODE=verify-full` and provide the CA bundle needed to validate the database server certificate.
 
-Under enforced FIPS mode (`FERRUM_FIPS_MODE=enforce`), a PostgreSQL or MySQL config database may not be reached over an unauthenticated connection. An explicitly configured `FERRUM_DB_TLS_MODE` of `disable`, `allow`, `prefer`, or `require` refuses startup, because none of those modes validate the server certificate chain; only `verify-ca` and `verify-full` are admitted. See [FIPS mode](fips.md) for the full admission boundary.
+Under enforced FIPS mode (`FERRUM_FIPS_MODE=enforce`), a PostgreSQL or MySQL config database may not be reached over an unauthenticated connection. An explicitly configured `FERRUM_DB_TLS_MODE` of `disable`, `allow`, `prefer`, or `require` refuses startup, because none of those modes validate the server certificate chain; only `verify-ca` and `verify-full` are admitted. When `FERRUM_DB_TLS_MODE` is unset, each configured `FERRUM_DB_URL`, `FERRUM_DB_FAILOVER_URLS` entry, and `FERRUM_DB_READ_REPLICA_URL` must itself select a verifying mode (`sslmode=verify-ca` or `sslmode=verify-full` for PostgreSQL; `ssl-mode=VERIFY_CA` or `ssl-mode=VERIFY_IDENTITY` for MySQL) — absent or weaker URL parameters are refused the same way. See [FIPS mode](fips.md) for the full admission boundary.
 
 For PostgreSQL and MySQL mTLS, `FERRUM_DB_TLS_CLIENT_CERT_PATH` and `FERRUM_DB_TLS_CLIENT_KEY_PATH` must be set together. For MongoDB, `FERRUM_DB_TLS_CLIENT_CERT_PATH` may point to an already-combined client cert+key PEM when `FERRUM_DB_TLS_CLIENT_KEY_PATH` is omitted.
 
@@ -508,7 +508,9 @@ PostgreSQL requires the server key file to have `chmod 600` and be owned by the 
 
 ### Connection works without TLS env vars
 
-If the database URL already contains TLS parameters (for example, `?sslmode=require`), avoid also setting `FERRUM_DB_TLS_MODE` for that connection. For SQL backends (PostgreSQL/MySQL) the gateway logs a startup warning when it detects both sources — env-derived parameters are appended to the URL and duplicate driver options can conflict. For MongoDB the two sources are mutually exclusive: setting `FERRUM_DB_TLS_MODE` alongside a URI that carries TLS options (a `tls`/`ssl` query parameter or the `mongodb+srv://` implicit-TLS scheme) is a hard startup error, so configure MongoDB TLS in exactly one place.
+If the database URL already contains TLS parameters (for example, `?sslmode=verify-full`), avoid also setting `FERRUM_DB_TLS_MODE` for that connection. For SQL backends (PostgreSQL/MySQL) the gateway logs a startup warning when it detects both sources — env-derived parameters are appended to the URL and duplicate driver options can conflict. For MongoDB the two sources are mutually exclusive: setting `FERRUM_DB_TLS_MODE` alongside a URI that carries TLS options (a `tls`/`ssl` query parameter or the `mongodb+srv://` implicit-TLS scheme) is a hard startup error, so configure MongoDB TLS in exactly one place.
+
+Under enforced FIPS mode, URL-owned TLS is the supported alternative when `FERRUM_DB_TLS_MODE` is unset: every PostgreSQL/MySQL primary, failover, and read-replica URL must carry a verifying mode (`sslmode=verify-ca` / `sslmode=verify-full`, or MySQL `ssl-mode=VERIFY_CA` / `ssl-mode=VERIFY_IDENTITY`). A plain `postgres://…` / `mysql://…` URL, or one with a weaker mode such as `sslmode=require`, is refused at FIPS admission.
 
 ## Failover and Read Replica URLs
 
