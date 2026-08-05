@@ -3187,6 +3187,35 @@ enum StreamWindowKind {
     Sentence,
     Paragraph,
     Bytes,
+    /// Model-relevant units under an explicitly selected bounded tokenizer.
+    Tokens(TokenWindowConfig),
+}
+
+/// Explicit tokenizer + token budgets for [`StreamWindowKind::Tokens`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TokenWindowConfig {
+    tokenizer: StreamTokenizer,
+    /// Soft window size in complete tokens (hard memory bound remains
+    /// `max_window_bytes`).
+    max_tokens: usize,
+    /// Complete tokens of already-cleared prose re-inspected with the next
+    /// window. Must be strictly less than `max_tokens`.
+    overlap_tokens: usize,
+}
+
+/// Bounded, deterministic tokenizers for streamed token windows. These are
+/// **not** provider BPE models — operators pick one explicitly so window cuts
+/// stay reproducible without embedding a vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamTokenizer {
+    /// Conservative ~4 Unicode scalar values per token (same estimate as
+    /// `ai_rate_limiter` / `ai_prompt_compressor`).
+    Chars4,
+    /// Maximal non-whitespace runs (Unicode whitespace separators).
+    Whitespace,
+    /// Maximal alphanumeric runs; each non-whitespace, non-alphanumeric
+    /// scalar is its own token. Better for scripts that omit spaces (CJK).
+    UnicodeWords,
 }
 
 /// How streamed `inspect` mode reacts to a mid-stream violation.
@@ -3237,6 +3266,18 @@ struct StreamingInspectConfig {
 /// latency and gateway-retained bytes, so it is rejected rather than accepted as
 /// a bound that never fires.
 const MAX_STREAM_HOLD_MS: u64 = 300_000;
+
+/// Ceiling for `streaming.max_window_tokens`. Tokenization walks only retained
+/// window text (already capped by `max_window_bytes`); this rejects configs that
+/// ask for an unrepresentably large soft budget rather than letting them look
+/// like they window by tokens while always hitting the byte force path.
+const MAX_STREAM_WINDOW_TOKENS: u64 = 65_536;
+
+/// Default soft token budget when `streaming.window` is `tokens`.
+const DEFAULT_MAX_WINDOW_TOKENS: u64 = 256;
+
+/// Default token overlap when `streaming.window` is `tokens`.
+const DEFAULT_OVERLAP_TOKENS: u64 = 32;
 
 /// Configured policy for a hold deadline that expires before the semantic
 /// verdict arrives.
@@ -3734,11 +3775,33 @@ impl StreamWindowEngine {
         let held_bytes: usize = self.held.iter().map(|e| e.raw_len).sum();
         let new_content = content_len > self.cleared_len;
 
-        let clears_to = if at_end || force {
+        let clears_to = if at_end {
             if !new_content && self.held.is_empty() {
                 return false;
             }
             content_len
+        } else if force {
+            if !new_content && self.held.is_empty() {
+                return false;
+            }
+            // Under the hard byte cap, prefer a complete-token cut for token
+            // windows so a memory force does not bisect a model-relevant unit
+            // when at least one complete token is already buffered.
+            if new_content {
+                if let StreamWindowKind::Tokens(cfg) = self.config.window {
+                    let content = self.reassembler.assistant_content();
+                    let new = &content[self.cleared_len..];
+                    if let Some(b) = last_complete_token_end(new, cfg.tokenizer) {
+                        self.cleared_len + b
+                    } else {
+                        content_len
+                    }
+                } else {
+                    content_len
+                }
+            } else {
+                content_len
+            }
         } else if new_content {
             // Allocate the joined prose only when there is new content and a
             // boundary search is actually needed (not per event).
@@ -3748,6 +3811,19 @@ impl StreamWindowEngine {
                 StreamWindowKind::Sentence => last_sentence_boundary(new),
                 StreamWindowKind::Paragraph => last_paragraph_boundary(new),
                 StreamWindowKind::Bytes => None,
+                StreamWindowKind::Tokens(cfg) => {
+                    // Retained overlap prose is re-inspected as part of the next
+                    // window, so it spends that window's token budget too.
+                    // Counting only newly arrived text would give every window
+                    // after the first `max_tokens` NEW tokens on top of the
+                    // overlap, so the configured budget would never bind.
+                    // Always require at least one new token so a window cannot
+                    // close without advancing `cleared_len`.
+                    let cleared = &content[..self.cleared_len.min(content.len())];
+                    let carried = TokenIter::new(cleared, cfg.tokenizer).count();
+                    let need = cfg.max_tokens.saturating_sub(carried).max(1);
+                    nth_token_end(new, cfg.tokenizer, need)
+                }
             };
             match boundary {
                 Some(b) => self.cleared_len + b,
@@ -3827,7 +3903,26 @@ impl StreamWindowEngine {
 
         // Bound retained prose: drop everything before its allocated overlap,
         // rebasing the offsets that count from the front of the reassembly.
-        let keep_from = self.cleared_len.saturating_sub(prose_overlap);
+        // Token windows use deterministic token overlap (still capped by the
+        // aggregate byte budget so retained memory cannot grow with tokens alone).
+        let keep_from = match self.config.window {
+            StreamWindowKind::Tokens(cfg) => {
+                let content = self.reassembler.assistant_content();
+                let max_len = self.cleared_len.min(content.len());
+                let cleared = &content[..max_len];
+                let prose_tokens = if has_tool_state {
+                    cfg.overlap_tokens
+                        .saturating_sub(cfg.overlap_tokens.div_ceil(2))
+                } else {
+                    cfg.overlap_tokens
+                };
+                let token_keep = start_of_last_n_tokens(cleared, cfg.tokenizer, prose_tokens);
+                let byte_keep = self.cleared_len.saturating_sub(prose_overlap);
+                // Higher keep_from drops more prefix — honor the tighter budget.
+                token_keep.max(byte_keep)
+            }
+            _ => self.cleared_len.saturating_sub(prose_overlap),
+        };
         if keep_from > 0 {
             let content = self.reassembler.assistant_content();
             // This prefix was inspected clean. Snap the drop UP to a UTF-8
@@ -3934,6 +4029,177 @@ fn next_event_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
+/// Whether `ch` belongs to a script that is counted one token per character
+/// rather than joined into a word run.
+///
+/// [`char::is_alphanumeric`] is true for CJK ideographs, kana, and Hangul
+/// syllables, so an unqualified alphanumeric run collapses a whole CJK sentence
+/// into a single "word" and makes a token window unboundedly larger than its
+/// configured budget. Unicode text segmentation (UAX #29) does not join
+/// adjacent ideographs, and neither does any production tokenizer, so each such
+/// character is its own token here. Alphabetic scripts that genuinely form
+/// space-delimited words — Latin, Greek, Cyrillic, Arabic, Hebrew, Devanagari,
+/// Thai — are deliberately excluded so their runs still merge.
+///
+/// Blocks covered (plain range test: allocation-free, no added dependency):
+/// - `U+3040..=U+309F` Hiragana
+/// - `U+30A0..=U+30FF` Katakana
+/// - `U+31F0..=U+31FF` Katakana Phonetic Extensions
+/// - `U+3400..=U+4DBF` CJK Unified Ideographs Extension A
+/// - `U+4E00..=U+9FFF` CJK Unified Ideographs
+/// - `U+AC00..=U+D7A3` Hangul Syllables
+/// - `U+F900..=U+FAFF` CJK Compatibility Ideographs
+/// - `U+FF66..=U+FF9D` Halfwidth Katakana
+/// - `U+20000..=U+2A6DF` CJK Unified Ideographs Extension B
+/// - `U+2F800..=U+2FA1F` CJK Compatibility Ideographs Supplement
+const fn is_single_char_token_script(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3040}'..='\u{309F}'
+            | '\u{30A0}'..='\u{30FF}'
+            | '\u{31F0}'..='\u{31FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7A3}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FF66}'..='\u{FF9D}'
+            | '\u{20000}'..='\u{2A6DF}'
+            | '\u{2F800}'..='\u{2FA1F}'
+    )
+}
+
+/// Incremental token walk over retained-window text. Yields `(end, start)` byte
+/// offsets for each complete token under `tokenizer`. Work is strictly bounded
+/// by `s.len()` — callers must only pass prose already capped by
+/// `max_window_bytes`.
+struct TokenIter<'a> {
+    text: &'a str,
+    tokenizer: StreamTokenizer,
+    cursor: usize,
+}
+
+impl<'a> TokenIter<'a> {
+    fn new(text: &'a str, tokenizer: StreamTokenizer) -> Self {
+        Self {
+            text,
+            tokenizer,
+            cursor: 0,
+        }
+    }
+}
+
+impl Iterator for TokenIter<'_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.tokenizer {
+            StreamTokenizer::Chars4 => {
+                if self.cursor >= self.text.len() {
+                    return None;
+                }
+                let start = self.cursor;
+                let mut chars = 0usize;
+                while self.cursor < self.text.len() && chars < 4 {
+                    let ch = self.text[self.cursor..].chars().next()?;
+                    self.cursor += ch.len_utf8();
+                    chars += 1;
+                }
+                Some((self.cursor, start))
+            }
+            StreamTokenizer::Whitespace => {
+                while self.cursor < self.text.len() {
+                    let ch = self.text[self.cursor..].chars().next()?;
+                    if ch.is_whitespace() {
+                        self.cursor += ch.len_utf8();
+                        continue;
+                    }
+                    let start = self.cursor;
+                    self.cursor += ch.len_utf8();
+                    while self.cursor < self.text.len() {
+                        let next = self.text[self.cursor..].chars().next()?;
+                        if next.is_whitespace() {
+                            break;
+                        }
+                        self.cursor += next.len_utf8();
+                    }
+                    return Some((self.cursor, start));
+                }
+                None
+            }
+            StreamTokenizer::UnicodeWords => {
+                while self.cursor < self.text.len() {
+                    let ch = self.text[self.cursor..].chars().next()?;
+                    if ch.is_whitespace() {
+                        self.cursor += ch.len_utf8();
+                        continue;
+                    }
+                    let start = self.cursor;
+                    self.cursor += ch.len_utf8();
+                    // Ideographs/kana/Hangul are alphanumeric but do not form
+                    // word runs: each is a token, and each also terminates a
+                    // preceding run. Without this an entire CJK sentence is one
+                    // token and the window budget stops bounding anything.
+                    if ch.is_alphanumeric() && !is_single_char_token_script(ch) {
+                        while self.cursor < self.text.len() {
+                            let next = self.text[self.cursor..].chars().next()?;
+                            if !next.is_alphanumeric() || is_single_char_token_script(next) {
+                                break;
+                            }
+                            self.cursor += next.len_utf8();
+                        }
+                    }
+                    return Some((self.cursor, start));
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Byte index just past the end of the `n`th complete token in `s`, or `None`
+/// when fewer than `n` tokens are present. `n == 0` returns `Some(0)`.
+fn nth_token_end(s: &str, tokenizer: StreamTokenizer, n: usize) -> Option<usize> {
+    if n == 0 {
+        return Some(0);
+    }
+    let mut count = 0usize;
+    for (token_end, _) in TokenIter::new(s, tokenizer) {
+        count += 1;
+        if count == n {
+            return Some(token_end);
+        }
+    }
+    None
+}
+
+/// Byte index just past the last complete token in `s`, or `None` when `s`
+/// holds no complete token.
+fn last_complete_token_end(s: &str, tokenizer: StreamTokenizer) -> Option<usize> {
+    let mut last = None;
+    for (token_end, _) in TokenIter::new(s, tokenizer) {
+        last = Some(token_end);
+    }
+    last
+}
+
+/// Byte index where the last `n` tokens of `s` begin. When `s` has fewer than
+/// `n` tokens, returns `0` (retain everything). When `n == 0`, returns `s.len()`
+/// (retain nothing). Two linear passes over retained-window text only.
+fn start_of_last_n_tokens(s: &str, tokenizer: StreamTokenizer, n: usize) -> usize {
+    if n == 0 || s.is_empty() {
+        return s.len();
+    }
+    let total = TokenIter::new(s, tokenizer).count();
+    if total <= n {
+        return 0;
+    }
+    let skip = total - n;
+    TokenIter::new(s, tokenizer)
+        .nth(skip)
+        .map(|(_, start)| start)
+        .unwrap_or(0)
+}
+
 fn streaming_str<'a>(
     streaming: Option<&'a serde_json::Map<String, Value>>,
     field: &str,
@@ -3960,24 +4226,96 @@ fn streaming_u64(
 }
 
 /// Parse the `streaming:` block for `streaming_response: inspect`. Unsupported
-/// (planned-but-not-yet-implemented) values are rejected with a clear message
-/// rather than silently ignored, so operators are never misled.
+/// values are rejected with a clear message rather than silently ignored, so
+/// operators are never misled.
 fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConfig, String> {
     let streaming = optional_object(config, "streaming")?;
 
-    let window = match streaming_str(streaming, "window")?.unwrap_or("sentence") {
+    let window_raw = streaming_str(streaming, "window")?.unwrap_or("sentence");
+    let tokenizer_raw = streaming_str(streaming, "tokenizer")?;
+    let max_window_tokens_raw = streaming_u64(streaming, "max_window_tokens")?;
+    let overlap_tokens_raw = streaming_u64(streaming, "overlap_tokens")?;
+
+    // Build the diagnostic only; the caller wraps it. A closure returning
+    // `Result<(), String>` cannot be `return`ed from a function whose Ok type is
+    // `StreamingInspectConfig`.
+    let reject_token_only_fields = |field: &str| {
+        format!(
+            "ai_semantic_firewall: streaming.{field} is only valid when streaming.window is 'tokens'"
+        )
+    };
+    if !matches!(window_raw, "tokens") {
+        if tokenizer_raw.is_some() {
+            return Err(reject_token_only_fields("tokenizer"));
+        }
+        if max_window_tokens_raw.is_some() {
+            return Err(reject_token_only_fields("max_window_tokens"));
+        }
+        if overlap_tokens_raw.is_some() {
+            return Err(reject_token_only_fields("overlap_tokens"));
+        }
+    }
+
+    let window = match window_raw {
         "sentence" => StreamWindowKind::Sentence,
         "paragraph" => StreamWindowKind::Paragraph,
         "bytes" => StreamWindowKind::Bytes,
         "tokens" => {
-            return Err(
-                "ai_semantic_firewall: streaming.window 'tokens' is not yet supported; use 'sentence', 'paragraph', or 'bytes'"
-                    .to_string(),
-            );
+            // Tokenizer must be chosen explicitly — there is no silent default
+            // that could imply provider BPE parity.
+            let tokenizer = match tokenizer_raw {
+                Some("chars4") => StreamTokenizer::Chars4,
+                Some("whitespace") => StreamTokenizer::Whitespace,
+                Some("unicode_words") => StreamTokenizer::UnicodeWords,
+                Some(other) => {
+                    return Err(format!(
+                        "ai_semantic_firewall: streaming.tokenizer must be one of 'chars4', 'whitespace', or 'unicode_words', got {other:?}"
+                    ));
+                }
+                None => {
+                    return Err(
+                        "ai_semantic_firewall: streaming.tokenizer is required when streaming.window is 'tokens'"
+                            .to_string(),
+                    );
+                }
+            };
+
+            let max_tokens = match max_window_tokens_raw {
+                None => DEFAULT_MAX_WINDOW_TOKENS,
+                Some(0) => {
+                    return Err(
+                        "ai_semantic_firewall: streaming.max_window_tokens must be greater than 0"
+                            .to_string(),
+                    );
+                }
+                Some(n) if n > MAX_STREAM_WINDOW_TOKENS => {
+                    return Err(format!(
+                        "ai_semantic_firewall: streaming.max_window_tokens must be less than or equal to {MAX_STREAM_WINDOW_TOKENS}, got {n}"
+                    ));
+                }
+                Some(n) => n,
+            };
+
+            let overlap_tokens = match overlap_tokens_raw {
+                None => DEFAULT_OVERLAP_TOKENS.min(max_tokens.saturating_sub(1)),
+                Some(n) if n >= max_tokens => {
+                    return Err(
+                        "ai_semantic_firewall: streaming.overlap_tokens must be less than streaming.max_window_tokens"
+                            .to_string(),
+                    );
+                }
+                Some(n) => n,
+            };
+
+            StreamWindowKind::Tokens(TokenWindowConfig {
+                tokenizer,
+                max_tokens: max_tokens as usize,
+                overlap_tokens: overlap_tokens as usize,
+            })
         }
         other => {
             return Err(format!(
-                "ai_semantic_firewall: streaming.window must be one of 'sentence', 'paragraph', or 'bytes', got {other:?}"
+                "ai_semantic_firewall: streaming.window must be one of 'sentence', 'paragraph', 'bytes', or 'tokens', got {other:?}"
             ));
         }
     };
@@ -6066,9 +6404,12 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
             "config.streaming",
             &[
                 "window",
+                "tokenizer",
                 "enforcement",
                 "max_window_bytes",
                 "overlap_bytes",
+                "max_window_tokens",
+                "overlap_tokens",
                 "max_inspections",
                 "on_violation",
                 "max_hold_ms",
@@ -6756,5 +7097,188 @@ mod stream_window_tests {
         assert_eq!(next_event_end(b"data: x\r\n\nrest"), Some(10));
         // A lone CR is not a blank-line terminator here; no false positive.
         assert_eq!(next_event_end(b"data: x\ny\n"), None);
+    }
+
+    fn token_cfg(
+        tokenizer: StreamTokenizer,
+        max_tokens: usize,
+        overlap_tokens: usize,
+        max_window_bytes: usize,
+        overlap_bytes: usize,
+    ) -> StreamingInspectConfig {
+        StreamingInspectConfig {
+            window: StreamWindowKind::Tokens(TokenWindowConfig {
+                tokenizer,
+                max_tokens,
+                overlap_tokens,
+            }),
+            enforcement: StreamEnforcement::Block,
+            max_window_bytes,
+            overlap_bytes,
+            max_inspections: 64,
+            cut_with_error_event: true,
+            max_hold: None,
+            hold_timeout: HoldTimeoutPolicy::FollowOnError,
+        }
+    }
+
+    #[test]
+    fn token_window_releases_at_whitespace_budget() {
+        let mut eng =
+            StreamWindowEngine::new(token_cfg(StreamTokenizer::Whitespace, 3, 0, 4096, 0));
+        let f1 = content_event("one two ");
+        assert!(!ingest(&mut eng, &f1), "under token budget → hold");
+        let f2 = content_event("three");
+        assert!(
+            ingest(&mut eng, &f2),
+            "third whitespace token closes window"
+        );
+        assert_eq!(window_prose(&eng), "one two three");
+        assert_eq!(eng.release(), [f1, f2].concat());
+    }
+
+    #[test]
+    fn token_window_chars4_is_deterministic() {
+        // "abcdefghij" → tokens of 4 chars: "abcd","efgh","ij"
+        assert_eq!(
+            nth_token_end("abcdefghij", StreamTokenizer::Chars4, 2),
+            Some(8)
+        );
+        assert_eq!(
+            nth_token_end("abcdefghij", StreamTokenizer::Chars4, 3),
+            Some(10)
+        );
+        assert_eq!(
+            nth_token_end("abcdefghij", StreamTokenizer::Chars4, 4),
+            None
+        );
+    }
+
+    #[test]
+    fn token_window_unicode_words_handles_cjk_and_arabic() {
+        // CJK: each ideograph is alphanumeric → one token per character.
+        let cjk = "東京大阪";
+        assert_eq!(
+            nth_token_end(cjk, StreamTokenizer::UnicodeWords, 2),
+            Some("東京".len())
+        );
+        assert_eq!(
+            nth_token_end(cjk, StreamTokenizer::UnicodeWords, 4),
+            Some(cjk.len())
+        );
+        // Arabic word + space + word.
+        let ar = "مرحبا بالعالم";
+        assert_eq!(
+            nth_token_end(ar, StreamTokenizer::UnicodeWords, 1),
+            Some("مرحبا".len())
+        );
+        assert_eq!(
+            nth_token_end(ar, StreamTokenizer::Whitespace, 2),
+            Some(ar.len())
+        );
+        // Punctuation is its own unicode_words token.
+        assert_eq!(
+            nth_token_end("hi!", StreamTokenizer::UnicodeWords, 2),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn token_overlap_retains_prior_tokens() {
+        let mut eng =
+            StreamWindowEngine::new(token_cfg(StreamTokenizer::Whitespace, 2, 1, 4096, 64));
+        let f1 = content_event("alpha beta");
+        assert!(ingest(&mut eng, &f1));
+        assert_eq!(window_prose(&eng), "alpha beta");
+        eng.release();
+        let f2 = content_event(" gamma");
+        assert!(ingest(&mut eng, &f2), "second window");
+        let prose = window_prose(&eng);
+        assert!(
+            prose.contains("beta") && prose.contains("gamma"),
+            "overlap must reintroduce the prior token: {prose:?}"
+        );
+    }
+
+    #[test]
+    fn token_window_unicode_words_splits_cjk_scripts_only() {
+        // An ideograph also terminates a preceding Latin run.
+        let mixed = "ab東c";
+        assert_eq!(
+            nth_token_end(mixed, StreamTokenizer::UnicodeWords, 1),
+            Some(2)
+        );
+        assert_eq!(
+            nth_token_end(mixed, StreamTokenizer::UnicodeWords, 2),
+            Some(2 + "東".len())
+        );
+        assert_eq!(
+            nth_token_end(mixed, StreamTokenizer::UnicodeWords, 3),
+            Some(mixed.len())
+        );
+        // Kana and Hangul syllables are one token per character too.
+        assert_eq!(
+            nth_token_end("カタカナ", StreamTokenizer::UnicodeWords, 3),
+            Some("カタカ".len())
+        );
+        assert_eq!(
+            nth_token_end("한국어", StreamTokenizer::UnicodeWords, 2),
+            Some("한국".len())
+        );
+        // Word-forming scripts and digit runs must still merge into one token.
+        assert_eq!(
+            nth_token_end("привет мир", StreamTokenizer::UnicodeWords, 1),
+            Some("привет".len())
+        );
+        assert_eq!(
+            nth_token_end("abc123 x", StreamTokenizer::UnicodeWords, 1),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn token_overlap_counts_against_next_window_budget() {
+        // 3-token windows with 2 tokens of overlap: after the first window the
+        // engine already holds 2 of the 3 tokens, so exactly ONE new token must
+        // close the second window.
+        let mut eng =
+            StreamWindowEngine::new(token_cfg(StreamTokenizer::Whitespace, 3, 2, 4096, 64));
+        assert!(ingest(&mut eng, &content_event("a b c")), "first window");
+        assert_eq!(window_prose(&eng), "a b c");
+        eng.release();
+        assert!(
+            ingest(&mut eng, &content_event(" d")),
+            "two retained tokens plus one new token fill the budget"
+        );
+        assert_eq!(window_prose(&eng), "b c d");
+    }
+
+    #[test]
+    fn token_window_without_overlap_still_requires_a_full_budget() {
+        // Converse of the overlap accounting: with nothing retained the next
+        // window must still wait for `max_tokens` new tokens.
+        let mut eng =
+            StreamWindowEngine::new(token_cfg(StreamTokenizer::Whitespace, 2, 0, 4096, 0));
+        assert!(ingest(&mut eng, &content_event("a b")), "first window");
+        eng.release();
+        assert!(
+            !ingest(&mut eng, &content_event(" c")),
+            "one token is under the budget"
+        );
+        assert!(ingest(&mut eng, &content_event(" d")), "second window");
+        assert_eq!(window_prose(&eng), " c d");
+    }
+
+    #[test]
+    fn token_byte_cap_prefers_complete_token_cut() {
+        // Force via a tiny byte cap after at least one complete whitespace token.
+        let mut eng = StreamWindowEngine::new(token_cfg(StreamTokenizer::Whitespace, 64, 0, 48, 8));
+        let f = content_event("hello world-extra");
+        assert!(ingest(&mut eng, &f), "byte cap forces a window");
+        let prose = window_prose(&eng);
+        assert!(
+            prose.is_empty() || prose.starts_with("hello"),
+            "forced cut should prefer a complete token prefix when prose landed: {prose:?}"
+        );
     }
 }

@@ -2699,7 +2699,7 @@ fn test_upstream_references_none_ok() {
 }
 
 #[test]
-fn retry_proxy_rejects_required_mesh_transport_upstream_targets() {
+fn retry_proxy_allows_required_mesh_transport_upstream_targets() {
     for tag in ["mesh.hbone", "mesh.mtls"] {
         let mut upstream = make_upstream("mesh-upstream");
         upstream.targets[0]
@@ -2712,11 +2712,9 @@ fn retry_proxy_rejects_required_mesh_transport_upstream_targets() {
         config.upstreams = vec![upstream];
         config.proxies = vec![proxy];
 
-        let err = config.validate_upstream_references().unwrap_err();
         assert!(
-            err.iter()
-                .any(|msg| msg.contains("enables retry") && msg.contains(tag)),
-            "expected retry/{tag} conflict, got {err:?}"
+            config.validate_upstream_references().is_ok(),
+            "retry must be transport-neutral for {tag} targets"
         );
     }
 }
@@ -3145,9 +3143,9 @@ fn retry_proxy_allows_mesh_transport_target_outside_selected_subset() {
 }
 
 #[test]
-fn retry_proxy_rejects_boolish_truthy_mesh_transport_tags() {
-    // Runtime treats `1`/`yes`/`on` as truthy for mesh.hbone/mesh.mtls, so the
-    // validator must too (otherwise these pass admission then 502 at runtime).
+fn retry_proxy_allows_boolish_truthy_mesh_transport_tags() {
+    // Runtime treats `1`/`yes`/`on` as truthy for mesh.hbone/mesh.mtls and the
+    // per-attempt planner must preserve that transport after admission.
     for value in ["1", "yes", "YES", "on", "True"] {
         let mut upstream = make_upstream("mesh-upstream");
         upstream.targets[0]
@@ -3160,20 +3158,18 @@ fn retry_proxy_rejects_boolish_truthy_mesh_transport_tags() {
         config.upstreams = vec![upstream];
         config.proxies = vec![proxy];
 
-        let err = config.validate_upstream_references().unwrap_err();
         assert!(
-            err.iter()
-                .any(|msg| msg.contains("enables retry") && msg.contains("mesh.hbone")),
-            "expected retry/mesh.hbone conflict for tag value {value:?}, got {err:?}"
+            config.validate_upstream_references().is_ok(),
+            "truthy mesh transport tag {value:?} must remain retryable"
         );
     }
 }
 
 #[test]
-fn retry_proxy_rejects_mesh_service_discovery_upstream() {
+fn retry_proxy_allows_mesh_service_discovery_upstream() {
     // Mesh service-discovery upstreams have empty static targets at admission
-    // but later publish HBONE-required targets, so retry conflicts even though
-    // no static target carries a mesh tag.
+    // but later publish HBONE-required targets, so admission must remain
+    // transport-neutral even though no static target carries a mesh tag.
     let mut upstream = make_upstream("mesh-sd-upstream");
     upstream.targets.clear();
     upstream.service_discovery = Some(ferrum_edge::config::types::ServiceDiscoveryConfig {
@@ -3197,18 +3193,16 @@ fn retry_proxy_rejects_mesh_service_discovery_upstream() {
     config.upstreams = vec![upstream];
     config.proxies = vec![proxy];
 
-    let err = config.validate_upstream_references().unwrap_err();
     assert!(
-        err.iter()
-            .any(|msg| msg.contains("enables retry") && msg.contains("mesh.hbone")),
-        "expected retry/mesh service-discovery conflict, got {err:?}"
+        config.validate_upstream_references().is_ok(),
+        "ambient mesh service-discovery targets must support retry"
     );
 }
 
 #[test]
-fn retry_proxy_rejects_sidecar_topology_mesh_service_discovery_upstream() {
-    // Sidecar-topology mesh SD publishes `mesh.mtls`-required targets, so the
-    // admission conflict must name the mTLS transport, not HBONE.
+fn retry_proxy_allows_sidecar_topology_mesh_service_discovery_upstream() {
+    // Sidecar-topology mesh SD publishes `mesh.mtls`-required targets and must
+    // remain valid when retries are enabled.
     let mut upstream = make_upstream("mesh-sd-upstream");
     upstream.targets.clear();
     upstream.service_discovery = Some(ferrum_edge::config::types::ServiceDiscoveryConfig {
@@ -3232,19 +3226,14 @@ fn retry_proxy_rejects_sidecar_topology_mesh_service_discovery_upstream() {
     config.upstreams = vec![upstream];
     config.proxies = vec![proxy];
 
-    let err = config.validate_upstream_references().unwrap_err();
     assert!(
-        err.iter()
-            .any(|msg| msg.contains("enables retry") && msg.contains("mesh.mtls")),
-        "expected retry/mesh.mtls service-discovery conflict, got {err:?}"
+        config.validate_upstream_references().is_ok(),
+        "sidecar mesh service-discovery targets must support retry"
     );
 }
 
 #[test]
-fn retry_proxy_rejects_mesh_route_dispatch_override_upstream() {
-    // A plain default upstream but a mesh_route_dispatch rule that overrides the
-    // upstream to a mesh-tagged one must be rejected: matched requests would
-    // 502 at runtime.
+fn retry_proxy_allows_mesh_route_dispatch_override_upstream() {
     let plain = make_upstream("plain-upstream");
     let mut mesh = make_upstream("mesh-upstream");
     mesh.targets[0]
@@ -3281,12 +3270,9 @@ fn retry_proxy_rejects_mesh_route_dispatch_override_upstream() {
     config.proxies = vec![proxy];
     config.plugin_configs = vec![dispatch];
 
-    let err = config.validate_upstream_references().unwrap_err();
     assert!(
-        err.iter().any(|msg| msg.contains("enables retry")
-            && msg.contains("mesh-upstream")
-            && msg.contains("mesh.hbone")),
-        "expected retry/route-override conflict, got {err:?}"
+        config.validate_upstream_references().is_ok(),
+        "route override retries must resolve the selected mesh transport"
     );
 }
 
@@ -3319,8 +3305,7 @@ fn retry_proxy_allows_mesh_target_when_status_retries_miss_allowed_methods() {
 }
 
 #[test]
-fn retry_proxy_rejects_mesh_target_when_status_retries_hit_allowed_methods() {
-    // The same config but with an overlapping method (GET) is rejected.
+fn retry_proxy_allows_mesh_target_when_status_retries_hit_allowed_methods() {
     let mut upstream = make_upstream("mesh-upstream");
     upstream.targets[0]
         .tags
@@ -3339,11 +3324,9 @@ fn retry_proxy_rejects_mesh_target_when_status_retries_hit_allowed_methods() {
     config.upstreams = vec![upstream];
     config.proxies = vec![proxy];
 
-    let err = config.validate_upstream_references().unwrap_err();
     assert!(
-        err.iter()
-            .any(|msg| msg.contains("enables retry") && msg.contains("mesh.hbone")),
-        "expected retry/mesh conflict when status retries overlap allowed_methods, got {err:?}"
+        config.validate_upstream_references().is_ok(),
+        "status retries on admitted methods must preserve mesh transport"
     );
 }
 
@@ -3360,10 +3343,9 @@ fn mesh_target(host: &str, port: u16) -> UpstreamTarget {
 }
 
 #[test]
-fn retry_proxy_rejects_when_a_later_mesh_target_port_escapes_the_cap() {
-    // The LB can select ANY mesh target. Capping retry to 0 on the FIRST mesh
-    // target's port but leaving a second mesh target's port uncapped still 502s
-    // when the LB picks the second, so the conflict must be reported.
+fn retry_proxy_allows_when_a_later_mesh_target_port_keeps_retry_enabled() {
+    // The LB can select any mesh target. Capping retry to 0 on the first target
+    // must not prevent the second target from using its own retry policy.
     use ferrum_edge::config::types::ResolvedPortOverride;
     let mut upstream = make_upstream("mesh-upstream");
     upstream.targets = vec![mesh_target("a.local", 8080), mesh_target("b.local", 9090)];
@@ -3382,11 +3364,9 @@ fn retry_proxy_rejects_when_a_later_mesh_target_port_escapes_the_cap() {
     config.upstreams = vec![upstream];
     config.proxies = vec![proxy];
 
-    let err = config.validate_upstream_references().unwrap_err();
     assert!(
-        err.iter()
-            .any(|msg| msg.contains("enables retry") && msg.contains("9090")),
-        "expected conflict from the uncapped mesh target on port 9090, got {err:?}"
+        config.validate_upstream_references().is_ok(),
+        "each target port resolves its retry and mesh policy at dispatch"
     );
 }
 
@@ -3496,7 +3476,7 @@ fn retry_proxy_allows_mesh_service_discovery_when_selected_policy_port_caps_retr
 }
 
 #[test]
-fn retry_proxy_rejects_same_upstream_dispatch_rule_that_adds_retry() {
+fn retry_proxy_allows_same_upstream_dispatch_rule_that_adds_retry() {
     // Base proxy has NO retry, but a mesh_route_dispatch rule pointing at the
     // SAME (mesh-tagged) default upstream adds its own retry. Runtime applies
     // that rule retry via `route_override_retry` before dispatch, so those
@@ -3540,12 +3520,9 @@ fn retry_proxy_rejects_same_upstream_dispatch_rule_that_adds_retry() {
     config.proxies = vec![proxy];
     config.plugin_configs = vec![dispatch];
 
-    let err = config.validate_upstream_references().unwrap_err();
     assert!(
-        err.iter().any(|msg| msg.contains("enables retry")
-            && msg.contains("mesh-upstream")
-            && msg.contains("mesh.hbone")),
-        "expected same-upstream rule-added-retry conflict, got {err:?}"
+        config.validate_upstream_references().is_ok(),
+        "route-local retry must preserve the selected mesh transport"
     );
 }
 
@@ -3616,9 +3593,9 @@ fn retry_proxy_allows_when_local_dispatch_shadows_conflicting_global() {
 }
 
 #[test]
-fn retry_proxy_still_rejects_unshadowed_global_dispatch_to_mesh() {
+fn retry_proxy_allows_unshadowed_global_dispatch_to_mesh() {
     // Control for the shadow test: with NO local dispatch, the global rule does
-    // apply and the conflict must be reported.
+    // applies and must remain retryable.
     let plain = make_upstream("plain-upstream");
     let mut mesh = make_upstream("mesh-upstream");
     mesh.targets[0]
@@ -3652,17 +3629,14 @@ fn retry_proxy_still_rejects_unshadowed_global_dispatch_to_mesh() {
     config.proxies = vec![proxy];
     config.plugin_configs = vec![global_dispatch];
 
-    let err = config.validate_upstream_references().unwrap_err();
     assert!(
-        err.iter().any(|msg| msg.contains("enables retry")
-            && msg.contains("mesh-upstream")
-            && msg.contains("mesh.hbone")),
-        "expected unshadowed global dispatch conflict, got {err:?}"
+        config.validate_upstream_references().is_ok(),
+        "global route overrides must support mesh transport retry"
     );
 }
 
 #[test]
-fn retry_proxy_still_rejects_foreign_namespace_global_dispatch() {
+fn retry_proxy_allows_foreign_namespace_global_dispatch() {
     let plain = make_upstream("plain-upstream");
     let mut mesh = make_upstream("mesh-upstream");
     mesh.targets[0]
@@ -3699,15 +3673,11 @@ fn retry_proxy_still_rejects_foreign_namespace_global_dispatch() {
     // `PluginScope::Global` is gateway-wide at runtime — `PluginCache` merges
     // the single global list into every proxy in every namespace — so a
     // tenant-b global dispatch rule DOES run on this proxy and its
-    // retry/mesh-transport conflict must still be reported. Namespace
-    // qualification applies to association and proxy_id resolution, not to
-    // global-scope applicability.
-    let err = config.validate_upstream_references().unwrap_err();
+    // transport-neutral retry behavior still applies. Namespace qualification
+    // applies to association and proxy_id resolution, not global applicability.
     assert!(
-        err.iter().any(|msg| msg.contains("enables retry")
-            && msg.contains("mesh-upstream")
-            && msg.contains("mesh.hbone")),
-        "expected cross-namespace global dispatch conflict, got {err:?}"
+        config.validate_upstream_references().is_ok(),
+        "gateway-wide route overrides must support mesh transport retry"
     );
 }
 

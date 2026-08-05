@@ -45,8 +45,24 @@ fn request_builders_share_owned_forwarding_strip_predicate() {
     // must call the shared ownership predicate (not a local string arm that
     // can drift). Covers reqwest primary + retry, direct H2, HBONE, mesh-mTLS,
     // H1/H2→native-H3, and H3-frontend→H3-backend builders.
+    //
+    // HBONE / mesh-mTLS builders strip through
+    // `strip_proxy_owned_forwarding_headers`, the HeaderMap counterpart of the
+    // string-map filters; that helper must itself call the shared predicate.
     let proxy_src = include_str!("../../../src/proxy/mod.rs");
     let h3_server_src = include_str!("../../../src/http3/server.rs");
+
+    let strip_helper_start = proxy_src
+        .find("fn strip_proxy_owned_forwarding_headers(")
+        .expect("strip_proxy_owned_forwarding_headers must remain present");
+    let strip_helper = proxy_src[strip_helper_start..]
+        .split("/// Build the outbound X-Forwarded-For header value.")
+        .next()
+        .expect("strip helper must be bounded");
+    assert!(
+        strip_helper.contains("is_proxy_owned_forwarding_header"),
+        "HeaderMap strip helper must use is_proxy_owned_forwarding_header"
+    );
 
     let sites = [
         (
@@ -101,9 +117,12 @@ fn request_builders_share_owned_forwarding_strip_predicate() {
             .find(end_marker)
             .unwrap_or_else(|| panic!("{label}: missing end marker `{end_marker}`"));
         let region = &src[start..start + end_rel];
+        let uses_shared_predicate = region.contains("is_proxy_owned_forwarding_header");
+        let uses_shared_helper = region.contains("strip_proxy_owned_forwarding_headers");
         assert!(
-            region.contains("is_proxy_owned_forwarding_header"),
-            "{label} must strip via is_proxy_owned_forwarding_header before regenerating Forwarded"
+            uses_shared_predicate || uses_shared_helper,
+            "{label} must strip via is_proxy_owned_forwarding_header \
+             (directly or via strip_proxy_owned_forwarding_headers) before regenerating Forwarded"
         );
         // Reqwest-style append paths previously used the XFF-only predicate and
         // left client Forwarded in place; forbid that regression.

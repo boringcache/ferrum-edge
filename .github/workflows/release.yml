@@ -138,6 +138,9 @@ jobs:
           # on any required `multicluster.*` live assertion that is missing,
           # failed, or skipped.
           wait_for_success "multicluster-federation-live.yml" "Multicluster Federation Live Datapath"
+          # Poller generation retirement and bounded last-good expiry are a
+          # release boundary independently of the static federation datapath.
+          wait_for_success "multicluster-poller-partition-live.yml" "Multicluster Poller Partition Live"
 
   build-release-binaries:
     name: Build (${{ matrix.asset_name }})

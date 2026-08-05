@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callback-lock recursion, raced handoff, stale state, and `ktime` wrap from
   fabricating samples. The metric has fixed microsecond buckets with saturating
   count/bucket counters, drops sum overflow, and adds no per-flow labels (#3309).
+- `ai_semantic_firewall` streamed `inspect` mode now accepts
+  `streaming.window: tokens` with an explicitly selected bounded tokenizer
+  (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft
+  `max_window_tokens` / `overlap_tokens` budgets, and deterministic
+  complete-token cuts under the existing `max_window_bytes` memory/CPU cap
+  (issue #3302). Invalid or non-token-window uses of the new fields fail closed
+  with field-specific diagnostics; OpenAPI and `docs/plugins.md` stay in parity.
 - VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
   compile onto a shared precomputed `Proxy.stream_match` carrier and are
@@ -80,6 +87,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Ferrum now returns `None` and turns locality-first preference off for that
   slice (fail closed). Previously the result was ordering-dependent. Same-SPIFFE
   local siblings that agree, or a single matching workload, are unchanged.
+
+- A required two-control-plane/two-data-plane multicluster poller gate now uses
+  verified TLS/mTLS, audience-bound per-remote credentials, and four independent
+  Toxiproxy links to live-verify last-good retention, independent trust/endpoint
+  expiry, fail-closed traffic, same-generation recovery, bounded/redacted metric
+  parity, and in-flight `RemoteCluster` retirement without stale reinstall.
+
+- `/metrics` no longer replays stale mesh observability samples. The
+  `prometheus_metrics` render cache (`render_cache_ttl_seconds`, default 5s) is
+  invalidated only by producers the registry owns, but the mesh federation,
+  remote-discovery, mesh identity/config, and xDS families are process-static
+  and could not invalidate it — so any scrape landing inside the TTL of a
+  previous scrape replayed frozen counters and stale cached-bundle age gauges.
+  A real trust/discovery partition could therefore come and go while
+  `ferrum_mesh_federation_poll_failures_total` and
+  `ferrum_mesh_remote_discovery_poll_failures_total` reported no increment at
+  all. These families are now rendered live on every scrape, matching the
+  existing treatment of the NodeWaypoint ADR series.
 
 - Audited admin mutations are durable **before they run** (issue #2421).
   The admin write gate fsyncs a pre-mutation audit intent — a stable event id

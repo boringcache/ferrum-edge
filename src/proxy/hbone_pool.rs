@@ -217,8 +217,10 @@ impl HbonePoolError {
                 }
             }
             Self::TlsHandshake { .. } => ErrorClass::TlsError,
-            Self::H2Handshake { .. }
-            | Self::InvalidConnectRequest { .. }
+            // The H2 handshake completes before any CONNECT/application
+            // request is opened, so immutable retry bodies are safe to replay.
+            Self::H2Handshake { .. } => ErrorClass::ConnectionPoolError,
+            Self::InvalidConnectRequest { .. }
             | Self::ConnectStream { .. }
             | Self::ConnectRejected { .. }
             | Self::ExtendedConnectUnsupported { .. } => ErrorClass::ProtocolError,

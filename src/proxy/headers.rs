@@ -562,10 +562,56 @@ pub fn merge_proxy_headers_and_strip_for_grpc(
     headers: &mut http::HeaderMap,
     proxy_headers: &std::collections::HashMap<String, String>,
 ) {
+    merge_proxy_headers_preserving_repeated(headers, proxy_headers);
+    strip_backend_request_headers_for_grpc(headers);
+}
+
+/// Merge the plugin-facing materialized header view over the pristine inbound
+/// `HeaderMap` without collapsing unchanged repeated field lines.
+///
+/// Native gRPC and secured mesh replay both need this representation boundary:
+/// the `HashMap<String, String>` is the authoritative plugin-mutated view, but
+/// it cannot itself represent repeated metadata. When its folded value still
+/// matches the pristine field-line sequence, retain the raw entries exactly;
+/// when a plugin changed the value, replace every raw entry with that mutation.
+/// Reserved gateway assertions are always removed from the untrusted raw base
+/// before an authenticated value from `proxy_headers` may be layered back on.
+///
+/// **`proxy_headers` is the AUTHORITATIVE REMOVAL SET.** A raw field line whose
+/// name is absent from `proxy_headers` is treated as a plugin removal and is
+/// dropped. That is required for replay correctness — otherwise a plugin's
+/// header removal is resurrected from the pristine map on every attempt — but it
+/// means a caller that passes a PARTIAL map silently deletes every raw header
+/// the map does not mention. Always pass the fully materialized
+/// [`crate::plugins::RequestContext::headers`] view; a prebuilt or filtered map
+/// needs its own merge helper (see `merge_proxy_headers_for_prebuilt_h3_grpc`).
+///
+/// One consequence: `materialize_headers` omits non-UTF-8 header values, so a
+/// field line carrying legal HTTP obs-text that is not valid UTF-8 is absent
+/// from `proxy_headers` and is therefore dropped here. For native gRPC this is
+/// inert (metadata must be ASCII, or base64 via `-bin`), but any future caller
+/// on a path that must forward arbitrary bytes byte-exact has to exempt those
+/// entries from the removal pass rather than reuse this helper as-is.
+pub fn merge_proxy_headers_preserving_repeated(
+    headers: &mut http::HeaderMap,
+    proxy_headers: &std::collections::HashMap<String, String>,
+) {
     // Drop client-supplied reserved assertion headers from the raw base BEFORE
     // the merge, so a verified gateway value carried in `proxy_headers`
     // (post-auth) is layered back on and preserved.
     strip_reserved_gateway_assertion_headers(headers);
+
+    // The materialized map is the authoritative post-plugin view. A missing
+    // key therefore represents a plugin removal, not permission to resurrect
+    // the pristine inbound value from the replay snapshot.
+    let removed: Vec<http::HeaderName> = headers
+        .keys()
+        .filter(|name| !proxy_headers.contains_key(name.as_str()))
+        .cloned()
+        .collect();
+    for name in removed {
+        headers.remove(name);
+    }
 
     for (k, v) in proxy_headers {
         let Ok(name) = http::HeaderName::from_bytes(k.as_bytes()) else {
@@ -574,11 +620,15 @@ pub fn merge_proxy_headers_and_strip_for_grpc(
         if raw_header_values_match_materialized(headers, &name, v) {
             continue;
         }
+        // The materialized map remains authoritative even when a plugin has
+        // produced a value that cannot be represented on the wire. Remove the
+        // pristine field set before parsing the replacement so invalid output
+        // is dropped instead of resurrecting the client's original value.
+        headers.remove(&name);
         if let Ok(val) = http::HeaderValue::from_str(v) {
             headers.insert(name, val);
         }
     }
-    strip_backend_request_headers_for_grpc(headers);
 }
 
 /// Returns `true` for headers that must NOT cross the backend-response trust
@@ -2171,6 +2221,7 @@ mod tests {
         // through the dispatch pipeline). Includes a hop-by-hop set the
         // client supplied — the bug was these survived the strip.
         let mut proxy_headers = std::collections::HashMap::new();
+        proxy_headers.insert("content-type".to_string(), "application/grpc".to_string());
         proxy_headers.insert("proxy-authorization".to_string(), "Bearer leak".to_string());
         proxy_headers.insert("proxy-connection".to_string(), "close".to_string());
         proxy_headers.insert("connection".to_string(), "keep-alive".to_string());
@@ -2221,8 +2272,10 @@ mod tests {
             http::header::CONTENT_TYPE,
             http::HeaderValue::from_static("application/grpc"),
         );
-        let proxy_headers: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+        let proxy_headers = std::collections::HashMap::from([(
+            "content-type".to_string(),
+            "application/grpc".to_string(),
+        )]);
 
         merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
 
@@ -2299,6 +2352,49 @@ mod tests {
         assert_eq!(
             headers.get("x-consumer-custom-id"),
             Some(&http::HeaderValue::from_static("real-id"))
+        );
+    }
+
+    #[test]
+    fn repeated_preserving_merge_honors_plugin_removal_and_replacement() {
+        let mut headers = http::HeaderMap::new();
+        headers.append("x-remove", http::HeaderValue::from_static("one"));
+        headers.append("x-remove", http::HeaderValue::from_static("two"));
+        headers.append("x-keep", http::HeaderValue::from_static("alpha"));
+        headers.append("x-keep", http::HeaderValue::from_static("beta"));
+        headers.append("x-rewrite", http::HeaderValue::from_static("old-one"));
+        headers.append("x-rewrite", http::HeaderValue::from_static("old-two"));
+        headers.append("x-invalid", http::HeaderValue::from_static("client-one"));
+        headers.append("x-invalid", http::HeaderValue::from_static("client-two"));
+        let proxy_headers = std::collections::HashMap::from([
+            ("x-keep".to_string(), "alpha, beta".to_string()),
+            ("x-rewrite".to_string(), "plugin-value".to_string()),
+            ("x-invalid".to_string(), "plugin\ninvalid".to_string()),
+        ]);
+
+        merge_proxy_headers_preserving_repeated(&mut headers, &proxy_headers);
+
+        assert!(headers.get("x-remove").is_none());
+        assert_eq!(
+            headers
+                .get_all("x-keep")
+                .iter()
+                .map(|value| value.as_bytes())
+                .collect::<Vec<_>>(),
+            vec![b"alpha".as_slice(), b"beta".as_slice()]
+        );
+        assert_eq!(
+            headers
+                .get_all("x-rewrite")
+                .iter()
+                .map(|value| value.as_bytes())
+                .collect::<Vec<_>>(),
+            vec![b"plugin-value".as_slice()],
+            "a plugin rewrite must replace the pristine repeated field set"
+        );
+        assert!(
+            headers.get("x-invalid").is_none(),
+            "an invalid plugin rewrite must drop the pristine client field set"
         );
     }
 
