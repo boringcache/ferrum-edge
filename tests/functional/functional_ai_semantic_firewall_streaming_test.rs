@@ -974,12 +974,8 @@ async fn inspect_mode_cuts_stream_when_hold_deadline_expires() {
     // verdict that never arrives.
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, CLEAN_SSE));
     let embeddings = tokio::spawn(start_stalled_embeddings_backend_on(embeddings_listener));
-    let gateway = start_in_process_gateway(hold_timeout_config(
-        backend_port,
-        embeddings_port,
-        "cut",
-    ))
-    .await;
+    let gateway =
+        start_in_process_gateway(hold_timeout_config(backend_port, embeddings_port, "cut")).await;
 
     let client = reqwest::Client::new();
     let started = std::time::Instant::now();
