@@ -21,11 +21,10 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     probe_compact_recovery_retry_for_tests, probe_empty_dead_letter_publish_for_tests,
     probe_shared_spool_batch_clone_for_tests, probe_streaming_replay_batch_range_errors_for_tests,
     probe_streaming_spool_reader_defensive_paths_for_tests, publish_dead_letter_payload_for_tests,
-    publish_dead_letter_payload_replacing_prior_for_tests,
-    reconcile_active_spool_usage_for_tests, render_prometheus, render_status_json,
-    replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
-    replay_spool_once_with_ceiling_for_tests, serialize_json_each_row,
-    serialize_json_each_row_projected, set_spool_write_hook_for_tests,
+    publish_dead_letter_payload_replacing_prior_for_tests, reconcile_active_spool_usage_for_tests,
+    render_prometheus, render_status_json, replay_spool_once_for_tests,
+    replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
+    serialize_json_each_row, serialize_json_each_row_projected, set_spool_write_hook_for_tests,
     spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
     spool_decompression_limit_for_tests, spool_index_entry_bytes_for_tests,
     spool_split_worklist_max_entries_for_tests, spool_streaming_limits_for_tests,
@@ -9047,9 +9046,8 @@ fn dead_letter_replace_decrements_usage_for_prior_rejected_artifacts() {
         "payload replace must decrement exactly the prior length before adding the new payload"
     );
 
-    let meta_path =
-        write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
-            .expect("initial dead-letter metadata should publish");
+    let meta_path = write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
+        .expect("initial dead-letter metadata should publish");
     let before_meta = spool.cached_stats_for_tests();
     let prior_meta_len = fs::metadata(&meta_path).unwrap().len();
     assert!(

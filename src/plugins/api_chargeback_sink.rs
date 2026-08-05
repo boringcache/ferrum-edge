@@ -10568,13 +10568,7 @@ pub fn publish_dead_letter_payload_for_tests(
     source_path: &Path,
     row: &[u8],
 ) -> Result<PathBuf, String> {
-    publish_dead_letter_payload_inner_for_tests(
-        spool,
-        source_path,
-        row,
-        None,
-    )
-    .map(|(path, _)| path)
+    publish_dead_letter_payload_inner_for_tests(spool, source_path, row, None).map(|(path, _)| path)
 }
 
 /// Publish a dead-letter payload after planting an accounted prior final.
@@ -10594,12 +10588,7 @@ pub fn publish_dead_letter_payload_replacing_prior_for_tests(
     row: &[u8],
     prior_payload: &[u8],
 ) -> Result<(PathBuf, SpoolStats), String> {
-    publish_dead_letter_payload_inner_for_tests(
-        spool,
-        source_path,
-        row,
-        Some(prior_payload),
-    )
+    publish_dead_letter_payload_inner_for_tests(spool, source_path, row, Some(prior_payload))
 }
 
 fn publish_dead_letter_payload_inner_for_tests(
