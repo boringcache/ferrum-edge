@@ -45,7 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused and the previously accepted slice stays live), with diagnostics that
   name the field and index and never echo the operator-supplied value. Focused
   Rust integration and Istio conformance tests verify visibility, lookup tiers,
-  hostile-input rejection/redaction, and native/xDS carrier parity.
+  hostile-input rejection/redaction, and native/xDS carrier parity, and a
+  functional suite runs the shipped `ferrum-edge` binary against a real
+  multi-namespace destination to prove the decision ON THE WIRE: a rule
+  exported only to the destination's own namespace does not change a
+  subscriber in another namespace, the same rule exported mesh-wide from the
+  root namespace does, and a client-namespace rule wins outright over visible
+  service- and root-namespace rules. The `mesh-e2e-sidecar` kind/SPIRE
+  assertions for these two rows stay `live_deferred` because Trusted Cross
+  policy forbids changing that suite's executable and configuration surfaces
+  from this change.
 
   The target-service tier is granted only on evidence of ownership: an
   in-cluster Service confirmed by the service inventory or pinned by a
@@ -122,6 +131,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolution. An upstream whose targets span two services previously collapsed
   the two independent lookups into one upstream-wide minimum, silently skipping
   the only rule the second host had.
+
+- xDS ACK-time carrier validation now covers every `exportTo`-bearing carrier
+  family, not just the reserved DestinationRule shape. A LEGACY (non-reserved
+  name) DestinationRule carrier — recognized by its inner `type_url`, so
+  genuinely unrelated ECDS extension configs are untouched — gets the same
+  fail-closed structural and `export_to` validation the reserved shape gets, and
+  the `VirtualServiceCorsPoliciesCarrier` entries' `export_to` lists are
+  validated at the ACK boundary too. Previously both were ACKed and normalized,
+  and a malformed value only surfaced later as a policy that was silently
+  dropped or matched nothing; now the response NACKs, the ECDS accumulator rolls
+  back, and the last accepted slice keeps serving. Rejection diagnostics name
+  the carrier field and the offending index, are capped at eight per rejected
+  carrier, and never echo the carrier-supplied value.
 
 - `exportTo` entries on the DestinationRule, ServiceEntry, and
   VirtualService-CORS xDS carriers are canonicalized (trimmed) at decode. The

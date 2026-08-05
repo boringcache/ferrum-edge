@@ -590,9 +590,11 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
     // RequestAuth JWT, DR connectTimeout + maxConnections, VS CORS, SPIFFE
     // identity plumbing, and the native MeshSubscribe config transport are
     // ENFORCED and emitted by tests/k8s/mesh_e2e_sidecar/run.sh. DestinationRule
-    // export visibility and lookup hierarchy remain semantically GA-gated but
-    // live-deferred because Trusted Cross policy forbids changing that suite's
-    // executable/configuration surfaces from this PR.
+    // export visibility and lookup hierarchy remain deferred FOR THIS SUITE
+    // because Trusted Cross policy forbids changing its executable/configuration
+    // surfaces from this PR; their real multi-namespace datapath acceptance runs
+    // the shipped binary in tests/functional/functional_mesh_mode_test.rs
+    // instead, which is not a kind/SPIRE artifact this validator reads.
     let contract = load_contract().expect("real contract loads");
     let sidecar_rows: Vec<_> = contract
         .ga_capabilities()

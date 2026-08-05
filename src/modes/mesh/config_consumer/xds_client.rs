@@ -1243,9 +1243,15 @@ fn reverse_translate(
     // GAP-2K: Recover full `MeshDestinationRule` semantics from ECDS resources
     // carrying the Ferrum-specific DR carrier type_url. Ferrum CP emits one
     // reserved carrier per admitted DR; legacy operator-authored non-reserved
-    // carriers remain best-effort compatibility inputs. Resources with other
-    // inner type_urls are silently skipped — they belong to unrelated
-    // extension configs.
+    // carriers keep their historic ROUTING compatibility (a non-reserved name
+    // is still accepted, and cross-namespace ones are skipped rather than
+    // rejected), but they are no longer best-effort on CONTENT: any resource
+    // declaring the DR type_url has already passed
+    // `validate_ecds_destination_rule_carrier` at the ACK boundary, so a
+    // malformed payload or an invalid `export_to` NACKed the response and never
+    // reaches here. The lenient arms below are retained as defense in depth.
+    // Resources with other inner type_urls are silently skipped — they belong
+    // to unrelated extension configs.
     let mut destination_rules = Vec::new();
     let mut dr_carrier_seen = false;
     for resource in accumulator.resources(ECDS_TYPE_URL) {
@@ -1754,42 +1760,125 @@ fn retain_visible_cors_policies(
     retained
 }
 
+/// Cap on how many per-entry validation diagnostics one rejected ECDS carrier
+/// may emit. The messages themselves are fixed-shape and echo no
+/// carrier-supplied value, but a hostile producer can still send many carriers
+/// each carrying many invalid entries; the NACK `error_detail` and the operator
+/// log line must stay bounded regardless.
+const XDS_CARRIER_DIAGNOSTIC_LIMIT: usize = 8;
+
+/// Join accumulated carrier diagnostics into one bounded rejection reason.
+fn join_bounded_carrier_errors(errors: Vec<String>) -> String {
+    let total = errors.len();
+    if total <= XDS_CARRIER_DIAGNOSTIC_LIMIT {
+        return errors.join("; ");
+    }
+    let shown = errors
+        .into_iter()
+        .take(XDS_CARRIER_DIAGNOSTIC_LIMIT)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let suppressed = total - XDS_CARRIER_DIAGNOSTIC_LIMIT;
+    format!("{shown}; (+{suppressed} more errors suppressed)")
+}
+
 fn validate_ecds_mesh_slice_carrier(resource: &AccumulatedResource) -> Result<(), String> {
     let typed_extension = decode_ecds_typed_extension(resource)?;
     let Some(inner) = mesh_slice_carrier_inner(resource, &typed_extension, true)? else {
         return Ok(());
     };
-    if let Err(e) = crate::xds::carrier::MeshSliceCarrier::decode(&inner.type_url, &inner.value) {
-        return Err(format!(
+    match crate::xds::carrier::MeshSliceCarrier::decode(&inner.type_url, &inner.value) {
+        Ok(Some(carrier)) => validate_recognized_mesh_slice_carrier(&carrier),
+        Ok(None) => Ok(()),
+        Err(e) => Err(format!(
             "xDS mesh-slice ECDS carrier '{}' failed JSON decode for '{}': {e}",
             typed_extension.name, inner.type_url
-        ));
+        )),
     }
-    Ok(())
 }
 
-fn validate_ecds_destination_rule_carrier(resource: &AccumulatedResource) -> Result<(), String> {
-    let Some((namespace, name)) = reserved_destination_rule_carrier_name(&resource.name)? else {
+/// Content validation for a recognized mesh-slice carrier, at the ACK boundary.
+///
+/// Decoding proves the carrier's SHAPE; it does not prove that the
+/// security-relevant fields inside it are supported. The VirtualService CORS
+/// carrier gained an `exportTo` list (issue #2465) whose evaluator is the same
+/// one that bounds DestinationRule visibility, so it gets the same fail-closed
+/// treatment the reserved DestinationRule carrier already had: an unsupported
+/// or self-conflicting list NACKs the ECDS response, `handle_ads_response`
+/// restores the accumulator snapshot, and the last accepted slice keeps
+/// serving. Without this the carrier is ACKed and the bad list only becomes
+/// visible later, as a silently non-matching (or over-matching) policy.
+///
+/// Diagnostics name the carrier field and the offending INDEX only — never the
+/// carrier-supplied namespace, name, host, or `exportTo` value.
+fn validate_recognized_mesh_slice_carrier(
+    carrier: &crate::xds::carrier::MeshSliceCarrier,
+) -> Result<(), String> {
+    use crate::xds::carrier::MeshSliceCarrier;
+    let MeshSliceCarrier::VirtualServiceCorsPolicies(policies) = carrier else {
         return Ok(());
     };
+    let mut errors = Vec::new();
+    for (index, policy) in policies.iter().enumerate() {
+        crate::modes::mesh::config::validate_mesh_export_to(
+            &format!("xDS VirtualService CORS carrier[{index}]"),
+            &policy.export_to,
+            &mut errors,
+        );
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(join_bounded_carrier_errors(errors))
+    }
+}
+
+/// ACK-time validation for EVERY recognized DestinationRule ECDS carrier —
+/// reserved (Ferrum CP) and legacy/non-reserved (operator- or third-party-CP
+/// authored) alike.
+///
+/// "Recognized" is decided by the INNER `type_url` only, so a genuinely
+/// unrelated extension config keeps riding the ECDS stream untouched and an
+/// unknown resource name is never reinterpreted as a DestinationRule. But a
+/// resource that DOES declare Ferrum's DestinationRule type_url is a
+/// DestinationRule by its producer's own declaration, so a malformed payload or
+/// an unsupported `export_to` list is a structural error at the ACK boundary,
+/// not a best-effort skip: it NACKs, `handle_ads_response` rolls the
+/// accumulator back, and last-known-good stays active. Skipping instead would
+/// let a malformed same-namespace legacy carrier be ACKed and normalized, and
+/// only later become inert — i.e. traffic served with the operator's policy
+/// silently missing (fail-open).
+///
+/// Diagnostics are fixed-shape and never echo the carrier-supplied `export_to`
+/// value.
+fn validate_ecds_destination_rule_carrier(resource: &AccumulatedResource) -> Result<(), String> {
+    let reserved = reserved_destination_rule_carrier_name(&resource.name)?;
     let typed_extension = decode_ecds_typed_extension(resource)?;
     let Some(inner) = destination_rule_carrier_inner(resource, &typed_extension)? else {
         return Ok(());
     };
     let dr = serde_json::from_slice::<MeshDestinationRule>(&inner.value).map_err(|e| {
-        format!(
-            "xDS reserved DestinationRule ECDS carrier '{}' failed JSON decode: {e}",
-            typed_extension.name
-        )
+        if reserved.is_some() {
+            format!(
+                "xDS reserved DestinationRule ECDS carrier '{}' failed JSON decode: {e}",
+                typed_extension.name
+            )
+        } else {
+            format!(
+                "xDS DestinationRule ECDS carrier '{}' failed JSON decode: {e}",
+                typed_extension.name
+            )
+        }
     })?;
-    validate_reserved_destination_rule_carrier_name(&resource.name, namespace, name, &dr)?;
+    if let Some((namespace, name)) = reserved {
+        validate_reserved_destination_rule_carrier_name(&resource.name, namespace, name, &dr)?;
+    }
 
     // `export_to` is the security boundary that bounds which subscribers may
-    // receive this policy. Validate it while the reserved carrier is still an
-    // ECDS response so an unsupported value NACKs and rolls the accumulator
-    // back, rather than ACKing the payload and discovering the error only at
-    // later materialization. Diagnostics are fixed-shape and never echo the
-    // carrier-supplied value.
+    // receive this policy. Validate it while the carrier is still an ECDS
+    // response so an unsupported value NACKs and rolls the accumulator back,
+    // rather than ACKing the payload and discovering the error only at later
+    // materialization.
     let mut errors = Vec::new();
     crate::modes::mesh::config::validate_mesh_export_to(
         "xDS DestinationRule carrier",
@@ -1799,7 +1888,7 @@ fn validate_ecds_destination_rule_carrier(resource: &AccumulatedResource) -> Res
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(errors.join("; "))
+        Err(join_bounded_carrier_errors(errors))
     }
 }
 
@@ -4369,20 +4458,131 @@ mod tests {
         assert!(slice.destination_rules.is_empty());
     }
 
+    /// A legacy (non-reserved-name) DR carrier whose payload does not decode is
+    /// a STRUCTURAL error at the ACK boundary, exactly like the reserved
+    /// carrier's. Skipping it would ACK a response that silently drops the
+    /// operator's policy — traffic then flows with no DestinationRule at all
+    /// (fail-open). The rejection must leave the previously accepted ECDS state
+    /// in place.
     #[test]
-    fn ecds_dr_carrier_invalid_json_skips_dr_without_failing_slice() {
+    fn legacy_ecds_dr_carrier_invalid_json_is_rejected_and_retains_last_good() {
+        let good_dr_json = r#"{
+            "name": "api-dr",
+            "namespace": "default",
+            "host": "api.default.svc.cluster.local"
+        }"#;
         let mut accumulator = primed_accumulator();
         accumulator
             .apply_sotw_response(
                 ECDS_TYPE_URL,
-                &[dr_carrier_resource("api-dr", "{not valid json}")],
+                &[dr_carrier_resource("api-dr", good_dr_json)],
                 "v1",
             )
             .expect("ECDS apply");
 
+        let err = accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[dr_carrier_resource("api-dr", "{not valid json}")],
+                "v2",
+            )
+            .expect_err("a recognized DR carrier with a bad payload is rejected");
+        assert!(err.contains("DestinationRule"), "{err}");
+        assert!(err.contains("failed JSON decode"), "{err}");
+
+        // Last-known-good: the rejected response replaced nothing, so the
+        // previously accepted DR still builds into the slice.
         let slice = accumulator
             .try_build_mesh_slice(&test_config())
-            .expect("reverse translate should not fail on bad inner JSON")
+            .expect("reverse translate")
+            .expect("all required types present");
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "api-dr");
+        assert_eq!(
+            accumulator
+                .versions_by_type
+                .get(ECDS_TYPE_URL)
+                .map(String::as_str),
+            Some("v1"),
+            "a rejected ECDS response must not advance the accepted version"
+        );
+    }
+
+    /// The legacy carrier gets the reserved carrier's `exportTo` validation
+    /// too: a same-namespace legacy carrier with an unsupported visibility list
+    /// must NACK rather than be ACKed, normalized, and later found inert.
+    #[test]
+    fn legacy_ecds_dr_carrier_invalid_export_to_is_rejected_fail_closed() {
+        let good_dr_json = r#"{
+            "name": "api-dr",
+            "namespace": "default",
+            "host": "api.default.svc.cluster.local"
+        }"#;
+        let hostile_dr_json = r#"{
+            "name": "api-dr",
+            "namespace": "default",
+            "host": "api.default.svc.cluster.local",
+            "export_to": ["HOSTILE_SECRET_VALUE"]
+        }"#;
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[dr_carrier_resource("api-dr", good_dr_json)],
+                "v1",
+            )
+            .expect("ECDS apply");
+
+        let err = accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[dr_carrier_resource("api-dr", hostile_dr_json)],
+                "v2",
+            )
+            .expect_err("invalid export_to must reject the legacy carrier too");
+        assert!(
+            err.contains("xDS DestinationRule carrier.exportTo[0]"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("HOSTILE_SECRET_VALUE"),
+            "the diagnostic must not echo the carrier-supplied value: {err}"
+        );
+
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate")
+            .expect("all required types present");
+        assert_eq!(
+            slice.destination_rules.len(),
+            1,
+            "the rejected visibility update must leave the last accepted DR live"
+        );
+        assert!(slice.destination_rules[0].export_to.is_empty());
+    }
+
+    /// Carrier ROUTING compatibility is unchanged by the stricter content
+    /// validation: recognition is by inner `type_url` only, so an unrelated
+    /// extension config with an unknown name is neither validated as a
+    /// DestinationRule nor rejected.
+    #[test]
+    fn unrelated_ecds_resource_is_not_validated_as_a_destination_rule() {
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[typed_extension_resource(
+                    "some-operator-extension",
+                    "type.googleapis.com/some.unrelated.extension",
+                    b"{not valid json}".to_vec(),
+                )],
+                "v1",
+            )
+            .expect("an unrelated ECDS extension config must still be accepted");
+
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate")
             .expect("all required types present");
         assert!(slice.destination_rules.is_empty());
     }
@@ -4496,12 +4696,14 @@ mod tests {
 
     #[test]
     fn ecds_mixed_resources_only_valid_carrier_makes_it_through() {
-        // Mixed slice: one valid DR-carrier + one unrelated inner type_url
-        // + one DR-carrier with invalid JSON. The valid DR must land in the
-        // slice; the others are silently skipped / warned. This pins the
-        // "bad payloads do not fail the whole slice" guarantee at the
-        // boundary where multiple ECDS resources coexist on the same
-        // response.
+        // Mixed slice: one valid DR-carrier + one unrelated inner type_url.
+        // The valid DR must land in the slice and the unrelated extension
+        // config must be skipped without disturbing it. This pins the
+        // "unrelated payloads do not fail the slice" guarantee at the boundary
+        // where multiple ECDS resources coexist on one response. (A malformed
+        // DR-TYPED payload in the same response is a different case: it is a
+        // structural error and rejects the whole response — see
+        // `legacy_ecds_dr_carrier_invalid_json_is_rejected_and_retains_last_good`.)
         let valid_dr_json = r#"{
             "name": "valid-dr",
             "namespace": "default",
@@ -4526,11 +4728,7 @@ mod tests {
         accumulator
             .apply_sotw_response(
                 ECDS_TYPE_URL,
-                &[
-                    dr_carrier_resource("valid-dr", valid_dr_json),
-                    other_any,
-                    dr_carrier_resource("bad-json-dr", "{not valid json}"),
-                ],
+                &[dr_carrier_resource("valid-dr", valid_dr_json), other_any],
                 "v1",
             )
             .expect("ECDS apply");
@@ -4545,6 +4743,102 @@ mod tests {
             slice.destination_rules[0].host,
             "valid.default.svc.cluster.local"
         );
+    }
+
+    fn cors_carrier_resource(policies_json: &str) -> proto::Any {
+        use crate::xds::carrier::{
+            FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL, carrier_resource_name_for_type_url,
+        };
+        let name = carrier_resource_name_for_type_url(FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL)
+            .expect("CORS carrier has a reserved resource name");
+        typed_extension_resource(
+            name,
+            FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL,
+            policies_json.as_bytes().to_vec(),
+        )
+    }
+
+    /// The CORS mesh-slice carrier carries an `exportTo` list evaluated by the
+    /// same visibility evaluator as the DestinationRule carrier's, so it gets
+    /// the same ACK-boundary rejection: an unsupported entry NACKs the ECDS
+    /// response and the last accepted carrier state keeps serving.
+    #[test]
+    fn ecds_cors_carrier_invalid_export_to_is_rejected_and_retains_last_good() {
+        let good = r#"[{
+            "name": "api-vs",
+            "namespace": "default",
+            "host": "api.default.svc.cluster.local",
+            "export_to": ["*"],
+            "cors": {"allowed_origins": [{"exact": "https://app.example.com"}]}
+        }]"#;
+        let hostile = r#"[{
+            "name": "api-vs",
+            "namespace": "default",
+            "host": "api.default.svc.cluster.local",
+            "export_to": ["HOSTILE_SECRET_VALUE"],
+            "cors": {"allowed_origins": [{"exact": "https://app.example.com"}]}
+        }]"#;
+
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(ECDS_TYPE_URL, &[cors_carrier_resource(good)], "v1")
+            .expect("valid CORS carrier applies");
+
+        let err = accumulator
+            .apply_sotw_response(ECDS_TYPE_URL, &[cors_carrier_resource(hostile)], "v2")
+            .expect_err("an unsupported CORS exportTo entry must reject the carrier");
+        assert!(
+            err.contains("xDS VirtualService CORS carrier[0].exportTo[0]"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("HOSTILE_SECRET_VALUE"),
+            "the diagnostic must not echo the carrier-supplied value: {err}"
+        );
+
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate")
+            .expect("all required types present");
+        assert_eq!(
+            slice.virtual_service_cors_policies.len(),
+            1,
+            "the rejected update must leave the last accepted CORS carrier live"
+        );
+        assert_eq!(
+            slice.virtual_service_cors_policies[0].export_to,
+            vec!["*".to_string()]
+        );
+        assert_eq!(
+            accumulator
+                .versions_by_type
+                .get(ECDS_TYPE_URL)
+                .map(String::as_str),
+            Some("v1"),
+            "a rejected ECDS response must not advance the accepted version"
+        );
+    }
+
+    /// A `*` mixed with explicit namespaces is self-conflicting: the carrier is
+    /// rejected rather than silently interpreted as mesh-wide.
+    #[test]
+    fn ecds_cors_carrier_conflicting_wildcard_export_to_is_rejected() {
+        let conflicting = r#"[{
+            "name": "api-vs",
+            "namespace": "default",
+            "host": "api.default.svc.cluster.local",
+            "export_to": ["*", "beta"],
+            "cors": {"allowed_origins": [{"exact": "https://app.example.com"}]}
+        }]"#;
+        let mut accumulator = primed_accumulator();
+        let err = accumulator
+            .apply_sotw_response(ECDS_TYPE_URL, &[cors_carrier_resource(conflicting)], "v1")
+            .expect_err("a conflicting wildcard list must reject the carrier");
+        assert!(
+            err.contains("xDS VirtualService CORS carrier[0].exportTo"),
+            "{err}"
+        );
+        assert!(accumulator.resources(ECDS_TYPE_URL).is_empty());
     }
 
     /// Pin the `docs/mesh.md` "ECDS DestinationRule carrier" worked example
