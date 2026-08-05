@@ -10585,7 +10585,17 @@ components:
         ttl_seconds:
           type: integer
           default: 3600
-          description: Cookie `Max-Age` in seconds (default 1 hour).
+          description: >-
+            Cookie `Max-Age` in seconds (default 1 hour). Ignored when
+            `session_cookie` is true.
+        session_cookie:
+          type: boolean
+          default: false
+          description: >-
+            Omit `Max-Age` so the cookie is a browser session cookie, cleared
+            when the browser closes. Set by the Gateway API translator for
+            `sessionPersistence.cookieConfig.lifetimeType: Session`; a
+            `Permanent` lifetime keeps `ttl_seconds` from `absoluteTimeout`.
         domain:
           type: [string, "null"]
           description: Optional `Domain` attribute.
