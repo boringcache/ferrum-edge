@@ -75,10 +75,11 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::config_sources::k8s::{
-    K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
-    route_local_fault_delay_for_rule, service_entry_port_protocol_is_udp,
-    sidecar_selector_from_istio, translate_k8s_objects_collecting_skips,
-    workload_entry_service_key_from_host, workload_selector_from_istio,
+    K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, SidecarOutboundPolicy,
+    classify_sidecar_outbound_traffic_policy, route_local_fault_delay_for_rule,
+    service_entry_port_protocol_is_udp, sidecar_selector_from_istio,
+    translate_k8s_objects_collecting_skips, workload_entry_service_key_from_host,
+    workload_selector_from_istio,
 };
 use crate::k8s_controller::status::StatusTranslationReuse;
 use crate::k8s_controller::status_plan::{
@@ -1369,6 +1370,15 @@ fn workload_entry_status(
 /// listener is modeled while the data plane is still serving the default inbound
 /// behavior in the default dry-run / disabled posture (keeps the translator and
 /// the status writer in lock-step on what is actually applied).
+///
+/// `spec.outboundTrafficPolicy` (issue #3262) is reported the same way: the
+/// translated mode lands on `outbound_traffic_policy`, and
+/// `outbound_traffic_policy_enforced` is that SAME gate — the slice builder
+/// resolves the workload-scoped policy under the identical predicate, so an
+/// operator reading this status can tell a translated-but-inert policy from a
+/// live one. A present-but-unrepresentable block is reported in `deferred_fields`
+/// with the enforced fail-closed outcome (`REGISTRY_ONLY`) named explicitly; the
+/// classification comes from the same shared predicate the translator applies.
 fn sidecar_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -1395,6 +1405,9 @@ fn sidecar_status(
         "Namespace"
     };
 
+    let outbound_policy = classify_sidecar_outbound_traffic_policy(&object.spec);
+    let outbound_mode = sidecar_outbound_policy_label(&outbound_policy);
+
     match result {
         Ok(_translation) => {
             let (ingress_modelable, ingress_deferred) =
@@ -1414,6 +1427,12 @@ fn sidecar_status(
             for reason in &ingress_deferred {
                 deferred.push(format!("ingress[] {reason}"));
             }
+            // Issue #3262: a present-but-unrepresentable `outboundTrafficPolicy`
+            // is accepted and enforced fail-closed as REGISTRY_ONLY. Surface the
+            // exact field + outcome so the degradation is never silent.
+            if let Some(reason) = outbound_policy.deferred {
+                deferred.push(reason.to_string());
+            }
             // When ingress modeling is gated off, surface the modelable-but-not-
             // applied count so operators still see the shapes Ferrum WOULD model
             // once they enable enforcement (the gate, not the resource, is why
@@ -1426,23 +1445,39 @@ fn sidecar_status(
                      {ingress_modelable} modelable when enabled)"
                 )
             };
+            // Same gate-honest framing as `ingress_clause`: an operator must be
+            // able to distinguish "translated and live" from "translated but
+            // inert because the rollout gate is off".
+            let outbound_clause = if outbound_policy.policy.is_none() {
+                "outboundTrafficPolicy inherited from the mesh-wide policy".to_string()
+            } else if ingress_enforced {
+                format!("outboundTrafficPolicy {outbound_mode} enforced")
+            } else {
+                format!(
+                    "outboundTrafficPolicy {outbound_mode} not applied \
+                     (FERRUM_MESH_SIDECAR_ENFORCED off / dry-run)"
+                )
+            };
             let message = if deferred.is_empty() {
                 format!(
                     "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries; \
-                     {ingress_clause}; egress narrowing gated by FERRUM_MESH_SIDECAR_ENFORCED)"
+                     {ingress_clause}; {outbound_clause}; egress narrowing gated by FERRUM_MESH_SIDECAR_ENFORCED)"
                 )
             } else {
                 format!(
                     "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries; \
-                     {ingress_clause}); deferred fields: {}",
+                     {ingress_clause}; {outbound_clause}); deferred fields: {}",
                     deferred.join(", ")
                 )
             };
+            let outbound_enforced = outbound_policy.policy.is_some() && ingress_enforced;
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "egress_entries": egress_entry_count,
                     "ingress_modeled": ingress_modeled,
+                    "outbound_traffic_policy": outbound_mode,
+                    "outbound_traffic_policy_enforced": outbound_enforced,
                     "deferred_fields": deferred,
                 }
             });
@@ -1454,11 +1489,29 @@ fn sidecar_status(
                 "translation": {
                     "scope": scope,
                     "egress_entries": egress_entry_count,
+                    "outbound_traffic_policy": outbound_mode,
                     "error": format!("{error}"),
                 }
             });
             accepted_status(object, false, "Invalid", &message, Some(detail))
         }
+    }
+}
+
+/// Render a classified `Sidecar.outboundTrafficPolicy` as the Istio-facing token
+/// operators wrote in their YAML (issue #3262), or `Inherit` when the Sidecar
+/// omitted the block entirely and the mesh-wide policy stays in force.
+///
+/// A fail-closed degradation renders as `REGISTRY_ONLY` — the mode Ferrum
+/// actually enforces — with the reason carried separately in `deferred_fields`,
+/// so the reported mode always matches the enforced one.
+fn sidecar_outbound_policy_label(classified: &SidecarOutboundPolicy) -> &'static str {
+    use crate::modes::mesh::config::OutboundTrafficPolicy;
+
+    match classified.policy {
+        None => "Inherit",
+        Some(OutboundTrafficPolicy::AllowAny) => "ALLOW_ANY",
+        Some(OutboundTrafficPolicy::RegistryOnly) => "REGISTRY_ONLY",
     }
 }
 

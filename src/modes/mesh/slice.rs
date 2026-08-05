@@ -404,6 +404,27 @@ pub struct MeshSlice {
     /// `workloads.addresses`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
+    /// Workload-scoped outbound traffic policy resolved from the local
+    /// workload's applicable Istio `Sidecar.outboundTrafficPolicy` (issue #3262).
+    ///
+    /// Resolved CP-side at slice build (raw `MeshSidecar` records do not ride the
+    /// slice — only this resolved view does, mirroring `local_ingress_listeners`)
+    /// under the SAME gate as ingress materialization,
+    /// `sidecar_enforced && !sidecar_dry_run`: applying a workload-scoped policy
+    /// changes data-plane behavior, so dry-run must not.
+    ///
+    /// `Some` OVERRIDES the mesh-wide [`Self::outbound_traffic_policy`]; `None`
+    /// inherits it (and then the `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY` default).
+    /// Both directions of the override are honored — a Sidecar `REGISTRY_ONLY`
+    /// tightens a mesh that is `ALLOW_ANY`, and a Sidecar `ALLOW_ANY` relaxes the
+    /// registry gate for exactly the workloads that Sidecar selects, matching
+    /// Istio. Relaxing the registry gate does NOT relax anything else: Sidecar
+    /// `egress` narrowing, `mesh_authz`, PeerAuthentication/mTLS posture, the
+    /// HBONE open-relay guard, and topology transport gates are independent and
+    /// still apply. Resolve the effective value through
+    /// [`Self::effective_outbound_traffic_policy`] — never read this field alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_outbound_traffic_policy: Option<OutboundTrafficPolicy>,
     /// Cold-path operator view of the Sidecar egress scope that was applied,
     /// or would have been applied when dry-run is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -685,9 +706,47 @@ impl MeshSlice {
             && self.trust_bundles == other.trust_bundles
             && self.multi_cluster == other.multi_cluster
             && self.outbound_traffic_policy == other.outbound_traffic_policy
+            // The workload-scoped Sidecar policy (issue #3262) flips independently
+            // of every other field: an operator editing ONLY
+            // `Sidecar.outboundTrafficPolicy.mode` (or deleting the Sidecar that
+            // carried it) leaves services/egress scope byte-identical. Omitting it
+            // from slice equality would let MeshSubscribe/update dedupe suppress
+            // the frame, so the DP would keep the stale registry gate — serving
+            // `ALLOW_ANY` passthrough after the operator moved to REGISTRY_ONLY.
+            && self.sidecar_outbound_traffic_policy == other.sidecar_outbound_traffic_policy
             && self.sidecar_egress_scope == other.sidecar_egress_scope
             && self.extension_configs == other.extension_configs
             && self.runtime_overlay == other.runtime_overlay
+    }
+
+    /// Resolve the EFFECTIVE outbound traffic policy for this slice's workload
+    /// (issue #3262).
+    ///
+    /// Precedence, most specific first — this mirrors Istio, where a `Sidecar`
+    /// resource's `outboundTrafficPolicy` replaces `MeshConfig`'s for exactly the
+    /// workloads it selects:
+    ///
+    /// 1. [`Self::sidecar_outbound_traffic_policy`] — the applicable Istio
+    ///    `Sidecar.outboundTrafficPolicy.mode` (only ever populated under
+    ///    `FERRUM_MESH_SIDECAR_ENFORCED` without dry-run).
+    /// 2. [`Self::outbound_traffic_policy`] — the mesh-wide
+    ///    `MeshConfig.outboundTrafficPolicy.mode` carried on the slice.
+    /// 3. `runtime_default` — `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY` (`allow_any`).
+    ///
+    /// This is the ONE place the precedence lives. Both consumers — HTTP-family
+    /// `mesh_outbound_registry` plugin injection and the stream-family
+    /// `MeshOutboundEnforcement` slot — call it, so the two transport families
+    /// can never disagree about whether the registry gate is armed. It runs at
+    /// slice apply only (cold path): the result is materialized into the injected
+    /// plugin config and the `ArcSwap` enforcement slot, never re-derived or
+    /// re-parsed per request.
+    pub fn effective_outbound_traffic_policy(
+        &self,
+        runtime_default: OutboundTrafficPolicy,
+    ) -> OutboundTrafficPolicy {
+        self.sidecar_outbound_traffic_policy
+            .or(self.outbound_traffic_policy)
+            .unwrap_or(runtime_default)
     }
 
     /// Build the set of known mesh destinations from this slice. Used by
@@ -1116,6 +1175,25 @@ impl MeshSlice {
             )
         } else {
             (Vec::new(), false, 0)
+        };
+
+        // Workload-scoped `Sidecar.outboundTrafficPolicy` (issue #3262). Gated
+        // exactly like ingress materialization — NOT like egress narrowing, which
+        // also runs under dry-run: dry-run is defined as "report the scope that
+        // WOULD apply, change nothing", and arming (or disarming) the outbound
+        // registry gate is a live behavior change. `None` here therefore means
+        // both "no Sidecar declared one" and "the gate is off", and both fall
+        // back to the mesh-wide policy in
+        // `effective_outbound_traffic_policy` — never to a weaker one.
+        let sidecar_outbound_traffic_policy = if sidecar_enforced && !sidecar_dry_run {
+            resolve_applicable_sidecar_outbound_policy(
+                &mesh.sidecars,
+                effective_namespace,
+                &effective_labels,
+                mesh.istio_root_namespace.as_str(),
+            )
+        } else {
+            None
         };
 
         // Sidecar-only indexes: skip the full scan over `mesh.services` and
@@ -1559,6 +1637,7 @@ impl MeshSlice {
                 scoped
             }),
             outbound_traffic_policy: mesh.outbound_traffic_policy,
+            sidecar_outbound_traffic_policy,
             sidecar_egress_scope,
             extension_configs,
             // The canonical GatewayConfig has no declarative RTDS surface.
@@ -2478,6 +2557,43 @@ fn select_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
         .or(root_workload_scoped)
         .or(namespace_default)
         .or(root_namespace_default)
+}
+
+/// Resolve the workload-scoped outbound traffic policy from the applicable
+/// `Sidecar.outboundTrafficPolicy` (issue #3262).
+///
+/// Uses [`select_applicable_sidecar`] — the SAME tier precedence as ingress
+/// (workload-scoped → root workload-scoped → namespace default → root-namespace
+/// default, ASCII-smallest `name` tiebreak) — and deliberately does NOT walk the
+/// egress `inherits_defaults` chain. That walk exists because Istio's `egress`
+/// has an explicit "omitted means inherit the namespace scope" rule; the outbound
+/// traffic policy has no such rule. Istio resolves exactly ONE Sidecar per
+/// workload, and a Sidecar that omits `outboundTrafficPolicy` simply leaves the
+/// mesh-wide `MeshConfig` value in force — it does not consult a less-specific
+/// Sidecar. Returning `None` here expresses precisely that inheritance.
+///
+/// Cold path: runs once per slice build, alongside the ingress resolution that
+/// already performs the same selection scan.
+fn resolve_applicable_sidecar_outbound_policy<L: WorkloadLabels + ?Sized>(
+    sidecars: &[MeshSidecar],
+    workload_namespace: &str,
+    workload_labels: &L,
+    istio_root_namespace: &str,
+) -> Option<OutboundTrafficPolicy> {
+    let sidecar = select_applicable_sidecar(
+        sidecars,
+        workload_namespace,
+        workload_labels,
+        istio_root_namespace,
+    )?;
+    let policy = sidecar.outbound_traffic_policy?;
+    debug!(
+        sidecar = %sidecar.name,
+        namespace = %sidecar.namespace,
+        policy = ?policy,
+        "Applying Sidecar-scoped outboundTrafficPolicy to the mesh slice"
+    );
+    Some(policy)
 }
 
 /// Resolve the routable custom inbound listeners from a workload's applicable
@@ -3594,6 +3710,7 @@ mod tests {
             trust_bundles: Some(make_trust_bundle_set()),
             multi_cluster: Some(make_multi_cluster()),
             outbound_traffic_policy: None,
+            sidecar_outbound_traffic_policy: None,
             sidecar_egress_scope: None,
             extension_configs: Vec::new(),
             runtime_overlay: MeshRuntimeOverlay::default(),
@@ -6154,6 +6271,7 @@ mod tests {
                 .collect(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }
     }
 
@@ -6170,6 +6288,7 @@ mod tests {
             egress: Vec::new(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }
     }
 
@@ -6729,6 +6848,7 @@ mod tests {
             egress: Vec::new(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         };
         sidecar.ingress = vec![MeshSidecarIngress {
             port: 8443,
@@ -8216,6 +8336,7 @@ mod tests {
                     egress: Vec::new(),
                     ingress_declared: false,
                     ingress: Vec::new(),
+                    outbound_traffic_policy: None,
                 },
             ],
             service_entries: vec![
@@ -8296,6 +8417,7 @@ mod tests {
                     egress: Vec::new(),
                     ingress_declared: false,
                     ingress: Vec::new(),
+                    outbound_traffic_policy: None,
                 },
                 make_inheriting_sidecar(
                     "frontend-ingress-only",
@@ -8411,6 +8533,7 @@ mod tests {
                 egress: Vec::new(),
                 ingress_declared: false,
                 ingress: Vec::new(),
+                outbound_traffic_policy: None,
             }],
             service_entries: vec![make_se_with_host(
                 "reviews",
@@ -8743,6 +8866,7 @@ mod tests {
                 ],
                 ingress_declared: false,
                 ingress: Vec::new(),
+                outbound_traffic_policy: None,
             }],
             services: vec![
                 make_service("alpha", "reviews"),

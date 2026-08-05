@@ -30,6 +30,12 @@ pub(crate) use istio::cors_policy_translatable;
 // is one predicate, so an HTTPS (→ Unknown → HTTP-family) listener is never
 // modeled by resolution yet reported as a deferred non-HTTP listener.
 pub(crate) use istio::sidecar_ingress_protocol_is_http_family;
+// Shared with the Istio status writer the same way (issue #3262): the Sidecar
+// `outboundTrafficPolicy` classification that decides the ENFORCED workload-scoped
+// policy is the same one that produces the reported `deferred_fields` reason, so a
+// fail-closed REGISTRY_ONLY degradation is never enforced without being reported
+// (nor reported without being enforced).
+pub(crate) use istio::{SidecarOutboundPolicy, classify_sidecar_outbound_traffic_policy};
 // Shared with the Istio status writer the same way: the ServiceEntry UDP-port
 // classification used by translation/materialization (a `protocol: UDP` port is
 // classified `AppProtocol::Udp` and its egress materialization is deferred/inert
@@ -126,6 +132,14 @@ pub struct K8sTranslationOptions {
     /// inbound behavior (dry-run / default-off). Default false (matches the env
     /// default and the slice builder). Egress narrowing has its OWN, looser gate
     /// (`enforced || dry_run`) and is not affected by this.
+    ///
+    /// The SAME effective gate governs `Sidecar.outboundTrafficPolicy`
+    /// application (issue #3262) — the slice builder resolves the workload-scoped
+    /// policy under the identical `sidecar_enforced && !sidecar_dry_run`
+    /// predicate — so the status writer reports the translated mode as APPLIED
+    /// only when this is true. It is deliberately one flag, not two: both are
+    /// "the applicable Sidecar changes data-plane behavior beyond narrowing what
+    /// the slice contains".
     pub mesh_sidecar_ingress_enforced: bool,
     /// Whether this Kubernetes source is an authoritative owner of mesh state
     /// (issue #2452).

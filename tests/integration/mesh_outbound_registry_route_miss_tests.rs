@@ -32,6 +32,10 @@ use ferrum_edge::modes::mesh::outbound_enforcement::MeshOutboundEnforcement;
 use ferrum_edge::plugins::mesh::outbound_registry::OutboundRegistry;
 use ferrum_edge::proxy::ProxyState;
 
+use super::mesh_test_support::{
+    default_mesh_runtime, gateway_config_with_mesh, mesh_config_with, service_for, workload_for,
+};
+
 const OUTBOUND_CAPTURE_PORT: u16 = 15001;
 const INBOUND_MTLS_PORT: u16 = 15006;
 const REJECT_STATUS: u16 = 403;
@@ -424,5 +428,199 @@ async fn inbound_non_capture_route_miss_keeps_generic_not_found() {
         http_deny_count(NS_INBOUND_SKIP),
         before,
         "inbound / non-capture route miss must not increment the deny metric"
+    );
+}
+
+// ── Sidecar-scoped outboundTrafficPolicy on the live path (issue #3262) ────
+//
+// The gate above is armed by the EFFECTIVE outbound policy. These tests drive
+// the same `handle_proxy_request` route-miss path, but with the enforcement
+// derived from a slice whose policy came from an Istio `Sidecar` — proving the
+// workload-scoped override actually changes client-visible capture behaviour in
+// both directions. Translation/selection/carrier coverage lives in
+// `tests/unit/config/sidecar_outbound_policy_tests.rs`.
+
+const NS_SIDECAR_REGISTRY_ONLY: &str = "route-miss-sidecar-registry-only";
+const NS_SIDECAR_ALLOW_ANY: &str = "route-miss-sidecar-allow-any";
+const SLICE_SERVICE_HOST: &str = "reviews.default.svc.cluster.local";
+
+/// Build a `ProxyState` whose outbound enforcement is derived from a slice
+/// carrying a `Sidecar.outboundTrafficPolicy`.
+///
+/// This mirrors `modes::mesh::refresh_mesh_outbound_enforcement` exactly: the
+/// arm/disarm decision comes from `MeshSlice::effective_outbound_traffic_policy`
+/// (production code), and the registry from `MeshOutboundEnforcement::from_slice`.
+/// The proxy table stays empty so every Host is a route miss and the gate is the
+/// only decision on the path.
+fn make_sidecar_policy_proxy_state(
+    namespace: &str,
+    mesh_wide: ferrum_edge::modes::mesh::config::OutboundTrafficPolicy,
+    sidecar_policy: ferrum_edge::modes::mesh::config::OutboundTrafficPolicy,
+) -> ProxyState {
+    let mut runtime = default_mesh_runtime();
+    runtime.namespace = "default".to_string();
+    runtime.outbound_traffic_policy = mesh_wide;
+    runtime.outbound_listen_addr = format!("127.0.0.1:{OUTBOUND_CAPTURE_PORT}")
+        .parse()
+        .expect("capture addr");
+    runtime.sidecar_enforced = true;
+    runtime.workload_labels = HashMap::from([("app".to_string(), "reviews".to_string())]);
+
+    let workload = workload_for("reviews", "default", [("app", "reviews")], ["10.0.0.1"]);
+    let service = service_for("reviews", "default", &[&workload]);
+    let mut mesh = mesh_config_with(vec![workload], vec![service], Vec::new());
+    mesh.sidecars = vec![ferrum_edge::modes::mesh::config::MeshSidecar {
+        name: "default-sidecar".to_string(),
+        namespace: "default".to_string(),
+        workload_selector: None,
+        egress_inherits_defaults: false,
+        egress: vec![ferrum_edge::modes::mesh::config::MeshSidecarEgress {
+            hosts: vec!["*/*".to_string()],
+            port: None,
+        }],
+        ingress_declared: false,
+        ingress: Vec::new(),
+        outbound_traffic_policy: Some(sidecar_policy),
+    }];
+    let mesh_config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let slice = ferrum_edge::modes::mesh::slice::MeshSlice::from_gateway_config(
+        &mesh_config,
+        runtime.mesh_slice_request(),
+    );
+    assert_eq!(
+        slice.sidecar_outbound_traffic_policy,
+        Some(sidecar_policy),
+        "the Sidecar policy must reach the slice before the gate is derived"
+    );
+
+    let dns_cache = DnsCache::new(DnsConfig::default());
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        proxies: Vec::<Proxy>::new(),
+        loaded_at: Utc::now(),
+        ..Default::default()
+    };
+    let env = make_env(OUTBOUND_CAPTURE_PORT);
+    let (state, _handles) = ProxyState::new(config, dns_cache, env, None, None)
+        .expect("ProxyState for sidecar outbound policy coverage");
+
+    let effective = slice.effective_outbound_traffic_policy(runtime.outbound_traffic_policy);
+    let enforcement = if matches!(
+        effective,
+        ferrum_edge::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly
+    ) {
+        MeshOutboundEnforcement::from_slice(
+            &slice,
+            &runtime.cluster_domain,
+            namespace.to_string(),
+            vec![OUTBOUND_CAPTURE_PORT],
+            REJECT_STATUS,
+        )
+        .map(Arc::new)
+    } else {
+        None
+    };
+    state.mesh_outbound_enforcement.store(Arc::new(enforcement));
+    state
+}
+
+/// A workload-scoped `REGISTRY_ONLY` refuses an unknown destination on the
+/// outbound capture listener even though the mesh-wide policy is `ALLOW_ANY`,
+/// while a destination the slice declares still falls through to normal routing.
+#[tokio::test(flavor = "multi_thread")]
+async fn sidecar_registry_only_refuses_unknown_destination_on_capture_listener() {
+    use ferrum_edge::modes::mesh::config::OutboundTrafficPolicy;
+
+    let state = make_sidecar_policy_proxy_state(
+        NS_SIDECAR_REGISTRY_ONLY,
+        OutboundTrafficPolicy::AllowAny,
+        OutboundTrafficPolicy::RegistryOnly,
+    );
+    let before = http_deny_count(NS_SIDECAR_REGISTRY_ONLY);
+    let (gateway_addr, _handle) = start_test_gateway(state).await;
+
+    for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
+        let (status, _headers, body) =
+            send_request(gateway_addr, version, Method::GET, "/", UNKNOWN_HOST, None)
+                .await
+                .unwrap_or_else(|error| panic!("{version:?} request failed: {error}"));
+        assert_eq!(
+            status, REJECT_STATUS,
+            "{version:?} a Sidecar REGISTRY_ONLY must refuse an unknown destination"
+        );
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(
+            body_text.contains("destination not in mesh registry"),
+            "{version:?} body must identify the REGISTRY_ONLY denial, got {body_text}"
+        );
+    }
+
+    assert!(
+        http_deny_count(NS_SIDECAR_REGISTRY_ONLY) > before,
+        "the deny decision must be counted under the fixed <denied> host bucket"
+    );
+
+    // A destination the slice DOES declare is not refused by the gate; it falls
+    // through to the ordinary route miss. This is what proves the gate is
+    // destination-scoped rather than a blanket outbound block.
+    let (status, _headers, body) = send_request(
+        gateway_addr,
+        TestHttpVersion::H1,
+        Method::GET,
+        "/",
+        SLICE_SERVICE_HOST,
+        None,
+    )
+    .await
+    .expect("known-host request");
+    assert_ne!(
+        status, REJECT_STATUS,
+        "a slice-declared destination must not take the registry reject status"
+    );
+    let body_text = String::from_utf8_lossy(&body);
+    assert!(
+        !body_text.contains("destination not in mesh registry"),
+        "a slice-declared destination must not get the registry denial body, got {body_text}"
+    );
+}
+
+/// The documented passthrough direction: a workload-scoped `ALLOW_ANY` disarms
+/// an otherwise mesh-wide `REGISTRY_ONLY`, so an unknown destination reaches the
+/// ordinary route-miss path instead of the registry denial.
+#[tokio::test(flavor = "multi_thread")]
+async fn sidecar_allow_any_preserves_passthrough_over_a_mesh_wide_registry_only() {
+    use ferrum_edge::modes::mesh::config::OutboundTrafficPolicy;
+
+    let state = make_sidecar_policy_proxy_state(
+        NS_SIDECAR_ALLOW_ANY,
+        OutboundTrafficPolicy::RegistryOnly,
+        OutboundTrafficPolicy::AllowAny,
+    );
+    let before = http_deny_count(NS_SIDECAR_ALLOW_ANY);
+    let (gateway_addr, _handle) = start_test_gateway(state).await;
+
+    let (status, _headers, body) = send_request(
+        gateway_addr,
+        TestHttpVersion::H1,
+        Method::GET,
+        "/",
+        UNKNOWN_HOST,
+        None,
+    )
+    .await
+    .expect("unknown-host request");
+    assert_ne!(
+        status, REJECT_STATUS,
+        "a Sidecar ALLOW_ANY must not take the registry reject status"
+    );
+    let body_text = String::from_utf8_lossy(&body);
+    assert!(
+        !body_text.contains("destination not in mesh registry"),
+        "ALLOW_ANY must reach the ordinary route-miss path, got {body_text}"
+    );
+    assert_eq!(
+        http_deny_count(NS_SIDECAR_ALLOW_ANY),
+        before,
+        "no registry deny is recorded when the gate is disarmed"
     );
 }

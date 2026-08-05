@@ -1539,6 +1539,10 @@ fn reverse_translate(
         // GAP-1a: mesh-wide outbound traffic policy recovered from the
         // OutboundTrafficPolicy carrier.
         outbound_traffic_policy: recovered.outbound_traffic_policy,
+        // Issue #3262: workload-scoped Sidecar override, recovered from its own
+        // carrier so an xDS-built slice resolves the same effective policy a
+        // native-built one does. `None` when the CP emitted no such carrier.
+        sidecar_outbound_traffic_policy: recovered.sidecar_outbound_traffic_policy,
         sidecar_egress_scope: recovered.sidecar_egress_scope,
         // GAP-2L.3: xDS-only deployments don't round-trip operator-defined
         // ECDS resources back into the slice today. The carrier paths
@@ -1651,6 +1655,7 @@ struct RecoveredSliceCarriers {
     proxy_configs: Vec<crate::modes::mesh::config::MeshProxyConfig>,
     trust_bundles: Option<crate::modes::mesh::config::TrustBundleSet>,
     outbound_traffic_policy: Option<crate::modes::mesh::config::OutboundTrafficPolicy>,
+    sidecar_outbound_traffic_policy: Option<crate::modes::mesh::config::OutboundTrafficPolicy>,
     multi_cluster: Option<crate::modes::mesh::config::MultiClusterConfig>,
     sidecar_egress_scope: Option<MeshEgressScopeSnapshot>,
 }
@@ -1903,6 +1908,9 @@ fn apply_recovered_carrier(
         MeshSliceCarrier::TrustBundles(value) => recovered.trust_bundles = Some(value),
         MeshSliceCarrier::OutboundTrafficPolicy(value) => {
             recovered.outbound_traffic_policy = Some(value)
+        }
+        MeshSliceCarrier::SidecarOutboundTrafficPolicy(value) => {
+            recovered.sidecar_outbound_traffic_policy = Some(value)
         }
         MeshSliceCarrier::MultiCluster(value) => recovered.multi_cluster = Some(value),
         MeshSliceCarrier::SidecarEgressScope(value) => recovered.sidecar_egress_scope = Some(value),

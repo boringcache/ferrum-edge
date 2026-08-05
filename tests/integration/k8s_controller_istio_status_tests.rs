@@ -906,3 +906,202 @@ fn destination_rule_failover_priority_subset_outlier_suppresses_inactive_advisor
         "a subset-scoped outlierDetection activates the subset lane, so no inactive advisory"
     );
 }
+
+// ── Sidecar outboundTrafficPolicy (issue #3262) ───────────────────────────
+
+/// Read the `translation` detail block of a `Sidecar` status update.
+fn sidecar_translation<'a>(updates: &'a [IstioStatusUpdate], name: &str) -> &'a Value {
+    &update_for(updates, "Sidecar", name)
+        .ferrum_detail
+        .as_ref()
+        .expect("ferrum detail")["translation"]
+}
+
+/// The `FerrumAccepted` condition of a `Sidecar` status update.
+fn sidecar_condition<'a>(updates: &'a [IstioStatusUpdate], name: &str) -> &'a Value {
+    find_condition(
+        update_for(updates, "Sidecar", name).status["conditions"]
+            .as_array()
+            .expect("conditions"),
+        "FerrumAccepted",
+    )
+}
+
+/// A supported mode is reported verbatim, and — with the enforcement gate on —
+/// as actually enforced. Nothing is deferred.
+#[test]
+fn sidecar_supported_outbound_traffic_policy_is_reported_as_enforced() {
+    let enforced = options().with_mesh_sidecar_ingress_enforced(true);
+    for (name, mode) in [("sc-allow", "ALLOW_ANY"), ("sc-registry", "REGISTRY_ONLY")] {
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            name,
+            json!({
+                "egress": [{ "hosts": ["./*"] }],
+                "outboundTrafficPolicy": { "mode": mode },
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], enforced.clone());
+        let translation = sidecar_translation(&updates, name);
+        assert_eq!(translation["outbound_traffic_policy"], json!(mode));
+        assert_eq!(
+            translation["outbound_traffic_policy_enforced"],
+            json!(true),
+            "with the gate on, the translated mode is live"
+        );
+        assert_eq!(
+            translation["deferred_fields"],
+            json!([]),
+            "a supported mode defers nothing"
+        );
+    }
+}
+
+/// An omitted block reports `Inherit` and is never claimed as enforced — the
+/// mesh-wide policy is what is actually in force.
+#[test]
+fn sidecar_without_outbound_traffic_policy_reports_inherit() {
+    let obj = object(
+        "networking.istio.io/v1",
+        "Sidecar",
+        "sc-inherit",
+        json!({ "egress": [{ "hosts": ["./*"] }] }),
+    );
+    let updates =
+        plan_istio_status_updates(&[obj], options().with_mesh_sidecar_ingress_enforced(true));
+    let translation = sidecar_translation(&updates, "sc-inherit");
+    assert_eq!(translation["outbound_traffic_policy"], json!("Inherit"));
+    assert_eq!(translation["outbound_traffic_policy_enforced"], json!(false));
+    assert_eq!(translation["deferred_fields"], json!([]));
+}
+
+/// With the rollout gate off, the mode is still translated and reported, but
+/// must NOT be claimed as enforced — the same gate-honest framing
+/// `ingress_modeled` uses.
+#[test]
+fn sidecar_outbound_traffic_policy_not_reported_as_enforced_when_gate_is_off() {
+    let obj = object(
+        "networking.istio.io/v1",
+        "Sidecar",
+        "sc-gated",
+        json!({ "outboundTrafficPolicy": { "mode": "REGISTRY_ONLY" } }),
+    );
+    // Default options() leaves the effective sidecar gate off.
+    let updates = plan_istio_status_updates(&[obj], options());
+    let translation = sidecar_translation(&updates, "sc-gated");
+    assert_eq!(translation["outbound_traffic_policy"], json!("REGISTRY_ONLY"));
+    assert_eq!(
+        translation["outbound_traffic_policy_enforced"],
+        json!(false),
+        "the status must never claim a policy is live while the gate is off"
+    );
+    let message = sidecar_condition(&updates, "sc-gated")["message"]
+        .as_str()
+        .expect("condition message");
+    assert!(
+        message.contains("not applied"),
+        "the condition message must say the policy is inert, got {message}"
+    );
+}
+
+/// Every unrepresentable variant is ACCEPTED, reported as the enforced
+/// fail-closed `REGISTRY_ONLY`, and names the exact field in `deferred_fields`.
+#[test]
+fn sidecar_unrepresentable_outbound_traffic_policy_is_accepted_and_deferred_fail_closed() {
+    let enforced = options().with_mesh_sidecar_ingress_enforced(true);
+    let cases: Vec<(&str, Value, &str)> = vec![
+        ("sc-no-mode", json!({}), "mode omitted"),
+        (
+            "sc-bad-mode",
+            json!({ "mode": "ALOW_ANY" }),
+            "not ALLOW_ANY or REGISTRY_ONLY",
+        ),
+        (
+            "sc-nonstring-mode",
+            json!({ "mode": 1 }),
+            "not ALLOW_ANY or REGISTRY_ONLY",
+        ),
+        ("sc-not-object", json!("REGISTRY_ONLY"), "not an object"),
+        (
+            "sc-egress-proxy",
+            json!({
+                "mode": "ALLOW_ANY",
+                "egressProxy": { "host": "istio-egressgateway.istio-system.svc.cluster.local" },
+            }),
+            "egressProxy is not supported",
+        ),
+    ];
+    for (name, policy, expected_fragment) in cases {
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            name,
+            json!({
+                "egress": [{ "hosts": ["./*"] }],
+                "outboundTrafficPolicy": policy,
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], enforced.clone());
+        assert_eq!(
+            sidecar_condition(&updates, name)["status"].as_str(),
+            Some("True"),
+            "{name} must stay ACCEPTED — rejecting it would drop its egress \
+             narrowing and widen the slice"
+        );
+        let translation = sidecar_translation(&updates, name);
+        assert_eq!(
+            translation["outbound_traffic_policy"],
+            json!("REGISTRY_ONLY"),
+            "{name} must report the fail-closed mode it actually enforces"
+        );
+        assert_eq!(
+            translation["outbound_traffic_policy_enforced"],
+            json!(true),
+            "{name} is enforced under the gate"
+        );
+        let deferred = translation["deferred_fields"]
+            .as_array()
+            .expect("deferred_fields array");
+        assert!(
+            deferred
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|entry| entry.contains(expected_fragment)),
+            "{name} must defer a reason naming {expected_fragment:?}, got {deferred:?}"
+        );
+        assert!(
+            deferred
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|entry| entry.contains("REGISTRY_ONLY")),
+            "{name} must name the enforced fail-closed outcome, got {deferred:?}"
+        );
+    }
+}
+
+/// The raw, operator-supplied `mode` value must never be echoed back into the
+/// status (it reaches the writer straight off an untrusted CRD).
+#[test]
+fn sidecar_outbound_traffic_policy_status_does_not_echo_the_raw_mode_value() {
+    let hostile = "<script>alert(1)</script>";
+    let obj = object(
+        "networking.istio.io/v1",
+        "Sidecar",
+        "sc-hostile",
+        json!({ "outboundTrafficPolicy": { "mode": hostile } }),
+    );
+    let updates =
+        plan_istio_status_updates(&[obj], options().with_mesh_sidecar_ingress_enforced(true));
+    let update = update_for(&updates, "Sidecar", "sc-hostile");
+    let rendered = serde_json::to_string(&update.ferrum_detail).expect("detail encodes");
+    let condition = serde_json::to_string(&update.status).expect("status encodes");
+    assert!(
+        !rendered.contains(hostile) && !condition.contains(hostile),
+        "the unsupported mode value must not be echoed into status"
+    );
+    assert_eq!(
+        sidecar_translation(&updates, "sc-hostile")["outbound_traffic_policy"],
+        json!("REGISTRY_ONLY")
+    );
+}

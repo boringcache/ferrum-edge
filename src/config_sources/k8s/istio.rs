@@ -656,9 +656,11 @@ fn peer_authentication(
 ///     `materialize_sidecar_inbound_proxies`). Unix-socket `defaultEndpoint`s
 ///     and non-HTTP-family listeners are parsed but cannot be modeled and stay
 ///     in the `deferred_fields` report (resolved fail-closed downstream).
-///
-/// `outboundTrafficPolicy` is still not translated here — it stays in the
-/// documented "deferred" table until a separate PR lands it.
+///   - `spec.outboundTrafficPolicy.mode` → [`MeshSidecar::outbound_traffic_policy`]
+///     (issue #3262), the workload-scoped override of the mesh-wide policy.
+///     Classification is delegated to the shared, fail-closed
+///     [`classify_sidecar_outbound_traffic_policy`] so the status writer's
+///     `deferred_fields` report can never disagree with what is enforced.
 fn sidecar(
     _acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -804,6 +806,22 @@ fn sidecar(
         }
     }
 
+    // `spec.outboundTrafficPolicy` (issue #3262). A present-but-unrepresentable
+    // block resolves to REGISTRY_ONLY rather than rejecting the resource — see
+    // `classify_sidecar_outbound_traffic_policy` for why dropping the Sidecar
+    // would WIDEN egress instead of failing closed. Warn once per translation so
+    // the degradation is visible in gateway logs as well as in CRD status.
+    let outbound_policy = classify_sidecar_outbound_traffic_policy(&object.spec);
+    if let Some(reason) = outbound_policy.deferred {
+        tracing::warn!(
+            namespace = %object.metadata.namespace,
+            sidecar = %object.metadata.name,
+            reason = %reason,
+            "Istio Sidecar outboundTrafficPolicy is not exactly representable; \
+             enforcing REGISTRY_ONLY for the selected workloads",
+        );
+    }
+
     Ok(MeshSidecar {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
@@ -812,6 +830,7 @@ fn sidecar(
         egress,
         ingress_declared,
         ingress,
+        outbound_traffic_policy: outbound_policy.policy,
     })
 }
 
@@ -5266,6 +5285,105 @@ fn sidecar_ingress_app_protocol(value: Option<&str>) -> AppProtocol {
 /// [`cors_policy_translatable`]) to keep the predicate in one place.
 pub(crate) fn sidecar_ingress_protocol_is_http_family(protocol: Option<&str>) -> bool {
     crate::modes::mesh::config::is_http_family_app_protocol(sidecar_ingress_app_protocol(protocol))
+}
+
+/// Fail-closed deferral reason: `outboundTrafficPolicy` was present but is not a
+/// JSON object.
+pub(crate) const SIDECAR_OUTBOUND_POLICY_MALFORMED: &str =
+    "outboundTrafficPolicy is not an object (enforcing REGISTRY_ONLY)";
+/// Fail-closed deferral reason: `outboundTrafficPolicy.egressProxy` is set and
+/// Ferrum cannot redirect unmatched egress through a named destination.
+pub(crate) const SIDECAR_OUTBOUND_POLICY_EGRESS_PROXY: &str =
+    "outboundTrafficPolicy.egressProxy is not supported (enforcing REGISTRY_ONLY)";
+/// Reported reason: `outboundTrafficPolicy.mode` was omitted inside a present
+/// block, so the Istio proto zero value (`REGISTRY_ONLY`) applies.
+pub(crate) const SIDECAR_OUTBOUND_POLICY_MODE_OMITTED: &str =
+    "outboundTrafficPolicy.mode omitted (enforcing the REGISTRY_ONLY proto default)";
+/// Fail-closed deferral reason: `outboundTrafficPolicy.mode` is not one of the
+/// two supported tokens, or is not a string at all.
+pub(crate) const SIDECAR_OUTBOUND_POLICY_MODE_UNSUPPORTED: &str =
+    "outboundTrafficPolicy.mode is not ALLOW_ANY or REGISTRY_ONLY (enforcing REGISTRY_ONLY)";
+
+/// Outcome of classifying a `Sidecar`'s `spec.outboundTrafficPolicy` block
+/// (issue #3262).
+///
+/// Shared by the translator ([`sidecar`]) and the Istio status writer
+/// (`istio_status::sidecar_status`) — like
+/// [`sidecar_ingress_protocol_is_http_family`] — so what Ferrum ENFORCES and what
+/// the `FerrumAccepted` status REPORTS can never diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SidecarOutboundPolicy {
+    /// The resolved workload-scoped policy, or `None` when the Sidecar OMITTED
+    /// `outboundTrafficPolicy` entirely (inherit the mesh-wide value).
+    pub policy: Option<crate::modes::mesh::config::OutboundTrafficPolicy>,
+    /// Fail-closed degradation reason when a PRESENT block could not be
+    /// represented exactly. `Some` implies `policy == Some(RegistryOnly)`.
+    /// Reported verbatim in `status.ferrum.translation.deferred_fields`; every
+    /// value is a `&'static str`, so no attacker-controlled input is echoed.
+    pub deferred: Option<&'static str>,
+}
+
+/// Classify `Sidecar.spec.outboundTrafficPolicy` into the workload-scoped
+/// outbound traffic policy Ferrum enforces (issue #3262).
+///
+/// Supported, exactly: `mode: ALLOW_ANY` and `mode: REGISTRY_ONLY`.
+///
+/// Everything else about a PRESENT block **fails closed to `REGISTRY_ONLY`** and
+/// records a field-specific deferral reason:
+///   - **`mode` omitted** — `REGISTRY_ONLY` is the Istio proto zero value of
+///     `OutboundTrafficPolicy.Mode`, so this is simultaneously the faithful and
+///     the conservative reading. Still reported, so it is never silent.
+///   - **`mode` unrecognized or not a string** (an `ALOW_ANY` typo, the numeric
+///     proto form, …) — the intent is ambiguous, so the restrictive mode applies.
+///     The raw value is never echoed into the status.
+///   - **the block is not an object** — malformed shape.
+///   - **`egressProxy` present** — Ferrum cannot funnel unmatched egress through
+///     a named `Destination`. Ignoring it would send traffic the operator scoped
+///     to an egress gateway straight out instead, so the registry gate stays on
+///     regardless of the declared `mode`.
+///
+/// The resource is never REJECTED over this field. A rejected Sidecar is dropped
+/// from the translation entirely (`translate_k8s_objects_collecting_skips` skips
+/// it and retries), which would also drop its `egress` narrowing and thereby
+/// WIDEN both the workload's slice service view and the `REGISTRY_ONLY` registry
+/// derived from it — the opposite of failing closed.
+pub(crate) fn classify_sidecar_outbound_traffic_policy(spec: &Value) -> SidecarOutboundPolicy {
+    use crate::modes::mesh::config::OutboundTrafficPolicy;
+
+    let Some(raw) = spec.get("outboundTrafficPolicy") else {
+        return SidecarOutboundPolicy {
+            policy: None,
+            deferred: None,
+        };
+    };
+    let fail_closed = |reason: &'static str| SidecarOutboundPolicy {
+        policy: Some(OutboundTrafficPolicy::RegistryOnly),
+        deferred: Some(reason),
+    };
+    let Some(block) = raw.as_object() else {
+        return fail_closed(SIDECAR_OUTBOUND_POLICY_MALFORMED);
+    };
+    // `egressProxy` changes what the mode MEANS in Istio (unmatched egress is
+    // routed THROUGH the named destination rather than out directly), so it is
+    // checked before the mode and wins over an explicit `ALLOW_ANY`.
+    if block.contains_key("egressProxy") {
+        return fail_closed(SIDECAR_OUTBOUND_POLICY_EGRESS_PROXY);
+    }
+    match block.get("mode") {
+        None | Some(Value::Null) => fail_closed(SIDECAR_OUTBOUND_POLICY_MODE_OMITTED),
+        Some(Value::String(mode)) => match mode.trim() {
+            "ALLOW_ANY" => SidecarOutboundPolicy {
+                policy: Some(OutboundTrafficPolicy::AllowAny),
+                deferred: None,
+            },
+            "REGISTRY_ONLY" => SidecarOutboundPolicy {
+                policy: Some(OutboundTrafficPolicy::RegistryOnly),
+                deferred: None,
+            },
+            _ => fail_closed(SIDECAR_OUTBOUND_POLICY_MODE_UNSUPPORTED),
+        },
+        Some(_) => fail_closed(SIDECAR_OUTBOUND_POLICY_MODE_UNSUPPORTED),
+    }
 }
 
 fn telemetry(
