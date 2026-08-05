@@ -689,8 +689,12 @@ fn local_fallback_read_path_uses_nofollow_handle_and_byte_ceiling() {
         AUDIT_SOURCE.contains("FILE_FLAG_OPEN_REPARSE_POINT"),
         "Windows fallback opens must not traverse reparse-point targets"
     );
+    // Anchor on the function NAME only. The signature is multi-line (it takes
+    // a shared lock-wait deadline as well as the path), so an anchor that
+    // included the first parameter silently matched nothing and turned this
+    // ordering guard into an unconditional panic.
     let lock_fn = AUDIT_SOURCE
-        .split("fn acquire_fallback_file_lock(lock_path")
+        .split("fn acquire_fallback_file_lock(")
         .nth(1)
         .unwrap_or("");
     let identity_check = lock_fn
