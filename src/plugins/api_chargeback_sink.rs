@@ -12133,6 +12133,26 @@ pub fn publish_dead_letter_payload_for_claim_for_tests(
         .map_err(ClaimMutationError::into_message)
 }
 
+/// Re-derive spendable dead-letter source-credit bytes exactly as admission does.
+///
+/// External tests use this to prove the capacity fail-closed paths independently
+/// of claim-pathname authorization. The credit is capacity, never authority: a
+/// reservation still held in memory grants `0` once the durable record, the
+/// coordination inode, the claim pathname, or the pinned artifact no longer
+/// re-proves the spend. Production callers always pair this check with
+/// [`SpoolManager::require_live_claim`]; the probe deliberately does not, so a
+/// regression that collapses capacity checks into authorization alone cannot
+/// hide behind an earlier Unauthorized return.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn probe_dead_letter_source_credit_bytes_for_tests(
+    spool: &SpoolManager,
+    claim_path: &Path,
+    claim: &SpoolClaimHandle,
+) -> u64 {
+    spool.source_credit_bytes(claim_path, claim.handoff_authority())
+}
+
 /// Publish one dead-letter payload against an identity pinned earlier,
 /// optionally planting an accounted prior final between append and publish.
 ///
