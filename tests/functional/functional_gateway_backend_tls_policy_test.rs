@@ -145,9 +145,14 @@ async fn start_https_echo_on(
                 let read = stream.read(&mut buf).await.unwrap_or(0);
                 let head = String::from_utf8_lossy(&buf[..read]).to_string();
                 let host = request_host_header(&head).unwrap_or_default();
-                let mut seen = recorder.lock().expect("host recorder lock");
-                seen.push(host.clone());
-                drop(seen);
+                // Keep the non-Send std::sync::MutexGuard in a lexical scope so
+                // the spawned future cannot carry it across the response I/O
+                // awaits below. An explicit drop() is not sufficient for every
+                // compiler/control-flow analysis used by hosted CI.
+                {
+                    let mut seen = recorder.lock().expect("host recorder lock");
+                    seen.push(host.clone());
+                }
                 let body = format!(r#"{{"status":"ok","tls":true,"host":"{host}"}}"#);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
