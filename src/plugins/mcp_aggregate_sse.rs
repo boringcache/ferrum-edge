@@ -33,8 +33,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -175,7 +175,9 @@ impl AggregateSseBounds {
         // One max-size payload plus the framing the broker adds around it must
         // fit the single retained-byte budget; otherwise the largest admitted
         // event could never be staged and every publish would fail closed.
-        let framed_ceiling = self.max_event_bytes.saturating_add(SSE_FRAME_OVERHEAD_BYTES);
+        let framed_ceiling = self
+            .max_event_bytes
+            .saturating_add(SSE_FRAME_OVERHEAD_BYTES);
         if framed_ceiling > self.max_retained_bytes {
             return Err(field_error(
                 "sse_max_event_bytes",
@@ -204,7 +206,10 @@ fn field_error(field: &str, detail: &str) -> String {
 
 fn validate_bound(value: usize, min: usize, max: usize, field: &str) -> Result<(), String> {
     if value < min || value > max {
-        return Err(field_error(field, &format!("must be between {min} and {max}")));
+        return Err(field_error(
+            field,
+            &format!("must be between {min} and {max}"),
+        ));
     }
     Ok(())
 }
@@ -212,7 +217,10 @@ fn validate_bound(value: usize, min: usize, max: usize, field: &str) -> Result<(
 fn validate_seconds(value: Duration, min: u64, max: u64, field: &str) -> Result<(), String> {
     let seconds = value.as_secs();
     if seconds < min || seconds > max || value.subsec_nanos() != 0 {
-        return Err(field_error(field, &format!("must be between {min} and {max}")));
+        return Err(field_error(
+            field,
+            &format!("must be between {min} and {max}"),
+        ));
     }
     Ok(())
 }

@@ -219,8 +219,7 @@ pub mod _test_support {
             grpc_trailers: HashMap::new(),
             aggregate_sse: Some(listener),
         };
-        crate::proxy::build_response_from_normalized_reject(reject)
-            .into_parts()
+        crate::proxy::build_response_from_normalized_reject(reject).into_parts()
     }
 
     /// Whether a finalized reject header map still selects the gateway-authored
