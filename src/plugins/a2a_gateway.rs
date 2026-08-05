@@ -1058,7 +1058,12 @@ impl Plugin for A2aGateway {
             }
         }
         if self.should_rewrite_grpc_agent_card(ctx) {
-            return self.stage_grpc_agent_card_rewrite(ctx, response_status, response_headers, body);
+            return self.stage_grpc_agent_card_rewrite(
+                ctx,
+                response_status,
+                response_headers,
+                body,
+            );
         }
         if !response_headers
             .get("content-type")
@@ -2318,11 +2323,7 @@ impl ProtobufEmitter for crate::proxy::response_buffer_budget::BoundedResponseBo
 /// Turn a refused write into the sentinel error so it propagates out of a
 /// [`for_each_protobuf_field`] visitor.
 fn emit_or_refuse(emitted: bool) -> Result<(), &'static str> {
-    if emitted {
-        Ok(())
-    } else {
-        Err(EMIT_REFUSED)
-    }
+    if emitted { Ok(()) } else { Err(EMIT_REFUSED) }
 }
 
 /// Base-128 varint. The scratch array is a fixed 10-byte STACK buffer — the
@@ -2545,7 +2546,9 @@ fn validate_agent_card_protobuf(message: &[u8]) -> Result<AgentCardSchema<'_>, &
     if !(name_seen || description_seen) || !has_endpoint {
         return Err("agent_card_protobuf_shape_unrecognized");
     }
-    Ok(AgentCardSchema { preferred_transport })
+    Ok(AgentCardSchema {
+        preferred_transport,
+    })
 }
 
 /// The `AgentInterface` counterpart of [`validate_agent_card_protobuf`].

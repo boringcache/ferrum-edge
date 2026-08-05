@@ -466,7 +466,10 @@ fn assert_trailers_only_failure(call: &GrpcCall, context: &str) {
     let code: u32 = raw
         .parse()
         .unwrap_or_else(|_| panic!("{context}: grpc-status {raw:?} is not a parseable u32"));
-    assert_ne!(code, 0, "{context}: expected a nonzero terminal grpc-status");
+    assert_ne!(
+        code, 0,
+        "{context}: expected a nonzero terminal grpc-status"
+    );
     assert!(
         call.body.is_empty(),
         "{context}: a gRPC rewrite refusal must be trailers-only, not an HTTP body ({} bytes)",
@@ -944,11 +947,7 @@ async fn a2a_grpc_card_version_allow_list_reload_admits_a_new_version() {
     assert_trailers_only_failure(&call, "0.3.7 before it is configured");
 
     harness
-        .reload_with(config_template(
-            PUBLIC_BASE,
-            true,
-            r#"["0.3.0", "0.3.7"]"#,
-        ))
+        .reload_with(config_template(PUBLIC_BASE, true, r#"["0.3.0", "0.3.7"]"#))
         .await;
 
     let call = send_grpc_request(&harness.addr, &path, &body, &[])

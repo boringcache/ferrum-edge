@@ -2889,8 +2889,7 @@ async fn grpc_agent_card_requires_positive_proof_of_a_successful_reply() {
 
     // No terminal grpc-status at all: not a proven-OK reply.
     let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
-    let mut headers =
-        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
     assert!(matches!(
         plugin
             .on_response_body(&mut ctx, 200, &mut headers, &body)
