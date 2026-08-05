@@ -18,6 +18,7 @@
 //! `BackendSelectedHttp1`, and `Http2ConnectionPool::is_known_http1_backend`
 //! returns `true` on the next probe — that's the H2 ALPN fallback test.
 
+use super::http2::is_benign_script_step_error;
 use super::tcp::{ExecutionMode, StepError, TcpStep};
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, private_key};
@@ -347,11 +348,20 @@ impl ScriptedTlsBackend {
 
     /// Panic if any script execution failed. Call this before test-side
     /// asserts when a short-read or I/O failure should fail the test
-    /// rather than be silently discarded.
+    /// rather than be silently discarded. Known-benign client disconnects
+    /// are ignored (see [`super::http2::is_benign_script_step_error`]).
     pub async fn assert_no_step_errors(&self) {
         let errs = self.step_errors().await;
-        if !errs.is_empty() {
-            panic!("{} script step error(s): {:?}", errs.len(), errs);
+        let unexpected: Vec<_> = errs
+            .iter()
+            .filter(|error| !is_benign_script_step_error(error))
+            .collect();
+        if !unexpected.is_empty() {
+            panic!(
+                "{} script step error(s): {:?}",
+                unexpected.len(),
+                unexpected
+            );
         }
     }
 
