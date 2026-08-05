@@ -30,6 +30,8 @@ const DEFAULT_FERRUM_GATEWAY_CLASS_NAME: &str = "ferrum";
 const GATEWAY_API_STATUS_PATCH_PARALLELISM: usize = 32;
 const ROUTE_STATUS_PATCH_MAX_ATTEMPTS: usize = 5;
 const ROUTE_STATUS_PATCH_RETRY_BASE_MS: u64 = 10;
+/// Gateway API `PolicyStatus.ancestors` is a hard MaxItems=16 list-map.
+const MAX_POLICY_ANCESTORS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayApiStatusUpdate {
@@ -812,24 +814,18 @@ fn backend_tls_policy_status(
     };
 
     // Ancestors: the managed Gateways whose attached routes reach a Service this
-    // policy targets. Prefer the translator's resolved target list; fall back to
-    // the raw `spec.targetRefs` so a policy the translator rejected outright
-    // still reports *somewhere* an operator can see it.
+    // policy targets. Union the translator's resolved targets with sanitized raw
+    // core-Service refs so a partially or wholly rejected targetRef still gets a
+    // visible condition on the relevant Gateway instead of disappearing.
+    let mut target_services: BTreeSet<(String, String)> = BTreeSet::new();
+    if let Some(outcome) = outcome {
+        target_services.extend(outcome.target_services.iter().cloned());
+    }
+    target_services.extend(policy_target_services(object));
     let mut ancestors_set: BTreeSet<(&str, &str)> = BTreeSet::new();
-    match outcome {
-        Some(outcome) => {
-            for (namespace, name) in &outcome.target_services {
-                if let Some(gateways) = ancestor_gateways_for_service(indexes, namespace, name) {
-                    ancestors_set.extend(gateways.iter().copied());
-                }
-            }
-        }
-        None => {
-            for (namespace, name) in policy_target_services(object) {
-                if let Some(gateways) = ancestor_gateways_for_service(indexes, namespace, name) {
-                    ancestors_set.extend(gateways.iter().copied());
-                }
-            }
+    for (namespace, name) in &target_services {
+        if let Some(gateways) = ancestor_gateways_for_service(indexes, namespace, name) {
+            ancestors_set.extend(gateways.iter().copied());
         }
     }
 
@@ -837,7 +833,8 @@ fn backend_tls_policy_status(
 
     let existing_ancestors = object.status.get("ancestors");
     let mut ancestors = retained_non_ferrum_status_entries(&object.status, "ancestors");
-    for (gateway_namespace, gateway_name) in ancestors_set {
+    let available = MAX_POLICY_ANCESTORS.saturating_sub(ancestors.len());
+    for (gateway_namespace, gateway_name) in ancestors_set.into_iter().take(available) {
         let ancestor_ref = json!({
             "group": "gateway.networking.k8s.io",
             "kind": "Gateway",
@@ -951,9 +948,13 @@ fn ancestor_gateways_for_service<'i, 'a>(
         .map(|(_, gateways)| gateways)
 }
 
-/// Raw `spec.targetRefs` core-Service targets, used only as the fallback
-/// ancestor source when the translator produced no outcome for this policy.
-fn policy_target_services(object: &K8sObject) -> Vec<(&str, &str)> {
+/// Sanitized raw `spec.targetRefs` core-Service targets for status ancestry.
+///
+/// This is intentionally more permissive than admission: a cross-namespace
+/// target is rejected by the translator, but using its declared namespace here
+/// lets Ferrum surface that rejection on a managed Gateway that actually routes
+/// to the named Service.
+fn policy_target_services(object: &K8sObject) -> Vec<(String, String)> {
     object
         .spec
         .get("targetRefs")
@@ -972,11 +973,16 @@ fn policy_target_services(object: &K8sObject) -> Vec<(&str, &str)> {
             group.is_empty() && kind == "Service"
         })
         .filter_map(|target_ref| {
-            let name = target_ref.get("name").and_then(Value::as_str)?;
-            // Ferrum admits same-namespace targets only; a cross-namespace
-            // `targetRefs[].namespace` is rejected by the translator, so the
-            // policy namespace is the only correct key here.
-            Some((object.metadata.namespace.as_str(), name))
+            let name = target_ref
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())?;
+            let namespace = target_ref
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|namespace| !namespace.is_empty())
+                .unwrap_or(object.metadata.namespace.as_str());
+            Some((namespace.to_string(), name.to_string()))
         })
         .collect()
 }
@@ -2191,11 +2197,16 @@ fn policy_status_merge_patch_for_update(
         })
         .collect();
     let ancestors = match live_status {
-        Some(status) => retained_non_ferrum_status_entries(status, "ancestors")
+        Some(status) => {
+            let mut retained = retained_non_ferrum_status_entries(status, "ancestors");
+            let available = MAX_POLICY_ANCESTORS.saturating_sub(retained.len());
+            retained.extend(desired_ancestors.into_iter().take(available));
+            retained
+        }
+        None => desired_ancestors
             .into_iter()
-            .chain(desired_ancestors)
+            .take(MAX_POLICY_ANCESTORS)
             .collect(),
-        None => desired_ancestors,
     };
 
     json!({
@@ -2610,7 +2621,7 @@ fn status_candidate_is_eligible(object: &K8sObject, indexes: &GatewayApiStatusIn
                 policy_target_services(object)
                     .into_iter()
                     .any(|(namespace, name)| {
-                        ancestor_gateways_for_service(indexes, namespace, name).is_some()
+                        ancestor_gateways_for_service(indexes, &namespace, &name).is_some()
                     });
             has_managed_ancestor || has_ferrum_status_entry(&object.status, "ancestors")
         }

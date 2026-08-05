@@ -809,7 +809,7 @@ fn backend_tls_policy_status_reports_invalid_ca_certificate_ref() {
     );
     assert_eq!(
         accepted.get("reason").and_then(Value::as_str),
-        Some("Invalid")
+        Some("NoValidCACertificate")
     );
     let resolved = condition(ancestor, "ResolvedRefs");
     assert_eq!(
@@ -828,6 +828,195 @@ fn backend_tls_policy_status_reports_invalid_ca_certificate_ref() {
     assert!(
         message.contains("caCertificateRefs[0]") && message.contains("default/missing-ca"),
         "message must be field-specific: {message}"
+    );
+}
+
+#[test]
+fn backend_tls_policy_status_marks_precedence_loser_conflicted() {
+    let mut older = backend_tls_policy_system("a-older", "reviews");
+    older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    older.spec["validation"]["hostname"] = serde_json::json!("older.example.com");
+    let mut newer = backend_tls_policy_system("b-newer", "reviews");
+    newer.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+    newer.spec["validation"]["hostname"] = serde_json::json!("newer.example.com");
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        service("reviews", 8080, "http"),
+        http_route("reviews-route", "reviews", 8080),
+        newer,
+        older,
+    ];
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    let upstream = translated
+        .config
+        .upstreams
+        .first()
+        .expect("the precedence winner must still materialize TLS");
+    assert_eq!(
+        upstream.backend_tls_sni.as_deref(),
+        Some("older.example.com"),
+        "runtime and status must use the same oldest-policy winner"
+    );
+
+    let newer_update =
+        policy_status_update(&objects, "b-newer").expect("loser status update");
+    let newer_ancestors = ferrum_ancestors(&newer_update);
+    let accepted = condition(&newer_ancestors[0], "Accepted");
+    assert_eq!(accepted.get("status").and_then(Value::as_str), Some("False"));
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("Conflicted")
+    );
+
+    let older_update = policy_status_update(&objects, "a-older").expect("winner status update");
+    let older_ancestors = ferrum_ancestors(&older_update);
+    assert_eq!(
+        condition(&older_ancestors[0], "Accepted")
+            .get("status")
+            .and_then(Value::as_str),
+        Some("True")
+    );
+}
+
+#[test]
+fn backend_tls_policy_status_reports_invalid_target_reference_kind() {
+    let mut policy = backend_tls_policy_system("bad-target", "reviews");
+    policy.spec["targetRefs"][0]["kind"] = serde_json::json!("Deployment");
+    let translated = translate_k8s_objects(&[policy], options()).expect("translate");
+    let status = translated
+        .backend_tls_policy_statuses
+        .first()
+        .expect("policy status projection");
+    assert!(!status.accepted);
+    assert_eq!(status.accepted_reason, "Invalid");
+    assert!(!status.resolved_refs);
+    assert_eq!(status.resolved_refs_reason, "InvalidKind");
+}
+
+#[test]
+fn backend_tls_policy_status_reports_cross_namespace_target_as_ref_not_permitted() {
+    let mut policy = backend_tls_policy_system("cross-ns-target", "reviews");
+    policy.spec["targetRefs"][0]["namespace"] = serde_json::json!("other");
+    let translated = translate_k8s_objects(&[policy], options()).expect("translate");
+    let status = translated
+        .backend_tls_policy_statuses
+        .first()
+        .expect("policy status projection");
+    assert!(!status.accepted);
+    assert_eq!(status.accepted_reason, "Invalid");
+    assert!(!status.resolved_refs);
+    assert_eq!(status.resolved_refs_reason, "RefNotPermitted");
+}
+
+#[test]
+fn backend_tls_policy_rejects_unrepresentable_or_malformed_optional_shapes() {
+    let cases = [
+        (
+            "multiple-targets",
+            serde_json::json!({
+                "targetRefs": [
+                    {"group": "", "kind": "Service", "name": "reviews"},
+                    {"group": "", "kind": "Service", "name": "ratings"}
+                ],
+                "validation": {
+                    "hostname": "backend.example.com",
+                    "wellKnownCACertificates": "System"
+                }
+            }),
+            "exactly one entry",
+        ),
+        (
+            "empty-section",
+            serde_json::json!({
+                "targetRefs": [{
+                    "group": "", "kind": "Service", "name": "reviews", "sectionName": ""
+                }],
+                "validation": {
+                    "hostname": "backend.example.com",
+                    "wellKnownCACertificates": "System"
+                }
+            }),
+            "sectionName must not be empty",
+        ),
+        (
+            "malformed-sans",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "reviews"}],
+                "validation": {
+                    "hostname": "backend.example.com",
+                    "wellKnownCACertificates": "System",
+                    "subjectAltNames": {"type": "Hostname", "hostname": "backend.example.com"}
+                }
+            }),
+            "subjectAltNames must be an array",
+        ),
+        (
+            "unsupported-options",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "reviews"}],
+                "validation": {
+                    "hostname": "backend.example.com",
+                    "wellKnownCACertificates": "System"
+                },
+                "options": {"example.com/min-version": "TLS1.3"}
+            }),
+            "spec.options is not supported",
+        ),
+    ];
+
+    for (name, spec, diagnostic) in cases {
+        let objects = vec![
+            gateway_class(),
+            gateway(),
+            service("reviews", 8080, "http"),
+            service("ratings", 8080, "http"),
+            http_route("reviews-route", "reviews", 8080),
+            object("BackendTLSPolicy", name, spec),
+        ];
+        let translated = translate_k8s_objects(&objects, options()).expect("translate");
+        assert!(
+            translated
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(diagnostic)),
+            "{name} must fail with a field-specific diagnostic: {:?}",
+            translated.warnings
+        );
+        assert!(
+            fault_body_mentions(&translated),
+            "{name} must retain the affected route as a fail-closed HTTP 500 rather than silently broadening to plaintext"
+        );
+    }
+}
+
+#[test]
+fn backend_tls_policy_status_never_exceeds_sixteen_ancestors() {
+    let mut objects = vec![gateway_class(), service("reviews", 8080, "http")];
+    for index in 0..17 {
+        let gateway_name = format!("edge-{index:02}");
+        let mut gateway = gateway();
+        gateway.metadata.name = gateway_name.clone();
+        let mut route = http_route(&format!("route-{index:02}"), "reviews", 8080);
+        route.spec["parentRefs"][0]["name"] = serde_json::json!(gateway_name);
+        route.spec["hostnames"][0] =
+            serde_json::json!(format!("reviews-{index:02}.example.com"));
+        objects.push(gateway);
+        objects.push(route);
+    }
+    objects.push(backend_tls_policy_system("reviews-tls", "reviews"));
+
+    let update = policy_status_update(&objects, "reviews-tls").expect("policy status update");
+    assert_eq!(
+        update
+            .status
+            .get("ancestors")
+            .and_then(Value::as_array)
+            .expect("ancestors")
+            .len(),
+        16,
+        "Gateway API PolicyStatus has a hard MaxItems=16 contract"
     );
 }
 

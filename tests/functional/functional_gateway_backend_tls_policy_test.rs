@@ -29,7 +29,7 @@ use ferrum_edge::identity::spiffe::TrustDomain;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -131,7 +131,6 @@ async fn start_https_echo_on(
             });
         }
     });
-    sleep(Duration::from_millis(100)).await;
     handle
 }
 
@@ -358,6 +357,33 @@ async fn get_status(proxy_http: u16, path: &str) -> u16 {
         .as_u16()
 }
 
+/// Poll through the bounded SIGHUP reload window instead of assuming a loaded
+/// hosted runner will apply the new snapshot within a fixed sleep.
+async fn wait_for_status(proxy_http: u16, path: &str, expected: u16) -> u16 {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("client");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let last = match client
+            .get(format!("http://127.0.0.1:{proxy_http}{path}"))
+            .header("Host", ROUTE_HOST)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().as_u16() == expected => return expected,
+            Ok(response) => format!("HTTP {}", response.status()),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "gateway did not converge to HTTP {expected} before the reload deadline; last observation: {last}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -582,15 +608,20 @@ async fn backend_tls_policy_withdrawal_reaches_the_live_data_path() {
     std::fs::write(config_path, translated_config_yaml(&without_policy))
         .expect("rewrite translated config");
     let pid = gateway.pid().expect("gateway still running");
-    let _ = std::process::Command::new("kill")
+    let signal = std::process::Command::new("kill")
         .args(["-HUP", &pid.to_string()])
-        .output();
-    sleep(Duration::from_secs(2)).await;
+        .output()
+        .expect("invoke SIGHUP command");
+    assert!(
+        signal.status.success(),
+        "SIGHUP command failed: {}",
+        String::from_utf8_lossy(&signal.stderr)
+    );
 
     // The backend speaks TLS only, so a withdrawn policy — which returns the
     // route to a plaintext direct backend — must stop succeeding.
     assert_eq!(
-        get_status(proxy_http, "/api/test").await,
+        wait_for_status(proxy_http, "/api/test", 502).await,
         502,
         "withdrawing the policy must reach the live data path, not just the config"
     );

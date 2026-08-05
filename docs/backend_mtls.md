@@ -85,6 +85,12 @@ only valid on a CA-bundle field — `system://corp-ca.pem` and `system://` on a
 client cert/key field are both rejected at config load. It is what Gateway API
 `BackendTLSPolicy` `wellKnownCACertificates: System` translates to.
 
+Ferrum supports exactly one `BackendTLSPolicy.spec.targetRefs` entry, following
+the Gateway API v1.5.1 recommendation while multi-target conflict/status
+semantics remain undefined. Non-empty `spec.options` are not supported. These
+and malformed optional field shapes are rejected fail closed rather than
+silently broadening a targeted backend to plaintext.
+
 **CA exclusivity**: When a custom CA is configured, it is the sole trust anchor. This prevents a backend pinned to an internal CA from being MITMed via any publicly-trusted certificate. If you need both internal and public CAs trusted, combine them into a single PEM bundle file.
 
 No-verify changes handshake verification only. Ferrum still materializes and

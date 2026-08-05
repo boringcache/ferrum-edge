@@ -349,9 +349,10 @@ pub struct K8sTranslation {
 /// status writer publishes on `status.ancestors[].conditions`.
 ///
 /// Reasons come from the Gateway API `PolicyConditionReason` vocabulary so the
-/// values are portable: `Accepted` / `Invalid` / `TargetNotFound` on `Accepted`,
-/// and `ResolvedRefs` / `InvalidCACertificateRef` / `InvalidKind` /
-/// `RefNotPermitted` on `ResolvedRefs`.
+/// values are portable: `Accepted` / `Conflicted` / `Invalid` /
+/// `NoValidCACertificate` / `TargetNotFound` on `Accepted`, and `ResolvedRefs`
+/// / `InvalidCACertificateRef` / `InvalidKind` / `RefNotPermitted` on
+/// `ResolvedRefs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayApiBackendTlsPolicyStatus {
     pub policy: K8sResourceKey,
@@ -835,6 +836,24 @@ impl K8sAccumulator {
     }
 
     fn finish(mut self) -> K8sTranslation {
+        // BackendTLSPolicy precedence depends on the complete snapshot. Mark
+        // losers only after every policy has been indexed so status is stable
+        // under input reordering and matches runtime lookup's winner.
+        let conflicted_policies = self.backend_tls_policies.conflicted_policy_ids();
+        for status in &mut self.backend_tls_policy_statuses {
+            if status.accepted
+                && conflicted_policies.contains(&(
+                    status.policy.namespace.clone(),
+                    status.policy.name.clone(),
+                ))
+            {
+                status.accepted = false;
+                status.accepted_reason = "Conflicted".to_string();
+                status.accepted_message =
+                    "An older BackendTLSPolicy takes precedence for the same Service section"
+                        .to_string();
+            }
+        }
         gateway_api::finalize_dispatch_plugin_precedence(&mut self.config.plugin_configs);
         debug_assert!(
             !gateway_api::dispatch_rule_internal_metadata_present(&self.config.plugin_configs),
