@@ -339,6 +339,32 @@ pub struct K8sTranslation {
     /// route attached to one programmed parent and one fail-closed parent does
     /// not report both parents as Programmed.
     pub materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
+    /// Per-`BackendTLSPolicy` translation outcome, projected for the Gateway
+    /// API status writer. Computed during translation (the only place the
+    /// ConfigMap/Secret CA index exists) so status planning never retranslates.
+    pub backend_tls_policy_statuses: Vec<GatewayApiBackendTlsPolicyStatus>,
+}
+
+/// Translation outcome for one Gateway API `BackendTLSPolicy`, in the shape the
+/// status writer publishes on `status.ancestors[].conditions`.
+///
+/// Reasons come from the Gateway API `PolicyConditionReason` vocabulary so the
+/// values are portable: `Accepted` / `Invalid` / `TargetNotFound` on `Accepted`,
+/// and `ResolvedRefs` / `InvalidCACertificateRef` / `InvalidKind` /
+/// `RefNotPermitted` on `ResolvedRefs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayApiBackendTlsPolicyStatus {
+    pub policy: K8sResourceKey,
+    pub accepted: bool,
+    pub accepted_reason: String,
+    pub accepted_message: String,
+    pub resolved_refs: bool,
+    pub resolved_refs_reason: String,
+    pub resolved_refs_message: String,
+    /// `(namespace, service name)` Service targets this policy attaches to.
+    /// The status writer derives the policy's `ancestors` from the managed
+    /// Gateways that route to these Services.
+    pub target_services: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -531,6 +557,8 @@ pub(crate) struct K8sAccumulator {
     gateway_api_materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
     /// Gateway API `BackendTLSPolicy` index keyed by target Service identity.
     backend_tls_policies: backend_tls_policy::BackendTlsPolicyIndex,
+    /// Per-policy status projections recorded as policies are collected.
+    backend_tls_policy_statuses: Vec<GatewayApiBackendTlsPolicyStatus>,
 }
 
 impl K8sAccumulator {
@@ -561,7 +589,15 @@ impl K8sAccumulator {
             gateway_api_route_conflicts: Vec::new(),
             gateway_api_materialized_route_parents: HashSet::new(),
             backend_tls_policies: backend_tls_policy::BackendTlsPolicyIndex::default(),
+            backend_tls_policy_statuses: Vec::new(),
         }
+    }
+
+    pub(crate) fn record_backend_tls_policy_status(
+        &mut self,
+        status: GatewayApiBackendTlsPolicyStatus,
+    ) {
+        self.backend_tls_policy_statuses.push(status);
     }
 
     /// Resolve a Service port name to its `port` value. Returns `None` when
@@ -850,6 +886,7 @@ impl K8sAccumulator {
             warnings: self.warnings,
             route_conflicts: self.gateway_api_route_conflicts,
             materialized_route_parents: self.gateway_api_materialized_route_parents,
+            backend_tls_policy_statuses: self.backend_tls_policy_statuses,
         }
     }
 }

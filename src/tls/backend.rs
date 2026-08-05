@@ -710,7 +710,14 @@ impl<'a> BackendTlsConfigBuilder<'a> {
     }
 
     fn build_server_verifier(&self) -> Result<BackendServerVerifier, TlsError> {
-        let root_store = build_root_cert_store(self.custom_ca_path(), self.global_ca)?;
+        // `system://` pins the built-in webpki roots. Passing the global CA
+        // through here would let a cluster-wide private bundle replace the
+        // trust anchors this backend explicitly asked for.
+        let root_store = if self.uses_system_trust_roots() {
+            build_root_cert_store(None, None)?
+        } else {
+            build_root_cert_store(self.custom_ca_path(), self.global_ca)?
+        };
         let inner = build_server_verifier_with_crls(root_store, self.crls)
             .map_err(|e| TlsError::Rustls(format!("Failed to build server verifier: {}", e)))?;
         if self.proxy.resolved_tls.san_allow_list.is_empty() {
@@ -722,11 +729,25 @@ impl<'a> BackendTlsConfigBuilder<'a> {
         }
     }
 
+    /// True when the resolved backend TLS config pinned the built-in
+    /// system/webpki trust anchors (`system://`).
+    fn uses_system_trust_roots(&self) -> bool {
+        self.proxy.resolved_tls.uses_system_trust_roots()
+    }
+
     fn skip_verification(&self) -> bool {
-        !self.proxy.resolved_tls.verify_server_cert || self.global_no_verify
+        // A `system://` trust selection is an explicit demand to verify against
+        // the platform roots, so it must not inherit `FERRUM_TLS_NO_VERIFY`.
+        // (Config validation additionally rejects pairing it with
+        // `backend_tls_verify_server_cert: false`.)
+        !self.proxy.resolved_tls.verify_server_cert
+            || (self.global_no_verify && self.proxy.resolved_tls.allows_global_no_verify())
     }
 
     fn custom_ca_path(&self) -> Option<&Path> {
+        if self.uses_system_trust_roots() {
+            return None;
+        }
         self.proxy
             .resolved_tls
             .server_ca_cert_path

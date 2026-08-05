@@ -1356,6 +1356,38 @@ impl BackendTlsConfig {
         }
     }
 
+    /// True when this backend explicitly selected the built-in system/webpki
+    /// trust anchors (`system://`) instead of a CA bundle.
+    ///
+    /// This is a *stronger* statement than "no CA path configured": it pins the
+    /// trust anchors to the platform roots and must bypass the cluster-global
+    /// `FERRUM_TLS_CA_BUNDLE_PATH` override and `FERRUM_TLS_NO_VERIFY`.
+    pub fn uses_system_trust_roots(&self) -> bool {
+        self.server_ca_cert_path
+            .as_deref()
+            .is_some_and(crate::tls::source::is_system_trust_roots_source)
+    }
+
+    /// The CA source that should actually be loaded for this backend, applying
+    /// the documented chain: backend CA, else global CA, else built-in roots.
+    ///
+    /// Returns `None` both when nothing is configured and when the backend
+    /// selected `system://` — in the latter case the global bundle is
+    /// deliberately NOT consulted, so a cluster-wide private CA cannot silently
+    /// become the trust anchor for a backend that asked for system roots.
+    pub fn effective_ca_source<'a>(&'a self, global_ca_path: Option<&'a str>) -> Option<&'a str> {
+        if self.uses_system_trust_roots() {
+            return None;
+        }
+        self.server_ca_cert_path.as_deref().or(global_ca_path)
+    }
+
+    /// Whether the global `FERRUM_TLS_NO_VERIFY` opt-out may apply to this
+    /// backend. An explicit `system://` trust selection never inherits it.
+    pub fn allows_global_no_verify(&self) -> bool {
+        !self.uses_system_trust_roots()
+    }
+
     pub fn recompute_san_digest(&mut self) {
         self.san_allow_list_key_digest = Self::compute_san_digest(&self.san_allow_list);
     }
@@ -4936,12 +4968,63 @@ fn validate_tls_material_source_field(
     value: &str,
     kind: crate::tls::source::MaterialKind,
 ) -> Result<(), String> {
-    match crate::tls::source::CertSource::parse(value, kind) {
+    let source = crate::tls::source::CertSource::parse(value, kind);
+    if source.is_system_trust_roots() {
+        return validate_system_trust_roots_source_field(field_name, value, kind);
+    }
+    match source {
         crate::tls::source::CertSource::InlinePem(_) => {
             validate_string_field(field_name, value, MAX_TLS_INLINE_PEM_LENGTH)
         }
         _ => validate_string_field(field_name, value, MAX_FILE_PATH_LENGTH),
     }
+}
+
+/// Admit `system://` only in its exact canonical spelling, and only where
+/// selecting a *trust store* is meaningful.
+///
+/// The value is a security decision, not a path, so a near-miss must not be
+/// accepted and silently reinterpreted: `system://corp-ca.pem` looks like it
+/// pins a bundle but would select the built-in roots, and `system://` on a
+/// client cert/key field selects nothing at all.
+fn validate_system_trust_roots_source_field(
+    field_name: &str,
+    value: &str,
+    kind: crate::tls::source::MaterialKind,
+) -> Result<(), String> {
+    if kind != crate::tls::source::MaterialKind::CaBundle {
+        return Err(format!(
+            "{field_name} must not be '{}': the system trust-roots source selects CA trust anchors and is only valid on a CA bundle field",
+            crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
+        ));
+    }
+    if value != crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE {
+        return Err(format!(
+            "{field_name} system trust-roots source must be exactly '{}' with no path or query options (got '{value}')",
+            crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
+        ));
+    }
+    Ok(())
+}
+
+/// Reject an explicit system-trust-roots selection paired with the verification
+/// opt-out. `system://` means "verify against the platform roots"; combining it
+/// with `verify_server_cert: false` is a contradiction that would otherwise
+/// silently resolve in favour of not verifying at all.
+fn validate_system_trust_roots_verify_pairing(
+    ca_field: &str,
+    verify_field: &str,
+    ca_value: Option<&str>,
+    verify_server_cert: bool,
+) -> Option<String> {
+    let selects_system = ca_value.is_some_and(crate::tls::source::is_system_trust_roots_source);
+    if selects_system && !verify_server_cert {
+        return Some(format!(
+            "{verify_field} cannot be false when {ca_field} is '{}' — the system trust-roots source requires server certificate verification",
+            crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
+        ));
+    }
+    None
 }
 
 /// Validate that a PEM certificate source is readable and every declared
@@ -6917,6 +7000,14 @@ impl Proxy {
         {
             errors.push(e);
         }
+        if let Some(e) = validate_system_trust_roots_verify_pairing(
+            "backend_tls_server_ca_cert_path",
+            "backend_tls_verify_server_cert",
+            self.backend_tls_server_ca_cert_path.as_deref(),
+            self.backend_tls_verify_server_cert,
+        ) {
+            errors.push(e);
+        }
 
         // TLS cert/key pairing: both must be set or neither
         match (
@@ -8111,6 +8202,14 @@ impl Upstream {
                 crate::tls::source::MaterialKind::CaBundle,
             )
         {
+            errors.push(e);
+        }
+        if let Some(e) = validate_system_trust_roots_verify_pairing(
+            "backend_tls_server_ca_cert_path",
+            "backend_tls_verify_server_cert",
+            self.backend_tls_server_ca_cert_path.as_deref(),
+            self.backend_tls_verify_server_cert,
+        ) {
             errors.push(e);
         }
         if let Some(ref sni) = self.backend_tls_sni

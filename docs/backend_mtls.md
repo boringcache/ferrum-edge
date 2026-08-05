@@ -58,10 +58,32 @@ The `FERRUM_TLS_CA_BUNDLE_PATH` allows you to specify custom Certificate Authori
 
 The gateway resolves backend CA trust in the following order:
 
-1. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with **only** that CA. Webpki/system roots are excluded to prevent public CAs from being trusted alongside your internal CA.
-2. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH` / `FERRUM_TLS_CA_BUNDLE_SOURCE`) — verify with **only** the global CA. Same exclusivity as proxy-specific.
-3. **Neither set** — verify with **bundled webpki roots** (secure default). The gateway does **not** skip verification when no CA is configured.
-4. **Explicit opt-out** — `backend_tls_verify_server_cert: false` on a per-proxy basis, or `FERRUM_TLS_NO_VERIFY=true` globally, skips all certificate verification. These are the **only** ways to disable verification and should never be used in production.
+1. **Explicit system roots** (`backend_tls_server_ca_cert_path: "system://"`) — verify with **only** the bundled webpki/system trust anchors. This is a *pin*, not an absence: steps 2 and 4 are skipped entirely (see below).
+2. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with **only** that CA. Webpki/system roots are excluded to prevent public CAs from being trusted alongside your internal CA.
+3. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH` / `FERRUM_TLS_CA_BUNDLE_SOURCE`) — verify with **only** the global CA. Same exclusivity as proxy-specific.
+4. **Neither set** — verify with **bundled webpki roots** (secure default). The gateway does **not** skip verification when no CA is configured.
+5. **Explicit opt-out** — `backend_tls_verify_server_cert: false` on a per-proxy basis, or `FERRUM_TLS_NO_VERIFY=true` globally, skips all certificate verification. These are the **only** ways to disable verification and should never be used in production.
+
+### `system://` — pinning the built-in trust anchors
+
+`system://` is a reserved, first-class value for `backend_tls_server_ca_cert_path`
+(and `Upstream.backend_tls_server_ca_cert_path`). It differs from leaving the
+field unset in three ways that matter:
+
+- It **does not fall back to `FERRUM_TLS_CA_BUNDLE_PATH`**. Leaving the field
+  unset means "no per-backend CA configured", which the chain above resolves to
+  the cluster-global bundle when one is set — so a cluster-wide private CA would
+  become the sole trust anchor. `system://` refuses that substitution.
+- It **never inherits `FERRUM_TLS_NO_VERIFY`**. Pairing it with
+  `backend_tls_verify_server_cert: false` is a config validation error.
+- It **partitions backend connection pools** like any other trust identity, so a
+  `system://` backend never shares a pooled connection with one verified against
+  a custom CA.
+
+It must be spelled exactly `system://`, with no path or query options, and is
+only valid on a CA-bundle field — `system://corp-ca.pem` and `system://` on a
+client cert/key field are both rejected at config load. It is what Gateway API
+`BackendTLSPolicy` `wellKnownCACertificates: System` translates to.
 
 **CA exclusivity**: When a custom CA is configured, it is the sole trust anchor. This prevents a backend pinned to an internal CA from being MITMed via any publicly-trusted certificate. If you need both internal and public CAs trusted, combine them into a single PEM bundle file.
 

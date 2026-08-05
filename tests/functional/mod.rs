@@ -37,6 +37,7 @@ mod functional_early_upload_deadline_test;
 mod functional_example_plugin_test;
 mod functional_file_mode_test;
 mod functional_forwarded_via_headers_test;
+mod functional_gateway_backend_tls_policy_test;
 mod functional_graceful_shutdown_test;
 mod functional_grpc_method_pre_hook_test;
 mod functional_grpc_plugins_test;

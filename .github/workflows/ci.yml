@@ -1058,6 +1058,7 @@ jobs:
               functional_auth_acl_test
               functional_credential_rotation_test
               functional_file_mode_test
+              functional_gateway_backend_tls_policy_test
               functional_host_only_routing_test
               functional_migrate_mode_test
               functional_protocol_validation_test

@@ -10,6 +10,11 @@ use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
+use ferrum_edge::k8s_controller::status::{
+    FERRUM_GATEWAY_CONTROLLER_NAME, GatewayApiStatusUpdate, plan_gateway_api_status_updates,
+};
+use ferrum_edge::tls::source::SYSTEM_TRUST_ROOTS_SOURCE;
+use serde_json::Value;
 
 fn options() -> K8sTranslationOptions {
     K8sTranslationOptions::new(
@@ -248,9 +253,13 @@ fn backend_tls_policy_system_enables_https_sni_on_upstream() {
         Some("backend.example.com")
     );
     assert!(upstream.backend_tls_verify_server_cert);
-    assert!(
-        upstream.backend_tls_server_ca_cert_path.is_none(),
-        "System roots leave CA path unset"
+    // `wellKnownCACertificates: System` must project the explicit system-roots
+    // source, NOT an unset CA path: unset falls back to the cluster-global
+    // FERRUM_TLS_CA_BUNDLE_PATH, so a private cluster CA would silently replace
+    // the public roots the policy asked for.
+    assert_eq!(
+        upstream.backend_tls_server_ca_cert_path.as_deref(),
+        Some(SYSTEM_TRUST_ROOTS_SOURCE)
     );
     assert!(
         translated
@@ -429,6 +438,556 @@ fn backend_tls_policy_delete_withdraws_tls_overlay() {
                 && proxy.upstream_id.is_none()),
         "withdrawn policy must leave plaintext direct backends"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Mixed policy-covered / uncovered backend sets (fail closed)
+// ---------------------------------------------------------------------------
+
+fn split_http_route(name: &str, backends: &[(&str, u16, u32)]) -> K8sObject {
+    let backend_refs: Vec<serde_json::Value> = backends
+        .iter()
+        .map(|(service, port, weight)| {
+            serde_json::json!({ "name": service, "port": port, "weight": weight })
+        })
+        .collect();
+    object(
+        "HTTPRoute",
+        name,
+        serde_json::json!({
+            "parentRefs": [{ "name": "edge" }],
+            "hostnames": ["split.example.com"],
+            "rules": [{
+                "matches": [{ "path": { "type": "PathPrefix", "value": "/split" } }],
+                "backendRefs": backend_refs
+            }]
+        }),
+    )
+}
+
+fn fault_body_mentions(translated: &ferrum_edge::config_sources::k8s::K8sTranslation) -> bool {
+    translated.config.plugin_configs.iter().any(|plugin| {
+        plugin.plugin_name == "mesh_route_dispatch"
+            && plugin
+                .config
+                .get("rules")
+                .and_then(|rules| rules.as_array())
+                .into_iter()
+                .flatten()
+                .any(|rule| {
+                    rule.get("fault")
+                        .and_then(|fault| fault.get("abort"))
+                        .and_then(|abort| abort.get("status"))
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(500)
+                        && rule
+                            .get("fault")
+                            .and_then(|fault| fault.get("abort"))
+                            .and_then(|abort| abort.get("body"))
+                            .and_then(|body| body.as_str())
+                            .is_some_and(|body| body.contains("BackendTLSPolicy"))
+                })
+    })
+}
+
+#[test]
+fn backend_tls_policy_mixed_covered_and_uncovered_backends_fails_closed() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        service("reviews", 8080, "http"),
+        service("ratings", 8080, "http"),
+        split_http_route("split-route", &[("reviews", 8080, 1), ("ratings", 8080, 1)]),
+        // Only `reviews` is covered. `ratings` has no policy at all.
+        backend_tls_policy_system("reviews-tls", "reviews"),
+    ];
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert!(
+        translated.config.upstreams.is_empty(),
+        "a partially covered backend set must not materialize a TLS upstream: {:?}",
+        translated.config.upstreams
+    );
+    assert!(
+        !translated
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_scheme == Some(BackendScheme::Https)),
+        "the uncovered Service must never be promoted to HTTPS"
+    );
+    let warning = translated
+        .warnings
+        .iter()
+        .find(|warning| warning.contains("mixes BackendTLSPolicy-covered and uncovered backends"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a field-specific mixed-coverage warning, got {:?}",
+                translated.warnings
+            )
+        });
+    assert!(
+        warning.contains("spec.rules[].backendRefs"),
+        "warning must name the offending field: {warning}"
+    );
+    assert!(
+        warning.contains("Service default/reviews") && warning.contains("Service default/ratings"),
+        "warning must identify both sides: {warning}"
+    );
+    assert!(
+        fault_body_mentions(&translated),
+        "mixed coverage must materialize an HTTP 500 fault abort"
+    );
+}
+
+#[test]
+fn backend_tls_policy_covering_every_backend_still_applies() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        service("reviews", 8080, "http"),
+        service("ratings", 8080, "http"),
+        split_http_route("split-route", &[("reviews", 8080, 1), ("ratings", 8080, 1)]),
+        backend_tls_policy_system("reviews-tls", "reviews"),
+        // Byte-identical validation, so both overlays compare equal and the
+        // combined upstream carries one unambiguous TLS identity.
+        backend_tls_policy_system("ratings-tls", "ratings"),
+    ];
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    let upstream = translated
+        .config
+        .upstreams
+        .first()
+        .expect("uniformly covered backends should materialize one TLS upstream");
+    assert_eq!(
+        upstream.backend_tls_sni.as_deref(),
+        Some("backend.example.com")
+    );
+    assert_eq!(
+        upstream.backend_tls_server_ca_cert_path.as_deref(),
+        Some(SYSTEM_TRUST_ROOTS_SOURCE)
+    );
+    assert!(
+        translated
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_scheme == Some(BackendScheme::Https))
+    );
+}
+
+#[test]
+fn backend_tls_policy_zero_weight_uncovered_backend_does_not_fail_closed() {
+    // A zero-weight backendRef receives no traffic, so it is not part of the
+    // effective backend set and must not trip the mixed-coverage guard.
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        service("reviews", 8080, "http"),
+        service("ratings", 8080, "http"),
+        split_http_route("split-route", &[("reviews", 8080, 1), ("ratings", 8080, 0)]),
+        backend_tls_policy_system("reviews-tls", "reviews"),
+    ];
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(
+        !translated
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("mixes BackendTLSPolicy-covered")),
+        "zero-weight backends must not trip the mixed-coverage guard: {:?}",
+        translated.warnings
+    );
+    let upstream = translated
+        .config
+        .upstreams
+        .first()
+        .expect("expected a TLS upstream for the only traffic-bearing backend");
+    assert_eq!(
+        upstream.backend_tls_server_ca_cert_path.as_deref(),
+        Some(SYSTEM_TRUST_ROOTS_SOURCE)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// targetRefs[].sectionName resolution
+// ---------------------------------------------------------------------------
+
+fn multi_port_service(name: &str) -> K8sObject {
+    object(
+        "Service",
+        name,
+        serde_json::json!({
+            "ports": [
+                { "name": "http", "port": 8080, "targetPort": 8080 },
+                { "name": "https", "port": 8443, "targetPort": 8443 }
+            ]
+        }),
+    )
+}
+
+fn sectioned_policy(name: &str, service_name: &str, section: &str, hostname: &str) -> K8sObject {
+    object(
+        "BackendTLSPolicy",
+        name,
+        serde_json::json!({
+            "targetRefs": [{
+                "group": "",
+                "kind": "Service",
+                "name": service_name,
+                "sectionName": section
+            }],
+            "validation": {
+                "hostname": hostname,
+                "wellKnownCACertificates": "System"
+            }
+        }),
+    )
+}
+
+#[test]
+fn backend_tls_policy_section_name_matches_only_its_service_port() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        multi_port_service("api"),
+        http_route("api-route", "api", 8443),
+        sectioned_policy("api-tls", "api", "https", "secure.example.com"),
+    ];
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    let upstream = translated
+        .config
+        .upstreams
+        .first()
+        .expect("sectionName-matched policy should apply");
+    assert_eq!(
+        upstream.backend_tls_sni.as_deref(),
+        Some("secure.example.com")
+    );
+}
+
+#[test]
+fn backend_tls_policy_section_name_mismatch_leaves_backend_plaintext() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        multi_port_service("api"),
+        // Route targets the `http` (8080) port; the policy is scoped to `https`.
+        http_route("api-route", "api", 8080),
+        sectioned_policy("api-tls", "api", "https", "secure.example.com"),
+    ];
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(
+        translated.config.upstreams.is_empty(),
+        "a sectionName-scoped policy must not apply to a different Service port"
+    );
+    assert!(
+        translated
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_scheme == Some(BackendScheme::Http)),
+        "the unmatched port must stay plaintext"
+    );
+}
+
+#[test]
+fn backend_tls_policy_section_scoped_wins_over_unscoped_for_its_port() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        multi_port_service("api"),
+        http_route("api-route", "api", 8443),
+        sectioned_policy("api-tls-https", "api", "https", "secure.example.com"),
+        backend_tls_policy_system("api-tls-any", "api"),
+    ];
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    let upstream = translated
+        .config
+        .upstreams
+        .first()
+        .expect("expected an upstream");
+    assert_eq!(
+        upstream.backend_tls_sni.as_deref(),
+        Some("secure.example.com"),
+        "the port-scoped policy must win over the Service-wide one"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// status.ancestors
+// ---------------------------------------------------------------------------
+
+fn policy_status_update(objects: &[K8sObject], name: &str) -> Option<GatewayApiStatusUpdate> {
+    let translated = translate_k8s_objects(objects, options()).expect("translate");
+    plan_gateway_api_status_updates(objects, options(), &translated.route_conflicts)
+        .into_iter()
+        .find(|update| update.kind == "BackendTLSPolicy" && update.name == name)
+}
+
+fn ferrum_ancestors(update: &GatewayApiStatusUpdate) -> Vec<Value> {
+    update
+        .status
+        .get("ancestors")
+        .and_then(Value::as_array)
+        .expect("status.ancestors must be written")
+        .iter()
+        .filter(|ancestor| {
+            ancestor.get("controllerName").and_then(Value::as_str)
+                == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+        })
+        .cloned()
+        .collect()
+}
+
+fn condition<'a>(ancestor: &'a Value, condition_type: &str) -> &'a Value {
+    ancestor
+        .get("conditions")
+        .and_then(Value::as_array)
+        .expect("conditions")
+        .iter()
+        .find(|condition| condition.get("type").and_then(Value::as_str) == Some(condition_type))
+        .unwrap_or_else(|| panic!("missing {condition_type} condition in {ancestor}"))
+}
+
+#[test]
+fn backend_tls_policy_status_reports_accepted_ancestor_gateway() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        service("reviews", 8080, "http"),
+        http_route("reviews-route", "reviews", 8080),
+        backend_tls_policy_system("reviews-tls", "reviews"),
+    ];
+    let update = policy_status_update(&objects, "reviews-tls").expect("policy status update");
+    assert_eq!(update.api_version, "gateway.networking.k8s.io/v1");
+    assert_eq!(update.namespace, "default");
+
+    let ancestors = ferrum_ancestors(&update);
+    assert_eq!(ancestors.len(), 1, "expected exactly one ancestor Gateway");
+    let ancestor = &ancestors[0];
+    assert_eq!(
+        ancestor.get("ancestorRef"),
+        Some(&serde_json::json!({
+            "group": "gateway.networking.k8s.io",
+            "kind": "Gateway",
+            "namespace": "default",
+            "name": "edge"
+        }))
+    );
+    let accepted = condition(ancestor, "Accepted");
+    assert_eq!(accepted.get("status").and_then(Value::as_str), Some("True"));
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("Accepted")
+    );
+    let resolved = condition(ancestor, "ResolvedRefs");
+    assert_eq!(resolved.get("status").and_then(Value::as_str), Some("True"));
+    assert_eq!(
+        resolved.get("reason").and_then(Value::as_str),
+        Some("ResolvedRefs")
+    );
+}
+
+#[test]
+fn backend_tls_policy_status_reports_invalid_ca_certificate_ref() {
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        service("broken", 8080, "http"),
+        http_route("broken-route", "broken", 8080),
+        backend_tls_policy_missing_ca("broken-tls", "broken"),
+    ];
+    let update = policy_status_update(&objects, "broken-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    assert_eq!(ancestors.len(), 1);
+    let ancestor = &ancestors[0];
+
+    let accepted = condition(ancestor, "Accepted");
+    assert_eq!(accepted.get("status").and_then(Value::as_str), Some("False"));
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("Invalid")
+    );
+    let resolved = condition(ancestor, "ResolvedRefs");
+    assert_eq!(resolved.get("status").and_then(Value::as_str), Some("False"));
+    assert_eq!(
+        resolved.get("reason").and_then(Value::as_str),
+        Some("InvalidCACertificateRef"),
+        "a missing ConfigMap CA is a reference failure, not a body failure"
+    );
+    let message = resolved
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        message.contains("caCertificateRefs[0]") && message.contains("default/missing-ca"),
+        "message must be field-specific: {message}"
+    );
+}
+
+#[test]
+fn backend_tls_policy_status_reports_unrepresentable_policy_as_invalid_only() {
+    let mut policy = backend_tls_policy_system("bad-tls", "reviews");
+    policy.spec["validation"]["wellKnownCACertificates"] = serde_json::json!("Unknown");
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        service("reviews", 8080, "http"),
+        http_route("reviews-route", "reviews", 8080),
+        policy,
+    ];
+    let update = policy_status_update(&objects, "bad-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    let ancestor = &ancestors[0];
+    assert_eq!(
+        condition(ancestor, "Accepted")
+            .get("reason")
+            .and_then(Value::as_str),
+        Some("Invalid")
+    );
+    // The references were fine; only the policy body was unrepresentable.
+    let resolved = condition(ancestor, "ResolvedRefs");
+    assert_eq!(resolved.get("status").and_then(Value::as_str), Some("True"));
+    assert_eq!(
+        resolved.get("reason").and_then(Value::as_str),
+        Some("ResolvedRefs")
+    );
+}
+
+#[test]
+fn backend_tls_policy_status_reports_target_not_found_when_service_is_absent() {
+    // The route still names `reviews` (so the managed Gateway is an ancestor),
+    // but no Service object exists, so the policy's targetRef never resolves.
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        http_route("reviews-route", "reviews", 8080),
+        backend_tls_policy_system("reviews-tls", "reviews"),
+    ];
+    let update = policy_status_update(&objects, "reviews-tls").expect("policy status update");
+    let ancestors = ferrum_ancestors(&update);
+    assert_eq!(ancestors.len(), 1);
+    let accepted = condition(&ancestors[0], "Accepted");
+    assert_eq!(accepted.get("status").and_then(Value::as_str), Some("False"));
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("TargetNotFound")
+    );
+}
+
+#[test]
+fn backend_tls_policy_status_preserves_third_party_ancestors_and_transition_times() {
+    let mut policy = backend_tls_policy_system("reviews-tls", "reviews");
+    policy.metadata.generation = Some(3);
+    // Live status: one third-party ancestor Ferrum must never touch, plus a
+    // stale Ferrum ancestor whose `Accepted` value is about to change and whose
+    // `ResolvedRefs` value is not.
+    policy.status = serde_json::json!({
+        "ancestors": [
+            {
+                "ancestorRef": {
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "namespace": "default",
+                    "name": "edge"
+                },
+                "controllerName": "example.com/other-controller",
+                "conditions": [{
+                    "type": "Accepted",
+                    "status": "False",
+                    "observedGeneration": 3,
+                    "reason": "Invalid",
+                    "message": "another controller's verdict",
+                    "lastTransitionTime": "2020-01-01T00:00:00Z"
+                }]
+            },
+            {
+                "ancestorRef": {
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "namespace": "default",
+                    "name": "edge"
+                },
+                "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
+                "conditions": [
+                    {
+                        "type": "Accepted",
+                        "status": "False",
+                        "observedGeneration": 2,
+                        "reason": "Invalid",
+                        "message": "a stale rejection",
+                        "lastTransitionTime": "2021-02-03T04:05:06Z"
+                    },
+                    {
+                        "type": "ResolvedRefs",
+                        "status": "True",
+                        "observedGeneration": 2,
+                        "reason": "ResolvedRefs",
+                        "message": "All BackendTLSPolicy references accepted by Ferrum",
+                        "lastTransitionTime": "2021-02-03T04:05:06Z"
+                    }
+                ]
+            }
+        ]
+    });
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        service("reviews", 8080, "http"),
+        http_route("reviews-route", "reviews", 8080),
+        policy,
+    ];
+
+    let update = policy_status_update(&objects, "reviews-tls").expect("policy status update");
+    let all = update
+        .status
+        .get("ancestors")
+        .and_then(Value::as_array)
+        .expect("ancestors");
+    assert_eq!(
+        all.iter()
+            .filter(|ancestor| {
+                ancestor.get("controllerName").and_then(Value::as_str)
+                    == Some("example.com/other-controller")
+            })
+            .count(),
+        1,
+        "a third-party controller's ancestor for the same Gateway must be preserved verbatim: {all:?}"
+    );
+
+    let ferrum = ferrum_ancestors(&update);
+    assert_eq!(ferrum.len(), 1);
+    let accepted = condition(&ferrum[0], "Accepted");
+    assert_eq!(accepted.get("status").and_then(Value::as_str), Some("True"));
+    assert_ne!(
+        accepted.get("lastTransitionTime").and_then(Value::as_str),
+        Some("2021-02-03T04:05:06Z"),
+        "a changed condition must get a fresh transition time"
+    );
+    let resolved = condition(&ferrum[0], "ResolvedRefs");
+    assert_eq!(
+        resolved.get("lastTransitionTime").and_then(Value::as_str),
+        Some("2021-02-03T04:05:06Z"),
+        "an unchanged condition must keep its transition time"
+    );
+    assert_eq!(
+        resolved.get("observedGeneration").and_then(Value::as_u64),
+        Some(3),
+        "observedGeneration must advance to the live spec generation"
+    );
+}
+
+#[test]
+fn backend_tls_policy_without_managed_ancestor_gets_no_status_update() {
+    // No route reaches the Service, so no managed Gateway is an ancestor and
+    // Ferrum must not claim policy status it cannot be responsible for.
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        service("orphan", 8080, "http"),
+        backend_tls_policy_system("orphan-tls", "orphan"),
+    ];
+    assert!(policy_status_update(&objects, "orphan-tls").is_none());
 }
 
 #[test]

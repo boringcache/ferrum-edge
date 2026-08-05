@@ -24,10 +24,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gateway API `BackendTLSPolicy` is watched and translated for Service-backed
   `HTTPRoute`/`GRPCRoute` backends (issue #3276). `validation.hostname` projects
   to upstream `backend_tls_sni`, optional `subjectAltNames` to
-  `backend_tls_san_allow_list`, and either ConfigMap/Secret `caCertificateRefs`
-  or `wellKnownCACertificates: System` to the upstream CA trust posture with
-  `backend_scheme: https`. Invalid or conflicting policies fail closed with an
-  HTTP 500 fault abort. Policy `status.ancestors` is not written yet.
+  `backend_tls_san_allow_list`, and ConfigMap/Secret `caCertificateRefs` to the
+  upstream CA trust posture with `backend_scheme: https`. Policy
+  `status.ancestors` is written per managed ancestor Gateway with `Accepted` /
+  `ResolvedRefs` conditions using the portable `PolicyConditionReason`
+  vocabulary, preserving third-party controllers' ancestors and stable
+  condition transition times.
+- `wellKnownCACertificates: System` now projects the new first-class
+  `system://` backend TLS trust source rather than an unset CA path. `system://`
+  pins the built-in system/webpki trust anchors for every HTTP/H2/H3/gRPC
+  backend client, health probe, and DTLS/stream backend: unlike an unset CA it
+  deliberately does NOT fall back to the cluster-global
+  `FERRUM_TLS_CA_BUNDLE_PATH`, and it never inherits `FERRUM_TLS_NO_VERIFY`, so
+  a cluster-wide private CA can no longer silently replace the public roots a
+  policy explicitly requested. It partitions backend connection pools, is
+  reported in the TLS material inventory, is rejected on client cert/key fields,
+  is rejected with any path or query options, and is rejected alongside
+  `backend_tls_verify_server_cert: false`.
+- A Gateway API route rule whose `backendRefs` mix `BackendTLSPolicy`-covered
+  and uncovered backends now fails closed with a field-specific sanitized
+  warning and an HTTP 500 fault abort. Ferrum folds a rule's backends into one
+  upstream carrying one backend scheme and one TLS identity, so the previous
+  behavior originated TLS — with the covered Service's SNI and trust anchors —
+  to Services no policy covered.
 - `ai_semantic_firewall` streamed `inspect` mode now accepts
   `streaming.window: tokens` with an explicitly selected bounded tokenizer
   (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft

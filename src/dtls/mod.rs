@@ -160,7 +160,10 @@ pub fn build_backend_dtls_config(
     crls: &crate::tls::CrlList,
     global_ca_bundle_path: Option<&str>,
 ) -> Result<BackendDtlsParams, anyhow::Error> {
-    let skip_verify = !proxy.resolved_tls.verify_server_cert || tls_no_verify;
+    // An explicit `system://` trust selection never inherits the global
+    // `FERRUM_TLS_NO_VERIFY` opt-out.
+    let skip_verify = !proxy.resolved_tls.verify_server_cert
+        || (tls_no_verify && proxy.resolved_tls.allows_global_no_verify());
 
     // Load client certificate for mutual TLS, or generate an ephemeral one.
     let certificate = match (
@@ -181,9 +184,7 @@ pub fn build_backend_dtls_config(
     if skip_verify
         && let Some(ca_path) = proxy
             .resolved_tls
-            .server_ca_cert_path
-            .as_deref()
-            .or(global_ca_bundle_path)
+            .effective_ca_source(global_ca_bundle_path)
     {
         load_root_store_from_pem(ca_path)?;
     }
@@ -1789,10 +1790,10 @@ fn load_backend_root_store(
     proxy: &Proxy,
     global_ca_bundle_path: Option<&str>,
 ) -> Result<rustls::RootCertStore, anyhow::Error> {
-    if let Some(ca_path) = &proxy.resolved_tls.server_ca_cert_path {
+    // `system://` resolves to `None` here, pinning the built-in roots and
+    // deliberately skipping the cluster-global bundle.
+    if let Some(ca_path) = proxy.resolved_tls.effective_ca_source(global_ca_bundle_path) {
         load_root_store_from_pem(ca_path)
-    } else if let Some(global_ca) = global_ca_bundle_path {
-        load_root_store_from_pem(global_ca)
     } else {
         Ok(rustls::RootCertStore::from_iter(
             webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),

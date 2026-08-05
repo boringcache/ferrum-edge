@@ -6049,6 +6049,13 @@ fn push_tls_material_source(
         return;
     };
     let source = CertSource::parse(value.to_string(), kind);
+    // `system://` names the compiled-in webpki roots: there is no material to
+    // fetch, and enrolling it would make `material_set_fingerprint` fail the
+    // whole watched set with `UnsupportedScheme`, disabling rotation detection
+    // for every other backend source alongside it.
+    if source.is_system_trust_roots() {
+        return;
+    }
     if seen.insert((kind, source.pool_key_component())) {
         sources.push(
             crate::tls::source::subscription::WatchedMaterialSource::new(label, source, kind),

@@ -251,6 +251,16 @@ impl InventoryEntryBuilder {
             return entry;
         }
 
+        // `system://` is a first-class trust selection with no material behind
+        // it. Report it as a loaded, non-refreshable entry rather than letting
+        // the loader's `UnsupportedScheme` arm describe it as "not implemented
+        // yet" — the built-in roots are compiled in and always present.
+        if self.source.is_system_trust_roots() {
+            entry.state = TlsInventoryState::Loaded;
+            entry.error = None;
+            return entry;
+        }
+
         if !scope.may_load(self.kind) {
             populate_entry_from_reload_state(&mut entry);
             return entry;

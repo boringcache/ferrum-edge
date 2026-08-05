@@ -7397,7 +7397,15 @@ components:
         backend_tls_server_ca_cert_path:
           type: [string, "null"]
           maxLength: 4096
-          description: Path to custom CA bundle for backend TLS verification. Max 4096 characters.
+          description: >-
+            Path (or typed source URI) for the custom CA bundle used for backend
+            TLS verification. Max 4096 characters. The reserved value
+            `system://` selects the built-in system/webpki trust anchors
+            explicitly: unlike leaving this field null, it does NOT fall back to
+            the global `FERRUM_TLS_CA_BUNDLE_PATH` and never inherits
+            `FERRUM_TLS_NO_VERIFY`. `system://` requires
+            `backend_tls_verify_server_cert: true` and must be spelled exactly,
+            with no path or query options.
         dns_override:
           type: [string, "null"]
 
@@ -10127,6 +10135,14 @@ components:
             Path to a PEM CA bundle used as the sole trust anchor when
             verifying backend server certificates for this upstream. When
             set, the system/webpki trust store is NOT used (CA exclusivity).
+            The reserved value `system://` inverts that: it pins the built-in
+            system/webpki trust anchors, and — unlike leaving this field null —
+            deliberately does NOT fall back to the global
+            `FERRUM_TLS_CA_BUNDLE_PATH` and never inherits
+            `FERRUM_TLS_NO_VERIFY`. It is the representation of Gateway API
+            `BackendTLSPolicy` `wellKnownCACertificates: System`, requires
+            `backend_tls_verify_server_cert: true`, and must be spelled
+            exactly, with no path or query options.
         backend_tls_sni:
           type: [string, "null"]
           maxLength: 253

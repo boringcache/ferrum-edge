@@ -1778,7 +1778,9 @@ async fn grpc_probe(
         }
     };
 
-    let skip_verify = use_tls && (!tls_config.verify_server_cert || global_no_verify);
+    let skip_verify = use_tls
+        && (!tls_config.verify_server_cert
+            || (global_no_verify && tls_config.allows_global_no_verify()));
 
     // When skip_verify is true, tonic's ClientTlsConfig doesn't support disabling
     // cert verification. Build a rustls ClientConfig directly with NoVerifier
@@ -1827,8 +1829,10 @@ async fn grpc_probe(
             .unwrap_or(host);
         let mut tonic_tls = tonic::transport::ClientTlsConfig::new().domain_name(sni_host);
 
-        // Load CA certs (upstream → global → system roots)
-        if let Some(ca_path) = tls_config.server_ca_cert_path.as_deref().or(global_ca_path) {
+        // Load CA certs (upstream → global → system roots). `system://` resolves
+        // to `None` here so the probe pins the built-in roots and deliberately
+        // skips the cluster-global bundle.
+        if let Some(ca_path) = tls_config.effective_ca_source(global_ca_path) {
             match load_probe_tls_material(ca_path, MaterialKind::CaBundle, "gRPC health probe CA") {
                 Ok(pem) => {
                     let cert = tonic::transport::Certificate::from_pem(pem);
@@ -1977,7 +1981,7 @@ async fn build_grpc_probe_channel_no_verify(
     use tokio_rustls::TlsConnector;
 
     // Build root cert store (still needed for mTLS client auth builder)
-    let ca_path = tls_config.server_ca_cert_path.as_deref().or(global_ca_path);
+    let ca_path = tls_config.effective_ca_source(global_ca_path);
     let root_store = if let Some(ca_path) = ca_path {
         load_probe_tls_root_store(ca_path, "gRPC health probe CA").map_err(std::io::Error::other)?
     } else {
@@ -2186,7 +2190,8 @@ fn build_health_check_client_with_tls(
     global_key_path: &Option<String>,
     global_no_verify: bool,
 ) -> Result<reqwest::Client, reqwest::Error> {
-    let skip_verify = !tls_config.verify_server_cert || global_no_verify;
+    let skip_verify = !tls_config.verify_server_cert
+        || (global_no_verify && tls_config.allows_global_no_verify());
 
     let mut builder = reqwest::Client::builder()
         .no_proxy()
@@ -2202,11 +2207,10 @@ fn build_health_check_client_with_tls(
         builder = builder.dns_resolver(Arc::new(resolver));
     }
 
-    // Load CA bundle (upstream → global → system roots)
-    let ca_path = tls_config
-        .server_ca_cert_path
-        .as_ref()
-        .or(global_ca_path.as_ref());
+    // Load CA bundle (upstream → global → system roots). `system://` resolves to
+    // `None` here so the probe pins the built-in roots and deliberately skips
+    // the cluster-global bundle.
+    let ca_path = tls_config.effective_ca_source(global_ca_path.as_deref());
     if let Some(ca_path) = ca_path {
         if let Ok(ca_data) =
             load_probe_tls_material(ca_path, MaterialKind::CaBundle, "Health check CA")
