@@ -1908,8 +1908,10 @@ pub fn target_key(upstream_id: &str, target: &UpstreamTarget) -> String {
 
 /// Domain-separation prefix for backend-bound sticky-session tokens. Bumping
 /// this string invalidates every outstanding token (clients transparently
-/// re-pin on their next request), so it doubles as a format version.
-const STICKY_SESSION_TOKEN_DOMAIN: &str = "ferrum-sticky-session-v1";
+/// re-pin on their next request), so it doubles as a format version — `v2` is
+/// the full-target identity below, replacing a `v1` that digested only the
+/// health-check `host:port` key.
+const STICKY_SESSION_TOKEN_DOMAIN: &str = "ferrum-sticky-session-v2";
 
 /// A sticky-session token is a lowercase hex SHA-256 digest: 64 characters.
 pub const STICKY_SESSION_TOKEN_LEN: usize = 64;
@@ -1925,8 +1927,19 @@ pub const STICKY_SESSION_TOKEN_LEN: usize = 64;
 /// route/service/namespace/policy cannot resolve inside another upstream's
 /// binding index even when both front the same pod IPs.
 ///
-/// The token is the digest of `domain \x1f namespace|upstream_id::host:port`,
-/// so it discloses no backend address, port, credential, or secret. It is
+/// Inside that scope the token digests the target's full STICKY IDENTITY
+/// (see [`write_sticky_target_identity`]), not merely its `host:port`. One
+/// route Upstream can legitimately carry the same network endpoint more than
+/// once — Gateway API fans several `backendRefs` into one rule, so two entries
+/// can share a pod IP and port while naming different Services, different
+/// declared Service ports (`service_port_policy_key`, i.e. different
+/// `dispatch_policy_port()` policy lanes), different subset tags, localities,
+/// or backend path overrides. Reusing the deliberately `host:port`-only
+/// health-check key ([`target_key`]) here collapsed those into one index entry
+/// and silently resolved a later target's cookie onto the first one, crossing
+/// Service and per-port policy semantics inside the route.
+///
+/// The digest discloses no backend address, port, credential, or secret. It is
 /// unkeyed on purpose: stickiness must survive a gateway restart and must be
 /// identical across every replica of a horizontally scaled gateway, and there
 /// is no cluster-wide shared secret available in every operating mode. The
@@ -1935,17 +1948,104 @@ pub const STICKY_SESSION_TOKEN_LEN: usize = 64;
 /// already have selected for some other client, never outside the
 /// health/subset/port-scoped candidate pool (see [`LoadBalancer::select_sticky`]).
 pub fn sticky_session_token(upstream_runtime_key: &str, target: &UpstreamTarget) -> String {
-    sticky_session_token_from_target_key(&target_key(upstream_runtime_key, target))
-}
-
-/// Token derivation from an already-built `namespace|upstream_id::host:port`
-/// key, so the per-balancer index can reuse its precomputed `target_keys`.
-fn sticky_session_token_from_target_key(scoped_target_key: &str) -> String {
-    let mut hasher = crate::fips::approved::Sha256::new();
+    let mut hasher = StickyHasher::new();
     hasher.update(STICKY_SESSION_TOKEN_DOMAIN.as_bytes());
     hasher.update([0x1fu8]);
-    hasher.update(scoped_target_key.as_bytes());
+    write_sticky_target_identity(&mut hasher, upstream_runtime_key, target);
     hex::encode(hasher.finalize())
+}
+
+/// The incremental hasher the sticky-identity encoder feeds.
+type StickyHasher = crate::fips::approved::Sha256;
+
+/// Absorb the canonical, unambiguous encoding of a target's sticky identity.
+///
+/// Every field of [`UpstreamTarget`] that can change how a request is routed,
+/// which policy/authorization lane governs it, which TLS material or subset
+/// overlay applies, or what the target *means* is covered:
+///
+/// - `host` / `port` — the dial destination.
+/// - `service_port_policy_key` — selects the `dispatch_policy_port()` policy
+///   lane (its algorithm, `hashOn`, passive-health policy, TLS overlay) and
+///   records the declared Service port that owns the target.
+/// - `tags` — subset membership (`SubsetDefinition.labels`), Service identity
+///   (`_ferrum_service_*`), and mesh provenance / HBONE dial facts.
+/// - `locality` — locality-LB tier and cross-cluster provenance.
+/// - `path` — overrides the proxy's `backend_path` for this target.
+///
+/// `weight` is deliberately EXCLUDED. It only sizes a target's share of
+/// *unbound* selections; two targets differing solely in weight are
+/// interchangeable for an already-pinned session. Including it would mean an
+/// ordinary canary weight shift invalidated every outstanding cookie on the
+/// route — the opposite of what session persistence promises. Transient
+/// health/counter state is likewise excluded: it is not a property of the
+/// target and would make the binding non-deterministic.
+///
+/// Determinism requirements the encoding satisfies:
+///
+/// - no dependence on `HashMap` iteration order — `tags` are sorted by key
+///   (keys are unique in a map, so that is a total order) and prefixed with
+///   their count;
+/// - every variable-length field is length-prefixed and every optional field
+///   carries a presence byte, so no rearrangement of contents can produce the
+///   same byte stream (`host="a", path="/b"` cannot collide with
+///   `host="a/b", path=None`);
+/// - integers use fixed-width big-endian bytes.
+///
+/// Cost is paid at balancer construction (reload / discovery update) and at the
+/// cold cookie-mint site, never on the per-request lookup path.
+fn write_sticky_target_identity(
+    hasher: &mut StickyHasher,
+    upstream_runtime_key: &str,
+    target: &UpstreamTarget,
+) {
+    absorb_identity_field(hasher, upstream_runtime_key.as_bytes());
+    absorb_identity_field(hasher, target.host.as_bytes());
+    hasher.update(target.port.to_be_bytes());
+    // Fixed width (presence byte + 2 bytes) so `None` and `Some(0)` differ.
+    match target.service_port_policy_key {
+        Some(policy_port) => {
+            hasher.update([1u8]);
+            hasher.update(policy_port.to_be_bytes());
+        }
+        None => hasher.update([0u8, 0, 0]),
+    }
+    absorb_optional_identity_field(hasher, target.locality.as_deref());
+    absorb_optional_identity_field(hasher, target.path.as_deref());
+    hasher.update((target.tags.len() as u64).to_be_bytes());
+    if !target.tags.is_empty() {
+        let mut tags: Vec<(&str, &str)> = target
+            .tags
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        tags.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        for (key, value) in tags {
+            absorb_identity_field(hasher, key.as_bytes());
+            absorb_identity_field(hasher, value.as_bytes());
+        }
+    }
+}
+
+/// Absorb one variable-length identity field, length-prefixed so field
+/// boundaries cannot be shifted between neighbours.
+#[inline]
+fn absorb_identity_field(hasher: &mut StickyHasher, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+/// Absorb an optional identity field: a presence byte, then the value when set.
+/// `None` and `Some("")` are therefore distinct.
+#[inline]
+fn absorb_optional_identity_field(hasher: &mut StickyHasher, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update([1u8]);
+            absorb_identity_field(hasher, value.as_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
 }
 
 /// Cheap boundary validation for an untrusted cookie value before it is used as
@@ -2315,8 +2415,13 @@ pub struct LoadBalancer {
     /// unless some effective hash-on strategy on this upstream is `Cookie`,
     /// which is the only configuration that mints tokens.
     ///
-    /// Degenerate duplicate `host:port` targets collapse to one entry; the
-    /// FIRST index wins so the mapping stays deterministic across rebuilds.
+    /// Keys come from [`sticky_session_token`], which digests the target's full
+    /// sticky identity — NOT the `host:port`-only health key. Two entries that
+    /// share a pod IP and port but name different Services, per-port policy
+    /// lanes, subset tags, localities, or path overrides therefore keep
+    /// SEPARATE bindings. Only targets identical in every identity-bearing
+    /// field collapse to one entry, and because those are interchangeable the
+    /// FIRST index wins deterministically across rebuilds.
     sticky_token_index: HashMap<String, usize>,
     algorithm: LoadBalancerAlgorithm,
     /// Round-robin / random / least-latency warm-up selection counters.
@@ -2726,8 +2831,11 @@ impl LoadBalancer {
         // can actually mint tokens — i.e. some effective hash-on strategy
         // (upstream, subset, or per-port lane) is `Cookie`. Every other
         // upstream keeps an empty map and pays nothing at reload or at request
-        // time. Duplicate `host:port` targets share one scoped target key, so
-        // `or_insert` keeps the first index for a stable mapping.
+        // time. The index is built through the SAME public
+        // `sticky_session_token` the response cookie mint site calls, so read
+        // side and write side cannot drift. Only targets identical in every
+        // identity-bearing field share a token; `or_insert` keeps the first
+        // index for those, which is stable because they are interchangeable.
         let mut mints_sticky_tokens = strategy_mints_sticky_tokens(&hash_on_strategy);
         for strategy in subset_hash_on_strategies.values() {
             mints_sticky_tokens |= strategy_mints_sticky_tokens(strategy);
@@ -2740,9 +2848,9 @@ impl LoadBalancer {
         }
         let mut sticky_token_index: HashMap<String, usize> = HashMap::new();
         if mints_sticky_tokens {
-            sticky_token_index.reserve(target_keys.len());
-            for (i, key) in target_keys.iter().enumerate() {
-                let token = sticky_session_token_from_target_key(key);
+            sticky_token_index.reserve(targets.len());
+            for (i, target) in targets.iter().enumerate() {
+                let token = sticky_session_token(upstream_id, target);
                 sticky_token_index.entry(token).or_insert(i);
             }
         }

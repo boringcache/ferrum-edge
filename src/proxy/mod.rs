@@ -36110,11 +36110,14 @@ fn buffered_collect_retain_failure(
 ///
 /// The cookie value is the opaque backend-bound token from
 /// [`crate::load_balancer::sticky_session_token`]: a SHA-256 digest over the
-/// namespace-qualified upstream identity and the selected `host:port`, never
-/// the address itself. It therefore leaks no backend topology, credential, or
-/// secret to the client, and it is scoped — a token minted for one upstream
-/// (Gateway API materializes one route-scoped upstream per persistent route
-/// rule) cannot resolve inside another upstream's binding index.
+/// namespace-qualified upstream identity and the selected target's full sticky
+/// identity (dial `host:port`, per-port policy key, tags, locality, and path
+/// override), never the address itself. It therefore leaks no backend topology,
+/// credential, or secret to the client, and it is scoped — a token minted for
+/// one upstream (Gateway API materializes one route-scoped upstream per
+/// persistent route rule) cannot resolve inside another upstream's binding
+/// index, and within one upstream two entries sharing a pod IP and port but
+/// naming different Services or policy lanes get distinct tokens.
 ///
 /// Callers must pass the target that ACTUALLY served the response, and must
 /// decide *whether* to call through

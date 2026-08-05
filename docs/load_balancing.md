@@ -370,11 +370,27 @@ upstreams:
 
 When `hash_on` is `cookie:<name>`, the gateway establishes sticky sessions automatically:
 
-1. **First request** (no cookie): The gateway selects a target using the client IP as a fallback key, then injects a `Set-Cookie` response header carrying an **opaque token bound to the target that served that response**. The token is a SHA-256 digest over the namespace-qualified upstream identity and the selected `host:port`, so it discloses no backend address, credential, or secret. It is unkeyed and deterministic, so affinity survives a gateway restart and is identical across gateway replicas.
+1. **First request** (no cookie): The gateway selects a target using the client IP as a fallback key, then injects a `Set-Cookie` response header carrying an **opaque token bound to the target that served that response**. The token is a SHA-256 digest over the namespace-qualified upstream identity and the selected target's **sticky identity** (below), so it discloses no backend address, credential, or secret. It is unkeyed and deterministic, so affinity survives a gateway restart and is identical across gateway replicas. Being unkeyed, it is *obfuscated, not authenticated*: a forged token can only steer a client to a backend the same upstream would already have selected for some other client, never outside the health/subset/port-scoped candidate pool.
 2. **Subsequent requests** (cookie present): The token is resolved through a per-upstream binding index that is materialized at config reload, returning the client to that **exact** target — not merely to a deterministic one.
 3. **Fallback**: a cookie value that is malformed, oversized, scoped to another upstream (Gateway API materializes one route-scoped upstream per persistent route rule, so a token cannot steer across routes, Services, namespaces, or policies), stale after the backend was removed, outside the selected subset/port lane, or currently unhealthy is treated as **no session**: the request falls through to ordinary load-balanced selection and a fresh, correctly bound cookie is issued on the response. Health, subset, port, TLS, authorization, retry, and connection-limit semantics are never bypassed.
 4. **Selected-port policy precedence**: the binding is resolved before the target is known, so it is validated against the initial dispatch port's lane. If the resolved target's own `dispatch_policy_port()` lane is a *different* policy lane whose effective algorithm is not consistent hashing, or whose `hash_on` names a different cookie, the binding **fails closed** to ordinary selection and reissue — a token can never reach past the per-port policy that governs the endpoint it names.
 5. **Retry rotation**: an honored binding is normally not re-issued. But retry may rotate off the bound backend after selection already decided, and rotation does not necessarily eject the failed endpoint. Whenever the backend that actually served the response is not the one the request was bound to, the response carries a **fresh cookie for the serving backend**, so the next request does not go back to the endpoint that just failed. Gateway-synthesized rejections that dialed no backend (mesh-transport or egress screens on a rotated candidate) issue no cookie at all. This holds on HTTP/1.1 and HTTP/2, direct gRPC, WebSocket (including HTTP/2 extended CONNECT), native HTTP/3, the HTTP/3→HTTP and HTTP/3→gRPC cross-protocol bridges, and HTTP/3 WebSocket.
+
+##### Sticky target identity
+
+One route Upstream can legitimately contain the same network endpoint more than once — Gateway API fans several `backendRefs` into a single rule, so two entries can share a pod IP and dial port while naming **different Services**, **different declared Service ports** (and therefore different per-port policy lanes), or different subset labels. The binding must not collapse those, so the digest covers every stable target field that can change routing, policy, authorization, TLS selection, or target meaning:
+
+| Field | Why it is part of the identity |
+|-------|-------------------------------|
+| `host`, `port` | The dial destination |
+| declared Service port (internal `service_port_policy_key`) | Selects the per-port policy lane — its algorithm, `hash_on`, passive-health policy and TLS overlay — and records which Service port owns the target |
+| `tags` | Subset membership (`subsets[].labels`), Service identity, and mesh provenance / HBONE dial facts |
+| `locality` | Locality-LB tier and cross-cluster provenance |
+| `path` | Per-target override of the proxy's `backend_path` |
+
+`weight` is deliberately **not** part of the identity: it only sizes a target's share of *unbound* selections, so two entries differing solely in weight are interchangeable for an already-pinned session — and including it would make an ordinary canary weight shift invalidate every outstanding session cookie on the route. Transient health, ejection, and counter state are excluded for the same reason the value must be reproducible: the token is derived identically on every replica and after every restart.
+
+The encoding is canonical — tags are sorted by key, variable-length fields are length-prefixed, and optional fields carry a presence marker — so it never depends on map iteration order and no rearrangement of two fields can produce the same digest. Two targets that are identical in *all* of the above fields share one binding, which is safe because dispatching to either is indistinguishable. Digests are materialized when the balancer is built (config reload / service-discovery update), not per request.
 
 ```yaml
 upstreams:

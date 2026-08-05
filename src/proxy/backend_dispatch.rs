@@ -684,7 +684,9 @@ pub(crate) fn resolve_sticky_binding(
 /// a rotation into a non-cookie port lane writes nothing.
 ///
 /// Hot path: one pointer comparison in the common no-rotation case, at worst a
-/// port compare plus a host string compare. No allocation.
+/// structural compare of the target's sticky-identity fields (port, host, the
+/// per-port policy key, locality, path, and the small tag map). No allocation,
+/// no digest.
 #[inline]
 pub(crate) fn sticky_cookie_reissue_target<'a>(
     selection_needs_set: bool,
@@ -703,15 +705,32 @@ pub(crate) fn sticky_cookie_reissue_target<'a>(
     }
 }
 
-/// Whether two targets name the same backend endpoint for affinity purposes.
+/// Whether two targets carry the same sticky identity, i.e. whether the token
+/// already held by the client also names the backend that served the response.
 ///
-/// The sticky token is derived from the namespace-qualified upstream identity
-/// plus `host:port` (`load_balancer::sticky_session_token`), so `host:port` is
-/// exactly the identity that decides whether an honored cookie still names the
-/// serving backend.
+/// This must mirror the field set `load_balancer::sticky_session_token`
+/// digests (`write_sticky_target_identity`) exactly. Comparing only `host:port`
+/// would skip reissue after a rotation onto a *different* target that happens
+/// to share a pod IP and port — a different Service, per-port policy lane,
+/// subset overlay, locality, or backend path override — leaving the client
+/// pinned to a backend that did not serve it. `weight` is excluded on both
+/// sides for the same reason it is excluded from the digest: it never changes
+/// which backend a pinned session reaches.
+///
+/// Structural comparison rather than re-deriving two digests keeps this
+/// allocation-free; the encoding is injective over these fields, so equality
+/// here is exactly token equality.
 #[inline]
 fn same_affinity_endpoint(a: &UpstreamTarget, b: &UpstreamTarget) -> bool {
-    std::ptr::eq(a, b) || (a.port == b.port && a.host == b.host)
+    if std::ptr::eq(a, b) {
+        return true;
+    }
+    a.port == b.port
+        && a.host == b.host
+        && a.service_port_policy_key == b.service_port_policy_key
+        && a.locality == b.locality
+        && a.path == b.path
+        && a.tags == b.tags
 }
 
 /// Replace a wildcard upstream target host (for example `*.example.com`) with

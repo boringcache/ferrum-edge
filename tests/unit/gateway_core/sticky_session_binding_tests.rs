@@ -12,7 +12,10 @@
 //!   namespace / BackendLBPolicy) does not steer traffic across that boundary;
 //! - a token whose backend was removed, ejected by health, or lives outside the
 //!   selected subset / port lane resolves to nothing, so the caller falls back
-//!   to ordinary selection instead of dialing an ineligible target.
+//!   to ordinary selection instead of dialing an ineligible target;
+//! - two entries of ONE upstream that share a pod IP and dial port but differ in
+//!   Service identity or declared Service port keep separate bindings, and
+//!   neither reaches into the other's per-port policy lane.
 //!
 //! Translation and the emitted `Set-Cookie` shape live in
 //! `gateway_backend_lb_policy_tests.rs`.
@@ -24,6 +27,10 @@ use dashmap::DashMap;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, Proxy, SubsetDefinition, Upstream, UpstreamPortOverride,
     UpstreamTarget,
+};
+use ferrum_edge::config::types::{
+    UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
+    UPSTREAM_TARGET_SERVICE_PORT_TAG,
 };
 use ferrum_edge::load_balancer::{
     HealthContext, LoadBalancerCache, STICKY_SESSION_TOKEN_LEN, is_sticky_session_token,
@@ -561,8 +568,9 @@ fn honored_binding_reissues_for_the_backend_a_retry_rotated_onto() {
 
 #[test]
 fn a_rotation_that_only_changed_ports_still_reissues() {
-    // Affinity identity is `host:port`: the same host on a different port is a
-    // different endpoint and a different token.
+    // The dial `host:port` is part of the affinity identity: the same host on a
+    // different port is a different endpoint and a different token. (It is not
+    // the WHOLE identity — see the sticky-target-identity section below.)
     let bound = target("10.1.0.10", 8080);
     let rotated = target("10.1.0.10", 9090);
 
@@ -1141,4 +1149,406 @@ fn both_direct_grpc_response_arms_inject_the_affinity_cookie() {
              cookie through the shared mint site before its headers are committed"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sticky target identity: one endpoint reached through two Services / lanes
+// ---------------------------------------------------------------------------
+//
+// A Gateway API route rule fans several `backendRefs` into ONE materialized
+// Upstream. Two of those entries can resolve to the same pod IP and dial port
+// while naming different Services, different declared Service ports (and so
+// different `dispatch_policy_port()` policy lanes), different subset tags,
+// localities, or backend path overrides.
+//
+// Deriving the token from the health-check key — which is `host:port` ONLY, on
+// purpose — collapsed such entries into a single binding-index entry with
+// first-index-wins. The cookie minted for the later target then resolved onto
+// the first one, crossing Service and per-port policy semantics inside the
+// route while still reporting "exact backend-bound" behavior. The token now
+// digests the target's full identity.
+
+/// A target with explicit control of every identity-bearing field.
+fn identity_target(
+    host: &str,
+    port: u16,
+    service_port_policy_key: Option<u16>,
+    tags: &[(&str, &str)],
+    locality: Option<&str>,
+    path: Option<&str>,
+) -> UpstreamTarget {
+    UpstreamTarget {
+        host: host.to_string(),
+        port,
+        service_port_policy_key,
+        weight: 1,
+        tags: tags
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect(),
+        locality: locality.map(str::to_string),
+        path: path.map(str::to_string),
+    }
+}
+
+/// One route `backendRef`, shaped exactly as `upstream_for_route_with_session`
+/// materializes it: Service identity tags plus the declared Service port as the
+/// per-port policy key.
+fn service_backend(service: &str, service_port: u16, host: &str, port: u16) -> UpstreamTarget {
+    let service_port_tag = service_port.to_string();
+    identity_target(
+        host,
+        port,
+        Some(service_port),
+        &[
+            (UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG, "default"),
+            (UPSTREAM_TARGET_SERVICE_NAME_TAG, service),
+            (UPSTREAM_TARGET_SERVICE_PORT_TAG, service_port_tag.as_str()),
+        ],
+        None,
+        None,
+    )
+}
+
+/// Which Service a resolved binding actually landed on.
+fn service_name_of(target: &UpstreamTarget) -> String {
+    target
+        .tags
+        .get(UPSTREAM_TARGET_SERVICE_NAME_TAG)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[test]
+fn one_endpoint_through_two_services_keeps_two_bindings() {
+    // Same pod IP, same dial port, same declared Service port: only the Service
+    // identity differs. On the `host:port` digest both minted the SAME token and
+    // the second Service had no reachable binding at all.
+    let checkout = service_backend("checkout", 80, "10.1.0.10", 8080);
+    let legacy = service_backend("legacy-checkout", 80, "10.1.0.10", 8080);
+    assert_eq!(checkout.host, legacy.host);
+    assert_eq!(checkout.port, legacy.port);
+
+    let checkout_token = token_for(NAMESPACE, UPSTREAM_ID, &checkout);
+    let legacy_token = token_for(NAMESPACE, UPSTREAM_ID, &legacy);
+    assert_ne!(
+        checkout_token, legacy_token,
+        "two Services on one endpoint must not share a session binding"
+    );
+
+    let pool = vec![checkout.clone(), legacy.clone()];
+    let cache = cache_for(sticky_upstream(pool));
+    let snapshot = cache.load();
+
+    for (token, expected) in [(&checkout_token, &checkout), (&legacy_token, &legacy)] {
+        let bound = LoadBalancerCache::select_sticky_from(
+            &snapshot,
+            NAMESPACE,
+            UPSTREAM_ID,
+            token,
+            None,
+            None,
+            None,
+        )
+        .expect("each Service's token must resolve to its own backend");
+        assert_eq!(bound.host, expected.host);
+        assert_eq!(bound.port, expected.port);
+        assert_eq!(service_name_of(&bound), service_name_of(expected));
+    }
+
+    // Weight is deliberately outside the identity: it only sizes a target's
+    // share of UNBOUND selections, so a canary weight shift must not invalidate
+    // every outstanding session on the route.
+    let mut heavier = checkout.clone();
+    heavier.weight = 97;
+    let heavier_token = token_for(NAMESPACE, UPSTREAM_ID, &heavier);
+    assert_eq!(
+        heavier_token, checkout_token,
+        "a weight change must not re-key an established session"
+    );
+}
+
+#[test]
+fn every_identity_bearing_field_changes_the_token() {
+    let base = identity_target(
+        "10.1.0.10",
+        8080,
+        Some(80),
+        &[("version", "v1")],
+        Some("us-east-1/us-east-1a"),
+        Some("/v1"),
+    );
+    let base_token = token_for(NAMESPACE, UPSTREAM_ID, &base);
+    let differs = |label: &str, mutated: &UpstreamTarget| {
+        let token = token_for(NAMESPACE, UPSTREAM_ID, mutated);
+        assert_ne!(
+            token, base_token,
+            "a changed {label} must produce a different sticky binding"
+        );
+    };
+
+    let mut host = base.clone();
+    host.host = "10.1.0.11".to_string();
+    differs("dial host", &host);
+
+    let mut port = base.clone();
+    port.port = 9090;
+    differs("dial port", &port);
+
+    let mut policy_key = base.clone();
+    policy_key.service_port_policy_key = Some(8080);
+    differs("declared Service port", &policy_key);
+
+    let mut no_policy_key = base.clone();
+    no_policy_key.service_port_policy_key = None;
+    differs("absent declared Service port", &no_policy_key);
+
+    let mut tag_value = base.clone();
+    tag_value.tags.insert("version".to_string(), "v2".to_string());
+    differs("subset tag value", &tag_value);
+
+    let mut extra_tag = base.clone();
+    extra_tag.tags.insert("canary".to_string(), "on".to_string());
+    differs("additional tag", &extra_tag);
+
+    let mut locality = base.clone();
+    locality.locality = Some("us-east-1/us-east-1b".to_string());
+    differs("locality", &locality);
+
+    let mut no_locality = base.clone();
+    no_locality.locality = None;
+    differs("absent locality", &no_locality);
+
+    let mut path = base.clone();
+    path.path = Some("/v2".to_string());
+    differs("backend path override", &path);
+
+    let mut no_path = base.clone();
+    no_path.path = None;
+    differs("absent backend path override", &no_path);
+
+    // An empty value must not read as an absent field.
+    let mut empty_path = base.clone();
+    empty_path.path = Some(String::new());
+    differs("empty backend path override", &empty_path);
+}
+
+#[test]
+fn tag_map_iteration_order_does_not_change_the_token() {
+    // Tags live in a `HashMap`, whose iteration order is neither insertion order
+    // nor stable between instances. A binding that depended on it would differ
+    // between gateway replicas and between restarts of one replica.
+    let labels: Vec<(String, String)> = (0..32)
+        .map(|i| (format!("tag-{i:02}"), format!("value-{i:02}")))
+        .collect();
+
+    let mut forward = identity_target("10.1.0.10", 8080, Some(80), &[], None, None);
+    for (key, value) in labels.iter() {
+        forward.tags.insert(key.clone(), value.clone());
+    }
+    let mut reverse = identity_target("10.1.0.10", 8080, Some(80), &[], None, None);
+    for (key, value) in labels.iter().rev() {
+        reverse.tags.insert(key.clone(), value.clone());
+    }
+
+    let forward_token = token_for(NAMESPACE, UPSTREAM_ID, &forward);
+    let reverse_token = token_for(NAMESPACE, UPSTREAM_ID, &reverse);
+    assert_eq!(
+        forward_token, reverse_token,
+        "the tag encoding must be canonically ordered, not map-iteration ordered"
+    );
+}
+
+#[test]
+fn identical_duplicate_targets_share_one_deterministic_binding() {
+    // Entries identical in every identity-bearing field are interchangeable —
+    // dispatching to either is the same request — so collapsing them onto one
+    // binding is safe. What must hold is determinism across rebuilds, and that
+    // the collapse never swallows a genuinely distinct neighbour.
+    let checkout = service_backend("checkout", 80, "10.1.0.10", 8080);
+    let duplicate = checkout.clone();
+    let neighbour = service_backend("legacy-checkout", 80, "10.1.0.10", 8080);
+
+    let token = token_for(NAMESPACE, UPSTREAM_ID, &checkout);
+    assert_eq!(token, token_for(NAMESPACE, UPSTREAM_ID, &duplicate));
+    let neighbour_token = token_for(NAMESPACE, UPSTREAM_ID, &neighbour);
+    assert_ne!(token, neighbour_token);
+
+    // A fresh `LoadBalancerCache` is exactly what a config reload builds.
+    for _ in 0..3 {
+        let pool = vec![checkout.clone(), duplicate.clone(), neighbour.clone()];
+        let cache = cache_for(sticky_upstream(pool));
+        let snapshot = cache.load();
+
+        let bound = LoadBalancerCache::select_sticky_from(
+            &snapshot,
+            NAMESPACE,
+            UPSTREAM_ID,
+            &token,
+            None,
+            None,
+            None,
+        )
+        .expect("a duplicated target keeps one stable binding");
+        assert_eq!(service_name_of(&bound), "checkout");
+
+        let neighbour_bound = LoadBalancerCache::select_sticky_from(
+            &snapshot,
+            NAMESPACE,
+            UPSTREAM_ID,
+            &neighbour_token,
+            None,
+            None,
+            None,
+        )
+        .expect("the distinct neighbour keeps its own binding");
+        assert_eq!(service_name_of(&neighbour_bound), "legacy-checkout");
+    }
+}
+
+#[test]
+fn the_minted_cookie_is_the_exact_index_key_for_a_shared_endpoint() {
+    // The response mint site and the constructor's binding index must derive the
+    // identical value; otherwise the gateway emits a cookie that resolves to a
+    // different backend, or to nothing at all. The shared-endpoint pair is where
+    // any drift between the two surfaces first.
+    let checkout = service_backend("checkout", 80, "10.1.0.10", 8080);
+    let legacy = service_backend("legacy-checkout", 80, "10.1.0.10", 8080);
+    let pool = vec![checkout.clone(), legacy.clone()];
+    let cache = cache_for(sticky_upstream(pool));
+    let snapshot = cache.load();
+
+    for expected in [&checkout, &legacy] {
+        let cookie = expected_affinity_cookie(expected);
+        let token = cookie
+            .split_once('=')
+            .and_then(|(_, rest)| rest.split(';').next())
+            .expect("the mint site emits `name=token; ...`");
+        let bound = LoadBalancerCache::select_sticky_from(
+            &snapshot,
+            NAMESPACE,
+            UPSTREAM_ID,
+            token,
+            None,
+            None,
+            None,
+        )
+        .expect("an emitted cookie value must be a live binding-index key");
+        assert_eq!(bound.tags, expected.tags);
+        assert_eq!(bound.host, expected.host);
+        assert_eq!(bound.port, expected.port);
+    }
+}
+
+#[test]
+fn a_shared_endpoints_bindings_never_cross_each_others_policy_lane() {
+    // Both entries dial 10.1.0.10:8080, but their declared Service ports put
+    // them in different `dispatch_policy_port()` lanes. The 9090 lane is
+    // round-robin — it does not elect this cookie — so its binding must fail
+    // closed, while the 80 lane's binding stays honored and still names ITS
+    // target rather than the other lane's.
+    let cookie_lane = identity_target("10.1.0.10", 8080, Some(80), &[], None, None);
+    let rr_lane = identity_target("10.1.0.10", 8080, Some(9090), &[], None, None);
+    let pool = vec![cookie_lane.clone(), rr_lane.clone()];
+    let mut upstream = sticky_upstream(pool);
+    upstream.port_overrides.insert(
+        9090,
+        port_override(Some(LoadBalancerAlgorithm::RoundRobin), None),
+    );
+    let (cache, proxy) = resolved_fixture(upstream, 8080, None);
+    let snapshot = cache.load();
+
+    let cookie_token = token_for(NAMESPACE, UPSTREAM_ID, &cookie_lane);
+    let rr_token = token_for(NAMESPACE, UPSTREAM_ID, &rr_lane);
+    assert_ne!(
+        cookie_token, rr_token,
+        "one endpoint in two policy lanes must not share a session binding"
+    );
+
+    // The raw index really does hand back the round-robin lane's target, so the
+    // lane guard below is load-bearing and not a restatement of pool scoping.
+    let raw = LoadBalancerCache::select_sticky_from(
+        &snapshot,
+        NAMESPACE,
+        UPSTREAM_ID,
+        &rr_token,
+        None,
+        None,
+        None,
+    )
+    .expect("fixture must actually exercise the cross-lane case");
+    assert_eq!(raw.service_port_policy_key, Some(9090));
+
+    assert!(
+        ferrum_edge::_test_support::resolve_sticky_binding_for_test(
+            &proxy,
+            &snapshot,
+            UPSTREAM_ID,
+            &rr_token,
+            COOKIE_NAME,
+            None,
+            None,
+        )
+        .is_none(),
+        "a round-robin policy lane must not honor this cookie's binding"
+    );
+
+    let honored = ferrum_edge::_test_support::resolve_sticky_binding_for_test(
+        &proxy,
+        &snapshot,
+        UPSTREAM_ID,
+        &cookie_token,
+        COOKIE_NAME,
+        None,
+        None,
+    )
+    .expect("the cookie lane's own binding stays honored");
+    assert_eq!(honored.service_port_policy_key, Some(80));
+}
+
+#[test]
+fn a_rotation_between_two_services_on_one_endpoint_reissues() {
+    // `same_affinity_endpoint` decides whether the cookie a client already holds
+    // still names the backend that served the response. Comparing `host:port`
+    // alone reported "same backend" for a rotation onto the OTHER Service on
+    // this endpoint and skipped the reissue, leaving the client pinned to a
+    // target that did not serve it.
+    let checkout = service_backend("checkout", 80, "10.1.0.10", 8080);
+    let legacy = service_backend("legacy-checkout", 80, "10.1.0.10", 8080);
+
+    let reissue = ferrum_edge::_test_support::sticky_cookie_reissue_target_for_test(
+        false,
+        Some(&checkout),
+        Some(&legacy),
+    )
+    .expect("a rotation onto another Service on one endpoint must reissue");
+    assert_eq!(service_name_of(reissue), "legacy-checkout");
+
+    let pool = vec![checkout.clone(), legacy.clone()];
+    let cache = cache_for(sticky_upstream(pool));
+    let bound = LoadBalancerCache::select_sticky_from(
+        &cache.load(),
+        NAMESPACE,
+        UPSTREAM_ID,
+        &token_for(NAMESPACE, UPSTREAM_ID, reissue),
+        None,
+        None,
+        None,
+    )
+    .expect("the reissued token must resolve");
+    assert_eq!(service_name_of(&bound), "legacy-checkout");
+
+    // A rotation that changed nothing identity-bearing (a distinct allocation
+    // differing only in weight) must still not re-mint the identical token.
+    let mut same_identity = checkout.clone();
+    same_identity.weight = 42;
+    let quiet = ferrum_edge::_test_support::sticky_cookie_reissue_target_for_test(
+        false,
+        Some(&checkout),
+        Some(&same_identity),
+    );
+    assert!(
+        quiet.is_none(),
+        "an identity-preserving rotation must not re-mint the identical token"
+    );
 }
