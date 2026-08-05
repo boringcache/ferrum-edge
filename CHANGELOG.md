@@ -29,10 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exporting partial or unredacted bytes. Name-based redaction matches the HTTP
   JSON contract exactly: a value is replaced when any enclosing name is
   sensitive — the field, an ancestor message field, or a protobuf map key
-  (never exported as a label, always consulted for the decision) — repeated
-  elements inherit their field's decision instead of being judged on the
-  numeric index, and JSON embedded in a protobuf string is decoded and redacted
-  before export.
+  (never exported as a label; map values use collision-free ordinal paths such
+  as `metadata.0`, and the key is consulted only for the redaction decision) —
+  repeated elements inherit their field's decision instead of being judged on
+  the numeric index, and JSON embedded in a protobuf string is decoded and
+  redacted before export.
 - `ai_semantic_firewall` streamed `inspect` mode now accepts
   `streaming.window: tokens` with an explicitly selected bounded tokenizer
   (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft

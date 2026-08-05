@@ -22365,8 +22365,10 @@ components:
             excerpts: in redacted_body a value is replaced wholesale when ANY
             enclosing name matches the sensitive field-name policy — the field
             itself, any ancestor message field, or the protobuf map key of a
-            map entry (map keys are never exported as labels but always decide
-            redaction) — every element of a repeated field inherits that field's
+            map entry (map keys are never exported as labels; each map value is
+            exported under a collision-free ordinal path such as `metadata.0`,
+            and the key still decides redaction) — every element of a repeated
+            field inherits that field's
             own decision, and JSON embedded inside a protobuf string is decoded
             and redacted before export. Malformed, truncated, oversized,
             undecodable, or unknown-field payloads omit the excerpt with a

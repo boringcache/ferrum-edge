@@ -2747,10 +2747,15 @@ impl AiTranscriptAudit {
 
     /// Stage an enrolled native-gRPC candidate. Classification is enrollment,
     /// not JSON AI heuristics — unenrolled methods never reach this path.
+    ///
+    /// `headers` must be the hook's authoritative request-header map (the
+    /// `before_proxy` / final-body parameter), never a stale `ctx.headers`
+    /// clone: gRPC framing reads `grpc-encoding` from this map.
     fn stage_grpc_candidate(
         &self,
         ctx: &mut RequestContext,
         body: &[u8],
+        headers: &HashMap<String, String>,
         phase: BodyPhase,
     ) -> PluginResult {
         if body.is_empty() {
@@ -2783,7 +2788,7 @@ impl AiTranscriptAudit {
         };
         let sample_hit = sample_from_record_id(&record_id) < self.sampling.rate;
         let capture = match phase {
-            BodyPhase::Final => self.capture_grpc_request(ctx, body, sample_hit),
+            BodyPhase::Final => self.capture_grpc_request(ctx, body, headers, sample_hit),
             BodyPhase::Provisional => RequestCapture::default(),
         };
 
@@ -2866,6 +2871,7 @@ impl AiTranscriptAudit {
         &self,
         ctx: &RequestContext,
         body: &[u8],
+        headers: &HashMap<String, String>,
         sample_hit: bool,
     ) -> RequestCapture {
         let reservation = match self.capture_skip_reason(sample_hit) {
@@ -2882,7 +2888,11 @@ impl AiTranscriptAudit {
         self.request_captures.fetch_add(1, Ordering::Relaxed);
         let hash = self.redactor.keyed_hash_hex(body);
         let shaped = if self.capture.request {
-            self.shape_grpc_body(ctx, body, &ctx.headers, GrpcBodyDirection::Request)
+            // Use the hook's finalized request headers, not `ctx.headers`: on
+            // H1/H2 the context is a lightweight clone whose header map can be
+            // stale while the explicit hook parameter is the backend-visible
+            // map (including a late `grpc-encoding` rewrite).
+            self.shape_grpc_body(ctx, body, headers, GrpcBodyDirection::Request)
         } else {
             ShapedBody::default()
         };
@@ -2899,7 +2909,16 @@ impl AiTranscriptAudit {
     }
 
     /// Complete an already-staged gRPC candidate from the FINAL request body.
-    fn capture_staged_grpc_request(&self, ctx: &mut RequestContext, body: &[u8]) {
+    ///
+    /// `headers` is the authoritative backend-visible request-header map from
+    /// the calling hook (final-body `headers`, or the live `before_proxy`
+    /// parameter on a short-circuit refresh) — required for `grpc-encoding`.
+    fn capture_staged_grpc_request(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
         };
@@ -2917,7 +2936,7 @@ impl AiTranscriptAudit {
                 return;
             }
         }
-        let mut capture = self.capture_grpc_request(ctx, body, sample_hit);
+        let mut capture = self.capture_grpc_request(ctx, body, headers, sample_hit);
         self.publish_request_capture(ctx, &capture);
         if let Some(mut staged) = self.staging.get_mut(&record_id) {
             staged.captured = true;
@@ -3118,7 +3137,8 @@ impl AiTranscriptAudit {
     /// `sensitive` is decided by the descriptor walk (or by
     /// [`sensitive_grpc_field_path`] for operator-selected `text_fields`) and is
     /// true when ANY ancestor segment matched the field-name policy — including
-    /// a map key that is deliberately not exported as a transcript label. That
+    /// a map key that is deliberately not exported as a transcript label
+    /// (entries use ordinal path segments instead). That
     /// mirrors [`redact_json_value_strings_at_depth`], which replaces the whole
     /// subtree under a sensitive object key rather than only its leaf.
     ///
@@ -4126,8 +4146,16 @@ impl Plugin for AiTranscriptAudit {
             let Some(body) = ctx.metadata.remove("request_body") else {
                 return PluginResult::Continue;
             };
-            let stage_result =
-                self.stage_grpc_candidate(ctx, body.as_bytes(), BodyPhase::Provisional);
+            // Pass the live `before_proxy` header map (not `ctx.headers`): the
+            // handler may have moved headers out of the context, and any later
+            // FINAL capture on a short-circuit path must not fall back to a
+            // stale copy for `grpc-encoding`.
+            let stage_result = self.stage_grpc_candidate(
+                ctx,
+                body.as_bytes(),
+                headers,
+                BodyPhase::Provisional,
+            );
             ctx.metadata.insert("request_body".to_string(), body);
             if !matches!(stage_result, PluginResult::Continue) {
                 return stage_result;
@@ -4184,7 +4212,7 @@ impl Plugin for AiTranscriptAudit {
         // bytes, so this is where the transaction's single capture pass runs.
         if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
             if self.grpc_capture_applies(ctx) {
-                self.capture_staged_grpc_request(ctx, body);
+                self.capture_staged_grpc_request(ctx, body, headers);
             } else {
                 self.capture_staged_request(ctx, body);
             }
@@ -4195,7 +4223,7 @@ impl Plugin for AiTranscriptAudit {
             return self.request_phase_commit_admission(ctx);
         }
         if self.grpc_capture_applies(ctx) {
-            let stage_result = self.stage_grpc_candidate(ctx, body, BodyPhase::Final);
+            let stage_result = self.stage_grpc_candidate(ctx, body, headers, BodyPhase::Final);
             if !matches!(stage_result, PluginResult::Continue) {
                 return stage_result;
             }
@@ -4254,7 +4282,15 @@ impl Plugin for AiTranscriptAudit {
             && let Some(body) = ctx.metadata.remove("request_body")
         {
             if self.grpc_capture_applies(ctx) {
-                self.capture_staged_grpc_request(ctx, body.as_bytes());
+                // No final-body hook ran (before_proxy short-circuit). The
+                // context header map is the post-`before_proxy` request view
+                // restored by the proxy — there is no separate finalized hook
+                // map on this path. Take it out briefly so capture can borrow
+                // headers and mutate staging/metadata without overlapping
+                // borrows of `ctx`.
+                let request_headers = std::mem::take(&mut ctx.headers);
+                self.capture_staged_grpc_request(ctx, body.as_bytes(), &request_headers);
+                ctx.headers = request_headers;
             } else {
                 self.capture_staged_request(ctx, body.as_bytes());
             }
@@ -4383,7 +4419,13 @@ impl Plugin for AiTranscriptAudit {
             && let Some(body) = ctx.metadata.remove("request_body")
         {
             if self.grpc_capture_applies(ctx) {
-                self.capture_staged_grpc_request(ctx, body.as_bytes());
+                // Synthetic short-circuit never ran the final-body hook, so
+                // there is no separate finalized request-header map. Use the
+                // post-`before_proxy` context headers (taken briefly to avoid
+                // overlapping borrows) for `grpc-encoding`.
+                let request_headers = std::mem::take(&mut ctx.headers);
+                self.capture_staged_grpc_request(ctx, body.as_bytes(), &request_headers);
+                ctx.headers = request_headers;
             } else {
                 self.capture_staged_request(ctx, body.as_bytes());
             }
@@ -7467,7 +7509,8 @@ fn value_has_unknown_fields(
 ///
 /// `sensitive` is resolved during the walk rather than re-derived from `path`,
 /// because the redaction decision needs names the exported label deliberately
-/// drops: map keys (kept out of the label) and repeated-element field names
+/// drops: map keys (kept out of the label — entries use ordinal segments) and
+/// repeated-element field names
 /// (whose label segment is a numeric index).
 struct GrpcCapturedString {
     path: String,
@@ -7559,15 +7602,17 @@ fn collect_string_value(
             }
         }
         ProtobufValue::Map(entries) => {
-            // Map keys are not exported as transcript path labels (operator
-            // text_fields cannot select them either), so values are walked
-            // under a stable placeholder segment. The key is still a field
-            // name for policy purposes: a `metadata` map carrying an
-            // `authorization` entry must redact exactly as the equivalent
-            // JSON object key would.
-            for (key, entry) in entries {
+            // Map keys are attacker-influenced and must not appear in transcript
+            // labels (`text_fields` cannot select them either). Emit each entry
+            // under a collision-free ordinal segment (`metadata.0`, `metadata.1`,
+            // …) mirroring repeated-field indexing, so every value survives the
+            // later `fields.insert` into the excerpt object. The key is kept
+            // only as redaction evidence: a `metadata` map carrying an
+            // `authorization` entry must redact exactly as the equivalent JSON
+            // object key would.
+            for (index, (key, entry)) in entries.iter().enumerate() {
                 let nested = sensitive || sensitive_map_key(key);
-                path.push("*".to_string());
+                path.push(index.to_string());
                 collect_string_value(entry, path, nested, out, budget)?;
                 path.pop();
             }

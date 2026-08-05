@@ -10430,10 +10430,15 @@ async fn grpc_compressed_identity_and_unsupported_encoding() {
     let omitted = records[0]
         .get("request_body_omitted_reason")
         .and_then(Value::as_str);
-    assert!(
-        omitted == Some("grpc_framing_error") || request_body.is_null(),
-        "unsupported encoding must omit excerpt: {}",
+    assert_eq!(
+        omitted,
+        Some("grpc_framing_error"),
+        "unsupported encoding must omit with grpc_framing_error: {}",
         records[0]
+    );
+    assert!(
+        request_body.is_null(),
+        "an omitted framing failure must export no request body: {request_body}"
     );
 }
 
@@ -10813,9 +10818,9 @@ async fn audit_grpc_request_excerpt(payload: AuditPayload<'_>) -> String {
 }
 
 /// A `map<string, string>` keyed `authorization` is the severe case: the
-/// exported label is `metadata.*`, whose leaf segment is not a sensitive name,
-/// and no built-in pattern matches a generic bearer token. Only consulting the
-/// map key keeps the credential out of the sink.
+/// exported label is an ordinal path (`metadata.0`), whose leaf segment is not
+/// a sensitive name, and no built-in pattern matches a generic bearer token.
+/// Only consulting the map key keeps the credential out of the sink.
 #[tokio::test(flavor = "current_thread")]
 async fn grpc_sensitive_map_key_redacts_value_without_exporting_the_key() {
     let payload = AuditPayload {
@@ -10849,6 +10854,175 @@ async fn grpc_sensitive_map_key_redacts_value_without_exporting_the_key() {
     assert!(
         excerpt.contains("summarize the ticket"),
         "a benign string field must still be captured: {excerpt}"
+    );
+}
+
+/// Every entry of one protobuf map must survive under a collision-free ordinal
+/// path. Emitting every value under the same `metadata.*` label let later
+/// `fields.insert` overwrite earlier entries, so a map with a benign value and
+/// a sensitive-keyed value could keep only one of them.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_same_map_preserves_benign_and_redacted_entries_without_exporting_keys() {
+    let payload = AuditPayload {
+        prompt: Some("summarize the ticket"),
+        metadata: vec![
+            ("note", "benign-map-value-keep"),
+            ("authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.same-map.sig"),
+        ],
+        ..AuditPayload::default()
+    };
+    let excerpt = audit_grpc_request_excerpt(payload).await;
+
+    assert!(
+        excerpt.contains("benign-map-value-keep"),
+        "a benign same-map value must survive ordinal export: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("eyJhbGciOiJIUzI1NiJ9"),
+        "a sensitive same-map value leaked a bearer token: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("Bearer "),
+        "a sensitive same-map value leaked a bearer token: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("[REDACTED]"),
+        "the sensitive same-map value must export the placeholder: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("authorization"),
+        "literal map key `authorization` must not be exported: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("\"note\""),
+        "literal map key `note` must not be exported: {excerpt}"
+    );
+    // Ordinal path segments distinguish entries without naming the keys.
+    assert!(
+        excerpt.contains("metadata.0") || excerpt.contains("metadata.1"),
+        "map values must export under ordinal paths: {excerpt}"
+    );
+}
+
+/// On H1/H2 the final-body hook receives an authoritative backend-visible
+/// header map while `ctx.headers` can be a stale lightweight clone. Framing
+/// must read `grpc-encoding` from the hook map so a compressed request is not
+/// parsed as identity.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_final_hook_headers_are_authoritative_for_request_framing() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().unwrap();
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    // Stale context map: no grpc-encoding (would be treated as identity).
+    ctx.headers.remove("grpc-encoding");
+    let mut hook_headers = grpc_headers();
+    hook_headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let req = gzip_grpc_frame(&hello_request_bytes("ops@example.com"));
+    let resp = grpc_frame(&hello_response_bytes("clean"));
+
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &hook_headers, &req)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &grpc_headers(), &resp)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "expected one audit record, got {records:?}");
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !request_body.is_empty(),
+        "gzip framing from hook headers must produce a real excerpt: {}",
+        records[0]
+    );
+    assert!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str)
+            .is_none(),
+        "hook-header gzip must not omit the request excerpt: {}",
+        records[0]
+    );
+    assert!(
+        !request_body.contains("ops@example.com"),
+        "decoded gzip excerpt must still redact the email: {request_body}"
+    );
+    assert!(
+        request_body.contains("[REDACTED]"),
+        "decoded gzip excerpt must export a redacted placeholder, not merely omit the secret: {request_body}"
+    );
+    assert!(
+        request_body.contains("/test.Greeter/SayHello"),
+        "decoded gzip excerpt must report the enrolled method: {request_body}"
+    );
+}
+
+/// Unsupported finalized `grpc-encoding` must omit with the exact framing
+/// reason — a null body alone is not enough evidence of fail-closed behavior.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_final_hook_unsupported_encoding_omits_with_framing_reason() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().unwrap();
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    // Stale context claims gzip; the authoritative hook map says snappy.
+    ctx.headers
+        .insert("grpc-encoding".to_string(), "gzip".to_string());
+    let mut hook_headers = grpc_headers();
+    hook_headers.insert("grpc-encoding".to_string(), "snappy".to_string());
+    let body = gzip_grpc_frame(&hello_request_bytes("secret@example.com"));
+
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &hook_headers, &body)
+        .await;
+    plugin
+        .capture_final_response_body(
+            &mut ctx,
+            200,
+            &grpc_headers(),
+            &grpc_frame(&hello_response_bytes("ok")),
+        )
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "expected one audit record, got {records:?}");
+    assert_eq!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
+        Some("grpc_framing_error"),
+        "unsupported finalized encoding must omit with grpc_framing_error: {}",
+        records[0]
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        request_body.is_null(),
+        "an omitted framing failure must export no request body: {request_body}"
+    );
+    assert!(
+        !format!("{records:?}").contains("secret@example.com"),
+        "unsupported encoding must not leak the secret into the record"
     );
 }
 
