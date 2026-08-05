@@ -22382,8 +22382,11 @@ components:
           required: [descriptor_path, methods]
           description: >-
             Native-gRPC capture contract. Present means the plugin also applies
-            to native gRPC, but only for the enrolled methods: every other gRPC
-            method is left undecoded, uncaptured, and unbuffered. Captured
+            to native gRPC, but only enrolled methods are decoded and captured.
+            Because the backend-effective method is not authoritative until
+            after routing, the presence of this block conservatively buffers
+            every native-gRPC request on the proxy; unenrolled responses are
+            not buffered by this plugin. Captured
             string fields honor the same mode/redaction contract as HTTP
             excerpts: in redacted_body a value is replaced wholesale when ANY
             enclosing name matches the sensitive field-name policy — the field

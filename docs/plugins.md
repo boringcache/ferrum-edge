@@ -5275,7 +5275,7 @@ Expiry removes the revoked live slot from the process-global map immediately; it
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `descriptor_path` | String | — | **Required.** Node-local path to a compiled `FileDescriptorSet` (`protoc --descriptor_set_out`) |
-| `methods` | Object | — | **Required.** Map of `/package.Service/Method` to that method's capture contract. Only enrolled methods are buffered/decoded; every other gRPC method is left untouched |
+| `methods` | Object | — | **Required.** Map of `/package.Service/Method` to that method's capture contract. Only enrolled methods are decoded/captured. Because the backend-effective method is not authoritative until after routing, the presence of a `grpc` block conservatively buffers every native-gRPC request on the proxy; unenrolled responses are not buffered by this plugin |
 | `methods[].request_type` | String | — | Fully-qualified protobuf request message type |
 | `methods[].response_type` | String | — | Fully-qualified protobuf response message type |
 | `methods[].text_fields` | String[] | *(all strings)* | Optional dotted field paths restricting which string fields are exported. Each path must end at a string field and may not traverse a map field. Omit to cover every string field recursively |
