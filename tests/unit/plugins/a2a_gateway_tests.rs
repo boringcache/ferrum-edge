@@ -4375,11 +4375,14 @@ fn a2a_inert_instances_still_enroll_a_static_presentation_policy() {
 async fn grpc_agent_card_absolute_looking_urls_fail_closed() {
     let over_length = format!("https://planner.internal/{}", "a".repeat(5000));
     let cases = [
-        // No authority at all — not "an empty authority", which WHATWG collapses
-        // (see `..._empty_authority_is_a_real_url` below).
+        // No authority at all — not an explicit canonical spelling.
         "https://",
         "https:///",
         "https://:8080/a2a",
+        "http:///a2a",
+        "https:////planner.internal/a2a",
+        "http://\\planner.internal/a2a",
+        "https:\\planner.internal/a2a",
         "https://user:pass@planner.internal/a2a",
         "http://token@planner.internal/a2a",
         "http://[::1/a2a",
@@ -4405,36 +4408,52 @@ async fn grpc_agent_card_absolute_looking_urls_fail_closed() {
     }
 }
 
-/// The boundary of the absolute-URL proof, pinned so it is not mistaken for a
-/// fail-closed case again.
-///
-/// `http:///a2a` looks like an empty authority, but WHATWG's
-/// special-authority-ignore-slashes state consumes the extra `/` and parses it
-/// as host `a2a` — it IS an absolute http URL, and `url::Url` (the same parser
-/// `discovery.public_base_url` is validated with) agrees. Admitting it is
-/// correct and safe: only the boolean verdict is used, the backend's own bytes
-/// are what get preserved when no rewrite is needed, and a client resolves the
-/// preserved value under the identical rule. The check exists to tell a URL
-/// apart from a serialized `AgentInterface` submessage, and such a submessage is
-/// already refused by the control-character bound — its leading tag byte is
-/// `0x0a`.
+/// Ambiguous absolute-URL spellings whose authority exists only after parser
+/// recovery must fail closed at the Agent Card boundary.
 #[tokio::test]
-async fn grpc_agent_card_url_with_empty_authority_is_a_real_url() {
+async fn grpc_agent_card_ambiguous_absolute_url_spellings_fail_closed() {
+    let cases = [
+        "http:///a2a",
+        "https:////planner.internal/a2a",
+        "http://\\planner.internal/a2a",
+        "https:\\planner.internal/a2a",
+    ];
+
+    for url in cases {
+        let card = encode_minimal_agent_card("planner", "planning agent", url, |out| {
+            encode_proto_string(14, "JSONRPC", out);
+            encode_proto_string(16, "0.3.0", out);
+        });
+        let (ctx, result) = admit_raw_card_message(card).await;
+        assert_grpc_rewrite_reject(
+            result,
+            "agent_card_protobuf_url_layout_mismatch",
+            ctx.metadata.get("a2a.error").map(String::as_str),
+        );
+    }
+}
+
+/// Ordinary absolute URLs with an explicit authority remain admitted.
+#[tokio::test]
+async fn grpc_agent_card_preserves_explicit_absolute_url_bytes() {
     let plugin = plugin(json!({
         "discovery": {"public_base_url": "https://gateway.example.com"}
     }));
     let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
-    let card = encode_minimal_agent_card("planner", "planning agent", "http:///a2a", |out| {
-        // Not JSONRPC, so `AgentCard.url` is PRESERVED rather than replaced —
-        // which is exactly the path where accepting the value has to be safe.
-        encode_proto_string(14, "GRPC", out);
-        encode_proto_bytes(
-            15,
-            &encode_agent_interface("https://planner.internal/a2a", "JSONRPC"),
-            out,
-        );
-        encode_proto_string(16, "0.3.0", out);
-    });
+    let card = encode_minimal_agent_card(
+        "planner",
+        "planning agent",
+        "http://planner.internal/a2a",
+        |out| {
+            encode_proto_string(14, "GRPC", out);
+            encode_proto_bytes(
+                15,
+                &encode_agent_interface("https://planner.internal/a2a", "JSONRPC"),
+                out,
+            );
+            encode_proto_string(16, "0.3.0", out);
+        },
+    );
     let body = frame_grpc_message(&card);
     let mut response_headers = grpc_ok_response_headers();
     let staged = plugin
@@ -4442,7 +4461,7 @@ async fn grpc_agent_card_url_with_empty_authority_is_a_real_url() {
         .await;
     assert!(
         matches!(staged, PluginResult::Continue),
-        "an empty-authority http URL is a real absolute URL and must be admitted"
+        "an explicit-authority http URL must be admitted"
     );
     assert_eq!(ctx.metadata.get("a2a.error"), None);
 
@@ -4458,7 +4477,7 @@ async fn grpc_agent_card_url_with_empty_authority_is_a_real_url() {
     let message = &rewritten[5..];
     assert_eq!(
         proto_string_field(message, 3).as_deref(),
-        Some("http:///a2a"),
+        Some("http://planner.internal/a2a"),
         "a preserved URL must be the backend's own bytes, never a normalized form"
     );
     assert_eq!(

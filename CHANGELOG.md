@@ -92,12 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `agent_card_grpc_rewrite_not_applied`. Operators fronting a non-0.3 A2A
   backend should set `discovery.rewrite_agent_card_urls: false`; leaving it
   enabled refuses such cards rather than serving un-rewritten internal URLs.
-  The absolute-URL proof is the WHATWG grammar rather than a stricter spelling
-  rule, so a form the standard accepts is accepted here too — `http:///a2a` is
-  host `a2a`, because the special-authority-ignore-slashes state consumes the
-  extra slash. That is safe: only the boolean verdict is used, a preserved URL
-  is re-emitted as the backend's own bytes rather than a normalized form, and a
-  discovery client resolves it under the identical rule.
+  The absolute-URL proof requires an explicit canonical authority spelling
+  before any path, query, or fragment; ambiguous recovery forms such as
+  `http:///a2a` fail closed because hostile wire input can be parsed differently
+  by downstream consumers.
 - `a2a_gateway` now enrolls in `request_deduplication` replay presentation
   provenance, because its Agent Card rewrite is a client-facing transform that
   a finalized replay deliberately skips (issue #3297). Every retained response

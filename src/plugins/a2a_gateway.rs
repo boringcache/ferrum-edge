@@ -2602,6 +2602,10 @@ const MAX_AGENT_CARD_URL_BYTES: usize = 4096;
 /// - The parsed scheme is exactly `http` or `https` — never `file`, `data`, or
 ///   an unknown scheme that merely embeds one of them.
 /// - A real, non-empty host is present.
+/// - The wire spelling carries an explicit `http`/`https` authority before any
+///   path, query, or fragment. WHATWG recovery can infer a host from forms such
+///   as `http:///a2a` where the authority is empty on the wire; those spellings
+///   are rejected because downstream parsers may disagree.
 /// - No embedded credentials. `http://user:pass@host/` is a URL, but publishing
 ///   one in a rewritten Agent Card would advertise a credential to every
 ///   discovery client, and Ferrum rejects embedded credentials at every other
@@ -2611,16 +2615,34 @@ const MAX_AGENT_CARD_URL_BYTES: usize = 4096;
 /// Only the boolean verdict leaves this function: the parsed/normalized form is
 /// never emitted, so the backend's own bytes are what get preserved when no
 /// rewrite is needed.
-///
-/// **Where the proof stops.** This is the WHATWG grammar, not a stricter
-/// spelling rule, so a value the standard accepts is accepted here even when it
-/// looks unusual — `http:///a2a` is host `a2a`, because the
-/// special-authority-ignore-slashes state consumes the extra slash. That is
-/// correct and safe: only the verdict is used, the preserved bytes are the
-/// backend's own, and a client resolves them under the identical rule. What the
-/// checks above genuinely exclude is a value that is not a URL at all, which is
-/// what a serialized `AgentInterface` submessage is — its leading tag byte
-/// (`0x0a`) is refused by the control-character bound before parsing.
+fn http_scheme_rest(value: &str) -> Option<(&'static str, &str)> {
+    if let Some(rest) = value.get(7..) {
+        if value[..7].eq_ignore_ascii_case("http://") {
+            return Some(("http", rest));
+        }
+    }
+    if let Some(rest) = value.get(8..) {
+        if value[..8].eq_ignore_ascii_case("https://") {
+            return Some(("https", rest));
+        }
+    }
+    None
+}
+
+/// Require a canonical absolute `http`/`https` authority spelling on the wire.
+fn has_explicit_http_authority_spelling(value: &str) -> bool {
+    let Some((_, rest)) = http_scheme_rest(value) else {
+        return false;
+    };
+    let authority = rest
+        .split(|byte| matches!(byte, b'/' | b'?' | b'#'))
+        .next()
+        .unwrap_or("");
+    !authority.is_empty()
+        && !authority.starts_with(':')
+        && !authority.bytes().any(|byte| byte == b'\\')
+}
+
 fn is_absolute_http_url(value: &str) -> bool {
     if value.is_empty() || value.len() > MAX_AGENT_CARD_URL_BYTES {
         return false;
@@ -2629,6 +2651,9 @@ fn is_absolute_http_url(value: &str) -> bool {
         .bytes()
         .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
     {
+        return false;
+    }
+    if !has_explicit_http_authority_spelling(value) {
         return false;
     }
     let Ok(parsed) = Url::parse(value) else {
