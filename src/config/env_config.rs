@@ -4860,7 +4860,7 @@ impl EnvConfig {
 
         for (param, value) in &found {
             if !Self::sql_url_tls_mode_is_verifying(db_type, value) {
-                return SqlUrlTlsPeerAuth::Unverified { param: *param };
+                return SqlUrlTlsPeerAuth::Unverified { param };
             }
         }
         SqlUrlTlsPeerAuth::Verified
