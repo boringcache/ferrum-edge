@@ -12,7 +12,8 @@ mod mesh_config;
 pub(crate) use core::secret_object_is_valid_tls_certificate;
 pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
-    backend_lb_policy_status, namespace_selector_matches, parse_reference_grant_permissions,
+    backend_lb_policy_conflict_losers, backend_lb_policy_status, namespace_selector_matches,
+    parse_reference_grant_permissions,
 };
 // Re-exported for the integration suite's at-cap/over-cap L4 candidate and
 // projection assertions (`tests/integration/mesh_l7_routing_tests.rs`), which
@@ -537,8 +538,8 @@ pub(crate) struct K8sAccumulator {
     gateway_api_materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
     /// Effective session persistence from `BackendLBPolicy` /
     /// `XBackendTrafficPolicy`, keyed by `(namespace, service_name)`.
-    /// Oldest creationTimestamp (then name) wins when multiple policies target
-    /// the same Service.
+    /// Oldest creationTimestamp (then full resource identity) wins when
+    /// multiple policies target the same Service (GEP-713 None merge).
     pub(crate) gateway_api_backend_session_policies:
         HashMap<(String, String), gateway_api::GatewayBackendSessionPolicy>,
 }

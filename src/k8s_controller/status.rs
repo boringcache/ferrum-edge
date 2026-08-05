@@ -11,11 +11,11 @@ use crate::config::types::GatewayConfig;
 use crate::config_sources::k8s::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiMaterializedRouteParent, GatewayApiRouteConflict,
     GatewayApiRouteConflictKey, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation,
-    K8sTranslationOptions, gateway_api_route_conflict_keys_with_acc,
-    gateway_api_status_conflict_context, namespace_selector_matches,
-    parse_gateway_listener_allowed_route_namespaces, parse_reference_grant_permissions,
-    secret_object_is_valid_tls_certificate, translate_k8s_objects_collecting_skips,
-    validate_gateway_listener_allowed_routes,
+    K8sTranslationOptions, backend_lb_policy_conflict_losers, backend_lb_policy_status,
+    gateway_api_route_conflict_keys_with_acc, gateway_api_status_conflict_context,
+    namespace_selector_matches, parse_gateway_listener_allowed_route_namespaces,
+    parse_reference_grant_permissions, secret_object_is_valid_tls_certificate,
+    translate_k8s_objects_collecting_skips, validate_gateway_listener_allowed_routes,
 };
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
@@ -561,6 +561,7 @@ pub fn plan_gateway_api_status_updates_budgeted(
 ) -> GatewayApiStatusPlanOutcome {
     let indexes = GatewayApiStatusIndexes::build(objects, route_conflicts);
     let conflict_context = gateway_api_status_conflict_context(objects, options.clone());
+    let backend_lb_conflict_losers = backend_lb_policy_conflict_losers(objects, &options);
 
     let owned_reuse;
     let reuse = match translation_reuse {
@@ -642,6 +643,7 @@ pub fn plan_gateway_api_status_updates_budgeted(
                 route_conflicts: &object_conflicts,
                 route_keys: &route_keys,
                 managed_parent_refs: &managed_parent_refs,
+                backend_lb_conflict_losers: &backend_lb_conflict_losers,
             },
         );
         if status == object.status {
@@ -678,6 +680,7 @@ struct DesiredStatusForObject<'a> {
     route_conflicts: &'a [&'a GatewayApiRouteConflict],
     route_keys: &'a [GatewayApiRouteConflictKey],
     managed_parent_refs: &'a [&'a Value],
+    backend_lb_conflict_losers: &'a HashSet<K8sResourceKey>,
 }
 
 fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_>) -> Value {
@@ -701,7 +704,10 @@ fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_
             ctx.route_keys,
         ),
         "BackendLBPolicy" | "XBackendTrafficPolicy" => {
-            crate::config_sources::k8s::backend_lb_policy_status(object)
+            let conflicted = ctx
+                .backend_lb_conflict_losers
+                .contains(&K8sResourceKey::from_object(object));
+            backend_lb_policy_status(object, conflicted)
         }
         _ => Value::Object(Default::default()),
     }
@@ -4568,6 +4574,51 @@ mod tests {
         assert_eq!(
             find_condition(conditions, "Accepted")["reason"].as_str(),
             Some("Conflicted")
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_status_planning_marks_newer_challenger_conflicted() {
+        let mut older = object(
+            "BackendLBPolicy",
+            "older",
+            json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "older"}
+            }),
+        );
+        older.api_version = "gateway.networking.k8s.io/v1alpha2".to_string();
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+
+        let mut newer = object(
+            "XBackendTrafficPolicy",
+            "newer",
+            json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "newer"}
+            }),
+        );
+        newer.api_version = "gateway.networking.x-k8s.io/v1alpha1".to_string();
+        newer.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        // Reversed input order must not change which policy is Conflicted.
+        let updates = plan_status_updates(&[newer.clone(), older.clone()], options());
+        let older_update = update_for(&updates, "BackendLBPolicy", "older");
+        let newer_update = update_for(&updates, "XBackendTrafficPolicy", "newer");
+
+        let older_condition = &older_update.status["ancestors"][0]["conditions"][0];
+        assert_eq!(older_condition["status"], "True");
+        assert_eq!(older_condition["reason"], "Accepted");
+
+        let newer_condition = &newer_update.status["ancestors"][0]["conditions"][0];
+        assert_eq!(newer_condition["status"], "False");
+        assert_eq!(newer_condition["reason"], "Conflicted");
+        assert!(
+            !newer_condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("api"),
+            "Conflicted message must not echo the Service name"
         );
     }
 

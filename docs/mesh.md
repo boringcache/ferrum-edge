@@ -2845,6 +2845,8 @@ When `FERRUM_K8S_CONTROLLER_ENABLED=true` and Gateway API watching is enabled, t
 
 Gateway API HTTP/GRPC route conflicts are resolved deterministically before config materialization. For routes that would produce the same parent reference, hostname, and Ferrum listen path, the oldest `metadata.creationTimestamp` wins; if timestamps tie or are absent, `{namespace}/{name}` order is the tiebreaker. Losing routes are skipped during translation and receive `Accepted=False`, `Programmed=False`, and `Conflicted=True` status.
 
+`BackendLBPolicy` / `XBackendTrafficPolicy` Direct attachment uses the same oldest-wins None-merge precedence as translation (creationTimestamp, then full resource identity across kinds). Status planning evaluates field validation first, then conflicts: a policy that wins every Service target stays `Accepted=True`; a challenger that loses any targeted Service is `Accepted=False` with reason `Conflicted` (atomic multi-target fail-closed). Invalid policies keep field-specific `UnsupportedValue` rejection and never participate as conflict winners.
+
 Gateway listener `allowedRoutes.namespaces.selector` is an atomic security
 boundary. Ferrum validates the complete selector before attachment, including
 Kubernetes label-key/value syntax, string-only `matchLabels`, expression field

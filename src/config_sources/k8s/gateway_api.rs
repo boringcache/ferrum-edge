@@ -277,7 +277,7 @@ pub(super) fn collect_backend_lb_policy(
         if !service_targets.insert(name.to_string()) {
             return Err(invalid_resource(
                 object,
-                format!("spec.targetRefs[{index}] duplicates Service {name}"),
+                format!("spec.targetRefs[{index}] duplicates an earlier Service targetRef"),
             ));
         }
     }
@@ -562,16 +562,18 @@ fn parse_gateway_api_duration_secs(
     raw: &str,
     field: &str,
 ) -> Result<u64, K8sTranslateError> {
+    // Diagnostics name the field and system cap only — never echo the operator
+    // duration string (which may carry hostile/control content into status).
     if !is_gateway_api_duration(raw) {
         return Err(invalid_resource(
             object,
-            format!("sessionPersistence.{field} '{raw}' is not a valid Gateway API duration"),
+            format!("sessionPersistence.{field} is not a valid Gateway API duration"),
         ));
     }
     let ms = parse_istio_duration_ms(raw).ok_or_else(|| {
         invalid_resource(
             object,
-            format!("sessionPersistence.{field} '{raw}' is not a valid Gateway API duration"),
+            format!("sessionPersistence.{field} is not a valid Gateway API duration"),
         )
     })?;
     if ms == 0 {
@@ -585,8 +587,7 @@ fn parse_gateway_api_duration_secs(
         return Err(invalid_resource(
             object,
             format!(
-                "sessionPersistence.{field} '{raw}' exceeds the sticky-cookie \
-                 ttl cap of {}s",
+                "sessionPersistence.{field} exceeds the sticky-cookie ttl cap of {}s",
                 crate::config::types::MAX_TIMEOUT_SECONDS
             ),
         ));
@@ -725,13 +726,112 @@ fn scope_cookie_session_to_route(
     session
 }
 
+/// Fixed Accepted=False / Conflicted message for GEP-713 None-merge losers.
+/// Must not echo policy identity, Service names, or operator-authored values.
+const BACKEND_LB_POLICY_CONFLICTED_MESSAGE: &str = "Another BackendLBPolicy or XBackendTrafficPolicy already targets one or more of the same Services and merging is not supported";
+
+/// Policies that lose at least one Service target under the same GEP-713 None
+/// merge / oldest-wins precedence used by [`collect_backend_lb_policy`].
+///
+/// Only syntactically valid, in-scope `BackendLBPolicy` / `XBackendTrafficPolicy`
+/// objects participate. Invalid policies are excluded so they cannot occupy a
+/// Service slot or convert a field-level rejection into Accepted/Conflicted.
+/// Participant processing is sorted by full resource identity so watch/input
+/// order cannot change winners.
+pub(crate) fn backend_lb_policy_conflict_losers<'a>(
+    objects: impl IntoIterator<Item = &'a K8sObject>,
+    options: &K8sTranslationOptions,
+) -> HashSet<K8sResourceKey> {
+    let mut participants: Vec<(GatewayBackendSessionPolicy, BTreeSet<String>)> = Vec::new();
+
+    for object in objects
+        .into_iter()
+        .filter(|object| super::includes_object_namespace(options, object))
+        .filter(|object| backend_lb_policy_kinds(&object.kind))
+    {
+        // Validation first: invalid objects never participate in conflict.
+        if validate_backend_lb_policy_for_status(object).is_err() {
+            continue;
+        }
+        let targets = object
+            .spec
+            .get("targetRefs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|target| {
+                string_field(target, "name")
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            })
+            .collect::<BTreeSet<_>>();
+        participants.push((
+            GatewayBackendSessionPolicy {
+                resource: K8sResourceKey::from_object(object),
+                creation_timestamp: object
+                    .metadata
+                    .creation_timestamp
+                    .as_deref()
+                    .and_then(parse_k8s_timestamp),
+                session: Ok(None),
+            },
+            targets,
+        ));
+    }
+
+    participants.sort_by(|left, right| left.0.resource.cmp(&right.0.resource));
+
+    let mut winners: BTreeMap<(String, String), GatewayBackendSessionPolicy> = BTreeMap::new();
+    for (record, targets) in &participants {
+        for service_name in targets {
+            let key = (record.resource.namespace.clone(), service_name.clone());
+            match winners.get(&key) {
+                None => {
+                    winners.insert(key, record.clone());
+                }
+                Some(existing) if backend_policy_is_preferred(record, existing) => {
+                    winners.insert(key, record.clone());
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    let mut losers = HashSet::new();
+    for (record, targets) in &participants {
+        for service_name in targets {
+            let key = (record.resource.namespace.clone(), service_name.clone());
+            let Some(winner) = winners.get(&key) else {
+                continue;
+            };
+            if winner.resource != record.resource {
+                losers.insert(record.resource.clone());
+                break;
+            }
+        }
+    }
+    losers
+}
+
 /// Build `status.ancestors` for BackendLBPolicy / XBackendTrafficPolicy.
 ///
-/// Ancestor is the targeted Service (Direct policy attachment). Accepted is
-/// True when targetRefs and sessionPersistence are representable; False with a
-/// field-specific reason otherwise (including unsupported `retryConstraint`).
-pub(crate) fn backend_lb_policy_status(object: &K8sObject) -> Value {
+/// Ancestor is the targeted Service (Direct policy attachment). Status
+/// evaluation order is deterministic:
+/// 1. Field validation / unsupported values → `Accepted=False` /
+///    `UnsupportedValue` (including unsupported `retryConstraint`)
+/// 2. GEP-713 None-merge conflicts → `Accepted=False` / `Conflicted` when
+///    `conflicted` is true because this policy lost at least one Service target
+///
+/// Invalid policies therefore never report Accepted because of a conflict
+/// check. With Ferrum's atomic direct-policy behavior, a multi-target policy
+/// that loses any Service is rejected entirely rather than partially accepted.
+pub(crate) fn backend_lb_policy_status(object: &K8sObject, conflicted: bool) -> Value {
     let (accepted, reason, message) = match validate_backend_lb_policy_for_status(object) {
+        Ok(()) if conflicted => (
+            false,
+            "Conflicted",
+            BACKEND_LB_POLICY_CONFLICTED_MESSAGE.to_string(),
+        ),
         Ok(()) => (
             true,
             "Accepted",
@@ -828,7 +928,7 @@ fn validate_backend_lb_policy_for_status(object: &K8sObject) -> Result<(), Strin
         }
         if !service_targets.insert(name) {
             return Err(format!(
-                "spec.targetRefs[{index}] duplicates Service {name}"
+                "spec.targetRefs[{index}] duplicates an earlier Service targetRef"
             ));
         }
     }
@@ -11705,7 +11805,7 @@ mod tests {
             "got: {err}"
         );
 
-        let status = super::backend_lb_policy_status(&policy);
+        let status = super::backend_lb_policy_status(&policy, false);
         assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
     }
 
@@ -11731,7 +11831,7 @@ mod tests {
         let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
             .expect_err("a non-object sessionPersistence must fail closed");
         assert!(err.to_string().contains("must be an object"), "got: {err}");
-        let status = super::backend_lb_policy_status(&policy);
+        let status = super::backend_lb_policy_status(&policy, false);
         assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
     }
 
@@ -11867,7 +11967,7 @@ mod tests {
         let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
             .expect_err("an empty target name must fail closed");
         assert!(err.to_string().contains("must not be empty"), "got: {err}");
-        let status = super::backend_lb_policy_status(&policy);
+        let status = super::backend_lb_policy_status(&policy, false);
         assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
     }
 
@@ -11892,7 +11992,7 @@ mod tests {
         let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
             .expect_err("more than 16 targetRefs must fail closed");
         assert!(err.to_string().contains("at most 16"), "got: {err}");
-        let status = super::backend_lb_policy_status(&policy);
+        let status = super::backend_lb_policy_status(&policy, false);
         assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
     }
 
@@ -11998,7 +12098,7 @@ mod tests {
                 }
             }),
         );
-        let status = super::backend_lb_policy_status(&policy);
+        let status = super::backend_lb_policy_status(&policy, false);
         let condition = &status["ancestors"][0]["conditions"][0];
         assert_eq!(condition["status"], "False");
         assert_eq!(condition["reason"], "UnsupportedValue");
@@ -12030,7 +12130,7 @@ mod tests {
         );
         assert!(err.to_string().contains("cookie name"), "got: {err}");
 
-        let status = super::backend_lb_policy_status(&policy);
+        let status = super::backend_lb_policy_status(&policy, false);
         let condition = &status["ancestors"][0]["conditions"][0];
         assert_eq!(condition["status"], "False");
         assert_eq!(condition["reason"], "UnsupportedValue");
@@ -12068,7 +12168,7 @@ mod tests {
         );
         assert!(err.to_string().contains("header name"), "got: {err}");
 
-        let status = super::backend_lb_policy_status(&policy);
+        let status = super::backend_lb_policy_status(&policy, false);
         let condition = &status["ancestors"][0]["conditions"][0];
         assert_eq!(condition["status"], "False");
         assert_eq!(condition["reason"], "UnsupportedValue");
@@ -12127,7 +12227,7 @@ mod tests {
             err.to_string().contains("type Header is not supported"),
             "got: {err}"
         );
-        let status = super::backend_lb_policy_status(&header_policy);
+        let status = super::backend_lb_policy_status(&header_policy, false);
         assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
     }
 
@@ -12155,7 +12255,7 @@ mod tests {
             "rejection must withhold sessionPersistence, got: {err}"
         );
 
-        let status = super::backend_lb_policy_status(&policy);
+        let status = super::backend_lb_policy_status(&policy, false);
         let condition = &status["ancestors"][0]["conditions"][0];
         assert_eq!(condition["status"], "False");
         assert_eq!(condition["reason"], "UnsupportedValue");
@@ -12185,9 +12285,294 @@ mod tests {
             .expect_err("retryConstraint-only policies must fail closed");
         assert!(err.to_string().contains("retryConstraint"), "got: {err}");
 
-        let status = super::backend_lb_policy_status(&policy);
+        let status = super::backend_lb_policy_status(&policy, false);
         let condition = &status["ancestors"][0]["conditions"][0];
         assert_eq!(condition["status"], "False");
         assert_eq!(condition["reason"], "UnsupportedValue");
+    }
+
+    fn accepted_condition(status: &Value) -> &Value {
+        &status["ancestors"][0]["conditions"][0]
+    }
+
+    #[test]
+    fn backend_lb_policy_status_older_wins_marks_challenger_conflicted() {
+        let mut older = backend_lb_policy(
+            "older",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "older"}
+            }),
+        );
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut newer = backend_lb_policy(
+            "newer",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "newer"}
+            }),
+        );
+        newer.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let losers = super::backend_lb_policy_conflict_losers(
+            &[older.clone(), newer.clone()],
+            &options(),
+        );
+        assert!(!losers.contains(&K8sResourceKey::from_object(&older)));
+        assert!(losers.contains(&K8sResourceKey::from_object(&newer)));
+
+        let winner_status = super::backend_lb_policy_status(&older, false);
+        let winner = accepted_condition(&winner_status);
+        assert_eq!(winner["status"], "True");
+        assert_eq!(winner["reason"], "Accepted");
+
+        let loser_status = super::backend_lb_policy_status(&newer, true);
+        let loser = accepted_condition(&loser_status);
+        assert_eq!(loser["status"], "False");
+        assert_eq!(loser["reason"], "Conflicted");
+        assert_eq!(
+            loser["message"].as_str(),
+            Some(super::BACKEND_LB_POLICY_CONFLICTED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_status_same_timestamp_cross_kind_uses_full_identity() {
+        let stamp = "2026-01-01T00:00:00Z";
+        let mut legacy = backend_lb_policy(
+            "same-name",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "legacy"}
+            }),
+        );
+        legacy.metadata.creation_timestamp = Some(stamp.to_string());
+        let mut current = x_backend_traffic_policy(
+            "same-name",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "current"}
+            }),
+        );
+        current.metadata.creation_timestamp = Some(stamp.to_string());
+
+        let forward = super::backend_lb_policy_conflict_losers(
+            &[legacy.clone(), current.clone()],
+            &options(),
+        );
+        let reverse = super::backend_lb_policy_conflict_losers(
+            &[current.clone(), legacy.clone()],
+            &options(),
+        );
+        assert_eq!(
+            forward, reverse,
+            "same-timestamp cross-kind precedence must not depend on input order"
+        );
+
+        // Full resource identity: apiVersion/kind/namespace/name. The
+        // gateway.networking.k8s.io BackendLBPolicy sorts before the
+        // gateway.networking.x-k8s.io XBackendTrafficPolicy sibling.
+        assert!(!forward.contains(&K8sResourceKey::from_object(&legacy)));
+        assert!(forward.contains(&K8sResourceKey::from_object(&current)));
+    }
+
+    #[test]
+    fn backend_lb_policy_status_conflict_is_input_order_independent() {
+        let mut older = x_backend_traffic_policy(
+            "alpha",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "alpha"}
+            }),
+        );
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut newer = backend_lb_policy(
+            "beta",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "beta"}
+            }),
+        );
+        newer.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let forward =
+            super::backend_lb_policy_conflict_losers(&[older.clone(), newer.clone()], &options());
+        let reverse =
+            super::backend_lb_policy_conflict_losers(&[newer.clone(), older.clone()], &options());
+        assert_eq!(forward, reverse);
+        assert!(!forward.contains(&K8sResourceKey::from_object(&older)));
+        assert!(forward.contains(&K8sResourceKey::from_object(&newer)));
+    }
+
+    #[test]
+    fn backend_lb_policy_status_multi_target_partial_conflict_fails_closed() {
+        let mut older = backend_lb_policy(
+            "older-svc-a",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "svc-a"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "a"}
+            }),
+        );
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut multi = backend_lb_policy(
+            "multi",
+            serde_json::json!({
+                "targetRefs": [
+                    {"group": "", "kind": "Service", "name": "svc-a"},
+                    {"group": "", "kind": "Service", "name": "svc-b"}
+                ],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "multi"}
+            }),
+        );
+        multi.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let losers =
+            super::backend_lb_policy_conflict_losers(&[older.clone(), multi.clone()], &options());
+        assert!(
+            losers.contains(&K8sResourceKey::from_object(&multi)),
+            "losing any Service target must Conflict the whole multi-target policy"
+        );
+        assert!(!losers.contains(&K8sResourceKey::from_object(&older)));
+
+        let status = super::backend_lb_policy_status(&multi, true);
+        // Atomic direct-policy behavior: every ancestor reports Conflicted.
+        for ancestor in status["ancestors"].as_array().expect("ancestors") {
+            let condition = &ancestor["conditions"][0];
+            assert_eq!(condition["status"], "False");
+            assert_eq!(condition["reason"], "Conflicted");
+        }
+    }
+
+    #[test]
+    fn backend_lb_policy_status_invalid_policy_stays_rejected_not_conflicted() {
+        let mut older = backend_lb_policy(
+            "older",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "older"}
+            }),
+        );
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut invalid = backend_lb_policy(
+            "invalid",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "type": "Cookie",
+                    "idleTimeout": "10s"
+                }
+            }),
+        );
+        invalid.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let losers =
+            super::backend_lb_policy_conflict_losers(&[older.clone(), invalid.clone()], &options());
+        assert!(
+            losers.is_empty(),
+            "invalid policies must not participate in conflict: {losers:?}"
+        );
+
+        // Validation precedes conflict: even if a caller incorrectly marked
+        // conflicted, the status reason stays UnsupportedValue.
+        let status = super::backend_lb_policy_status(&invalid, true);
+        let condition = accepted_condition(&status);
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "UnsupportedValue");
+        assert!(
+            condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("idleTimeout")
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_diagnostics_omit_hostile_duration_and_service_name() {
+        let hostile_duration = "1s\ninjected-hostile-duration-marker";
+        let hostile_service = "svc-echo\ninjected-hostile-service-marker";
+        let policy = backend_lb_policy(
+            "hostile",
+            serde_json::json!({
+                "targetRefs": [
+                    {"group": "", "kind": "Service", "name": "api"},
+                    {"group": "", "kind": "Service", "name": hostile_service}
+                ],
+                "sessionPersistence": {
+                    "type": "Cookie",
+                    "absoluteTimeout": hostile_duration,
+                    "cookieConfig": {"lifetimeType": "Permanent"}
+                }
+            }),
+        );
+
+        // Duplicate targetRef path uses a second policy with a repeated Service.
+        let duplicate = backend_lb_policy(
+            "dup",
+            serde_json::json!({
+                "targetRefs": [
+                    {"group": "", "kind": "Service", "name": hostile_service},
+                    {"group": "", "kind": "Service", "name": hostile_service}
+                ],
+                "sessionPersistence": {"type": "Cookie"}
+            }),
+        );
+
+        let duration_err = translate_k8s_objects(std::slice::from_ref(&policy), options())
+            .expect_err("hostile duration must fail closed");
+        let duration_msg = duration_err.to_string();
+        assert!(
+            duration_msg.contains("sessionPersistence.absoluteTimeout"),
+            "got: {duration_msg}"
+        );
+        assert!(
+            duration_msg.contains("is not a valid Gateway API duration")
+                || duration_msg.contains("exceeds the sticky-cookie"),
+            "got: {duration_msg}"
+        );
+        assert!(
+            !duration_msg.contains(hostile_duration),
+            "duration diagnostic must not echo operator text: {duration_msg}"
+        );
+        assert!(
+            !duration_msg.contains("injected-hostile-duration-marker"),
+            "got: {duration_msg}"
+        );
+
+        let duration_status = super::backend_lb_policy_status(&policy, false);
+        let duration_status_msg = duration_status["ancestors"][0]["conditions"][0]["message"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !duration_status_msg.contains(hostile_duration)
+                && !duration_status_msg.contains("injected-hostile-duration-marker"),
+            "status must not echo hostile duration: {duration_status_msg}"
+        );
+
+        let dup_err = translate_k8s_objects(std::slice::from_ref(&duplicate), options())
+            .expect_err("duplicate Service targetRef must fail closed");
+        let dup_msg = dup_err.to_string();
+        assert!(
+            dup_msg.contains("duplicates an earlier Service targetRef"),
+            "got: {dup_msg}"
+        );
+        assert!(
+            !dup_msg.contains(hostile_service)
+                && !dup_msg.contains("injected-hostile-service-marker"),
+            "duplicate diagnostic must not echo Service name: {dup_msg}"
+        );
+
+        let dup_status = super::backend_lb_policy_status(&duplicate, false);
+        let dup_status_msg = dup_status["ancestors"][0]["conditions"][0]["message"]
+            .as_str()
+            .unwrap_or("");
+        assert_eq!(
+            dup_status_msg,
+            "spec.targetRefs[1] duplicates an earlier Service targetRef"
+        );
+        assert!(
+            !dup_status_msg.contains(hostile_service)
+                && !dup_status_msg.contains("injected-hostile-service-marker"),
+            "status must not echo Service name: {dup_status_msg}"
+        );
     }
 }
