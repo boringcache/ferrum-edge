@@ -10047,6 +10047,7 @@ components:
             - `header:<name>` — hash on a request header value (e.g. `header:x-user-id`)
             - `cookie:<name>` — hash on a cookie value; if the cookie is absent, the
               gateway sets a `Set-Cookie` response header to establish a sticky session.
+            Header and cookie names must contain only ASCII HTTP token characters.
             Ignored by other algorithms.
         hash_on_cookie_config:
           oneOf:
@@ -10632,7 +10633,9 @@ components:
         path:
           type: string
           default: "/"
-          description: Cookie `Path` attribute.
+          description: >-
+            Cookie `Path` attribute. Must start with `/` and must not contain
+            control bytes or `;`.
         ttl_seconds:
           type: integer
           default: 3600
@@ -10649,7 +10652,8 @@ components:
             `Permanent` lifetime keeps `ttl_seconds` from `absoluteTimeout`.
         domain:
           type: [string, "null"]
-          description: Optional `Domain` attribute.
+          description: >-
+            Optional ASCII domain name. An optional leading dot is accepted.
         http_only:
           type: boolean
           default: true

@@ -899,7 +899,7 @@ impl HashOnStrategy {
             None | Some("ip") | Some("") => Self::Ip,
             Some(s) if s.starts_with("header:") => {
                 let name = s["header:".len()..].trim();
-                if name.is_empty() {
+                if !crate::config::types::is_valid_http_token(name) {
                     Self::Ip
                 } else {
                     Self::Header(name.to_ascii_lowercase())
@@ -907,7 +907,7 @@ impl HashOnStrategy {
             }
             Some(s) if s.starts_with("cookie:") => {
                 let name = s["cookie:".len()..].trim();
-                if name.is_empty() {
+                if !crate::config::types::is_valid_http_token(name) {
                     Self::Ip
                 } else {
                     Self::Cookie(name.to_string())

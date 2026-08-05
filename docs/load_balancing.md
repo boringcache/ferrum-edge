@@ -326,7 +326,9 @@ Uses 150 virtual nodes per target on a hash ring for uniform distribution.
 
 #### Hash Key Sources
 
-The `hash_on` field controls what value is used as the hash key:
+The `hash_on` field controls what value is used as the hash key. Header and
+cookie names must use ASCII HTTP token syntax; whitespace, control bytes, and
+separators such as `;`, `=`, and `:` are rejected at config admission.
 
 | `hash_on` value | Description | Cookie injection |
 |---|---|---|
@@ -424,10 +426,10 @@ upstreams:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `path` | string | `"/"` | Cookie `Path` attribute |
+| `path` | string | `"/"` | Cookie `Path` attribute; must start with `/` and cannot contain control bytes or `;` |
 | `ttl_seconds` | integer | `3600` | Cookie `Max-Age` in seconds (1 hour default). Ignored when `session_cookie` is true |
 | `session_cookie` | boolean | `false` | Omit `Max-Age` so the cookie is a browser session cookie (Gateway API `lifetimeType: Session`) |
-| `domain` | string | — | Optional `Domain` attribute |
+| `domain` | string | — | Optional ASCII domain name (an optional leading dot is accepted) |
 | `http_only` | boolean | `true` | Set the `HttpOnly` flag |
 | `secure` | boolean | `false` | Set the `Secure` flag |
 | `same_site` | string | — | `SameSite` attribute: `Strict`, `Lax`, or `None` |

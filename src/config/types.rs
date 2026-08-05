@@ -5290,6 +5290,102 @@ fn validate_string_field(field_name: &str, value: &str, max_len: usize) -> Resul
     Ok(())
 }
 
+/// RFC 9110 token syntax used by HTTP field names and RFC 6265 cookie names.
+/// Keeping this at config admission prevents a persisted `hash_on` value from
+/// becoming an invalid request-header lookup or an attribute-confused
+/// gateway-authored `Set-Cookie` line.
+pub(crate) fn is_valid_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'a'..=b'z'
+                    | b'|'
+                    | b'~'
+            )
+        })
+}
+
+fn validate_hash_on_field(field_name: &str, value: &str, errors: &mut Vec<String>) {
+    if let Err(error) = validate_string_field(field_name, value, MAX_HASH_ON_LENGTH) {
+        errors.push(error);
+    }
+
+    let trimmed = value.trim();
+    if value != trimmed {
+        errors.push(format!(
+            "{field_name} must not contain leading or trailing whitespace"
+        ));
+        return;
+    }
+    if trimmed.is_empty() || trimmed == "ip" {
+        return;
+    }
+
+    let (kind, name) = if let Some(name) = trimmed.strip_prefix("header:") {
+        ("header", name)
+    } else if let Some(name) = trimmed.strip_prefix("cookie:") {
+        ("cookie", name)
+    } else {
+        errors.push(format!(
+            "{field_name} must be 'ip', 'header:<name>', or 'cookie:<name>'"
+        ));
+        return;
+    };
+
+    if name.is_empty() {
+        errors.push(format!(
+            "{field_name} '{kind}:' requires a non-empty {kind} name"
+        ));
+    } else if !is_valid_http_token(name) {
+        errors.push(format!(
+            "{field_name} '{kind}:' name must contain only ASCII HTTP token characters"
+        ));
+    }
+}
+
+fn valid_hash_on_cookie_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path
+            .bytes()
+            .any(|byte| byte <= 0x1f || byte == 0x7f || byte == b';')
+}
+
+fn valid_hash_on_cookie_domain(domain: &str) -> bool {
+    let domain = domain.strip_prefix('.').unwrap_or(domain);
+    !domain.is_empty()
+        && !domain.ends_with('.')
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        })
+}
+
 fn validate_tls_material_source_field(
     field_name: &str,
     value: &str,
@@ -8167,37 +8263,10 @@ impl Upstream {
             errors.push(e);
         }
 
-        // hash_on
-        if let Some(ref hash_on) = self.hash_on
-            && let Err(e) = validate_string_field("hash_on", hash_on, MAX_HASH_ON_LENGTH)
-        {
-            errors.push(e);
-        }
-
-        // Validate hash_on format: must be "ip", "header:<name>", or "cookie:<name>"
+        // Validate hash_on format and the header/cookie name that reaches the
+        // request and Set-Cookie boundaries.
         if let Some(ref hash_on) = self.hash_on {
-            let trimmed = hash_on.trim();
-            if !trimmed.is_empty()
-                && trimmed != "ip"
-                && !trimmed.starts_with("header:")
-                && !trimmed.starts_with("cookie:")
-            {
-                errors.push(format!(
-                    "hash_on must be 'ip', 'header:<name>', or 'cookie:<name>' (got '{}')",
-                    trimmed
-                ));
-            }
-            // Validate that header/cookie name is non-empty
-            if let Some(name) = trimmed.strip_prefix("header:")
-                && name.trim().is_empty()
-            {
-                errors.push("hash_on 'header:' requires a non-empty header name".to_string());
-            }
-            if let Some(name) = trimmed.strip_prefix("cookie:")
-                && name.trim().is_empty()
-            {
-                errors.push("hash_on 'cookie:' requires a non-empty cookie name".to_string());
-            }
+            validate_hash_on_field("hash_on", hash_on, &mut errors);
         }
 
         // hash_on_cookie_config
@@ -8208,23 +8277,33 @@ impl Upstream {
                 MAX_COOKIE_PATH_LENGTH,
             ) {
                 errors.push(e);
+            } else if !valid_hash_on_cookie_path(&cc.path) {
+                errors.push(
+                    "hash_on_cookie_config.path must start with '/' and must not contain control bytes or ';'"
+                        .to_string(),
+                );
             }
-            if let Some(ref domain) = cc.domain
-                && let Err(e) = validate_string_field(
+            if let Some(ref domain) = cc.domain {
+                if let Err(e) = validate_string_field(
                     "hash_on_cookie_config.domain",
                     domain,
                     MAX_COOKIE_DOMAIN_LENGTH,
-                )
-            {
-                errors.push(e);
+                ) {
+                    errors.push(e);
+                } else if !valid_hash_on_cookie_domain(domain) {
+                    errors.push(
+                        "hash_on_cookie_config.domain must be a valid ASCII domain name"
+                            .to_string(),
+                    );
+                }
             }
             if let Some(ref same_site) = cc.same_site
                 && !["Strict", "Lax", "None"].contains(&same_site.as_str())
             {
-                errors.push(format!(
-                    "hash_on_cookie_config.same_site must be 'Strict', 'Lax', or 'None' (got '{}')",
-                    same_site
-                ));
+                errors.push(
+                    "hash_on_cookie_config.same_site must be 'Strict', 'Lax', or 'None'"
+                        .to_string(),
+                );
             }
             if cc.ttl_seconds > MAX_TIMEOUT_SECONDS {
                 errors.push(format!(
@@ -8408,45 +8487,11 @@ impl Upstream {
                     .as_ref()
                     .and_then(|policy| policy.hash_on.as_ref())
                 {
-                    // Bound the length the same way upstream-level `hash_on` is
-                    // (MAX_HASH_ON_LENGTH): the value is persisted, cloned into
-                    // the LB cache, and read per request, so an unbounded
-                    // `header:`+megabytes string must be rejected at admission.
-                    if let Err(e) = validate_string_field(
+                    validate_hash_on_field(
                         &format!("subsets[{i}].traffic_policy.hash_on"),
                         hash_on,
-                        MAX_HASH_ON_LENGTH,
-                    ) {
-                        errors.push(e);
-                    }
-                    let trimmed = hash_on.trim();
-                    if !trimmed.is_empty()
-                        && trimmed != "ip"
-                        && !trimmed.starts_with("header:")
-                        && !trimmed.starts_with("cookie:")
-                    {
-                        errors.push(format!(
-                            "subsets[{}].traffic_policy.hash_on must be 'ip', \
-                             'header:<name>', or 'cookie:<name>' (got '{}')",
-                            i, trimmed
-                        ));
-                    }
-                    if let Some(name) = trimmed.strip_prefix("header:")
-                        && name.trim().is_empty()
-                    {
-                        errors.push(format!(
-                            "subsets[{}].traffic_policy.hash_on 'header:' requires a non-empty header name",
-                            i
-                        ));
-                    }
-                    if let Some(name) = trimmed.strip_prefix("cookie:")
-                        && name.trim().is_empty()
-                    {
-                        errors.push(format!(
-                            "subsets[{}].traffic_policy.hash_on 'cookie:' requires a non-empty cookie name",
-                            i
-                        ));
-                    }
+                        &mut errors,
+                    );
                 }
             }
         }

@@ -2364,6 +2364,31 @@ fn test_upstream_hash_on_empty_cookie_name() {
 }
 
 #[test]
+fn test_upstream_hash_on_rejects_non_token_header_and_cookie_names_without_echoing_values() {
+    for hash_on in [
+        "header:x user",
+        "header:x:user",
+        "header: x-user",
+        "cookie:sid; Secure",
+        "cookie:sid=other",
+        "cookie: sid",
+        "cookie:sid\r\ninjected-header",
+    ] {
+        let mut upstream = make_upstream("u1");
+        upstream.hash_on = Some(hash_on.to_string());
+        let errs = upstream.validate_fields().unwrap_err();
+        assert!(
+            errs.iter().any(|error| error.contains("ASCII HTTP token")),
+            "expected token-syntax rejection for {hash_on:?}, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().all(|error| !error.contains(hash_on)),
+            "admission diagnostics must not echo the rejected value: {errs:?}"
+        );
+    }
+}
+
+#[test]
 fn test_upstream_hash_on_cookie_config_validation() {
     use ferrum_edge::config::types::HashOnCookieConfig;
 
@@ -2401,6 +2426,46 @@ fn test_upstream_hash_on_cookie_config_valid() {
         same_site: Some("Lax".to_string()),
     });
     assert!(upstream.validate_fields().is_ok());
+}
+
+#[test]
+fn test_upstream_hash_on_cookie_config_rejects_attribute_and_header_injection() {
+    use ferrum_edge::config::types::HashOnCookieConfig;
+
+    for path in ["relative", "/api; Secure", "/api\r\nSet-Cookie: injected=1"] {
+        let mut upstream = make_upstream("u1");
+        upstream.hash_on = Some("cookie:session".to_string());
+        upstream.hash_on_cookie_config = Some(HashOnCookieConfig {
+            path: path.to_string(),
+            ..HashOnCookieConfig::default()
+        });
+        let errs = upstream.validate_fields().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|error| error.contains("hash_on_cookie_config.path")),
+            "expected path rejection for {path:?}, got: {errs:?}"
+        );
+    }
+
+    for domain in [
+        "example.com; Secure",
+        "example.com\r\nSet-Cookie: injected=1",
+        "-bad.example",
+        "bad..example",
+    ] {
+        let mut upstream = make_upstream("u1");
+        upstream.hash_on = Some("cookie:session".to_string());
+        upstream.hash_on_cookie_config = Some(HashOnCookieConfig {
+            domain: Some(domain.to_string()),
+            ..HashOnCookieConfig::default()
+        });
+        let errs = upstream.validate_fields().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|error| error.contains("hash_on_cookie_config.domain")),
+            "expected domain rejection for {domain:?}, got: {errs:?}"
+        );
+    }
 }
 
 // ---- UDP amplification factor validation tests ----

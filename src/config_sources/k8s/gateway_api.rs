@@ -376,37 +376,12 @@ fn backend_policy_is_preferred(
     }
 }
 
-/// RFC 6265 / RFC 7230 token byte (cookie-name and field-name share this set).
-fn is_session_name_token_byte(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'!'
-            | b'#'
-            | b'$'
-            | b'%'
-            | b'&'
-            | b'\''
-            | b'*'
-            | b'+'
-            | b'-'
-            | b'.'
-            | b'0'..=b'9'
-            | b'A'..=b'Z'
-            | b'^'
-            | b'_'
-            | b'`'
-            | b'a'..=b'z'
-            | b'|'
-            | b'~'
-    )
-}
-
 fn is_valid_session_cookie_name(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(is_session_name_token_byte)
+    crate::config::types::is_valid_http_token(name)
 }
 
 fn is_valid_session_header_name(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(is_session_name_token_byte)
+    crate::config::types::is_valid_http_token(name)
 }
 
 fn parse_session_persistence(

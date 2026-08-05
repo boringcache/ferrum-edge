@@ -286,6 +286,28 @@ fn upstream_validates_oversized_subset_hash_on() {
 }
 
 #[test]
+fn upstream_rejects_non_token_subset_hash_on_name() {
+    let policy: SubsetTrafficPolicy = serde_json::from_value(serde_json::json!({
+        "hash_on": "cookie:sid; Secure"
+    }))
+    .expect("subset traffic policy");
+    let upstream = make_upstream(Some(vec![SubsetDefinition {
+        name: "unsafe".into(),
+        labels: HashMap::from([("v".into(), "1".into())]),
+        traffic_policy: Some(policy),
+    }]));
+
+    let errors = upstream.validate_fields().unwrap_err();
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("subsets[0].traffic_policy.hash_on")
+                && error.contains("ASCII HTTP token")
+        }),
+        "expected subset cookie-name token rejection, got: {errors:?}"
+    );
+}
+
+#[test]
 fn upstream_validates_empty_subset_labels() {
     let u = make_upstream(Some(vec![SubsetDefinition {
         name: "empty-labels".into(),
