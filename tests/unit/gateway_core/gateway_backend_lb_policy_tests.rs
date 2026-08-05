@@ -299,6 +299,7 @@ fn sticky_session_cookie_omits_max_age_on_set_cookie() {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        source_labels: HashMap::new(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
