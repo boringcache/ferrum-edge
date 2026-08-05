@@ -692,8 +692,7 @@ fn resolve_rule_session_persistence(
             }
         }
     }
-    Ok(resolved
-        .map(|(_, session)| scope_cookie_session_to_route(object, rule_index, session)))
+    Ok(resolved.map(|(_, session)| scope_cookie_session_to_route(object, rule_index, session)))
 }
 
 /// A Service-attached policy applies independently to each route rule. Scope
@@ -706,11 +705,7 @@ fn scope_cookie_session_to_route(
     rule_index: usize,
     mut session: GatewaySessionPersistence,
 ) -> GatewaySessionPersistence {
-    let Some(session_name) = session
-        .hash_on
-        .strip_prefix("cookie:")
-        .map(str::to_owned)
-    else {
+    let Some(session_name) = session.hash_on.strip_prefix("cookie:").map(str::to_owned) else {
         return session;
     };
     let identity = format!(
@@ -726,10 +721,7 @@ fn scope_cookie_session_to_route(
     const ROUTE_MARKER: &str = "-fe-";
     let max_base_len = 128 - ROUTE_MARKER.len() - ROUTE_SUFFIX_LEN;
     let base = &session_name[..session_name.len().min(max_base_len)];
-    session.hash_on = format!(
-        "cookie:{base}{ROUTE_MARKER}{}",
-        &digest[..ROUTE_SUFFIX_LEN]
-    );
+    session.hash_on = format!("cookie:{base}{ROUTE_MARKER}{}", &digest[..ROUTE_SUFFIX_LEN]);
     session
 }
 
@@ -819,9 +811,7 @@ fn validate_backend_lb_policy_for_status(object: &K8sObject) -> Result<(), Strin
         }
         for field in ["group", "kind", "name"] {
             if target.get(field).is_some_and(|value| !value.is_string()) {
-                return Err(format!(
-                    "spec.targetRefs[{index}].{field} must be a string"
-                ));
+                return Err(format!("spec.targetRefs[{index}].{field} must be a string"));
             }
         }
         let kind = string_field(target, "kind").unwrap_or("Service");
@@ -11707,13 +11697,11 @@ mod tests {
                 }
             }),
         );
-        let err = translate_k8s_objects(
-            &[policy.clone(), http_route_to_service("api")],
-            options(),
-        )
-        .expect_err("an unenforced absolute session lifetime must fail closed");
+        let err = translate_k8s_objects(&[policy.clone(), http_route_to_service("api")], options())
+            .expect_err("an unenforced absolute session lifetime must fail closed");
         assert!(
-            err.to_string().contains("cannot enforce an absolute lifetime"),
+            err.to_string()
+                .contains("cannot enforce an absolute lifetime"),
             "got: {err}"
         );
 
@@ -11925,16 +11913,13 @@ mod tests {
             }),
         );
         let route = http_route_to_service("api");
-        let forward = translate_k8s_objects(
-            &[legacy.clone(), current.clone(), route.clone()],
-            options(),
-        )
-        .expect("forward policy order");
+        let forward =
+            translate_k8s_objects(&[legacy.clone(), current.clone(), route.clone()], options())
+                .expect("forward policy order");
         let reverse = translate_k8s_objects(&[current, legacy, route], options())
             .expect("reverse policy order");
         assert_eq!(
-            forward.config.upstreams[0].hash_on,
-            reverse.config.upstreams[0].hash_on,
+            forward.config.upstreams[0].hash_on, reverse.config.upstreams[0].hash_on,
             "cross-kind policy precedence must not depend on watch order"
         );
     }
