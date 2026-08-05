@@ -2118,7 +2118,7 @@ fn write_sticky_target_identity(
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        tags.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        tags.sort_unstable_by_key(|(key, _)| *key);
         for (key, value) in tags {
             absorb_identity_field(hasher, key.as_bytes());
             absorb_identity_field(hasher, value.as_bytes());
@@ -2239,6 +2239,13 @@ pub(crate) fn write_target_host_port_key(buf: &mut String, target: &UpstreamTarg
 enum RetryExcludeContract {
     ConfiguredStickyIdentity,
     EffectiveEndpointLane,
+}
+
+/// Target identity and comparison contract used to remove an already-tried
+/// backend from a retry candidate lane.
+struct RetryExclusion<'a> {
+    target: &'a UpstreamTarget,
+    contract: RetryExcludeContract,
 }
 
 /// Whether `target` is covered by `exclude` under the active retry contract.
@@ -5415,9 +5422,11 @@ impl LoadBalancer {
                 port_state,
                 subset_name,
                 subset_target_indices,
-                exclude,
+                RetryExclusion {
+                    target: exclude,
+                    contract,
+                },
                 health,
-                contract,
             );
         }
 
@@ -5532,9 +5541,8 @@ impl LoadBalancer {
         port_state: &PortLbState,
         subset_name: &str,
         subset_indices: &[usize],
-        exclude: &UpstreamTarget,
+        exclusion: RetryExclusion<'_>,
         health: Option<&HealthContext<'_>>,
-        contract: RetryExcludeContract,
     ) -> Option<Arc<UpstreamTarget>> {
         // Build subset∩port, then drop excluded (previously tried) target(s)
         // from the candidate list BEFORE sizing the ejection cap (mirrors the
@@ -5546,7 +5554,13 @@ impl LoadBalancer {
         let intersection: Vec<usize> = strict_scope
             .iter()
             .copied()
-            .filter(|&idx| !retry_exclude_matches(&self.targets[idx], exclude, contract))
+            .filter(|&idx| {
+                !retry_exclude_matches(
+                    &self.targets[idx],
+                    exclusion.target,
+                    exclusion.contract,
+                )
+            })
             .collect();
         if intersection.is_empty() {
             return None;

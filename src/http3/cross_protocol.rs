@@ -542,10 +542,12 @@ fn select_next_cross_protocol_retry_target(
         epoch,
         proxy,
         prev_target,
-        hash_key,
-        client_ip,
-        proxy_headers,
-        request_authority,
+        crate::proxy::backend_dispatch::RetryTargetRequest {
+            base_hash_key: hash_key,
+            client_ip,
+            proxy_headers,
+            request_authority,
+        },
     ) else {
         return CrossProtocolRetryTarget::Unchanged;
     };

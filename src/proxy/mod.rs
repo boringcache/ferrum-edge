@@ -11660,10 +11660,12 @@ async fn handle_websocket_request_authenticated(
                             &epoch,
                             &proxy,
                             prev_target,
-                            hash_key,
-                            &ctx.client_ip,
-                            &ctx.headers,
-                            request_host.as_deref(),
+                            backend_dispatch::RetryTargetRequest {
+                                base_hash_key: hash_key,
+                                client_ip: &ctx.client_ip,
+                                proxy_headers: &ctx.headers,
+                                request_authority: request_host.as_deref(),
+                            },
                         )
                     {
                         if !retry_target_preserves_backend_path(
@@ -27503,10 +27505,12 @@ async fn handle_proxy_request_inner(
                         &epoch,
                         &proxy,
                         prev_target,
-                        hash_key,
-                        &ctx.client_ip,
-                        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
-                        request_host.as_deref(),
+                        backend_dispatch::RetryTargetRequest {
+                            base_hash_key: hash_key,
+                            client_ip: &ctx.client_ip,
+                            proxy_headers: owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
+                            request_authority: request_host.as_deref(),
+                        },
                     ) {
                     if !retry_target_preserves_backend_path(
                         backend_path_is_policy_bound,
@@ -30095,10 +30099,12 @@ async fn handle_proxy_request_inner(
                     &epoch,
                     &proxy,
                     prev_target,
-                    hash_key,
-                    &ctx.client_ip,
-                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
-                    request_host.as_deref(),
+                    backend_dispatch::RetryTargetRequest {
+                        base_hash_key: hash_key,
+                        client_ip: &ctx.client_ip,
+                        proxy_headers: owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        request_authority: request_host.as_deref(),
+                    },
                 ) {
                 if !retry_target_preserves_backend_path(
                     backend_path_is_policy_bound,

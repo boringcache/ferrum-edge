@@ -1334,6 +1334,14 @@ pub(crate) fn resolve_hash_key(
     }
 }
 
+/// Request-derived inputs shared by every retry-target selection path.
+pub(crate) struct RetryTargetRequest<'a> {
+    pub(crate) base_hash_key: &'a str,
+    pub(crate) client_ip: &'a str,
+    pub(crate) proxy_headers: &'a HashMap<String, String>,
+    pub(crate) request_authority: Option<&'a str>,
+}
+
 /// Select the next retry DIAL target with per-port DestinationRule awareness.
 ///
 /// Six retry sites (HTTP/H2, gRPC, and WebSocket in `src/proxy/mod.rs` plus
@@ -1387,10 +1395,7 @@ pub(crate) fn select_next_retry_target(
     epoch: &RequestEpoch,
     proxy: &Proxy,
     prev_target: &UpstreamTarget,
-    base_hash_key: &str,
-    client_ip: &str,
-    proxy_headers: &HashMap<String, String>,
-    request_authority: Option<&str>,
+    request: RetryTargetRequest<'_>,
 ) -> Option<Arc<UpstreamTarget>> {
     let upstream_id = proxy.upstream_id.as_deref()?;
 
@@ -1424,10 +1429,10 @@ pub(crate) fn select_next_retry_target(
             Some(port),
             proxy.upstream_subset.as_deref(),
         );
-        rehashed = resolve_hash_key(&strategy, client_ip, proxy_headers).0;
+        rehashed = resolve_hash_key(&strategy, request.client_ip, request.proxy_headers).0;
         &rehashed
     } else {
-        base_hash_key
+        request.base_hash_key
     };
 
     let health_ctx = HealthContext {
@@ -1492,7 +1497,7 @@ pub(crate) fn select_next_retry_target(
     }?;
 
     // Return a DIAL target. Never hand callers a literal wildcard host.
-    concretize_retry_dial_target(selected, request_authority)
+    concretize_retry_dial_target(selected, request.request_authority)
 }
 
 /// Concretize a CONFIGURED retry candidate into a DIAL target.
@@ -1921,10 +1926,12 @@ mod tests {
             &epoch,
             proxy,
             prev_target,
-            client_ip,
-            client_ip,
-            &headers,
-            None,
+            RetryTargetRequest {
+                base_hash_key: client_ip,
+                client_ip,
+                proxy_headers: &headers,
+                request_authority: None,
+            },
         )
         .expect("retry target should be selected");
 

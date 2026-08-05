@@ -1025,10 +1025,12 @@ pub(crate) async fn handle_h3_websocket(
                             &epoch,
                             &proxy,
                             prev_target,
-                            hash_key,
-                            &ctx.client_ip,
-                            &proxy_headers,
-                            request_host.as_deref(),
+                            crate::proxy::backend_dispatch::RetryTargetRequest {
+                                base_hash_key: hash_key,
+                                client_ip: &ctx.client_ip,
+                                proxy_headers: &proxy_headers,
+                                request_authority: request_host.as_deref(),
+                            },
                         )
                     {
                         if !crate::proxy::retry_target_preserves_backend_path(

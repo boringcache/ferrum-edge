@@ -200,6 +200,14 @@ pub mod _test_support {
         concretize_wildcard_target_for_request(target, request_host)
     }
 
+    /// Test adapter for the request-derived retry-target inputs.
+    pub struct RetryTargetRequestForTest<'a> {
+        pub base_hash_key: &'a str,
+        pub client_ip: &'a str,
+        pub proxy_headers: &'a std::collections::HashMap<String, String>,
+        pub request_authority: Option<&'a str>,
+    }
+
     /// Test-only view of shared retry-target selection (#3278 / PR #3585).
     ///
     /// Returns a DIAL target: a concretized previous wildcard is excluded by its
@@ -211,20 +219,19 @@ pub mod _test_support {
         epoch: &crate::request_epoch::RequestEpoch,
         proxy: &crate::config::types::Proxy,
         prev_target: &crate::config::types::UpstreamTarget,
-        base_hash_key: &str,
-        client_ip: &str,
-        proxy_headers: &std::collections::HashMap<String, String>,
-        request_authority: Option<&str>,
+        request: RetryTargetRequestForTest<'_>,
     ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
         crate::proxy::backend_dispatch::select_next_retry_target(
             state,
             epoch,
             proxy,
             prev_target,
-            base_hash_key,
-            client_ip,
-            proxy_headers,
-            request_authority,
+            crate::proxy::backend_dispatch::RetryTargetRequest {
+                base_hash_key: request.base_hash_key,
+                client_ip: request.client_ip,
+                proxy_headers: request.proxy_headers,
+                request_authority: request.request_authority,
+            },
         )
     }
 

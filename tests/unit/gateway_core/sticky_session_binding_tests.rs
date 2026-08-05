@@ -2123,10 +2123,12 @@ async fn retry_excludes_concretized_previous_wildcard_and_returns_dial_target() 
         &epoch,
         &proxy,
         &prev_dial,
-        "retry-key",
-        "192.0.2.10",
-        &HashMap::new(),
-        Some("api.example.com"),
+        ferrum_edge::_test_support::RetryTargetRequestForTest {
+            base_hash_key: "retry-key",
+            client_ip: "192.0.2.10",
+            proxy_headers: &HashMap::new(),
+            request_authority: Some("api.example.com"),
+        },
     )
     .expect("a second wildcard backend must be available for retry");
 
@@ -2156,10 +2158,12 @@ async fn retry_aborts_without_literal_wildcard_when_authority_missing_or_unmatch
             &epoch,
             &proxy,
             &prev_dial,
-            "retry-key",
-            "192.0.2.10",
-            &HashMap::new(),
-            None,
+            ferrum_edge::_test_support::RetryTargetRequestForTest {
+                base_hash_key: "retry-key",
+                client_ip: "192.0.2.10",
+                proxy_headers: &HashMap::new(),
+                request_authority: None,
+            },
         )
         .is_none(),
         "missing authority must fail closed rather than dial *.example.com"
@@ -2170,10 +2174,12 @@ async fn retry_aborts_without_literal_wildcard_when_authority_missing_or_unmatch
             &epoch,
             &proxy,
             &prev_dial,
-            "retry-key",
-            "192.0.2.10",
-            &HashMap::new(),
-            Some("example.net"),
+            ferrum_edge::_test_support::RetryTargetRequestForTest {
+                base_hash_key: "retry-key",
+                client_ip: "192.0.2.10",
+                proxy_headers: &HashMap::new(),
+                request_authority: Some("example.net"),
+            },
         )
         .is_none(),
         "non-matching authority must fail closed rather than invent a host"
@@ -2214,10 +2220,12 @@ async fn full_identity_exclusion_keeps_sibling_sharing_host_port() {
         &epoch,
         &proxy,
         &tried,
-        "retry-key",
-        "192.0.2.10",
-        &HashMap::new(),
-        None,
+        ferrum_edge::_test_support::RetryTargetRequestForTest {
+            base_hash_key: "retry-key",
+            client_ip: "192.0.2.10",
+            proxy_headers: &HashMap::new(),
+            request_authority: None,
+        },
     )
     .expect("sibling sharing host:port must remain eligible");
     assert_eq!(service_name_of(&next), "svc-b");
@@ -2239,10 +2247,12 @@ async fn cookie_reissue_after_wildcard_retry_rotation_names_configured_backend()
         &epoch,
         &proxy,
         &prev_dial,
-        "retry-key",
-        "192.0.2.10",
-        &HashMap::new(),
-        Some("api.example.com"),
+        ferrum_edge::_test_support::RetryTargetRequestForTest {
+            base_hash_key: "retry-key",
+            client_ip: "192.0.2.10",
+            proxy_headers: &HashMap::new(),
+            request_authority: Some("api.example.com"),
+        },
     )
     .expect("wildcard retry must rotate onto the sibling dial target");
     assert_eq!(rotated.host, "api.example.com");
