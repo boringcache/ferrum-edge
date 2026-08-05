@@ -5756,23 +5756,24 @@ pub enum SpoolFsFault {
 /// attempt is publishing to.
 ///
 /// This is a statement about the protocol's own name generation, not a proof
-/// about the filesystem: a same-UID actor sharing the volume can atomically
-/// rename its own file over any pathname, whichever variant applies. So the
-/// variant only decides *whether an unlink is ever considered*; when it is, the
-/// unlink is additionally bound to the still-open writer descriptor
-/// ([`remove_path_if_descriptor_matches`]), which is the capability that proves
-/// which file the pathname currently resolves to. Stat-then-unlink, content
-/// comparison, and timestamp comparison would all lose the race against a peer's
-/// atomic `rename`, and an in-process lock says nothing about a peer process on
-/// a shared volume.
+/// about the filesystem. The variant only decides *whether an unlink is ever
+/// considered*; when it is, the pathname is compared with the still-open writer
+/// descriptor by [`remove_path_if_descriptor_matches`] while every cooperating
+/// Ferrum writer is excluded by the namespace lock. The descriptor keeps the
+/// published inode stable and makes that comparison meaningful; the shared lock,
+/// rather than the descriptor alone, prevents a protocol peer from interleaving
+/// a rename between the comparison and unlink. A fully adversarial process with
+/// the same UID can already mutate the owner-only spool tree directly and is
+/// outside that cooperative-writer trust boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpoolFinalOwnership {
     /// A name generated so that no other writer of this protocol publishes to
     /// it: the ULID-derived data batch `<ulid>.<owner_tag>.<ext>`, and the
     /// `<that name>.rejected.meta` dead-letter record derived from one. Rollback
-    /// after a post-rename failure unlinks such a final *only* while it still
-    /// resolves to the descriptor this attempt wrote; a hostile replacement is
-    /// left byte-for-byte untouched.
+    /// after a post-rename failure unlinks such a final *only* when the locked
+    /// identity check still resolves it to the descriptor this attempt wrote; a
+    /// replacement already visible at that boundary is left byte-for-byte
+    /// untouched.
     Unique,
     /// A well-known name every writer of the namespace publishes to — currently
     /// only `spool.meta.json`. Rollback never unlinks such a final, even when it
@@ -7101,8 +7102,8 @@ impl SpoolManager {
             let _live = LiveSpoolPathGuard::new(tmp_path.clone());
             // The final name carries a freshly minted ULID, so no other writer
             // of this protocol publishes to it. Rollback of a failed publish is
-            // still descriptor-bound, so a hostile same-UID replacement of that
-            // pathname survives instead of being deleted.
+            // still descriptor-bound, so a replacement already visible at the
+            // locked identity check survives instead of being deleted.
             write_private_file_atomically_with_ops(
                 &tmp_path,
                 &final_path,
@@ -9409,8 +9410,8 @@ impl DeadLetterPayloadWriter {
         self._live.take();
         // The published payload is an owned spool file. Account for it only on
         // this success path: every failure return above unlinks the rename
-        // result while it is still provably this handoff's, so it never entered
-        // the maintained gauges.
+        // result after the locked identity check still names this handoff's
+        // descriptor, so it never entered the maintained gauges.
         spool.usage.account_add(1, self.byte_len);
         invalidate_status_cache();
         let file = self.file.take().ok_or_else(|| {
@@ -9641,12 +9642,13 @@ enum DescriptorBoundUnlink {
 /// Unlink `path` only while it still resolves to the exact regular file `file`
 /// has open.
 ///
-/// The open descriptor — not a metadata snapshot — is the capability that makes
-/// this sound. While it lives the kernel cannot recycle its device/inode for a
-/// replacement, so a same-UID actor who atomically renames another file over
-/// `path` is always visible here as a different file node rather than winning a
-/// stat-then-unlink race. An extra hard link on either view would survive the
-/// unlink and is refused for the same reason.
+/// The open descriptor — not a metadata snapshot — keeps this attempt's inode
+/// stable while the caller holds the namespace mutation lock. That lets the
+/// pathname be compared with the exact published node and rejects a replacement
+/// already visible at the check; the lock prevents cooperating Ferrum writers
+/// from interleaving another rename before the unlink. This helper is not an
+/// atomic unlink-by-descriptor primitive against an arbitrary same-UID process.
+/// An extra hard link on either view would survive the unlink and is refused.
 fn remove_path_if_descriptor_matches(path: &Path, file: &File) -> DescriptorBoundUnlink {
     let descriptor_metadata = match file.metadata() {
         Ok(metadata) => metadata,
@@ -9809,7 +9811,8 @@ fn write_dead_letter_meta_authorized(
     // `<ulid>.<owner_tag>.<ext>.rejected.meta` inherits the uniqueness of the
     // ULID-named source artifact it describes, so no other writer of this
     // protocol publishes to it and a failed publish rolls back the entry it
-    // published — descriptor-bound, so a hostile replacement is left alone.
+    // published — descriptor-bound, so a replacement visible at the locked
+    // identity check is left alone.
     write_private_file_atomically_with_ops(
         tmp_path,
         meta_path,
@@ -12150,10 +12153,11 @@ fn write_private_file_atomically_with_ops(
 ) -> Result<(), String> {
     // The temp writer descriptor stays open across this attempt's rename and
     // parent-directory fsync, so rollback holds a capability rather than a
-    // snapshot: while it lives the kernel cannot recycle its device/inode, which
-    // is what makes "the final still names the file I published" provable
-    // instead of a stat-then-unlink race. It is released when this function
-    // returns, after every rollback decision below has been taken.
+    // snapshot: while it lives the kernel cannot recycle its device/inode. The
+    // caller's namespace lock excludes cooperating writers while rollback
+    // compares that stable identity and unlinks the pathname. The descriptor is
+    // released when this function returns, after every rollback decision below
+    // has been taken.
     let mut progress = AtomicWriteProgress::default();
     let result =
         write_private_file_atomically_inner(tmp_path, final_path, bytes, ops, &mut progress);
@@ -12185,15 +12189,13 @@ fn write_private_file_atomically_with_ops(
     //
     // For a [`SpoolFinalOwnership::Unique`] name — a ULID-derived data batch or
     // its dead-letter metadata — no other *legitimate protocol writer* owns the
-    // generated name. That is not proof that the pathname still names this
-    // attempt's file: a same-UID actor sharing the volume can atomically rename
-    // its own file over any pathname, including in the window between this
-    // attempt's rename and the parent-directory fsync that failed above. So the
-    // unlink is bound to the still-open writer descriptor: it removes the entry
-    // only while that entry is provably the exact regular file this attempt
-    // published, and a replacement is left byte-for-byte untouched while the
-    // primary durability error is still returned. A pre-rename failure never
-    // matches either, because the descriptor still names the temp.
+    // generated name. The unlink is therefore considered, but is bound to the
+    // still-open writer descriptor: under the namespace lock it removes the
+    // entry only when the identity check still names the exact regular file this
+    // attempt published. A replacement already visible at that check is left
+    // byte-for-byte untouched while the primary durability error is still
+    // returned. A pre-rename failure never matches either, because the
+    // descriptor still names the temp.
     //
     // For a [`SpoolFinalOwnership::Shared`] name — `spool.meta.json`, one
     // well-known path for every writer of the namespace — the unlink is skipped
@@ -12219,10 +12221,10 @@ fn write_private_file_atomically_with_ops(
         match remove_path_if_descriptor_matches(final_path, file) {
             DescriptorBoundUnlink::Removed => {}
             DescriptorBoundUnlink::NotThisDescriptor => {
-                // A same-UID actor replaced the entry between this attempt's
-                // rename and the durability failure above. The replacement is
-                // not this attempt's to delete, so it is left exactly as found
-                // and the primary durability error is returned on its own.
+                // The entry no longer named this attempt's descriptor when
+                // rollback checked it. The replacement is not this attempt's
+                // to delete, so it is left exactly as found and the primary
+                // durability error is returned on its own.
                 warn!(
                     plugin = PLUGIN_NAME,
                     path = %final_path.display(),

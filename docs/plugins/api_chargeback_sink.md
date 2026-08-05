@@ -471,17 +471,22 @@ on a path, so no check could keep such a removal from deleting it.
 The ULID-derived `<ulid>.<owner_tag>.<ext>` batch and its
 `<name>.rejected.meta` dead-letter record are names no other protocol writer
 publishes to, so rollback of a post-rename failure may remove them. That is not
-by itself proof that the pathname still names *this attempt's* file: a same-UID
-actor sharing the volume can atomically rename its own file over any pathname,
-including in the window between this attempt's rename and the parent-directory
-fsync that failed. So the removal is bound to the temp writer descriptor, which
-Ferrum holds open across the rename and the directory fsync: while that
-descriptor lives the kernel cannot recycle its device/inode, so "this entry is
-still the file I published" is provable rather than a stat-then-unlink race. An
-extra hard link on either view fails the same check. If the entry has been
-replaced, it is left byte-for-byte untouched, a warning names the path, and the
-primary durability error is returned on its own. A failure *before* the rename
-publishes nothing at the final path and never considers it at all.
+by itself proof that the pathname still names *this attempt's* file. Ferrum
+holds the temp writer descriptor open across the rename and directory fsync,
+then compares the pathname with that stable inode while holding the shared
+namespace lock. The descriptor makes the identity comparison meaningful; the
+namespace lock prevents every cooperating Ferrum process from renaming between
+that comparison and the unlink. An extra hard link on either view fails the
+same check. If a replacement is already visible at the locked check, it is left
+byte-for-byte untouched, a warning names the path, and the primary durability
+error is returned on its own. A failure *before* the rename publishes nothing
+at the final path and never considers it at all.
+
+The spool directory and its files are owner-only, but a fully adversarial
+process running as the same UID can already rename or delete entries in that
+tree without using Ferrum's advisory lock. That process is outside the spool
+coordination trust boundary; the cross-process guarantees here apply to Ferrum
+instances that share the namespace and obey `.spool-quota.lock`.
 
 A failed manifest publish therefore leaves the manifest entry in place, and
 Ferrum does **not** treat that as success. The durability error is still
