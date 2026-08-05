@@ -8503,7 +8503,9 @@ async fn initial_ceiling_release_never_promotes_a_substituted_claim() {
         .unwrap();
     let day = source.parent().unwrap().to_path_buf();
     let authoritative_bytes = fs::read(&source).unwrap();
-    let displaced = outside.path().join("displaced-before-ceiling-release.ndjson");
+    let displaced = outside
+        .path()
+        .join("displaced-before-ceiling-release.ndjson");
 
     let clear = ClearReplayHookOnDrop;
     let (fired, claim_slot) = install_claim_substitution_hook(
@@ -8515,14 +8517,9 @@ async fn initial_ceiling_release_never_promotes_a_substituted_claim() {
         .try_acquire(ceiling.max())
         .expect("a peer reservation saturates the replay ceiling");
 
-    let error = replay_spool_once_with_ceiling_for_tests(
-        &spool,
-        "http://127.0.0.1:1/",
-        4,
-        ceiling,
-    )
-    .await
-    .expect_err("the bound initial release must refuse a substituted claim");
+    let error = replay_spool_once_with_ceiling_for_tests(&spool, "http://127.0.0.1:1/", 4, ceiling)
+        .await
+        .expect_err("the bound initial release must refuse a substituted claim");
     drop(peer_hold);
     drop(clear);
 
@@ -8564,7 +8561,9 @@ async fn initial_unreadable_quarantine_never_renames_a_substituted_claim() {
     let source_file = fs::File::create(&source).unwrap();
     source_file.set_len(hard_limit.saturating_add(1)).unwrap();
     drop(source_file);
-    let displaced = outside.path().join("displaced-before-initial-quarantine.ndjson");
+    let displaced = outside
+        .path()
+        .join("displaced-before-initial-quarantine.ndjson");
 
     let clear = ClearReplayHookOnDrop;
     let (fired, claim_slot) = install_claim_substitution_hook(
@@ -9811,7 +9810,13 @@ async fn streaming_replay_refuses_a_post_preflight_path_swap_without_mutating_it
         newer.exists(),
         "the failed tick must preserve later records for a future replay"
     );
-    assert!(server.received_requests().await.unwrap_or_default().is_empty());
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
 }
 
 #[cfg(unix)]

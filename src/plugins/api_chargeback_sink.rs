@@ -7996,10 +7996,7 @@ impl SpoolManager {
     /// A single spool file can contain multiple replay chunks. Renewing between
     /// chunks prevents the aggregate file-delivery time from outliving a lease
     /// that is intentionally derived from one bounded request/retry budget.
-    fn renew_claim_locked(
-        &self,
-        claim: &mut SpoolClaimHandle,
-    ) -> Result<(), String> {
+    fn renew_claim_locked(&self, claim: &mut SpoolClaimHandle) -> Result<(), String> {
         let lease_delta = self.claim_lease_secs.min(i64::MAX as u64) as i64;
         let lease_deadline = unix_timestamp_seconds().saturating_add(lease_delta);
         self.renew_claim_locked_at(claim, lease_deadline)
@@ -11900,7 +11897,10 @@ async fn replay_spool_once(
                     .metrics
                     .record_failure(FailureReason::Serialize, error.clone());
                 if let Some(hook) = snapshot_spool_replay_hook_for_tests() {
-                    hook(SpoolReplayHookPoint::BeforeInitialCeilingRelease, claim.path());
+                    hook(
+                        SpoolReplayHookPoint::BeforeInitialCeilingRelease,
+                        claim.path(),
+                    );
                 }
                 let _guard = spool.lock_spool_mutation()?;
                 spool
@@ -12020,15 +12020,7 @@ async fn replay_spool_once(
         if let Some(hook) = snapshot_spool_replay_hook_for_tests() {
             hook(SpoolReplayHookPoint::AfterMatchingReplayOpen, claim.path());
         }
-        match replay_spool_stream(
-            spool,
-            &mut claim,
-            flush_config,
-            &mut reader,
-            batch_size,
-        )
-        .await
-        {
+        match replay_spool_stream(spool, &mut claim, flush_config, &mut reader, batch_size).await {
             Ok(completion) => {
                 if reader.row_count() != line_count {
                     drop(reader);
