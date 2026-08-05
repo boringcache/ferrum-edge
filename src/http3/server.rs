@@ -6900,6 +6900,18 @@ async fn handle_h3_request(
                 },
                 attempt,
             ) {
+                // Re-check the CURRENT target's DestinationRule maxRetries
+                // before authorizing another retry — mixed-port rotation can
+                // leave the proxy-level ceiling looser than the current port.
+                if !crate::proxy::current_retry_attempt_allowed(
+                    retry_config.max_retries,
+                    &proxy,
+                    current_target.as_deref(),
+                    attempt,
+                ) {
+                    break;
+                }
+
                 // Resolve and validate the retry target before charging this
                 // failure as an intermediate attempt or entering backoff. An
                 // incompatible path terminates here, leaving the ordinary
@@ -6927,6 +6939,19 @@ async fn handle_h3_request(
                         warn!(
                             proxy_id = %proxy.id,
                             "Aborting H3 retry because the candidate would change the authorized backend method path"
+                        );
+                        break;
+                    }
+                    if !crate::proxy::retry_attempt_allowed_for_target(
+                        retry_config.max_retries,
+                        &proxy,
+                        &next,
+                        attempt,
+                    ) {
+                        warn!(
+                            proxy_id = %proxy.id,
+                            attempt = attempt,
+                            "Aborting H3 retry because the candidate exceeds its DestinationRule maxRetries cap"
                         );
                         break;
                     }

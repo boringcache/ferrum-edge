@@ -208,7 +208,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}`
   with per-port > selected-subset > top-level precedence, target-rotation-safe
   dispatch resolution, transport/pool isolation, and subset-keyed RAII H1
-  admission (issues #3228, #3240, #3241, and #3242).
+  admission (issues #3228, #3240, #3241, and #3242). Retry loops re-resolve the
+  selected target's effective `maxRetries` after load-balancer rotation so a
+  mixed-port candidate with a stricter (or zero) cap is never dispatched under
+  a looser initial-port ceiling.
   Startup pool warmup resolves the per-target effective proxy before it builds
   and keys each reqwest warmup client, so a `DO_NOT_UPGRADE` reached through the
   subset or top-level tier pre-warms its force-H1 client instead of

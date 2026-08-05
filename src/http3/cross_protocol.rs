@@ -510,6 +510,8 @@ enum CrossProtocolRetryTarget {
     Unchanged,
     Selected(Arc<UpstreamTarget>, String, String),
     BackendPathMismatch,
+    /// Candidate's DestinationRule `maxRetries` does not authorize this attempt.
+    RetryBudgetExceeded,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -525,6 +527,8 @@ fn select_next_cross_protocol_retry_target(
     query_string: &str,
     client_ip: &str,
     proxy_headers: &HashMap<String, String>,
+    route_max_retries: u32,
+    attempt: u32,
 ) -> CrossProtocolRetryTarget {
     let (Some(prev_target), Some(hash_key)) = (current_target, lb_hash_key) else {
         return CrossProtocolRetryTarget::Unchanged;
@@ -558,6 +562,23 @@ fn select_next_cross_protocol_retry_target(
             "Aborting cross-protocol retry because the candidate would change the authorized backend method path"
         );
         return CrossProtocolRetryTarget::BackendPathMismatch;
+    }
+
+    // Mixed-port rotation can land on a stricter DestinationRule maxRetries
+    // (including zero). Refuse before any intermediate outcome is charged to
+    // a candidate that will never be dispatched.
+    if !crate::proxy::retry_attempt_allowed_for_target(
+        route_max_retries,
+        proxy,
+        &next,
+        attempt,
+    ) {
+        warn!(
+            proxy_id = %proxy.id,
+            attempt = attempt,
+            "Aborting cross-protocol retry because the candidate exceeds its DestinationRule maxRetries cap"
+        );
+        return CrossProtocolRetryTarget::RetryBudgetExceeded;
     }
 
     let next_url = crate::proxy::build_backend_url_with_target(
@@ -1917,6 +1938,12 @@ where
                                     &attempt_result,
                                     attempt,
                                 )
+                                && crate::proxy::current_retry_attempt_allowed(
+                                    retry_config.max_retries,
+                                    proxy,
+                                    current_target.as_deref(),
+                                    attempt,
+                                )
                             {
                                 let retry_target = select_next_cross_protocol_retry_target(
                                     state,
@@ -1930,10 +1957,13 @@ where
                                     query_string,
                                     client_ip,
                                     proxy_headers,
+                                    retry_config.max_retries,
+                                    attempt,
                                 );
                                 if !matches!(
                                     &retry_target,
                                     CrossProtocolRetryTarget::BackendPathMismatch
+                                        | CrossProtocolRetryTarget::RetryBudgetExceeded
                                 ) {
                                     record_cross_protocol_backend_admission_outcome(
                                         &mut backend_admission_permits,
@@ -2014,6 +2044,12 @@ where
                                     &attempt_result,
                                     attempt,
                                 )
+                                && crate::proxy::current_retry_attempt_allowed(
+                                    retry_config.max_retries,
+                                    proxy,
+                                    current_target.as_deref(),
+                                    attempt,
+                                )
                             {
                                 let retry_target = select_next_cross_protocol_retry_target(
                                     state,
@@ -2027,10 +2063,13 @@ where
                                     query_string,
                                     client_ip,
                                     proxy_headers,
+                                    retry_config.max_retries,
+                                    attempt,
                                 );
                                 if !matches!(
                                     &retry_target,
                                     CrossProtocolRetryTarget::BackendPathMismatch
+                                        | CrossProtocolRetryTarget::RetryBudgetExceeded
                                 ) {
                                     record_cross_protocol_backend_admission_outcome(
                                         &mut backend_admission_permits,
@@ -4729,6 +4768,12 @@ where
             if !is_connection_error
                 || !retry_config.retry_on_connect_failure
                 || attempt >= retry_config.max_retries
+                || !crate::proxy::current_retry_attempt_allowed(
+                    retry_config.max_retries,
+                    proxy,
+                    current_target.as_deref(),
+                    attempt,
+                )
             {
                 break;
             }
@@ -4745,8 +4790,14 @@ where
                 query_string,
                 client_ip,
                 proxy_headers,
+                retry_config.max_retries,
+                attempt,
             );
-            if matches!(&retry_target, CrossProtocolRetryTarget::BackendPathMismatch) {
+            if matches!(
+                &retry_target,
+                CrossProtocolRetryTarget::BackendPathMismatch
+                    | CrossProtocolRetryTarget::RetryBudgetExceeded
+            ) {
                 break;
             }
 

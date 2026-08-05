@@ -657,3 +657,45 @@ fn websocket_max_connections_gate_stays_keyed_on_the_policy_port() {
         );
     }
 }
+
+#[test]
+fn websocket_retry_rotation_rechecks_destination_rule_max_retries() {
+    // Mixed-port retry rotation can leave the initial-port ceiling and land on
+    // a stricter (or zero) maxRetries candidate. Both WebSocket bridges must
+    // refuse that candidate through the shared helper before dialing it.
+    //
+    // H1/H2's existing loop slice ends at `match ws_dial_result` (before the
+    // Err-arm retry rotation), so inspect the full authenticated handler there.
+    let h1_handler = {
+        let start = PROXY_SOURCE
+            .find("async fn handle_websocket_request_authenticated(")
+            .expect("H1/H2 WebSocket handler must remain present");
+        let end = PROXY_SOURCE[start..]
+            .find("\nasync fn ")
+            .map(|offset| start + offset)
+            .unwrap_or(PROXY_SOURCE.len());
+        squeeze(&PROXY_SOURCE[start..end])
+    };
+    let h3_body = squeeze(h3_ws_loop());
+
+    for (label, body) in [("H1/H2", h1_handler.as_str()), ("H3", h3_body.as_str())] {
+        assert!(
+            body.contains("retry_attempt_allowed_for_target("),
+            "{label} WebSocket retry must re-check DestinationRule maxRetries for candidates"
+        );
+        assert!(
+            body.contains("current_retry_attempt_allowed("),
+            "{label} WebSocket retry must re-check DestinationRule maxRetries for the current target"
+        );
+        let selection = body.find("select_next_retry_target(").unwrap_or_else(|| {
+            panic!("{label} WebSocket retry rotation must remain present")
+        });
+        let candidate_cap = body.find("retry_attempt_allowed_for_target(").unwrap_or_else(|| {
+            panic!("{label} WebSocket candidate maxRetries gate must remain present")
+        });
+        assert!(
+            selection < candidate_cap,
+            "{label} WebSocket must re-resolve maxRetries after selecting the retry candidate"
+        );
+    }
+}

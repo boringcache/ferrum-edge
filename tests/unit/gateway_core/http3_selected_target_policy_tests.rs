@@ -159,6 +159,14 @@ fn h3_native_retry_loop_resolves_effective_proxy_per_attempt() {
     let rotation = loop_src
         .find("select_next_retry_target(")
         .expect("native-H3 retry rotation must remain present");
+    assert!(
+        loop_src.contains("retry_attempt_allowed_for_target("),
+        "native-H3 retry must re-check DestinationRule maxRetries for rotated candidates"
+    );
+    assert!(
+        loop_src.contains("current_retry_attempt_allowed("),
+        "native-H3 retry must re-check DestinationRule maxRetries for the current target"
+    );
     let re_resolve = loop_src[rotation..]
         .find("let attempt_dispatch_proxy = crate::proxy::resolve_effective_proxy_for_target(")
         .expect("rotated native-H3 retry attempts must re-resolve the effective proxy");
@@ -338,6 +346,14 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         cross_protocol.contains("CrossProtocolRetryTarget::BackendPathMismatch"),
         "cross-protocol retries must distinguish a path mismatch from no target rotation"
     );
+    assert!(
+        cross_protocol.contains("CrossProtocolRetryTarget::RetryBudgetExceeded"),
+        "cross-protocol retries must distinguish a DestinationRule maxRetries miss from path mismatch"
+    );
+    assert!(
+        cross_protocol.contains("retry_attempt_allowed_for_target("),
+        "cross-protocol candidate selection must re-resolve DestinationRule maxRetries"
+    );
     let grpc_retry = cross_protocol
         .rfind("let retry_target = select_next_cross_protocol_retry_target(")
         .expect("cross-protocol gRPC retry selection must remain present");
@@ -345,11 +361,16 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
     let mismatch = after_grpc_retry
         .find("CrossProtocolRetryTarget::BackendPathMismatch")
         .expect("cross-protocol gRPC retry must inspect the mismatch result");
+    let budget = after_grpc_retry
+        .find("CrossProtocolRetryTarget::RetryBudgetExceeded")
+        .expect("cross-protocol gRPC retry must inspect the retry-budget result");
     let failure_record = after_grpc_retry
         .find("let retry_error_class =")
         .expect("cross-protocol gRPC retry failure recording must remain present");
     assert!(
-        mismatch < failure_record && after_grpc_retry[mismatch..failure_record].contains("break;"),
+        mismatch < failure_record
+            && budget < failure_record
+            && after_grpc_retry[mismatch.min(budget)..failure_record].contains("break;"),
         "cross-protocol gRPC retries must abort before recording an intermediate retry attempt"
     );
 }

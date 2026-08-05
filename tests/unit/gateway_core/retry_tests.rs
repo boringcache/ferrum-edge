@@ -349,6 +349,28 @@ fn http_retry_re_resolves_mesh_transport_before_each_dispatch() {
     let selection = retry_body
         .find("select_next_retry_target(")
         .expect("retry target rotation not found");
+    let retry_cap_gate = retry_body
+        .find("retry_attempt_allowed_for_target(")
+        .expect("HTTP retry must re-check DestinationRule maxRetries for the candidate");
+    let current_cap_gate = retry_body
+        .find("current_retry_attempt_allowed(")
+        .expect("HTTP retry must re-check DestinationRule maxRetries for the current target");
+    assert!(
+        current_cap_gate < selection,
+        "current-target maxRetries must gate retry authorization before rotation"
+    );
+    assert!(
+        selection < retry_cap_gate,
+        "candidate maxRetries must be re-resolved after select_next_retry_target"
+    );
+    let intermediate_record = retry_body
+        .find("permits.record_backend_outcome(BackendAdmissionOutcome {")
+        .expect("HTTP retry intermediate outcome recording must remain present");
+    assert!(
+        retry_cap_gate < intermediate_record
+            && retry_body[retry_cap_gate..intermediate_record].contains("break;"),
+        "a candidate that exceeds its maxRetries cap must abort before intermediate outcome accounting"
+    );
     let hbone = retry_body
         .find("target_hbone_enabled")
         .expect("HBONE transport resolution not found");
