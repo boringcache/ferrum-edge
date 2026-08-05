@@ -25,7 +25,7 @@ FORBIDDEN_PATTERNS = (
 REQUIRED_INNER_PATTERNS = (
     re.compile(r"for\s+process_dir\s+in\s+/proc/\[0-9\]\*;\s+do"),
     re.compile(r'done\s*<\s*"\$process_dir/cmdline"'),
-    re.compile(r"\$\{argv0##\*/\}\s*=\s*\"ferrum-edge\""),
+    re.compile(r'"\$\{argv0##\*/\}"\s*=\s*"ferrum-edge"'),
     re.compile(r'\[ "\$argv1" = "run" \]'),
     re.compile(r"multiple ferrum-edge run processes found"),
     re.compile(r"no ferrum-edge run process found"),
