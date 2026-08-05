@@ -365,6 +365,39 @@ fn backend_policy_is_preferred(
     }
 }
 
+/// RFC 6265 / RFC 7230 token byte (cookie-name and field-name share this set).
+fn is_session_name_token_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'0'..=b'9'
+            | b'A'..=b'Z'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'a'..=b'z'
+            | b'|'
+            | b'~'
+    )
+}
+
+fn is_valid_session_cookie_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(is_session_name_token_byte)
+}
+
+fn is_valid_session_header_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(is_session_name_token_byte)
+}
+
 fn parse_session_persistence(
     object: &K8sObject,
     value: &Value,
@@ -390,6 +423,14 @@ fn parse_session_persistence(
 
     match persistence_type {
         "Cookie" => {
+            if !is_valid_session_cookie_name(&session_name) {
+                return Err(invalid_resource(
+                    object,
+                    "sessionPersistence.sessionName must be a valid HTTP cookie name \
+                     (ASCII token characters only; control bytes and separators \
+                     such as space, tab, CR, LF, ;, and = are rejected)",
+                ));
+            }
             let lifetime = value
                 .get("cookieConfig")
                 .and_then(|cfg| string_field(cfg, "lifetimeType"))
@@ -430,6 +471,14 @@ fn parse_session_persistence(
             })
         }
         "Header" => {
+            if !is_valid_session_header_name(&session_name) {
+                return Err(invalid_resource(
+                    object,
+                    "sessionPersistence.sessionName must be a valid HTTP header name \
+                     (ASCII token characters only; control bytes and separators \
+                     such as space, tab, CR, LF, and : are rejected)",
+                ));
+            }
             if value.get("cookieConfig").is_some() {
                 return Err(invalid_resource(
                     object,
@@ -11634,6 +11683,131 @@ mod tests {
                 .as_str()
                 .unwrap_or("")
                 .contains("idleTimeout")
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_rejects_cookie_session_name_with_newline_injection() {
+        let policy = backend_lb_policy(
+            "inject",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "lb-affinity\nevilmalicious=1",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let err = translate_k8s_objects(&[policy.clone(), http_route_to_service("api")], options())
+            .expect_err("newline in cookie sessionName must fail closed");
+        assert!(
+            err.to_string().contains("sessionPersistence.sessionName"),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("cookie name"),
+            "got: {err}"
+        );
+
+        let status = super::backend_lb_policy_status(&policy);
+        let condition = &status["ancestors"][0]["conditions"][0];
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "UnsupportedValue");
+        assert!(
+            condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("sessionPersistence.sessionName")
+        );
+        assert!(
+            condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("cookie name")
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_rejects_header_session_name_with_invalid_characters() {
+        let policy = backend_lb_policy(
+            "bad-header",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "x-session name",
+                    "type": "Header"
+                }
+            }),
+        );
+        let err = translate_k8s_objects(&[policy.clone(), http_route_to_service("api")], options())
+            .expect_err("space in header sessionName must fail closed");
+        assert!(
+            err.to_string().contains("sessionPersistence.sessionName"),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("header name"),
+            "got: {err}"
+        );
+
+        let status = super::backend_lb_policy_status(&policy);
+        let condition = &status["ancestors"][0]["conditions"][0];
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "UnsupportedValue");
+        assert!(
+            condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("sessionPersistence.sessionName")
+        );
+        assert!(
+            condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("header name")
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_accepts_valid_cookie_and_header_session_names() {
+        let cookie_policy = backend_lb_policy(
+            "cookie",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "lb-affinity",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let header_policy = backend_lb_policy(
+            "header",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "X-Session-Affinity",
+                    "type": "Header"
+                }
+            }),
+        );
+        let cookie = translate_k8s_objects(
+            &[cookie_policy, http_route_to_service("api")],
+            options(),
+        )
+        .expect("valid cookie sessionName should translate");
+        assert_eq!(
+            cookie.config.upstreams[0].hash_on.as_deref(),
+            Some("cookie:lb-affinity")
+        );
+
+        let header = translate_k8s_objects(
+            &[header_policy, http_route_to_service("api")],
+            options(),
+        )
+        .expect("valid header sessionName should translate");
+        assert_eq!(
+            header.config.upstreams[0].hash_on.as_deref(),
+            Some("header:X-Session-Affinity")
         );
     }
 
