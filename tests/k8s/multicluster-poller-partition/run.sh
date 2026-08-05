@@ -667,9 +667,11 @@ signal_reload() {
   wait_for_projected_withdrawal "projected withdrawn mesh config" 30 "$context"
   # The readiness probe also runs `ferrum-edge health` in this shared process
   # namespace. `pidof ferrum-edge` can therefore return both the daemon and a
-  # transient probe process. `/proc/<pid>/exe` is ptrace-gated across UIDs, so
-  # the signal sidecar cannot rely on it to identify ferrum-edge (UID 1337).
-  # Parse readable `/proc/<pid>/cmdline` instead: require argv[0] basename
+  # transient probe process. `/proc/<pid>/exe` is an unnecessary identity race,
+  # so select by argv instead. The signal sidecar deliberately runs as the same
+  # non-root UID 1337 as the gateway: Linux credential checks otherwise deny
+  # both `/proc/<pid>/cmdline` reads and signal delivery across containers.
+  # Parse `/proc/<pid>/cmdline`: require argv[0] basename
   # `ferrum-edge` and argv[1] `run`, compare only as data, and discover +
   # signal exactly one candidate in one exec to minimize the PID lifetime gap.
   kubectl --context "$context" -n "$NS" exec "pod/$pod" -c signal -- sh -eu -c '
