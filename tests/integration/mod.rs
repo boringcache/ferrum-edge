@@ -21,6 +21,7 @@ mod admin_runtime_metrics_tests;
 mod ai_stream_router_normalization_tests;
 mod ai_token_metrics_contract_tests;
 mod ai_transcript_audit_grpc_contract_tests;
+mod ai_transcript_audit_grpc_reload_tests;
 mod api_chargeback_sink_tests;
 mod apply_incremental_outcome_tests;
 mod audit_retention_tests;

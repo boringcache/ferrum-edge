@@ -746,6 +746,7 @@ jobs:
               integration::ai_stream_router_normalization_tests
               integration::ai_token_metrics_contract_tests
               integration::ai_transcript_audit_grpc_contract_tests
+              integration::ai_transcript_audit_grpc_reload_tests
               integration::api_chargeback_sink_tests
               integration::gateway_allowed_routes_selector_tests
               integration::k8s_controller_gateway_status_tests

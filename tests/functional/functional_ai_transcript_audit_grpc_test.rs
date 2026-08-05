@@ -249,22 +249,86 @@ fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
     crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
+/// Fragments of a GATEWAY-authored listener bind failure. Every one is a
+/// literal piece of a message this binary emits when a listener cannot take its
+/// port — `Stream listener bind failed: …`, `Stream listener(s) failed to
+/// bind:…`, `Stream listener failed to bind on config reload: …`.
+const LISTENER_BIND_FAILURE_MARKERS: [&str; 2] = ["bind failed", "failed to bind"];
+
+/// Fragments naming the kernel condition a lost bind race actually produces.
+const ADDRESS_IN_USE_MARKERS: [&str; 3] = [
+    "address already in use",
+    "eaddrinuse",
+    "is already in use on",
+];
+
+/// Whether ONE gateway-authored message reports a listener that lost its port.
+///
+/// All three terms must be present in the same message: it must be about a
+/// listener, it must be a bind failure, and the failure must be address-in-use.
+/// A diagnostic that merely quotes one of these phrases — an operator config
+/// value, a rejected request body, an error detail — satisfies none of the
+/// conjunction on its own.
+fn message_reports_listener_bind_race(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("listener")
+        && LISTENER_BIND_FAILURE_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+        && ADDRESS_IN_USE_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+}
+
+/// The gateway's OWN message for one captured line, or `None` when the line is
+/// not a structured gateway event.
+///
+/// The binary logs through `tracing_subscriber::fmt().json()`, which nests the
+/// event message under `fields.message`; its pre-subscriber bootstrap writer
+/// emits a flattened top-level `message`. Every other key on those objects —
+/// `error`, `target`, span fields, and any operator- or peer-derived detail a
+/// structured event attaches — is deliberately NOT read: a config value, a
+/// response body, or an error detail carrying "Address already in use" must not
+/// be able to buy a rerun of a deterministic startup failure.
+fn gateway_authored_message(line: &str) -> Option<String> {
+    let event = serde_json::from_str::<Value>(line).ok()?;
+    let object = event.as_object()?;
+    object
+        .get("fields")
+        .and_then(Value::as_object)
+        .and_then(|fields| fields.get("message"))
+        .or_else(|| object.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// True only when captured startup evidence shows the child lost an ephemeral
 /// port bind race. Every other failure — spawn/config errors, non-bind exits,
 /// authenticated readiness timeouts while the child is still alive, and any
 /// unclassified diagnostic — must stop the outer loop immediately.
+///
+/// Structured lines are judged on the gateway's own `message` field alone.
+/// Bootstrap and other non-JSON output has no field structure to trust, so the
+/// complete line must carry the whole conjunction itself. Nothing else is
+/// retryable: an unknown failure is never rerun.
 fn gateway_startup_failure_is_bind_race(diagnostic: &str) -> bool {
-    let lower = diagnostic.to_ascii_lowercase();
-    lower.contains("address already in use")
-        || lower.contains("eaddrinuse")
-        || lower.contains("addrinuse")
-        || lower.contains("already in use on")
-        || (lower.contains("bind") && lower.contains("already in use"))
+    diagnostic.lines().any(line_reports_listener_bind_race)
+}
+
+/// Judge ONE captured line of the harness diagnostic.
+fn line_reports_listener_bind_race(line: &str) -> bool {
+    match gateway_authored_message(line) {
+        // Structured event: only the gateway's own message may vouch for it.
+        Some(message) => message_reports_listener_bind_race(&message),
+        // Non-JSON output has no field structure to trust, so the complete
+        // line must carry the whole conjunction itself.
+        None => message_reports_listener_bind_race(line),
+    }
 }
 
 /// Spawn a file-mode gateway through the shared harness. Each outer-loop
 /// iteration gets fresh ports, temp config, and a per-attempt observability
-/// token; only address-in-use/bind-race evidence is retryable.
+/// token; only gateway-authored listener bind-race evidence is retryable.
 async fn spawn_audit_gateway_with_bind_race_retry(
     config_yaml: &str,
 ) -> Result<TestGateway, Box<dyn std::error::Error + Send + Sync>> {
@@ -311,16 +375,81 @@ async fn spawn_audit_gateway_with_bind_race_retry(
 mod gateway_startup_classifier_tests {
     use super::gateway_startup_failure_is_bind_race;
 
-    #[test]
-    fn accepts_address_in_use_evidence() {
-        assert!(gateway_startup_failure_is_bind_race(
+    /// The captured-output section the harness appends to a spawn failure.
+    fn diagnostic_with(captured: &str) -> String {
+        format!(
             "gateway process exited before proving ownership\n\
              --- captured gateway output ---\n\
-             FATAL: Port 38421 is already in use on 127.0.0.1: Address already in use (os error 98)"
-        ));
+             {captured}"
+        )
+    }
+
+    #[test]
+    fn accepts_a_structured_listener_bind_race() {
+        // `tracing_subscriber::fmt().json()` shape: the gateway's own message
+        // is nested under `fields.message`.
+        assert!(gateway_startup_failure_is_bind_race(&diagnostic_with(
+            r#"{"timestamp":"2026-08-05T00:00:00Z","level":"ERROR","fields":{"message":"Stream listener bind failed: Port 38421 is already in use on 127.0.0.1: Address already in use (os error 48)"},"target":"ferrum_edge::proxy::stream_listener"}"#
+        )));
+        // Aggregated reconcile failure — the embedded newline stays inside the
+        // JSON string, so the event is still one complete line.
+        assert!(gateway_startup_failure_is_bind_race(&diagnostic_with(
+            r#"{"level":"ERROR","fields":{"message":"Stream listener(s) failed to bind:\nproxy 'edge-tcp' port 38421: Port 38421 is already in use on 127.0.0.1: Address already in use (os error 48)"},"target":"ferrum_edge::proxy"}"#
+        )));
+        assert!(gateway_startup_failure_is_bind_race(&diagnostic_with(
+            r#"{"level":"ERROR","fields":{"message":"Stream listener failed to bind on config reload: Port 38421 is already in use on 127.0.0.1: Address already in use (os error 48)"},"target":"ferrum_edge::proxy"}"#
+        )));
+    }
+
+    #[test]
+    fn accepts_a_non_json_bootstrap_line_carrying_the_whole_conjunction() {
         assert!(gateway_startup_failure_is_bind_race(
             "failed to bind admin listener: EADDRINUSE"
         ));
+    }
+
+    /// The masking case this classifier exists to refuse: the phrase appears
+    /// only in operator- or peer-controlled text, never in the gateway's own
+    /// message for a listener bind.
+    #[test]
+    fn rejects_address_in_use_text_outside_the_gateway_message() {
+        // Sibling field on a structured event (config echo).
+        assert!(!gateway_startup_failure_is_bind_race(&diagnostic_with(
+            r#"{"level":"ERROR","fields":{"message":"Invalid plugin configuration"},"config":"listener failed to bind: Address already in use","target":"ferrum_edge::config"}"#
+        )));
+        // Bootstrap writer detail field — `message` names the real failure and
+        // the OS text hangs off `error`.
+        assert!(!gateway_startup_failure_is_bind_race(&diagnostic_with(
+            r#"{"timestamp":"2026-08-05T00:00:00Z","level":"ERROR","target":"ferrum_edge::bootstrap","message":"secret resolution failed","error":"provider listener failed to bind: Address already in use (os error 48)"}"#
+        )));
+        // A rejected request body quoted back inside a structured event.
+        assert!(!gateway_startup_failure_is_bind_race(&diagnostic_with(
+            r#"{"level":"WARN","fields":{"message":"Rejected upstream response"},"body":"listener failed to bind: address already in use","target":"ferrum_edge::proxy"}"#
+        )));
+        // Operator detail nested one level deeper than the message field.
+        assert!(!gateway_startup_failure_is_bind_race(&diagnostic_with(
+            r#"{"level":"ERROR","fields":{"message":"Plugin validation failed","detail":"listener bind failed: Address already in use"},"target":"ferrum_edge::plugins"}"#
+        )));
+    }
+
+    /// A listener message that is not an address-in-use bind failure, and an
+    /// address-in-use string with nothing tying it to a listener bind, are both
+    /// unclassified — and an unclassified failure is never rerun.
+    #[test]
+    fn rejects_incomplete_conjunctions() {
+        assert!(!gateway_startup_failure_is_bind_race(&diagnostic_with(
+            r#"{"level":"ERROR","fields":{"message":"Gateway listener task 'HTTP proxy listener' failed: HTTP proxy listener failed"},"target":"ferrum_edge::modes::file"}"#
+        )));
+        assert!(!gateway_startup_failure_is_bind_race(&diagnostic_with(
+            r#"{"level":"ERROR","fields":{"message":"Fatal error: Gateway startup failed: HTTP proxy listener exited before completing startup"},"target":"ferrum_edge"}"#
+        )));
+        assert!(!gateway_startup_failure_is_bind_race(
+            "Address already in use (os error 48)"
+        ));
+        // Split across lines is not the same line.
+        assert!(!gateway_startup_failure_is_bind_race(&diagnostic_with(
+            "listener failed to bind\nAddress already in use (os error 48)"
+        )));
     }
 
     #[test]
@@ -466,6 +595,101 @@ plugin_configs:
     )
 }
 
+// ============================================================================
+// Backend-effective method transition fixture
+// ============================================================================
+
+/// The one enrolled method, spelled exactly as the excerpt reports it.
+const ENROLLED_METHOD: &str = "/test.Greeter/SayHello";
+
+/// Client path whose own method is NOT enrolled and whose backend-effective
+/// method is. `/audit/SayHello` parses as `audit/SayHello`; after
+/// `strip_listen_path` removes `/audit` and `backend_path` prepends
+/// `/test.Greeter`, the backend sees `/test.Greeter/SayHello`.
+const BACKEND_ENROLLS_PATH: &str = "/audit/SayHello";
+
+/// Client path that IS the enrolled method but whose backend-effective method
+/// is not. Stripping the whole listen path leaves nothing, so `backend_path`
+/// alone decides: the backend sees `/test.Greeter/Refuted`.
+const BACKEND_REFUTES_PATH: &str = "/test.Greeter/SayHello";
+
+/// Config for the backend-effective enrollment transitions, driven end to end
+/// through the real router, the real `grpc_method_router`, and the real native
+/// gRPC dispatch — no plugin hooks are called directly.
+///
+/// `grpc_method_router` is what makes this a lifecycle test rather than a
+/// metadata test: it publishes `grpc_full_method` twice, provisionally from the
+/// CLIENT path in `on_request_received` and authoritatively from the
+/// backend-effective path in `on_backend_path_resolved`. Both proxies are
+/// listed in its allow list, so it never rejects here; its only role is to
+/// publish the method view `ai_transcript_audit` reads.
+///
+/// Both plugin instances are global-scoped so the two proxies share one
+/// enrollment and one sink, which is what lets a record captured on either
+/// proxy be observed on the same collector queue.
+fn build_transition_config_yaml(backend_port: u16, collector_port: u16) -> String {
+    let descriptor = descriptor_path();
+    format!(
+        r#"
+version: "1"
+proxies:
+  - id: "grpc-audit-transition-in"
+    listen_path: "/audit"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    backend_path: "/test.Greeter"
+    strip_listen_path: true
+    auth_mode: single
+
+  - id: "grpc-audit-transition-out"
+    listen_path: "/test.Greeter/SayHello"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    backend_path: "/test.Greeter/Refuted"
+    strip_listen_path: true
+    auth_mode: single
+
+consumers: []
+
+plugin_configs:
+  - id: "grpc-audit"
+    plugin_name: "ai_transcript_audit"
+    scope: global
+    enabled: true
+    config:
+      mode: "redacted_body"
+      sampling:
+        rate: 1.0
+      redaction:
+        builtins: ["email"]
+        hash_redacted_values: false
+      sink:
+        type: "http"
+        endpoint_url: "http://127.0.0.1:{collector_port}/ingest"
+        allow_insecure_loopback: true
+        batch_size: 1
+        flush_interval_ms: 100
+      grpc:
+        descriptor_path: "{descriptor}"
+        methods:
+          "/test.Greeter/SayHello":
+            request_type: "test.HelloRequest"
+            response_type: "test.HelloResponse"
+
+  - id: "grpc-method-policy"
+    plugin_name: "grpc_method_router"
+    scope: global
+    enabled: true
+    config:
+      allow_methods:
+        - "test.Greeter/SayHello"
+        - "test.Greeter/Refuted"
+"#
+    )
+}
+
 /// A 100%-abort `fault_injection` instance. Its priority (2940) is after
 /// `ai_transcript_audit` (2740), so it is a genuine `before_proxy`
 /// short-circuit for an already-staged audit candidate: no backend dispatch,
@@ -492,15 +716,24 @@ struct Harness {
 
 impl Harness {
     async fn start(extra_proxy_plugins: &str, extra_plugin_configs: &str) -> Self {
+        Self::start_with(|backend_port, collector_port| {
+            build_audit_config_yaml(
+                backend_port,
+                collector_port,
+                extra_proxy_plugins,
+                extra_plugin_configs,
+            )
+        })
+        .await
+    }
+
+    /// Start the echo backend and collector, then bring up a gateway whose
+    /// file-mode config is built from their live ports.
+    async fn start_with(build_config: impl FnOnce(u16, u16) -> String) -> Self {
         build_gateway().expect("build gateway binary");
         let (backend_port, backend) = start_grpc_echo_backend().await;
         let (collector_port, records, collector) = start_audit_collector().await;
-        let config_yaml = build_audit_config_yaml(
-            backend_port,
-            collector_port,
-            extra_proxy_plugins,
-            extra_plugin_configs,
-        );
+        let config_yaml = build_config(backend_port, collector_port);
         let gateway = spawn_audit_gateway_with_bind_race_retry(&config_yaml)
             .await
             .expect("spawn audit gateway");
@@ -713,6 +946,157 @@ async fn grpc_audit_never_captures_an_unenrolled_live_method() {
         records.is_empty(),
         "an unenrolled method must not be captured: {records:?}"
     );
+    harness.shutdown();
+}
+
+/// Backend-effective enrollment, transition IN, over the live data path.
+///
+/// The client method (`audit/SayHello`) is a well-formed gRPC method that this
+/// instance does not enroll, so nothing is staged in `before_proxy`. Routing,
+/// listen-path stripping, and `backend_path` then produce
+/// `/test.Greeter/SayHello`, `grpc_method_router` republishes it in
+/// `on_backend_path_resolved`, and the final request-body hook is the first
+/// place the call is known to be auditable. Exactly one record must ship, under
+/// the NORMALIZED BACKEND-EFFECTIVE method, carrying the real request and
+/// response payloads.
+#[tokio::test]
+#[ignore]
+async fn grpc_audit_captures_a_method_only_the_backend_effective_path_enrolls() {
+    let harness = Harness::start_with(build_transition_config_yaml).await;
+    let body = grpc_frame(&encode_hello_request("transition-in-subject", 0));
+    let call = send_grpc_request(&harness.addr, BACKEND_ENROLLS_PATH, &body, &[])
+        .await
+        .expect("gRPC call");
+    assert_eq!(call.status, 200);
+    assert_eq!(
+        call.grpc_status(),
+        "0",
+        "the transitioned call must succeed end to end: headers={:?} trailers={:?}",
+        call.headers,
+        call.trailers
+    );
+
+    let records = harness.records.wait_for(1).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "a backend-effective enrolled call must export exactly one record: {records:?}"
+    );
+    let excerpt = request_excerpt(&records[0]);
+    assert!(
+        excerpt.contains(&format!("\"grpc_method\":\"{ENROLLED_METHOD}\"")),
+        "the record must be filed under the normalized backend-effective method, \
+         not the client path {BACKEND_ENROLLS_PATH}: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains(BACKEND_ENROLLS_PATH),
+        "the unenrolled client path must not appear as the captured method: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("transition-in-subject"),
+        "the excerpt must carry the decoded protobuf string field: {excerpt}"
+    );
+    assert!(
+        records[0]
+            .get("request_hash")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| !hash.is_empty()),
+        "a captured request must carry its keyed body hash: {}",
+        records[0]
+    );
+    assert_eq!(
+        records[0]
+            .get("response_body_omitted_reason")
+            .and_then(Value::as_str),
+        None,
+        "the response excerpt must not be omitted: {}",
+        records[0]
+    );
+    assert!(
+        records[0]
+            .get("response_body")
+            .and_then(Value::as_str)
+            .is_some_and(|body| body.contains("transition-in-subject")),
+        "the response excerpt must carry the decoded echoed field: {}",
+        records[0]
+    );
+    harness.shutdown();
+}
+
+/// Backend-effective enrollment, transition OUT, over the live data path.
+///
+/// Here the CLIENT path is the enrolled method, so `before_proxy` stages a
+/// provisional candidate. `backend_path` then rewrites the call to
+/// `/test.Greeter/Refuted`, which this instance does not enroll, and the final
+/// request-body hook must discard that staging entry. The request must still
+/// reach the backend unchanged, and no record — no excerpt, no hash — may ship
+/// for the refuted method.
+///
+/// The absence is proven by a BARRIER, not a sleep: after the refuted call
+/// completes, a sentinel call is driven through the transition-IN proxy on the
+/// same gateway. Both instances are global, so both share one sink, and that
+/// sink is a single FIFO queue drained by one worker that awaits each flush
+/// before starting the next (`batch_size: 1` makes every record its own
+/// awaited delivery). A record captured during the refuted call would therefore
+/// be delivered STRICTLY BEFORE the sentinel's. Observing the sentinel as the
+/// first and only record is positive proof the refuted call captured nothing.
+#[tokio::test]
+#[ignore]
+async fn grpc_audit_discards_a_candidate_the_backend_effective_method_refutes() {
+    let harness = Harness::start_with(build_transition_config_yaml).await;
+
+    let refuted_body = grpc_frame(&encode_hello_request("refuted-subject", 0));
+    let refuted = send_grpc_request(&harness.addr, BACKEND_REFUTES_PATH, &refuted_body, &[])
+        .await
+        .expect("gRPC call");
+    assert_eq!(refuted.status, 200);
+    assert_eq!(
+        refuted.grpc_status(),
+        "0",
+        "a refuted enrollment must not change what the client sees: \
+         headers={:?} trailers={:?}",
+        refuted.headers,
+        refuted.trailers
+    );
+
+    let sentinel_body = grpc_frame(&encode_hello_request("sentinel-subject", 0));
+    let sentinel = send_grpc_request(&harness.addr, BACKEND_ENROLLS_PATH, &sentinel_body, &[])
+        .await
+        .expect("gRPC call");
+    assert_eq!(
+        sentinel.grpc_status(),
+        "0",
+        "the sentinel call must succeed so its record is a usable barrier"
+    );
+
+    let records = harness.records.wait_for(1).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "only the sentinel may be exported; the refuted method must not be captured: {records:?}"
+    );
+    let excerpt = request_excerpt(&records[0]);
+    assert!(
+        excerpt.contains(&format!("\"grpc_method\":\"{ENROLLED_METHOD}\"")),
+        "the surviving record must be the sentinel's enrolled capture: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("sentinel-subject"),
+        "the surviving record must carry the sentinel payload: {excerpt}"
+    );
+    // No stale candidate and no stale hash: nothing derived from the refuted
+    // request may ride along on any exported record.
+    for record in &records {
+        let serialized = record.to_string();
+        assert!(
+            !serialized.contains("refuted-subject"),
+            "a refuted candidate leaked into an exported record: {serialized}"
+        );
+        assert!(
+            !serialized.contains("Refuted"),
+            "the refuted backend-effective method leaked into an exported record: {serialized}"
+        );
+    }
     harness.shutdown();
 }
 
