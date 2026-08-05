@@ -3742,7 +3742,13 @@ fn grpc_agent_card_diagnostics_are_completely_documented() {
 
     // Reverse direction, restricted to the diagnostic table's own rows so an
     // unrelated parameter table in this section cannot be misread as one.
-    const STAGES: [&str; 5] = ["Framing", "Version/layout", "Schema", "Decoding", "Emission"];
+    const STAGES: [&str; 5] = [
+        "Framing",
+        "Version/layout",
+        "Schema",
+        "Decoding",
+        "Emission",
+    ];
     for line in section.lines() {
         let Some(row) = line.strip_prefix("| ") else {
             continue;
