@@ -25,6 +25,7 @@ use crate::scaffolding::ports::{reserve_udp_port, unbound_port, unbound_udp_port
 use std::net::SocketAddr;
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::time::Instant;
 
 /// Locate the already-built `ferrum-edge` binary. Match the same fallback
 /// order the other functional tests use.
@@ -543,22 +544,14 @@ plugin_configs: []
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn dtls_passthrough_sni_routes_to_correct_backend() {
-    // Backend A: records every datagram it sees. Accepts 1 datagram.
+    // Keep both backend sockets bound while the gateway starts. The gateway
+    // helper may spend up to 20 seconds on a failed health-check attempt;
+    // spawning the scripted backends before it returns would let their
+    // 10-second expect deadlines expire and drop the sockets before a retry.
     let res_a = reserve_udp_port().await.expect("reserve a");
     let backend_a_port = res_a.port;
-    let backend_a = ScriptedUdpBackend::builder(res_a.into_socket())
-        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
-        .spawn()
-        .expect("spawn backend a");
-
-    // Backend B: records every datagram it sees. Expects nothing —
-    // we'll assert `received_datagrams().is_empty()`.
     let res_b = reserve_udp_port().await.expect("reserve b");
     let backend_b_port = res_b.port;
-    let backend_b = ScriptedUdpBackend::builder(res_b.into_socket())
-        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
-        .spawn()
-        .expect("spawn backend b");
 
     // Two passthrough proxies sharing a frontend listen_port. The
     // `stream_listener` reconciler groups them into a single
@@ -594,6 +587,19 @@ plugin_configs: []
     let fx = start_gateway_with_retry(build_yaml, Vec::new(), true).await;
     let gateway_addr: SocketAddr = format!("127.0.0.1:{}", fx.udp_port).parse().unwrap();
 
+    // Start the scripts only after the gateway is ready. Backend A expects
+    // the routed ClientHello. Backend B deliberately stays silent while
+    // recording any misrouted datagram for the assertion below.
+    let backend_a = ScriptedUdpBackend::builder(res_a.into_socket())
+        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
+        .expect_deadline(Duration::from_secs(25))
+        .spawn()
+        .expect("spawn backend a");
+    let backend_b = ScriptedUdpBackend::builder(res_b.into_socket())
+        .step(UdpStep::Silence(Duration::from_secs(25)))
+        .spawn()
+        .expect("spawn backend b");
+
     // Craft a DTLS 1.2 ClientHello with SNI = backend-a.test and
     // send it to the gateway. The gateway peeks SNI, routes to
     // proxy "dtls-a", and forwards the datagram to backend A.
@@ -601,13 +607,26 @@ plugin_configs: []
     let client = UdpClient::connect(gateway_addr).await.expect("client");
     client.send_datagram(&hello).await.expect("send hello");
 
-    // Give the gateway time to establish the session + forward. The
-    // gateway's UDP recv → SNI peek → session create → backend
-    // socket bind → send round trip is well under 500 ms; 2 s is
-    // generous tolerance for CI runners.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let a_dgrams = backend_a.received_datagrams().await;
+    // Wait on the routing behavior itself. A fixed sleep races a contended
+    // runner: snapshotting immediately afterward can observe the backend just
+    // before its receive task records the already-forwarded datagram.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let a_dgrams = loop {
+        let observed = backend_a.received_datagrams().await;
+        if observed.iter().any(|d| d.payload == hello) {
+            break observed;
+        }
+        if Instant::now() >= deadline {
+            let b_dgrams = backend_b.received_datagrams().await;
+            panic!(
+                "backend A did not receive the DTLS ClientHello within 20 seconds; \
+                 backend A saw {} datagrams, backend B saw {b_dgrams:?}. Gateway logs:\n{}",
+                observed.len(),
+                fx.captured_stderr()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     let b_dgrams = backend_b.received_datagrams().await;
 
     assert!(
