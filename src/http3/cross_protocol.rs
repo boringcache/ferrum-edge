@@ -9351,7 +9351,9 @@ mod tests {
     /// `connectionPool.http` DR override applies on the bridge. This asserts the
     /// resolution `dispatch_plain` performs at entry: a per-port override wins
     /// for its port; a port with no explicit entry picks up the
-    /// service-discovery top-level fallback.
+    /// service-discovery top-level HTTP fallback. The fallback cannot carry TCP
+    /// `connectTimeout`; that policy is projected onto the upstream/proxy
+    /// posture instead of this derived HTTP-only slot.
     #[test]
     fn h3_plain_bridge_resolves_effective_proxy_for_selected_target() {
         let mut proxy = minimal_proxy();
@@ -9366,7 +9368,8 @@ mod tests {
             },
         )]));
         proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
-            connect_timeout_ms: Some(1_500),
+            http_idle_timeout_ms: Some(2_000),
+            h2_max_concurrent_streams: Some(64),
             ..Default::default()
         });
 
@@ -9384,9 +9387,11 @@ mod tests {
         let effective_sd =
             crate::proxy::resolve_effective_proxy_for_target(&proxy, Some(&sd_target));
         assert_eq!(
-            effective_sd.backend_connect_timeout_ms, 1_500,
-            "the bridge must apply the SD top-level fallback on a runtime-resolved port"
+            effective_sd.backend_connect_timeout_ms, 5_000,
+            "the HTTP-only fallback must not manufacture a TCP connectTimeout"
         );
+        assert_eq!(effective_sd.pool_idle_timeout_seconds, Some(2));
+        assert_eq!(effective_sd.pool_http2_max_concurrent_streams, Some(64));
     }
 
     /// The H3→HTTP bridge's `http1MaxPendingRequests` admission must key by the
