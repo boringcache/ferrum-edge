@@ -555,7 +555,6 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     for plugin_source in [
         include_str!("../../../src/plugins/request_mirror.rs"),
         include_str!("../../../src/plugins/serverless_function.rs"),
-        include_str!("../../../src/plugins/ai_federation.rs"),
     ] {
         assert!(plugin_source.contains("fn dispatches_finalized_request_egress(&self) -> bool"));
         assert!(plugin_source.contains("async fn dispatch_finalized_request_egress("));
@@ -565,6 +564,17 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
                 .contains("fn defer_before_proxy_until_backend_path_resolved(&self) -> bool")
         );
     }
+
+    // Streaming federation performs only reversible provider selection in
+    // `before_proxy`; it opts into the post-backend-path-policy pass. Actual
+    // provider I/O remains in finalized request egress after final-body policy.
+    let federation = include_str!("../../../src/plugins/ai_federation.rs");
+    assert!(federation.contains("fn dispatches_finalized_request_egress(&self) -> bool"));
+    assert!(federation.contains("async fn dispatch_finalized_request_egress("));
+    assert!(federation.contains("    async fn before_proxy("));
+    assert!(
+        federation.contains("fn defer_before_proxy_until_backend_path_resolved(&self) -> bool")
+    );
 }
 
 #[test]

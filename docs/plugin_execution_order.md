@@ -238,9 +238,13 @@ When backend-path policy is active, `before_proxy` hooks that can dispatch
 external work or synthesize a terminal response opt into the deferred phases.
 Ferrum runs them in their normal relative priority order only after path policy.
 `fault_injection`, `response_mock`, `grpc_deadline`, and `load_testing` use
-this boundary, so a backend-effective gRPC deny cannot be delayed, faulted,
-mocked, deadline-rejected, or load-fanned-out before it is enforced. Proxies
-without a backend-path policy retain the ordinary single `before_proxy` pass.
+this boundary. The opt-in streaming path in `ai_federation` uses it as well,
+because provider selection reserves concurrency/circuit admission and commits a
+third-party destination even though provider I/O remains in finalized request
+egress. Thus a backend-effective gRPC deny cannot be delayed, faulted, mocked,
+deadline-rejected, load-fanned-out, or provider-claimed before it is enforced.
+Proxies without a backend-path policy retain the ordinary single
+`before_proxy` pass.
 Deferred hooks generally observe the original client path, preserving their
 normal request semantics even when mesh routing rewrote the backend path.
 

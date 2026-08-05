@@ -6667,6 +6667,15 @@ impl Plugin for AiFederation {
         self.streaming.enabled && self.owned_stream_claim(ctx).is_some()
     }
 
+    /// Provider selection can reserve concurrency/circuit admission and writes
+    /// the committed third-party destination. When backend-path policy is
+    /// active, that work must not happen until the effective path is authorized
+    /// (GHSA-4vr5-4wm3-x5xv). The ordinary ordering is unchanged on proxies
+    /// without such a policy.
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        self.streaming.enabled
+    }
+
     /// Claim a streaming Chat Completions request and commit exactly one
     /// provider before any downstream-visible byte exists (issue #3298).
     ///

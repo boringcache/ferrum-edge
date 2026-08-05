@@ -410,7 +410,11 @@ proxies:
     backend_port: {backend_port}
     strip_listen_path: true
     pool_enable_http2: false
-plugins:
+    plugins:
+      - plugin_config_id: "federation-streaming-plugin"
+
+consumers: []
+plugin_configs:
   - id: "federation-streaming-plugin"
     proxy_id: "federation-streaming"
     plugin_name: "ai_federation"
