@@ -69,7 +69,7 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^src/tls/",
     ],
     "mesh-federation": [
-        r"^\.github/workflows/(ci|multicluster-federation-live)\.yml$",
+        r"^\.github/workflows/(ci|multicluster-federation-live|multicluster-poller-partition-live)\.yml$",
         # `validate_live_assertions.py` is the emitted-artifact release gate in
         # the workflow's `gate` job, so editing it changes what a live run must
         # prove about the artifact it published.
@@ -77,6 +77,7 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^\.github/actions/setup-kubernetes-tools/",
         r"^tests/k8s/multicluster-federation/",
+        r"^tests/k8s/multicluster-poller-partition/",
         r"^tests/k8s/lib/(live_assertions|spire)\.sh$",
         # The GA-contract half of this suite is the enforced, non-deferred
         # `multicluster-federation` rows of ga_contract.yaml, pinned by the
@@ -252,6 +253,7 @@ def self_test() -> int:
         ("gateway-api", ["Dockerfile.release"], True),
         ("gateway-api", ["docs/mesh.md"], False),
         ("mesh-federation", ["tests/k8s/lib/spire.sh"], True),
+        ("mesh-federation", ["tests/k8s/multicluster-poller-partition/run.sh"], True),
         ("mesh-federation", [".github/scripts/live_suite_path_filter.py"], True),
         ("mesh-federation", [".github/actions/setup-kubernetes-tools/action.yml"], True),
         ("mesh-federation", ["src/service_discovery/kubernetes.rs"], True),

@@ -10,10 +10,36 @@ For the DOC-10 executable Prometheus family contract — exact names, types, HEL
 |----------|--------|------|-------|-------------|
 | `/live` | GET | None | None | Liveness probe — always `{"status":"ok"}`, no internals |
 | `/admin/metrics` | GET | JWT required | 5-second TTL | Comprehensive runtime metrics (JSON) |
-| `/metrics` | GET | JWT / metrics token / allowed CIDR | 5-second TTL (configurable via `render_cache_ttl_seconds`) | Prometheus exposition format, including request, AI token/cost, and TLS certificate metrics |
+| `/metrics` | GET | JWT / metrics token / allowed CIDR | 5-second TTL (configurable via `render_cache_ttl_seconds`); process-static families are exempt — see below | Prometheus exposition format, including request, AI token/cost, and TLS certificate metrics |
 | `/health` | GET | None (tiered) | None | `status`+`ready` unauthenticated; full diagnostics require auth |
 
 `/metrics` "Auth" means a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`; otherwise it returns `401`. The same credential set unlocks the detailed `/health` and `/overload` views.
+
+#### What `render_cache_ttl_seconds` does and does not cover
+
+The render cache memoizes only the families the `prometheus_metrics` registry
+owns, because only those producers invalidate it when they change. Families
+sourced from process-static state outside the registry are rendered fresh on
+every scrape and are unaffected by the TTL:
+
+- the mesh observability block — mesh identity/CA (`ferrum_mesh_cert_*`,
+  `ferrum_mesh_ca_health`, `ferrum_mesh_trust_bundle_version`), mesh config
+  intake (`ferrum_mesh_config_*`, `ferrum_mesh_subscribe_audience_rejections_total`),
+  inbound posture (`ferrum_mesh_inbound_plaintext_allowed`,
+  `ferrum_mesh_mtls_handshake_failures_total`), SPIFFE federation
+  (`ferrum_mesh_federation_*`), remote-cluster discovery
+  (`ferrum_mesh_remote_discovery_*`), and xDS intake (`ferrum_xds_*`)
+- the NodeWaypoint ADR series (`ferrum_mesh_node_waypoint_*`)
+
+Keeping these off the cache is load-bearing rather than incidental. Their
+counters would otherwise appear frozen to any scrape landing inside the TTL of a
+previous one, so a short-lived fault could come and go without ever being
+counted on `/metrics`. The mesh block also carries wall-clock freshness gauges
+(`ferrum_mesh_federation_bundle_age_seconds`,
+`ferrum_mesh_remote_discovery_endpoint_age_seconds`,
+`ferrum_mesh_cert_expiry_seconds`); nothing increments when time merely passes,
+so no invalidation hook could keep a memoized age honest — a cached age is
+simply wrong by however long the cache has been held.
 
 ### Metrics vs Prometheus vs Health
 
