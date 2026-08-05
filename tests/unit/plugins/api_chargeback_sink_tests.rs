@@ -4002,7 +4002,8 @@ fn symlinked_dead_letter_source_credit_record_refuses_spool_prepare() {
     symlink(&outside, &credit_path).unwrap();
 
     let error = SpoolManager::for_tests_with_owner(settings, &test_owner_spec("node-a"), 412)
-        .expect_err("a symlinked credit record must fail closed");
+        .err()
+        .expect("a symlinked credit record must fail closed");
 
     assert!(
         error.contains("symlinked spool path"),
@@ -4026,7 +4027,8 @@ fn hard_linked_dead_letter_source_credit_record_refuses_spool_prepare() {
     fs::hard_link(&credit_path, &alias).unwrap();
 
     let error = SpoolManager::for_tests_with_owner(settings, &test_owner_spec("node-a"), 422)
-        .expect_err("a hard-linked credit record must fail closed");
+        .err()
+        .expect("a hard-linked credit record must fail closed");
 
     assert!(error.contains("hard link"), "unexpected error: {error}");
 }
