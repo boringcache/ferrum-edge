@@ -13,6 +13,7 @@
 //!   - functional_file_mode_test: File mode with YAML config, SIGHUP reload
 //!   - functional_grpc_test: gRPC reverse proxy
 //!   - functional_load_balancer_test: Load balancing algorithms
+//!   - functional_failover_priority_test: Live DestinationRule failoverPriority traffic
 //!   - functional_load_stress_test: Load & stress (10k proxies, 30k plugins, mixed auth/payloads, admin mutations)
 //!   - functional_mtls_test: TLS/mTLS security (frontend mTLS, backend CA verification, gateway-as-mTLS-client, admin mTLS)
 //!   - functional_scale_perf_test: Scale performance (0→30k proxies with auth+ACL, throughput degradation)
