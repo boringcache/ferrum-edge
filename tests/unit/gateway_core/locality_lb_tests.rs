@@ -2465,6 +2465,61 @@ fn failover_priority_derives_topology_labels_from_locality_string() {
 }
 
 #[test]
+fn failover_priority_locality_derivation_matches_source_side_parsing() {
+    // The SOURCE side of the comparison derives its topology labels through
+    // `merge_derived_topology_labels` → `LocalityPreference::parse`, which trims
+    // each segment and keeps `splitn(3, '/')`'s remainder as the sub-zone. The
+    // endpoint-side segmenter must agree, or a padded / four-segment locality
+    // would rank a genuinely matching endpoint as a mismatch.
+    let source_labels = HashMap::from([
+        (
+            "topology.kubernetes.io/region".to_string(),
+            "us-west".to_string(),
+        ),
+        (
+            "topology.kubernetes.io/zone".to_string(),
+            "us-west-1".to_string(),
+        ),
+        (
+            "topology.istio.io/subzone".to_string(),
+            "rack-3/slot-2".to_string(),
+        ),
+    ]);
+    // Padded segments plus a four-segment locality whose sub-zone is the
+    // untouched `splitn(3, '/')` remainder. No explicit topology tags, so every
+    // endpoint value comes from the locality derivation under test.
+    let padded_locality = " us-west / us-west-1 / rack-3/slot-2";
+    let up = upstream_with_failover_priority(
+        source_labels,
+        vec![
+            target("padded.local", Some(padded_locality)),
+            target("other.local", Some("eu/eu-1/r9")),
+        ],
+        vec![
+            "topology.kubernetes.io/region".to_string(),
+            "topology.kubernetes.io/zone".to_string(),
+            "topology.istio.io/subzone".to_string(),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("seg-{i}"),
+            no_health(),
+        )
+        .expect("selected");
+        assert_eq!(
+            selection.target.host, "padded.local",
+            "endpoint locality segmentation must mirror LocalityPreference::parse"
+        );
+    }
+}
+
+#[test]
 fn failover_priority_recomputes_on_endpoint_reload() {
     // update_targets must rebuild failoverPriority ranks from the preserved
     // source_labels + locality_lb_setting against the new endpoint set.

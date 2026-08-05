@@ -2278,13 +2278,31 @@ fn endpoint_failover_priority_label<'a>(target: &'a UpstreamTarget, key: &str) -
     }
 }
 
+/// Derive one `region` / `zone` / `sub_zone` segment (index 0/1/2) from a raw
+/// locality string, exactly mirroring [`LocalityPreference::parse`].
+///
+/// The mirror is load-bearing: the SOURCE side of a failoverPriority comparison
+/// derives its `topology.kubernetes.io/*` values through
+/// `merge_derived_topology_labels` → `LocalityPreference::parse`, so a segmenter
+/// that disagreed here would rank an endpoint as mismatched purely because of
+/// padded segments (`"us-west / us-west-1"`) or a four-segment locality (whose
+/// sub-zone is `splitn(3, '/')`'s untouched remainder). An empty region makes
+/// the whole locality unusable, the same way `parse` returns `None`.
 #[inline]
 fn locality_segment(raw: Option<&str>, index: usize) -> Option<&str> {
     let raw = raw?.trim();
     if raw.is_empty() {
         return None;
     }
-    raw.split('/').nth(index).filter(|part| !part.is_empty())
+    let mut parts = raw.splitn(3, '/').map(str::trim);
+    let region = parts.next()?;
+    if region.is_empty() {
+        return None;
+    }
+    if index == 0 {
+        return Some(region);
+    }
+    parts.nth(index - 1).filter(|part| !part.is_empty())
 }
 
 /// True when `to` (a distribute key, e.g. `us-west` or `us-west/us-west-1`)

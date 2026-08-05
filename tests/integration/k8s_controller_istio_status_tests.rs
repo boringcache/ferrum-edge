@@ -764,3 +764,39 @@ fn destination_rule_failover_priority_status_reflects_outlier_activation() {
         "applicable outlierDetection must activate failoverPriority without an inactive advisory"
     );
 }
+
+/// A `subsets[].trafficPolicy.outlierDetection` resolves into that subset's
+/// passive health check, which the load balancer treats as an activating
+/// failover signal for the subset lane. The status advisory must not claim the
+/// ranks are inert when a subset lane is in fact ranking.
+#[test]
+fn destination_rule_failover_priority_subset_outlier_suppresses_inactive_advisory() {
+    let subset_outlier = object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "priority-subset-active",
+        json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": ["topology.kubernetes.io/region"]
+                    }
+                }
+            },
+            "subsets": [{
+                "name": "v1",
+                "labels": {"version": "v1"},
+                "trafficPolicy": {"outlierDetection": {}}
+            }]
+        }),
+    );
+    let updates = plan_istio_status_updates(&[subset_outlier], options());
+
+    let active = update_for(&updates, "DestinationRule", "priority-subset-active");
+    assert_eq!(
+        active.ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"],
+        json!([]),
+        "a subset-scoped outlierDetection activates the subset lane, so no inactive advisory"
+    );
+}

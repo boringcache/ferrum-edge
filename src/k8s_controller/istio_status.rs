@@ -757,12 +757,28 @@ fn deferred_locality_lb_fields(spec: &Value) -> Vec<&'static str> {
     let Some(traffic_policy) = spec.get("trafficPolicy") else {
         return deferred;
     };
-    let top_level_outlier = traffic_policy.get("outlierDetection").is_some();
+    // A `subsets[].trafficPolicy.outlierDetection` resolves into that subset's
+    // `SubsetDefinition.traffic_policy.passive_health_check`, which the load
+    // balancer's `failover_enabled_for_subset` / `failover_enabled_for_port_subset`
+    // treat as an activating signal. Reporting "inactive" while a subset lane is
+    // in fact ranking would be a wrong advisory, so any subset-scoped
+    // outlierDetection suppresses it the same way a top-level one does.
+    let subset_outlier = spec
+        .get("subsets")
+        .and_then(Value::as_array)
+        .is_some_and(|subsets| {
+            subsets.iter().any(|subset| {
+                subset
+                    .get("trafficPolicy")
+                    .is_some_and(|policy| policy.get("outlierDetection").is_some())
+            })
+        });
+    let activating_outlier = traffic_policy.get("outlierDetection").is_some() || subset_outlier;
     let top_level_failover_priority = traffic_policy
         .get("loadBalancer")
         .and_then(|lb| lb.get("localityLbSetting"))
         .is_some_and(has_failover_priority);
-    if top_level_failover_priority && !top_level_outlier {
+    if top_level_failover_priority && !activating_outlier {
         deferred.push(
             "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority (accepted but inactive without applicable outlierDetection or Ferrum active health; baseline locality selection is unchanged)",
         );
@@ -777,7 +793,7 @@ fn deferred_locality_lb_fields(spec: &Value) -> Vec<&'static str> {
                 .and_then(|lb| lb.get("localityLbSetting"))
                 .is_some_and(has_failover_priority);
             let port_outlier = entry.get("outlierDetection").is_some();
-            if port_failover_priority && !top_level_outlier && !port_outlier {
+            if port_failover_priority && !activating_outlier && !port_outlier {
                 deferred.push(
                     "trafficPolicy.portLevelSettings[].loadBalancer.localityLbSetting.failoverPriority (accepted but inactive without applicable outlierDetection or Ferrum active health; baseline locality selection is unchanged)",
                 );
