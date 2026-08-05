@@ -5555,11 +5555,7 @@ impl LoadBalancer {
             .iter()
             .copied()
             .filter(|&idx| {
-                !retry_exclude_matches(
-                    &self.targets[idx],
-                    exclusion.target,
-                    exclusion.contract,
-                )
+                !retry_exclude_matches(&self.targets[idx], exclusion.target, exclusion.contract)
             })
             .collect();
         if intersection.is_empty() {
