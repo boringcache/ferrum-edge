@@ -88,11 +88,39 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
     }
 }
 
-/// Strip live NodeWaypoint ADR series appended outside the render cache.
+/// Families rendered from process-static state and appended by `render()`
+/// *outside* the render cache: NodeWaypoint ADR series plus the mesh
+/// observability block (federation / remote discovery / mesh identity / xDS).
+///
+/// None of these are owned by `MetricsRegistry`, so none of them invalidate
+/// `render_cache`, and several are wall-clock age gauges that legitimately move
+/// between two scrapes in the same test. Cache-stability assertions must ignore
+/// them; they are not evidence about the cached body.
+const LIVE_UNCACHED_METRIC_PREFIXES: &[&str] = &[
+    "ferrum_mesh_node_waypoint_",
+    "ferrum_mesh_ca_health",
+    "ferrum_mesh_cert_",
+    "ferrum_mesh_config_",
+    "ferrum_mesh_federation_",
+    "ferrum_mesh_inbound_plaintext_allowed",
+    "ferrum_mesh_mtls_handshake_failures_total",
+    "ferrum_mesh_remote_discovery_",
+    "ferrum_mesh_subscribe_audience_rejections_total",
+    "ferrum_mesh_trust_bundle_version",
+    "ferrum_xds_",
+];
+
+fn is_live_uncached_metric_line(line: &str) -> bool {
+    LIVE_UNCACHED_METRIC_PREFIXES
+        .iter()
+        .any(|family| line.contains(family))
+}
+
+/// Strip the live process-static series appended outside the render cache.
 fn metrics_without_live_node_waypoint_series(output: &str) -> String {
     output
         .lines()
-        .filter(|line| !line.contains("ferrum_mesh_node_waypoint_"))
+        .filter(|line| !is_live_uncached_metric_line(line))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1211,6 +1239,99 @@ async fn test_render_cache_not_invalidated_when_young() {
     assert!(!second.contains("young-2"));
     // But render_uncached should see it
     assert!(registry.render_uncached().contains("young-2"));
+}
+
+/// Assert the single sample line for `family` carrying `selector` ends with
+/// `expected` (the rendered counter value plus its leading space).
+fn assert_sample_value(output: &str, family: &str, selector: &str, expected: &str, why: &str) {
+    let prefix = format!("{family}{{");
+    let mut matches: Vec<&str> = Vec::new();
+    for line in output.lines() {
+        if line.starts_with(&prefix) && line.contains(selector) {
+            matches.push(line);
+        }
+    }
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one {family} sample for {selector}:\n{output}"
+    );
+    assert!(
+        matches[0].ends_with(expected),
+        "{why}: {}\nfull scrape:\n{output}",
+        matches[0]
+    );
+}
+
+#[tokio::test]
+async fn mesh_poll_failure_counters_are_live_across_the_render_cache() {
+    // The mesh federation / remote-discovery families are process-static state
+    // owned by `prometheus_helpers`, not by the registry, so incrementing them
+    // cannot invalidate `render_cache`. While they rode inside the cached body,
+    // any scrape within `render_cache_ttl_secs` of a previous scrape replayed
+    // stale counters: the multicluster poller partition live gate cut every
+    // federation and discovery connection, watched both pollers log real
+    // failures, and still read a zero delta off `/metrics`.
+    let registry = MetricsRegistry::new();
+    // Long TTL and a high invalidation min-age so the cached body is guaranteed
+    // to still be warm on the second scrape — the exact condition under which
+    // the stale read used to happen.
+    registry.configure(300, 3600, 60_000, "ferrum");
+
+    let suffix = format!("{}-{}", std::process::id(), line!());
+    let trust_domain = format!("cache-{suffix}.example");
+    let cluster = format!("cache-{suffix}");
+    let td_selector = format!("trust_domain=\"{trust_domain}\"");
+    let cluster_selector = format!("cluster=\"{cluster}\"");
+
+    // Prime the cache. Neither family exists for these fresh identities yet.
+    let primed = registry.render();
+    assert!(
+        !primed.contains(&trust_domain) && !primed.contains(&cluster),
+        "test identities must be absent before the first failure:\n{primed}"
+    );
+
+    prometheus_helpers::increment_mesh_federation_poll_failure(
+        &trust_domain,
+        format!("https://federation-{suffix}.example:8443"),
+    );
+    prometheus_helpers::increment_mesh_remote_discovery_poll_failure(
+        &cluster,
+        &trust_domain,
+        format!("https://cp-{suffix}.example:9443"),
+    );
+
+    // Second scrape inside the TTL: the cached body is reused, but the mesh
+    // block must be re-rendered from live state.
+    let scraped = registry.render();
+    assert_sample_value(
+        &scraped,
+        "ferrum_mesh_federation_poll_failures_total",
+        &td_selector,
+        " 1",
+        "federation poll failure must be visible on a cache-hit scrape",
+    );
+    assert_sample_value(
+        &scraped,
+        "ferrum_mesh_remote_discovery_poll_failures_total",
+        &cluster_selector,
+        " 1",
+        "discovery poll failure must be visible on a cache-hit scrape",
+    );
+
+    // A second increment must also land rather than being frozen by the cache.
+    prometheus_helpers::increment_mesh_federation_poll_failure(
+        &trust_domain,
+        format!("https://federation-{suffix}.example:8443"),
+    );
+    let rescraped = registry.render();
+    assert_sample_value(
+        &rescraped,
+        "ferrum_mesh_federation_poll_failures_total",
+        &td_selector,
+        " 2",
+        "successive failures must keep advancing on cache-hit scrapes",
+    );
 }
 
 #[tokio::test]

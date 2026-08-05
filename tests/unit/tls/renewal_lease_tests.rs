@@ -105,6 +105,40 @@ fn open_store_lock_file(dir: &Path) -> File {
         .expect("open the lease store's lock file")
 }
 
+/// Move one persisted claim just past expiry while preserving the authoritative
+/// document version, holder, acquisition timestamp, and fence.
+///
+/// The sidecar lock keeps this state-driven test mutation inside the same
+/// cross-process exclusion boundary as production lease updates. One second
+/// remains inside the 24-hour expired-record retention window, so takeover must
+/// advance from the crashed generation's fence rather than recreating it.
+fn expire_persisted_claim(dir: &Path, name: &str) {
+    let lock = hold_store_lock(dir);
+    let path = dir.join("tls-leases.json");
+    let mut document: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).expect("read the authoritative lease document"),
+    )
+    .expect("parse the authoritative lease document");
+    let claim = document
+        .get_mut("leases")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|leases| leases.get_mut(name))
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("the crashed claim remains persisted");
+    let expired_at =
+        Utc::now() - chrono::TimeDelta::try_seconds(1).expect("one second is representable");
+    claim.insert(
+        "expires_at".to_string(),
+        serde_json::Value::String(expired_at.to_rfc3339()),
+    );
+    std::fs::write(
+        path,
+        serde_json::to_vec(&document).expect("serialize the expired lease document"),
+    )
+    .expect("persist the expired lease document");
+    drop(lock);
+}
+
 /// Poll the persisted record until a heartbeat has advanced `expires_at` past
 /// `beyond`, or give up after `timeout`.
 ///
@@ -169,22 +203,27 @@ fn an_expired_claim_fails_over_to_another_instance() {
     let instance_a = instance(dir.path(), "replica-a");
     let instance_b = instance(dir.path(), "replica-b");
     let name = acme_renewal_lease_name("edge-cert");
-    let short = Duration::from_millis(150);
+    let ttl = Duration::from_secs(60);
 
-    let held = instance_a.try_acquire(&name, short).expect("A claims");
+    let held = instance_a.try_acquire(&name, ttl).expect("A claims");
     let lease = held.expect("A must win the first claim");
+    let crashed_fence = lease.fence();
     // A crashed holder never releases. Leaking the guard reproduces that
     // exactly: only expiry can hand the claim over.
     std::mem::forget(lease);
 
-    let denied = instance_b.try_acquire(&name, short).expect("B attempts");
+    let denied = instance_b.try_acquire(&name, ttl).expect("B attempts");
     assert!(denied.is_none(), "the claim is still live");
 
-    std::thread::sleep(Duration::from_millis(400));
+    expire_persisted_claim(dir.path(), &name);
 
-    let taken = instance_b.try_acquire(&name, short).expect("B retries");
+    let taken = instance_b.try_acquire(&name, ttl).expect("B retries");
     let lease = taken.expect("an expired claim must fail over");
     assert_eq!(lease.holder(), "replica-b");
+    assert!(
+        lease.fence() > crashed_fence,
+        "takeover must advance the fence past the crashed generation"
+    );
 }
 
 #[test]
@@ -322,30 +361,34 @@ fn a_second_instance_with_the_same_identity_cannot_take_a_live_claim() {
 /// Crash recovery for a same-identity restart happens through expiry, not
 /// through immediate reclamation — and the takeover advances the fence, so the
 /// dead generation can no longer renew or release.
+///
+/// Both halves are scheduling-independent. The live denial uses a long TTL so a
+/// loaded runner cannot expire the claim between acquire and the restart
+/// attempt (the previous 150 ms TTL + "immediate" denial raced wall-clock
+/// descheduling). Expiry is then stamped into the persisted record — still
+/// inside the retention window so the crashed fence is not pruned — rather than
+/// slept out, matching the file-seeded takeover fixtures elsewhere in this
+/// module.
 #[test]
 fn a_same_identity_restart_reclaims_only_after_expiry() {
     let dir = tempfile::tempdir().expect("tempdir");
     let instance_a = instance(dir.path(), "replica-a");
     let name = acme_renewal_lease_name("edge-cert");
-    let short = Duration::from_millis(150);
+    let ttl = Duration::from_secs(60);
 
-    let held = instance_a.try_acquire(&name, short).expect("A claims");
+    let held = instance_a.try_acquire(&name, ttl).expect("A claims");
     let crashed = held.expect("A must win the first claim");
     let crashed_fence = crashed.fence();
     // A crashed holder never releases; leaking the guard reproduces that.
     std::mem::forget(crashed);
 
     let restarted = instance(dir.path(), "replica-a");
-    let denied = restarted
-        .try_acquire(&name, short)
-        .expect("restart attempts");
+    let denied = restarted.try_acquire(&name, ttl).expect("restart attempts");
     assert!(denied.is_none(), "the claim is still live");
 
-    std::thread::sleep(Duration::from_millis(400));
+    expire_persisted_claim(dir.path(), &name);
 
-    let taken = restarted
-        .try_acquire(&name, short)
-        .expect("restart retries");
+    let taken = restarted.try_acquire(&name, ttl).expect("restart retries");
     let lease = taken.expect("an expired claim must be reclaimable");
     assert_eq!(lease.holder(), "replica-a");
     assert!(

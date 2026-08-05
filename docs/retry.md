@@ -42,6 +42,8 @@ Retry logic applies to the following proxy protocols:
 
 HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3) share the same retry loop in the proxy core and support both connection failure and HTTP status code retries.
 
+For H1/H2 frontend requests, that loop is transport-neutral across mixed plain, HBONE, and Sidecar mesh-mTLS target sets. Selection/rotation runs first; the exact target's effective port policy, timeout, connection limits, TLS identity/SNI/trust domain, pool partition, and plain/mesh transport are then re-resolved for every attempt. The HTTP/3 frontend still fails closed for mesh-tagged targets because it has no mesh egress bridge.
+
 gRPC retries handle connection-level failures (connect refused, timeout, DNS, TLS, and pooled-sender dispatch cancellations where hyper proves the request never left the client) by buffering the request body and replaying it against alternative upstream targets. Read timeouts and gRPC application-level errors (e.g., UNAVAILABLE status in trailers) are not retried because the request was already sent to the backend.
 
 A client `grpc-timeout` is anchored once at request receipt into an absolute monotonic deadline (independent of whether the `grpc_deadline` plugin is installed). Plugins, request-body collection, pool/client acquisition, backoff, response headers, and body reads all consume that same Instant. Native gRPC and pass-through gRPC-Web dispatch each forward a decremented remaining `grpc-timeout` on every attempt rather than re-arming the original relative header. Retry attempts also reuse the real collected `HeaderMap` so duplicate metadata lines and opaque field values stay byte-identical to attempt 1.
@@ -201,6 +203,8 @@ With this configuration, if `10.0.1.1` returns 502, the retry goes to `10.0.1.2`
 
 For proxies without an upstream (direct backend), retries go to the same backend host.
 
+Mesh-tagged and plain targets may coexist in one upstream. Rotation never inherits the previous target's transport: a retry selected for `mesh.hbone` uses HBONE, one selected for `mesh.mtls` uses the SVID-mTLS pool, and an ordinary target uses its direct H3/H2/H1 transport. Secured transports fail closed when identity, capability, SNI, trust-domain, or authorization checks cannot be satisfied; there is no direct-dial fallback. All attempts within one request use the request's atomic configuration snapshot, while live SVID/capability state is checked again at each attempt boundary.
+
 ## Interaction with Circuit Breaker
 
 When both `retry` and `circuit_breaker` are configured on the same proxy, they work together:
@@ -225,8 +229,11 @@ circuit_breaker:
 
 The retry system handles request bodies as follows:
 
-- **Connection failures**: The request body was never sent to the backend, so it is safely replayed on retry.
-- **HTTP status failures**: The request body is retained (buffered) and replayed on each retry attempt.
+- **One-time preparation**: When a retry can fire, the client upload is fully drained under its size/deadline limits before the first attempt. Request-body transforms and final-body hooks run once, and immutable bytes are retained for dispatch. Streaming uploads are never copied from one in-flight backend request into another.
+- **Protocol-faithful replay**: Secured mesh attempts retain the pristine `HeaderMap` alongside the body and merge the authoritative post-plugin header view onto it for every attempt. Unchanged repeated fields and native gRPC `-bin` metadata therefore stay as separate field lines; plugin replacements/removals, reserved-assertion stripping, hop-by-hop stripping, forwarding-header regeneration, gRPC `te: trailers`, and framing repair are still applied at the outbound boundary. Validated gRPC-Web request trailers use their staged native representation. Buffered mesh requests (retry retain or body-policy buffering) carrying native request trailers fail closed before backend admission because the generic intake path cannot validate or forward those trailers; streaming native requests are unchanged.
+- **Connection failures**: Only failures classified as pre-wire (DNS, connect, TLS/pool/handshake) bypass the method filter. The retained body is safe to replay because the application received no request bytes.
+- **HTTP status and post-wire failures**: Replay requires both a configured retryable status/error and a method in `retryable_methods`; this is the explicit side-effect/idempotency gate.
+- **Per-attempt phases**: Target selection, health/circuit-breaker checks, backend admission and adaptive-concurrency reservation, DNS, mesh identity/authorization, pool acquisition, and passive-health/outcome recording run for each attempt. Request transforms/finalization do not.
 - **Response streaming**: The retry decision is made from response headers alone (status code, connection-error flag, error class, method), so a proxy configured for streaming streams on *every* attempt, not just the last one. An attempt selected for retry drops its undrained response before any byte reaches the client. See [Interaction with Retry Logic](response_body_streaming.md#interaction-with-retry-logic).
 
 ## Examples
