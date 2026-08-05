@@ -372,8 +372,8 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         classification: BuiltinPluginClassification::Public,
         priority: 2740,
         active_phases: "before_proxy, on_final_request_body, on_final_response_body, on_response_committed, response_stream_inspector, on_response_stream_terminated, log",
-        matrix_protocols: HTTP_ONLY_PROTOCOLS,
-        protocol_rationale: "HTTP-only AI transcript capture to a configured sink",
+        matrix_protocols: HTTP_GRPC_PROTOCOLS,
+        protocol_rationale: "HTTP AI transcript capture to a configured sink; native gRPC only for methods enrolled in the descriptor-based `grpc` block",
     },
     BuiltinPluginParityMeta {
         name: "ai_prompt_shield",

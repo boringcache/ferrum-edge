@@ -637,11 +637,15 @@ fn runtime_plugin_file_dependency_validation_runs_off_async_workers() {
     assert!(plugin_cache.contains("pub(crate) fn country_mmdb_preload_required("));
     assert!(plugin_cache.contains("pub(crate) fn body_validator_descriptor_preload_required("));
     assert!(plugin_cache.contains("pub(crate) fn ai_response_guard_descriptor_preload_required("));
+    assert!(proxy.contains("ai_transcript_audit_descriptor_preload_required("));
+    assert!(
+        plugin_cache.contains("pub(crate) fn ai_transcript_audit_descriptor_preload_required(")
+    );
     assert_eq!(
         plugin_cache
             .matches("self.expanded_file_dependency_rebuild_scope(")
             .count(),
-        3,
+        4,
         "MMDB and protobuf descriptor preloads must use the exact expanded delta-build scope"
     );
 

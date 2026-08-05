@@ -10471,9 +10471,17 @@ impl ProxyState {
                 &prospective_proxy_rebuilds,
                 prospective_delta.global_plugin_configs_changed,
             );
+        let ai_transcript_audit_descriptor_preload_required = self
+            .plugin_cache
+            .ai_transcript_audit_descriptor_preload_required(
+                &new_config,
+                &prospective_proxy_rebuilds,
+                prospective_delta.global_plugin_configs_changed,
+            );
         if country_mmdb_preload_required
             || body_validator_descriptor_preload_required
             || ai_response_guard_descriptor_preload_required
+            || ai_transcript_audit_descriptor_preload_required
         {
             new_config = match crate::config::validation_pipeline::validate_plugin_file_dependencies_off_thread(
                 new_config,
