@@ -64,7 +64,7 @@ use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
 use crate::modes::mesh::dns_proxy::MeshDnsProxy;
 use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::modes::mesh::slice::{
-    DestinationHostOwner, MeshSlice, MeshSliceRequest, ServiceEntryHostOwner,
+    MeshSlice, MeshSliceRequest, ServiceEntryHostOwner,
     destination_host_owner, index_service_entry_host_owners, mesh_service_identities,
 };
 use crate::modes::startup_security;
@@ -2108,14 +2108,11 @@ fn gateway_config_from_mesh_slice_with_federation(
             multi_cluster: slice.multi_cluster.clone(),
             outbound_traffic_policy: slice.outbound_traffic_policy,
             // Keep the reconstructed mesh block agreeing with the slice the
-            // materializer actually reads (issue #2469). A producer that
-            // carried no root namespace leaves the field at Istio's default
-            // rather than blanking it.
-            istio_root_namespace: if slice.istio_root_namespace.trim().is_empty() {
-                config::default_istio_root_namespace()
-            } else {
-                slice.istio_root_namespace.clone()
-            },
+            // materializer actually reads (issue #2469). Missing / blank root
+            // provenance stays blank here — do not invent `istio-system` and
+            // thereby grant root-tier policy without trustworthy evidence.
+            // Materialization classifies tiers from the slice, not this field.
+            istio_root_namespace: slice.istio_root_namespace.trim().to_string(),
             ..MeshConfig::default()
         })),
         loaded_at,
@@ -7900,7 +7897,8 @@ struct MaterializationTierScope<'a> {
     /// The subscriber workload's namespace — Istio's FIRST lookup tier.
     client_namespace: &'a str,
     /// The mesh's `meshConfig.rootNamespace`, carried on `MeshSlice`. EMPTY
-    /// means the producer carried no root namespace; see
+    /// (absent / blank / whitespace-only provenance) disables the root tier
+    /// and refuses Unscoped rules; see
     /// [`MaterializationTierScope::eligible_tier`].
     root_namespace: &'a str,
     /// Cluster DNS domain, used to read a target service namespace out of a
@@ -7920,40 +7918,41 @@ impl MaterializationTierScope<'_> {
     /// Istio lookup tier for a `(DestinationRule, Upstream, destination host)`
     /// triple, or `None` when the rule must be refused outright.
     ///
-    /// Two namespaces are accepted as SERVICE-tier evidence, and the more
-    /// specific (smaller) resulting tier wins:
+    /// Service-tier ownership evidence, in order:
     ///
-    /// - the upstream's own `namespace` — authoritative for every materialized
-    ///   mesh outbound upstream (`mesh_outbound_route_upstream` stamps the
-    ///   service's namespace) and for operator-authored upstreams;
-    /// - the owner of the MATCHED destination host, resolved by the shared
-    ///   [`destination_host_owner`] — `.svc` syntax, then an
-    ///   inventory-confirmed two-label `name.namespace`, then the declaring
-    ///   ServiceEntry — which is what makes a mixed-namespace upstream resolve
-    ///   each destination independently.
+    /// 1. the owner of the MATCHED destination host, resolved by the shared
+    ///    [`destination_host_owner`] — `.svc` syntax, then an
+    ///    inventory-confirmed two-label `name.namespace`, then the declaring
+    ///    ServiceEntry. When this resolves, it is AUTHORITATIVE: an upstream
+    ///    container namespace must not widen it. That closes the operator-
+    ///    authored / multi-target case where a single upstream namespace cannot
+    ///    own every matched host, and where `by_upstream.min(by_host)` would
+    ///    otherwise let the upstream's unrelated namespace manufacture a more
+    ///    privileged service tier for a host owned elsewhere.
+    /// 2. otherwise the upstream's own `namespace`, retained only as a narrow
+    ///    fallback when host ownership genuinely cannot be resolved and the
+    ///    upstream namespace is still a trustworthy ownership signal —
+    ///    notably every materialized mesh outbound upstream
+    ///    (`mesh_outbound_route_upstream` stamps the service's namespace). For
+    ///    an external host the host-owner arm (1) already recovers the
+    ///    declaring ServiceEntry, so a ServiceEntry-derived EgressGateway
+    ///    upstream stamped with the GATEWAY's namespace still admits the
+    ///    owner-authored service-tier rule the control plane admitted.
     ///
-    /// The second is the SAME resolver, in the same precedence ORDER, that
-    /// `admit_destination_rules` used to admit the rule, and that is the point:
-    /// the two halves must agree by construction. Reading the upstream's
-    /// namespace alone does not work for an external host — it pins no
-    /// namespace syntactically, and `build_egress_upstream` stamps every
-    /// ServiceEntry-derived EgressGateway upstream with the GATEWAY's own
-    /// namespace, which the operator cannot choose — so an owner-authored rule
-    /// the control plane admitted at the service tier (TLS origination, outlier
-    /// detection, connect timeout) would otherwise be refused here and silently
-    /// dropped. Keeping the ORDER matters just as much: consulting the
-    /// ServiceEntry index ahead of `.svc` syntax or the service inventory would
-    /// let a carrier-supplied ServiceEntry declaring `reviews.beta[.svc…]`
-    /// transfer ownership of `beta`'s service to its own namespace.
+    /// The host-owner resolver is the SAME helper, in the same precedence
+    /// ORDER, that `admit_destination_rules` used to admit the rule, and that
+    /// is the point: the two halves must agree by construction. Keeping the
+    /// ORDER matters: consulting the ServiceEntry index ahead of `.svc`
+    /// syntax or the service inventory would let a carrier-supplied
+    /// ServiceEntry declaring `reviews.beta[.svc…]` transfer ownership of
+    /// `beta`'s service to its own namespace.
     ///
-    /// Taking the union of the two rather than replacing one with the other
-    /// keeps this classification a superset of the pre-#2469 upstream-only one.
-    ///
-    /// Refusal is gated on the slice carrying a root namespace. Without it
-    /// `Root` and `Unscoped` are indistinguishable (both fall to the lowest
-    /// bucket), and refusing would silently drop a legitimate mesh-wide
-    /// default — so an absent root namespace keeps the pre-#2469 permissive
-    /// bucketing instead. Every Ferrum-built slice carries one.
+    /// Missing, empty, or whitespace-only root provenance fails closed:
+    /// `Unscoped` is refused rather than restored to the pre-#2469 permissive
+    /// bucketing. Client and service tiers that are independently provable
+    /// still apply; a legitimate root-tier default is simply unavailable
+    /// without trustworthy root provenance — never guessed. Every Ferrum-built
+    /// slice carries a non-empty root namespace.
     ///
     /// This is a precedence pass layered over admission, not a replacement for
     /// it: visibility (`exportTo`) and namespace eligibility are enforced
@@ -7968,30 +7967,26 @@ impl MaterializationTierScope<'_> {
         upstream: &Upstream,
         matched_host: &str,
     ) -> Option<DestinationRuleLookupTier> {
-        let by_upstream = destination_rule_lookup_tier(
-            &dr.namespace,
-            self.client_namespace,
-            Some(upstream.namespace.as_str()),
-            self.root_namespace,
-        );
         let host_owner = destination_host_owner(
             matched_host,
             self.cluster_domain,
             self.mesh_service_identities,
             self.service_entry_hosts,
         );
-        let by_host = destination_rule_lookup_tier(
+        let service_namespace = match host_owner.as_ref() {
+            Some(owner) => Some(owner.namespace()),
+            None => {
+                let upstream_namespace = upstream.namespace.trim();
+                (!upstream_namespace.is_empty()).then_some(upstream_namespace)
+            }
+        };
+        let tier = destination_rule_lookup_tier(
             &dr.namespace,
             self.client_namespace,
-            host_owner.as_ref().map(DestinationHostOwner::namespace),
+            service_namespace,
             self.root_namespace,
         );
-        let tier = by_upstream.min(by_host);
-        if tier.is_in_lookup_path() || self.root_namespace.is_empty() {
-            Some(tier)
-        } else {
-            None
-        }
+        tier.is_in_lookup_path().then_some(tier)
     }
 }
 
@@ -20831,15 +20826,215 @@ mod tests {
         );
     }
 
-    /// A producer that carries no root namespace leaves `Root` and `Unscoped`
-    /// indistinguishable, so refusing would silently drop a legitimate
-    /// mesh-wide default. Absent evidence keeps the permissive bucketing.
+    /// Missing, empty, or whitespace-only root provenance must fail closed:
+    /// an unrelated namespace's rule is refused, while independently provable
+    /// client/service tiers remain available. A legitimate root-tier default
+    /// is unavailable without trustworthy provenance — never guessed.
     #[test]
-    fn destination_rule_refusal_requires_a_carried_root_namespace() {
-        assert!(
-            lookup_tier_rule_applied(&lookup_tier_slice("gamma", "")),
-            "without a carried root namespace the materializer must not refuse"
-        );
+    fn destination_rule_missing_root_provenance_fails_closed_at_materialization() {
+        for (label, root) in [
+            ("absent / empty", ""),
+            ("whitespace-only", "   \t  "),
+        ] {
+            assert!(
+                !lookup_tier_rule_applied(&lookup_tier_slice("gamma", root)),
+                "{label}: Unscoped rule must be refused without trustworthy root provenance"
+            );
+            assert!(
+                lookup_tier_rule_applied(&lookup_tier_slice("default", root)),
+                "{label}: service-tier evidence from the matched host must still apply"
+            );
+            assert!(
+                lookup_tier_rule_applied(&lookup_tier_slice("alpha", root)),
+                "{label}: client-tier evidence must still apply"
+            );
+            assert!(
+                !lookup_tier_rule_applied(&lookup_tier_slice("istio-system", root)),
+                "{label}: root-tier must not be guessed when provenance is blank"
+            );
+        }
+    }
+
+    /// An upstream container namespace must not widen a resolved host owner into
+    /// a more privileged service tier. `evil` cannot grant `evil` service-tier
+    /// policy for a host owned by `beta`, including on a mixed-target upstream.
+    #[test]
+    fn destination_rule_upstream_namespace_cannot_widen_resolved_host_owner() {
+        let beta_host = "reviews.beta.svc.cluster.local";
+        let other_host = "ratings.gamma.svc.cluster.local";
+
+        for label in [
+            "single-target operator upstream",
+            "mixed-target operator upstream",
+        ] {
+            let mut upstream = destination_rule_test_upstream("u-evil", beta_host);
+            upstream.namespace = "evil".to_string();
+            if label.starts_with("mixed") {
+                upstream.targets.push(UpstreamTarget {
+                    host: other_host.to_string(),
+                    port: 8080,
+                    service_port_policy_key: None,
+                    weight: 1,
+                    tags: HashMap::new(),
+                    locality: None,
+                    path: None,
+                });
+            }
+            let mut proxy = destination_rule_test_proxy("p1", &upstream.id);
+            // Keep proxy/upstream namespaces aligned so the DR projection is
+            // not skipped for unrelated namespace-gate reasons.
+            proxy.namespace = "evil".to_string();
+            let mut config = GatewayConfig {
+                proxies: vec![proxy],
+                upstreams: vec![upstream],
+                ..GatewayConfig::default()
+            };
+            let original_algorithm = config.upstreams[0].algorithm;
+            let slice = MeshSlice {
+                namespace: "alpha".to_string(),
+                istio_root_namespace: "istio-system".to_string(),
+                destination_rules: vec![MeshDestinationRule {
+                    name: "hijack".to_string(),
+                    namespace: "evil".to_string(),
+                    host: beta_host.to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
+                }],
+                ..MeshSlice::default()
+            };
+            apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+                .expect("destination rules apply");
+            assert_eq!(
+                config.upstreams[0].algorithm, original_algorithm,
+                "{label}: evil must not manufacture service-tier policy for a beta-owned host"
+            );
+
+            // Legitimate client / service precedence still works on the same
+            // upstream shape once the rule is actually in the lookup path.
+            config.upstreams[0].algorithm = LoadBalancerAlgorithm::RoundRobin;
+            let client_slice = MeshSlice {
+                namespace: "alpha".to_string(),
+                istio_root_namespace: "istio-system".to_string(),
+                destination_rules: vec![MeshDestinationRule {
+                    name: "client-policy".to_string(),
+                    namespace: "alpha".to_string(),
+                    host: beta_host.to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
+                }],
+                ..MeshSlice::default()
+            };
+            apply_destination_rules(&mut config, &test_mesh_runtime_config(), &client_slice)
+                .expect("client-tier rule applies");
+            assert_eq!(
+                config.upstreams[0].algorithm,
+                LoadBalancerAlgorithm::Random,
+                "{label}: client-tier precedence must remain intact"
+            );
+
+            config.upstreams[0].algorithm = LoadBalancerAlgorithm::RoundRobin;
+            let service_slice = MeshSlice {
+                namespace: "alpha".to_string(),
+                istio_root_namespace: "istio-system".to_string(),
+                destination_rules: vec![MeshDestinationRule {
+                    name: "service-policy".to_string(),
+                    namespace: "beta".to_string(),
+                    host: beta_host.to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
+                }],
+                ..MeshSlice::default()
+            };
+            apply_destination_rules(&mut config, &test_mesh_runtime_config(), &service_slice)
+                .expect("service-tier rule applies");
+            assert_eq!(
+                config.upstreams[0].algorithm,
+                LoadBalancerAlgorithm::LeastConnections,
+                "{label}: resolved host owner beta must still grant service tier"
+            );
+        }
+    }
+
+    /// Client-tier beats service-tier beats root-tier even when an unrelated
+    /// upstream namespace is present — precedence must stay Istio-shaped after
+    /// the host-owner-authoritative repair.
+    #[test]
+    fn destination_rule_client_service_root_precedence_with_foreign_upstream_namespace() {
+        let host = "reviews.beta.svc.cluster.local";
+        let mut upstream = destination_rule_test_upstream("u1", host);
+        upstream.namespace = "evil".to_string();
+        let mut proxy = destination_rule_test_proxy("p1", "u1");
+        proxy.namespace = "evil".to_string();
+        let mut config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            namespace: "alpha".to_string(),
+            istio_root_namespace: "istio-system".to_string(),
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "root-policy".to_string(),
+                    namespace: "istio-system".to_string(),
+                    host: host.to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin)),
+                        connect_timeout_ms: Some(9000),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
+                },
+                MeshDestinationRule {
+                    name: "service-policy".to_string(),
+                    namespace: "beta".to_string(),
+                    host: host.to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
+                        connect_timeout_ms: Some(5000),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
+                },
+                MeshDestinationRule {
+                    name: "client-policy".to_string(),
+                    namespace: "alpha".to_string(),
+                    host: host.to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        connect_timeout_ms: Some(1000),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
+                },
+            ],
+            ..MeshSlice::default()
+        };
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+        assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::Random);
+        assert_eq!(config.proxies[0].backend_connect_timeout_ms, 1000);
     }
 
     #[test]

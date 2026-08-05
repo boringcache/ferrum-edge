@@ -209,21 +209,20 @@ pub struct MeshSlice {
     /// (`FERRUM_K8S_ISTIO_ROOT_NAMESPACE`), carried so the data plane can
     /// classify Istio's THIRD DestinationRule lookup tier (issue #2469).
     ///
-    /// Without it the materializer cannot tell an admitted root-namespace
-    /// default apart from a rule declared in an arbitrary namespace: both land
-    /// in the lowest bucket, so a `Root`-vs-`Unscoped` refusal is impossible
-    /// and a reverse-translated xDS carrier for an unrelated namespace applies
-    /// whenever no client/service-tier rule matches. It is a SCOPING input,
-    /// not a policy: it only ever decides which of two buckets a rule lands
-    /// in, never whether the rule was visible (that is `exportTo`, evaluated
-    /// strictly earlier).
+    /// Without trustworthy root provenance the materializer cannot tell an
+    /// admitted root-namespace default apart from a rule declared in an
+    /// arbitrary namespace: both would land in the lowest bucket. Missing,
+    /// empty, or whitespace-only provenance therefore fails closed — Unscoped
+    /// rules are refused, independently provable client/service tiers still
+    /// apply, and a legitimate root-tier default is unavailable rather than
+    /// guessed. It is a SCOPING input, not a policy: it only ever decides
+    /// which of two buckets a rule lands in, never whether the rule was
+    /// visible (that is `exportTo`, evaluated strictly earlier).
     ///
-    /// EMPTY means "this producer did not carry the root namespace". The
-    /// materializer then keeps the pre-#2469 permissive bucketing rather than
-    /// refusing rules it cannot classify — refusing on absent evidence would
-    /// silently drop a legitimate mesh-wide default. Every Ferrum-built slice
-    /// carries it (`MeshConfig::istio_root_namespace` defaults to
-    /// `istio-system`), so real deployments always get the enforcement.
+    /// EMPTY means "this producer did not carry a trustworthy root
+    /// namespace". Every Ferrum-built slice carries one
+    /// (`MeshConfig::istio_root_namespace` defaults to `istio-system`), so
+    /// real deployments always get the root tier.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub istio_root_namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

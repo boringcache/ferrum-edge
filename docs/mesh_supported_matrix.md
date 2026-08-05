@@ -71,7 +71,10 @@ CI today."
   and the client → target-service → root-namespace lookup hierarchy**
   (issues #2465 / #2469). Lookup resolution is per destination HOST at both
   layers, the mesh root namespace rides the slice so the data plane can refuse
-  a rule outside all three lookup namespaces, and VirtualService-derived CORS
+  a rule outside all three lookup namespaces (missing/blank root provenance
+  fails closed rather than restoring permissive Unscoped bucketing), host-owner
+  evidence is authoritative over a conflicting upstream container namespace, and
+  VirtualService-derived CORS
   policy narrows through the SAME shared `exportTo` evaluator at the same
   enforcement points a DestinationRule does. These new DestinationRule semantics are pinned by
   Rust conformance/integration gates and are explicitly live-deferred under

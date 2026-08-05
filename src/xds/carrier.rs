@@ -233,10 +233,12 @@ pub enum MeshSliceCarrier {
     OutboundTrafficPolicy(OutboundTrafficPolicy),
     MultiCluster(MultiClusterConfig),
     SidecarEgressScope(MeshEgressScopeSnapshot),
-    /// `meshConfig.rootNamespace` (issue #2469). Emitted only when non-empty;
-    /// its ABSENCE tells the DP that this producer carried no root namespace,
-    /// which keeps the materializer on the permissive pre-#2469 bucketing
-    /// rather than refusing rules it cannot classify.
+    /// `meshConfig.rootNamespace` (issue #2469). Emitted only when non-empty
+    /// after trim; its ABSENCE (or a blank / whitespace-only carrier, which
+    /// decode ignores) tells the DP there is no trustworthy root provenance.
+    /// The materializer then refuses Unscoped rules rather than restoring
+    /// pre-#2469 permissive bucketing; independently provable client/service
+    /// tiers still apply.
     IstioRootNamespace(String),
 }
 
@@ -470,7 +472,16 @@ impl MeshSliceCarrier {
             }
             FERRUM_ECDS_ISTIO_ROOT_NAMESPACE_TYPE_URL => {
                 let namespace: String = decode_json(value)?;
-                MeshSliceCarrier::IstioRootNamespace(namespace.trim().to_string())
+                let trimmed = namespace.trim().to_string();
+                // A blank / whitespace-only carrier is not trustworthy root
+                // provenance. Ignore it rather than installing an empty value
+                // that could clear a previously recovered root namespace, and
+                // rather than inventing a default that would grant root-tier
+                // policy without evidence.
+                if trimmed.is_empty() {
+                    return Ok(None);
+                }
+                MeshSliceCarrier::IstioRootNamespace(trimmed)
             }
             _ => return Ok(None),
         };
@@ -706,9 +717,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     if let Some(scope) = slice.sidecar_egress_scope.as_ref() {
         carriers.push(MeshSliceCarrier::SidecarEgressScope(scope.clone()));
     }
-    // Issue #2469: emitted only when non-empty, so absence stays the honest
-    // signal for "this producer carried no root namespace" and the DP keeps
-    // the permissive bucketing instead of refusing rules it cannot classify.
+    // Issue #2469: emitted only when non-empty after trim, so absence stays
+    // the honest signal for "this producer carried no trustworthy root
+    // namespace". Blank / whitespace-only values are never put on the wire;
+    // the DP refuses Unscoped rules without root provenance rather than
+    // restoring pre-#2469 permissive bucketing.
     if !slice.istio_root_namespace.trim().is_empty() {
         carriers.push(MeshSliceCarrier::IstioRootNamespace(
             slice.istio_root_namespace.trim().to_string(),
@@ -768,7 +781,14 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         }
         MeshSliceCarrier::MultiCluster(value) => slice.multi_cluster = Some(value),
         MeshSliceCarrier::SidecarEgressScope(value) => slice.sidecar_egress_scope = Some(value),
-        MeshSliceCarrier::IstioRootNamespace(value) => slice.istio_root_namespace = value,
+        // Decode already rejects blank values; defend in depth so an empty
+        // variant constructed in-process cannot clear trustworthy provenance.
+        MeshSliceCarrier::IstioRootNamespace(value) => {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                slice.istio_root_namespace = trimmed.to_string();
+            }
+        }
     }
 }
 
@@ -1074,5 +1094,47 @@ mod tests {
             .encode_value()
             .expect("encode");
         assert_eq!(direct, via_carrier);
+    }
+
+    /// Blank / whitespace-only root-namespace carriers are not trustworthy
+    /// provenance: decode ignores them, apply cannot clear a prior value, and
+    /// emission omits empty/whitespace slice fields (issue #2469).
+    #[test]
+    fn blank_istio_root_namespace_carrier_is_ignored() {
+        for blank in ["", "   ", "\t\n"] {
+            let encoded = serde_json::to_vec(blank).expect("encode blank");
+            let decoded = MeshSliceCarrier::decode(FERRUM_ECDS_ISTIO_ROOT_NAMESPACE_TYPE_URL, &encoded)
+                .expect("JSON decode succeeds");
+            assert!(
+                decoded.is_none(),
+                "blank root carrier {blank:?} must be ignored at decode"
+            );
+        }
+
+        let mut slice = MeshSlice {
+            istio_root_namespace: "istio-system".to_string(),
+            ..MeshSlice::default()
+        };
+        apply_carrier(
+            &mut slice,
+            MeshSliceCarrier::IstioRootNamespace("   ".to_string()),
+        );
+        assert_eq!(
+            slice.istio_root_namespace, "istio-system",
+            "blank apply must not clear trustworthy root provenance"
+        );
+
+        for blank in ["", "  \t "] {
+            let carriers = build_slice_carriers(&MeshSlice {
+                istio_root_namespace: blank.to_string(),
+                ..MeshSlice::default()
+            });
+            assert!(
+                !carriers
+                    .iter()
+                    .any(|c| matches!(c, MeshSliceCarrier::IstioRootNamespace(_))),
+                "empty/whitespace slice root must not be emitted"
+            );
+        }
     }
 }

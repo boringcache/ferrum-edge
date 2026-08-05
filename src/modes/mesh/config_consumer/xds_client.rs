@@ -1415,9 +1415,10 @@ fn reverse_translate(
         namespace: config.namespace.clone(),
         // Issue #2469: the mesh root namespace rides its own carrier so a
         // reverse-translated slice can classify Istio's third DestinationRule
-        // lookup tier. Empty when the CP emitted no carrier — the materializer
-        // then keeps its permissive pre-#2469 bucketing rather than refusing
-        // rules it has no evidence to classify.
+        // lookup tier. Empty when the CP emitted no carrier (or only a blank
+        // one, which decode ignores) — the materializer then refuses Unscoped
+        // rules rather than restoring pre-#2469 permissive bucketing; client
+        // and service tiers that are independently provable still apply.
         istio_root_namespace: recovered.istio_root_namespace,
         workload_spiffe_id: config.workload_spiffe_id.clone(),
         waypoint_name: config.waypoint_name.clone(),
@@ -1984,7 +1985,14 @@ fn apply_recovered_carrier(
         }
         MeshSliceCarrier::MultiCluster(value) => recovered.multi_cluster = Some(value),
         MeshSliceCarrier::SidecarEgressScope(value) => recovered.sidecar_egress_scope = Some(value),
-        MeshSliceCarrier::IstioRootNamespace(value) => recovered.istio_root_namespace = value,
+        // Decode already drops blank root carriers; ignore empty values here
+        // so in-process construction cannot clear trustworthy provenance.
+        MeshSliceCarrier::IstioRootNamespace(value) => {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                recovered.istio_root_namespace = trimmed.to_string();
+            }
+        }
     }
 }
 
