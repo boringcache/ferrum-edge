@@ -39,7 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maxima (8 MiB and 1024 frames) enforced at admission: the decoded-byte scan
   budget bounds decoded payload, not frame count, so legal zero-length frames
   would otherwise let an operator-configured frame count drive an unbounded
-  frame vector. Malformed, oversized, or undecodable frames omit excerpts with
+  frame vector. Descriptor-tree depth/node ceilings are aggregate across the
+  complete buffered body rather than resetting for each frame. Malformed,
+  oversized, undecodable, or scan-exhausting bodies omit excerpts with
   compiled-in reasons rather than exporting partial or unredacted bytes.
   Name-based redaction matches the HTTP JSON contract exactly: a value is
   replaced when any enclosing name is
@@ -47,8 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (never exported as a label; map values use collision-free ordinal paths such
   as `metadata.0`, and the key is consulted only for the redaction decision) —
   repeated elements inherit their field's decision instead of being judged on
-  the numeric index, and JSON embedded in a protobuf string is decoded and
-  redacted before export. Map ordinals are assigned over a deterministic
+  the numeric index; configured `text_fields` retain every repeated value under
+  a collision-free indexed path rather than silently selecting the first; and
+  JSON embedded in a protobuf string is decoded and redacted before export.
+  Map ordinals are assigned over a deterministic
   canonical key order rather than protobuf map iteration order, so identical
   input always produces identical labels and identical bounded truncation.
   Enrolled requests stage binary-safe from a bounded retained snapshot of the

@@ -3208,13 +3208,19 @@ impl AiTranscriptAudit {
         };
 
         let mut messages = Vec::with_capacity(frames.len());
+        // Both walks are body-wide, not per-frame. `max_messages` bounds the
+        // frame vector, while this aggregate ceiling bounds descriptor-tree
+        // work and temporary excerpt state across the complete buffered RPC.
+        // Resetting either budget for every frame would let a legal multi-frame
+        // body multiply the advertised node ceiling by up to `max_messages`.
+        let mut unknown_field_budget = GrpcWalkBudget::new();
+        let mut excerpt_walk_budget = GrpcWalkBudget::new();
         for (index, frame) in frames.iter().enumerate() {
             let decoded = match DynamicMessage::decode(descriptor.clone(), frame.payload.as_ref()) {
                 Ok(message) => message,
                 Err(_) => return ShapedBody::omitted(OMIT_REASON_GRPC_DECODE),
             };
-            let mut budget = GrpcWalkBudget::new();
-            match has_unknown_fields(&decoded, &mut budget) {
+            match has_unknown_fields(&decoded, &mut unknown_field_budget) {
                 Ok(false) => {}
                 Ok(true) => return ShapedBody::omitted(OMIT_REASON_GRPC_DECODE),
                 // The tree was never cleared, so this is a scan-ceiling
@@ -3222,26 +3228,40 @@ impl AiTranscriptAudit {
                 Err(()) => return ShapedBody::omitted(OMIT_REASON_GRPC_SCAN_LIMIT),
             }
             let mut fields = serde_json::Map::new();
-            let mut walk_budget = GrpcWalkBudget::new();
             if let Some(paths) = method.text_fields.as_ref() {
                 for path in paths {
-                    // A budget exhaustion would drop the remaining configured
-                    // fields, so it omits the whole excerpt with a reason
+                    // Repeated fields retain every selected value under an
+                    // indexed path. A budget exhaustion would drop remaining
+                    // values or configured paths, so omit the whole excerpt
                     // rather than exporting a silent partial capture.
-                    let Ok(found) = read_text_field(&decoded, path, &mut walk_budget) else {
+                    let mut selected = Vec::new();
+                    if collect_text_field(
+                        &decoded,
+                        path,
+                        &mut Vec::new(),
+                        false,
+                        &mut selected,
+                        &mut excerpt_walk_budget,
+                    )
+                    .is_err()
+                    {
                         return ShapedBody::omitted(OMIT_REASON_GRPC_SCAN_LIMIT);
-                    };
-                    if let Some(value) = found {
-                        let sensitive = sensitive_grpc_field_path(path);
-                        let key = path.join(".");
-                        let exported = self.export_grpc_string(sensitive, &value);
-                        fields.insert(key, Value::String(exported));
+                    }
+                    for captured in selected {
+                        let exported =
+                            self.export_grpc_string(captured.sensitive, &captured.value);
+                        fields.insert(captured.path, Value::String(exported));
                     }
                 }
             } else {
                 let mut strings = Vec::new();
-                if collect_string_fields(&decoded, &mut Vec::new(), &mut strings, &mut walk_budget)
-                    .is_err()
+                if collect_string_fields(
+                    &decoded,
+                    &mut Vec::new(),
+                    &mut strings,
+                    &mut excerpt_walk_budget,
+                )
+                .is_err()
                 {
                     return ShapedBody::omitted(OMIT_REASON_GRPC_SCAN_LIMIT);
                 }
@@ -3281,11 +3301,10 @@ impl AiTranscriptAudit {
 
     /// Apply the same redaction contract used for HTTP JSON excerpts.
     ///
-    /// `sensitive` is decided by the descriptor walk (or by
-    /// [`sensitive_grpc_field_path`] for operator-selected `text_fields`) and is
-    /// true when ANY ancestor segment matched the field-name policy — including
-    /// a map key that is deliberately not exported as a transcript label
-    /// (entries use ordinal path segments instead). That
+    /// `sensitive` is decided by the descriptor walk and is true when ANY
+    /// ancestor segment matched the field-name policy — including a map key
+    /// that is deliberately not exported as a transcript label (entries use
+    /// ordinal path segments instead). That
     /// mirrors [`redact_json_value_strings_at_depth`], which replaces the whole
     /// subtree under a sensitive object key rather than only its leaf.
     ///
@@ -7841,14 +7860,6 @@ struct GrpcCapturedString {
     sensitive: bool,
 }
 
-/// Whether any segment of a field path names a sensitive field.
-///
-/// The HTTP JSON path replaces the whole subtree under a sensitive object key,
-/// so a benign leaf beneath `credentials` or `password_reset` must not export.
-fn sensitive_grpc_field_path(path: &[String]) -> bool {
-    path.iter().any(|segment| sensitive_json_field(segment))
-}
-
 /// Whether a protobuf map key names a sensitive field. Only string keys can:
 /// scalar keys are positional identifiers, never field names.
 fn sensitive_map_key(key: &MapKey) -> bool {
@@ -7989,60 +8000,91 @@ fn collect_string_value(
     Ok(())
 }
 
-/// `Ok(None)` means this direction's message simply does not carry the path —
-/// an ordinary miss for a `text_fields` entry that only resolves against the
-/// other root. `Err(())` means the frame's shared walk budget was exhausted, so
-/// the remaining configured fields cannot be read and the excerpt must carry an
-/// explicit omission reason instead of a silent partial `fields` object.
-fn read_text_field(
+/// Collect every string selected by one configured dotted path.
+///
+/// A path may resolve only against the other direction's root, which is an
+/// ordinary empty result. Repeated fields are expanded completely and receive
+/// positional path segments (`tags.0`, `messages.2.text`) so no selected value
+/// overwrites a sibling in the JSON object. `Err(())` means the body-wide walk
+/// budget was exhausted; callers then omit the complete excerpt rather than
+/// exporting a silent partial `fields` object.
+fn collect_text_field(
     message: &DynamicMessage,
     path: &[String],
+    output_path: &mut Vec<String>,
+    sensitive: bool,
+    out: &mut Vec<GrpcCapturedString>,
     budget: &mut GrpcWalkBudget,
-) -> Result<Option<String>, ()> {
-    read_text_field_at(message, path, budget)
+) -> Result<(), ()> {
+    collect_text_field_at(message, path, output_path, sensitive, out, budget)
 }
 
-fn read_text_field_at(
+fn collect_text_field_at(
     message: &DynamicMessage,
     path: &[String],
+    output_path: &mut Vec<String>,
+    sensitive: bool,
+    out: &mut Vec<GrpcCapturedString>,
     budget: &mut GrpcWalkBudget,
-) -> Result<Option<String>, ()> {
+) -> Result<(), ()> {
     if path.is_empty() {
-        return Ok(None);
+        return Ok(());
     }
     budget.scoped(|budget| {
         let Some(field) = message.descriptor().get_field_by_name(&path[0]) else {
-            return Ok(None);
+            return Ok(());
         };
         if !message.has_field(&field) {
-            return Ok(None);
+            return Ok(());
         }
         let value = message.get_field(&field);
-        read_text_value(&value, &path[1..], budget)
+        let nested_sensitive = sensitive || sensitive_json_field(field.name());
+        output_path.push(field.name().to_string());
+        let result = collect_text_value(
+            &value,
+            &path[1..],
+            output_path,
+            nested_sensitive,
+            out,
+            budget,
+        );
+        output_path.pop();
+        result
     })?
 }
 
-fn read_text_value(
+fn collect_text_value(
     value: &ProtobufValue,
     rest: &[String],
+    output_path: &mut Vec<String>,
+    sensitive: bool,
+    out: &mut Vec<GrpcCapturedString>,
     budget: &mut GrpcWalkBudget,
-) -> Result<Option<String>, ()> {
+) -> Result<(), ()> {
     budget.charge()?;
     match value {
-        ProtobufValue::String(text) if rest.is_empty() => Ok(Some(text.to_string())),
+        ProtobufValue::String(text) if rest.is_empty() => {
+            out.push(GrpcCapturedString {
+                path: output_path.join("."),
+                value: text.to_string(),
+                sensitive,
+            });
+            Ok(())
+        }
         ProtobufValue::Message(message) if !rest.is_empty() => {
-            read_text_field_at(message, rest, budget)
+            collect_text_field_at(message, rest, output_path, sensitive, out, budget)
         }
         ProtobufValue::List(items) => {
-            // Prefer the first matching string for a repeated path leaf.
-            for item in items {
-                if let Some(found) = read_text_value(item, rest, budget)? {
-                    return Ok(Some(found));
-                }
+            for (index, item) in items.iter().enumerate() {
+                output_path.push(index.to_string());
+                let result =
+                    collect_text_value(item, rest, output_path, sensitive, out, budget);
+                output_path.pop();
+                result?;
             }
-            Ok(None)
+            Ok(())
         }
-        _ => Ok(None),
+        _ => Ok(()),
     }
 }
 

@@ -11322,6 +11322,116 @@ async fn grpc_name_redaction_covers_ancestors_repeats_and_embedded_json() {
     );
 }
 
+/// A configured `text_fields` selector names a field, not one arbitrary
+/// element of that field. Repeated strings must therefore retain every value
+/// under distinct indexed paths; stopping after the first value silently loses
+/// audit evidence while still presenting the excerpt as complete.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_text_fields_preserve_every_repeated_string_with_indexed_paths() {
+    let dir = audit_descriptor_dir();
+    let request = grpc_frame(&audit_payload_bytes(
+        &dir,
+        AuditPayload {
+            api_keys: vec!["first-selected-secret", "second-selected-secret"],
+            ..AuditPayload::default()
+        },
+    ));
+    let response = grpc_frame(&audit_ack_bytes(&dir, "ok"));
+    let mut overrides = audit_grpc_overrides(&dir);
+    overrides["grpc"]["methods"]["/audit.Sink/Ingest"]["text_fields"] =
+        json!(["api_keys"]);
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, overrides),
+        loopback_http_client(),
+    )
+    .expect("valid repeated text_fields config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/audit.Sink/Ingest");
+    let headers = grpc_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &request)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &response)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "expected one audit record: {records:?}");
+    let excerpt = records[0]["request_body"].as_str().unwrap_or_default();
+    assert!(
+        excerpt.contains("api_keys.0") && excerpt.contains("api_keys.1"),
+        "every selected repeated value needs a collision-free indexed path: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("first-selected-secret")
+            && !excerpt.contains("second-selected-secret"),
+        "selected sensitive repeated values must remain redacted: {excerpt}"
+    );
+}
+
+/// The descriptor-tree ceiling is a contract for one buffered RPC body, not a
+/// multiplier that resets for every legal frame. Otherwise a body below the
+/// decoded-byte limit can drive `max_messages` independent 50k-node walks and
+/// build correspondingly large temporary excerpt maps before the final string
+/// is truncated.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_walk_ceiling_is_aggregate_across_all_frames() {
+    let dir = audit_descriptor_dir();
+    let payload = audit_payload_bytes(
+        &dir,
+        AuditPayload {
+            api_keys: vec!["bounded"; 64],
+            ..AuditPayload::default()
+        },
+    );
+    let frame = grpc_frame(&payload);
+    let mut request = Vec::with_capacity(frame.len() * HARD_MAX_GRPC_MAX_MESSAGES);
+    for _ in 0..HARD_MAX_GRPC_MAX_MESSAGES {
+        request.extend_from_slice(&frame);
+    }
+    let response = grpc_frame(&audit_ack_bytes(&dir, "ok"));
+    let mut overrides = audit_grpc_overrides(&dir);
+    overrides["grpc"]["max_messages"] = json!(HARD_MAX_GRPC_MAX_MESSAGES);
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, overrides),
+        loopback_http_client(),
+    )
+    .expect("valid aggregate-walk config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/audit.Sink/Ingest");
+    let headers = grpc_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &request)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &response)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "expected one audit record: {records:?}");
+    assert_eq!(
+        records[0]["request_body_omitted_reason"].as_str(),
+        Some("grpc_scan_limit"),
+        "the body-wide node ceiling must omit rather than build a partial excerpt: {}",
+        records[0]
+    );
+    assert!(
+        records[0]["request_body"].is_null(),
+        "a scan-limited body must not export a partial excerpt: {}",
+        records[0]
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // gRPC walk-budget accounting
 // ══════════════════════════════════════════════════════════════════════

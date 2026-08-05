@@ -22460,8 +22460,10 @@ components:
                     description: >-
                       Dotted field paths restricting which string fields are
                       exported. Each path must end at a string field and may
-                      not traverse a map field. Omit to cover every string
-                      field recursively.
+                      not traverse a map field. Repeated fields retain every
+                      selected value under indexed paths such as tags.0 or
+                      messages.2.text. Omit to cover every string field
+                      recursively.
                 anyOf:
                   - required: [request_type]
                   - required: [response_type]
@@ -22491,7 +22493,10 @@ components:
                 deployment maximum of 1024 frames: the decoded-byte scan budget
                 bounds decoded payload, not frame count, so legal zero-length
                 frames would otherwise let an operator-configured value drive an
-                effectively unbounded frame vector.
+                effectively unbounded frame vector. Descriptor-tree depth and
+                node ceilings are aggregate across the complete buffered body,
+                rather than resetting for every frame; exhaustion omits the
+                complete excerpt with grpc_scan_limit.
 
     AiSemanticFirewallConfig:
       type: object
