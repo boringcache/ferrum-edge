@@ -1,0 +1,342 @@
+name: Multicluster Poller Partition Live
+
+on:
+  workflow_dispatch:
+  pull_request:
+  merge_group:
+  # Every main push runs the live suite: release.yml's `validate-release-sha`
+  # requires a successful PUSH run of this workflow for the tag target, so each
+  # main SHA must carry a green poller-partition run.
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: multicluster-poller-${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FERRUM_IMAGE_REPOSITORY: ferrum-edge
+  FERRUM_IMAGE_TAG: multicluster-poller-partition
+  CLUSTER_A: ferrum-poller-a-${{ github.run_id }}-${{ github.run_attempt }}
+  CLUSTER_B: ferrum-poller-b-${{ github.run_id }}-${{ github.run_attempt }}
+  TOXIPROXY_CONTAINER: ferrum-poller-toxi-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  changes:
+    name: Multicluster poller partition trigger
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+
+      # Relevance decides whether a REQUIRED live gate runs at all, so it must
+      # never be computed by code the pull request supplies: a PR that widens
+      # its own suite patterns could declare itself irrelevant, skip the live
+      # job, and still turn the required check green.
+      #
+      # Everything below reads ONE immutable trusted commit. The base-branch
+      # tip is fetched from the base repository, pinned once to a full object
+      # id, checked to hold the filter as a regular blob, and then read BY
+      # OBJECT ID rather than by path. A fork head, a rewritten head, or a push
+      # to the base branch mid-run therefore cannot swap the script between
+      # validation and execution, and every failure exits non-zero so the gate
+      # fails closed instead of quietly declaring itself irrelevant.
+      #
+      # This block is frozen by .github/scripts/verify_cross_build_policy.py
+      # (see live_suite_relevance_errors); it is byte-identical across every
+      # live-suite workflow apart from the suite, slug, and display name.
+      - name: Check for multicluster-poller-partition changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+
+          filter_path=.github/scripts/live_suite_path_filter.py
+          changed_files="$RUNNER_TEMP/multicluster-poller-partition-changed-files.txt"
+          trusted_filter="$RUNNER_TEMP/multicluster-poller-partition-trusted-filter.py"
+          rm -f -- "$changed_files" "$trusted_filter"
+          : > "$changed_files"
+
+          filter_args=(--suite mesh-federation --changed-files "$changed_files")
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # `github.base_ref` names a branch in the BASE repository, so a fork
+            # cannot control its contents -- but it is still untrusted text.
+            # Reject anything outside a conservative branch charset before it
+            # reaches a refspec so no option, pathspec, or revision-syntax
+            # metacharacter can be smuggled into a git invocation.
+            if ! printf '%s' "$BASE_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$'; then
+              echo "::error::refusing to resolve an unsafe base ref" >&2
+              exit 1
+            fi
+            case "$BASE_REF" in
+              *..*|*//*|*/|*.lock|*/.*)
+                echo "::error::refusing to resolve an unsafe base ref" >&2
+                exit 1
+                ;;
+            esac
+            fetched=false
+            for attempt in 1 2 3; do
+              if git fetch --no-tags --no-recurse-submodules origin \
+                "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base"; then
+                fetched=true
+                break
+              fi
+              echo "git fetch of ${BASE_REF} failed (attempt ${attempt}/3); retrying" >&2
+              sleep $(( attempt * 10 ))
+            done
+            if [ "$fetched" != true ]; then
+              echo "::error::git fetch of ${BASE_REF} failed after 3 attempts" >&2
+              exit 1
+            fi
+            # Pin the moving tip exactly once; nothing below re-resolves a ref.
+            trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            # Merge queues synthesize a combined SHA. Use the event's base_sha
+            # as the trusted filter source and the change-set base so a missing
+            # pull_request payload cannot force-skip or check only main.
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              fetched=false
+              for attempt in 1 2 3; do
+                if git fetch --no-tags --no-recurse-submodules origin \
+                  "${MERGE_BASE_SHA}"; then
+                  fetched=true
+                  break
+                fi
+                echo "git fetch of merge_group base failed (attempt ${attempt}/3); retrying" >&2
+                sleep $(( attempt * 10 ))
+              done
+              if [ "$fetched" != true ]; then
+                echo "::error::git fetch of merge_group base_sha failed after 3 attempts" >&2
+                exit 1
+              fi
+            fi
+            trusted_sha="$MERGE_BASE_SHA"
+          else
+            # A push to the default branch and a manual dispatch already run
+            # trusted code, so the checked-out commit IS the trusted base.
+            trusted_sha="$(git rev-parse --verify --quiet 'HEAD^{commit}' || true)"
+            filter_args+=(--force-run)
+          fi
+
+          if ! printf '%s' "$trusted_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::trusted base did not resolve to a full commit id" >&2
+            exit 1
+          fi
+
+          # Reject anything that is not a regular blob at that exact commit: a
+          # symlink (mode 120000) would make a content read emit its target
+          # path, a gitlink (160000) or tree (040000) carries no script at all,
+          # and a missing entry must fail closed rather than fall back to the
+          # pull request's own copy.
+          entry="$(git ls-tree --full-tree "$trusted_sha" -- "$filter_path")"
+          if [ "$(printf '%s\n' "$entry" | grep -c . || true)" != "1" ]; then
+            echo "::error::${filter_path} is not a single tree entry at ${trusted_sha}" >&2
+            exit 1
+          fi
+          entry_mode="$(printf '%s\n' "$entry" | awk '{print $1}')"
+          entry_type="$(printf '%s\n' "$entry" | awk '{print $2}')"
+          entry_object="$(printf '%s\n' "$entry" | awk '{print $3}')"
+          entry_path="$(printf '%s\n' "$entry" | awk -F'\t' '{print $2}')"
+          if [ "$entry_type" != "blob" ] || [ "$entry_path" != "$filter_path" ]; then
+            echo "::error::${filter_path} is not a blob at ${trusted_sha}" >&2
+            exit 1
+          fi
+          case "$entry_mode" in
+            100644|100755) ;;
+            *)
+              echo "::error::${filter_path} has non-regular mode ${entry_mode}" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$entry_object" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::${filter_path} did not resolve to an object id" >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -s "$entry_object")" -gt 262144 ]; then
+            echo "::error::${filter_path} exceeds the 256 KiB trusted-filter ceiling" >&2
+            exit 1
+          fi
+          git cat-file blob "$entry_object" > "$trusted_filter"
+
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            git diff --name-only --no-renames "${trusted_sha}...HEAD" \
+              | sort > "$changed_files"
+          fi
+
+          # Isolated interpreter: no user site directory, no PYTHON* overrides,
+          # and no implicit path entry, so nothing the pull request committed
+          # can be imported by the trusted filter.
+          python3 -I "$trusted_filter" --self-test
+          plan="$(python3 -I "$trusted_filter" "${filter_args[@]}")"
+          relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          case "$relevant" in
+            true|false) ;;
+            *)
+              echo "::error::trusted relevance filter produced no usable verdict" >&2
+              exit 1
+              ;;
+          esac
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
+
+  multicluster-poller-partition-live:
+    name: Poller partition and last-good retention
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+
+    steps:
+      - name: Validate merge-queue base identity
+        if: github.event_name == 'merge_group'
+        env:
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "merge_group base_sha missing or malformed" >&2
+            exit 1
+          fi
+
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: ci-multicluster-poller-partition-live
+
+      - name: Build runtime binary
+        run: cargo build --profile pr-build --bin ferrum-edge
+
+      - name: Package runtime image
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/pr-build/ferrum-edge
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}
+
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-kubernetes-tools
+
+      - name: Run poller-driven partition topology
+        env:
+          FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE: "true"
+          FERRUM_SKIP_IMAGE_BUILD: "1"
+          FERRUM_POLLER_RESULTS_DIR: ${{ github.workspace }}/target/multicluster-poller-partition
+        run: tests/k8s/multicluster-poller-partition/run.sh
+
+      - name: Upload redacted live evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: multicluster-poller-partition-results
+          path: target/multicluster-poller-partition
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce deterministic cleanup
+        if: always()
+        run: |
+          set +e
+          docker rm -f "$TOXIPROXY_CONTAINER"
+          kind delete cluster --name "$CLUSTER_A"
+          kind delete cluster --name "$CLUSTER_B"
+
+  gate:
+    name: Multicluster Poller Partition Live
+    needs:
+      - changes
+      - multicluster-poller-partition-live
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Summarize multicluster poller partition live result
+        id: summarize
+        run: |
+          {
+            echo "## Multicluster Poller Partition Live"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Fail closed by default: the artifact gate below runs only when this
+          # step positively establishes that a relevant live run succeeded.
+          echo "validate=false" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then
+            echo "Skipped live datapath validation: no multicluster federation, mesh, identity, proxy, GA-contract, image, proto, documentation, configuration, or CI workflow surfaces changed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
+            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.multicluster-poller-partition-live.result }}" != "success" ]; then
+            echo "Live datapath validation failed or did not complete: ${{ needs.multicluster-poller-partition-live.result }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "validate=true" >> "$GITHUB_OUTPUT"
+          echo "Live datapath run succeeded; validating the emitted live-assertions.json artifact against the release contract." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout validator
+        if: steps.summarize.outputs.validate == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Download emitted evidence
+        if: steps.summarize.outputs.validate == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          name: multicluster-poller-partition-results
+          path: multicluster-poller-partition-artifact
+
+      - name: Validate exact poller boundary contract
+        if: steps.summarize.outputs.validate == 'true'
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          python3 .github/scripts/validate_live_assertions.py --self-test
+          python3 .github/scripts/validate_live_assertions.py \
+            --artifact multicluster-poller-partition-artifact/live-assertions.json \
+            --suite multicluster-poller-partition \
+            --platform-profile kind-spire-toxiproxy-multicluster-pollers \
+            --commit "$EXPECTED_COMMIT" \
+            --max-age-seconds 21600 \
+            --required-namespace multicluster_poller. \
+            --require multicluster_poller.initial.polled_trust_endpoints_installed \
+            --require multicluster_poller.transient.last_good_retained \
+            --require multicluster_poller.transient.cache_age_increased \
+            --require multicluster_poller.endpoint.expired_fail_closed \
+            --require multicluster_poller.endpoint.remote_target_removed \
+            --require multicluster_poller.endpoint.recovered_same_generation \
+            --require multicluster_poller.trust.expired_fail_closed \
+            --require multicluster_poller.trust.inbound_outbound_recomputed \
+            --require multicluster_poller.trust.recovered_same_generation \
+            --require multicluster_poller.metrics.failure_backoff_recovery_bounded \
+            --require multicluster_poller.metrics.admin_status_parity \
+            --require multicluster_poller.withdrawal.inflight_generation_retired \
+            --require multicluster_poller.withdrawal.retired_state_not_reinstalled

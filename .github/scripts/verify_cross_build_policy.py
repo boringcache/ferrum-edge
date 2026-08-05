@@ -1435,12 +1435,13 @@ PUBLISH_CONTROL_CONTRACTS = {
 # ---------------------------------------------------------------------------
 # Trusted-base relevance contract for the required live-datapath gates
 # ---------------------------------------------------------------------------
-# `mesh-e2e-sidecar-live.yml` and `multicluster-federation-live.yml` publish
-# REQUIRED status checks that may skip their expensive live job when a pull
-# request touches nothing relevant. That skip is a security boundary: if the
-# relevance verdict is computed by a script the PULL REQUEST supplies, the pull
-# request can widen its own suite patterns, declare itself irrelevant, skip the
-# live job, and still turn the required gate green.
+# `mesh-e2e-sidecar-live.yml`, `multicluster-federation-live.yml`, and
+# `multicluster-poller-partition-live.yml` publish REQUIRED status checks that
+# may skip their expensive live job when a pull request touches nothing
+# relevant. That skip is a security boundary: if the relevance verdict is
+# computed by a script the PULL REQUEST supplies, the pull request can widen
+# its own suite patterns, declare itself irrelevant, skip the live job, and
+# still turn the required gate green.
 #
 # The block below is therefore the ONLY accepted shape for that decision, and
 # it is frozen byte-for-byte so a later pull request cannot weaken, redirect,
@@ -1654,6 +1655,13 @@ LIVE_SUITE_RELEVANCE_CONTRACTS = {
         "multicluster-federation-live",
         "Multicluster federation trigger",
         "multicluster-federation",
+        "mesh-federation",
+    ),
+    "multicluster-poller-partition-live.yml": (
+        "changes",
+        "multicluster-poller-partition-live",
+        "Multicluster poller partition trigger",
+        "multicluster-poller-partition",
         "mesh-federation",
     ),
 }

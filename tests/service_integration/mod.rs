@@ -1,8 +1,9 @@
 //! Functional integration tests for Ferrum's external-middleware integrations
 //! that can only be validated against the REAL third-party software — a
-//! service registry, a directory server, a Kafka-compatible broker, and a SQL
-//! database — imitated locally with free OSS containers
-//! (`testcontainers`/Docker). No managed or cloud service is ever used.
+//! service registry, a directory server, a Kafka-compatible broker, a SQL
+//! database, and an OIDC/OAuth2 identity provider — imitated locally with free
+//! OSS containers (`testcontainers`/Docker). No managed or cloud service is
+//! ever used.
 //!
 //! These exercise the REAL integration code paths against locally-run servers:
 //!
@@ -24,6 +25,13 @@
 //!     SQLx Any text bindings, a cross-namespace `config_change_locks`
 //!     concurrency regression against ER_LOCK_DEADLOCK 1213, and byte-exact
 //!     NFC/NFD consumer identity uniqueness under `utf8mb4_0900_bin` (#2994).
+//!   - **oidc** — Ory Hydra. Drives `oidc_relying_party` through live discovery,
+//!     authorization-code + PKCE, JWKS/UserInfo/end-session, encrypted sessions,
+//!     claim headers, idle/absolute expiry, refresh, and logout (#3333).
+//!   - **oauth2_introspection** — same Hydra fixture. Drives
+//!     `oauth2_introspection` against opaque tokens: active/inactive, scope /
+//!     role / issuer / audience, client auth methods, discovery facade, cache,
+//!     and failure policy (#3333).
 //!
 //! Container-backed tests self-skip (with a printed notice) when Docker is
 //! unavailable, so the suite is safe to run locally without Docker. In CI the
@@ -37,6 +45,8 @@
 //!   cargo test --test service_integration ldap
 //!   cargo test --test service_integration kafka
 //!   cargo test --test service_integration mysql
+//!   cargo test --test service_integration oidc
+//!   cargo test --test service_integration oauth2_introspection
 
 mod common;
 
@@ -44,3 +54,5 @@ mod consul;
 mod kafka;
 mod ldap;
 mod mysql;
+mod oauth2_introspection;
+mod oidc;
