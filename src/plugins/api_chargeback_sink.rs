@@ -6623,6 +6623,19 @@ struct SpoolSourceCreditRecord {
     generation: u64,
 }
 
+/// Borrowed subset of the durable record needed to authorize one spend.
+///
+/// Parsing from the fixed-size stack buffer in
+/// [`SpoolSourceCreditReservation::record_matches`] avoids allocating a fresh
+/// byte vector and owned strings for every rejected replay batch.
+#[derive(Deserialize)]
+struct SpoolSourceCreditWitness<'a> {
+    format_version: u32,
+    #[serde(borrow)]
+    claim_base: &'a str,
+    reserved_bytes: u64,
+}
+
 /// The namespace-wide exclusive credit for the authoritative source bytes one
 /// dead-letter handoff will free when it removes its claim.
 ///
@@ -6659,7 +6672,7 @@ impl SpoolSourceCreditReservation {
     ///
     /// The credit is never taken from these in-memory fields alone: they are
     /// only the expectation the on-disk truth has to satisfy.
-    fn read_record(&self) -> Result<SpoolSourceCreditRecord, String> {
+    fn record_matches(&self, claim_base: &str, reserved_bytes: u64) -> Result<bool, String> {
         let mut file = &self.file;
         file.seek(SeekFrom::Start(0)).map_err(|error| {
             format!(
@@ -6667,26 +6680,43 @@ impl SpoolSourceCreditReservation {
                 self.path.display()
             )
         })?;
-        let mut bytes = Vec::new();
-        let mut reader = file.take(SPOOL_MAX_SOURCE_CREDIT_BYTES as u64 + 1);
-        reader.read_to_end(&mut bytes).map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to read spool dead-letter credit record '{}': {error}",
-                self.path.display()
-            )
-        })?;
-        if bytes.len() > SPOOL_MAX_SOURCE_CREDIT_BYTES {
+        let mut bytes = [0u8; SPOOL_MAX_SOURCE_CREDIT_BYTES + 1];
+        let mut filled = 0usize;
+        loop {
+            if filled == bytes.len() {
+                return Err(format!(
+                    "{PLUGIN_NAME}: spool dead-letter credit record '{}' exceeds its hard bound",
+                    self.path.display()
+                ));
+            }
+            match file.read(&mut bytes[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "{PLUGIN_NAME}: failed to read spool dead-letter credit record '{}': {error}",
+                        self.path.display()
+                    ));
+                }
+            }
+        }
+        if filled > SPOOL_MAX_SOURCE_CREDIT_BYTES {
             return Err(format!(
                 "{PLUGIN_NAME}: spool dead-letter credit record '{}' exceeds its hard bound",
                 self.path.display()
             ));
         }
-        serde_json::from_slice(&bytes).map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: invalid spool dead-letter credit record '{}': {error}",
-                self.path.display()
-            )
-        })
+        let record: SpoolSourceCreditWitness<'_> =
+            serde_json::from_slice(&bytes[..filled]).map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: invalid spool dead-letter credit record '{}': {error}",
+                    self.path.display()
+                )
+            })?;
+        Ok(record.format_version == SPOOL_SOURCE_CREDIT_FORMAT_VERSION
+            && record.claim_base == claim_base
+            && record.reserved_bytes == reserved_bytes)
     }
 }
 
@@ -6999,15 +7029,10 @@ impl SpoolManager {
         ) {
             return 0;
         }
-        match reservation.read_record() {
-            Ok(record)
-                if record.format_version == SPOOL_SOURCE_CREDIT_FORMAT_VERSION
-                    && record.claim_base == base
-                    && record.reserved_bytes == pinned_len =>
-            {
-                pinned_len
-            }
-            _ => 0,
+        if reservation.record_matches(base, pinned_len).unwrap_or(false) {
+            pinned_len
+        } else {
+            0
         }
     }
 
