@@ -26,7 +26,7 @@
 
 use std::fmt::Write as _;
 
-use crate::config::env_config::{DbTlsMode, EnvConfig};
+use crate::config::env_config::{DbTlsMode, EnvConfig, SqlUrlTlsPeerAuth};
 use crate::config::types::{BackendScheme, GatewayConfig, PluginConfig};
 
 /// Maximum number of individual offending entries named in one diagnostic.
@@ -380,22 +380,39 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
     // SQL modes that do not authenticate the config-database peer must not be
     // admitted into the enforced boundary. `verify-ca` and `verify-full` are
     // the only explicit modes that validate the server certificate chain.
+    // When `FERRUM_DB_TLS_MODE` is unset, peer authentication must be selected
+    // by URL-owned parameters on every configured SQL URL (primary, failover,
+    // and read replica); otherwise the same unauthenticated-peer exposure is
+    // reachable by omitting the env var rather than setting a weak one.
     let sql_config_store = env_config.db_type.as_deref().is_some_and(|db_type| {
         db_type.eq_ignore_ascii_case("postgres") || db_type.eq_ignore_ascii_case("mysql")
     });
-    if sql_config_store && let Some(mode) = env_config.db_tls_mode {
-        // Exhaustive on purpose: a future `DbTlsMode` variant must be an
-        // explicit decision here, and until it is made it falls into the
-        // refusal arm rather than being silently admitted.
-        match mode {
-            DbTlsMode::VerifyCa | DbTlsMode::VerifyFull => {}
-            unverified => {
-                return Err(format!(
-                    "FERRUM_DB_TLS_MODE={unverified} does not authenticate the SQL \
-                     config-database peer and is refused while FIPS mode is enforced; use \
-                     `verify-ca` or `verify-full`."
-                ));
+    if sql_config_store {
+        let dialect = if env_config
+            .db_type
+            .as_deref()
+            .is_some_and(|db_type| db_type.eq_ignore_ascii_case("postgres"))
+        {
+            "postgres"
+        } else {
+            "mysql"
+        };
+        if let Some(mode) = env_config.db_tls_mode {
+            // Exhaustive on purpose: a future `DbTlsMode` variant must be an
+            // explicit decision here, and until it is made it falls into the
+            // refusal arm rather than being silently admitted.
+            match mode {
+                DbTlsMode::VerifyCa | DbTlsMode::VerifyFull => {}
+                unverified => {
+                    return Err(format!(
+                        "FERRUM_DB_TLS_MODE={unverified} does not authenticate the SQL \
+                         config-database peer and is refused while FIPS mode is enforced; use \
+                         `verify-ca` or `verify-full`."
+                    ));
+                }
             }
+        } else {
+            refuse_unverified_sql_url_tls(env_config, dialect)?;
         }
     }
 
@@ -532,6 +549,67 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+/// Refuse SQL config-database URLs that do not demonstrably authenticate the
+/// peer when `FERRUM_DB_TLS_MODE` is unset.
+///
+/// Checks `FERRUM_DB_URL`, every `FERRUM_DB_FAILOVER_URLS` entry, and
+/// `FERRUM_DB_READ_REPLICA_URL`. Diagnostics name the env setting and the
+/// offending query-parameter key only — never the URL or its credentials.
+fn refuse_unverified_sql_url_tls(
+    env_config: &EnvConfig,
+    dialect: &str,
+) -> Result<(), String> {
+    let mut checks: Vec<(String, &str)> = Vec::new();
+    if let Some(url) = env_config
+        .db_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+    {
+        checks.push(("FERRUM_DB_URL".to_string(), url));
+    }
+    for (index, url) in env_config.db_failover_urls.iter().enumerate() {
+        if url.trim().is_empty() {
+            continue;
+        }
+        checks.push((
+            format!("FERRUM_DB_FAILOVER_URLS[#{}]", index + 1),
+            url.as_str(),
+        ));
+    }
+    if let Some(url) = env_config
+        .db_read_replica_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+    {
+        checks.push(("FERRUM_DB_READ_REPLICA_URL".to_string(), url));
+    }
+
+    for (label, url) in checks {
+        match EnvConfig::sql_url_tls_peer_auth(url, dialect) {
+            SqlUrlTlsPeerAuth::Verified => {}
+            SqlUrlTlsPeerAuth::Absent { expected_param } => {
+                return Err(format!(
+                    "{label} does not set `{expected_param}` to a peer-authenticating value and is \
+                     refused while FIPS mode is enforced with FERRUM_DB_TLS_MODE unset; embed a \
+                     verifying `{expected_param}` in the URL (`verify-ca`/`verify-full` for \
+                     PostgreSQL, `VERIFY_CA`/`VERIFY_IDENTITY` for MySQL) or set \
+                     FERRUM_DB_TLS_MODE to `verify-ca` or `verify-full`."
+                ));
+            }
+            SqlUrlTlsPeerAuth::Unverified { param } => {
+                return Err(format!(
+                    "{label} query parameter `{param}` does not authenticate the SQL \
+                     config-database peer and is refused while FIPS mode is enforced with \
+                     FERRUM_DB_TLS_MODE unset; use a verifying mode (`verify-ca`/`verify-full` \
+                     for PostgreSQL, `VERIFY_CA`/`VERIFY_IDENTITY` for MySQL) or set \
+                     FERRUM_DB_TLS_MODE to `verify-ca` or `verify-full`."
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
