@@ -11830,12 +11830,10 @@ mod tests {
         );
         let err = translate_k8s_objects(&[policy.clone(), http_route_to_service("api")], options())
             .expect_err("retryConstraint must reject the entire policy fail-closed");
+        assert!(err.to_string().contains("retryConstraint"), "got: {err}");
         assert!(
-            err.to_string().contains("retryConstraint"),
-            "got: {err}"
-        );
-        assert!(
-            err.to_string().contains("sessionPersistence is not applied"),
+            err.to_string()
+                .contains("sessionPersistence is not applied"),
             "rejection must withhold sessionPersistence, got: {err}"
         );
 

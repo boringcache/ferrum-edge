@@ -237,8 +237,7 @@ plugin_configs: []
         .await
         .expect("header probe request");
     assert!(header_first.status().is_success());
-    let header_pinned =
-        parse_server_name(&header_first.text().await.expect("header probe body"));
+    let header_pinned = parse_server_name(&header_first.text().await.expect("header probe body"));
     assert!(
         !header_pinned.is_empty(),
         "header probe body must identify a backend"
