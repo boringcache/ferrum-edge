@@ -1432,6 +1432,55 @@ pin_project! {
 // required for soundness.
 unsafe impl<B: Send + Sync> Sync for SyncBody<B> {}
 
+/// Immutable request DATA with an optional validated terminal trailers frame.
+///
+/// Mesh retries clone the `Bytes` and `HeaderMap` handles for each attempt.
+/// Native inbound request trailers are not accepted into this type because the
+/// generic intake path has no trailer-policy validation; callers may populate
+/// `trailers` only from the gRPC-Web plugin's validated staging representation.
+pub struct ReplayableRequestBody {
+    data: Option<Bytes>,
+    trailers: Option<http::HeaderMap>,
+}
+
+impl ReplayableRequestBody {
+    pub(crate) fn new(data: Bytes, trailers: Option<http::HeaderMap>) -> Self {
+        Self {
+            data: (!data.is_empty()).then_some(data),
+            trailers: trailers.filter(|trailers| !trailers.is_empty()),
+        }
+    }
+}
+
+impl http_body::Body for ReplayableRequestBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if let Some(data) = self.data.take() {
+            return Poll::Ready(Some(Ok(Frame::data(data))));
+        }
+        if let Some(trailers) = self.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
+        Poll::Ready(None)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_none() && self.trailers.is_none()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        let mut hint = http_body::SizeHint::new();
+        let len = self.data.as_ref().map_or(0, Bytes::len) as u64;
+        hint.set_exact(len);
+        hint
+    }
+}
+
 impl<B> SyncBody<B> {
     pub(crate) fn new(inner: B) -> Self {
         Self { inner }

@@ -55,7 +55,8 @@ path = "tests/secrets_functional/mod.rs"
 # carry shared container helpers. Container-backed tests self-skip when Docker
 # is unavailable (graceful locally) and hard-fail in CI; see
 # `tests/service_integration/`. Run e.g.
-# `cargo test --test service_integration consul` (or `ldap` / `kafka`).
+# `cargo test --test service_integration consul` (or `ldap` / `kafka` / `mysql` /
+# `oidc` / `oauth2_introspection`).
 [[test]]
 name = "service_integration"
 path = "tests/service_integration/mod.rs"
@@ -215,7 +216,7 @@ pin-project-lite = "0.2"
 # backend traffic through an unintended hop). Everything else from the
 # pre-0.13 default set is re-enabled explicitly. `rustls-no-provider` is
 # load-bearing: `crypto-ring` / `fips`, not reqwest, selects the provider.
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "stream", "http2", "charset"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls-no-provider", "stream", "http2", "charset"] }
 hickory-resolver = { version = "0.26", features = ["tokio", "system-config"] }
 base64 = "0.22"
 # AWS event-stream prelude/message CRC32 (ITU-T V.42). Already transitive via

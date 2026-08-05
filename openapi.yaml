@@ -3005,6 +3005,8 @@ paths:
         slice version per connected DP would let external tooling diff
         what the CP thinks each DP should have against what each DP
         reports here, without having to walk every DP in lock-step.
+        Superseded by `GET /mesh/slice-drift` on the control plane
+        (issue #3265).
       tags: [Mesh Config Drift]
       security:
         - bearerAuth: []
@@ -3409,6 +3411,86 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           description: No active mesh runtime state (not in mesh mode)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /mesh/slice-drift:
+    get:
+      operationId: getMeshSliceDrift
+      summary: Inspect CP-side per-DP mesh slice convergence and drift
+      description: |
+        Control-plane only (issue #3265). Returns per-authenticated local
+        MeshSubscribe identity the versions the CP desired, last sent,
+        last acknowledged, and last rejected (with age and a closed
+        redacted NACK label). Desired advances only when that DP's actual
+        projected slice content changes; version-only/no-op reloads and
+        unrelated namespaces do not manufacture drift. Identity is the JWT `sub` bound at
+        subscribe time — caller-supplied display fields are never trusted.
+
+        ACK/NACK reports must bind the currently connected replacement
+        session's opaque wire token and current sent version. The token is
+        never returned by this endpoint, metrics, or logs. Caller-supplied
+        NACK text is discarded rather than retained.
+
+        Returns 404 outside CP mode. Returns 200 with an empty
+        `data_planes` list when CP mode is active but no local mesh DP
+        has subscribed yet. Disconnected rows are retained for 300s;
+        the registry hard-caps at 4096 identities.
+      tags: [Mesh Config Drift]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: CP-side mesh slice drift snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshSliceDriftResponse"
+              examples:
+                converged:
+                  summary: One converged DP
+                  value:
+                    mode: cp
+                    generated_at: "2026-08-02T16:00:00Z"
+                    summary:
+                      tracked: 1
+                      connected: 1
+                      converged: 1
+                      drifted: 0
+                      rejecting: 0
+                      pending: 0
+                      disconnected: 0
+                    data_planes:
+                      - node_id: mesh-dp-a
+                        namespace: ferrum
+                        connected: true
+                        session_connected_at: "2026-08-02T15:59:00Z"
+                        desired:
+                          version: "v2"
+                          at: "2026-08-02T15:59:30Z"
+                          age_seconds: 30
+                        sent:
+                          version: "v2"
+                          at: "2026-08-02T15:59:30Z"
+                          age_seconds: 30
+                        acknowledged:
+                          version: "v2"
+                          at: "2026-08-02T15:59:31Z"
+                          age_seconds: 29
+                        convergence: converged
+                        drift:
+                          desired_vs_sent: false
+                          desired_vs_acknowledged: false
+                          sent_vs_acknowledged: false
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Not in control-plane mode, or drift tracker not wired
           content:
             application/json:
               schema:
@@ -24051,7 +24133,7 @@ components:
     AiStreamRouterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 4057, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Provider fallback is NOT implemented and a `fallback` config block is REJECTED at admission (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body before dispatch and never switches providers, pre- or post-first-byte, so a stored fallback policy could only be silently inert. No ai_stream_router.fallback_attempts metadata is emitted. Configuration is strict: unknown root and provider fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
+      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 4057, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini requests are translated to Gemini/streamGenerateContent (Vertex-compatible) and provider SSE/JSON streams are normalized to OpenAI chat.completion.chunk SSE. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Provider fallback is NOT implemented and a `fallback` config block is REJECTED at admission (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body before dispatch and never switches providers, pre- or post-first-byte, so a stored fallback policy could only be silently inert. No ai_stream_router.fallback_attempts metadata is emitted. Configuration is strict: unknown root and provider fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
       required: [providers]
       properties:
         enabled:
@@ -24093,13 +24175,13 @@ components:
                   - openai_compatible
                   - anthropic
                   - google_gemini
-                description: "Provider wire format. openai/openai_compatible pass through; anthropic is translated + normalized; google_gemini is reserved (rejected at construction in this MVP)."
+                description: "Provider wire format. openai/openai_compatible pass through; anthropic and google_gemini are translated + normalized to OpenAI chat.completion.chunk SSE."
               endpoint:
                 type: string
-                description: "Full https (or http with allow_plaintext) provider streaming endpoint URL, e.g. https://api.openai.com/v1/chat/completions or https://api.anthropic.com/v1/messages. May contain a literal {model} path placeholder for future providers. An endpoint query string (e.g. an Azure-style ?api-version=...) is preserved and merged with the client's own query using '&'. IPv6 literal hosts are bracketed in the forwarded authority."
+                description: "Full https (or http with allow_plaintext) provider streaming endpoint URL, e.g. https://api.openai.com/v1/chat/completions, https://api.anthropic.com/v1/messages, or https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent. May contain a literal {model} path placeholder (required for typical Gemini/Vertex model routing). An endpoint query string (e.g. an Azure-style ?api-version=...) is preserved and merged with the client's own query using '&'. IPv6 literal hosts are bracketed in the forwarded authority."
               api_key:
                 type: string
-                description: "Provider API key. Supports a ${ENV_VAR} reference resolved from the process environment. Injected as Authorization: Bearer for openai(-compatible), x-api-key for anthropic."
+                description: "Provider API key. Supports a ${ENV_VAR} reference resolved from the process environment. Injected as Authorization: Bearer for openai(-compatible), x-api-key for anthropic, x-goog-api-key for google_gemini."
               model_patterns:
                 type: array
                 minItems: 1
@@ -25114,10 +25196,18 @@ components:
                 node id; it contains no credentials. Counts active spool files
                 (*.ndjson / *.ndjson.zst), atomic-write temps
                 (*.write-<process_tag>-<generation>.tmp), in-flight replay claims
-                (*.inflight), and quarantined (*.corrupt) / dead-letter metadata
-                files. A pending write is sized before admission under the spool write
-                lock; the oldest evictable owned file is dropped until the incoming
-                encoded file fits. In-flight claims, temps under an active write,
+                (*.inflight), and quarantined (*.corrupt) / dead-letter payload and
+                metadata files. Ordinary pending writes are sized before admission;
+                incrementally streamed dead-letter payloads are admitted before each
+                bounded replay-batch append. Admission/inventory/eviction and the
+                corresponding mutation hold one stable ownership-bound exclusive
+                filesystem lock shared by every manager, plugin generation, and
+                cooperating Ferrum process using the namespace. The private
+                no-follow lock inode and spool.meta.json identity are revalidated
+                after acquisition; lock/identity failures refuse the mutation. The
+                zero-length coordination file is excluded from quota/status counts.
+                The oldest evictable owned file is dropped until the incoming bytes fit.
+                In-flight claims, temps under an active write,
                 and records carrying another owner's tag are never evictable, so a
                 write that cannot fit is rejected rather than exceeding the ceiling
                 or destroying another owner's or another delivery's records. Each
@@ -25512,6 +25602,14 @@ components:
                 prepare_failures_total:
                   type: integer
                   minimum: 0
+                replay_attempts_total:
+                  type: integer
+                  minimum: 0
+                  description: ClickHouse HTTP attempts made by bounded replay, including permanent-failure isolation children.
+                dead_letter_rows_total:
+                  type: integer
+                  minimum: 0
+                  description: Permanently rejected rows durably handed to the private dead-letter payload store.
                 unbound_files:
                   type: integer
                   minimum: 0
@@ -25664,12 +25762,20 @@ components:
               type: integer
             files:
               type: integer
-              description: Count of owned spool files (active data, temps, in-flight claims, and quarantined).
+              description: Count of owned spool files (active data, temps, in-flight claims, corrupt quarantine, and dead-letter payload/metadata files).
             bytes:
               type: integer
-              description: Total encoded on-disk bytes for owned spool files (active data, temps, in-flight claims, and quarantined).
+              description: Total encoded on-disk bytes for owned spool files (active data, temps, in-flight claims, corrupt quarantine, and dead-letter payload/metadata files).
             drops_total:
               type: integer
+            replay_attempts_total:
+              type: integer
+              minimum: 0
+              description: ClickHouse HTTP attempts made by bounded replay, including permanent-failure isolation children.
+            dead_letter_rows_total:
+              type: integer
+              minimum: 0
+              description: Permanently rejected rows durably handed to the private dead-letter payload store.
             unbound_files:
               type: integer
               description: |
@@ -26063,6 +26169,104 @@ components:
           type: string
           format: date-time
           description: When the last config update was broadcast to this mesh node
+
+    MeshSliceDriftResponse:
+      type: object
+      required: [mode, generated_at, summary, data_planes]
+      description: >
+        Control-plane per-authenticated-DP mesh slice convergence snapshot
+        (issue #3265).
+      properties:
+        mode:
+          type: string
+          enum: [cp]
+        generated_at:
+          type: string
+          format: date-time
+        summary:
+          $ref: "#/components/schemas/MeshSliceDriftSummary"
+        data_planes:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeshSliceDriftEntry"
+
+    MeshSliceDriftSummary:
+      type: object
+      required: [tracked, connected, converged, drifted, rejecting, pending, disconnected]
+      properties:
+        tracked: { type: integer, minimum: 0 }
+        connected: { type: integer, minimum: 0 }
+        converged: { type: integer, minimum: 0 }
+        drifted: { type: integer, minimum: 0 }
+        rejecting: { type: integer, minimum: 0 }
+        pending: { type: integer, minimum: 0 }
+        disconnected: { type: integer, minimum: 0 }
+
+    MeshSliceDriftEntry:
+      type: object
+      required: [node_id, namespace, connected, session_connected_at, convergence, drift]
+      properties:
+        node_id:
+          type: string
+          description: Authenticated JWT subject for the mesh DP
+        namespace:
+          type: string
+        connected:
+          type: boolean
+        session_connected_at:
+          type: string
+          format: date-time
+        disconnected_at:
+          type: string
+          format: date-time
+        desired:
+          $ref: "#/components/schemas/MeshSliceVersionStamp"
+        sent:
+          $ref: "#/components/schemas/MeshSliceVersionStamp"
+        acknowledged:
+          $ref: "#/components/schemas/MeshSliceVersionStamp"
+        rejected:
+          $ref: "#/components/schemas/MeshSliceRejectedStamp"
+        convergence:
+          type: string
+          enum: [converged, drifted, rejecting, pending, disconnected]
+        drift:
+          $ref: "#/components/schemas/MeshSliceDriftFlags"
+
+    MeshSliceVersionStamp:
+      type: object
+      required: [version, at, age_seconds]
+      properties:
+        version:
+          type: string
+          maxLength: 256
+          description: Exact opaque version; runtime enforces a 256 UTF-8 byte cap, no controls, and no surrounding whitespace.
+        at: { type: string, format: date-time }
+        age_seconds: { type: integer, format: int64, minimum: 0 }
+
+    MeshSliceRejectedStamp:
+      type: object
+      required: [version, at, age_seconds, reason]
+      properties:
+        version:
+          type: string
+          maxLength: 256
+          description: Exact opaque version; runtime enforces a 256 UTF-8 byte cap, no controls, and no surrounding whitespace.
+        at: { type: string, format: date-time }
+        age_seconds: { type: integer, format: int64, minimum: 0 }
+        reason:
+          type: string
+          enum: [reported_rejection]
+          maxLength: 64
+          description: Fixed control-safe label. Caller-supplied NACK text is discarded and never retained.
+
+    MeshSliceDriftFlags:
+      type: object
+      required: [desired_vs_sent, desired_vs_acknowledged, sent_vs_acknowledged]
+      properties:
+        desired_vs_sent: { type: boolean }
+        desired_vs_acknowledged: { type: boolean }
+        sent_vs_acknowledged: { type: boolean }
 
     ConnectedDpNode:
       type: object

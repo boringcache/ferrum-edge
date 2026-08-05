@@ -165,6 +165,39 @@ DEDICATED_REQUIRED_CHECKS = {
             "--required-namespace multicluster.",
         },
     },
+    ".github/workflows/multicluster-poller-partition-live.yml": {
+        "job": "gate",
+        "name": "Multicluster Poller Partition Live",
+        # Aggregate required check plus emitted-artifact gate. Relevance may
+        # skip the expensive live job; validate=true is emitted only after the
+        # relevant-and-successful path is positively established so a skipped
+        # suite still reports the required check green without demanding an
+        # artifact that was never produced.
+        "needs": {
+            "changes",
+            "multicluster-poller-partition-live",
+        },
+        "contract": {
+            '${{ needs.changes.result }}" != "success"',
+            '${{ needs.changes.outputs.relevant }}" = "false"',
+            '${{ needs.changes.outputs.relevant }}" != "true"',
+            '${{ needs.multicluster-poller-partition-live.result }}" != "success"',
+            'echo "validate=false" >> "$GITHUB_OUTPUT"',
+            'echo "validate=true" >> "$GITHUB_OUTPUT"',
+            "if: steps.summarize.outputs.validate == 'true'",
+            "name: multicluster-poller-partition-results",
+            "python3 .github/scripts/validate_live_assertions.py --self-test",
+            "--artifact multicluster-poller-partition-artifact/live-assertions.json",
+            "--suite multicluster-poller-partition",
+            "--platform-profile kind-spire-toxiproxy-multicluster-pollers",
+            '--commit "$EXPECTED_COMMIT"',
+            "EXPECTED_COMMIT: ${{ github.sha }}",
+            "--max-age-seconds 21600",
+            "--required-namespace multicluster_poller.",
+            "multicluster_poller.withdrawal.inflight_generation_retired",
+            "multicluster_poller.withdrawal.retired_state_not_reinstalled",
+        },
+    },
 }
 
 # The artifact validator is only a gate if it is reached with a SHA-pinned
@@ -208,6 +241,9 @@ DEDICATED_WORKFLOW_NAMES = {
     ".github/workflows/multicluster-federation-live.yml": (
         "Multicluster Federation Live Datapath"
     ),
+    ".github/workflows/multicluster-poller-partition-live.yml": (
+        "Multicluster Poller Partition Live"
+    ),
 }
 
 # Every required status check owner must trigger on merge_group. Without that
@@ -220,6 +256,9 @@ REQUIRED_MERGE_GROUP_WORKFLOWS = {
     ".github/workflows/cross-build-policy.yml": "Trusted Cross Build Policy",
     ".github/workflows/multicluster-federation-live.yml": (
         "Multicluster Federation Live"
+    ),
+    ".github/workflows/multicluster-poller-partition-live.yml": (
+        "Multicluster Poller Partition Live"
     ),
 }
 
