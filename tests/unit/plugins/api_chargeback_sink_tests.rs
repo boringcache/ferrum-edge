@@ -8777,6 +8777,61 @@ async fn spool_replay_fails_closed_on_non_file_hardlink_symlink_and_declared_zst
     );
 }
 
+/// An unpinnable candidate whose quarantine name is already occupied must be
+/// left exactly where it is rather than clobbering the existing evidence, and it
+/// must still not abort replay of a healthy later record.
+#[cfg(unix)]
+#[tokio::test]
+async fn hardlinked_candidate_never_clobbers_an_existing_quarantine_sibling() {
+    use std::fs::hard_link;
+
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[200]).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    let linked = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FC1"));
+    fs::write(&linked, br#"{"event_id":"hardlink-occupied-quarantine"}"#).unwrap();
+    let alias = temp.path().join("outside-alias.ndjson");
+    hard_link(&linked, &alias).unwrap();
+    let occupied = linked.with_file_name(format!(
+        "{}.corrupt",
+        linked.file_name().unwrap().to_string_lossy()
+    ));
+    let existing_evidence = b"prior-quarantined-evidence\n";
+    fs::write(&occupied, existing_evidence).unwrap();
+
+    // A healthy record must still be delivered and removed in the same tick.
+    let healthy = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FC2"));
+    fs::write(&healthy, br#"{"event_id":"healthy-after-hostile-hardlink"}"#).unwrap();
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect("an unquarantinable hard link must not abort the tick");
+
+    assert!(
+        linked.is_file(),
+        "the hostile hard link must be left inert under its own name"
+    );
+    assert_eq!(
+        fs::read(&occupied).unwrap(),
+        existing_evidence,
+        "an existing quarantine sibling must never be clobbered"
+    );
+    assert_eq!(
+        fs::read(&alias).unwrap(),
+        br#"{"event_id":"hardlink-occupied-quarantine"}"#,
+        "the out-of-namespace alias must not be touched"
+    );
+    assert!(
+        !healthy.exists(),
+        "an unrelated healthy record must still replay in the same tick"
+    );
+}
+
 #[tokio::test]
 async fn spool_replay_defers_when_ceiling_cannot_hold_stream_and_batch() {
     let temp = tempfile::tempdir().unwrap();

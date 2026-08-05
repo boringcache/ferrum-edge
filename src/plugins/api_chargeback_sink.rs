@@ -6152,9 +6152,13 @@ fn directory_is_within_canonical_root(canonical_root: &Path, dir: &Path) -> Resu
 /// artifact this handoff opened, so [`ManagedClaimState::ReplacedRegularFile`]
 /// is kept distinct from [`ManagedClaimState::LiveClaim`]. Missing and
 /// wrong-type claims stay distinct from both so diagnostics can distinguish a
-/// completed handoff from hostile interference. Neither state authorizes a
-/// payload or metadata publication, because the final rename may replace an
-/// existing `.rejected.*` sibling and is therefore destructive too.
+/// completed handoff from hostile interference, and so evidence publication is
+/// not gated on the same predicate that protects completed `.rejected.*`
+/// siblings and the terminal claim unlink. No state but
+/// [`ManagedClaimState::LiveClaim`] ever authorizes replacing, unlinking, or
+/// accounting out a sibling; see
+/// [`SpoolManager::authorize_dead_letter_publication`] for the one narrowly
+/// admitted constructive case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedClaimState {
     /// The claim pathname still resolves to the exact pinned authoritative
@@ -6207,9 +6211,15 @@ impl PinnedClaimArtifact {
     fn pin_required(path: &Path) -> Result<Self, String> {
         let file = open_spool_file_no_follow(path)?;
         let identity = pinned_claim_descriptor_identity(&file, path)?;
-        Ok(Self {
+        Ok(Self::from_pinned(file, identity))
+    }
+
+    /// Adopt a descriptor that has already been securely opened and validated by
+    /// [`pinned_claim_descriptor_identity`].
+    fn from_pinned(file: File, identity: SpoolFileIdentity) -> Self {
+        Self {
             pinned: Some((file, identity)),
-        })
+        }
     }
 
     /// Refresh the immutable preflight baseline after an intentional claim
@@ -6825,6 +6835,7 @@ impl SpoolManager {
         let _guard = self.lock_spool_mutation()?;
         Ok(self
             .claim_replay_file_locked(path)?
+            .into_claimed()?
             .map(|claim| claim.path().to_path_buf()))
     }
 
@@ -6837,7 +6848,7 @@ impl SpoolManager {
         path: &Path,
     ) -> Result<Option<SpoolClaimHandle>, String> {
         let _guard = self.lock_spool_mutation()?;
-        self.claim_replay_file_locked(path)
+        self.claim_replay_file_locked(path)?.into_claimed()
     }
 
     #[doc(hidden)]
@@ -7280,21 +7291,22 @@ impl SpoolManager {
     /// Classify a managed claim path against the pinned authoritative artifact
     /// before any destructive step.
     ///
-    /// Every dead-letter publication can replace a final pathname and is thus a
-    /// destructive mutation, not merely constructive evidence creation.
     /// Destructive behavior is different for each non-live outcome and must not
     /// be collapsed:
     /// - [`ManagedClaimState::Missing`]: the handoff already completed. Do not
     ///   unlink durable siblings or the claim pathname, and refuse to open a new
     ///   writer against the stale claim.
     /// - [`ManagedClaimState::NotRegularFile`]: hostile interference at the
-    ///   claim path. Skip every mutation.
+    ///   claim path. Skip every mutation of that pathname and of every existing
+    ///   sibling; only a clobber-free publication of evidence read from the
+    ///   already-open authoritative descriptor may still complete.
     /// - [`ManagedClaimState::ReplacedRegularFile`]: same-UID substitution of a
     ///   *different* regular file at the claim pathname — or an extra hard link
-    ///   on the pinned inode. Shape is not authority, so this is
-    ///   treated exactly like the wrong-type case: every mutation is refused.
-    ///   Only the pinned artifact can authorize deleting, renaming, publishing,
-    ///   or accounting a claim pathname or its derived siblings.
+    ///   on the pinned inode. Shape is not authority, and the replacement may be
+    ///   another live handoff's data artifact for this exact name, so every
+    ///   mutation *and* every publication into its derived sibling namespace is
+    ///   refused. Only the pinned artifact can authorize deleting, renaming, or
+    ///   accounting a claim pathname or its derived siblings.
     ///
     /// The contract for every caller: hold the namespace mutation lock across
     /// this classification and the destructive step it authorizes, and pass the
@@ -7353,6 +7365,50 @@ impl SpoolManager {
             ))),
             Err(error) => Err(ClaimMutationError::Unauthorized(error)),
         }
+    }
+
+    /// Authorize one step of a dead-letter publication transaction.
+    ///
+    /// The returned state tells the caller whether the *destructive* half is
+    /// authorized as well: only [`ManagedClaimState::LiveClaim`] may unlink or
+    /// replace a completed `.rejected.*` sibling, account bytes out of the owned
+    /// inventory, or perform the terminal claim operation.
+    ///
+    /// [`ManagedClaimState::NotRegularFile`] is admitted for the constructive
+    /// half alone, and only while no `replaceable` sibling exists. A directory or
+    /// other non-file planted at the claim pathname can never be a data file, a
+    /// claim marker, or any other honest handoff's artifact, so it does not make
+    /// the derived `<data-name>.rejected.*` namespace somebody else's; the rows
+    /// being written come from the descriptor this replay opened and validated,
+    /// not from the replaced pathname. Refusing here instead would let a
+    /// same-UID actor suppress the audit trail for rows the gateway has already
+    /// permanently rejected, simply by planting a directory. Nothing about the
+    /// replaced pathname is mutated, released, removed, or accounted either way.
+    ///
+    /// [`ManagedClaimState::Missing`] (the handoff already completed elsewhere)
+    /// and [`ManagedClaimState::ReplacedRegularFile`] (a same-UID regular file
+    /// that may be another live handoff's data artifact for this exact name)
+    /// authorize nothing at all.
+    fn authorize_dead_letter_publication(
+        &self,
+        source: &Path,
+        artifact: &PinnedClaimArtifact,
+        replaceable: &[&Path],
+    ) -> Result<ManagedClaimState, ClaimMutationError> {
+        let state = self
+            .managed_claim_state(source, artifact)
+            .map_err(ClaimMutationError::Unauthorized)?;
+        if state == ManagedClaimState::LiveClaim {
+            return Ok(state);
+        }
+        let occupied = |path: &&Path| fs::symlink_metadata(path).is_ok();
+        if state == ManagedClaimState::NotRegularFile && !replaceable.iter().any(occupied) {
+            return Ok(state);
+        }
+        Err(ClaimMutationError::Unauthorized(format!(
+            "{PLUGIN_NAME}: refusing to mutate spool claim '{}': the pathname no longer resolves to the authoritative claimed artifact",
+            source.display()
+        )))
     }
 
     fn meta_path(&self) -> PathBuf {
@@ -7939,9 +7995,13 @@ impl SpoolManager {
     /// Atomically claim one replay candidate.
     ///
     /// The rename is the mutual-exclusion primitive: on a shared volume exactly
-    /// one accepted generation or process can win it. `Ok(None)` means somebody
-    /// else won, and the caller must simply move on.
-    fn claim_replay_file_locked(&self, path: &Path) -> Result<Option<SpoolClaimHandle>, String> {
+    /// one accepted generation or process can win it.
+    /// [`ReplayClaimOutcome::Contended`] means somebody else won, and the caller
+    /// must simply move on. [`ReplayClaimOutcome::Unclaimable`] means the
+    /// candidate could not be pinned as an authoritative artifact at all; it is
+    /// never delivered and never renamed into an authoritative destination, and
+    /// it must not abort progress on unrelated later records.
+    fn claim_replay_file_locked(&self, path: &Path) -> Result<ReplayClaimOutcome, String> {
         self.assert_managed_path(path)?;
         if !is_spool_data_file(path) {
             return Err(format!(
@@ -7966,7 +8026,40 @@ impl SpoolManager {
         // carried by the returned claim handle, so even the first preflight
         // ceiling/error paths have an authority capability and can never rename
         // a substitute that arrived after this point.
-        let mut artifact = PinnedClaimArtifact::pin_required(path)?;
+        //
+        // Pinning is also where honest contention first becomes visible: the
+        // winner's rename removes this pathname, so a pre-open `NotFound` is the
+        // same lost race the rename below reports and must stay ordinary
+        // contention. Every other secure-open or descriptor-validation failure
+        // stays fail-closed — the candidate is refused, never claimed.
+        let file = match open_spool_file_no_follow_raw(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ReplayClaimOutcome::Contended);
+            }
+            Err(error) => {
+                return Ok(ReplayClaimOutcome::Unclaimable(UnclaimableCandidate {
+                    reason: format!(
+                        "{PLUGIN_NAME}: failed to securely open spool file '{}': {error}",
+                        path.display()
+                    ),
+                    opened: None,
+                }));
+            }
+        };
+        let identity = match pinned_claim_descriptor_identity(&file, path) {
+            Ok(identity) => identity,
+            Err(reason) => {
+                // The open succeeded, so the refusal observed one exact inode.
+                // Carrying the descriptor lets the caller demote that inode — and
+                // only that inode — into the inert quarantine namespace.
+                return Ok(ReplayClaimOutcome::Unclaimable(UnclaimableCandidate {
+                    reason,
+                    opened: Some(file),
+                }));
+            }
+        };
+        let mut artifact = PinnedClaimArtifact::from_pinned(file, identity);
         // Register the live lease before the rename so a concurrent prepare in
         // this process can never see the claim as orphaned.
         let guard = LiveSpoolPathGuard::new(claim_path.clone());
@@ -7975,18 +8068,66 @@ impl SpoolManager {
                 artifact.refresh_identity(&claim_path)?;
                 self.require_live_claim(&claim_path, &artifact)
                     .map_err(ClaimMutationError::into_message)?;
-                Ok(Some(SpoolClaimHandle {
+                Ok(ReplayClaimOutcome::Claimed(SpoolClaimHandle {
                     path: claim_path,
                     _live: guard,
                     artifact,
                 }))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(ReplayClaimOutcome::Contended)
+            }
             Err(error) => Err(format!(
                 "{PLUGIN_NAME}: failed to claim spool file '{}' as in-flight '{}': {error}",
                 path.display(),
                 claim_path.display()
             )),
+        }
+    }
+
+    /// Isolate a replay candidate that could not be pinned as an authoritative
+    /// artifact, without letting it abort progress on unrelated later records.
+    ///
+    /// Quarantine is attempted only when the refusal itself opened the inode, so
+    /// the demotion is exact-inode authorized. Anything else — a candidate whose
+    /// secure open failed outright, or one whose pathname stopped naming the
+    /// refused inode — is left exactly where it is, reported, and still counted
+    /// in the owned inventory for operator reconciliation.
+    fn isolate_unclaimable_candidate(&self, path: &Path, candidate: UnclaimableCandidate) {
+        let UnclaimableCandidate { reason, opened } = candidate;
+        self.metrics
+            .record_failure(FailureReason::Serialize, reason.clone());
+        let Some(file) = opened else {
+            warn!(
+                plugin = PLUGIN_NAME,
+                error = %reason,
+                path = %path.display(),
+                generation = self.generation,
+                "Chargeback sink left an unopenable spool replay candidate inert and will continue replay; it is still counted as owned and an operator must reconcile it"
+            );
+            return;
+        };
+        match quarantine_unclaimable_candidate(self, path, &file) {
+            Ok(quarantine_path) => {
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %reason,
+                    path = %path.display(),
+                    quarantine_path = %quarantine_path.display(),
+                    generation = self.generation,
+                    "Chargeback sink quarantined a spool replay candidate that could not be pinned as an authoritative artifact and will continue replay"
+                );
+            }
+            Err(quarantine_error) => {
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %reason,
+                    quarantine_error = %quarantine_error,
+                    path = %path.display(),
+                    generation = self.generation,
+                    "Chargeback sink left an unpinnable spool replay candidate inert because it could not be safely quarantined; replay will continue"
+                );
+            }
         }
     }
 
@@ -8179,6 +8320,45 @@ impl SpoolManager {
             managed_namespace = %self.namespace_root.display(),
             "Chargeback sink found spool records that are not bound to this destination identity, or reached the bounded scan limit; reported counts are lower bounds when scan_truncated=true, records are never replayed or deleted, and an operator must reconcile them (rate-limited)"
         );
+    }
+}
+
+/// A replay candidate this generation refused to pin as an authoritative
+/// artifact.
+///
+/// `opened` is `Some` only when the secure open itself succeeded and the
+/// *descriptor* validation refused it (wrong type, or an extra hard link). That
+/// descriptor is the only thing that can authorize an exact-inode quarantine of
+/// the pathname, so it is carried out of the claim protocol rather than dropped.
+struct UnclaimableCandidate {
+    reason: String,
+    opened: Option<File>,
+}
+
+/// Result of one atomic replay-claim attempt.
+enum ReplayClaimOutcome {
+    /// The candidate is claimed and the handle carries its pinned descriptor.
+    Claimed(SpoolClaimHandle),
+    /// Another accepted generation or process won the atomic rename, or the
+    /// candidate had already left the replayable pathname before this attempt
+    /// could pin it. Ordinary contention, never an error.
+    Contended,
+    /// The candidate cannot be pinned as an authoritative artifact. It is never
+    /// claimed, read, delivered, or promoted, and it must not abort the tick.
+    Unclaimable(UnclaimableCandidate),
+}
+
+impl ReplayClaimOutcome {
+    /// Collapse to the simple claimed/contended shape used by the test seams,
+    /// where an unpinnable candidate is reported as an ordinary refusal instead
+    /// of being isolated by the replay loop.
+    #[allow(dead_code)] // external unit tests only
+    fn into_claimed(self) -> Result<Option<SpoolClaimHandle>, String> {
+        match self {
+            Self::Claimed(claim) => Ok(Some(claim)),
+            Self::Contended => Ok(None),
+            Self::Unclaimable(candidate) => Err(candidate.reason),
+        }
     }
 }
 
@@ -8697,6 +8877,66 @@ fn quarantine_spool_file(
     Ok(quarantine_path)
 }
 
+/// Demote one refused replay candidate into the inert `.corrupt` namespace,
+/// bound to the exact inode the refusal opened.
+///
+/// [`SpoolManager::require_live_claim`] cannot authorize this step: its proof
+/// deliberately refuses `nlink != 1`, which is one of the very refusals being
+/// isolated here. The demotion is still exact-inode bound — the pathname must
+/// still name the descriptor this refusal opened — and its destination is never
+/// delivered, restored, or replayed. An existing quarantine sibling is never
+/// clobbered, and nothing outside the managed namespace is touched.
+fn quarantine_unclaimable_candidate(
+    spool: &SpoolManager,
+    path: &Path,
+    file: &File,
+) -> Result<PathBuf, String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
+    let base = spool_artifact_base_name(name);
+    let quarantine_path = path.with_file_name(format!("{base}.corrupt"));
+    let _guard = spool.lock_spool_mutation()?;
+    spool.assert_managed_path(path)?;
+    spool.assert_managed_path(&quarantine_path)?;
+    let descriptor_metadata = file.metadata().map_err(|error| {
+        format!("{PLUGIN_NAME}: failed to stat a refused spool replay candidate: {error}")
+    })?;
+    let path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to lstat refused spool replay candidate '{}': {error}",
+            path.display()
+        )
+    })?;
+    if !descriptor_metadata.file_type().is_file()
+        || !path_metadata.file_type().is_file()
+        || !SpoolFileIdentity::from_metadata(&descriptor_metadata)
+            .same_file_node(&SpoolFileIdentity::from_metadata(&path_metadata))
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: refusing to quarantine '{}': the pathname no longer names the refused artifact",
+            path.display()
+        ));
+    }
+    if fs::symlink_metadata(&quarantine_path).is_ok() {
+        return Err(format!(
+            "{PLUGIN_NAME}: refusing to quarantine '{}': '{}' already exists",
+            path.display(),
+            quarantine_path.display()
+        ));
+    }
+    fs::rename(path, &quarantine_path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to quarantine refused spool replay candidate '{}' to '{}': {error}",
+            path.display(),
+            quarantine_path.display()
+        )
+    })?;
+    invalidate_status_cache();
+    Ok(quarantine_path)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeadLetterReason {
     PermanentHttp,
@@ -8791,11 +9031,16 @@ impl DeadLetterPayloadWriter {
         let (_, prior_meta_path) = dead_letter_meta_paths(source_path)?;
         let _guard = spool.lock_spool_mutation()?;
         // Opening begins a publication transaction whose later rename may
-        // replace a completed sibling. Require the exact pinned claim up front;
-        // a missing, wrong-type, or substituted pathname authorizes no part of
-        // that transaction.
-        spool
-            .require_live_claim(source_path, artifact)
+        // replace a completed sibling. Authorize it up front: the exact pinned
+        // claim authorizes the whole transaction, a planted non-file authorizes
+        // only the constructive half over an empty sibling set, and a missing or
+        // substituted regular pathname authorizes nothing.
+        let claim_state = spool
+            .authorize_dead_letter_publication(
+                source_path,
+                artifact,
+                &[prior_meta_path.as_path(), final_path.as_path()],
+            )
             .map_err(ClaimMutationError::into_message)?;
         spool.assert_managed_path(&temp_path)?;
         spool.assert_managed_path(&final_path)?;
@@ -8806,9 +9051,16 @@ impl DeadLetterPayloadWriter {
         // handoff artifacts under the namespace lock before rebuilding so
         // recovery never needs quota for two complete rejected payloads and
         // never evicts unrelated active spool data merely to duplicate one.
-        // Only the exact pinned claim reaches this cleanup.
-        let prior_siblings = [(&prior_meta_path, "metadata"), (&final_path, "payload")];
-        for (path, kind) in prior_siblings {
+        // Only the exact pinned claim authorizes that destructive cleanup; every
+        // other admitted state iterates an empty set (and was admitted only
+        // because no such sibling exists), so the body stays shared.
+        let authorized_siblings = [(&prior_meta_path, "metadata"), (&final_path, "payload")];
+        let prior_siblings: &[(&PathBuf, &str)] = if claim_state == ManagedClaimState::LiveClaim {
+            &authorized_siblings
+        } else {
+            &authorized_siblings[..0]
+        };
+        for (path, kind) in prior_siblings.iter().copied() {
             let removed_len = spool_regular_file_len(path);
             match fs::remove_file(path) {
                 Ok(()) => {
@@ -8881,10 +9133,14 @@ impl DeadLetterPayloadWriter {
         })?;
         let _guard = spool.lock_spool_mutation()?;
         // Admission may evict other replayable files, and the append mutates
-        // this handoff's temp. Revalidate the exact claim before either action;
+        // this handoff's temp. Re-authorize the publication before either action;
         // a substitution between delivery chunks authorizes neither.
         spool
-            .require_live_claim(&self.source_path, artifact)
+            .authorize_dead_letter_publication(
+                &self.source_path,
+                artifact,
+                &[self.final_path.as_path()],
+            )
             .map_err(ClaimMutationError::into_message)?;
         spool.assert_managed_path(&self.temp_path)?;
         spool.assert_managed_path(&self.final_path)?;
@@ -8944,13 +9200,19 @@ impl DeadLetterPayloadWriter {
 
         let _guard = spool.lock_spool_mutation()?;
         // The final rename can replace an existing payload and is destructive
-        // even when no explicit cleanup runs. Bind the entire publish to the
-        // exact pinned claim, under the namespace lock.
+        // even when no explicit cleanup runs. Authorize the whole publish under
+        // the namespace lock, naming that replaceable final: a state admitted
+        // only for constructive publication can never reach a rename that would
+        // clobber an existing sibling.
         spool.assert_managed_path(&self.source_path)?;
         spool.assert_managed_path(&self.temp_path)?;
         spool.assert_managed_path(&self.final_path)?;
-        spool
-            .require_live_claim(&self.source_path, artifact)
+        let claim_state = spool
+            .authorize_dead_letter_publication(
+                &self.source_path,
+                artifact,
+                &[self.final_path.as_path()],
+            )
             .map_err(ClaimMutationError::into_message)?;
         // Before mutating any prior partial handoff, prove the live temp path
         // still names the descriptor whose completed metadata we captured at
@@ -8976,19 +9238,21 @@ impl DeadLetterPayloadWriter {
         // since the claim was validated: a missing, non-file, or substituted
         // claim must not authorize that unlink (completed handoff, hostile
         // directory plant, planted regular file).
-        let replaced_payload_len = spool_regular_file_len(&self.final_path);
-        match fs::remove_file(&self.final_path) {
-            Ok(()) => {
-                if let Some(len) = replaced_payload_len {
-                    spool.usage.account_sub(1, len);
+        if claim_state == ManagedClaimState::LiveClaim {
+            let replaced_payload_len = spool_regular_file_len(&self.final_path);
+            match fs::remove_file(&self.final_path) {
+                Ok(()) => {
+                    if let Some(len) = replaced_payload_len {
+                        spool.usage.account_sub(1, len);
+                    }
                 }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "{PLUGIN_NAME}: failed to replace prior dead-letter payload '{}': {error}",
-                    self.final_path.display()
-                ));
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "{PLUGIN_NAME}: failed to replace prior dead-letter payload '{}': {error}",
+                        self.final_path.display()
+                    ));
+                }
             }
         }
         // The temp and still-authoritative source are both present in the
@@ -9320,29 +9584,32 @@ fn write_dead_letter_meta(
     spool.assert_managed_path(&meta_path)?;
     spool.assert_managed_path(&tmp_path)?;
     // The final metadata rename can replace an existing record and is
-    // destructive even when no explicit cleanup runs. Bind the whole publish
-    // transaction to the exact pinned claim under this namespace lock.
+    // destructive even when no explicit cleanup runs. Authorize the whole
+    // publish transaction under this namespace lock, naming that replaceable
+    // final so a constructive-only state can never reach a clobbering rename.
     spool.assert_managed_path(source_path)?;
-    spool
-        .require_live_claim(source_path, artifact)
+    let claim_state = spool
+        .authorize_dead_letter_publication(source_path, artifact, &[meta_path.as_path()])
         .map_err(ClaimMutationError::into_message)?;
     spool.evict_until_can_admit(bytes.len() as u64)?;
     // Measured after eviction: a reclaim that already deleted this record has
     // accounted for it, so re-measuring here cannot double-subtract. The
     // identity check runs under the same namespace mutation lock as the unlink.
-    let replaced_meta_len = spool_regular_file_len(&meta_path);
-    match fs::remove_file(&meta_path) {
-        Ok(()) => {
-            if let Some(len) = replaced_meta_len {
-                spool.usage.account_sub(1, len);
+    if claim_state == ManagedClaimState::LiveClaim {
+        let replaced_meta_len = spool_regular_file_len(&meta_path);
+        match fs::remove_file(&meta_path) {
+            Ok(()) => {
+                if let Some(len) = replaced_meta_len {
+                    spool.usage.account_sub(1, len);
+                }
             }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(format!(
-                "{PLUGIN_NAME}: failed to replace dead-letter metadata '{}': {error}",
-                meta_path.display()
-            ));
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: failed to replace dead-letter metadata '{}': {error}",
+                    meta_path.display()
+                ));
+            }
         }
     }
     let _live = LiveSpoolPathGuard::new(tmp_path.clone());
@@ -10387,12 +10654,20 @@ impl StreamingSpoolReader {
     }
 }
 
-fn open_spool_file_no_follow(path: &Path) -> Result<File, String> {
+/// Secure open of a managed spool file, preserving the raw [`std::io::Error`].
+///
+/// The claim protocol has to distinguish an ordinary lost-race `NotFound` from
+/// every other secure-open failure, and only the typed error can do that.
+fn open_spool_file_no_follow_raw(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    options.open(path).map_err(|error| {
+    options.open(path)
+}
+
+fn open_spool_file_no_follow(path: &Path) -> Result<File, String> {
+    open_spool_file_no_follow_raw(path).map_err(|error| {
         format!(
             "{PLUGIN_NAME}: failed to securely open spool file '{}': {error}",
             path.display()
@@ -11870,12 +12145,22 @@ async fn replay_spool_once(
 ) -> Result<(), String> {
     let files = spool.list_replayable_spool_files()?;
     for file in files {
-        let mut claim = {
+        let outcome = {
             let _guard = spool.lock_spool_mutation()?;
-            match spool.claim_replay_file_locked(&file)? {
-                Some(claim) => claim,
-                // Another accepted generation or process won the atomic claim.
-                None => continue,
+            spool.claim_replay_file_locked(&file)?
+        };
+        let mut claim = match outcome {
+            ReplayClaimOutcome::Claimed(claim) => claim,
+            // Another accepted generation or process won the atomic claim.
+            ReplayClaimOutcome::Contended => continue,
+            // A hostile or unreadable candidate is isolated where that can be
+            // done safely and left inert otherwise. Either way it is reported
+            // and never allowed to abort replay of unrelated later records.
+            // Isolation retakes the namespace mutation lock, so it runs only
+            // after the claim guard above has been released.
+            ReplayClaimOutcome::Unclaimable(candidate) => {
+                spool.isolate_unclaimable_candidate(&file, candidate);
+                continue;
             }
         };
         let inflight = claim.path().to_path_buf();

@@ -529,9 +529,26 @@ Claim disposition:
 - **Unreadable** — the claim is quarantined as `<data-name>.corrupt`.
 - **Descriptor lost / pathname unproven** — the claim remains inert under its
   `.inflight` name, remains counted in owned spool usage, and is reported for
-  operator verification and reconciliation. It is never automatically restored,
-  and it authorizes no rejected-payload or rejected-metadata publication: those
-  final renames can replace existing evidence and are destructive mutations too.
+  operator verification and reconciliation. It is never automatically restored.
+  A substituted regular file or a completed (missing) claim additionally
+  authorizes no rejected-payload or rejected-metadata publication: those final
+  renames can replace existing evidence and are destructive mutations too. A
+  planted non-file (for example a directory) is the one narrow exception, and
+  only for evidence that is purely constructive: the rejected rows already read
+  from this replay's own validated descriptor may still be published, but only
+  while no `.rejected.*` sibling exists to clobber, and never with any unlink,
+  replacement, release, or accounting against the replaced pathname. Otherwise a
+  same-UID actor could suppress the audit trail for permanently rejected rows
+  just by planting a directory.
+
+Claim candidates that cannot be pinned at all are isolated rather than allowed
+to abort a replay tick. An artifact that is not a single-linked regular file
+(for example a planted hard link) is demoted to `<data-name>.corrupt` bound to
+the exact inode the refusal opened, never clobbering an existing quarantine
+sibling. One whose secure open fails outright (for example a mode-000 file)
+carries no descriptor to bind, so it is left exactly where it is, counted, and
+reported for operator reconciliation. Either way, later records in the same tick
+still replay.
 
 In-flight claims count toward `spool.max_bytes` but are **never** eviction
 candidates; when only claimed or foreign-owned files remain, an admission that
@@ -644,10 +661,11 @@ fields are never logged.
   credentials, or charge-record fields. The payload file intentionally contains
   original billing rows and must remain access-controlled. If any payload,
   metadata, quota, or source-removal step fails, the original file remains
-  replayable. The exact pinned claim is revalidated under the namespace lock
-  before opening the handoff, before the payload final rename, before metadata
-  publication, and before source removal. A missing, wrong-type, or substituted
-  claim therefore cannot replace completed evidence merely by colliding with its
+  replayable. The claim is re-authorized under the namespace lock before opening
+  the handoff, before every payload append, before the payload final rename,
+  before metadata publication, and before source removal. Only the exact pinned
+  claim authorizes the destructive half, so a missing, substituted, or planted
+  pathname can never replace completed evidence merely by colliding with its
   derived final pathname. While the source remains authoritative, a later attempt
   removes prior partial metadata/payload siblings under the namespace lock before
   rebuilding them, so recovery does not require quota for two rejected payloads.
