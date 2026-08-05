@@ -17,16 +17,16 @@ use ferrum_edge::plugins::ai_transcript_audit::{
     AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS, AI_TRANSCRIPT_AUDIT_LIMITS_KEYS,
     AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS, AI_TRANSCRIPT_AUDIT_REDACTION_KEYS,
     AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS, AI_TRANSCRIPT_AUDIT_SINK_KEYS, AiTranscriptAudit,
-    HARD_MAX_CAPTURE_BYTES_AGGREGATE, HARD_MAX_REQUEST_BYTES, HARD_MAX_RESPONSE_BYTES,
-    HARD_MAX_STREAM_CAPTURE_BYTES, MAX_MODEL_BYTES, MAX_TOOL_NAME_BYTES, MAX_TOOL_NAMES,
-    MAX_TOOL_NAMES_AGGREGATE_BYTES, accounted_record_bytes, max_retained_record_bytes,
-    max_serialized_record_bytes, snapshots,
+    HARD_MAX_CAPTURE_BYTES_AGGREGATE, HARD_MAX_GRPC_MAX_MESSAGE_BYTES, HARD_MAX_GRPC_MAX_MESSAGES,
+    HARD_MAX_REQUEST_BYTES, HARD_MAX_RESPONSE_BYTES, HARD_MAX_STREAM_CAPTURE_BYTES,
+    MAX_MODEL_BYTES, MAX_TOOL_NAME_BYTES, MAX_TOOL_NAMES, MAX_TOOL_NAMES_AGGREGATE_BYTES,
+    accounted_record_bytes, max_retained_record_bytes, max_serialized_record_bytes, snapshots,
 };
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
 use ferrum_edge::plugins::{
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
-    RequestContext, ResponseStreamAction, ResponseStreamInspector,
+    HTTP_GRPC_PROTOCOLS, HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient,
+    PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction, ResponseStreamInspector,
     chain_response_stream_inspectors, create_response_stream_inspector, plugin_failure_policy,
     priority, validate_plugin_config,
 };
@@ -682,6 +682,7 @@ fn accepted_config_key_sets_are_exported_for_schema_parity() {
             "limits",
             "privacy",
             "sink",
+            "grpc",
         ]
     );
     assert_eq!(
@@ -9958,4 +9959,2030 @@ async fn sink_delivery_failure_diagnostics_are_redacted() {
         !captured.contains("/audit/"),
         "no raw credential-bearing path may survive: {captured}"
     );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Native gRPC capture (issue #3304)
+// ══════════════════════════════════════════════════════════════════════
+
+fn grpc_descriptor_path() -> String {
+    format!(
+        "{}/tests/fixtures/test_validator.bin",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn hello_request_bytes(name: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(grpc_descriptor_path()).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("test.HelloRequest").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("name", Value::String(name.to_string()));
+    msg.set_field_by_name("age", Value::I32(42));
+    msg.encode_to_vec()
+}
+
+fn hello_response_bytes(message: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(grpc_descriptor_path()).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("test.HelloResponse").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("message", Value::String(message.to_string()));
+    msg.set_field_by_name("success", Value::Bool(true));
+    msg.encode_to_vec()
+}
+
+fn grpc_frame(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(0);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn gzip_grpc_frame(payload: &[u8]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut frame = Vec::with_capacity(5 + compressed.len());
+    frame.push(1);
+    frame.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&compressed);
+    frame
+}
+
+fn grpc_ctx(method: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        method.to_string(),
+    );
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::HttpFlavor::Grpc,
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    ctx
+}
+
+fn grpc_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers
+}
+
+fn grpc_audit_overrides() -> Value {
+    json!({
+        "redaction": {
+            "builtins": ["email", "api_key", "aws_key"],
+            "hash_redacted_values": false
+        },
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "/test.Greeter/SayHello": {
+                    "request_type": "test.HelloRequest",
+                    "response_type": "test.HelloResponse"
+                }
+            }
+        }
+    })
+}
+
+fn grpc_audit_plugin(overrides: Value) -> AiTranscriptAudit {
+    AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", overrides),
+        loopback_http_client(),
+    )
+    .expect("valid grpc audit config")
+}
+
+#[test]
+fn grpc_block_extends_supported_protocols_and_buffering() {
+    let plugin = grpc_audit_plugin(grpc_audit_overrides());
+    let protocols = plugin.supported_protocols();
+    assert!(protocols.contains(&ProxyProtocol::Http));
+    assert!(protocols.contains(&ProxyProtocol::Grpc));
+    assert_eq!(
+        protocols, HTTP_GRPC_PROTOCOLS,
+        "grpc enrollment must advertise the shared HTTP+gRPC matrix"
+    );
+
+    let enrolled = grpc_ctx("/test.Greeter/SayHello");
+    assert!(plugin.should_buffer_request_body(&enrolled));
+    assert!(plugin.should_buffer_response_body(&enrolled));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &enrolled,
+        Some("application/grpc"),
+        200,
+        &grpc_headers(),
+    ));
+
+    // The request-body gate is CONSERVATIVE for native gRPC: the enrollment
+    // verdict is not decidable before `on_backend_path_resolved`, and answering
+    // `false` here pins the request to the streaming fast path where no final
+    // request-body hook can ever re-decide. Response buffering is decided after
+    // that hook, so it stays enrollment-scoped.
+    let other = grpc_ctx("/test.Greeter/Other");
+    assert!(plugin.should_buffer_request_body(&other));
+    assert!(!plugin.should_buffer_response_body(&other));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &other,
+        Some("application/grpc"),
+        200,
+        &grpc_headers(),
+    ));
+
+    // Ordinary HTTP traffic on the same gRPC-enrolled instance keeps the
+    // JSON-POST fast path: a non-JSON POST is still not buffered.
+    let mut http_on_grpc_instance = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat".to_string(),
+    );
+    http_on_grpc_instance
+        .headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    assert!(!plugin.should_buffer_request_body(&http_on_grpc_instance));
+
+    let http_only = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    assert_eq!(http_only.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    // An instance WITHOUT a `grpc` block never pays the conservative gate, even
+    // for a native gRPC request.
+    assert!(!http_only.should_buffer_request_body(&grpc_ctx("/test.Greeter/SayHello")));
+}
+
+#[test]
+fn grpc_config_validation_fail_closed() {
+    let base_sink = json!({
+        "type": "http",
+        "endpoint_url": "https://audit.example.com/x"
+    });
+    for bad in [
+        json!({"sink": base_sink, "grpc": {}}),
+        json!({"sink": base_sink, "grpc": {"descriptor_path": "/tmp/x.bin", "methods": {}}}),
+        json!({"sink": base_sink, "grpc": {
+            "descriptor_path": "/tmp/x.bin",
+            "methods": {"not-a-path": {"request_type": "test.HelloRequest"}}
+        }}),
+        json!({"sink": base_sink, "grpc": {
+            "descriptor_path": "/tmp/x.bin",
+            "methods": {"/test.Greeter/SayHello": {}}
+        }}),
+        json!({"sink": base_sink, "grpc": {
+            "descriptor_path": "/tmp/x.bin",
+            "unknown": 1,
+            "methods": {"/test.Greeter/SayHello": {"request_type": "test.HelloRequest"}}
+        }}),
+    ] {
+        assert!(
+            AiTranscriptAudit::new(&bad, loopback_http_client()).is_err(),
+            "expected rejection for {bad}"
+        );
+    }
+
+    // Shape-only admission must not need the node-local descriptor.
+    assert!(
+        AiTranscriptAudit::validate_config(
+            &json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/x"
+                },
+                "grpc": {
+                    "descriptor_path": "/nonexistent/descriptor.bin",
+                    "methods": {
+                        "/test.Greeter/SayHello": {
+                            "request_type": "test.HelloRequest",
+                            "response_type": "test.HelloResponse"
+                        }
+                    }
+                }
+            }),
+            loopback_http_client(),
+        )
+        .is_ok()
+    );
+
+    // Shared validate_plugin_config must also stay shape-only.
+    assert!(
+        validate_plugin_config(
+            "ai_transcript_audit",
+            &json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/x"
+                },
+                "grpc": {
+                    "descriptor_path": "/nonexistent/descriptor.bin",
+                    "methods": {
+                        "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+                    }
+                }
+            }),
+        )
+        .is_ok()
+    );
+}
+
+/// `grpc.max_message_bytes` / `grpc.max_messages` are operator-facing frame
+/// budgets, and the decoded-byte scan budget does NOT bound them: a body of
+/// legal zero-length 5-byte frames consumes no decoded bytes at all, so an
+/// unbounded `max_messages` would let one request drive an equally unbounded
+/// `Vec<GrpcFrame>`. Both carry immutable deployment maxima, accepted exactly
+/// at the bound and refused one above it.
+#[test]
+fn grpc_frame_budgets_are_bounded_by_deployment_maxima() {
+    let descriptor = grpc_descriptor_path();
+    let config = |key: &str, value: usize| {
+        let mut config = json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/x"
+            },
+            "grpc": {
+                "descriptor_path": descriptor,
+                "methods": {
+                    "/test.Greeter/SayHello": {"request_type": "test.HelloRequest"}
+                }
+            }
+        });
+        config["grpc"][key] = json!(value);
+        config
+    };
+
+    for (key, hard_max) in [
+        ("max_message_bytes", HARD_MAX_GRPC_MAX_MESSAGE_BYTES),
+        ("max_messages", HARD_MAX_GRPC_MAX_MESSAGES),
+    ] {
+        let at_bound = config(key, hard_max);
+        assert!(
+            AiTranscriptAudit::new(&at_bound, loopback_http_client()).is_ok(),
+            "'grpc.{key}' must accept exactly {hard_max}"
+        );
+        // Shape-only admission (Admin/CP) must refuse it too, so an
+        // over-budget policy never reaches a data-plane node.
+        assert!(
+            AiTranscriptAudit::validate_config(&at_bound, loopback_http_client()).is_ok(),
+            "shape-only validation must accept exactly {hard_max} for 'grpc.{key}'"
+        );
+
+        let over_bound = config(key, hard_max + 1);
+        let error = AiTranscriptAudit::new(&over_bound, loopback_http_client())
+            .err()
+            .expect("above the deployment hard maximum must fail closed");
+        assert!(
+            error.contains(key) && error.contains(&hard_max.to_string()),
+            "the diagnostic must name the field and its ceiling: {error}"
+        );
+        assert!(
+            validate_plugin_config("ai_transcript_audit", &over_bound).is_err(),
+            "shared shape-only validation must refuse 'grpc.{key}' above {hard_max}"
+        );
+    }
+
+    // The ceilings stay tied to the constants they were derived from.
+    assert_eq!(
+        HARD_MAX_GRPC_MAX_MESSAGE_BYTES, 8_388_608,
+        "per-message ceiling must match the 8 MiB aggregate scan ceiling"
+    );
+    assert_eq!(HARD_MAX_GRPC_MAX_MESSAGES, 1_024);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_unary_roundtrip_redacts_credential_in_payload() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+    let resp = grpc_frame(&hello_response_bytes(
+        "token=AKIAIOSFODNN7EXAMPLE keep secret",
+    ));
+    let headers = grpc_headers();
+
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &resp)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "expected one audit record, got {records:?}"
+    );
+    let record = &records[0];
+    let request_body = record
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let response_body = record
+        .get("response_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !request_body.contains("agent@example.com"),
+        "request excerpt leaked email: {request_body}"
+    );
+    assert!(
+        !response_body.contains("AKIAIOSFODNN7EXAMPLE"),
+        "response excerpt leaked aws key: {response_body}"
+    );
+    assert!(
+        request_body.contains("grpc_method") && response_body.contains("grpc_method"),
+        "excerpts must be schema-shaped JSON: req={request_body} resp={response_body}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_malformed_and_oversized_frames_omit_excerpt() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "redaction": { "builtins": ["email"], "hash_redacted_values": false },
+                "grpc": {
+                    "descriptor_path": grpc_descriptor_path(),
+                    "max_message_bytes": 16,
+                    "max_messages": 1,
+                    "methods": {
+                        "/test.Greeter/SayHello": {
+                            "request_type": "test.HelloRequest",
+                            "response_type": "test.HelloResponse"
+                        }
+                    }
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let payload = hello_request_bytes("hello");
+    let mut truncated = grpc_frame(&payload);
+    truncated.pop();
+    let oversized = grpc_frame(&payload); // payload + frame > 16-byte message ceiling
+    let mut multi = grpc_frame(&hello_response_bytes("one"));
+    multi.extend_from_slice(&grpc_frame(&hello_response_bytes("two")));
+
+    // Truncated request → omit with framing reason, still emit a record.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let headers = grpc_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &truncated)
+        .await;
+    plugin
+        .capture_final_response_body(
+            &mut ctx,
+            200,
+            &headers,
+            &grpc_frame(&hello_response_bytes("ok")),
+        )
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let omitted = records[0]
+        .get("request_body_omitted_reason")
+        .and_then(Value::as_str);
+    let req_body = records[0]
+        .get("request_body")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        omitted == Some("grpc_framing_error")
+            || omitted == Some("grpc_message_limit")
+            || req_body.is_null()
+            || records[0]
+                .get("request_body_truncated")
+                .and_then(Value::as_bool)
+                == Some(true),
+        "truncated frame must omit/flag excerpt: record={} omitted={omitted:?}",
+        records[0]
+    );
+
+    // Oversized declared length / multi-frame above max_messages on response.
+    let server2 = mock_sink().await;
+    let endpoint2 = format!("{}/ingest", server2.uri());
+    let plugin2 = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint2,
+            json!({
+                "redaction": { "builtins": ["email"], "hash_redacted_values": false },
+                "grpc": {
+                    "descriptor_path": grpc_descriptor_path(),
+                    "max_messages": 1,
+                    "methods": {
+                        "/test.Greeter/SayHello": {
+                            "request_type": "test.HelloRequest",
+                            "response_type": "test.HelloResponse"
+                        }
+                    }
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin2.start_background_tasks().unwrap();
+    plugin2.commit_background_tasks();
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let headers = grpc_headers();
+    let req = grpc_frame(&hello_request_bytes("clean"));
+    plugin2
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    plugin2
+        .capture_final_response_body(&mut ctx, 200, &headers, &multi)
+        .await;
+    let records = wait_for_records(&server2).await;
+    assert_eq!(records.len(), 1);
+    let resp_omitted = records[0]
+        .get("response_body_omitted_reason")
+        .and_then(Value::as_str);
+    let resp_body = records[0]
+        .get("response_body")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        resp_omitted == Some("grpc_message_limit")
+            || resp_body.is_null()
+            || records[0]
+                .get("response_body_truncated")
+                .and_then(Value::as_bool)
+                == Some(true),
+        "max_messages overflow must omit response excerpt: {}",
+        records[0]
+    );
+
+    // Keep oversized local binding used (construction with max_message_bytes).
+    let _ = oversized;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_compressed_identity_and_unsupported_encoding() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().unwrap();
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let mut headers = grpc_headers();
+    headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let req = gzip_grpc_frame(&hello_request_bytes("ops@example.com"));
+    let resp = gzip_grpc_frame(&hello_response_bytes("clean"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &resp)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !request_body.contains("ops@example.com"),
+        "gzip frame must still be redacted: {request_body}"
+    );
+
+    // Unsupported encoding omits rather than exporting compressed bytes.
+    let server2 = mock_sink().await;
+    let endpoint2 = format!("{}/ingest", server2.uri());
+    let plugin2 = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint2, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin2.start_background_tasks().unwrap();
+    plugin2.commit_background_tasks();
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let mut headers = grpc_headers();
+    headers.insert("grpc-encoding".to_string(), "snappy".to_string());
+    let body = gzip_grpc_frame(&hello_request_bytes("secret@example.com"));
+    plugin2
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    plugin2
+        .capture_final_response_body(
+            &mut ctx,
+            200,
+            &grpc_headers(),
+            &grpc_frame(&hello_response_bytes("ok")),
+        )
+        .await;
+    let records = wait_for_records(&server2).await;
+    assert_eq!(records.len(), 1);
+    let request_body = records[0]
+        .get("request_body")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let omitted = records[0]
+        .get("request_body_omitted_reason")
+        .and_then(Value::as_str);
+    assert_eq!(
+        omitted,
+        Some("grpc_framing_error"),
+        "unsupported encoding must omit with grpc_framing_error: {}",
+        records[0]
+    );
+    assert!(
+        request_body.is_null(),
+        "an omitted framing failure must export no request body: {request_body}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_unenrolled_method_never_stages() {
+    let plugin = grpc_audit_plugin(grpc_audit_overrides());
+    let mut ctx = grpc_ctx("/test.Greeter/Other");
+    let headers = grpc_headers();
+    let body = grpc_frame(&hello_request_bytes("agent@example.com"));
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        !ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .is_some_and(|v| v == "true"),
+        "unenrolled methods must not become audit candidates"
+    );
+}
+
+/// `grpc_method_router` publishes `grpc_full_method` WITHOUT a leading slash
+/// (`parse_grpc_path` strips it and `grpc_method_metadata` rejoins
+/// `service + "/" + method`), while every enrollment key is normalized to
+/// `/package.Service/Method`. Preferring that metadata verbatim would make it
+/// unable to match any enrolled key while still suppressing the `ctx.path`
+/// fallback, so a proxy running both plugins would silently capture nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_full_method_metadata_without_leading_slash_still_enrolls() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    // The client path is deliberately NOT enrolled: only the router-published
+    // method (which is also what reflects a method rewrite) can select capture.
+    let mut ctx = grpc_ctx("/rewritten.Client/Path");
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "a slash-less grpc_full_method must still select the enrolled method"
+    );
+    assert!(plugin.should_buffer_response_body(&ctx));
+
+    let headers = grpc_headers();
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+    let resp = grpc_frame(&hello_response_bytes("ok"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "an enrolled router-rewritten method must stage an audit candidate"
+    );
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &resp)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "enrolled gRPC capture must not be silently disabled, got {records:?}"
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        request_body.contains("/test.Greeter/SayHello"),
+        "the excerpt must report the normalized enrolled method: {request_body}"
+    );
+    assert!(
+        !request_body.contains("agent@example.com"),
+        "captured excerpt leaked an email: {request_body}"
+    );
+}
+
+/// Provisional (client-path) method UNENROLLED -> backend-effective method
+/// ENROLLED.
+///
+/// `should_buffer_request_body` and `before_proxy` both run before
+/// `on_backend_path_resolved`, so they only see the client path. A client path
+/// like `/prefix/test.Greeter/SayHello` does not even parse as a gRPC method,
+/// yet listen-path stripping makes the backend-effective method the enrolled
+/// `/test.Greeter/SayHello`. If the buffer gate answered `false` there, the
+/// request would ride the native-gRPC streaming fast path and no final
+/// request-body hook would ever run — a silent, total capture loss.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_backend_effective_method_enrolls_after_unenrolled_client_path() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/prefix/test.Greeter/SayHello");
+    // The provisional publication from `grpc_method_router::on_request_received`
+    // is absent, because the client path does not parse as `/service/method`.
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "a native gRPC request must buffer before the backend-effective method \
+         is known, or it can never be re-decided"
+    );
+
+    let mut headers = grpc_headers();
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    let staged = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(staged, PluginResult::Continue));
+    assert!(
+        !ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .is_some_and(|value| value == "true"),
+        "an unenrolled client-path method must not stage in before_proxy"
+    );
+
+    // `grpc_method_router::on_backend_path_resolved` republishes the
+    // backend-effective method (without a leading slash).
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the backend-effective method enrolls this call, so it must be captured"
+    );
+
+    let resp = grpc_frame(&hello_response_bytes("ok"));
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &resp)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "a backend-effective enrolled method must emit exactly one record, got {records:?}"
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        request_body.contains("/test.Greeter/SayHello"),
+        "the excerpt must report the normalized enrolled method: {request_body}"
+    );
+    assert!(
+        !request_body.contains("agent@example.com"),
+        "captured excerpt leaked an email: {request_body}"
+    );
+}
+
+/// Provisional (client-path) method ENROLLED -> backend-effective method
+/// UNENROLLED.
+///
+/// `before_proxy` legitimately stages against the client path (that view is
+/// authoritative for a pre-routing short circuit), but once the authoritative
+/// backend-effective method refutes enrollment the provisional entry must be
+/// discarded: no record for the refuted method, and the protobuf frames must
+/// never be reinterpreted through the HTTP/JSON capture path.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_backend_effective_method_refutes_enrolled_client_path() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let mut headers = grpc_headers();
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the provisional client-path method is enrolled, so before_proxy stages"
+    );
+
+    // A route override / upstream target path makes the backend-effective
+    // method a different, unenrolled one.
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/Other".to_string(),
+    );
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("false"),
+        "a refuted backend-effective method must discard the provisional candidate"
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_transcript_audit.request_hash"),
+        "no request hash may survive a refuted enrollment"
+    );
+
+    let resp = grpc_frame(&hello_response_bytes("ok"));
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &resp)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let records = received_records(&server).await;
+    assert!(
+        records.is_empty(),
+        "a method the authoritative view does not enroll must emit no record, got {records:?}"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// gRPC name-based redaction parity with the HTTP JSON contract
+// ══════════════════════════════════════════════════════════════════════
+//
+// The checked-in `test_validator.bin` fixture has no repeated, map, or nested
+// message fields, so these tests encode a proto3 `FileDescriptorSet` directly
+// from `descriptor.proto` wire shapes — no `protoc` run and no new checked-in
+// fixture binary.
+//
+// ```proto
+// syntax = "proto3";
+// package audit;
+// message Credentials { string display_name = 1; }
+// message Payload {
+//   string prompt = 1;
+//   repeated string api_keys = 2;
+//   map<string, string> metadata = 3;
+//   Credentials credentials = 4;
+//   string tool_arguments = 5;
+//   map<string, string> labels = 6;
+// }
+// message Ack { string status = 1; }
+// ```
+
+const PB3_LABEL_OPTIONAL: u64 = 1;
+const PB3_LABEL_REPEATED: u64 = 3;
+const PB3_TYPE_STRING: u64 = 9;
+const PB3_TYPE_MESSAGE: u64 = 11;
+const PB3_CREDENTIALS: &str = ".audit.Credentials";
+const PB3_METADATA_ENTRY: &str = ".audit.Payload.MetadataEntry";
+const PB3_LABELS_ENTRY: &str = ".audit.Payload.LabelsEntry";
+
+fn pb3_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn pb3_tag(out: &mut Vec<u8>, field: u32, wire: u64) {
+    pb3_varint(out, (u64::from(field) << 3) | wire);
+}
+
+fn pb3_len_field(field: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    pb3_tag(&mut out, field, 2);
+    pb3_varint(&mut out, payload.len() as u64);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn pb3_str_field(field: u32, value: &str) -> Vec<u8> {
+    pb3_len_field(field, value.as_bytes())
+}
+
+fn pb3_varint_field(field: u32, value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    pb3_tag(&mut out, field, 0);
+    pb3_varint(&mut out, value);
+    out
+}
+
+/// One `FieldDescriptorProto`.
+fn pb3_field(name: &str, number: u32, label: u64, kind: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(pb3_str_field(1, name));
+    out.extend(pb3_varint_field(3, u64::from(number)));
+    out.extend(pb3_varint_field(4, label));
+    out.extend(pb3_varint_field(5, kind));
+    out
+}
+
+/// A message-typed `FieldDescriptorProto` (`type_name` is field 6).
+fn pb3_message_field(name: &str, number: u32, label: u64, ty: &str) -> Vec<u8> {
+    let mut out = pb3_field(name, number, label, PB3_TYPE_MESSAGE);
+    out.extend(pb3_str_field(6, ty));
+    out
+}
+
+/// One `DescriptorProto`.
+fn pb3_message(name: &str, fields: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = pb3_str_field(1, name);
+    for field in fields {
+        out.extend(pb3_len_field(2, field));
+    }
+    out
+}
+
+fn pb3_with_nested(mut message: Vec<u8>, nested: &[u8]) -> Vec<u8> {
+    message.extend(pb3_len_field(3, nested));
+    message
+}
+
+/// Set `MessageOptions.map_entry` (options is field 7; map_entry is field 7).
+fn pb3_as_map_entry(mut message: Vec<u8>) -> Vec<u8> {
+    let options = pb3_varint_field(7, 1);
+    message.extend(pb3_len_field(7, &options));
+    message
+}
+
+/// A synthetic `map<string, string>` entry message.
+fn pb3_string_map_entry(name: &str) -> Vec<u8> {
+    let key = pb3_field("key", 1, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let value = pb3_field("value", 2, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    pb3_as_map_entry(pb3_message(name, &[key, value]))
+}
+
+fn audit_descriptor_set() -> Vec<u8> {
+    let display_name = pb3_field("display_name", 1, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let credentials_msg = pb3_message("Credentials", &[display_name]);
+
+    let prompt = pb3_field("prompt", 1, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let api_keys = pb3_field("api_keys", 2, PB3_LABEL_REPEATED, PB3_TYPE_STRING);
+    let metadata = pb3_message_field("metadata", 3, PB3_LABEL_REPEATED, PB3_METADATA_ENTRY);
+    let credentials = pb3_message_field("credentials", 4, PB3_LABEL_OPTIONAL, PB3_CREDENTIALS);
+    let tool_arguments = pb3_field("tool_arguments", 5, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let label_map = pb3_message_field("labels", 6, PB3_LABEL_REPEATED, PB3_LABELS_ENTRY);
+    let fields = vec![
+        prompt,
+        api_keys,
+        metadata,
+        credentials,
+        tool_arguments,
+        label_map,
+    ];
+    let payload = pb3_message("Payload", &fields);
+    let payload = pb3_with_nested(payload, &pb3_string_map_entry("MetadataEntry"));
+    let payload = pb3_with_nested(payload, &pb3_string_map_entry("LabelsEntry"));
+
+    let status = pb3_field("status", 1, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let ack = pb3_message("Ack", &[status]);
+
+    let mut file = pb3_str_field(1, "audit.proto");
+    file.extend(pb3_str_field(2, "audit"));
+    for message in [credentials_msg, payload, ack] {
+        file.extend(pb3_len_field(4, &message));
+    }
+    file.extend(pb3_str_field(12, "proto3"));
+    pb3_len_field(1, &file)
+}
+
+fn audit_descriptor_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bytes = audit_descriptor_set();
+    std::fs::write(dir.path().join("audit.bin"), bytes).expect("write pb set");
+    dir
+}
+
+fn audit_descriptor_path(dir: &tempfile::TempDir) -> String {
+    dir.path().join("audit.bin").to_string_lossy().to_string()
+}
+
+/// Only `email` is enabled, so no built-in pattern can match a bearer token,
+/// an `sk-`-free opaque key, or the embedded-JSON secret: the field-name
+/// policy is the only thing that can keep them out of the excerpt.
+fn audit_grpc_overrides(dir: &tempfile::TempDir) -> Value {
+    json!({
+        "redaction": { "builtins": ["email"], "hash_redacted_values": false },
+        "grpc": {
+            "descriptor_path": audit_descriptor_path(dir),
+            "methods": {
+                "/audit.Sink/Ingest": {
+                    "request_type": "audit.Payload",
+                    "response_type": "audit.Ack"
+                }
+            }
+        }
+    })
+}
+
+#[derive(Default)]
+struct AuditPayload<'a> {
+    prompt: Option<&'a str>,
+    api_keys: Vec<&'a str>,
+    metadata: Vec<(&'a str, &'a str)>,
+    display_name: Option<&'a str>,
+    tool_arguments: Option<&'a str>,
+    labels: Vec<(&'a str, &'a str)>,
+}
+
+fn audit_string_list(values: &[&str]) -> prost_reflect::Value {
+    use prost_reflect::Value;
+
+    let items = values
+        .iter()
+        .map(|v| Value::String(v.to_string()))
+        .collect();
+    Value::List(items)
+}
+
+fn audit_string_map(entries: &[(&str, &str)]) -> prost_reflect::Value {
+    use prost_reflect::{MapKey, Value};
+
+    let map = entries
+        .iter()
+        .map(|(k, v)| (MapKey::String(k.to_string()), Value::String(v.to_string())))
+        .collect();
+    Value::Map(map)
+}
+
+fn audit_payload_bytes(dir: &tempfile::TempDir, payload: AuditPayload<'_>) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(audit_descriptor_path(dir)).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("audit.Payload").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    if let Some(prompt) = payload.prompt {
+        msg.set_field_by_name("prompt", Value::String(prompt.to_string()));
+    }
+    if !payload.api_keys.is_empty() {
+        msg.set_field_by_name("api_keys", audit_string_list(&payload.api_keys));
+    }
+    if !payload.metadata.is_empty() {
+        msg.set_field_by_name("metadata", audit_string_map(&payload.metadata));
+    }
+    if let Some(display_name) = payload.display_name {
+        let credentials = pool.get_message_by_name("audit.Credentials").unwrap();
+        let mut inner = DynamicMessage::new(credentials);
+        inner.set_field_by_name("display_name", Value::String(display_name.to_string()));
+        msg.set_field_by_name("credentials", Value::Message(inner));
+    }
+    if let Some(arguments) = payload.tool_arguments {
+        msg.set_field_by_name("tool_arguments", Value::String(arguments.to_string()));
+    }
+    if !payload.labels.is_empty() {
+        msg.set_field_by_name("labels", audit_string_map(&payload.labels));
+    }
+    msg.encode_to_vec()
+}
+
+fn audit_ack_bytes(dir: &tempfile::TempDir, status: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(audit_descriptor_path(dir)).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("audit.Ack").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("status", Value::String(status.to_string()));
+    msg.encode_to_vec()
+}
+
+/// Run one enrolled unary gRPC roundtrip and return the exported request
+/// excerpt (the `request_body` field of the single emitted audit record).
+async fn audit_grpc_request_excerpt(payload: AuditPayload<'_>) -> String {
+    let dir = audit_descriptor_dir();
+    let request = grpc_frame(&audit_payload_bytes(&dir, payload));
+    let response = grpc_frame(&audit_ack_bytes(&dir, "ok"));
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, audit_grpc_overrides(&dir)),
+        loopback_http_client(),
+    )
+    .expect("valid audit grpc config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/audit.Sink/Ingest");
+    let headers = grpc_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &request)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &response)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "expected one audit record, got {records:?}"
+    );
+    records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A `map<string, string>` keyed `authorization` is the severe case: the
+/// exported label is an ordinal path (`metadata.0`), whose leaf segment is not
+/// a sensitive name, and no built-in pattern matches a generic bearer token.
+/// Only consulting the map key keeps the credential out of the sink.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_sensitive_map_key_redacts_value_without_exporting_the_key() {
+    let payload = AuditPayload {
+        prompt: Some("summarize the ticket"),
+        metadata: vec![("authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.body.sig")],
+        labels: vec![("note", "second pass")],
+        ..AuditPayload::default()
+    };
+    let excerpt = audit_grpc_request_excerpt(payload).await;
+
+    assert!(
+        !excerpt.contains("eyJhbGciOiJIUzI1NiJ9"),
+        "a map value keyed `authorization` leaked a bearer token: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("Bearer "),
+        "a map value keyed `authorization` leaked a bearer token: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("[REDACTED]"),
+        "the sensitive map value must export the placeholder: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("authorization"),
+        "map keys must stay out of the exported transcript label: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("second pass"),
+        "a benign map value must still be captured: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("summarize the ticket"),
+        "a benign string field must still be captured: {excerpt}"
+    );
+}
+
+/// Every entry of one protobuf map must survive under a collision-free ordinal
+/// path. Emitting every value under the same `metadata.*` label let later
+/// `fields.insert` overwrite earlier entries, so a map with a benign value and
+/// a sensitive-keyed value could keep only one of them.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_same_map_preserves_benign_and_redacted_entries_without_exporting_keys() {
+    let payload = AuditPayload {
+        prompt: Some("summarize the ticket"),
+        metadata: vec![
+            ("note", "benign-map-value-keep"),
+            ("authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.same-map.sig"),
+        ],
+        ..AuditPayload::default()
+    };
+    let excerpt = audit_grpc_request_excerpt(payload).await;
+
+    assert!(
+        excerpt.contains("benign-map-value-keep"),
+        "a benign same-map value must survive ordinal export: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("eyJhbGciOiJIUzI1NiJ9"),
+        "a sensitive same-map value leaked a bearer token: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("Bearer "),
+        "a sensitive same-map value leaked a bearer token: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("[REDACTED]"),
+        "the sensitive same-map value must export the placeholder: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("authorization"),
+        "literal map key `authorization` must not be exported: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("\"note\""),
+        "literal map key `note` must not be exported: {excerpt}"
+    );
+    // Ordinal path segments distinguish entries without naming the keys.
+    assert!(
+        excerpt.contains("metadata.0") || excerpt.contains("metadata.1"),
+        "map values must export under ordinal paths: {excerpt}"
+    );
+}
+
+/// On H1/H2 the final-body hook receives an authoritative backend-visible
+/// header map while `ctx.headers` can be a stale lightweight clone. Framing
+/// must read `grpc-encoding` from the hook map so a compressed request is not
+/// parsed as identity.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_final_hook_headers_are_authoritative_for_request_framing() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().unwrap();
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    // Stale context map: no grpc-encoding (would be treated as identity).
+    ctx.headers.remove("grpc-encoding");
+    let mut hook_headers = grpc_headers();
+    hook_headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let req = gzip_grpc_frame(&hello_request_bytes("ops@example.com"));
+    let resp = grpc_frame(&hello_response_bytes("clean"));
+
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &hook_headers, &req)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &grpc_headers(), &resp)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "expected one audit record, got {records:?}"
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !request_body.is_empty(),
+        "gzip framing from hook headers must produce a real excerpt: {}",
+        records[0]
+    );
+    assert!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str)
+            .is_none(),
+        "hook-header gzip must not omit the request excerpt: {}",
+        records[0]
+    );
+    assert!(
+        !request_body.contains("ops@example.com"),
+        "decoded gzip excerpt must still redact the email: {request_body}"
+    );
+    assert!(
+        request_body.contains("[REDACTED:email"),
+        "decoded gzip excerpt must export a redacted placeholder, not merely omit the secret: {request_body}"
+    );
+    assert!(
+        request_body.contains("/test.Greeter/SayHello"),
+        "decoded gzip excerpt must report the enrolled method: {request_body}"
+    );
+}
+
+/// Unsupported finalized `grpc-encoding` must omit with the exact framing
+/// reason — a null body alone is not enough evidence of fail-closed behavior.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_final_hook_unsupported_encoding_omits_with_framing_reason() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().unwrap();
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    // Stale context claims gzip; the authoritative hook map says snappy.
+    ctx.headers
+        .insert("grpc-encoding".to_string(), "gzip".to_string());
+    let mut hook_headers = grpc_headers();
+    hook_headers.insert("grpc-encoding".to_string(), "snappy".to_string());
+    let body = gzip_grpc_frame(&hello_request_bytes("secret@example.com"));
+
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &hook_headers, &body)
+        .await;
+    plugin
+        .capture_final_response_body(
+            &mut ctx,
+            200,
+            &grpc_headers(),
+            &grpc_frame(&hello_response_bytes("ok")),
+        )
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "expected one audit record, got {records:?}"
+    );
+    assert_eq!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
+        Some("grpc_framing_error"),
+        "unsupported finalized encoding must omit with grpc_framing_error: {}",
+        records[0]
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        request_body.is_null(),
+        "an omitted framing failure must export no request body: {request_body}"
+    );
+    assert!(
+        !format!("{records:?}").contains("secret@example.com"),
+        "unsupported encoding must not leak the secret into the record"
+    );
+}
+
+/// Ancestor names, repeated-field elements, and JSON embedded in a protobuf
+/// string all follow the HTTP JSON contract rather than a leaf-only check.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_name_redaction_covers_ancestors_repeats_and_embedded_json() {
+    let arguments = r#"{"api_key":"embedded-secret-value","city":"Paris"}"#;
+    let payload = AuditPayload {
+        prompt: Some("summarize the ticket"),
+        api_keys: vec!["repeated-secret-one", "repeated-secret-two"],
+        display_name: Some("Ada Lovelace"),
+        tool_arguments: Some(arguments),
+        ..AuditPayload::default()
+    };
+    let excerpt = audit_grpc_request_excerpt(payload).await;
+
+    // Repeated field: the label leaf is a numeric index, so the decision has
+    // to come from the `api_keys` field name and cover every element.
+    assert!(
+        !excerpt.contains("repeated-secret-one"),
+        "a `repeated string api_keys` element leaked: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("repeated-secret-two"),
+        "a `repeated string api_keys` element leaked: {excerpt}"
+    );
+    // Sensitive ancestor with a benign leaf.
+    assert!(
+        !excerpt.contains("Ada Lovelace"),
+        "`credentials.display_name` leaked under a sensitive parent: {excerpt}"
+    );
+    // JSON encoded inside a protobuf string.
+    assert!(
+        !excerpt.contains("embedded-secret-value"),
+        "JSON embedded in a protobuf string bypassed the policy: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("Paris"),
+        "embedded-JSON redaction must not blank the whole value: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("summarize the ticket"),
+        "a benign string field must still be captured: {excerpt}"
+    );
+}
+
+/// A configured `text_fields` selector names a field, not one arbitrary
+/// element of that field. Repeated strings must therefore retain every value
+/// under distinct indexed paths; stopping after the first value silently loses
+/// audit evidence while still presenting the excerpt as complete.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_text_fields_preserve_every_repeated_string_with_indexed_paths() {
+    let dir = audit_descriptor_dir();
+    let request = grpc_frame(&audit_payload_bytes(
+        &dir,
+        AuditPayload {
+            api_keys: vec!["first-selected-secret", "second-selected-secret"],
+            ..AuditPayload::default()
+        },
+    ));
+    let response = grpc_frame(&audit_ack_bytes(&dir, "ok"));
+    let mut overrides = audit_grpc_overrides(&dir);
+    overrides["grpc"]["methods"]["/audit.Sink/Ingest"]["text_fields"] = json!(["api_keys"]);
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, overrides),
+        loopback_http_client(),
+    )
+    .expect("valid repeated text_fields config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/audit.Sink/Ingest");
+    let headers = grpc_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &request)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &response)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "expected one audit record: {records:?}");
+    let excerpt = records[0]["request_body"].as_str().unwrap_or_default();
+    assert!(
+        excerpt.contains("api_keys.0") && excerpt.contains("api_keys.1"),
+        "every selected repeated value needs a collision-free indexed path: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("first-selected-secret") && !excerpt.contains("second-selected-secret"),
+        "selected sensitive repeated values must remain redacted: {excerpt}"
+    );
+}
+
+/// The descriptor-tree ceiling is a contract for one buffered RPC body, not a
+/// multiplier that resets for every legal frame. Otherwise a body below the
+/// decoded-byte limit can drive `max_messages` independent 50k-node walks and
+/// build correspondingly large temporary excerpt maps before the final string
+/// is truncated.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_walk_ceiling_is_aggregate_across_all_frames() {
+    let dir = audit_descriptor_dir();
+    let payload = audit_payload_bytes(
+        &dir,
+        AuditPayload {
+            api_keys: vec!["bounded"; 64],
+            ..AuditPayload::default()
+        },
+    );
+    let frame = grpc_frame(&payload);
+    let mut request = Vec::with_capacity(frame.len() * HARD_MAX_GRPC_MAX_MESSAGES);
+    for _ in 0..HARD_MAX_GRPC_MAX_MESSAGES {
+        request.extend_from_slice(&frame);
+    }
+    let response = grpc_frame(&audit_ack_bytes(&dir, "ok"));
+    let mut overrides = audit_grpc_overrides(&dir);
+    overrides["grpc"]["max_messages"] = json!(HARD_MAX_GRPC_MAX_MESSAGES);
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, overrides),
+        loopback_http_client(),
+    )
+    .expect("valid aggregate-walk config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/audit.Sink/Ingest");
+    let headers = grpc_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &request)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &response)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "expected one audit record: {records:?}");
+    assert_eq!(
+        records[0]["request_body_omitted_reason"].as_str(),
+        Some("grpc_scan_limit"),
+        "the body-wide node ceiling must omit rather than build a partial excerpt: {}",
+        records[0]
+    );
+    assert!(
+        records[0]["request_body"].is_null(),
+        "a scan-limited body must not export a partial excerpt: {}",
+        records[0]
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// gRPC walk-budget accounting
+// ══════════════════════════════════════════════════════════════════════
+//
+// Two more hand-encoded `FileDescriptorSet`s, built with the same wire-shape
+// helpers as above:
+//
+// ```proto
+// syntax = "proto3";
+// package wide;
+// message WideRequest { string f0 = 1; /* … */ string f39 = 40; }
+// message NarrowAck { string status = 1; }
+//
+// package deep;
+// message Deep0 { Deep1 next = 1; } /* … */ message Deep39 { string leaf = 1; }
+// ```
+
+/// Comfortably above the walk budget's 32-level depth ceiling, so a leaked
+/// level per miss exhausts it before the last configured path is read.
+const WIDE_REQUEST_FIELD_COUNT: usize = 40;
+
+/// Deeper than the same ceiling, so the walk cannot clear the tree.
+const DEEP_NEST_LEVELS: usize = 40;
+
+fn wide_descriptor_set() -> Vec<u8> {
+    let request_fields: Vec<Vec<u8>> = (0..WIDE_REQUEST_FIELD_COUNT)
+        .map(|index| {
+            pb3_field(
+                &format!("f{index}"),
+                index as u32 + 1,
+                PB3_LABEL_OPTIONAL,
+                PB3_TYPE_STRING,
+            )
+        })
+        .collect();
+    let request = pb3_message("WideRequest", &request_fields);
+    let status = pb3_field("status", 1, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let ack = pb3_message("NarrowAck", &[status]);
+
+    let mut file = pb3_str_field(1, "wide.proto");
+    file.extend(pb3_str_field(2, "wide"));
+    for message in [request, ack] {
+        file.extend(pb3_len_field(4, &message));
+    }
+    file.extend(pb3_str_field(12, "proto3"));
+    pb3_len_field(1, &file)
+}
+
+fn deep_descriptor_set() -> Vec<u8> {
+    let mut messages = Vec::with_capacity(DEEP_NEST_LEVELS);
+    for level in 0..DEEP_NEST_LEVELS - 1 {
+        let next = pb3_message_field(
+            "next",
+            1,
+            PB3_LABEL_OPTIONAL,
+            &format!(".deep.Deep{}", level + 1),
+        );
+        messages.push(pb3_message(&format!("Deep{level}"), &[next]));
+    }
+    let leaf = pb3_field("leaf", 1, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let innermost = format!("Deep{}", DEEP_NEST_LEVELS - 1);
+    messages.push(pb3_message(&innermost, &[leaf]));
+
+    let mut file = pb3_str_field(1, "deep.proto");
+    file.extend(pb3_str_field(2, "deep"));
+    for message in &messages {
+        file.extend(pb3_len_field(4, message));
+    }
+    file.extend(pb3_str_field(12, "proto3"));
+    pb3_len_field(1, &file)
+}
+
+fn write_descriptor(name: &str, bytes: Vec<u8>) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(name);
+    std::fs::write(&path, bytes).expect("write pb set");
+    let path = path.to_string_lossy().to_string();
+    (dir, path)
+}
+
+fn wide_request_bytes(descriptor_path: &str, first_value: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(descriptor_path).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("wide.WideRequest").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("f0", Value::String(first_value.to_string()));
+    msg.encode_to_vec()
+}
+
+fn narrow_ack_bytes(descriptor_path: &str, status: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(descriptor_path).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("wide.NarrowAck").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("status", Value::String(status.to_string()));
+    msg.encode_to_vec()
+}
+
+fn deep_message_bytes(descriptor_path: &str, leaf: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(descriptor_path).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let innermost = pool
+        .get_message_by_name(&format!("deep.Deep{}", DEEP_NEST_LEVELS - 1))
+        .expect("innermost descriptor");
+    let mut current = DynamicMessage::new(innermost);
+    current.set_field_by_name("leaf", Value::String(leaf.to_string()));
+    for level in (0..DEEP_NEST_LEVELS - 1).rev() {
+        let descriptor = pool
+            .get_message_by_name(&format!("deep.Deep{level}"))
+            .expect("nested descriptor");
+        let mut outer = DynamicMessage::new(descriptor);
+        outer.set_field_by_name("next", Value::Message(current));
+        current = outer;
+    }
+    current.encode_to_vec()
+}
+
+/// A `text_fields` path only has to resolve against ONE of the method's roots,
+/// so configuring request-only paths is legitimate. Each of those is an
+/// ordinary miss while the RESPONSE is shaped; if a miss leaked a level of the
+/// frame's shared walk budget, the later `status` path would be silently
+/// dropped and the excerpt would export a partial `fields` object with no
+/// omission reason at all.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_request_only_text_fields_do_not_exhaust_the_response_walk_budget() {
+    let (_dir, descriptor_path) = write_descriptor("wide.bin", wide_descriptor_set());
+    let mut text_fields: Vec<String> = (0..WIDE_REQUEST_FIELD_COUNT)
+        .map(|index| format!("f{index}"))
+        .collect();
+    text_fields.push("status".to_string());
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "redaction": { "builtins": ["email"], "hash_redacted_values": false },
+                "grpc": {
+                    "descriptor_path": descriptor_path.as_str(),
+                    "methods": {
+                        "/wide.Sink/Ingest": {
+                            "request_type": "wide.WideRequest",
+                            "response_type": "wide.NarrowAck",
+                            "text_fields": text_fields
+                        }
+                    }
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid wide grpc config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/wide.Sink/Ingest");
+    let headers = grpc_headers();
+    let request = grpc_frame(&wide_request_bytes(&descriptor_path, "summarize"));
+    let response = grpc_frame(&narrow_ack_bytes(&descriptor_path, "walk-budget-intact"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &request)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &response)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "expected one audit record, got {records:?}"
+    );
+    assert_eq!(
+        records[0]
+            .get("response_body_omitted_reason")
+            .and_then(Value::as_str),
+        None,
+        "the response excerpt must not be omitted here: {}",
+        records[0]
+    );
+    let response_body = records[0]
+        .get("response_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        response_body.contains("walk-budget-intact"),
+        "request-only text_fields must not leak walk depth and silently drop a \
+         configured response field: {response_body}"
+    );
+}
+
+/// Exhausting the node/depth ceiling is not a decode failure. Both fail closed,
+/// but the compiled-in omission reason is the operator's only evidence of WHY,
+/// so a scan-ceiling stop must say `grpc_scan_limit`.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_walk_ceiling_omits_with_the_scan_limit_reason() {
+    let (_dir, descriptor_path) = write_descriptor("deep.bin", deep_descriptor_set());
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "redaction": { "builtins": ["email"], "hash_redacted_values": false },
+                "grpc": {
+                    "descriptor_path": descriptor_path.as_str(),
+                    "methods": {
+                        "/deep.Sink/Ingest": {
+                            "request_type": "deep.Deep0",
+                            "response_type": "deep.Deep0"
+                        }
+                    }
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid deep grpc config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/deep.Sink/Ingest");
+    let headers = grpc_headers();
+    let nested = grpc_frame(&deep_message_bytes(&descriptor_path, "leaf value"));
+    // An empty `Deep0` keeps the response side an ordinary shallow capture, so
+    // only the request exercises the walk ceiling.
+    let shallow = grpc_frame(&[]);
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &nested)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &shallow)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "expected one audit record, got {records:?}"
+    );
+    assert_eq!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
+        Some("grpc_scan_limit"),
+        "a walk-ceiling stop is not a decode error: {}",
+        records[0]
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        request_body.is_null(),
+        "an omitted excerpt must export no partial body: {request_body}"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Binary-safe staging, short-circuit framing, deterministic map ordinals
+// ══════════════════════════════════════════════════════════════════════
+
+/// `test.HelloRequest` with an explicit `age`. A negative `int32` encodes as a
+/// ten-byte varint of `0xFF` bytes, so the resulting frame is guaranteed NOT to
+/// be valid UTF-8 — the shape ordinary native protobuf traffic takes and the
+/// UTF-8-only `request_body` metadata view cannot represent.
+fn hello_request_bytes_with_age(name: &str, age: i32) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value as ProtoValue};
+
+    let bytes = std::fs::read(grpc_descriptor_path()).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("test.HelloRequest").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("name", ProtoValue::String(name.to_string()));
+    msg.set_field_by_name("age", ProtoValue::I32(age));
+    msg.encode_to_vec()
+}
+
+fn live_grpc_audit_plugin(endpoint: &str) -> AiTranscriptAudit {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid audit grpc config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin
+}
+
+/// The binary snapshot opt-in is what makes non-UTF-8 protobuf stageable before
+/// `before_proxy` returns. It is instance-scoped, so an HTTP-only instance must
+/// not pay for it.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_enrollment_opts_into_binary_request_body_bytes() {
+    let grpc_plugin = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid audit grpc config");
+    assert!(
+        grpc_plugin.needs_request_body_bytes(),
+        "an enrolled gRPC instance must retain the binary request body: native \
+         protobuf is routinely not valid UTF-8"
+    );
+
+    let http_only = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid http-only audit config");
+    assert!(
+        !http_only.needs_request_body_bytes(),
+        "an HTTP-only instance must not pay for a second body representation"
+    );
+}
+
+/// Without binary-safe staging an enrolled protobuf request never becomes a
+/// candidate in `before_proxy`, so a later `before_proxy` plugin that returns a
+/// synthetic response or a rejection consumes the transaction unaudited.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_non_utf8_request_stages_and_captures_on_a_before_proxy_short_circuit() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = live_grpc_audit_plugin(&endpoint);
+
+    let payload = hello_request_bytes_with_age("binary-safe-subject", -1);
+    let request = grpc_frame(&payload);
+    assert!(
+        std::str::from_utf8(&request).is_err(),
+        "the fixture must be non-UTF-8 for this test to mean anything"
+    );
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    // Exactly what the proxy publishes for a non-UTF-8 body: no `request_body`
+    // text view, only the retained binary snapshot.
+    ctx.request_body_bytes = Some(Bytes::copy_from_slice(&request));
+    assert!(!ctx.metadata.contains_key("request_body"));
+
+    let mut proxy_headers = grpc_headers();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert!(
+        ctx.metadata.contains_key("ai_transcript_audit.record_id"),
+        "an enrolled binary gRPC request must stage before a later before_proxy \
+         plugin can short-circuit it: {:?}",
+        ctx.metadata
+    );
+
+    // A later `before_proxy` plugin terminates with a synthetic response: no
+    // final request-body hook runs for this transaction.
+    ctx.metadata.insert(
+        "ferrum:synthetic_short_circuit".to_string(),
+        "true".to_string(),
+    );
+    plugin
+        .capture_final_response_body(
+            &mut ctx,
+            200,
+            &grpc_headers(),
+            &grpc_frame(&hello_response_bytes("short-circuit reply")),
+        )
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "a short-circuited enrolled request must still be audited: {records:?}"
+    );
+    assert_eq!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
+        None,
+        "a binary request must not omit its excerpt: {}",
+        records[0]
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        request_body.contains("/test.Greeter/SayHello"),
+        "the excerpt must name the enrolled method: {request_body}"
+    );
+    assert!(
+        request_body.contains("binary-safe-subject"),
+        "a non-UTF-8 protobuf request must still export its decoded excerpt: \
+         {request_body}"
+    );
+}
+
+/// On a `before_proxy` short-circuit there is no finalized hook header map, and
+/// `ctx.headers` is a lightweight clone that can be missing the authoritative
+/// `grpc-encoding`. Framing must come from the witness recorded while the
+/// `before_proxy` map was live, or a compressed request omits as malformed.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_short_circuit_framing_uses_the_staged_witness_not_ctx_headers() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = live_grpc_audit_plugin(&endpoint);
+
+    let request = gzip_grpc_frame(&hello_request_bytes("witness-framed-subject"));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    // Stale context map: no `grpc-encoding` at all.
+    ctx.headers.remove("grpc-encoding");
+    ctx.request_body_bytes = Some(Bytes::copy_from_slice(&request));
+
+    // Authoritative `before_proxy` map: the request IS gzip-framed.
+    let mut proxy_headers = grpc_headers();
+    proxy_headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+
+    ctx.metadata.insert(
+        "ferrum:synthetic_short_circuit".to_string(),
+        "true".to_string(),
+    );
+    plugin
+        .capture_final_response_body(
+            &mut ctx,
+            200,
+            &grpc_headers(),
+            &grpc_frame(&hello_response_bytes("clean")),
+        )
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "expected one audit record: {records:?}");
+    assert_eq!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
+        None,
+        "the staged framing witness must decode the gzip request: {}",
+        records[0]
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        request_body.contains("witness-framed-subject"),
+        "the inflated excerpt must carry the decoded field: {request_body}"
+    );
+}
+
+/// The witness is a short-circuit fallback only. On ordinary dispatch the final
+/// request-body hook's own header parameter stays authoritative, so a late
+/// `grpc-encoding` rewrite after `before_proxy` is honored rather than being
+/// overridden by the earlier witness.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_final_hook_headers_outrank_the_staged_framing_witness() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = live_grpc_audit_plugin(&endpoint);
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    // `before_proxy` sees identity framing over the pre-transform body.
+    let identity = grpc_frame(&hello_request_bytes("pre-transform"));
+    ctx.request_body_bytes = Some(Bytes::copy_from_slice(&identity));
+    let mut proxy_headers = grpc_headers();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+
+    // A request transform then compresses the backend-visible body and rewrites
+    // `grpc-encoding` on the finalized map.
+    let mut hook_headers = grpc_headers();
+    hook_headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let final_body = gzip_grpc_frame(&hello_request_bytes("backend-visible-subject"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &hook_headers, &final_body)
+        .await;
+    plugin
+        .capture_final_response_body(
+            &mut ctx,
+            200,
+            &grpc_headers(),
+            &grpc_frame(&hello_response_bytes("clean")),
+        )
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "expected one audit record: {records:?}");
+    assert_eq!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
+        None,
+        "the hook's own header map must decode the rewritten framing: {}",
+        records[0]
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        request_body.contains("backend-visible-subject"),
+        "the backend-visible body must be the captured one: {request_body}"
+    );
+}
+
+/// Protobuf map entries live in a `HashMap`, so ordinal labels assigned from
+/// iteration order would name different entries run to run — and, under a
+/// bounded excerpt, change which entries survive truncation. Ordinals must come
+/// from a deterministic canonical key order while the keys themselves stay out
+/// of the transcript.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_map_ordinals_are_deterministic_and_key_ordered() {
+    // Deliberately inserted out of order.
+    let payload = || AuditPayload {
+        prompt: Some("map ordering"),
+        metadata: vec![
+            ("k_charlie", "map-value-charlie"),
+            ("k_alpha", "map-value-alpha"),
+            ("k_delta", "map-value-delta"),
+            ("k_bravo", "map-value-bravo"),
+        ],
+        ..AuditPayload::default()
+    };
+
+    let first = audit_grpc_request_excerpt(payload()).await;
+    let second = audit_grpc_request_excerpt(payload()).await;
+    assert_eq!(
+        first, second,
+        "identical input must produce an identical excerpt"
+    );
+
+    for (ordinal, expected) in [
+        (0, "map-value-alpha"),
+        (1, "map-value-bravo"),
+        (2, "map-value-charlie"),
+        (3, "map-value-delta"),
+    ] {
+        let label = format!("\"metadata.{ordinal}\":\"{expected}\"");
+        assert!(
+            first.contains(&label),
+            "map ordinals must follow canonical key order, missing {label}: {first}"
+        );
+    }
+    for key in ["k_alpha", "k_bravo", "k_charlie", "k_delta"] {
+        assert!(
+            !first.contains(key),
+            "literal map key {key} must never be exported: {first}"
+        );
+    }
 }

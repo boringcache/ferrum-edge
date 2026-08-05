@@ -1558,7 +1558,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |
 | `ws_rate_limiting` | | | ✓ | | | Per-connection frame rate limiting for WebSocket |
 | `udp_rate_limiting` | | | | | ✓ | Per-client-IP datagram and byte rate limiting for UDP proxies |
-| `ai_transcript_audit` | ✓ | | | | | HTTP-only AI transcript capture to a configured sink |
+| `ai_transcript_audit` | ✓ | ✓ | | | | HTTP AI transcript capture to a configured sink; native gRPC only for methods enrolled in the descriptor-based `grpc` block |
 | `ai_prompt_shield` | ✓ | | | | | HTTP-only PII detection/redaction for bare JSON prompts; native gRPC unsupported (gRPC-Web framed bodies are skipped) |
 | `waf` | ✓ | ✓ | ✓ | ✓ | ✓ | HTTP-family always, including complete WebSocket text/binary application messages in both directions; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured |
 | `fault_injection` | ✓ | ✓ | ✓ | ✓ | ✓ | Probabilistic aborts and delays across HTTP-family, TCP stream connect, and UDP/DTLS session + datagram hooks |

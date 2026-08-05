@@ -1,8 +1,8 @@
 use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, Consumer, DispatchKind, GatewayConfig,
-    LocalityPreference, MeshSdConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
-    ResolvedPortOverride, ResolvedSubsetTrafficPolicy, RetryConfig, SdProvider,
+    H2UpgradePolicy, LocalityPreference, MeshSdConfig, PluginAssociation, PluginConfig,
+    PluginScope, Proxy, ResolvedPortOverride, ResolvedSubsetTrafficPolicy, RetryConfig, SdProvider,
     ServiceDiscoveryConfig, Upstream, UpstreamPortOverride, UpstreamTarget, hosts_overlap,
     validate_host_entry, validate_resource_id, wildcard_matches,
 };
@@ -859,6 +859,7 @@ fn resolve_upstream_tls_falls_back_when_subset_overlay_is_empty_or_missing() {
                 ..BackendTlsConfig::default_verify()
             }),
             passive_health_check: None,
+            ..Default::default()
         },
     );
     upstream
@@ -3098,6 +3099,372 @@ fn backend_tls_sni_without_retry_or_buffering_passes_validate() {
         config.validate_upstream_references().is_ok(),
         "SNI alone must pass admission under default body limits"
     );
+}
+
+fn subset_sni_upstream(
+    subset_v1_policy: ResolvedSubsetTrafficPolicy,
+    subset_v2_policy: ResolvedSubsetTrafficPolicy,
+) -> Upstream {
+    let mut upstream = make_upstream("sni-subset-upstream");
+    upstream.backend_tls_sni = Some("backend.mesh.internal".into());
+    upstream.targets = vec![
+        UpstreamTarget {
+            host: "v1.local".into(),
+            port: 8080,
+            service_port_policy_key: None,
+            weight: 100,
+            tags: HashMap::from([("version".to_string(), "v1".to_string())]),
+            locality: None,
+            path: None,
+        },
+        UpstreamTarget {
+            host: "v2.local".into(),
+            port: 8080,
+            service_port_policy_key: None,
+            weight: 100,
+            tags: HashMap::from([("version".to_string(), "v2".to_string())]),
+            locality: None,
+            path: None,
+        },
+    ];
+    upstream.subsets = Some(vec![
+        ferrum_edge::config::types::SubsetDefinition {
+            name: "v1".into(),
+            labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+            traffic_policy: None,
+        },
+        ferrum_edge::config::types::SubsetDefinition {
+            name: "v2".into(),
+            labels: HashMap::from([("version".to_string(), "v2".to_string())]),
+            traffic_policy: None,
+        },
+    ]);
+    upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+        h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+        max_retries: Some(5),
+        http1_max_pending_requests: Some(90),
+        ..UpstreamPortOverride::default()
+    });
+    upstream
+        .resolved_subset_tls
+        .insert("v1".into(), subset_v1_policy);
+    upstream
+        .resolved_subset_tls
+        .insert("v2".into(), subset_v2_policy);
+    upstream
+}
+
+#[test]
+fn backend_tls_sni_with_subset_do_not_upgrade_fails_validate() {
+    let upstream = subset_sni_upstream(
+        ResolvedSubsetTrafficPolicy {
+            tls: None,
+            passive_health_check: None,
+            h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+            max_retries: Some(1),
+            http1_max_pending_requests: Some(1),
+        },
+        ResolvedSubsetTrafficPolicy {
+            tls: None,
+            passive_health_check: None,
+            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+            max_retries: Some(3),
+            http1_max_pending_requests: Some(4),
+        },
+    );
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("sni-subset-upstream".into());
+    proxy.upstream_subset = Some("v1".into());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+    config.normalize_fields();
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter().any(|msg| {
+            msg.contains("h2UpgradePolicy is DO_NOT_UPGRADE")
+                && msg.contains("backend TLS SNI")
+                && msg.contains("direct HTTP/2")
+        }),
+        "selected subset DO_NOT_UPGRADE + applicable SNI must reject, got {err:?}"
+    );
+}
+
+#[test]
+fn backend_tls_sni_with_sibling_subset_upgrade_does_not_false_reject() {
+    let upstream = subset_sni_upstream(
+        ResolvedSubsetTrafficPolicy {
+            tls: None,
+            passive_health_check: None,
+            h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+            max_retries: Some(1),
+            http1_max_pending_requests: Some(1),
+        },
+        ResolvedSubsetTrafficPolicy {
+            tls: None,
+            passive_health_check: None,
+            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+            max_retries: Some(3),
+            http1_max_pending_requests: Some(4),
+        },
+    );
+    let mut proxy = make_proxy("p-v2", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("sni-subset-upstream".into());
+    proxy.upstream_subset = Some("v2".into());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+    config.normalize_fields();
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "sibling subset UPGRADE must not inherit v1 DO_NOT_UPGRADE into SNI admission"
+    );
+}
+
+#[test]
+fn backend_tls_sni_ignores_sibling_subset_target_port_policy() {
+    let mut upstream = subset_sni_upstream(
+        ResolvedSubsetTrafficPolicy {
+            tls: None,
+            passive_health_check: None,
+            h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+            max_retries: Some(1),
+            http1_max_pending_requests: Some(1),
+        },
+        ResolvedSubsetTrafficPolicy {
+            tls: None,
+            passive_health_check: None,
+            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+            max_retries: Some(3),
+            http1_max_pending_requests: Some(4),
+        },
+    );
+    upstream.targets[1].port = 8443;
+    upstream.port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+            ..UpstreamPortOverride::default()
+        },
+    );
+    upstream.port_overrides.insert(
+        8443,
+        UpstreamPortOverride {
+            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+            ..UpstreamPortOverride::default()
+        },
+    );
+
+    let mut proxy = make_proxy("p-v2-distinct-port", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("sni-subset-upstream".into());
+    proxy.upstream_subset = Some("v2".into());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+    config.normalize_fields();
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "v1's force-H1 target port must not reject proxy-wide SNI admission for selected subset v2"
+    );
+}
+
+#[test]
+fn backend_tls_sni_per_port_upgrade_clears_inherited_do_not_upgrade() {
+    let mut upstream = make_upstream("sni-port-upstream");
+    upstream.backend_tls_sni = Some("backend.mesh.internal".into());
+    upstream.targets = vec![UpstreamTarget {
+        host: "svc.local".into(),
+        port: 8080,
+        service_port_policy_key: None,
+        weight: 100,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    }];
+    upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+        h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+        max_retries: Some(2),
+        http1_max_pending_requests: Some(10),
+        ..UpstreamPortOverride::default()
+    });
+    upstream.port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            // Explicit UPGRADE clears the inherited DO_NOT_UPGRADE for this port.
+            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+            ..UpstreamPortOverride::default()
+        },
+    );
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("sni-port-upstream".into());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+    config.normalize_fields();
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "per-port UPGRADE must clear inherited DO_NOT_UPGRADE for the SNI dial port"
+    );
+}
+
+#[test]
+fn backend_tls_sni_per_port_default_clears_inherited_do_not_upgrade() {
+    let mut upstream = make_upstream("sni-port-default-upstream");
+    upstream.backend_tls_sni = Some("backend.mesh.internal".into());
+    upstream.targets = vec![UpstreamTarget {
+        host: "svc.local".into(),
+        port: 8080,
+        service_port_policy_key: None,
+        weight: 100,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    }];
+    upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+        h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+        max_retries: Some(2),
+        http1_max_pending_requests: Some(10),
+        ..UpstreamPortOverride::default()
+    });
+    upstream.port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            h2_upgrade_policy: Some(H2UpgradePolicy::Default),
+            ..UpstreamPortOverride::default()
+        },
+    );
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("sni-port-default-upstream".into());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+    config.normalize_fields();
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "explicit per-port DEFAULT must clear inherited DO_NOT_UPGRADE for SNI admission"
+    );
+}
+
+#[test]
+fn backend_tls_sni_per_port_do_not_upgrade_rejects_only_that_port() {
+    let mut upstream = make_upstream("sni-mixed-ports");
+    let mut port_sni = BackendTlsConfig::default_verify();
+    port_sni.sni = Some("reviews.mesh.internal".into());
+    upstream.port_overrides.insert(
+        8443,
+        UpstreamPortOverride {
+            tls: Some(port_sni),
+            h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+            ..UpstreamPortOverride::default()
+        },
+    );
+    upstream.port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+            ..UpstreamPortOverride::default()
+        },
+    );
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("sni-mixed-ports".into());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+    config.normalize_fields();
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter().any(|msg| {
+            msg.contains("h2UpgradePolicy is DO_NOT_UPGRADE")
+                && msg.contains("per-port TLS SNI")
+                && msg.contains("8443")
+                && msg.contains("reviews.mesh.internal")
+        }),
+        "only the DO_NOT_UPGRADE SNI port must reject, got {err:?}"
+    );
+}
+
+#[test]
+fn selected_subset_http_policy_projects_onto_proxy_fallback_for_admission() {
+    // Public normalize/projection path: selected-subset HTTP fields overlay the
+    // inherited fallback with port > subset > top-level precedence, using
+    // admitted positive caps (not zero).
+    let upstream = subset_sni_upstream(
+        ResolvedSubsetTrafficPolicy {
+            tls: None,
+            passive_health_check: None,
+            h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+            max_retries: Some(1),
+            http1_max_pending_requests: Some(1),
+        },
+        ResolvedSubsetTrafficPolicy {
+            tls: None,
+            passive_health_check: None,
+            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+            max_retries: Some(3),
+            http1_max_pending_requests: Some(4),
+        },
+    );
+    // No SNI for this projection-only check.
+    let mut upstream = upstream;
+    upstream.backend_tls_sni = None;
+
+    let mut v1 = make_proxy("subset-v1", "/v1");
+    v1.upstream_id = Some("sni-subset-upstream".into());
+    v1.upstream_subset = Some("v1".into());
+    let mut v2 = make_proxy("subset-v2", "/v2");
+    v2.upstream_id = Some("sni-subset-upstream".into());
+    v2.upstream_subset = Some("v2".into());
+    let mut unmatched = make_proxy("subset-unmatched", "/unmatched");
+    unmatched.upstream_id = Some("sni-subset-upstream".into());
+
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![v1, v2, unmatched];
+    config.normalize_fields();
+
+    let fallback = |id: &str| {
+        config
+            .proxies
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| p.dispatch_port_override_fallback.clone())
+            .expect("fallback projected")
+    };
+    let v1_fb = fallback("subset-v1");
+    assert_eq!(v1_fb.h2_upgrade_policy, Some(H2UpgradePolicy::DoNotUpgrade));
+    assert_eq!(v1_fb.max_retries, Some(1));
+    assert_eq!(v1_fb.http1_max_pending_requests, Some(1));
+
+    let v2_fb = fallback("subset-v2");
+    assert_eq!(v2_fb.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
+    assert_eq!(v2_fb.max_retries, Some(3));
+    assert_eq!(v2_fb.http1_max_pending_requests, Some(4));
+
+    let unmatched_fb = fallback("subset-unmatched");
+    assert_eq!(
+        unmatched_fb.h2_upgrade_policy,
+        Some(H2UpgradePolicy::Upgrade)
+    );
+    assert_eq!(unmatched_fb.max_retries, Some(5));
+    assert_eq!(unmatched_fb.http1_max_pending_requests, Some(90));
 }
 
 #[test]

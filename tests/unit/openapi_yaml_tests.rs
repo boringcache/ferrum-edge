@@ -6090,6 +6090,9 @@ fn upstream_runtime_serialization_is_covered_by_openapi() {
                     "sni": "backend.example"
                 },
                 "connect_timeout_ms": 750,
+                "h2_upgrade_policy": "DO_NOT_UPGRADE",
+                "max_retries": 2,
+                "http1_max_pending_requests": 7,
                 "passive_health_check": {}
             }
         }],
@@ -7338,6 +7341,75 @@ async fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
             runtime_valid, expected_valid,
             "runtime/schema parity drift for {config}"
         );
+    }
+}
+
+/// `grpc.max_message_bytes` / `grpc.max_messages` carry immutable deployment
+/// maxima. The decoded-byte scan budget bounds decoded payload, not frame
+/// count, so an unbounded `max_messages` would let a body of legal zero-length
+/// frames drive an unbounded frame vector. Schema `maximum` and the runtime
+/// ceilings must agree, and both must accept exactly the bound and refuse one
+/// above it.
+#[tokio::test]
+async fn ai_transcript_audit_grpc_frame_budgets_are_bounded_in_openapi() {
+    use ferrum_edge::plugins::ai_transcript_audit::{
+        AiTranscriptAudit, HARD_MAX_GRPC_MAX_MESSAGE_BYTES, HARD_MAX_GRPC_MAX_MESSAGES,
+    };
+    use ferrum_edge::plugins::utils::PluginHttpClient;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let grpc_properties = spec
+        .pointer("/components/schemas/AiTranscriptAuditConfig/properties/grpc/properties")
+        .expect("missing AiTranscriptAuditConfig grpc properties");
+
+    for (field, hard_max) in [
+        ("max_message_bytes", HARD_MAX_GRPC_MAX_MESSAGE_BYTES),
+        ("max_messages", HARD_MAX_GRPC_MAX_MESSAGES),
+    ] {
+        assert_eq!(
+            grpc_properties[field]["maximum"],
+            json!(hard_max),
+            "grpc.{field} schema maximum must match the runtime deployment ceiling"
+        );
+        assert_eq!(grpc_properties[field]["minimum"], json!(1));
+    }
+
+    let descriptor_path = format!(
+        "{}/tests/fixtures/test_validator.bin",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let http_client = PluginHttpClient::default();
+    let config = |field: &str, value: usize| {
+        let mut config = json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/ingest"
+            },
+            "grpc": {
+                "descriptor_path": descriptor_path,
+                "methods": {
+                    "/test.Greeter/SayHello": {"request_type": "test.HelloRequest"}
+                }
+            }
+        });
+        config["grpc"][field] = json!(value);
+        config
+    };
+
+    for (field, hard_max) in [
+        ("max_message_bytes", HARD_MAX_GRPC_MAX_MESSAGE_BYTES),
+        ("max_messages", HARD_MAX_GRPC_MAX_MESSAGES),
+    ] {
+        for (value, expected_valid) in [(hard_max, true), (hard_max + 1, false)] {
+            let instance = config(field, value);
+            assert_component_validity(&spec, "AiTranscriptAuditConfig", &instance, expected_valid);
+            assert_eq!(
+                AiTranscriptAudit::new(&instance, http_client.clone()).is_ok(),
+                expected_valid,
+                "runtime/schema parity drift for grpc.{field} = {value}"
+            );
+        }
     }
 }
 

@@ -694,7 +694,7 @@ jobs:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external
     # binary), so they ALSO don't need redis/mongo services. The shard split
-    # below keeps all 83 test-file filters visible to the grep-based coverage
+    # below keeps all 107 test-file filters visible to the grep-based coverage
     # contract while balancing them across two runners. Two-hundred-plus
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
     # make elapsed time, not CPU utilisation, the useful balancing signal.
@@ -736,6 +736,7 @@ jobs:
               integration::admin_mesh_runtime_overlay_tests
               integration::admin_mesh_service_graph_tests
               integration::admin_node_waypoint_identities_tests
+              integration::admin_upstream_proxy_sni_admission_tests
               integration::apply_incremental_outcome_tests
               integration::log_schema_integration_tests
               integration::log_schema_registry_tests
@@ -745,6 +746,8 @@ jobs:
               integration::example_plugin_contract_tests
               integration::ai_stream_router_normalization_tests
               integration::ai_token_metrics_contract_tests
+              integration::ai_transcript_audit_grpc_contract_tests
+              integration::ai_transcript_audit_grpc_reload_tests
               integration::api_chargeback_sink_tests
               integration::gateway_allowed_routes_selector_tests
               integration::k8s_controller_gateway_status_tests
@@ -1067,6 +1070,7 @@ jobs:
               functional_a2a_gateway_grpc_card_test
               functional_ai_response_guard_grpc_test
               functional_ai_stream_router_test
+              functional_ai_transcript_audit_grpc_test
               functional_ai_semantic_firewall_streaming_test
               functional_body_validator_request_representation_test
               functional_body_validator_response_stream_test
@@ -1163,6 +1167,7 @@ jobs:
               functional_early_upload_deadline_test
               functional_h3_authority_validation_test
               functional_h3_local_policy_test
+              functional_subset_http_policy_test
               functional_h3_grpc_web_test
               functional_h3_grpc_streaming_test
               functional_h3_mtls_early_data_test
@@ -4381,7 +4386,7 @@ jobs:
           fi
           if [ "${RUN_WRR}" = "true" ]; then
             {
-              echo "WRR selection contention guard executed: 4-thread/1-thread throughput speedup >= 1.10x across 4/32/129-target fixtures."
+              echo "WRR selection contention guard executed: mandatory 4-thread/1-thread throughput speedup >= 1.10x on 32/129-target fixtures; 4-target 5:1:1:1 fixture remains measured (informational parallel speedup under Arc strong-count hotspot; 4/32 1-thread serial-wall ratio ceiling)."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi

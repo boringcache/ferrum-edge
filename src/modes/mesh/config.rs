@@ -1999,21 +1999,24 @@ pub struct MeshConnectionPoolHttp {
     /// Mapped from `maxRetries`. Interpreted as a per-request retry-count
     /// CAP (an upper bound on `Proxy.retry.max_retries`), NOT Envoy's
     /// cluster-wide outstanding-retry concurrency budget — see the honest
-    /// semantics note in `docs/mesh.md` and `cap_proxy_retry_for_target`
-    /// in `src/proxy/mod.rs`. When a proxy already carries a retry policy
-    /// the effective `max_retries` becomes `min(existing, this)`; when no
-    /// policy exists this field does NOT synthesize one (an Istio
-    /// `maxRetries` is a budget, not a retry-policy enabler). Always
-    /// positive when set (zero/negative rejected at translate time).
+    /// semantics note in `docs/mesh.md` and `route_retry_ceiling` /
+    /// `retry_attempt_allowed_for_target` in `src/proxy/mod.rs`. When a proxy
+    /// already carries a retry policy the effective budget for a target is
+    /// `min(original_route_ceiling, this)`; when no policy exists this field
+    /// does NOT synthesize one (an Istio `maxRetries` is a budget, not a
+    /// retry-policy enabler). Zero explicitly disables an existing retry
+    /// policy for the selected destination. The original route ceiling stays
+    /// available across rotation; retry loops re-resolve the candidate's cap
+    /// before dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
-    /// Mapped from `http1MaxPendingRequests`. The maximum number of requests
-    /// that may be simultaneously *waiting on connection capacity* for a
-    /// backend destination on the HTTP/1.1 dispatch path. Projects onto
-    /// `Upstream.port_overrides[port].http1_max_pending_requests` and is
-    /// enforced as a per-`(host, port)` pending gate: when the queue is full a
-    /// new H1 request is shed with a 503 ("upstream overflow" in Envoy terms)
-    /// rather than queued unboundedly. HTTP/1.1-scoped: it does NOT gate
+    /// Mapped from `http1MaxPendingRequests`. Honestly reinterpreted as the
+    /// maximum concurrent in-flight requests for a backend destination on the
+    /// HTTP/1.1 dispatch path. Projects onto the inherited/per-port dispatch
+    /// policy and is enforced per `(host, policy port, selected subset)`: when
+    /// full a new H1 request is shed with a 503 ("upstream overflow" in Envoy
+    /// terms).
+    /// HTTP/1.1-scoped: it does NOT gate
     /// direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch (those use
     /// `http2MaxRequests` → `h2_max_concurrent_streams` for concurrency).
     /// Always positive when set (zero/negative rejected at translate time).
@@ -3765,17 +3768,15 @@ fn validate_mesh_config_internal(
                 &mut errors,
             );
         }
-        // `connectionPool.http.http1MaxPendingRequests` is enforced by the
-        // limiter as a per-`(host, port)` pending gate where `Some(0)` is
-        // hard-overflow (sheds EVERY H1 request). The K8s translator rejects
-        // 0/negative at parse time (`translate_http_uint32`), but the
-        // native/file slice path bypasses that translator, so apply the same
-        // positive-value check here — matching the repo invariant that
-        // native/file slices run the validation the K8s translator does.
+        // `http1MaxPendingRequests` is honestly reinterpreted by the limiter as
+        // a per-`(host, policy port, selected subset)` concurrent in-flight H1
+        // gate, where `Some(0)` would shed every request.
+        // Native/file/xDS slices bypass K8s translation, so apply the same
+        // field-specific validation here. (`maxRetries: 0` is valid and
+        // disables an existing retry policy for the destination.)
         // Walk every place a `connectionPool.http` block can ride a DR:
         // top-level `trafficPolicy`, per-port `portLevelSettings`, and each
-        // `subsets[].trafficPolicy` (the translator rejects subset-scoped 0 too,
-        // before it drops the field from the unused subset overlay).
+        // `subsets[].trafficPolicy`.
         validate_dr_connection_pool_http(
             &format!("MeshDestinationRule '{}'.trafficPolicy", dr.name),
             dr.traffic_policy.as_ref(),
@@ -4128,16 +4129,17 @@ fn validate_required_tls_path(context: String, value: Option<&str>, errors: &mut
 }
 
 /// Validate a DestinationRule `connectionPool.http` block from the native/file
-/// mesh slice path, matching the positive-value checks the K8s translator
+/// mesh slice path, matching the lower-bound checks the K8s translator
 /// (`translate_http_uint32`) enforces at parse time.
 ///
-/// `http1MaxPendingRequests` is the load-bearing one: the
+/// `http1MaxPendingRequests` is load-bearing because the
 /// [`crate::backend_pending_limit::BackendPendingLimiter`] treats `Some(0)` as a
 /// hard-overflow that sheds every HTTP/1.1 request, so an accidental `0` on a
 /// hand-authored native/file DR would silently blackhole all H1 traffic to the
 /// matched destination. The K8s translator rejects 0/negative; this keeps the
-/// native/file path equivalent (negatives are already impossible — the field
-/// deserializes as `u32` — so only the zero case needs rejecting here).
+/// native/file path equivalent. `maxRetries: 0` is valid and explicitly
+/// disables an existing retry policy for the selected destination; negatives
+/// are already impossible because both fields deserialize as `u32`.
 fn validate_dr_connection_pool_http(
     context: &str,
     policy: Option<&MeshTrafficPolicy>,
