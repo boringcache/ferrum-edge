@@ -366,6 +366,31 @@ fn cancelled_stream_refuses_its_own_response() {
     assert_eq!(refused.unwrap_err(), SseError::StreamCancelled);
 }
 
+#[test]
+fn invalid_response_envelope_falls_back_and_releases_capacity() {
+    let tuned = AggregateSseBounds {
+        max_streams_per_session: 1,
+        ..bounds()
+    };
+    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
+    broker.ensure_session("sess-id-match").unwrap();
+
+    let stream = open(&broker, "sess-id-match", "expected");
+    let mismatched = json!({
+        "jsonrpc": "2.0",
+        "id": "different",
+        "result": {}
+    });
+    let refused = stream.publish_encoded(&encode(&mismatched));
+    assert_eq!(refused.unwrap_err(), SseError::ResponseEnvelopeInvalid);
+
+    // Refusal is terminal and returns the one stream slot, so the bad response
+    // is answered inline and a fresh identity can be admitted immediately.
+    let _next = open(&broker, "sess-id-match", "next");
+    let reopen = broker.open_stream("sess-id-match", &text_id("expected"));
+    assert_eq!(reopen.unwrap_err(), SseError::StreamCompleted);
+}
+
 #[tokio::test]
 async fn duplicate_listener_is_refused_and_disconnect_permits_reattach() {
     let broker = broker();
@@ -575,6 +600,69 @@ async fn retention_is_one_budget_and_never_drops_an_undelivered_response() {
     publish(&broker, "sess-budget", 4).unwrap();
 }
 
+#[tokio::test]
+async fn delivered_history_is_evicted_to_admit_at_the_event_cap() {
+    // Replay may use the full retained-event allowance. Once that event has
+    // been delivered it is safely evictable, and a new response must replace
+    // it instead of being refused merely because the ring was exactly full
+    // before admission.
+    let tuned = AggregateSseBounds {
+        max_retained_events: 1,
+        max_replay_events: 1,
+        ..bounds()
+    };
+    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
+    broker.ensure_session("sess-event-admit").unwrap();
+    let listener = broker.attach_listener("sess-event-admit", None).unwrap();
+    let mut body = listener.take_body().unwrap();
+
+    publish(&broker, "sess-event-admit", 1).unwrap();
+    let seen = drain_until(&mut body, &["\"n\":1"], 4).await;
+    assert!(seen.contains("\"n\":1"));
+
+    publish(&broker, "sess-event-admit", 2)
+        .expect("delivered history at the event cap must make room for a new response");
+    let seen = drain_until(&mut body, &["\"n\":2"], 4).await;
+    assert!(seen.contains("\"n\":2"));
+}
+
+#[tokio::test]
+async fn delivered_history_is_evicted_to_admit_at_the_byte_cap() {
+    // The event-count budget has room, but the byte budget fits only one of
+    // these responses. Delivery makes the first event evictable, so byte
+    // pressure must reclaim it before deciding the second response overflows.
+    let tuned = AggregateSseBounds {
+        max_event_bytes: 4096,
+        max_retained_bytes: 4096 + 128,
+        max_retained_events: 8,
+        max_replay_events: 8,
+        ..bounds()
+    };
+    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
+    broker.ensure_session("sess-byte-admit").unwrap();
+    let listener = broker.attach_listener("sess-byte-admit", None).unwrap();
+    let mut body = listener.take_body().unwrap();
+    let filler = "x".repeat(3800);
+
+    let first_payload = json!({"jsonrpc": "2.0", "id": 1, "result": {"blob": filler.clone()}});
+    let first = broker
+        .open_stream("sess-byte-admit", &number_id(1))
+        .unwrap();
+    first.publish_encoded(&encode(&first_payload)).unwrap();
+    let seen = drain_until(&mut body, &["\"id\":1"], 4).await;
+    assert!(seen.contains("\"id\":1"));
+
+    let second_payload = json!({"jsonrpc": "2.0", "id": 2, "result": {"blob": filler}});
+    let second = broker
+        .open_stream("sess-byte-admit", &number_id(2))
+        .unwrap();
+    second
+        .publish_encoded(&encode(&second_payload))
+        .expect("delivered history at the byte cap must make room for a new response");
+    let seen = drain_until(&mut body, &["\"id\":2"], 4).await;
+    assert!(seen.contains("\"id\":2"));
+}
+
 #[test]
 fn byte_budget_bounds_total_retained_bytes() {
     // One ~4 KiB event fits; two do not. The retired design's independent
@@ -656,7 +744,18 @@ async fn session_removal_ends_the_attached_body() {
     let greeting = frame_text(next_frame(&mut body).await);
     assert!(greeting.contains(": mcp-sse"));
 
+    publish(&broker, "sess-del", 1).unwrap();
+    assert!(
+        body.retained_session_bytes_for_test() > 0,
+        "the live session must retain the staged response"
+    );
+
     broker.remove_session("sess-del");
+    assert_eq!(
+        body.retained_session_bytes_for_test(),
+        0,
+        "session teardown must release payload history even while a stale body is held"
+    );
     assert_ended(&mut body).await;
 }
 
@@ -790,6 +889,7 @@ fn every_error_reason_is_a_fixed_low_cardinality_token() {
         SseError::UnknownStream,
         SseError::StreamCompleted,
         SseError::StreamCancelled,
+        SseError::ResponseEnvelopeInvalid,
         SseError::EventTooLarge,
         SseError::RetentionOverflow,
         SseError::StreamCardinalityOverflow,

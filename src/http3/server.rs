@@ -12424,8 +12424,21 @@ async fn send_h3_aggregate_sse_response(
     let response = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 SSE response: {}", e))?;
-    stream.send_response(response).await?;
     let deadline = body.deadline();
+    // Header/QPACK writes can wait on the peer too. Keep them inside the same
+    // hard listener lifetime as DATA, otherwise a client that never services
+    // the response stream could pin this task before the bounded pump starts.
+    match tokio::time::timeout_at(deadline, stream.send_response(response)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            drop(body);
+            crate::http3::stream_util::abort_response_stream(stream);
+            if halt_recv {
+                crate::http3::stream_util::halt_request_body(stream);
+            }
+            return Ok(());
+        }
+    }
     let pump = async {
         while let Some(frame) = body.next().await {
             let Ok(frame) = frame else {

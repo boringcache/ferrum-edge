@@ -255,6 +255,7 @@ pub enum AggregateSseError {
     UnknownStream,
     StreamCompleted,
     StreamCancelled,
+    ResponseEnvelopeInvalid,
     EventTooLarge,
     RetentionOverflow,
     StreamCardinalityOverflow,
@@ -283,6 +284,9 @@ impl AggregateSseError {
             Self::UnknownStream => "stream identity is unknown on this session",
             Self::StreamCompleted => "stream identity already completed on this session",
             Self::StreamCancelled => "stream identity was cancelled by the client",
+            Self::ResponseEnvelopeInvalid => {
+                "JSON-RPC response envelope is invalid for the open stream"
+            }
             Self::EventTooLarge => "SSE event payload exceeds the maximum length",
             Self::RetentionOverflow => "SSE session retention capacity exceeded",
             Self::StreamCardinalityOverflow => "SSE stream cardinality exceeded for this session",
@@ -311,6 +315,7 @@ impl AggregateSseError {
             Self::UnknownStream => "unknown_stream",
             Self::StreamCompleted => "stream_completed",
             Self::StreamCancelled => "stream_cancelled",
+            Self::ResponseEnvelopeInvalid => "response_envelope_invalid",
             Self::EventTooLarge => "event_too_large",
             Self::RetentionOverflow => "retention_overflow",
             Self::StreamCardinalityOverflow => "stream_cardinality_overflow",
@@ -328,6 +333,7 @@ impl AggregateSseError {
             | Self::StreamIdMissing
             | Self::StreamIdTooLarge
             | Self::StreamIdInvalid
+            | Self::ResponseEnvelopeInvalid
             | Self::EventTooLarge => 400,
             Self::UnknownSession | Self::StaleSession | Self::UnknownStream => 404,
             Self::DuplicateListener
@@ -502,12 +508,34 @@ impl SessionInner {
     /// client has seen, so capacity pressure fails the publish instead of
     /// losing it.
     fn trim(&mut self, bounds: &AggregateSseBounds) {
+        self.trim_for_admission(bounds, 0, 0);
+    }
+
+    /// Evict already-consumed history until the current ring plus an incoming
+    /// reservation fits. `incoming_events` is either zero (ordinary delivery
+    /// trimming) or one (publish admission); callers never reserve more than
+    /// one event at a time.
+    ///
+    /// Looking only at the current ring is insufficient for publish admission:
+    /// a ring exactly at its event or byte cap can still contain delivered,
+    /// safely-evictable history. Reserve the incoming footprint while trimming
+    /// so that history is released before a new response is refused. Events
+    /// still owed to the listener remain ineligible, preserving fail-closed
+    /// delivery.
+    fn trim_for_admission(
+        &mut self,
+        bounds: &AggregateSseBounds,
+        incoming_events: usize,
+        incoming_bytes: usize,
+    ) {
         let consumed = self.consumed_watermark();
         let mut replayable = self.replayable_prefix(consumed);
         while replayable > 0 {
             let over_replay = replayable > bounds.max_replay_events;
-            let over_events = self.history.len() > bounds.max_retained_events;
-            let over_bytes = self.history_bytes > bounds.max_retained_bytes;
+            let over_events = self.history.len().saturating_add(incoming_events)
+                > bounds.max_retained_events;
+            let over_bytes = self.history_bytes.saturating_add(incoming_bytes)
+                > bounds.max_retained_bytes;
             if !over_replay && !over_events && !over_bytes {
                 break;
             }
@@ -529,9 +557,9 @@ impl SessionInner {
         bounds: &AggregateSseBounds,
         encoded: &[u8],
     ) -> Result<u64, AggregateSseError> {
-        self.trim(bounds);
         let event_id = self.last_event_id.saturating_add(1);
         let framed = frame_sse_event(event_id, encoded);
+        self.trim_for_admission(bounds, 1, framed.len());
         let projected = self.history_bytes.saturating_add(framed.len());
         if self.history.len() >= bounds.max_retained_events {
             return Err(AggregateSseError::RetentionOverflow);
@@ -602,12 +630,29 @@ impl SessionState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Mark a session dead and release every payload-bearing allocation before
+    /// returning its listener waker. Old response bodies or request leases may
+    /// still hold this `SessionState` after DELETE/eviction/reload (especially a
+    /// transport parked in a write), but a dead generation has no legal replay
+    /// consumer. Clearing here prevents each stale body from pinning a full
+    /// retained-byte budget until the peer finally disconnects.
+    fn close_inner(inner: &mut SessionInner) -> Option<Waker> {
+        inner.closed = true;
+        let waker = inner.take_waker();
+        inner.listener = None;
+        inner.streams.clear();
+        inner.open_streams = 0;
+        inner.terminal_order.clear();
+        inner.history.clear();
+        inner.history_bytes = 0;
+        waker
+    }
+
     /// Close the session and hand back the listener waker, so the caller can
     /// wake the body AFTER releasing every lock it holds.
     fn close(&self) -> Option<Waker> {
         let mut inner = self.lock();
-        inner.closed = true;
-        inner.take_waker()
+        Self::close_inner(&mut inner)
     }
 
     fn close_if_idle(&self, now: Instant, ttl: Duration) -> (bool, Option<Waker>) {
@@ -615,8 +660,7 @@ impl SessionState {
         if now.saturating_duration_since(inner.last_activity) < ttl {
             return (false, None);
         }
-        inner.closed = true;
-        let waker = inner.take_waker();
+        let waker = Self::close_inner(&mut inner);
         (true, waker)
     }
 
@@ -1225,6 +1269,20 @@ impl AggregateSseStream {
             self.0.session.settle_stream(&self.0.identity);
             return Err(error);
         }
+        // The HTTP request and its terminal JSON-RPC body must name the same
+        // type-sensitive identity. Without this check a broken or hostile
+        // upstream could answer request A with id B and have that response
+        // published on the shared listener under A's cancellation/capacity
+        // lifecycle. Parsing is bounded by `max_event_bytes`, and the original
+        // bytes are still what gets retained after the identity check.
+        if !response_matches_stream_identity(
+            encoded,
+            &self.0.identity,
+            self.0.session.bounds.max_stream_id_bytes,
+        ) {
+            self.0.session.settle_stream(&self.0.identity);
+            return Err(AggregateSseError::ResponseEnvelopeInvalid);
+        }
         self.0.session.publish_terminal(&self.0.identity, encoded)
     }
 
@@ -1342,6 +1400,14 @@ impl AggregateSseBody {
     pub fn deadline(&self) -> tokio::time::Instant {
         self.deadline
     }
+
+    /// Retained payload bytes still owned by this body's session. External
+    /// regressions use this to prove teardown releases history even when the
+    /// body itself deliberately remains alive like a stalled transport.
+    #[allow(dead_code)]
+    pub fn retained_session_bytes_for_test(&self) -> usize {
+        self.session.lock().history_bytes
+    }
 }
 
 impl Drop for AggregateSseBody {
@@ -1402,6 +1468,35 @@ fn validate_event_bytes(encoded: &[u8], max_event_bytes: usize) -> Result<(), Ag
         return Err(AggregateSseError::EventTooLarge);
     }
     Ok(())
+}
+
+fn response_matches_stream_identity(
+    encoded: &[u8],
+    expected: &StreamIdentity,
+    max_identity_bytes: usize,
+) -> bool {
+    // Different JSON consumers disagree on duplicate object members. A shared
+    // stream cannot safely route an envelope when one peer may read a different
+    // `id`, `result`, or `error` than the gateway did.
+    if crate::util::json_dup_keys::slice_ambiguity(encoded).is_some() {
+        return false;
+    }
+    let Ok(response) = serde_json::from_slice::<Value>(encoded) else {
+        return false;
+    };
+    let Some(object) = response.as_object() else {
+        return false;
+    };
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || object.contains_key("result") == object.contains_key("error")
+    {
+        return false;
+    }
+    let Some(id) = object.get("id") else {
+        return false;
+    };
+    StreamIdentity::from_json_rpc_id(id, max_identity_bytes)
+        .is_ok_and(|observed| &observed == expected)
 }
 
 /// Parse `Last-Event-ID` into a resume cursor. Bounded, digits only, and never

@@ -10182,6 +10182,47 @@ async fn aggregate_sse_multiplexes_a_synthetic_list_and_a_routed_call_on_one_lis
 }
 
 #[tokio::test]
+async fn aggregate_sse_preserves_non_ok_upstream_http_status_inline() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
+    let mut stream = attach_sse_body(&plugin, &session_id).await;
+
+    let mut call_ctx = route_tool_call_with_listener(&plugin, &session_id, 550).await;
+    let upstream = weather_tool_result(550);
+    let response_headers = known_json_response_headers(&upstream);
+    let preserved = plugin
+        .on_final_response_body(&mut call_ctx, 503, &response_headers, &upstream)
+        .await;
+    assert!(
+        matches!(preserved, PluginResult::Continue),
+        "the original non-200 response must remain on the POST"
+    );
+    assert_eq!(
+        call_ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        Some("inline")
+    );
+    assert!(!mcp_sse_stream_is_open_for_test(&call_ctx));
+
+    // The listener stays usable, but it must never receive the upstream error
+    // body that the POST preserved with status 503.
+    let pinged = ping(&plugin, &session_id, json!("after-non-ok")).await;
+    assert_eq!(reject_raw(pinged).0, 202);
+    let seen = sse_drain_until(&mut stream, &["after-non-ok"], 6).await;
+    assert!(seen.contains("after-non-ok"));
+    assert!(
+        !seen.contains("Partly cloudy"),
+        "a non-200 upstream response must not be published as an SSE success"
+    );
+}
+
+#[tokio::test]
 async fn aggregate_sse_cancellation_marks_an_open_routed_request_and_suppresses_its_result() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
     let plugin = create_plugin(

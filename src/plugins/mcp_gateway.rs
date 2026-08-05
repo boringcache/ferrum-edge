@@ -1910,11 +1910,18 @@ impl McpGateway {
     /// or dropped.
     fn multiplex_upstream_response(
         ctx: &mut RequestContext,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> Option<PluginResult> {
         let stream = ctx.mcp_sse_stream.take()?;
-        let inspectable = !body.is_empty()
+        // A routed MCP JSON-RPC response is multiplexable only when its HTTP
+        // response is the protocol's ordinary 200 representation. Converting a
+        // 4xx/5xx (or any other status) into the POST-side 202 would erase the
+        // upstream failure semantics and move an HTTP error body onto a stream
+        // as though it were a successful JSON-RPC response.
+        let inspectable = response_status == 200
+            && !body.is_empty()
             && header_value(response_headers, "content-type").is_none_or(mcp_content_type_is_json)
             && Self::response_encoding_allows_rewrite(response_headers)
             && !super::utils::sse::original_response_is_event_stream(ctx, response_headers);
@@ -5420,7 +5427,7 @@ impl Plugin for McpGateway {
             Self::settle_sse_stream_inline(ctx);
             return enforced;
         }
-        match Self::multiplex_upstream_response(ctx, response_headers, body) {
+        match Self::multiplex_upstream_response(ctx, response_status, response_headers, body) {
             Some(replacement) => replacement,
             None => PluginResult::Continue,
         }
