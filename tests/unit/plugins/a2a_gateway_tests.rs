@@ -1627,16 +1627,10 @@ async fn grpc_agent_card_malformed_frame_fails_closed() {
     let result = plugin
         .on_response_body(&mut ctx, 200, &mut response_headers, &[0x00, 0x00, 0x00])
         .await;
-    assert!(matches!(
+    assert_grpc_rewrite_reject(
         result,
-        PluginResult::Reject {
-            status_code: 500,
-            ..
-        }
-    ));
-    assert_eq!(
+        "agent_card_grpc_frame_malformed",
         ctx.metadata.get("a2a.error").map(String::as_str),
-        Some("agent_card_grpc_frame_malformed")
     );
 }
 
