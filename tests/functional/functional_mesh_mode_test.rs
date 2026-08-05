@@ -1532,6 +1532,25 @@ fn dr_live_rule(
     }
 }
 
+/// Extract the labelled backend's entity body from `mesh_inbound_http_get`'s
+/// full HTTP/1 response. Policy assertions must never key on gateway-managed
+/// headers such as `Date`: doing so both rejects a correct response as an
+/// unknown label and makes a sticky-backend sample appear to change when the
+/// requests cross a wall-clock second.
+fn dr_live_backend_label(response: &str) -> Result<String, String> {
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("response has no HTTP header/body boundary: {response:?}"))?;
+    let label = body.trim();
+    if label == "backend-a" || label == "backend-b" {
+        Ok(label.to_string())
+    } else {
+        Err(format!(
+            "response entity is not a fixture backend label: {label:?}; response={response:?}"
+        ))
+    }
+}
+
 /// Slice for the live DestinationRule cases: one externally-declared
 /// destination in `beta` with two labelled endpoints, plus whatever rules the
 /// scenario is testing.
@@ -1678,10 +1697,16 @@ async fn drive_dr_live_visibility(
         let mut converged = None;
         while Instant::now() < deadline {
             match request().await {
-                Ok((200, body)) => {
-                    converged = Some(body);
-                    break;
-                }
+                Ok((200, response)) => match dr_live_backend_label(&response) {
+                    Ok(label) => {
+                        converged = Some(label);
+                        break;
+                    }
+                    Err(error) => {
+                        last_failure = format!("attempt {attempt}: {error}");
+                        break;
+                    }
+                },
                 Ok((status, body)) => {
                     last_failure =
                         format!("attempt {attempt}: convergence status {status}, body {body:?}");
@@ -1704,16 +1729,22 @@ async fn drive_dr_live_visibility(
             cp.shutdown().await;
             continue;
         };
-        observed.insert(first_body.trim().to_string());
+        observed.insert(first_body);
 
         // Authoritative measurement: each remaining request is driven exactly
         // once and must be served.
         let mut measurement_failure = None;
         for index in 1..DR_LIVE_REQUESTS {
             match request().await {
-                Ok((200, body)) => {
-                    observed.insert(body.trim().to_string());
-                }
+                Ok((200, response)) => match dr_live_backend_label(&response) {
+                    Ok(label) => {
+                        observed.insert(label);
+                    }
+                    Err(error) => {
+                        measurement_failure = Some(format!("request {index}: {error}"));
+                        break;
+                    }
+                },
                 Ok((status, body)) => {
                     measurement_failure =
                         Some(format!("request {index} returned {status}, body {body:?}"));
