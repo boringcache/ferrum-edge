@@ -10093,6 +10093,17 @@ components:
           description: >-
             Source workload locality in `region/zone/subzone` form, projected
             by mesh slice apply. A direct operator value is rejected.
+        source_labels:
+          type: object
+          readOnly: true
+          additionalProperties:
+            type: string
+          description: >-
+            Source workload labels used for DestinationRule
+            `localityLbSetting.failoverPriority` ranking. Projected by mesh
+            slice apply from authoritative slice workload labels, with
+            unambiguous derived topology enrichment only. A direct operator
+            value is rejected.
         locality_lb_setting:
           oneOf:
             - $ref: "#/components/schemas/UpstreamLocalityLbSetting"
@@ -10347,12 +10358,24 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/LocalityDistribute"
-          description: Weighted target-locality distributions.
+          description: Weighted target-locality distributions. Mutually exclusive with failover and failover_priority.
         failover:
           type: array
           items:
             $ref: "#/components/schemas/LocalityFailover"
-          description: Source-region to failover-region mappings.
+          description: Source-region to failover-region mappings. Mutually exclusive with distribute and failover_priority.
+        failover_priority:
+          type: array
+          items:
+            type: string
+          description: |
+            Ordered Istio failoverPriority label keys (`key`) or key/value
+            overrides containing exactly one equals sign (`key=value`). When an
+            applicable upstream, per-port, or per-subset active/passive health
+            policy enables failover, replaces default region/zone/subzone tiers
+            with label-match priority tiers; otherwise remains inert and leaves
+            baseline selection unchanged. An empty source-label map produces no
+            tiers. Mutually exclusive with distribute and failover.
 
     LocalityDistribute:
       type: object

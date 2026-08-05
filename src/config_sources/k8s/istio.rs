@@ -1583,12 +1583,6 @@ fn translate_locality_lb_setting(
              distribute, failover, or failoverPriority",
         ));
     }
-    if has_failover_priority {
-        return Err(invalid_resource(
-            object,
-            "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority is not supported",
-        ));
-    }
 
     let distribute = if let Some(entries) = value.get("distribute") {
         let arr = entries.as_array().ok_or_else(|| {
@@ -1736,10 +1730,82 @@ fn translate_locality_lb_setting(
         Vec::new()
     };
 
+    let failover_priority = if let Some(entries) = value.get("failoverPriority") {
+        let arr = entries.as_array().ok_or_else(|| {
+            invalid_resource(
+                object,
+                "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority must be an array",
+            )
+        })?;
+        if arr.is_empty() {
+            return Err(invalid_resource(
+                object,
+                "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority must not be empty",
+            ));
+        }
+        let mut out = Vec::with_capacity(arr.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for (idx, entry) in arr.iter().enumerate() {
+            let Some(raw) = entry.as_str() else {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority[{idx}] \
+                         must be a string"
+                    ),
+                ));
+            };
+            let Some((key, _override)) = crate::config::types::parse_failover_priority_entry(raw)
+            else {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority[{idx}] \
+                         is not a valid label key or key=value entry with exactly one '='"
+                    ),
+                ));
+            };
+            // Duplicate *identical* raw strings are accepted (Istio keeps every
+            // list position as a match step) but surface a deterministic warning
+            // so operators notice accidental repetition. Rejecting would silently
+            // diverge from Istio admission of the same YAML. Ranking still
+            // resolves expected values through one override map (last key=value
+            // wins for that key at every position, including bare-key entries) —
+            // distinct forms of the same key (`version=v1` vs `version`) do not
+            // trip this raw-string dedupe.
+            if !seen.insert(raw.to_string()) {
+                tracing::warn!(
+                    resource = %object.metadata.name,
+                    namespace = %object.metadata.namespace,
+                    key = %key,
+                    index = idx,
+                    "DestinationRule localityLbSetting.failoverPriority contains a duplicate \
+                     identical entry; each list position remains a match step (expected values \
+                     still follow Istio's last-wins override map for that key)"
+                );
+            }
+            // Key must be a non-empty Kubernetes-style label key fragment.
+            if key.chars().any(|c| c.is_whitespace()) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority[{idx}] \
+                         key must not contain whitespace"
+                    ),
+                ));
+            }
+            out.push(raw.to_string());
+        }
+        out
+    } else {
+        Vec::new()
+    };
+
     Ok(MeshLocalityLbSetting {
         enabled,
         distribute,
         failover,
+        failover_priority,
     })
 }
 

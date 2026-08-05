@@ -144,6 +144,7 @@ fn build_matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         dispatch_port_override_fallback: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         api_spec_id: None,

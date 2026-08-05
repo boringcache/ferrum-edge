@@ -523,8 +523,9 @@ pub fn load_config_from_file(
 
     // Reject mesh-projected upstream fields on this operator-provided file load.
     // File config is operator-authored, so (like the admin write path) it must not
-    // carry `Upstream.{port_overrides, source_locality, locality_lb_strict,
-    // locality_lb_setting}` — those are owned by the mesh slice-apply layer and are
+    // carry `Upstream.{port_overrides, source_locality, source_labels,
+    // locality_lb_strict, locality_lb_setting}` — those are owned by the mesh
+    // slice-apply layer and are
     // not persisted/round-tripped here. This is deliberately OUTSIDE the shared
     // validation pipeline (which also runs on the mesh slice-apply path, where the
     // mesh layer legitimately projects these fields); only operator entry points

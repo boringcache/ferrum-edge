@@ -817,3 +817,92 @@ fn destination_rule_top_level_idle_timeout_and_http2_max_requests_are_not_deferr
         "top-level/per-port idleTimeout+http2MaxRequests are applied at those scopes: {deferred:?}"
     );
 }
+
+#[test]
+fn destination_rule_failover_priority_status_reflects_outlier_activation() {
+    let without_outlier = object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "priority-inert",
+        json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": ["topology.kubernetes.io/region"]
+                    }
+                }
+            }
+        }),
+    );
+    let with_outlier = object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "priority-active",
+        json!({
+            "host": "ratings.default.svc.cluster.local",
+            "trafficPolicy": {
+                "outlierDetection": {},
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": ["topology.kubernetes.io/region"]
+                    }
+                }
+            }
+        }),
+    );
+    let updates = plan_istio_status_updates(&[without_outlier, with_outlier], options());
+
+    let inert = update_for(&updates, "DestinationRule", "priority-inert");
+    let inert_fields = inert.ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"]
+        .as_array()
+        .expect("inactive policy advisory");
+    assert!(inert_fields.iter().any(|field| {
+        field
+            .as_str()
+            .is_some_and(|field| field.contains("accepted but inactive"))
+    }));
+
+    let active = update_for(&updates, "DestinationRule", "priority-active");
+    assert_eq!(
+        active.ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"],
+        json!([]),
+        "applicable outlierDetection must activate failoverPriority without an inactive advisory"
+    );
+}
+
+/// A `subsets[].trafficPolicy.outlierDetection` resolves into that subset's
+/// passive health check, which the load balancer treats as an activating
+/// failover signal for the subset lane. The status advisory must not claim the
+/// ranks are inert when a subset lane is in fact ranking.
+#[test]
+fn destination_rule_failover_priority_subset_outlier_suppresses_inactive_advisory() {
+    let subset_outlier = object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "priority-subset-active",
+        json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": ["topology.kubernetes.io/region"]
+                    }
+                }
+            },
+            "subsets": [{
+                "name": "v1",
+                "labels": {"version": "v1"},
+                "trafficPolicy": {"outlierDetection": {}}
+            }]
+        }),
+    );
+    let updates = plan_istio_status_updates(&[subset_outlier], options());
+
+    let active = update_for(&updates, "DestinationRule", "priority-subset-active");
+    assert_eq!(
+        active.ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"],
+        json!([]),
+        "a subset-scoped outlierDetection activates the subset lane, so no inactive advisory"
+    );
+}

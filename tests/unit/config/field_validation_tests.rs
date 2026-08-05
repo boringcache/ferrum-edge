@@ -118,6 +118,7 @@ fn make_upstream(id: &str) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
@@ -1110,6 +1111,25 @@ fn test_upstream_locality_lb_strict_rejected_by_admin_api() {
 }
 
 #[test]
+fn test_upstream_source_labels_rejected_by_admin_api() {
+    let mut upstream = make_upstream("test");
+    upstream.source_labels = HashMap::from([("version".to_string(), "v1".to_string())]);
+    let errs = upstream
+        .validate_operator_provided_fields()
+        .expect_err("source_labels must be rejected on the admin write path");
+    assert!(
+        errs.iter().any(|e| e.contains("source_labels")
+            && e.contains("cannot be set directly via the admin API")),
+        "expected source_labels admin-API rejection, got: {errs:?}"
+    );
+    // Runtime apply (mesh slice prep SETS this) must NOT reject.
+    assert!(
+        upstream.validate_fields().is_ok(),
+        "validate_fields must not reject mesh-projected source_labels on the runtime path"
+    );
+}
+
+#[test]
 fn test_upstream_locality_lb_setting_rejected_by_admin_api() {
     use std::collections::BTreeMap;
 
@@ -1128,6 +1148,7 @@ fn test_upstream_locality_lb_setting_rejected_by_admin_api() {
             from: "us-west".to_string(),
             to: "us-east".to_string(),
         }],
+        failover_priority: Vec::new(),
     });
     let errs = upstream
         .validate_operator_provided_fields()
@@ -2708,6 +2729,7 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,

@@ -1090,12 +1090,17 @@ fn default_weight() -> u32 {
 ///
 /// `enabled` defaults to `true` (matches Istio semantics — an explicit
 /// `enabled: false` disables locality preference, distribute weighting,
-/// and failover override entirely). `distribute` and `failover` are
-/// mutually exclusive at evaluation time: when a `distribute` entry
-/// matches the source locality the load balancer uses per-locality
-/// weights and skips the priority tier preference; otherwise `failover`
-/// (when configured) supplies a fourth tier consulted after `region`
-/// and before the unfiltered fallback set.
+/// failover override, and failover-priority tiers entirely). Exactly one
+/// of `distribute`, `failover`, or `failover_priority` may be set
+/// (Istio mutual exclusivity). When `distribute` matches the source
+/// locality the load balancer uses per-locality weights and skips the
+/// priority-tier preference; otherwise `failover` (when configured)
+/// supplies a fourth tier consulted after `region` and before the
+/// unfiltered fallback set. When `failover_priority` is set and an effective
+/// active/passive health policy enables failover, it replaces the default
+/// region/zone/subzone tiers with ordered workload-label priority tiers (see
+/// [`Upstream::source_labels`] and target `tags`). Without an applicable health
+/// policy it is inert, matching Istio.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpstreamLocalityLbSetting {
     #[serde(default = "default_true_locality_lb_enabled")]
@@ -1104,6 +1109,12 @@ pub struct UpstreamLocalityLbSetting {
     pub distribute: Vec<LocalityDistribute>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failover: Vec<LocalityFailover>,
+    /// Ordered Istio `failoverPriority` label keys (`key`) or key/value
+    /// overrides containing exactly one equals sign (`key=value`). Mutually
+    /// exclusive with `distribute` and `failover`; inert unless an applicable
+    /// active/passive health policy enables failover.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failover_priority: Vec<String>,
 }
 
 fn default_true_locality_lb_enabled() -> bool {
@@ -1116,7 +1127,75 @@ impl Default for UpstreamLocalityLbSetting {
             enabled: true,
             distribute: Vec::new(),
             failover: Vec::new(),
+            failover_priority: Vec::new(),
         }
+    }
+}
+
+/// Well-known topology label keys honored by
+/// `localityLbSetting.failoverPriority` (Istio special semantics).
+pub const FAILOVER_PRIORITY_LABEL_NETWORK: &str = "topology.istio.io/network";
+pub const FAILOVER_PRIORITY_LABEL_CLUSTER: &str = "topology.istio.io/cluster";
+pub const FAILOVER_PRIORITY_LABEL_REGION: &str = "topology.kubernetes.io/region";
+pub const FAILOVER_PRIORITY_LABEL_ZONE: &str = "topology.kubernetes.io/zone";
+pub const FAILOVER_PRIORITY_LABEL_SUBZONE: &str = "topology.istio.io/subzone";
+pub const FAILOVER_PRIORITY_LABEL_HOSTNAME: &str = "kubernetes.io/hostname";
+
+/// Parse one Istio `failoverPriority` entry into `(key, optional_override_value)`.
+///
+/// Entries are either a bare label key (`topology.kubernetes.io/region`) or
+/// `key=value`. Istio recognizes an override only when splitting on `=` yields
+/// exactly two parts, so entries containing multiple `=` characters are
+/// rejected rather than silently reinterpreted. Empty keys are rejected.
+pub fn parse_failover_priority_entry(raw: &str) -> Option<(&str, Option<&str>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed != raw {
+        return None;
+    }
+    match trimmed.split_once('=') {
+        Some((key, value)) => {
+            if key.is_empty() || value.contains('=') {
+                None
+            } else {
+                Some((key, Some(value)))
+            }
+        }
+        None => Some((trimmed, None)),
+    }
+}
+
+/// Overlay Istio well-known topology labels derived from structured
+/// locality / network / cluster metadata onto a label map used by
+/// `failoverPriority` matching.
+///
+/// Existing keys are overwritten so structured locality metadata wins over a
+/// stale operator-authored topology label that disagrees with the fields.
+pub fn merge_derived_topology_labels(
+    labels: &mut HashMap<String, String>,
+    locality: Option<&str>,
+    network: Option<&str>,
+    cluster: Option<&str>,
+) {
+    if let Some(locality) = locality.and_then(LocalityPreference::parse) {
+        labels.insert(FAILOVER_PRIORITY_LABEL_REGION.to_string(), locality.region);
+        if let Some(zone) = locality.zone {
+            labels.insert(FAILOVER_PRIORITY_LABEL_ZONE.to_string(), zone);
+        }
+        if let Some(sub_zone) = locality.sub_zone {
+            labels.insert(FAILOVER_PRIORITY_LABEL_SUBZONE.to_string(), sub_zone);
+        }
+    }
+    if let Some(network) = network.filter(|value| !value.is_empty()) {
+        labels.insert(
+            FAILOVER_PRIORITY_LABEL_NETWORK.to_string(),
+            network.to_string(),
+        );
+    }
+    if let Some(cluster) = cluster.filter(|value| !value.is_empty()) {
+        labels.insert(
+            FAILOVER_PRIORITY_LABEL_CLUSTER.to_string(),
+            cluster.to_string(),
+        );
     }
 }
 
@@ -1509,6 +1588,14 @@ pub struct Upstream {
     /// balancing. Projected from the selected workload at slice-apply time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_locality: Option<String>,
+    /// Source-workload labels used by
+    /// `localityLbSetting.failoverPriority` matching. Projected at slice-apply
+    /// from authoritative `MeshSlice.labels` (`FERRUM_MESH_WORKLOAD_LABELS` /
+    /// CP request), optionally enriched with unambiguous same-SPIFFE /
+    /// label-matched selector keys and derived topology metadata. Empty for
+    /// non-mesh upstreams.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub source_labels: HashMap<String, String>,
     /// Strict local-first locality LB for this upstream. Default `false`
     /// (fail-open): when `source_locality` is absent the locality-aware LB
     /// returns mixed local + remote endpoints. When `true` (fail-closed-to-
@@ -1524,8 +1611,9 @@ pub struct Upstream {
     /// `DestinationRule.trafficPolicy.localityLbSetting`. Populated by the
     /// mesh apply layer from a matching `MeshDestinationRule`; `None` for
     /// hand-crafted upstreams. The load balancer reads this at construction
-    /// time to honour weighted `distribute` and region-`failover` overrides
-    /// on top of the priority-tier preference driven by `source_locality`.
+    /// time to honour weighted `distribute`, region-`failover`, and
+    /// health-gated label-ordered `failover_priority` overrides on top of (or
+    /// instead of) the priority-tier preference driven by `source_locality`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality_lb_setting: Option<UpstreamLocalityLbSetting>,
     /// Path to a PEM client certificate for mTLS with backend targets.
@@ -8143,9 +8231,9 @@ impl Upstream {
         }
 
         // NOTE: rejection of mesh-PROJECTED fields that an operator must not set
-        // directly (`port_overrides`, `source_locality`, `locality_lb_strict`,
-        // `locality_lb_setting`, and the mesh-only fields nested under
-        // `subsets[].traffic_policy`) lives in
+        // directly (`port_overrides`, `source_locality`, `source_labels`,
+        // `locality_lb_strict`, `locality_lb_setting`, and the mesh-only fields
+        // nested under `subsets[].traffic_policy`) lives in
         // [`Upstream::validate_operator_provided_fields`], NOT here. The rejection
         // belongs on every OPERATOR-PROVIDED load (admin write/admission AND the
         // file-mode loader, via [`GatewayConfig::validate_operator_provided_fields`])
@@ -8423,11 +8511,11 @@ impl Upstream {
 
     /// Reject mesh-PROJECTED fields that an OPERATOR must not set directly.
     ///
-    /// `port_overrides`, `source_locality`, `locality_lb_strict`,
+    /// `port_overrides`, `source_locality`, `source_labels`, `locality_lb_strict`,
     /// `locality_lb_setting`, and the mesh-derived fields nested under
     /// `subsets[].traffic_policy` are
     /// all populated by the mesh slice-apply layer (from DestinationRules / the
-    /// workload locality / `FERRUM_MESH_LOCALITY_LB_STRICT`), NOT by operators.
+    /// workload locality / labels / `FERRUM_MESH_LOCALITY_LB_STRICT`), NOT by operators.
     /// The top-level projected fields are not persisted by the SQL / MongoDB
     /// schemas. The nested fields can round-trip inside the persisted `subsets`
     /// JSON, but their effective runtime state is materialized only while applying
@@ -8465,6 +8553,16 @@ impl Upstream {
             );
         }
 
+        if !self.source_labels.is_empty() {
+            errors.push(
+                "source_labels is projected from authoritative mesh slice \
+                 labels (plus unambiguous derived topology metadata) and \
+                 cannot be set directly via the admin API — set \
+                 FERRUM_MESH_WORKLOAD_LABELS / workload labels instead"
+                    .to_string(),
+            );
+        }
+
         if self.locality_lb_strict {
             errors.push(
                 "locality_lb_strict is projected from the \
@@ -8479,7 +8577,8 @@ impl Upstream {
                 "locality_lb_setting is projected from a mesh \
                  DestinationRule's trafficPolicy.localityLbSetting and \
                  cannot be set directly via the admin API — express \
-                 weighted distribute and failover via a DestinationRule"
+                 weighted distribute, failover, or failoverPriority via a \
+                 DestinationRule"
                     .to_string(),
             );
         }
@@ -9316,8 +9415,8 @@ impl GatewayConfig {
 
     /// Reject mesh-PROJECTED upstream fields on operator-PROVIDED config loads.
     ///
-    /// `Upstream.{port_overrides, source_locality, locality_lb_strict,
-    /// locality_lb_setting}` and mesh-only fields under
+    /// `Upstream.{port_overrides, source_locality, source_labels,
+    /// locality_lb_strict, locality_lb_setting}` and mesh-only fields under
     /// `Upstream.subsets[].traffic_policy` are owned by the mesh slice-apply layer
     /// (Destination rules / workload locality /
     /// `FERRUM_MESH_LOCALITY_LB_STRICT`); an operator must never set them directly.
