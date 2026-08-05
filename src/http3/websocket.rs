@@ -600,6 +600,9 @@ pub(crate) async fn handle_h3_websocket(
     // logs record what the client sent, not the backend-rewritten path in
     // `ctx.path`.
     original_request_path: String,
+    // Validated inbound routing host already used for initial wildcard
+    // concretization. Retries must reuse this exact authority.
+    request_host: Option<String>,
 ) -> Result<(), anyhow::Error> {
     // Defense in depth: dispatcher already checked this. If the flag
     // got toggled mid-flight, return 501 rather than half-bridging.
@@ -1025,6 +1028,7 @@ pub(crate) async fn handle_h3_websocket(
                             hash_key,
                             &ctx.client_ip,
                             &proxy_headers,
+                            request_host.as_deref(),
                         )
                     {
                         if !crate::proxy::retry_target_preserves_backend_path(

@@ -200,6 +200,34 @@ pub mod _test_support {
         concretize_wildcard_target_for_request(target, request_host)
     }
 
+    /// Test-only view of shared retry-target selection (#3278 / PR #3585).
+    ///
+    /// Returns a DIAL target: a concretized previous wildcard is excluded by its
+    /// configured identity, and a selected wildcard is re-concretized with
+    /// `request_authority` (or the helper returns `None` rather than dialing a
+    /// literal `*.example.com`).
+    pub fn select_next_retry_target_for_test(
+        state: &crate::proxy::ProxyState,
+        epoch: &crate::request_epoch::RequestEpoch,
+        proxy: &crate::config::types::Proxy,
+        prev_target: &crate::config::types::UpstreamTarget,
+        base_hash_key: &str,
+        client_ip: &str,
+        proxy_headers: &std::collections::HashMap<String, String>,
+        request_authority: Option<&str>,
+    ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
+        crate::proxy::backend_dispatch::select_next_retry_target(
+            state,
+            epoch,
+            proxy,
+            prev_target,
+            base_hash_key,
+            client_ip,
+            proxy_headers,
+            request_authority,
+        )
+    }
+
     /// Test-only view of the shared retry-rotation reissue derivation every
     /// response path uses to decide whether — and for which backend — a
     /// sticky-session cookie must be minted (#3278).

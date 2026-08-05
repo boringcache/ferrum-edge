@@ -11152,6 +11152,10 @@ async fn handle_websocket_request_authenticated(
     // access logs record what the client sent, not the backend-rewritten
     // path stored in `ctx.path`.
     original_request_path: String,
+    // Validated inbound routing host already used for initial wildcard
+    // concretization. Retries must reuse this exact authority — never
+    // re-derive from backend-controlled data.
+    request_host: Option<String>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -11659,6 +11663,7 @@ async fn handle_websocket_request_authenticated(
                             hash_key,
                             &ctx.client_ip,
                             &ctx.headers,
+                            request_host.as_deref(),
                         )
                     {
                         if !retry_target_preserves_backend_path(
@@ -26496,6 +26501,7 @@ async fn handle_proxy_request_inner(
             strip_len,
             backend_path_is_policy_bound,
             original_request_path.clone(),
+            request_host.clone(),
         )
         .await;
     }
@@ -27500,6 +27506,7 @@ async fn handle_proxy_request_inner(
                         hash_key,
                         &ctx.client_ip,
                         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
+                        request_host.as_deref(),
                     ) {
                     if !retry_target_preserves_backend_path(
                         backend_path_is_policy_bound,
@@ -30091,6 +30098,7 @@ async fn handle_proxy_request_inner(
                     hash_key,
                     &ctx.client_ip,
                     owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                    request_host.as_deref(),
                 ) {
                 if !retry_target_preserves_backend_path(
                     backend_path_is_policy_bound,

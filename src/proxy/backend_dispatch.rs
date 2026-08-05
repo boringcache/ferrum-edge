@@ -743,12 +743,14 @@ fn same_affinity_endpoint(a: &UpstreamTarget, b: &UpstreamTarget) -> bool {
 ///
 /// The returned clone is a DIAL target: it drives connection, DNS resolution,
 /// SNI, pool keying, and circuit-breaker attribution for this request only. It
-/// is NOT the upstream's configured identity — `host` no longer matches any
-/// entry the load balancer was built from, so it is absent from the
-/// sticky-session binding index. Anything that must persist across requests
-/// (today: the Gateway API session-persistence cookie) has to be expressed in
-/// the configured identity instead, via
+/// is NOT the upstream's configured selection identity — `host` no longer
+/// matches any entry the load balancer was built from, so it is absent from the
+/// sticky-session binding index and from retry exclusion. Anything that must
+/// persist or exclude across attempts (sticky cookies; retry rotation) has to
+/// be expressed in the configured identity instead, via
 /// [`crate::load_balancer::LoadBalancer::configured_sticky_identity_target`].
+/// Retry selection then re-applies this same concretization before returning a
+/// dial-ready candidate (see [`select_next_retry_target`]).
 ///
 /// A request authority that does not match the wildcard leaves the configured
 /// target untouched, so no concretization — and no binding — is invented for it.
@@ -1332,37 +1334,54 @@ pub(crate) fn resolve_hash_key(
     }
 }
 
-/// Select the next retry target with per-port DestinationRule awareness.
+/// Select the next retry DIAL target with per-port DestinationRule awareness.
 ///
 /// Six retry sites (HTTP/H2, gRPC, and WebSocket in `src/proxy/mod.rs` plus
 /// the three H3 paths in `src/http3/{cross_protocol,server,websocket}.rs`)
-/// previously open-coded the same five-step sequence:
+/// previously open-coded the same five-step sequence. This helper owns the
+/// full retry-selection contract:
 ///
-/// 1. Compute the per-port override port that covers `prev_target` (if any).
-/// 2. If the failed target sits in an override lane, recompute the retry hash
+/// 1. Reconcile a concretized `prev_target` (wildcard dial clone) back to the
+///    exact CONFIGURED selection identity it came from, via
+///    [`LoadBalancerCache::configured_sticky_identity_target_from`]. Exclusion
+///    walks the configured target set; comparing a concrete dial host to a
+///    configured `*.example.com` entry would miss the just-tried backend.
+/// 2. Compute the per-port override port that covers that configured identity
+///    (if any).
+/// 3. If the failed target sits in an override lane, recompute the retry hash
 ///    key from the same effective selection strategy used by initial dispatch
 ///    (per-port, subset, then upstream) so consistent-hash buckets stay
 ///    consistent on the retry attempt; otherwise reuse the steady-state
 ///    `base_hash_key`.
-/// 3. Build a `HealthContext` whose `max_ejection_percent` honours the
+/// 4. Build a `HealthContext` whose `max_ejection_percent` honours the
 ///    per-port `passive_health_check` override when one is configured.
-/// 4. Dispatch to the appropriate `select_next_target_*_from` variant —
-///    subset-vs-no-subset crossed with port-vs-no-port (four variants).
-/// 5. Hand the next `Arc<UpstreamTarget>` back to the caller, which still
-///    owns its own URL building, circuit-breaker key updates, and per-protocol
-///    plumbing.
+/// 5. Dispatch to the appropriate `select_next_target_*_from` variant —
+///    subset-vs-no-subset crossed with port-vs-no-port (four variants) —
+///    excluding the exact configured identity (full routing/policy field set).
+/// 6. Re-concretize the selected CONFIGURED candidate with `request_authority`
+///    before returning, so callers receive a DIAL target ready for URL / DNS /
+///    SNI / pool / circuit-breaker use. A selected wildcard with missing or
+///    non-matching authority fails closed (`None`) rather than dialing the
+///    literal `*.example.com`.
 ///
-/// Drift between the open-coded copies of step 2 is what produced the H3
+/// `request_authority` must be the same validated inbound routing host already
+/// used for the initial
+/// [`concretize_wildcard_target_for_request`] call — never backend-controlled.
+///
+/// Drift between the open-coded copies of step 3 is what produced the H3
 /// retry hash-key bug fixed in commit `a8d62bd1`. Centralising the sequence
 /// here keeps future per-port LB additions from re-introducing that drift.
 ///
 /// # Performance
 ///
-/// Hot-path safe: `epoch.load_balancer` is an already-cloned `Arc` snapshot,
-/// `HealthContext` is borrowed, and the only allocation is the optional
-/// `String` produced by `resolve_hash_key()` when the override-lane branch
-/// fires. Steady-state retries with no port override reuse the borrowed
-/// `base_hash_key` with zero allocations.
+/// The ordinary no-retry path does not call this helper. On retry, all-concrete
+/// upstreams pay only the existing selection work (identity mapping is a
+/// precomputed boolean). Wildcard upstreams may scan the small configured
+/// target set for identity reconciliation; that cost is retry-only.
+/// `epoch.load_balancer` is an already-cloned `Arc` snapshot, `HealthContext`
+/// is borrowed, and the only steady-state allocation is the optional `String`
+/// from `resolve_hash_key()` on the override-lane branch (plus a dial clone
+/// when a wildcard candidate is selected).
 pub(crate) fn select_next_retry_target(
     state: &ProxyState,
     epoch: &RequestEpoch,
@@ -1371,11 +1390,20 @@ pub(crate) fn select_next_retry_target(
     base_hash_key: &str,
     client_ip: &str,
     proxy_headers: &HashMap<String, String>,
+    request_authority: Option<&str>,
 ) -> Option<Arc<UpstreamTarget>> {
     let upstream_id = proxy.upstream_id.as_deref()?;
 
-    let retry_override_port = crate::proxy::retry_port_override_dispatch_port(proxy, prev_target)
-        .filter(|port| {
+    // Configured selection identity for exclusion — not the dial clone.
+    let exclude_target = LoadBalancerCache::configured_sticky_identity_target_from(
+        &epoch.load_balancer,
+        &proxy.namespace,
+        upstream_id,
+        prev_target,
+    );
+
+    let retry_override_port =
+        crate::proxy::retry_port_override_dispatch_port(proxy, exclude_target).filter(|port| {
             LoadBalancerCache::has_port_override_state_from(
                 &epoch.load_balancer,
                 &proxy.namespace,
@@ -1419,7 +1447,7 @@ pub(crate) fn select_next_retry_target(
         ),
     };
 
-    if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+    let selected = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
         if let Some(port) = retry_override_port {
             LoadBalancerCache::select_next_target_for_port_subset_from(
                 &epoch.load_balancer,
@@ -1428,7 +1456,7 @@ pub(crate) fn select_next_retry_target(
                 retry_key,
                 port,
                 subset_name,
-                prev_target,
+                exclude_target,
                 Some(&health_ctx),
             )
         } else {
@@ -1438,7 +1466,7 @@ pub(crate) fn select_next_retry_target(
                 upstream_id,
                 retry_key,
                 subset_name,
-                prev_target,
+                exclude_target,
                 Some(&health_ctx),
             )
         }
@@ -1449,7 +1477,7 @@ pub(crate) fn select_next_retry_target(
             upstream_id,
             retry_key,
             port,
-            prev_target,
+            exclude_target,
             Some(&health_ctx),
         )
     } else {
@@ -1458,10 +1486,37 @@ pub(crate) fn select_next_retry_target(
             &proxy.namespace,
             upstream_id,
             retry_key,
-            prev_target,
+            exclude_target,
             Some(&health_ctx),
         )
+    }?;
+
+    // Return a DIAL target. Never hand callers a literal wildcard host.
+    concretize_retry_dial_target(selected, request_authority)
+}
+
+/// Concretize a CONFIGURED retry candidate into a DIAL target.
+///
+/// Concrete hosts pass through unchanged. Wildcard hosts require a matching
+/// `request_authority`; missing or non-matching authority fails closed with
+/// `None` rather than returning the literal `*.example.com` for dial / DNS /
+/// SNI / pool use. This is intentionally stricter than
+/// [`concretize_wildcard_target_for_request`], which leaves an unmatched
+/// wildcard untouched for the initial-selection path.
+fn concretize_retry_dial_target(
+    configured: Arc<UpstreamTarget>,
+    request_authority: Option<&str>,
+) -> Option<Arc<UpstreamTarget>> {
+    if !configured.host.starts_with("*.") {
+        return Some(configured);
     }
+    let request_host = request_authority?;
+    if !crate::config::types::wildcard_matches(&configured.host, request_host) {
+        return None;
+    }
+    let mut concrete = configured.as_ref().clone();
+    concrete.host = request_host.to_string();
+    Some(Arc::new(concrete))
 }
 
 #[cfg(test)]
@@ -1869,6 +1924,7 @@ mod tests {
             client_ip,
             client_ip,
             &headers,
+            None,
         )
         .expect("retry target should be selected");
 

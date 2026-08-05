@@ -251,6 +251,9 @@ where
     pub response_committed_plugins: &'a [Arc<dyn Plugin>],
     pub requires_response_stream_hooks: bool,
     pub sticky_cookie_needed: bool,
+    /// Validated inbound routing host already used for initial wildcard
+    /// concretization. Retries must reuse this exact authority.
+    pub request_authority: Option<&'a str>,
     /// Config-time response-trailer governance, precomputed per reload. Used by
     /// the STREAMING gRPC relay, whose terminal metadata crosses the
     /// response-header policy boundary after the initial HEADERS frame is
@@ -525,6 +528,7 @@ fn select_next_cross_protocol_retry_target(
     query_string: &str,
     client_ip: &str,
     proxy_headers: &HashMap<String, String>,
+    request_authority: Option<&str>,
 ) -> CrossProtocolRetryTarget {
     let (Some(prev_target), Some(hash_key)) = (current_target, lb_hash_key) else {
         return CrossProtocolRetryTarget::Unchanged;
@@ -541,6 +545,7 @@ fn select_next_cross_protocol_retry_target(
         hash_key,
         client_ip,
         proxy_headers,
+        request_authority,
     ) else {
         return CrossProtocolRetryTarget::Unchanged;
     };
@@ -651,6 +656,7 @@ where
         response_committed_plugins,
         requires_response_stream_hooks,
         sticky_cookie_needed,
+        request_authority,
         response_trailer_governance,
     } = request;
     let backend_start = Instant::now();
@@ -762,6 +768,7 @@ where
                 response_committed_plugins,
                 requires_response_stream_hooks,
                 sticky_cookie_needed,
+                request_authority,
             )
             .await
         }
@@ -797,6 +804,7 @@ where
                 requires_response_body_buffering,
                 response_committed_plugins,
                 sticky_cookie_needed,
+                request_authority,
                 response_trailer_governance,
             )
             .await
@@ -1608,6 +1616,7 @@ async fn dispatch_plain<S>(
     response_committed_plugins: &[Arc<dyn Plugin>],
     requires_response_stream_hooks: bool,
     sticky_cookie_needed: bool,
+    request_authority: Option<&str>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -1909,6 +1918,7 @@ where
                                     query_string,
                                     client_ip,
                                     proxy_headers,
+                                    request_authority,
                                 );
                                 if !matches!(
                                     &retry_target,
@@ -2006,6 +2016,7 @@ where
                                     query_string,
                                     client_ip,
                                     proxy_headers,
+                                    request_authority,
                                 );
                                 if !matches!(
                                     &retry_target,
@@ -4354,6 +4365,7 @@ async fn dispatch_grpc<S>(
     requires_response_body_buffering: bool,
     response_committed_plugins: &[Arc<dyn Plugin>],
     sticky_cookie_needed: bool,
+    request_authority: Option<&str>,
     response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
@@ -4727,6 +4739,7 @@ where
                 query_string,
                 client_ip,
                 proxy_headers,
+                request_authority,
             );
             if matches!(&retry_target, CrossProtocolRetryTarget::BackendPathMismatch) {
                 break;

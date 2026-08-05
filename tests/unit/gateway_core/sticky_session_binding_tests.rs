@@ -18,7 +18,10 @@
 //!   neither reaches into the other's per-port policy lane;
 //! - a wildcard-hosted target is dialed through a per-request concretized clone
 //!   whose host is the request authority, yet mints — and honors — the cookie of
-//!   the CONFIGURED entry the binding index is keyed by.
+//!   the CONFIGURED entry the binding index is keyed by;
+//! - retry selection reconciles that dial clone back to the configured identity
+//!   for exclusion, re-concretizes the next candidate, and fails closed rather
+//!   than dialing a literal `*.example.com`.
 //!
 //! Translation and the emitted `Set-Cookie` shape live in
 //! `gateway_backend_lb_policy_tests.rs`.
@@ -1119,11 +1122,9 @@ fn every_retry_capable_mint_site_uses_the_shared_reissue_derivation() {
     assert_eq!(mint_sites(h3_cross_src), 0);
 
     // Mapping the served backend onto its CONFIGURED identity is what makes a
-    // wildcard-hosted upstream's cookie resolvable at all. It belongs to that
-    // same single mint site: exactly one use in proxy/mod.rs and none in any
-    // dispatch file, because a path that minted straight from a per-request
-    // dial clone would emit tokens that are not binding-index keys and reissue
-    // the client forever.
+    // wildcard-hosted upstream's cookie resolvable at all. The mint site in
+    // proxy/mod.rs owns one use; retry selection lives in backend_dispatch and
+    // must NOT grow a second mint-site copy in any dispatch file.
     let identity_mapping = "configured_sticky_identity_target_from(";
     assert_eq!(proxy_src.matches(identity_mapping).count(), 1);
     assert_eq!(h3_server_src.matches(identity_mapping).count(), 0);
@@ -1849,9 +1850,9 @@ fn a_retry_rotation_between_wildcard_backends_reissues_for_the_serving_one() {
     let snapshot = cache.load();
 
     // Selection honored the client's binding to `a` and the request dialed a's
-    // clone. `select_next_retry_target` then hands back the CONFIGURED `b`, so
-    // cover both shapes the served target can take: the configured entry, and a
-    // concretized clone of it.
+    // clone. `select_next_retry_target` then hands back a DIAL clone of `b`
+    // (re-concretized with the request authority), so cover both shapes the
+    // served target can take: the configured entry, and a concretized clone.
     let bound_dial = dialed(&a, "api.example.com");
     for served in [b.clone(), dialed(&b, "api.example.com")] {
         let reissue = ferrum_edge::_test_support::sticky_cookie_reissue_target_for_test(
@@ -2061,4 +2062,312 @@ fn an_all_concrete_upstream_is_untouched_by_the_wildcard_identity_mapping() {
         &a,
     );
     assert!(std::ptr::eq(unknown, &a));
+}
+
+// ---------------------------------------------------------------------------
+// Wildcard retry selection: configured identity vs dial identity
+// ---------------------------------------------------------------------------
+//
+// Initial selection returns a configured wildcard; dispatch concretizes it for
+// the dial. Retry must reconcile that dial clone back to the configured entry
+// for exclusion, then re-concretize the next configured candidate before
+// returning — otherwise exclusion misses and callers dial `*.example.com`.
+
+fn rr_upstream(targets: Vec<UpstreamTarget>) -> Upstream {
+    let mut upstream = sticky_upstream(targets);
+    upstream.algorithm = LoadBalancerAlgorithm::RoundRobin;
+    upstream.hash_on = None;
+    upstream.hash_on_cookie_config = None;
+    upstream
+}
+
+async fn retry_state_for(upstream: Upstream) -> (ferrum_edge::proxy::ProxyState, Proxy) {
+    let proxy_json = serde_json::json!({
+        "id": "retry-proxy",
+        "listen_path": "/retry",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080,
+        "upstream_id": UPSTREAM_ID,
+        "namespace": NAMESPACE,
+    });
+    let mut proxy: Proxy = serde_json::from_value(proxy_json).expect("proxy fixture");
+    proxy.namespace = NAMESPACE.to_string();
+    let mut config = GatewayConfig {
+        upstreams: vec![upstream],
+        proxies: vec![proxy],
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+    config.resolve_dispatch_port_overrides();
+    let proxy = config.proxies[0].clone();
+    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
+    let env_config = ferrum_edge::config::env_config::EnvConfig::default();
+    let (state, _) = ferrum_edge::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+        .expect("test proxy state should build");
+    (state, proxy)
+}
+
+#[tokio::test]
+async fn retry_excludes_concretized_previous_wildcard_and_returns_dial_target() {
+    // Non-sticky round-robin: has_wildcard must work without cookie minting.
+    let a = wildcard_backend("egress-a", "*.example.com", 8080);
+    let b = wildcard_backend("egress-b", "*.example.com", 8080);
+    let (state, proxy) = retry_state_for(rr_upstream(vec![a.clone(), b.clone()])).await;
+    let epoch = state.request_epoch.load();
+    let prev_dial = dialed(&a, "api.example.com");
+    assert_eq!(prev_dial.host, "api.example.com");
+
+    let next = ferrum_edge::_test_support::select_next_retry_target_for_test(
+        &state,
+        &epoch,
+        &proxy,
+        &prev_dial,
+        "retry-key",
+        "192.0.2.10",
+        &HashMap::new(),
+        Some("api.example.com"),
+    )
+    .expect("a second wildcard backend must be available for retry");
+
+    assert_eq!(
+        next.host, "api.example.com",
+        "retry must return a DIAL target, not the configured literal wildcard"
+    );
+    assert_eq!(
+        service_name_of(&next),
+        "egress-b",
+        "the just-tried configured wildcard identity must be excluded"
+    );
+    assert!(!next.host.starts_with("*."));
+}
+
+#[tokio::test]
+async fn retry_aborts_without_literal_wildcard_when_authority_missing_or_unmatched() {
+    let a = wildcard_backend("egress-a", "*.example.com", 8080);
+    let b = wildcard_backend("egress-b", "*.example.com", 8080);
+    let (state, proxy) = retry_state_for(rr_upstream(vec![a.clone(), b.clone()])).await;
+    let epoch = state.request_epoch.load();
+    let prev_dial = dialed(&a, "api.example.com");
+
+    assert!(
+        ferrum_edge::_test_support::select_next_retry_target_for_test(
+            &state,
+            &epoch,
+            &proxy,
+            &prev_dial,
+            "retry-key",
+            "192.0.2.10",
+            &HashMap::new(),
+            None,
+        )
+        .is_none(),
+        "missing authority must fail closed rather than dial *.example.com"
+    );
+    assert!(
+        ferrum_edge::_test_support::select_next_retry_target_for_test(
+            &state,
+            &epoch,
+            &proxy,
+            &prev_dial,
+            "retry-key",
+            "192.0.2.10",
+            &HashMap::new(),
+            Some("example.net"),
+        )
+        .is_none(),
+        "non-matching authority must fail closed rather than invent a host"
+    );
+}
+
+#[tokio::test]
+async fn full_identity_exclusion_keeps_sibling_sharing_host_port() {
+    // Same dial endpoint, different Service identity — exclusion by host/port
+    // alone would drop the sibling; full sticky identity must keep it.
+    let tried = identity_target(
+        "10.1.0.10",
+        8080,
+        None,
+        &[
+            (UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG, "default"),
+            (UPSTREAM_TARGET_SERVICE_NAME_TAG, "svc-a"),
+        ],
+        None,
+        None,
+    );
+    let sibling = identity_target(
+        "10.1.0.10",
+        8080,
+        None,
+        &[
+            (UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG, "default"),
+            (UPSTREAM_TARGET_SERVICE_NAME_TAG, "svc-b"),
+        ],
+        None,
+        None,
+    );
+    let (state, proxy) = retry_state_for(rr_upstream(vec![tried.clone(), sibling.clone()])).await;
+    let epoch = state.request_epoch.load();
+
+    let next = ferrum_edge::_test_support::select_next_retry_target_for_test(
+        &state,
+        &epoch,
+        &proxy,
+        &tried,
+        "retry-key",
+        "192.0.2.10",
+        &HashMap::new(),
+        None,
+    )
+    .expect("sibling sharing host:port must remain eligible");
+    assert_eq!(service_name_of(&next), "svc-b");
+    assert_eq!(next.host, "10.1.0.10");
+    assert_eq!(next.port, 8080);
+}
+
+#[tokio::test]
+async fn cookie_reissue_after_wildcard_retry_rotation_names_configured_backend() {
+    let a = wildcard_backend("egress-a", "*.example.com", 8080);
+    let b = wildcard_backend("egress-b", "*.example.com", 8080);
+    let (state, proxy) = retry_state_for(sticky_upstream(vec![a.clone(), b.clone()])).await;
+    let epoch = state.request_epoch.load();
+    let snapshot = state.load_balancer_cache.load();
+    let prev_dial = dialed(&a, "api.example.com");
+
+    let rotated = ferrum_edge::_test_support::select_next_retry_target_for_test(
+        &state,
+        &epoch,
+        &proxy,
+        &prev_dial,
+        "retry-key",
+        "192.0.2.10",
+        &HashMap::new(),
+        Some("api.example.com"),
+    )
+    .expect("wildcard retry must rotate onto the sibling dial target");
+    assert_eq!(rotated.host, "api.example.com");
+    assert_eq!(service_name_of(&rotated), "egress-b");
+
+    let reissue = ferrum_edge::_test_support::sticky_cookie_reissue_target_for_test(
+        false,
+        Some(&prev_dial),
+        Some(&rotated),
+    )
+    .expect("rotation onto the sibling must reissue");
+    assert_eq!(service_name_of(reissue), "egress-b");
+
+    let mut headers: HashMap<String, String> = HashMap::new();
+    assert!(
+        ferrum_edge::_test_support::inject_sticky_affinity_cookie_for_test(
+            &proxy,
+            &snapshot,
+            Some(reissue),
+            true,
+            &mut headers,
+        )
+    );
+    assert_eq!(
+        headers.get("set-cookie"),
+        Some(&expected_affinity_cookie(&b)),
+        "reissue must name the CONFIGURED wildcard backend"
+    );
+    let bound = LoadBalancerCache::select_sticky_from(
+        &snapshot,
+        NAMESPACE,
+        UPSTREAM_ID,
+        &minted_token(&headers),
+        None,
+        None,
+        None,
+    )
+    .expect("reissued token must resolve on the next request");
+    assert_eq!(bound.host, "*.example.com");
+    assert_eq!(service_name_of(&bound), "egress-b");
+    assert_eq!(dialed(&bound, "api.example.com").host, "api.example.com");
+}
+
+#[test]
+fn all_six_retry_callers_pass_request_authority_to_shared_helper() {
+    // Anti-drift: every retry transport must thread the validated inbound
+    // authority into select_next_retry_target and must not open-code a literal
+    // wildcard dial around that helper.
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    let h3_server = include_str!("../../../src/http3/server.rs");
+    let h3_cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let h3_ws = include_str!("../../../src/http3/websocket.rs");
+
+    // Three call sites in proxy/mod.rs (HTTP/H2, direct gRPC, WebSocket) and
+    // one each in the three H3 retry paths.
+    assert_eq!(
+        proxy_src.matches("select_next_retry_target(").count(),
+        3,
+        "proxy/mod.rs must keep exactly the three retry call sites"
+    );
+    assert_eq!(h3_server.matches("select_next_retry_target(").count(), 1);
+    assert_eq!(
+        h3_cross.matches("select_next_retry_target(").count(),
+        1,
+        "cross-protocol must funnel through one shared wrapper call"
+    );
+    assert_eq!(h3_ws.matches("select_next_retry_target(").count(), 1);
+
+    // Every production call passes the validated inbound host near the helper.
+    for (label, source, expected_calls) in [
+        ("proxy/mod.rs", proxy_src, 3usize),
+        ("http3/server.rs", h3_server, 1),
+        ("http3/websocket.rs", h3_ws, 1),
+    ] {
+        let mut remaining = source;
+        let mut seen = 0usize;
+        while let Some(idx) = remaining.find("select_next_retry_target(") {
+            let window: String = remaining[idx..].chars().take(600).collect();
+            assert!(
+                window.contains("request_host.as_deref()"),
+                "{label} select_next_retry_target call must pass request_host.as_deref(): {window}"
+            );
+            seen += 1;
+            remaining = &remaining[idx + "select_next_retry_target(".len()..];
+        }
+        assert_eq!(
+            seen, expected_calls,
+            "{label} must keep {expected_calls} select_next_retry_target call(s)"
+        );
+    }
+
+    assert!(
+        h3_cross.contains("pub request_authority: Option<&'a str>,"),
+        "CrossProtocolRequest must carry the validated inbound authority"
+    );
+    let cross_call = h3_cross
+        .split("crate::proxy::backend_dispatch::select_next_retry_target(")
+        .nth(1)
+        .expect("cross-protocol shared helper call")
+        .split(')')
+        .next()
+        .expect("call close");
+    assert!(
+        cross_call.contains("request_authority"),
+        "H3 cross-protocol must pass request_authority into the shared helper"
+    );
+
+    // No dispatch path may open-code dialing a literal configured wildcard
+    // beside the shared helper (the helper is the only place allowed to turn a
+    // configured `*.` into a concrete dial host for retries).
+    for (label, source) in [
+        ("proxy/mod.rs", proxy_src),
+        ("http3/server.rs", h3_server),
+        ("http3/cross_protocol.rs", h3_cross),
+        ("http3/websocket.rs", h3_ws),
+    ] {
+        let mut remaining = source;
+        while let Some(idx) = remaining.find("select_next_retry_target(") {
+            let after = &remaining[idx..];
+            let window: String = after.chars().take(800).collect();
+            assert!(
+                !window.contains("starts_with(\"*.\")"),
+                "{label} must not open-code wildcard dial logic beside select_next_retry_target"
+            );
+            remaining = &after["select_next_retry_target(".len()..];
+        }
+    }
 }

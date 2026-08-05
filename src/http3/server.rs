@@ -4812,6 +4812,7 @@ async fn handle_h3_request(
             strip_len,
             backend_path_is_policy_bound,
             original_request_path.clone(),
+            request_host.clone(),
         )
         .await;
     }
@@ -5083,6 +5084,7 @@ async fn handle_h3_request(
                 response_committed_plugins: plugin_cache_view.response_committed_plugins(),
                 requires_response_stream_hooks: stream_hooks_enabled,
                 sticky_cookie_needed,
+                request_authority: request_host.as_deref(),
                 response_trailer_governance,
             })
             .await?
@@ -6919,6 +6921,7 @@ async fn handle_h3_request(
                         hash_key,
                         &ctx.client_ip,
                         &proxy_headers,
+                        request_host.as_deref(),
                     ) {
                     if !crate::proxy::retry_target_preserves_backend_path(
                         backend_path_is_policy_bound,
