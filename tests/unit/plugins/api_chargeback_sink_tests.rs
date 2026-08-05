@@ -21,6 +21,7 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     probe_compact_recovery_retry_for_tests, probe_empty_dead_letter_publish_for_tests,
     probe_shared_spool_batch_clone_for_tests, probe_streaming_replay_batch_range_errors_for_tests,
     probe_streaming_spool_reader_defensive_paths_for_tests, publish_dead_letter_payload_for_tests,
+    publish_dead_letter_payload_replacing_prior_for_tests,
     reconcile_active_spool_usage_for_tests, render_prometheus, render_status_json,
     replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
     replay_spool_once_with_ceiling_for_tests, serialize_json_each_row,
@@ -8990,6 +8991,93 @@ fn dead_letter_open_fails_closed_when_prior_rejected_meta_is_a_directory() {
     assert!(
         meta_path.is_dir(),
         "failed open cleanup must leave the planted prior meta directory"
+    );
+}
+
+#[test]
+fn dead_letter_replace_decrements_usage_for_prior_rejected_artifacts() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-replace-usage")])
+        .unwrap();
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim should be acquired");
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+    let row = br#"{"event_id":"evt-replace-usage"}"#;
+    let prior_payload = b"prior-rejected-payload-marker-bytes\n";
+    let prior_payload_len = prior_payload.len() as u64;
+    let before_payload = spool.cached_stats_for_tests();
+
+    // Claim stays a regular file so publish authorizes replace. Open clears any
+    // prior sibling, so the helper plants an accounted final between append and
+    // publish — the only way to exercise publish's successful account_sub.
+    let (payload_path, after_prior_payload) =
+        publish_dead_letter_payload_replacing_prior_for_tests(
+            &spool,
+            &claim_path,
+            row,
+            prior_payload,
+        )
+        .expect("live claim must replace an accounted prior payload");
+    assert_eq!(fs::read(&payload_path).unwrap(), row);
+    assert_eq!(
+        after_prior_payload.files,
+        before_payload.files.saturating_add(1),
+        "planted prior must enter the maintained file gauge before publish"
+    );
+    assert_eq!(
+        after_prior_payload.bytes,
+        before_payload.bytes.saturating_add(prior_payload_len),
+        "planted prior must enter the maintained byte gauge before publish"
+    );
+    let after_payload = spool.cached_stats_for_tests();
+    assert_eq!(
+        after_payload.files, after_prior_payload.files,
+        "payload replace must account_sub the prior file rather than stacking"
+    );
+    assert_eq!(
+        after_payload.bytes,
+        after_prior_payload
+            .bytes
+            .saturating_sub(prior_payload_len)
+            .saturating_add(row.len() as u64),
+        "payload replace must decrement exactly the prior length before adding the new payload"
+    );
+
+    let meta_path =
+        write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
+            .expect("initial dead-letter metadata should publish");
+    let before_meta = spool.cached_stats_for_tests();
+    let prior_meta_len = fs::metadata(&meta_path).unwrap().len();
+    assert!(
+        prior_meta_len > 0,
+        "prior metadata must occupy accounted bytes"
+    );
+
+    write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 2)
+        .expect("live claim must replace prior dead-letter metadata");
+    let new_meta_len = fs::metadata(&meta_path).unwrap().len();
+    let after_meta = spool.cached_stats_for_tests();
+    let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta["rejected_rows"], 2);
+    assert_eq!(
+        after_meta.files, before_meta.files,
+        "metadata replace must account_sub the prior file rather than stacking"
+    );
+    assert_eq!(
+        after_meta.bytes,
+        before_meta
+            .bytes
+            .saturating_sub(prior_meta_len)
+            .saturating_add(new_meta_len),
+        "metadata replace must decrement exactly the prior metadata length"
+    );
+    assert!(
+        claim_path.is_file(),
+        "replacement must leave the live claim untouched"
     );
 }
 

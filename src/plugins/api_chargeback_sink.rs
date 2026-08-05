@@ -7102,14 +7102,11 @@ impl SpoolManager {
     ///   publication continue; final claim removal then fails through the
     ///   natural `remove_file` / "failed to remove replay source" path.
     ///
-    /// Symlinks stay refused via [`Self::assert_managed_path`].
+    /// Symlinks are refused by the opening [`Self::assert_managed_path`] call
+    /// (via [`reject_symlinked_spool_path`]); this match never sees one.
     fn managed_claim_state(&self, path: &Path) -> Result<ManagedClaimState, String> {
         self.assert_managed_path(path)?;
         match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
-                "{PLUGIN_NAME}: refusing to operate on symlinked spool path '{}'",
-                path.display()
-            )),
             Ok(metadata) if metadata.is_file() => Ok(ManagedClaimState::RegularFile),
             Ok(_) => Ok(ManagedClaimState::NotRegularFile),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -10571,6 +10568,46 @@ pub fn publish_dead_letter_payload_for_tests(
     source_path: &Path,
     row: &[u8],
 ) -> Result<PathBuf, String> {
+    publish_dead_letter_payload_inner_for_tests(
+        spool,
+        source_path,
+        row,
+        None,
+    )
+    .map(|(path, _)| path)
+}
+
+/// Publish a dead-letter payload after planting an accounted prior final.
+///
+/// `DeadLetterPayloadWriter::open` clears prior siblings before creating the
+/// temp, so the successful `account_sub` on publish only runs when a prior
+/// final appears between open and publish. External tests use this seam to
+/// prove that replace decrements spool usage by the replaced length.
+///
+/// Returns the published path and the usage snapshot taken after the prior was
+/// planted and accounted, immediately before publish replaces it.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn publish_dead_letter_payload_replacing_prior_for_tests(
+    spool: &SpoolManager,
+    source_path: &Path,
+    row: &[u8],
+    prior_payload: &[u8],
+) -> Result<(PathBuf, SpoolStats), String> {
+    publish_dead_letter_payload_inner_for_tests(
+        spool,
+        source_path,
+        row,
+        Some(prior_payload),
+    )
+}
+
+fn publish_dead_letter_payload_inner_for_tests(
+    spool: &SpoolManager,
+    source_path: &Path,
+    row: &[u8],
+    prior_payload: Option<&[u8]>,
+) -> Result<(PathBuf, SpoolStats), String> {
     if row.is_empty() || row.len() > SPOOL_MAX_ROW_BYTES {
         return Err(format!(
             "{PLUGIN_NAME}: dead-letter append probe row is outside the hard row bound"
@@ -10598,7 +10635,19 @@ pub fn publish_dead_letter_payload_for_tests(
     };
     let mut writer = DeadLetterPayloadWriter::open(spool, source_path)?;
     writer.append_batch(spool, &batch, &[0])?;
-    writer.publish(spool).map(|published| published.path)
+    if let Some(prior) = prior_payload {
+        let (_, final_path) = dead_letter_payload_paths(spool, source_path)?;
+        fs::write(&final_path, prior).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to plant prior dead-letter payload '{}': {error}",
+                final_path.display()
+            )
+        })?;
+        spool.usage.account_add(1, prior.len() as u64);
+    }
+    let accounted_before_publish = spool.cached_stats();
+    let path = writer.publish(spool)?.path;
+    Ok((path, accounted_before_publish))
 }
 
 /// Publish one production-format dead-letter metadata record for an already
