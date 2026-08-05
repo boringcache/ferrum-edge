@@ -13,7 +13,6 @@
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
@@ -2913,296 +2912,6 @@ fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether a proxy's retry policy can actually trigger for at least one request
-/// the proxy can admit.
-///
-/// Mirrors the runtime gates so config validation does not reject combinations
-/// that can never retry:
-/// - `max_retries == 0` never retries.
-/// - `retry_on_connect_failure` is method-agnostic (a connect failure never
-///   reaches the HTTP layer), so it makes retry effective for *any* admitted
-///   method.
-/// - Status-code retries only fire for methods listed in `retryable_methods`,
-///   and method admission (`allowed_methods`) runs before backend dispatch. So
-///   status retries are only effective when `retryable_methods` overlaps the
-///   methods the proxy is allowed to serve.
-pub(crate) fn proxy_retry_is_effective(
-    retry: Option<&RetryConfig>,
-    allowed_methods: Option<&[String]>,
-) -> bool {
-    let Some(retry) = retry else {
-        return false;
-    };
-    if retry.max_retries == 0 {
-        return false;
-    }
-    if retry.retry_on_connect_failure {
-        return true;
-    }
-    if retry.retryable_status_codes.is_empty() || retry.retryable_methods.is_empty() {
-        return false;
-    }
-    match allowed_methods {
-        // `allowed_methods == None` means "allow all", so any retryable method
-        // can be admitted.
-        None => true,
-        Some(allowed) => retry.retryable_methods.iter().any(|retryable| {
-            allowed
-                .iter()
-                .any(|served| served.eq_ignore_ascii_case(retryable))
-        }),
-    }
-}
-
-/// Project a single referenced upstream's per-port / top-level connection
-/// policy onto a throwaway proxy clone for per-resource admission paths.
-///
-/// `Proxy.dispatch_port_overrides` / `Proxy.dispatch_port_override_fallback` are
-/// `#[serde(skip)]` DR-derived projections that only
-/// [`GatewayConfig::resolve_dispatch_port_overrides`] populates over a full
-/// config. A proxy that arrives straight off the admin request body therefore has
-/// both fields `None`. This projection is still used by the backend-TLS SNI
-/// direct-H2 compatibility validation and mirrors the full-config resolution.
-pub(crate) fn proxy_with_resolved_port_caps(proxy: &Proxy, upstream: &Upstream) -> Proxy {
-    let mut resolved = proxy.clone();
-    resolved.dispatch_port_overrides = if upstream.port_overrides.is_empty() {
-        None
-    } else {
-        let ports: HashMap<u16, ResolvedPortOverride> = upstream
-            .port_overrides
-            .iter()
-            .filter_map(|(port, ovr)| {
-                ResolvedPortOverride::from_upstream_override(ovr).map(|r| (*port, r))
-            })
-            .collect();
-        (!ports.is_empty()).then_some(ports)
-    };
-    resolved.dispatch_port_override_fallback =
-        dispatch_port_override_fallback_from_upstream(upstream);
-    resolved
-}
-
-/// Outcome of screening one enabled plugin config for backend-TLS SNI
-/// request-body-buffering admission.
-///
-/// `shadows_same_named_global` mirrors `PluginCache` merge rules: a disabled
-/// config never shadows; a successfully constructed local (or a
-/// custom/unknown/`Ok(None)` name) does; a built-in whose configuration fails
-/// to construct does not — the cache's `Err` arm leaves the global in place.
-struct SniBufferingScreenEffect {
-    forces_buffering: bool,
-    shadows_same_named_global: bool,
-}
-
-/// Screen one plugin config for SNI buffering admission.
-///
-/// The buffering answer comes from the authoritative
-/// [`crate::plugins::Plugin::requires_request_body_buffering`] implementation
-/// on an instance built from the SAME parsed configuration the runtime
-/// `PluginCache` builds — there is no second, config-shaped re-implementation
-/// of the predicate to drift out of sync. See
-/// [`crate::plugins::RequestBodyBufferingScreener`] for the side-effect
-/// guarantees of that construction.
-///
-/// A plugin the screen cannot evaluate (custom / unknown plugin, or a
-/// configuration that does not construct) is admitted with a value-redacted
-/// warning, preserving the documented residual: those requests still fail
-/// closed at runtime with a `502` and
-/// `gateway-error-reason: backend_tls_sni_requires_direct_h2`.
-fn screen_plugin_config_for_sni_buffering(
-    proxy_id: &str,
-    pc: &PluginConfig,
-    screener: &OnceCell<crate::plugins::RequestBodyBufferingScreener>,
-) -> SniBufferingScreenEffect {
-    if !pc.enabled {
-        return SniBufferingScreenEffect {
-            forces_buffering: false,
-            shadows_same_named_global: false,
-        };
-    }
-    // Built on first use: a proxy whose effective plugin configs are all
-    // disabled (or absent) never constructs the screener's HTTP client.
-    let screener = screener.get_or_init(crate::plugins::RequestBodyBufferingScreener::new);
-    match screener.screen(&pc.plugin_name, &pc.config) {
-        crate::plugins::RequestBodyBufferingScreen::Buffers => SniBufferingScreenEffect {
-            forces_buffering: true,
-            shadows_same_named_global: true,
-        },
-        crate::plugins::RequestBodyBufferingScreen::Streams => SniBufferingScreenEffect {
-            forces_buffering: false,
-            shadows_same_named_global: true,
-        },
-        crate::plugins::RequestBodyBufferingScreen::Indeterminate(gap) => {
-            tracing::warn!(
-                proxy_id = %proxy_id,
-                plugin_config_id = %pc.id,
-                plugin_name = %pc.plugin_name,
-                reason = gap.as_str(),
-                "Backend TLS SNI admission could not evaluate request-body buffering for this \
-                 plugin; admitting the proxy. Direct HTTP/2 SNI dispatch still fails closed at \
-                 runtime (502, gateway-error-reason: backend_tls_sni_requires_direct_h2) if the \
-                 plugin buffers request bodies"
-            );
-            // `NotBuiltin` covers custom/unknown names and retired aliases
-            // (`Ok(None)`): PluginCache still removes the same-named global in
-            // those arms. Prefer shadowing (and the documented admit residual)
-            // over a false SNI rejection. `ConstructionFailed` mirrors the
-            // cache's `Err` arm and must not shadow.
-            let shadows_same_named_global = matches!(
-                gap,
-                crate::plugins::RequestBodyBufferingScreenGap::NotBuiltin
-            );
-            SniBufferingScreenEffect {
-                forces_buffering: false,
-                shadows_same_named_global,
-            }
-        }
-    }
-}
-
-/// Source description for a backend TLS SNI override that forces direct-H2.
-fn proxy_plain_https_sni_sources<'a>(
-    proxy: &'a Proxy,
-    upstream: Option<&'a Upstream>,
-) -> Vec<(&'a str, String)> {
-    let mut sources = Vec::new();
-    if let Some(sni) = proxy.resolved_tls.sni.as_deref() {
-        sources.push((sni, "resolved backend TLS SNI".to_string()));
-    }
-    if let Some(overrides) = proxy.dispatch_port_overrides.as_ref() {
-        for (port, ovr) in overrides {
-            if let Some(sni) = ovr.tls.as_ref().and_then(|tls| tls.sni.as_deref()) {
-                sources.push((
-                    sni,
-                    format!("DestinationRule per-port TLS SNI on port {port}"),
-                ));
-            }
-        }
-    } else if let Some(upstream) = upstream {
-        // Admin/single-resource paths may not have projected
-        // `dispatch_port_overrides` yet; still catch Upstream.port_overrides.
-        for (port, ovr) in &upstream.port_overrides {
-            if let Some(sni) = ovr.tls.as_ref().and_then(|tls| tls.sni.as_deref()) {
-                sources.push((
-                    sni,
-                    format!("DestinationRule per-port TLS SNI on port {port}"),
-                ));
-            }
-        }
-        if let Some(sni) = upstream.backend_tls_sni.as_deref()
-            && proxy.resolved_tls.sni.is_none()
-        {
-            sources.push((sni, "upstream backend_tls_sni".to_string()));
-        }
-    }
-    sources
-}
-
-/// Reject plain-HTTPS proxies whose backend TLS SNI override cannot dispatch
-/// on the direct-H2 pool (retry body replay, request-body buffering plugins,
-/// or `pool_enable_http2: false`). Covers proxy-level and DestinationRule
-/// per-port TLS overlays so `validate` catches guaranteed total outages.
-///
-/// The buffering leg is derived from the runtime
-/// [`crate::plugins::Plugin::requires_request_body_buffering`] answer of a
-/// plugin built from the same parsed config (see
-/// [`screen_plugin_config_for_sni_buffering`]), so it tracks every
-/// conditional buffering plugin exactly and needs no per-plugin maintenance.
-/// Plugin construction happens only for proxies that actually carry a plain
-/// HTTPS SNI override, and only for that proxy's effective plugin configs.
-pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
-    proxy: &Proxy,
-    upstream: Option<&Upstream>,
-    plugin_configs: &[PluginConfig],
-) -> Vec<String> {
-    // gRPC / native H3 own the TLS handshake and support SNI on their pools;
-    // the reqwest incompatibility is specific to plain HTTPS (HttpsPool).
-    if proxy.dispatch_kind != DispatchKind::HttpsPool {
-        return Vec::new();
-    }
-    let sources = proxy_plain_https_sni_sources(proxy, upstream);
-    if sources.is_empty() {
-        return Vec::new();
-    }
-    let sni_desc = sources
-        .iter()
-        .map(|(sni, source)| format!("'{sni}' ({source})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut errors = Vec::new();
-    if proxy.pool_enable_http2 == Some(false) {
-        errors.push(format!(
-            "Proxy '{}' sets backend TLS SNI override ({sni_desc}) but pool_enable_http2 is false; \
-             plain HTTPS SNI overrides require the direct HTTP/2 backend pool",
-            proxy.id
-        ));
-    }
-    if proxy_retry_is_effective(proxy.retry.as_ref(), proxy.allowed_methods.as_deref()) {
-        errors.push(format!(
-            "Proxy '{}' enables retry with backend TLS SNI override ({sni_desc}); \
-             request-body replay for retries is incompatible with direct HTTP/2 SNI dispatch",
-            proxy.id
-        ));
-    }
-
-    // Effective plugins for this proxy: associations + globals in the proxy's
-    // namespace (unless a local instance shadows that plugin name — mirror
-    // PluginCache tenancy and merge rules for the buffering screen only).
-    // Associations resolve by `(namespace, id)` so reused plugin ids in other
-    // tenants cannot false-reject this proxy.
-    //
-    // The screener owns an HTTP client, so build it lazily: proxies without an
-    // effective plugin config never pay for one, and non-SNI proxies already
-    // returned above.
-    let screener: OnceCell<crate::plugins::RequestBodyBufferingScreener> = OnceCell::new();
-    let mut local_names: HashSet<&str> = HashSet::new();
-    for assoc in &proxy.plugins {
-        let Some(pc) = plugin_configs
-            .iter()
-            .find(|pc| pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id)
-        else {
-            continue;
-        };
-        match pc.scope {
-            PluginScope::Global => continue,
-            PluginScope::Proxy if pc.proxy_id.as_deref() != Some(proxy.id.as_str()) => continue,
-            PluginScope::Proxy | PluginScope::ProxyGroup => {}
-        }
-        let effect = screen_plugin_config_for_sni_buffering(&proxy.id, pc, &screener);
-        // Mirror PluginCache: only locals that would enter (or deliberately
-        // clear) the merge list shadow a same-named global. Disabled
-        // configs and construction failures do not.
-        if effect.shadows_same_named_global {
-            local_names.insert(pc.plugin_name.as_str());
-        }
-        if effect.forces_buffering {
-            errors.push(format!(
-                "Proxy '{}' attaches request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
-                 request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
-                proxy.id, pc.id
-            ));
-        }
-    }
-    for pc in plugin_configs {
-        if pc.scope != PluginScope::Global || pc.namespace != proxy.namespace {
-            continue;
-        }
-        if local_names.contains(pc.plugin_name.as_str()) {
-            continue;
-        }
-        let effect = screen_plugin_config_for_sni_buffering(&proxy.id, pc, &screener);
-        if effect.forces_buffering {
-            errors.push(format!(
-                "Proxy '{}' inherits global request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
-                 request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
-                proxy.id, pc.id
-            ));
-        }
-    }
-    errors
-}
-
 impl GatewayConfig {
     /// Validate that all proxy (host, listen_path) combinations are unique.
     ///
@@ -4178,10 +3887,16 @@ impl GatewayConfig {
     /// In file mode there's no DB, so this catches dangling references
     /// at config load time.
     ///
-    /// Plain-HTTPS proxies with a backend TLS SNI override are likewise screened
-    /// for combinations that cannot use the direct-H2 pool (effective retry,
-    /// request-body-buffering plugins, `pool_enable_http2: false`), including
-    /// DestinationRule per-port TLS overlays (issue #2954).
+    /// A backend TLS SNI override is deliberately NOT screened here. It once
+    /// rejected effective retry, request-body-buffering plugins, and
+    /// `pool_enable_http2: false` because only the direct-H2 pool could carry a
+    /// server name (issue #2954). The reqwest/HTTP-1.1 SNI dial serves all
+    /// three, so those rejections refused working Gateway API `BackendTLSPolicy`
+    /// shapes (issue #3276). The remaining fail-closed answers are runtime
+    /// decisions that config cannot make: the `502` /
+    /// `backend_tls_sni_requires_direct_h2` when a dial genuinely cannot be
+    /// constructed, and the WebSocket transport's own pre-dial refusal
+    /// (`crate::proxy::websocket_backend_tls_sni_unsupported`).
     pub fn validate_upstream_references(&self) -> Result<(), Vec<String>> {
         // Upstream references are namespace-local. A bare-id index would accept
         // a dangling same-namespace reference whenever another tenant owns
@@ -4218,21 +3933,6 @@ impl GatewayConfig {
                     }
                 }
             }
-
-            // Backend TLS SNI on plain HTTPS requires direct-H2; reject
-            // combinations that cannot dispatch (retry / body-buffering /
-            // pool_enable_http2=false), including DestinationRule per-port
-            // TLS overlays projected onto this proxy.
-            let upstream = proxy.upstream_id.as_deref().and_then(|uid| {
-                upstreams_by_key
-                    .get(&(proxy.namespace.as_str(), uid))
-                    .copied()
-            });
-            errors.extend(backend_tls_sni_direct_h2_conflict_messages(
-                proxy,
-                upstream,
-                &self.plugin_configs,
-            ));
         }
 
         if errors.is_empty() {

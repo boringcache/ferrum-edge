@@ -2645,71 +2645,6 @@ fn retry_proxy_allows_required_mesh_transport_upstream_targets() {
     }
 }
 
-#[test]
-fn backend_tls_sni_with_retry_fails_validate_upstream_references() {
-    let mut upstream = make_upstream("sni-upstream");
-    upstream.backend_tls_sni = Some("backend.mesh.internal".into());
-    let mut proxy = make_proxy("p1", "/api");
-    proxy.backend_scheme = Some(BackendScheme::Https);
-    proxy.dispatch_kind = DispatchKind::HttpsPool;
-    proxy.upstream_id = Some("sni-upstream".into());
-    proxy.retry = Some(RetryConfig::default());
-    let mut config = empty_config();
-    config.upstreams = vec![upstream];
-    config.proxies = vec![proxy];
-    config.normalize_fields();
-
-    let err = config.validate_upstream_references().unwrap_err();
-    assert!(
-        err.iter().any(|msg| {
-            msg.contains("enables retry")
-                && msg.contains("backend TLS SNI")
-                && msg.contains("direct HTTP/2")
-        }),
-        "expected SNI+retry admission rejection, got {err:?}"
-    );
-}
-
-#[test]
-fn backend_tls_sni_with_grpc_web_buffering_fails_validate() {
-    let mut upstream = make_upstream("sni-upstream");
-    upstream.backend_tls_sni = Some("backend.mesh.internal".into());
-    let mut proxy = make_proxy("p1", "/api");
-    proxy.backend_scheme = Some(BackendScheme::Https);
-    proxy.dispatch_kind = DispatchKind::HttpsPool;
-    proxy.upstream_id = Some("sni-upstream".into());
-    proxy.plugins = vec![PluginAssociation {
-        plugin_config_id: "grpc-web-1".into(),
-    }];
-    let mut config = empty_config();
-    config.upstreams = vec![upstream];
-    config.proxies = vec![proxy];
-    config.plugin_configs = vec![PluginConfig {
-        id: "grpc-web-1".into(),
-        namespace: ferrum_edge::config::types::default_namespace(),
-        plugin_name: "grpc_web".into(),
-        scope: PluginScope::Proxy,
-        proxy_id: Some("p1".into()),
-        enabled: true,
-        config: serde_json::json!({}),
-        priority_override: None,
-        api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    }];
-    config.normalize_fields();
-
-    let err = config.validate_upstream_references().unwrap_err();
-    assert!(
-        err.iter().any(|msg| {
-            msg.contains("request-body-buffering")
-                && msg.contains("backend TLS SNI")
-                && msg.contains("grpc-web-1")
-        }),
-        "expected SNI+buffering admission rejection, got {err:?}"
-    );
-}
-
 /// Build a plugin config for the SNI admission tests.
 fn sni_plugin_config(
     id: &str,
@@ -2741,8 +2676,9 @@ fn sni_proxy_plugin(id: &str, name: &str, config: serde_json::Value) -> PluginCo
     sni_plugin_config(id, name, PluginScope::Proxy, config)
 }
 
-/// A plain-HTTPS proxy with a backend TLS SNI override, with every
-/// non-global plugin config attached to it.
+/// A plain-HTTPS proxy with an upstream-level backend TLS SNI override — the
+/// shape a Gateway API `BackendTLSPolicy` `validation.hostname` translates to —
+/// with every non-global plugin config attached to it.
 fn sni_config_with_plugins(plugin_configs: Vec<PluginConfig>) -> GatewayConfig {
     let mut upstream = make_upstream("sni-upstream");
     upstream.backend_tls_sni = Some("backend.mesh.internal".into());
@@ -2767,215 +2703,10 @@ fn sni_config_with_plugins(plugin_configs: Vec<PluginConfig>) -> GatewayConfig {
     config
 }
 
-/// Only the request-body-buffering leg of the SNI admission errors.
-fn buffering_rejection_ids(config: &GatewayConfig) -> Vec<String> {
-    let Err(errors) = config.validate_upstream_references() else {
-        return Vec::new();
-    };
-    let mut rejections = Vec::new();
-    for msg in errors {
-        if msg.contains("request-body-buffering") {
-            rejections.push(msg);
-        }
-    }
-    rejections
-}
-
-/// The screen follows each plugin's own parsed state instead of a static name
-/// list: `compression` buffers only when request decompression is configured.
-#[test]
-fn backend_tls_sni_buffering_screen_follows_compression_plugin_state() {
-    let pc = sni_proxy_plugin("compression-1", "compression", serde_json::json!({}));
-    let config = sni_config_with_plugins(vec![pc]);
-    let rejections = buffering_rejection_ids(&config);
-    let msg = format!("response-only compression rejected: {rejections:?}");
-    assert!(rejections.is_empty(), "{msg}");
-
-    let decompress = serde_json::json!({
-        "decompress_request": true,
-        "max_decompressed_request_size": 1024
-    });
-    let pc = sni_proxy_plugin("compression-1", "compression", decompress);
-    let config = sni_config_with_plugins(vec![pc]);
-    let rejections = buffering_rejection_ids(&config);
-    let hit = rejections.iter().any(|m| m.contains("compression-1"));
-    let msg = format!("decompressing compression admitted: {rejections:?}");
-    assert!(hit, "{msg}");
-}
-
-/// `hmac_auth` buffers the request body before authenticate but was absent
-/// from the old hardcoded name list; the trait-derived screen catches it.
-#[test]
-fn backend_tls_sni_buffering_screen_covers_plugins_absent_from_old_list() {
-    let pc = sni_proxy_plugin("hmac-1", "hmac_auth", serde_json::json!({}));
-    let config = sni_config_with_plugins(vec![pc]);
-    let rejections = buffering_rejection_ids(&config);
-    let hit = rejections.iter().any(|m| m.contains("hmac-1"));
-    let msg = format!("hmac_auth buffering not screened: {rejections:?}");
-    assert!(hit, "{msg}");
-}
-
-/// Global-scope inheritance keeps working through the trait-derived screen.
-#[test]
-fn backend_tls_sni_buffering_screen_covers_inherited_global_plugins() {
-    let scope = PluginScope::Global;
-    let empty = serde_json::json!({});
-    let pc = sni_plugin_config("global-web", "grpc_web", scope, empty);
-    let config = sni_config_with_plugins(vec![pc]);
-    let rejections = buffering_rejection_ids(&config);
-    let named = rejections.iter().any(|m| m.contains("global-web"));
-    let inherited = rejections.iter().any(|m| m.contains("inherits"));
-    let msg = format!("global buffering plugin not screened: {rejections:?}");
-    assert!(named && inherited, "{msg}");
-}
-
-/// A disabled plugin config is not effective and must not reject the proxy.
-#[test]
-fn backend_tls_sni_buffering_screen_ignores_disabled_plugin_configs() {
-    let empty = serde_json::json!({});
-    let mut pc = sni_proxy_plugin("grpc-web-1", "grpc_web", empty);
-    pc.enabled = false;
-    let config = sni_config_with_plugins(vec![pc]);
-    let rejections = buffering_rejection_ids(&config);
-    let msg = format!("disabled plugin rejected: {rejections:?}");
-    assert!(rejections.is_empty(), "{msg}");
-}
-
-/// A disabled local plugin must not shadow an enabled global with the same
-/// name; the global's buffering requirement still rejects the SNI proxy.
-#[test]
-fn backend_tls_sni_buffering_screen_disabled_local_does_not_shadow_enabled_global() {
-    let empty = serde_json::json!({});
-    let global = sni_plugin_config("global-web", "grpc_web", PluginScope::Global, empty.clone());
-    let mut local = sni_proxy_plugin("local-web", "grpc_web", empty);
-    local.enabled = false;
-    let config = sni_config_with_plugins(vec![global, local]);
-    let rejections = buffering_rejection_ids(&config);
-    let global_hit = rejections.iter().any(|m| m.contains("global-web"));
-    let inherited = rejections.iter().any(|m| m.contains("inherits"));
-    let msg = format!("enabled global shadowed by disabled local: {rejections:?}");
-    assert!(global_hit && inherited, "{msg}");
-}
-
-/// An enabled local whose config does not construct must not shadow an
-/// enabled buffering global — PluginCache's construction-`Err` arm leaves the
-/// global in place, and SNI admission must keep seeing that global.
-#[test]
-fn backend_tls_sni_buffering_screen_unconstructable_local_does_not_shadow_enabled_global() {
-    let decompress = serde_json::json!({
-        "decompress_request": true,
-        "max_decompressed_request_size": 1024
-    });
-    let global = sni_plugin_config(
-        "global-compression",
-        "compression",
-        PluginScope::Global,
-        decompress,
-    );
-    let bad = serde_json::json!({"algorithms": ["not-a-codec"]});
-    let local = sni_proxy_plugin("local-compression", "compression", bad);
-    let config = sni_config_with_plugins(vec![global, local]);
-    let rejections = buffering_rejection_ids(&config);
-    let global_hit = rejections.iter().any(|m| m.contains("global-compression"));
-    let inherited = rejections.iter().any(|m| m.contains("inherits"));
-    let local_hit = rejections.iter().any(|m| m.contains("local-compression"));
-    let msg = format!("enabled buffering global shadowed by unconstructable local: {rejections:?}");
-    assert!(global_hit && inherited && !local_hit, "{msg}");
-}
-
-/// Unknown / custom plugin names stay admitted; the runtime 502 remains the
-/// fail-closed backstop, so admission must not invent a rejection.
-#[test]
-fn backend_tls_sni_buffering_screen_admits_unknown_plugin_names() {
-    let cfg = serde_json::json!({"anything": true});
-    let pc = sni_proxy_plugin("custom-1", "some_custom_plugin", cfg);
-    let config = sni_config_with_plugins(vec![pc]);
-    let rejections = buffering_rejection_ids(&config);
-    let msg = format!("unevaluable plugin rejected: {rejections:?}");
-    assert!(rejections.is_empty(), "{msg}");
-}
-
-/// A built-in whose config does not construct is rejected by plugin-config
-/// validation, not disguised as a buffering conflict here.
-#[test]
-fn backend_tls_sni_buffering_screen_admits_unconstructable_configs() {
-    let cfg = serde_json::json!({"algorithms": ["not-a-codec"]});
-    let pc = sni_proxy_plugin("compression-1", "compression", cfg);
-    let config = sni_config_with_plugins(vec![pc]);
-    let rejections = buffering_rejection_ids(&config);
-    let msg = format!("unconstructable config rejected: {rejections:?}");
-    assert!(rejections.is_empty(), "{msg}");
-}
-
-/// Plugin config ids may be reused across namespaces; SNI admission must
-/// resolve proxy associations in the proxy's namespace only.
-#[test]
-fn backend_tls_sni_buffering_screen_ignores_reused_plugin_id_in_other_namespace() {
-    let mut local = sni_proxy_plugin("shared-pc-id", "compression", serde_json::json!({}));
-    local.namespace = "tenant-a".to_string();
-    let decompress = serde_json::json!({
-        "decompress_request": true,
-        "max_decompressed_request_size": 1024
-    });
-    let mut foreign = sni_proxy_plugin("shared-pc-id", "compression", decompress);
-    foreign.namespace = "tenant-b".to_string();
-    let mut config = sni_config_with_plugins(vec![foreign, local]);
-    config.proxies[0].namespace = "tenant-a".to_string();
-    config.upstreams[0].namespace = "tenant-a".to_string();
-    config.normalize_fields();
-    let rejections = buffering_rejection_ids(&config);
-    let msg = format!("other-namespace plugin id false rejection: {rejections:?}");
-    assert!(rejections.is_empty(), "{msg}");
-}
-
-/// Global buffering plugins in another namespace must not reject this proxy.
-#[test]
-fn backend_tls_sni_buffering_screen_ignores_global_plugins_in_other_namespace() {
-    let empty = serde_json::json!({});
-    let mut foreign = sni_plugin_config("global-web", "grpc_web", PluginScope::Global, empty);
-    foreign.namespace = "tenant-b".to_string();
-    let mut config = sni_config_with_plugins(vec![foreign]);
-    config.proxies[0].namespace = "tenant-a".to_string();
-    config.upstreams[0].namespace = "tenant-a".to_string();
-    config.normalize_fields();
-    let rejections = buffering_rejection_ids(&config);
-    let msg = format!("other-namespace global false rejection: {rejections:?}");
-    assert!(rejections.is_empty(), "{msg}");
-}
-
-/// Same-namespace inherited globals must still reject plain-HTTPS SNI proxies.
-#[test]
-fn backend_tls_sni_buffering_screen_rejects_same_namespace_global_plugins() {
-    let empty = serde_json::json!({});
-    let mut global = sni_plugin_config("global-web", "grpc_web", PluginScope::Global, empty);
-    global.namespace = "tenant-a".to_string();
-    let mut config = sni_config_with_plugins(vec![global]);
-    config.proxies[0].namespace = "tenant-a".to_string();
-    config.upstreams[0].namespace = "tenant-a".to_string();
-    config.normalize_fields();
-    let rejections = buffering_rejection_ids(&config);
-    let global_hit = rejections.iter().any(|m| m.contains("global-web"));
-    let inherited = rejections.iter().any(|m| m.contains("inherits"));
-    let msg = format!("same-namespace global not screened: {rejections:?}");
-    assert!(global_hit && inherited, "{msg}");
-}
-
-/// A proxy without a plain-HTTPS SNI override is never screened at all, so a
-/// buffering plugin on it must stay admitted.
-#[test]
-fn buffering_plugins_are_only_screened_for_sni_proxies() {
-    let empty = serde_json::json!({});
-    let pc = sni_proxy_plugin("grpc-web-1", "grpc_web", empty);
-    let mut config = sni_config_with_plugins(vec![pc]);
-    config.upstreams[0].backend_tls_sni = None;
-    config.proxies[0].resolved_tls.sni = None;
-    let rejections = buffering_rejection_ids(&config);
-    let msg = format!("non-SNI proxy screened: {rejections:?}");
-    assert!(rejections.is_empty(), "{msg}");
-}
-
-#[test]
-fn backend_tls_sni_per_port_overlay_with_http2_disabled_fails_validate() {
+/// The same shape, but with the SNI override arriving as a DestinationRule /
+/// per-port `BackendTLSPolicy` overlay on the upstream's policy port instead of
+/// at the upstream level.
+fn per_port_sni_config() -> GatewayConfig {
     let mut upstream = make_upstream("sni-upstream");
     let mut per_port_tls = BackendTlsConfig::default_verify();
     per_port_tls.sni = Some("reviews.mesh.internal".into());
@@ -2990,39 +2721,137 @@ fn backend_tls_sni_per_port_overlay_with_http2_disabled_fails_validate() {
     proxy.backend_scheme = Some(BackendScheme::Https);
     proxy.dispatch_kind = DispatchKind::HttpsPool;
     proxy.upstream_id = Some("sni-upstream".into());
-    proxy.pool_enable_http2 = Some(false);
     let mut config = empty_config();
     config.upstreams = vec![upstream];
     config.proxies = vec![proxy];
     config.normalize_fields();
+    config
+}
 
-    let err = config.validate_upstream_references().unwrap_err();
+/// Admission errors that name the SNI test proxy, if any.
+fn sni_admission_errors(config: &GatewayConfig) -> Vec<String> {
+    match config.validate_upstream_references() {
+        Ok(()) => Vec::new(),
+        Err(errors) => errors,
+    }
+}
+
+/// The runtime honors a backend TLS SNI override on the reqwest/HTTP-1.1 dial,
+/// so a retry-enabled route is an ordinary `BackendTLSPolicy` shape. Admission
+/// used to reject it on the premise that only the direct-H2 pool could carry a
+/// server name; issue #3276 requires that valid policy shapes are not rejected
+/// generically.
+#[test]
+fn backend_tls_sni_with_effective_retry_is_admitted() {
+    let mut config = sni_config_with_plugins(Vec::new());
+    config.proxies[0].retry = Some(RetryConfig::default());
+    config.normalize_fields();
+
+    let errors = sni_admission_errors(&config);
     assert!(
-        err.iter().any(|msg| {
-            msg.contains("pool_enable_http2 is false")
-                && msg.contains("per-port TLS SNI")
-                && msg.contains("reviews.mesh.internal")
-        }),
-        "expected per-port SNI + http2-disabled rejection, got {err:?}"
+        errors.is_empty(),
+        "SNI + retry must be admitted; got {errors:?}"
     );
 }
 
+/// Request-body buffering (here `grpc_web`) is served by the reqwest/H1 SNI
+/// dial too, at proxy scope and through an inherited same-namespace global.
 #[test]
-fn backend_tls_sni_without_retry_or_buffering_passes_validate() {
-    let mut upstream = make_upstream("sni-upstream");
-    upstream.backend_tls_sni = Some("backend.mesh.internal".into());
-    let mut proxy = make_proxy("p1", "/api");
-    proxy.backend_scheme = Some(BackendScheme::Https);
-    proxy.dispatch_kind = DispatchKind::HttpsPool;
-    proxy.upstream_id = Some("sni-upstream".into());
-    let mut config = empty_config();
-    config.upstreams = vec![upstream];
-    config.proxies = vec![proxy];
+fn backend_tls_sni_with_request_body_buffering_plugin_is_admitted() {
+    let empty = serde_json::json!({});
+    let local = sni_proxy_plugin("grpc-web-1", "grpc_web", empty.clone());
+    let config = sni_config_with_plugins(vec![local]);
+    let errors = sni_admission_errors(&config);
+    assert!(
+        errors.is_empty(),
+        "SNI + a proxy-scoped buffering plugin must be admitted; got {errors:?}"
+    );
+
+    let global = sni_plugin_config("global-web", "grpc_web", PluginScope::Global, empty);
+    let config = sni_config_with_plugins(vec![global]);
+    let errors = sni_admission_errors(&config);
+    assert!(
+        errors.is_empty(),
+        "SNI + an inherited global buffering plugin must be admitted; got {errors:?}"
+    );
+}
+
+/// `pool_enable_http2: false` only removes the direct-H2 pool, which the
+/// reqwest/H1 SNI dial does not need.
+#[test]
+fn backend_tls_sni_with_pool_http2_disabled_is_admitted() {
+    let mut config = sni_config_with_plugins(Vec::new());
+    config.proxies[0].pool_enable_http2 = Some(false);
     config.normalize_fields();
 
+    let errors = sni_admission_errors(&config);
+    assert!(
+        errors.is_empty(),
+        "SNI + pool_enable_http2=false must be admitted; got {errors:?}"
+    );
+}
+
+/// All three former conflict legs at once, on the upstream-level override.
+#[test]
+fn backend_tls_sni_with_retry_buffering_and_http2_disabled_is_admitted() {
+    let pc = sni_proxy_plugin("grpc-web-1", "grpc_web", serde_json::json!({}));
+    let mut config = sni_config_with_plugins(vec![pc]);
+    config.proxies[0].retry = Some(RetryConfig::default());
+    config.proxies[0].pool_enable_http2 = Some(false);
+    config.normalize_fields();
+
+    let errors = sni_admission_errors(&config);
+    assert!(
+        errors.is_empty(),
+        "every former SNI conflict combination must be admitted; got {errors:?}"
+    );
+}
+
+/// The DestinationRule / per-port `BackendTLSPolicy` overlay is admitted for the
+/// same combinations, both on its own and with all three former conflict legs.
+#[test]
+fn backend_tls_sni_per_port_overlay_is_admitted_with_every_former_conflict() {
+    let config = per_port_sni_config();
+    let errors = sni_admission_errors(&config);
+    assert!(
+        errors.is_empty(),
+        "a per-port SNI overlay alone must be admitted; got {errors:?}"
+    );
+
+    let pc = sni_proxy_plugin("grpc-web-1", "grpc_web", serde_json::json!({}));
+    let mut config = per_port_sni_config();
+    config.plugin_configs = vec![pc];
+    config.proxies[0].plugins = vec![PluginAssociation {
+        plugin_config_id: "grpc-web-1".into(),
+    }];
+    config.proxies[0].retry = Some(RetryConfig::default());
+    config.proxies[0].pool_enable_http2 = Some(false);
+    config.normalize_fields();
+
+    let errors = sni_admission_errors(&config);
+    assert!(
+        errors.is_empty(),
+        "a per-port SNI overlay with retry + buffering + no-h2 must be admitted; got {errors:?}"
+    );
+}
+
+/// A plain SNI route stays admitted, and a proxy carrying no override is never
+/// screened for these combinations at all.
+#[test]
+fn backend_tls_sni_alone_and_non_sni_proxies_pass_validate() {
+    let config = sni_config_with_plugins(Vec::new());
     assert!(
         config.validate_upstream_references().is_ok(),
         "SNI alone must pass admission under default body limits"
+    );
+
+    let pc = sni_proxy_plugin("grpc-web-1", "grpc_web", serde_json::json!({}));
+    let mut config = sni_config_with_plugins(vec![pc]);
+    config.upstreams[0].backend_tls_sni = None;
+    config.proxies[0].resolved_tls.sni = None;
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "a proxy without an SNI override must stay admitted"
     );
 }
 

@@ -10156,9 +10156,13 @@ components:
             URL authority while pinning the socket to the selected target).
             It also partitions backend connection pools, so two values never
             share a connection. Must be an exact DNS hostname — not a
-            wildcard and not an IP literal (RFC 6066 §3). Direct WebSocket
-            (`wss://`) transport cannot apply it and refuses such an upgrade
-            with 502; see `docs/backend_mtls.md`.
+            wildcard and not an IP literal (RFC 6066 §3). Because the reqwest
+            HTTP/1.1 dial serves them, this field is accepted alongside
+            effective retry, request-body-buffering plugins, and
+            `pool_enable_http2: false`; admission returns no 400 for those
+            combinations. Direct WebSocket (`wss://`) transport cannot apply
+            it and refuses such an upgrade with 502; see
+            `docs/backend_mtls.md`.
         backend_tls_san_allow_list:
           type: array
           maxItems: 256

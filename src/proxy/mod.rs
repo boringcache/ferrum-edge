@@ -12685,6 +12685,25 @@ fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Whether everything left of the rendered host, to the END of the authority,
+/// is a port and nothing else: either empty, or `:` followed by one or more
+/// ASCII digits.
+///
+/// This is the host-boundary proof for [`rewrite_backend_url_authority_host`],
+/// and it is deliberately a whole-remainder test rather than a leading-byte
+/// test. `:` alone establishes nothing about the host: an authority's userinfo
+/// runs to the LAST `@`, so `foo.example:443@evil.test` names the host
+/// `evil.test` while presenting a `:`-led remainder, and `:443x` is not an
+/// authority whose host can be identified at all. Rejecting both leaves the
+/// rewrite defined only where the source host really is the authority's host.
+/// Allocation-free: a byte scan over a borrowed slice.
+fn authority_remainder_is_port_only(remainder: &str) -> bool {
+    match remainder.strip_prefix(':') {
+        None => remainder.is_empty(),
+        Some(port) => !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()),
+    }
+}
+
 /// Rewrite the AUTHORITY HOST of a `{scheme}://{host}:{port}{path}` backend URL,
 /// replacing the rendered `from_host` (in the authority position only) with the
 /// rendered `to_host`. Used by the CROSS-CLUSTER HBONE dispatch to turn a URL
@@ -12697,14 +12716,19 @@ fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
 /// URL is returned unchanged (defensive; the caller still fails closed on a
 /// subsequent parse error).
 ///
-/// The prefix match additionally requires a **host boundary**: what follows the
-/// rendered source host must be empty or start with `:` (the port separator).
-/// Without that, `from_host = "foo.example"` also matched the authority
-/// `foo.example.evil` and rewrote a *different* host's URL — the callers here
-/// build exact authorities, but a security helper must not depend on its
-/// callers for the property it exists to provide. Bracketed IPv6 is unaffected:
-/// the closing `]` is part of the rendered host, so the remainder is `` or
-/// `:{port}` exactly as for a DNS name.
+/// The prefix match additionally requires a **complete host boundary**: what
+/// follows the rendered source host must be the whole remainder of the
+/// authority, and that remainder must be either empty or `:` plus a nonempty
+/// decimal port ([`authority_remainder_is_port_only`]). Without that,
+/// `from_host = "foo.example"` also matched the authority `foo.example.evil`
+/// and rewrote a *different* host's URL. Accepting any `:`-led remainder was
+/// not enough either: URL userinfo is everything before the last `@`, so
+/// `foo.example:443@evil.test` has host `evil.test` while still "starting with
+/// a colon", and `:443x` / `:` are not authorities this helper can reason about
+/// at all. The callers here build exact authorities, but a security helper must
+/// not depend on its callers for the property it exists to provide. Bracketed
+/// IPv6 is unaffected: the closing `]` is part of the rendered host, so the
+/// remainder is `` or `:{port}` exactly as for a DNS name.
 fn rewrite_backend_url_authority_host(url: &str, from_host: &str, to_host: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
@@ -12719,7 +12743,7 @@ fn rewrite_backend_url_authority_host(url: &str, from_host: &str, to_host: &str)
     // The authority is `{rendered_host}:{port}` (or bare `{rendered_host}`).
     if let Some(after_host) = authority
         .strip_prefix(rendered_from.as_ref())
-        .filter(|after_host| after_host.is_empty() || after_host.starts_with(':'))
+        .filter(|after_host| authority_remainder_is_port_only(after_host))
     {
         let rendered_to = url_render_host(to_host);
         format!(
@@ -42175,6 +42199,38 @@ mod tests {
         let out = rewrite_backend_url_authority_host(userinfo, from, to);
         assert_eq!(out, userinfo);
 
+        // ...including the `:`-led userinfo form, whose remainder starts with
+        // the port separator but whose real host (userinfo runs to the LAST
+        // `@`) is `evil.test`. Accepting any `:`-led remainder admitted this.
+        for userinfo_port in [
+            "https://foo.example:443@evil.test/p",
+            "https://foo.example:443@evil.test:8443/p",
+            "https://foo.example:@evil.test/p",
+        ] {
+            let out = rewrite_backend_url_authority_host(userinfo_port, from, to);
+            assert_eq!(
+                out, userinfo_port,
+                "userinfo authority must not be rewritten: {userinfo_port}"
+            );
+        }
+
+        // A malformed / non-decimal / empty port is not an authority whose host
+        // can be identified, so it is not rewritten either.
+        for malformed in [
+            "https://foo.example:443x/p",
+            "https://foo.example:/p",
+            "https://foo.example:80a80/p",
+            "https://foo.example: 443/p",
+            "https://foo.example:+443/p",
+            "https://foo.example:443:8443/p",
+        ] {
+            let out = rewrite_backend_url_authority_host(malformed, from, to);
+            assert_eq!(
+                out, malformed,
+                "malformed port suffix must not be rewritten: {malformed}"
+            );
+        }
+
         // The exact host, with and without a port, still rewrites.
         let exact = "https://foo.example:8443/p?q=1";
         let out = rewrite_backend_url_authority_host(exact, from, to);
@@ -42199,6 +42255,67 @@ mod tests {
         let v6_sibling = "https://[fd00::1]x:8443/p";
         let out = rewrite_backend_url_authority_host(v6_sibling, "fd00::1", "sni.example");
         assert_eq!(out, v6_sibling);
+
+        // Ordinary decimal ports rewrite whatever terminates the authority —
+        // `/`, `?`, `#`, or end of string.
+        for (input, expected) in [
+            ("https://foo.example:1/p", "https://sni.example.com:1/p"),
+            (
+                "https://foo.example:65535/p",
+                "https://sni.example.com:65535/p",
+            ),
+            ("https://foo.example:8443", "https://sni.example.com:8443"),
+            (
+                "https://foo.example:8443?q=1",
+                "https://sni.example.com:8443?q=1",
+            ),
+            (
+                "https://foo.example:8443#frag",
+                "https://sni.example.com:8443#frag",
+            ),
+            ("https://foo.example", "https://sni.example.com"),
+        ] {
+            let out = rewrite_backend_url_authority_host(input, from, to);
+            assert_eq!(out, expected, "expected rewrite for {input}");
+        }
+
+        // A bracketed IPv6 port suffix is held to the same rule.
+        let v6_bad_port = "https://[fd00::1]:443@evil.test/p";
+        let out = rewrite_backend_url_authority_host(v6_bad_port, "fd00::1", "sni.example");
+        assert_eq!(out, v6_bad_port);
+    }
+
+    /// The port-suffix predicate that supplies the host boundary, pinned
+    /// directly so the rewrite's negatives cannot be satisfied by accident.
+    #[test]
+    fn authority_remainder_is_port_only_accepts_only_empty_or_decimal_port() {
+        for accepted in ["", ":1", ":80", ":8443", ":65535", ":000"] {
+            assert!(
+                authority_remainder_is_port_only(accepted),
+                "expected accepted remainder: {accepted:?}"
+            );
+        }
+        for rejected in [
+            ":",
+            ":x",
+            ":443x",
+            ":443@evil.test",
+            ":@evil.test",
+            ": 443",
+            ":+443",
+            ":-1",
+            ":443:8443",
+            "x",
+            ".evil",
+            "@evil.test",
+            // Non-ASCII digits: `is_ascii_digit`, not `is_numeric`.
+            ":４４３",
+        ] {
+            assert!(
+                !authority_remainder_is_port_only(rejected),
+                "expected rejected remainder: {rejected:?}"
+            );
+        }
     }
 
     #[test]

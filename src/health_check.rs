@@ -1217,7 +1217,10 @@ impl HealthChecker {
         // (`crate::proxy::backend_tls_sni_reqwest_dial`) — while the client
         // built for this target pins its resolver to the real target host, so
         // the override is never resolved and the socket cannot leave that
-        // target's egress-screened candidate set.
+        // target's egress-screened candidate set. That client is also restricted
+        // to HTTP/1.1 (`build_health_check_client_with_tls`), which is what makes
+        // the explicit `Host` below authoritative: over HTTP/2 the authority
+        // would be rebuilt from the URI, i.e. from the server name.
         let probe_server_name = if config.use_tls {
             tls_config.sni.as_deref()
         } else {
@@ -1231,7 +1234,9 @@ impl HealthChecker {
         );
         // ...and the backend must still see its OWN authority, never the server
         // name. Sent explicitly because hyper-util only derives `Host` from the
-        // URL when the request carries none. Absent (and byte-identical to
+        // URL when the request carries none, and PRESERVED because the SNI probe
+        // client speaks HTTP/1.1 only — `Host` is a header there, not a value the
+        // transport recomputes from the URI. Absent (and byte-identical to
         // today's probe) whenever no override is configured.
         let host_header = probe_server_name.map(|_| probe_authority(scheme, &host, port));
         let udp_payload = config
@@ -2394,6 +2399,43 @@ fn accept_health_check_client(
     }
 }
 
+/// Install the probe's dial identity on a health-check client builder: the DNS
+/// resolver, and — for a `backend_tls_sni` probe — the HTTP/1.1-only
+/// restriction that keeps its explicit `Host` header authoritative.
+///
+/// Both halves are one decision. A pinned probe's URL host is the overridden TLS
+/// server name, so:
+///
+/// * the resolver must answer every name by resolving the REAL target, or
+///   reqwest would resolve the override and dial wherever it points; and
+/// * ALPN must exclude `h2`, or HTTP/2 would rebuild `:authority` from that same
+///   URL and show the backend the override instead of the target being probed.
+///
+/// Split out of [`build_health_check_client_with_tls`] so the pairing can be
+/// asserted on a `ClientBuilder` (whose `Debug` reports `http1_only`) rather
+/// than only observed on the wire.
+fn apply_probe_dial_identity(
+    builder: reqwest::ClientBuilder,
+    dns_cache: Option<DnsCache>,
+    dial_host_pin: Option<&str>,
+) -> Result<reqwest::ClientBuilder, HealthCheckClientError> {
+    match (dns_cache, dial_host_pin) {
+        (Some(dns_cache), Some(pin)) => {
+            let resolver = DnsCacheResolver::with_hostname_pin(dns_cache, pin);
+            Ok(builder.dns_resolver(Arc::new(resolver)).http1_only())
+        }
+        (Some(dns_cache), None) => {
+            let resolver = DnsCacheResolver::new(dns_cache);
+            Ok(builder.dns_resolver(Arc::new(resolver)))
+        }
+        // A server-name override with no DNS cache to pin would let reqwest's
+        // own resolver look up the SNI hostname and dial wherever it points.
+        // That is the escape this must never allow, so fail closed instead.
+        (None, Some(_)) => Err(HealthCheckClientError::DialPinUnavailable),
+        (None, None) => Ok(builder),
+    }
+}
+
 /// Build a health check HTTP client with upstream-specific TLS configuration.
 ///
 /// Configures the client with the upstream's CA bundle, client cert/key for mTLS,
@@ -2406,6 +2448,23 @@ fn accept_health_check_client(
 /// resolver answer every name by resolving the REAL target instead, so the
 /// server name is never itself resolved and the socket cannot leave the
 /// egress-screened candidate set for that target.
+///
+/// A pinned client is additionally restricted to **HTTP/1.1**, for the same
+/// reason the proxy's SNI dial is. The probe carries the real target authority
+/// in an explicit `Host` header, which hyper-util preserves on HTTP/1.1 — but
+/// HTTP/2 derives `:authority` from the URI, i.e. from the server name, so an
+/// h2-negotiated probe would present the OVERRIDE as its authority and measure
+/// a request the backend never receives from proxy traffic. `http1_only()` is
+/// load-bearing here rather than a hint: this builder does not use
+/// `use_preconfigured_tls`, so reqwest itself derives the client's ALPN from
+/// the version preference and advertises `http/1.1` alone (see
+/// `vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/client.rs`), which means
+/// an h2-capable backend cannot select h2 on this connection. Probes without an
+/// override keep the default h2-capable client: their URL already names the real
+/// target, so there is no authority to lose.
+///
+/// The resolver + ALPN half of that contract lives in
+/// [`apply_probe_dial_identity`] so it can be asserted directly.
 fn build_health_check_client_with_tls(
     pool_config: &PoolConfig,
     dns_cache: Option<DnsCache>,
@@ -2428,23 +2487,7 @@ fn build_health_check_client_with_tls(
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(skip_verify);
 
-    match (dns_cache.clone(), dial_host_pin) {
-        (Some(dns_cache), Some(pin)) => {
-            let resolver = DnsCacheResolver::with_hostname_pin(dns_cache, pin);
-            builder = builder.dns_resolver(Arc::new(resolver));
-        }
-        (Some(dns_cache), None) => {
-            let resolver = DnsCacheResolver::new(dns_cache);
-            builder = builder.dns_resolver(Arc::new(resolver));
-        }
-        // A server-name override with no DNS cache to pin would let reqwest's
-        // own resolver look up the SNI hostname and dial wherever it points.
-        // That is the escape this must never allow, so fail closed instead.
-        (None, Some(_)) => {
-            return Err(HealthCheckClientError::DialPinUnavailable);
-        }
-        (None, None) => {}
-    }
+    builder = apply_probe_dial_identity(builder, dns_cache.clone(), dial_host_pin)?;
 
     // Load CA bundle (upstream → global → system roots). `system://` resolves to
     // `None` here so the probe pins the built-in roots and deliberately skips
@@ -2567,7 +2610,9 @@ fn build_health_check_client_with_tls(
         builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
     }
 
-    if pool_config.enable_http2 {
+    // An SNI-override probe is HTTP/1.1-only by construction (see above), so the
+    // HTTP/2 keepalive settings have nothing to govern on it.
+    if pool_config.enable_http2 && dial_host_pin.is_none() {
         builder = builder
             .http2_keep_alive_interval(Duration::from_secs(
                 pool_config.http2_keep_alive_interval_seconds,
@@ -2584,7 +2629,14 @@ fn build_health_check_client_with_tls(
     // above refuse, just later. `skip_verify` is deliberately NOT an escape here
     // either — see the CA block for why disabling verification does not license
     // discarding explicitly configured material.
-    let has_explicit_material = ca_path.is_some() || cert_path.is_some() || key_path.is_some();
+    //
+    // A `dial_host_pin` disqualifies the fallback outright, whatever material was
+    // named: the minimal client carries neither the hostname pin nor the H1-only
+    // restriction, so it would resolve the SNI hostname from the probe URL and
+    // dial wherever THAT points — the exact escape `DialPinUnavailable` exists to
+    // refuse. Fail closed instead and let the probe report unhealthy.
+    let has_explicit_material =
+        ca_path.is_some() || cert_path.is_some() || key_path.is_some() || dial_host_pin.is_some();
     match builder.build() {
         Ok(client) => Ok(client),
         Err(e) if !has_explicit_material => {
@@ -3430,6 +3482,50 @@ mod tests {
         assert!(
             pin_missing,
             "an unpinnable SNI probe must not build a client that resolves the server name"
+        );
+    }
+
+    /// A pinned (SNI-override) probe client must be HTTP/1.1-only.
+    ///
+    /// The probe puts the server name in the URL authority and the REAL target
+    /// in an explicit `Host` header. HTTP/2 rebuilds `:authority` from the URI,
+    /// so an h2-negotiated probe would present the override instead — measuring
+    /// a request proxy traffic never makes. `ClientBuilder`'s `Debug` reports
+    /// `http1_only` exactly when the version preference is HTTP/1, which is the
+    /// same field that restricts the client's advertised ALPN to `http/1.1`.
+    /// The wire-level counterpart (an h2-advertising backend that only speaks
+    /// raw H1) lives in
+    /// `tests/integration/gateway_api_backend_tls_policy_tests.rs`.
+    #[test]
+    fn sni_probe_dial_identity_is_restricted_to_http1() {
+        let dns_cache = DnsCache::new(DnsConfig::default());
+
+        let pinned = apply_probe_dial_identity(
+            reqwest::Client::builder(),
+            Some(dns_cache.clone()),
+            Some("pod-a.internal"),
+        )
+        .expect("pinned SNI probe builder");
+        assert!(
+            format!("{pinned:?}").contains("http1_only"),
+            "an SNI-override probe must not be able to negotiate h2: {pinned:?}"
+        );
+
+        // A probe without an override keeps the ordinary h2-capable client: its
+        // URL already names the real target, so there is no authority to lose.
+        let unpinned = apply_probe_dial_identity(reqwest::Client::builder(), Some(dns_cache), None)
+            .expect("ordinary probe builder");
+        assert!(
+            !format!("{unpinned:?}").contains("http1_only"),
+            "a probe without a server-name override must not be narrowed to H1: {unpinned:?}"
+        );
+
+        // And the pin itself stays mandatory: no cache, no client.
+        let unpinnable =
+            apply_probe_dial_identity(reqwest::Client::builder(), None, Some("pod-a.internal"));
+        assert!(
+            matches!(unpinnable, Err(HealthCheckClientError::DialPinUnavailable)),
+            "an unpinnable SNI probe must not build a builder at all"
         );
     }
 

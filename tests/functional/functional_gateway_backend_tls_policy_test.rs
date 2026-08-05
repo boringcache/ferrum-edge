@@ -323,9 +323,10 @@ fn k8s_objects(
 /// The dispatch is deliberately NOT forced onto HTTP/1.1. The echo backend
 /// offers only `http/1.1` in ALPN, so the direct-H2 pool cannot negotiate h2
 /// and the request falls through to the reqwest HTTP/1.1 SNI dial — which is
-/// exactly the path under test. Pinning `pool_enable_http2: false` would both
-/// skip that fallback and be rejected by
-/// `backend_tls_sni_direct_h2_conflict_messages` at config load.
+/// exactly the path under test. Pinning `pool_enable_http2: false` would skip
+/// that fallback (it is admitted at config load, but it takes the route
+/// straight to reqwest rather than through the capability downgrade this
+/// suite exercises).
 fn translated_config_yaml(objects: &[K8sObject]) -> String {
     let options = K8sTranslationOptions::new(
         "default".to_string(),

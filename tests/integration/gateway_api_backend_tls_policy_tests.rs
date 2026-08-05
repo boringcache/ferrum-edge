@@ -5,16 +5,25 @@
 //! projection, System well-known roots, invalid CA fail-closed, and policy
 //! withdrawal on delete from the translated snapshot.
 
-use ferrum_edge::config::types::BackendScheme;
+use std::sync::{Arc, Mutex, Once};
+use std::time::{Duration, Instant};
+
+use ferrum_edge::config::PoolConfig;
+use ferrum_edge::config::types::{BackendScheme, GatewayConfig, Upstream};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
+use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::status::{
     FERRUM_GATEWAY_CONTROLLER_NAME, GatewayApiStatusUpdate, plan_gateway_api_status_updates,
 };
 use ferrum_edge::tls::source::SYSTEM_TRUST_ROOTS_SOURCE;
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 fn options() -> K8sTranslationOptions {
     K8sTranslationOptions::new(
@@ -2175,5 +2184,253 @@ fn backend_tls_policy_section_name_miss_on_non_tcp_service_reports_target_not_fo
     assert!(
         !fault_body_mentions(&translated),
         "a policy that attaches to nothing must not fault the Service's valid ports"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Live: the SNI health probe must speak HTTP/1.1
+// ---------------------------------------------------------------------------
+//
+// A `BackendTLSPolicy` `validation.hostname` becomes `backend_tls_sni`, and the
+// active HTTP probe has to offer that server name or it reports a healthy
+// backend as unhealthy. reqwest exposes no per-request server-name hook, so the
+// override goes in the probe URL's authority while the REAL target authority is
+// carried in an explicit `Host` header.
+//
+// That pairing only holds over HTTP/1.1. HTTP/2 derives `:authority` from the
+// URI — i.e. from the server name — so an h2-negotiated probe would show the
+// backend the override instead of the target it is probing. The fixture below
+// therefore ADVERTISES `h2` ahead of `http/1.1` while speaking raw HTTP/1.1: a
+// probe client that is not restricted to H1 selects h2, sends a connection
+// preface instead of a request, and records no `Host` at all.
+
+static INIT_PROBE_CRYPTO: Once = Once::new();
+
+fn ensure_crypto_provider() {
+    INIT_PROBE_CRYPTO.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+struct ProbeCa {
+    cert_pem: String,
+    issuer: Issuer<'static, KeyPair>,
+}
+
+fn probe_ca(cn: &str) -> ProbeCa {
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("CA key");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    let cert = params.self_signed(&key_pair).expect("self-sign CA");
+    ProbeCa {
+        cert_pem: cert.pem(),
+        issuer: Issuer::new(params, key_pair),
+    }
+}
+
+/// Leaf valid for `dns_san` only — the policy hostname, never the dial target.
+fn probe_leaf(ca: &ProbeCa, dns_san: &str) -> (String, String) {
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+    let mut params = CertificateParams::new(vec![dns_san.to_string()]).expect("leaf params");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, dns_san);
+    let cert = params.signed_by(&key_pair, &ca.issuer).expect("sign leaf");
+    (cert.pem(), key_pair.serialize_pem())
+}
+
+/// What one accepted connection revealed about the probe.
+#[derive(Debug, Clone)]
+struct ObservedProbe {
+    /// TLS server name the client presented.
+    server_name: Option<String>,
+    /// ALPN protocol the connection settled on.
+    alpn: Option<String>,
+    /// `Host` header of the HTTP/1.1 request, if the client sent a request at
+    /// all. An h2 client writes a connection preface here instead, so this
+    /// stays `None` — which is exactly the regression this fixture detects.
+    host_header: Option<String>,
+}
+
+/// Accept task, bound port, and per-connection observations.
+type ProbeFixture = (tokio::task::JoinHandle<()>, u16, ProbeLog);
+
+type ProbeLog = Arc<Mutex<Vec<ObservedProbe>>>;
+
+/// TLS listener that ADVERTISES `h2` ahead of `http/1.1` but only ever speaks
+/// raw HTTP/1.1.
+async fn start_h2_first_raw_h1_backend(cert_pem: &str, key_pem: &str) -> ProbeFixture {
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse backend cert");
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .expect("parse backend key")
+        .expect("backend key present");
+    let provider = rustls::crypto::ring::default_provider();
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("backend server cert");
+    // The whole point of the fixture: h2 is offered FIRST.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let observed: ProbeLog = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&observed);
+
+    let handle = tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            let recorder = Arc::clone(&recorder);
+            tokio::spawn(async move {
+                let Ok(mut stream) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let (_, conn) = stream.get_ref();
+                let server_name = conn.server_name().map(str::to_string);
+                let alpn = conn.alpn_protocol().map(alpn_label);
+                let mut buf = vec![0u8; 4096];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                let request_head = String::from_utf8_lossy(&buf[..read]).into_owned();
+                let observation = ObservedProbe {
+                    server_name,
+                    alpn,
+                    host_header: h1_host_header(&request_head),
+                };
+                if let Ok(mut seen) = recorder.lock() {
+                    seen.push(observation);
+                }
+                // Answer raw HTTP/1.1 regardless: an h2 client cannot use this,
+                // which is what makes an unrestricted probe fail loudly.
+                let body = br#"{"status":"ok"}"#;
+                let response_head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response_head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    (handle, port, observed)
+}
+
+/// Owned rendering of a negotiated ALPN protocol identifier.
+fn alpn_label(protocol: &[u8]) -> String {
+    String::from_utf8_lossy(protocol).into_owned()
+}
+
+/// `Host` value of a raw HTTP/1.1 request head, if this is a request at all.
+fn h1_host_header(head: &str) -> Option<String> {
+    if !head.starts_with("GET ") && !head.starts_with("HEAD ") {
+        return None;
+    }
+    for line in head.split("\r\n").skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("host") {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn backend_tls_policy_sni_probe_speaks_http1_and_shows_the_real_target_authority() {
+    ensure_crypto_provider();
+
+    const POLICY_HOSTNAME: &str = "backend.example.com";
+    let ca = probe_ca("backend-tls-policy-probe-ca");
+    let (leaf_cert, leaf_key) = probe_leaf(&ca, POLICY_HOSTNAME);
+    let (_backend, backend_port, observed) =
+        start_h2_first_raw_h1_backend(&leaf_cert, &leaf_key).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, ca.cert_pem.as_bytes()).expect("write CA");
+
+    // What a `BackendTLSPolicy` with `validation.hostname` translates to: the
+    // SNI override plus the policy's CA, dialing the real target.
+    let upstream: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "reviews",
+        "namespace": "ferrum",
+        "targets": [{ "host": "127.0.0.1", "port": backend_port, "weight": 100 }],
+        "backend_tls_sni": POLICY_HOSTNAME,
+        "backend_tls_server_ca_cert_path": ca_path.to_string_lossy(),
+        "backend_tls_verify_server_cert": true,
+        "health_checks": {
+            "active": {
+                "http_path": "/healthz",
+                "interval_seconds": 1,
+                "timeout_ms": 4000,
+                "healthy_threshold": 1,
+                "unhealthy_threshold": 1,
+                "healthy_status_codes": [200],
+                "use_tls": true,
+                "probe_type": "http"
+            }
+        }
+    }))
+    .expect("upstream fixture");
+
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+
+    let dns_cache = DnsCache::new(DnsConfig::default());
+    let checker = HealthChecker::with_pool_config(&PoolConfig::default(), dns_cache);
+    checker.start(&config);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let probe = loop {
+        let first = match observed.lock() {
+            Ok(seen) => seen.first().cloned(),
+            Err(poisoned) => poisoned.into_inner().first().cloned(),
+        };
+        if let Some(probe) = first {
+            break probe;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the backend TLS SNI health probe never reached the backend"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    for handle in checker.take_active_check_handles() {
+        handle.abort();
+    }
+
+    assert_eq!(
+        probe.server_name.as_deref(),
+        Some(POLICY_HOSTNAME),
+        "the probe must present the BackendTLSPolicy hostname as its TLS server name"
+    );
+    assert_eq!(
+        probe.alpn.as_deref(),
+        Some("http/1.1"),
+        "the SNI probe client must not negotiate h2 even when the backend offers it first"
+    );
+    let expected_authority = format!("127.0.0.1:{backend_port}");
+    assert_eq!(
+        probe.host_header.as_deref(),
+        Some(expected_authority.as_str()),
+        "the backend must be shown the REAL target authority, not the server name"
     );
 }

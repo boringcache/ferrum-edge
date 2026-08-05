@@ -138,10 +138,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `502` and `gateway-error-reason`, halting the H3 request body and dialing no
   backend, on the buffered and streaming legs alike. A stray override on a
   plaintext backend is ignored there exactly as it is on the HTTP/1.1 and
-  HTTP/2 forks, so no config becomes an HTTP/3-only outage. Note that config
-  admission still rejects SNI combined with effective retry,
-  request-body-buffering plugins, or `pool_enable_http2: false`; that check is now
-  conservative rather than protective and its relaxation is a follow-up.
+  HTTP/2 forks, so no config becomes an HTTP/3-only outage.
+- Config admission no longer rejects a backend TLS SNI override combined with
+  effective retry, a request-body-buffering plugin, or `pool_enable_http2:
+  false`, for proxy-level overrides and for DestinationRule / `BackendTLSPolicy`
+  per-port TLS overlays alike. Those rejections existed because only the
+  direct-H2 pool could carry a server name; the reqwest/HTTP-1.1 SNI dial above
+  serves all three, so `ferrum-edge validate` and the Admin API were refusing
+  Gateway API `BackendTLSPolicy` shapes that work. The request-body-buffering
+  admission screener that derived the third leg is retired with them. Nothing
+  that is genuinely unrepresentable becomes admissible: the runtime `502` /
+  `gateway-error-reason: backend_tls_sni_requires_direct_h2` still fires when a
+  dial cannot be constructed, and a `wss://` upgrade whose effective backend TLS
+  carries an `sni` value is still refused before dialing, because the WebSocket
+  transport derives both `Host` and the TLS server name from the request URI and
+  cannot apply a distinct server name at all.
+- Active HTTP health probes that carry a backend TLS SNI override are now
+  restricted to **HTTP/1.1**. The probe puts the server name in the URL
+  authority and the real target authority in an explicit `Host` header; HTTP/2
+  rebuilds `:authority` from the URI, so an h2-negotiated probe presented the
+  override to the backend instead of the target it was probing. The client's
+  ALPN advertises `http/1.1` alone, so an h2-capable backend cannot select h2 on
+  it. The same client keeps its resolver pinned to the real target, and a probe
+  whose dial cannot be pinned now fails closed in every case rather than
+  degrading to the unpinned minimal fallback client.
 - Active **HTTP and gRPC** health probes now verify against the same effective
   backend TLS server name as request traffic. A backend covered by
   `backend_tls_sni` (`BackendTLSPolicy` `validation.hostname` or a

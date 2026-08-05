@@ -163,9 +163,13 @@ traffic, and both are fail-closed on explicitly configured material:
     that client's DNS resolver to the **real target host**, so the override
     hostname is never resolved and the socket cannot leave that target's
     screened candidate set. `Host` is sent explicitly as the real target
-    authority. Because the pin names one target, an HTTPS probe with an override
-    builds one client per target instead of one per upstream, and fails closed
-    if no DNS cache is available to pin with.
+    authority, and that client's ALPN is restricted to `http/1.1` so the
+    explicit `Host` stays authoritative — over HTTP/2 the authority is rebuilt
+    from the URI, i.e. from the server name, which would show the backend the
+    override instead of the target being probed. Because the pin names one
+    target, an HTTPS probe with an override builds one client per target instead
+    of one per upstream, and fails closed — never degrading to an unpinned,
+    h2-capable client — if no DNS cache is available to pin with.
   * the **gRPC** probe sets the override as the TLS `domain_name` (verified
     branch) and as the rustls `ServerName` (no-verify branch), while tonic's
     `origin` keeps the real target authority for `:authority`.

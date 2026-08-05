@@ -25,9 +25,7 @@ use crate::config::db_backend::{
 };
 use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_decode_rejection};
 use crate::config::types::{
-    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
-    backend_tls_sni_direct_h2_conflict_messages, proxy_with_resolved_port_caps,
-    validate_resource_id,
+    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 
@@ -2700,13 +2698,12 @@ impl AdminResource for Upstream {
 
     async fn after_validate(
         db: &dyn DatabaseBackend,
-        state: &AdminState,
+        _state: &AdminState,
         namespace: &str,
         resource: &Self,
         _existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
-        let cached_config = state.cached_gateway_config();
         let subset_names: HashSet<&str> = resource
             .subsets
             .as_deref()
@@ -2735,33 +2732,6 @@ impl AdminResource for Upstream {
                             resource.id, subset_name, proxy.id
                         ));
                     }
-                    // Reverse write order for issue #2954: adding SNI onto an
-                    // upstream that a retry / buffering / http2-disabled proxy
-                    // already targets must fail closed at admission.
-                    let mut admission_proxy = proxy_with_resolved_port_caps(&proxy, resource);
-                    admission_proxy.resolved_tls =
-                        crate::config::types::BackendTlsConfig::from_upstream(resource);
-                    if let Some(subset_name) = proxy.upstream_subset.as_deref()
-                        && let Some(subset_tls) = resource
-                            .resolved_subset_tls
-                            .get(subset_name)
-                            .and_then(|resolved| resolved.tls.clone())
-                    {
-                        admission_proxy.resolved_tls = subset_tls;
-                    }
-                    admission_proxy.dispatch_kind = crate::config::types::DispatchKind::from(
-                        admission_proxy.effective_scheme(),
-                    );
-                    let empty_plugins: &[PluginConfig] = &[];
-                    let plugin_configs = cached_config
-                        .as_ref()
-                        .map(|config| config.plugin_configs.as_slice())
-                        .unwrap_or(empty_plugins);
-                    errors.extend(backend_tls_sni_direct_h2_conflict_messages(
-                        &admission_proxy,
-                        Some(resource),
-                        plugin_configs,
-                    ));
                 }
             }
 
@@ -3748,7 +3718,6 @@ impl AdminResource for Proxy {
         existing: Option<&Self>,
         ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
-        let cached_config = state.cached_gateway_config();
         if let Some(upstream_id) = resource.upstream_id.as_deref() {
             // Namespace-predicated lookup: an upstream in another namespace
             // reports as missing (cross-namespace references are equally
@@ -3777,36 +3746,6 @@ impl AdminResource for Proxy {
                                 subset_name, upstream_id
                             )]));
                         }
-                    }
-                    // Plain-HTTPS SNI overrides require direct-H2. Reject retry /
-                    // body-buffering / pool_enable_http2=false combinations at
-                    // admission (issue #2954), matching full-config validate.
-                    let mut admission_proxy = proxy_with_resolved_port_caps(resource, &upstream);
-                    admission_proxy.resolved_tls =
-                        crate::config::types::BackendTlsConfig::from_upstream(&upstream);
-                    if let Some(subset_name) = resource.upstream_subset.as_deref()
-                        && let Some(subset_tls) = upstream
-                            .resolved_subset_tls
-                            .get(subset_name)
-                            .and_then(|resolved| resolved.tls.clone())
-                    {
-                        admission_proxy.resolved_tls = subset_tls;
-                    }
-                    admission_proxy.dispatch_kind = crate::config::types::DispatchKind::from(
-                        admission_proxy.effective_scheme(),
-                    );
-                    let empty_plugins: &[PluginConfig] = &[];
-                    let plugin_configs = cached_config
-                        .as_ref()
-                        .map(|config| config.plugin_configs.as_slice())
-                        .unwrap_or(empty_plugins);
-                    let sni_errors = backend_tls_sni_direct_h2_conflict_messages(
-                        &admission_proxy,
-                        Some(&upstream),
-                        plugin_configs,
-                    );
-                    if !sni_errors.is_empty() {
-                        return Err(AfterValidateError::BadRequest(sni_errors));
                     }
                 }
                 Ok(None) => {
