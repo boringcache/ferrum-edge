@@ -24157,7 +24157,7 @@ components:
               items:
                 type: string
               default: ["lf.a2a.v1.A2AService"]
-              description: Fully-qualified gRPC service names recognized as A2A services. V1 observes and gates these methods without decoding protobuf payloads.
+              description: Fully-qualified gRPC service names recognized as A2A services. RPCs on these services are detected, mapped to canonical a2a.method names, and gated by method policy from request metadata alone - request protobuf payloads are never decoded. The one decoded payload is the unary Agent Card reply (GetAgentCard / GetExtendedAgentCard) when discovery.rewrite_agent_card_urls is enabled - a proven-successful reply is decoded against the A2A 0.3.x Agent Card wire layout, rewritten, and re-encoded as a single uncompressed frame, and anything unsupported or malformed fails closed with a fixed diagnostic. All other gRPC responses, including streaming ones, pass through undecoded.
         detection:
           type: object
           properties:

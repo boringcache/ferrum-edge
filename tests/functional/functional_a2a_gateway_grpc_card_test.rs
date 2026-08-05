@@ -23,14 +23,18 @@
 //!    `rewrite_agent_card_urls` both take effect on a SIGHUP'd running gateway,
 //!    so the feature is not merely correct at first construction.
 //!
-//! The harness is deliberately the bounded one `functional_ai_response_guard_grpc_test`
-//! uses: one echo backend holding its own pre-bound listener, one gateway child
-//! with retry on fresh ports, and no unbounded servers.
+//! The harness is deliberately the bounded one `functional_grpc_plugins_test` /
+//! `functional_websocket_test` use: one echo backend holding its own pre-bound
+//! listener, and one gateway child spawned onto simultaneously-held proxy/admin
+//! port reservations that are released only at the spawn call, with readiness
+//! proven by the authenticated `/health` detail tier for that attempt's own
+//! bearer token — never by a bare TCP accept or a sleep. Bounded retry on fresh
+//! reservations and a fresh token; no unbounded servers.
 //!
 //! Run with:
 //! `cargo test --test functional_tests functional_a2a_gateway_grpc_card -- --ignored --nocapture`
 
-use crate::scaffolding::ports::reserve_port;
+use crate::scaffolding::ports::{PortReservation, reserve_port, reserve_port_pair};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -43,7 +47,6 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep};
 use tokio_stream::wrappers::ReceiverStream;
@@ -245,11 +248,17 @@ fn has_field(message: &[u8], target: u32) -> bool {
 // Harness
 // ============================================================================
 
-async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    listener.local_addr().unwrap().port()
+/// Per-spawn-attempt observability credential.
+///
+/// The authenticated `/health` detail tier is the only thing that proves the
+/// listener answering on an admin port is THIS child rather than a parallel
+/// test's gateway that happened to inherit the port. A fresh token per attempt
+/// means a retry can never be satisfied by the corpse of the previous one.
+fn mint_observability_token() -> String {
+    format!(
+        "ferrum-edge-a2a-grpc-card-probe-{}",
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 /// Echo backend: returns the request body as the gRPC response body, mirrors
@@ -337,53 +346,149 @@ fn gateway_binary_path() -> &'static str {
     }
 }
 
+/// Spawn the gateway on two ports this attempt still HOLDS.
+///
+/// Both reservations stay live while the environment is prepared, which is what
+/// makes the proxy and admin ports distinct (two live listeners cannot share a
+/// port) and unstealable in the interval between selecting them and using them.
+/// They are released on the last statement before `spawn`, because the child has
+/// to bind them itself; that residual window is what
+/// [`wait_for_owned_gateway`] then closes by proving identity rather than
+/// trusting a bare accept.
 fn start_gateway(
     config_path: &str,
-    http_port: u16,
-    admin_port: u16,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let child = std::process::Command::new(gateway_binary_path())
+    gateway: PortReservation,
+    admin: PortReservation,
+    observability_token: &str,
+) -> Result<(std::process::Child, u16, u16), Box<dyn std::error::Error>> {
+    let http_port = gateway.port;
+    let admin_port = admin.port;
+    let mut command = std::process::Command::new(gateway_binary_path());
+    command
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_ACCEPT_THREADS", "1")
+        // Ownership proof for this exact child (issue #3428 / #2132): presenting
+        // this token unlocks the authenticated `/health` detail tier, which no
+        // foreign gateway can answer.
+        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    Ok(child)
+        .stderr(std::process::Stdio::null());
+
+    // Release both ports only now, immediately before the child binds them.
+    drop(gateway);
+    drop(admin);
+
+    let child = command.spawn()?;
+    Ok((child, http_port, admin_port))
 }
 
-async fn wait_for_gateway(
+/// Prove *this* child owns its admin and proxy listeners before returning.
+///
+/// An unauthenticated `/health` plus a bare TCP accept is not identity
+/// (issue #2132): the reservations above are released before the subprocess
+/// binds, so a competing process can still claim the proxy port. The child then
+/// dies with `Address already in use` while the foreign listener keeps answering
+/// the probe, and every later data-path assertion is made against a stranger.
+///
+/// Barrier (same contract as `TestGateway` / `functional_grpc_plugins_test`):
+/// 1. `Child::try_wait` before and after every probe — a dead child voids the
+///    attempt instead of being polled for until the timeout.
+/// 2. Authenticated `/health` detail tier for this attempt's bearer token with
+///    `ready: true`, which flips only after every listener bind (proxy included).
+/// 3. TCP connect to the proxy port once identity is proven.
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
     admin_port: u16,
+    observability_token: &str,
     gateway_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-            && tokio::net::TcpStream::connect(("127.0.0.1", gateway_port))
-                .await
-                .is_ok()
-        {
-            return Ok(());
+    const STARTUP_TIMEOUT_SECS: u64 = 30;
+    const PROBE_SLICE: Duration = Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
+    let addr = format!("127.0.0.1:{}", gateway_port);
+
+    let mut last_observation = String::from("no response yet");
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "Gateway exited during startup with {status} \
+                 (last observation: {last_observation})"
+            )
+            .into());
         }
-        sleep(Duration::from_millis(250)).await;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "Gateway did not prove ownership of admin port {admin_port} within \
+                 {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
+            )
+            .into());
+        }
+        match crate::common::probe_gateway_identity(
+            admin_port,
+            observability_token,
+            remaining.min(PROBE_SLICE),
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(err) => last_observation = err.to_string(),
+        }
     }
-    Err("Gateway did not become healthy within 15 seconds".into())
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(format!("Gateway exited after reporting ready with {status}").into());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "Gateway port {gateway_port} did not accept TCP connections within \
+                 {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
+            )
+            .into());
+        }
+        match tokio::net::TcpStream::connect(&addr).await {
+            Ok(_) => return Ok(()),
+            Err(err) => last_observation = err.to_string(),
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
+/// Bounded spawn retry. Every attempt takes fresh, simultaneously-held port
+/// reservations and a fresh ownership token, so a failed attempt never leaves a
+/// half-claimed port or a reusable credential behind.
 async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let gateway_port = free_port().await;
-        let admin_port = free_port().await;
-        let mut child = match start_gateway(config_path, gateway_port, admin_port) {
-            Ok(child) => child,
+        let (gateway_reservation, admin_reservation) = match reserve_port_pair().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!(
+                    "Gateway port reservation attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, e
+                );
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
+                }
+                continue;
+            }
+        };
+        let observability_token = mint_observability_token();
+        let started = start_gateway(
+            config_path,
+            gateway_reservation,
+            admin_reservation,
+            &observability_token,
+        );
+        let (mut child, gateway_port, admin_port) = match started {
+            Ok(started) => started,
             Err(e) => {
                 eprintln!(
                     "Gateway spawn attempt {}/{} failed: {}",
@@ -395,13 +500,17 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
                 continue;
             }
         };
-        match wait_for_gateway(admin_port, gateway_port).await {
+        match wait_for_owned_gateway(&mut child, admin_port, &observability_token, gateway_port)
+            .await
+        {
             Ok(()) => return (child, gateway_port, admin_port),
             Err(e) => {
                 eprintln!(
-                    "Gateway health attempt {}/{} failed: {}",
+                    "Gateway ownership check attempt {}/{} failed: {}",
                     attempt, MAX_ATTEMPTS, e
                 );
+                // A still-live child from a void attempt must not outlive it and
+                // keep holding ports the next attempt could be offered.
                 let _ = child.kill();
                 let _ = child.wait();
                 if attempt < MAX_ATTEMPTS {

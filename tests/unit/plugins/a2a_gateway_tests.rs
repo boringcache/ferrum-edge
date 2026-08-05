@@ -3660,3 +3660,125 @@ fn invalid_a2a_gateway_configs_are_rejected() {
         );
     }
 }
+
+const A2A_GATEWAY_SOURCE: &str = include_str!("../../../src/plugins/a2a_gateway.rs");
+
+/// Every fixed gRPC Agent Card diagnostic string literal the plugin source
+/// carries.
+///
+/// Scanned from the opening quote of each known prefix rather than by splitting
+/// on `"`, so an escaped quote elsewhere in the file cannot desynchronize the
+/// parity and silently shrink the set this test compares against.
+fn agent_card_diagnostic_literals(source: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    for prefix in [
+        "\"agent_card_protobuf_",
+        "\"agent_card_grpc_",
+        "\"unsupported_agent_card_",
+    ] {
+        let mut rest = source;
+        while let Some(index) = rest.find(prefix) {
+            let tail = &rest[index + 1..];
+            let end = tail
+                .find('"')
+                .expect("a string literal must have a closing quote");
+            found.push(&tail[..end]);
+            rest = &tail[end..];
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// The gRPC Agent Card diagnostic enumeration in `docs/plugins.md` is a
+/// *complete* list of client-visible codes, not a sample.
+///
+/// It is published as an operator-facing contract, so an omission is worse than
+/// no list at all: an operator who cannot find an observed `a2a.error` in the
+/// table concludes their gateway produced something undocumented. This pins both
+/// directions — every client-visible diagnostic in the source is in the table,
+/// and every diagnostic in the table exists in the source.
+#[test]
+fn grpc_agent_card_diagnostics_are_completely_documented() {
+    const GUIDE: &str = include_str!("../../../docs/plugins.md");
+    // Internal sentinel for "the output pass refused a write". Callers translate
+    // it into `agent_card_grpc_frame_too_large` or the shared capacity terminal,
+    // so it must never be documented as a client-visible diagnostic.
+    const INTERNAL_ONLY: &str = "agent_card_protobuf_emit_refused";
+
+    let section = GUIDE
+        .split("### `a2a_gateway`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("a2a_gateway docs section");
+    let literals = agent_card_diagnostic_literals(A2A_GATEWAY_SOURCE);
+    assert!(
+        literals.len() > 1,
+        "diagnostic extraction found {} literals — the scan is broken",
+        literals.len()
+    );
+
+    let mut documented = 0usize;
+    for diagnostic in &literals {
+        if *diagnostic == INTERNAL_ONLY {
+            assert!(
+                !section.contains(diagnostic),
+                "{INTERNAL_ONLY} never reaches a client and must not be documented as a diagnostic"
+            );
+            continue;
+        }
+        assert!(
+            section.contains(&format!("| `{diagnostic}` |")),
+            "docs/plugins.md must list the client-visible diagnostic {diagnostic} \
+             in the a2a_gateway gRPC Agent Card table"
+        );
+        documented += 1;
+    }
+    assert!(
+        documented > 0,
+        "no client-visible diagnostics were checked against the guide"
+    );
+
+    // Reverse direction, restricted to the diagnostic table's own rows so an
+    // unrelated parameter table in this section cannot be misread as one.
+    const STAGES: [&str; 5] = ["Framing", "Version/layout", "Schema", "Decoding", "Emission"];
+    for line in section.lines() {
+        let Some(row) = line.strip_prefix("| ") else {
+            continue;
+        };
+        let mut columns = row.split('|');
+        let stage = columns.next().unwrap_or_default().trim();
+        if !STAGES.contains(&stage) {
+            continue;
+        }
+        let Some(name) = columns.next() else {
+            continue;
+        };
+        let name = name.trim().trim_matches('`');
+        assert!(
+            literals.contains(&name),
+            "docs/plugins.md documents {name}, which the plugin source cannot produce"
+        );
+    }
+}
+
+/// The OpenAPI `endpoint.grpc_services` description must describe what the gRPC
+/// binding actually does. It used to say the payloads are never decoded, which
+/// stopped being true when unary Agent Card decode/rewrite landed.
+#[test]
+fn openapi_grpc_services_describes_agent_card_decoding() {
+    const SPEC: &str = include_str!("../../../openapi.yaml");
+
+    assert!(
+        !SPEC.contains("without decoding protobuf payloads"),
+        "openapi.yaml must not claim the A2A gRPC binding never decodes protobuf payloads"
+    );
+    let scoped = "The one decoded payload is the unary Agent Card reply \
+                  (GetAgentCard / GetExtendedAgentCard)";
+    assert!(
+        SPEC.contains(scoped),
+        "openapi.yaml endpoint.grpc_services must scope protobuf decoding \
+         to unary Agent Card replies"
+    );
+}
