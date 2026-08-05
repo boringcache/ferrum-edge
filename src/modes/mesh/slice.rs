@@ -2533,8 +2533,16 @@ const DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE: usize = 32;
 /// time" rather than to silence. Sized well above any realistic mesh's
 /// subscribing-namespace count so ordinary deployments never leave steady-state
 /// dedup; the whole map is bounded by
-/// `128 * 32` counts plus their namespace keys.
+/// `128 * 32` counts plus namespace keys of at most
+/// [`DESTINATION_RULE_AMBIGUITY_NAMESPACE_KEY_MAX_BYTES`] bytes.
 const DESTINATION_RULE_AMBIGUITY_NAMESPACE_BUDGET: usize = 128;
+
+/// Kubernetes namespaces are RFC 1123 labels and therefore at most 63 bytes.
+/// Native/xDS inputs are validated separately, but the warning deduplicator is
+/// process-global and must remain byte-bounded even if a hostile or cross-wired
+/// producer presents an oversized subscriber namespace. Oversized keys are
+/// never retained; their warnings remain visible on every observation.
+const DESTINATION_RULE_AMBIGUITY_NAMESPACE_KEY_MAX_BYTES: usize = 63;
 
 /// Record this namespace's ambiguous-destination count, returning `true` when
 /// that count has NOT been reported for this namespace before (so the caller
@@ -2556,6 +2564,12 @@ fn record_destination_rule_ambiguity_in(
     client_namespace: &str,
     ambiguous: usize,
 ) -> bool {
+    if client_namespace.len() > DESTINATION_RULE_AMBIGUITY_NAMESPACE_KEY_MAX_BYTES {
+        // Do not let a bounded key COUNT hide unbounded retained key BYTES.
+        // Re-report rather than hash/truncate: collisions must never silence a
+        // different subscriber's ambiguity warning.
+        return true;
+    }
     // Steady state is the common case, so it must not allocate a key.
     if let Some(counts) = reported.get(client_namespace) {
         if counts.contains(&ambiguous) {
@@ -5784,6 +5798,31 @@ mod tests {
 
         // A namespace admitted before saturation keeps its steady-state dedup.
         assert!(!record_destination_rule_ambiguity_in(&mut reported, "a", 1));
+    }
+
+    /// A key-count budget is not a byte budget when the key comes from a
+    /// native/xDS subscriber. Oversized namespace strings must never be
+    /// retained in the process-global dedup map; repeated observations keep
+    /// reporting rather than colliding through hashing or truncation.
+    #[test]
+    fn ambiguity_warn_dedup_does_not_retain_oversized_namespace_keys() {
+        let mut reported: HashMap<String, HashSet<usize>> = HashMap::new();
+        let oversized = "n".repeat(DESTINATION_RULE_AMBIGUITY_NAMESPACE_KEY_MAX_BYTES + 1);
+
+        assert!(record_destination_rule_ambiguity_in(
+            &mut reported,
+            &oversized,
+            1
+        ));
+        assert!(record_destination_rule_ambiguity_in(
+            &mut reported,
+            &oversized,
+            1
+        ));
+        assert!(
+            reported.is_empty(),
+            "an oversized subscriber namespace must consume no retained key bytes"
+        );
     }
 
     fn pa(
