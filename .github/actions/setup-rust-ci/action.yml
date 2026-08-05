@@ -161,7 +161,22 @@ runs:
           exit 0
         fi
 
-        sudo apt-get update
+        # Keep this best-effort optimization independent of unrelated
+        # third-party repositories too. Otherwise a Microsoft/Google outage can
+        # silently remove the fast linker and make CI timing nondeterministic.
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+          ubuntu_sources=sources.list.d/ubuntu.sources
+        elif [ -f /etc/apt/sources.list ]; then
+          ubuntu_sources=sources.list
+        else
+          echo "::warning::canonical Ubuntu apt sources are unavailable"
+          exit 1
+        fi
+        sudo apt-get update \
+          -o "Dir::Etc::sourcelist=${ubuntu_sources}" \
+          -o "Dir::Etc::sourceparts=-" \
+          -o "APT::Get::List-Cleanup=0" \
+          -o "Acquire::Retries=3"
         sudo apt-get install -y --no-install-recommends "${optional_packages[@]}"
 
     - uses: ./.github/actions/setup-fast-linker
