@@ -374,7 +374,7 @@ must name a `FERRUM_*` variable.
 A failed ClickHouse export uses `retry.max_attempts` total attempts (including
 the initial try; valid range **1–32**). `0` is rejected rather than silently
 rewritten. `clickhouse.timeout_ms` is bounded to **1–600000** ms per attempt so
-the cross-process spool claim lease is finite and remains longer than the
+the cross-process spool claim horizon is finite and remains longer than the
 accepted request/retry budget. Batch `size` is capped at **10000** and
 `flush_interval_ms` at **600000** to match the shared `BatchingLogger` admission
 limits. Each of
@@ -459,16 +459,34 @@ Unix parent-directory open or fsync failure is a **write failure**: Ferrum rolls
 the attempt back, performs a second real parent-directory fsync, and returns the
 error before any snapshot baseline commit.
 
-Rollback is ownership-scoped, and ownership is decided by the name being
-published rather than by inspecting the file on disk. It always removes this
-attempt's own attributed temp. It also removes the **final** path when that name
-belongs exclusively to the attempt — the ULID-derived `<ulid>.<owner_tag>.<ext>`
-batch and its `<name>.rejected.meta` dead-letter record, which no other writer
-can publish. It never removes `spool.meta.json`, the one final name every writer
-of a namespace shares: an unlink acts on a path, and a peer's `rename` can
-replace that path between any ownership check and the removal, so no
-stat-then-unlink, content comparison, or timestamp comparison could keep such a
-removal from deleting a peer's newer manifest.
+Rollback is ownership-scoped **and** descriptor-bound. It always removes this
+attempt's own attributed temp, whose name only this attempt can be writing.
+
+For the **final** path it first asks whether the name is one that any other
+legitimate writer of the protocol publishes to. `spool.meta.json` is — it is the
+one final name every writer of a namespace shares — so it is *never* unlinked: a
+peer's newer manifest is an honest publication to that name, and an unlink acts
+on a path, so no check could keep such a removal from deleting it.
+
+The ULID-derived `<ulid>.<owner_tag>.<ext>` batch and its
+`<name>.rejected.meta` dead-letter record are names no other protocol writer
+publishes to, so rollback of a post-rename failure may remove them. That is not
+by itself proof that the pathname still names *this attempt's* file. Ferrum
+holds the temp writer descriptor open across the rename and directory fsync,
+then compares the pathname with that stable inode while holding the shared
+namespace lock. The descriptor makes the identity comparison meaningful; the
+namespace lock prevents every cooperating Ferrum process from renaming between
+that comparison and the unlink. An extra hard link on either view fails the
+same check. If a replacement is already visible at the locked check, it is left
+byte-for-byte untouched, a warning names the path, and the primary durability
+error is returned on its own. A failure *before* the rename publishes nothing
+at the final path and never considers it at all.
+
+The spool directory and its files are owner-only, but a fully adversarial
+process running as the same UID can already rename or delete entries in that
+tree without using Ferrum's advisory lock. That process is outside the spool
+coordination trust boundary; the cross-process guarantees here apply to Ferrum
+instances that share the namespace and obey `.spool-quota.lock`.
 
 A failed manifest publish therefore leaves the manifest entry in place, and
 Ferrum does **not** treat that as success. The durability error is still
@@ -507,42 +525,101 @@ claims** each candidate by renaming it to
 before any ClickHouse delivery. The rename is the mutual-exclusion primitive: on
 a shared volume exactly one accepted generation or process can win it, and the
 loser simply moves on to the next file. `process_tag` is a per-process nonce
-drawn with 128 bits at startup, so a restart never mistakes a crashed run's claim
-for live work. The lease deadline is derived from the configured worst-case
+drawn with 128 bits at startup, so a restart can identify a prior run's claim for
+diagnostics without treating it as live work. The lease deadline is derived from
+the configured worst-case
 delivery budget (`clickhouse.timeout_ms` × `retry.max_attempts` plus the retry
 backoff schedule, ×4, with a 300-second floor and no shorter ceiling).
 Multi-chunk replay renews the claim before each chunk, so the aggregate delivery
-of one file cannot outlive a lease sized for one bounded request/retry budget.
+of one file does not get reported as stranded during an ordinary bounded
+request/retry budget. A deadline is liveness evidence only; it never authorizes
+restoring a descriptor-free pathname.
 
 Claim disposition:
 
 - **Delivered** — the claim is removed.
-- **Retryable** — the claim is released back to its durable replayable name and
-  the tick stops so ordering is preserved.
+- **Retryable** — an ordinary delivery, I/O, quota, or serialization failure
+  taken while the exact claim is still live: the claim is released back to its
+  durable replayable name through the exact-claim-bound release path, and the
+  tick stops so ordering is preserved.
 - **Permanent / 413 single row** — good siblings are delivered through bounded
   bisection; each minimal rejected row is durably copied byte-for-byte to the
   private dead-letter payload file and described by safe metadata before the
   source claim is removed.
 - **Unreadable** — the claim is quarantined as `<data-name>.corrupt`.
+- **Descriptor lost / pathname unproven** — the claim remains inert under its
+  `.inflight` name, remains counted in owned spool usage, and is reported for
+  operator verification and reconciliation. It is never automatically restored.
+
+  Dead-letter publication is authorized by exactly one predicate: the claim
+  pathname still resolves, under the namespace mutation lock, to the pinned
+  descriptor this replay opened and validated. Every other state — a missing
+  (completed) claim, a same-UID substituted regular file, a planted non-file such
+  as a directory, and a classification that cannot be completed at all — fails
+  closed with no exception. There is no weaker "constructive evidence is
+  harmless" admission, because the `.rejected.ndjson` and `.rejected.meta` names
+  are *derived from the claim pathname*: a handoff that can no longer prove it
+  owns that pathname owns none of the names derived from it either, and shape is
+  not authority.
+
+  On any non-live state nothing at all happens for that handoff: no handoff temp
+  is created or opened, no rejected row is admitted or appended, no quota
+  candidate is evicted on its behalf, no sibling is removed or replaced, no
+  payload or metadata final is published, no maintained usage accounting changes,
+  and the claim is not released, promoted, quarantined, removed, or accounted.
+  No further external delivery is attempted for it. The hostile pathname is left
+  exactly as found, for operator reconciliation.
+
+  This classification is carried, not flattened, at **every** claim-bound step of
+  the live replay pipeline. Losing claim authorization is **not** a retryable
+  storage failure, so it never enters the release path: it is reported as
+  `unauthorized <stage>` wrapping the original pathname-scoped refusal verbatim,
+  counted in the sink's failure metrics, and returned. Reporting it as retryable
+  would attempt a release that is correctly refused anyway, but would replace the
+  diagnostic that says where authorization was actually lost with the refusal's
+  own. The stages are:
+
+  | Stage | Claim-bound step |
+  | --- | --- |
+  | `claim renewal` | the between-chunks rename onto a fresh lease deadline |
+  | `dead-letter payload open` | creating this handoff's private payload temp |
+  | `dead-letter payload append` | admitting and appending rejected rows |
+  | `dead-letter payload publish` | the replacing rename of `<data-name>.rejected.ndjson` |
+  | `dead-letter metadata publish` | the replacing rename of `<data-name>.rejected.meta` |
+  | `terminal claim removal` | unlinking the authoritative source and accounting it out |
+
+  Ordinary I/O, capacity, quota, and accounting failures stay retryable — but
+  only when the exact live claim is still proven at the moment they are taken.
+
+  Recovery driven by the exact pinned claim keeps its deliberate replace, unlink,
+  and account-out behavior, because that claim genuinely owns the derived sibling
+  namespace.
+
+Claim candidates that cannot be pinned at all are isolated rather than allowed
+to abort a replay tick. An artifact that is not a single-linked regular file
+(for example a planted hard link) is demoted to `<data-name>.corrupt` bound to
+the exact inode the refusal opened, never clobbering an existing quarantine
+sibling. One whose secure open fails outright (for example a mode-000 file)
+carries no descriptor to bind, so it is left exactly where it is, counted, and
+reported for operator reconciliation. Either way, later records in the same tick
+still replay.
 
 In-flight claims count toward `spool.max_bytes` but are **never** eviction
 candidates; when only claimed or foreign-owned files remain, an admission that
-cannot fit fails closed instead of destroying them. Recovery at prepare time
-returns a claim to its durable name only when this process demonstrably abandoned
-it (same `process_tag`, no live lease) or when a peer's lease deadline has
-passed.
+cannot fit fails closed instead of destroying them. Only the live claim handle's
+pinned descriptor can release a claim to its durable name. Prepare never restores
+an abandoned, expired, or unattributed descriptor-free claim: a same-UID actor
+could have replaced that pathname while preserving its ownership-bearing
+filename, and a lease horizon cannot prove otherwise.
 
 Within one process the exclusion is absolute: a live claim holds an in-memory
-lease, so no other accepted generation can recover it. Across processes sharing a
-volume the exclusion is the atomic rename plus a *time* bound, not a proof that
-the peer stopped: a peer stalled past its lease (host pause, `SIGSTOP`, or clock
-skew between replicas) can still be delivering a claim another process has
-recovered. The lease is sized at four times the accepted worst-case delivery
-budget and renewed before every chunk so that window is not reachable by ordinary
-slow delivery, and the residual case is a duplicate insert — not a lost or
-misrouted record — which the stable `event_id` / `ReplacingMergeTree` idempotency
-contract deduplicates. A claim is never delivered to a destination other than the
-one its `owner_tag` names.
+lease, so no other accepted generation can mutate it. Across processes sharing a
+volume, the atomic rename provides exclusion while the live owner retains its
+descriptor. If the descriptor is lost through task abort or process failure,
+automatic recovery fails closed: the claim is left inert even after its deadline
+and must be reconciled by an operator who can establish its provenance. This
+trades unattended crash recovery for destination integrity; Ferrum never promotes
+an unproven pathname merely because its filename contains an `owner_tag`.
 
 Queued export and spool-delivery events retain the same byte leases under
 `batch.buffer_max_bytes`; transferring an event to the spool worker does not
@@ -627,8 +704,9 @@ fields are never logged.
   authoritative source for a later/operator-assisted attempt. The completed
   temp is fsynced, atomically renamed, and directory-fsynced before the sibling
   `.rejected.meta` document is published; only then is the authoritative source
-  removed. The metadata contains the payload filename, byte length, SHA-256,
-  aggregate
+  removed. That publishing rename is reached only after the exact pinned claim
+  authorized it. The metadata contains the payload filename, byte length,
+  SHA-256, aggregate
   `rejected_rows`, safe `outcomes` (`reason`, optional `http_status`, and
   `row_count`), and `quarantined_at_unix`. Rejections are accumulated into a
   fixed-size per-status tally whose footprint is independent of the artifact's
@@ -638,9 +716,16 @@ fields are never logged.
   credentials, or charge-record fields. The payload file intentionally contains
   original billing rows and must remain access-controlled. If any payload,
   metadata, quota, or source-removal step fails, the original file remains
-  replayable; while that source remains authoritative, a later attempt removes
-  prior partial metadata/payload siblings under the namespace lock before
-  rebuilding them, so recovery does not require quota for two rejected payloads.
+  replayable. The claim is re-proved against the pinned descriptor under the
+  namespace lock before opening the handoff, before every payload append, before
+  the payload rename, before metadata publication, and before source removal —
+  each boundary on its own, never inheriting an earlier one's proof. Only the
+  exact pinned claim authorizes any of them, so a missing, substituted, or
+  planted pathname can never create, replace, or account for anything in the
+  namespace derived from it. While the source remains authoritative, a later
+  attempt removes prior partial metadata/payload siblings under the namespace
+  lock before rebuilding them, so recovery does not require quota for two
+  rejected payloads.
   Successfully inserted rows may be retried with their unchanged `event_id`
   idempotency identity.
 - Temps left by an interrupted atomic write are reconciled only when this process
@@ -648,8 +733,9 @@ fields are never logged.
   path, or when they are foreign/unattributable **and** older than the stale-temp
   age (300 s). A reloaded generation therefore cannot unlink the active temp of
   an older accepted generation or of a peer process sharing the volume.
-- In-flight replay claims are recovered to durable replayable names during live
-  prepare, subject to the lease rules above.
+- Descriptor-free in-flight replay claims are reported during live prepare but
+  remain inert until an operator verifies and reconciles them. Live handles use
+  the descriptor-bound release path for ordinary retryable outcomes.
 
 Dead-letter payloads/metadata, corrupt files, temps, and in-flight claims remain
 under the managed namespace and count toward `spool.max_bytes`. Dead-letter
