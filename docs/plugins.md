@@ -1596,7 +1596,7 @@ labelled by `proxy_id`, relay `direction`, and `error_class`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `render_cache_ttl_seconds` | Integer | `5` | How long the cached `/metrics` response is served before rebuilding |
+| `render_cache_ttl_seconds` | Integer | `5` | How long the cached `/metrics` response is served before rebuilding. Covers only registry-owned families; process-static mesh observability (`ferrum_mesh_federation_*`, `ferrum_mesh_remote_discovery_*`, `ferrum_mesh_cert_*`, `ferrum_mesh_config_*`, `ferrum_xds_*`) and NodeWaypoint (`ferrum_mesh_node_waypoint_*`) series are rendered live on every scrape — see [admin_metrics.md](admin_metrics.md#what-render_cache_ttl_seconds-does-and-does-not-cover) |
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle metric entries live before eviction (prevents unbounded memory growth from deleted/recreated proxies) |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Under extreme load this prevents an allocation per request — the render TTL is the real freshness guarantee |
 

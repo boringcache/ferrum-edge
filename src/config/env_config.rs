@@ -5302,7 +5302,7 @@ impl EnvConfig {
                 // `LoadBalancer` in src/load_balancer.rs). Cross-cluster
                 // east-west GATEWAY failover targets are unaffected (always
                 // local-first regardless of the flag); this only affects
-                // plain remote workload endpoints from the Experimental
+                // plain remote workload endpoints from the Beta
                 // remote-discovery path.
                 if self.mesh_remote_discovery_poll_interval_seconds > 0
                     && !self.mesh_locality_lb_strict
