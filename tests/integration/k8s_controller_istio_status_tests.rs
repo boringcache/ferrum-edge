@@ -972,7 +972,10 @@ fn sidecar_without_outbound_traffic_policy_reports_inherit() {
         plan_istio_status_updates(&[obj], options().with_mesh_sidecar_ingress_enforced(true));
     let translation = sidecar_translation(&updates, "sc-inherit");
     assert_eq!(translation["outbound_traffic_policy"], json!("Inherit"));
-    assert_eq!(translation["outbound_traffic_policy_enforced"], json!(false));
+    assert_eq!(
+        translation["outbound_traffic_policy_enforced"],
+        json!(false)
+    );
     assert_eq!(translation["deferred_fields"], json!([]));
 }
 
@@ -990,7 +993,10 @@ fn sidecar_outbound_traffic_policy_not_reported_as_enforced_when_gate_is_off() {
     // Default options() leaves the effective sidecar gate off.
     let updates = plan_istio_status_updates(&[obj], options());
     let translation = sidecar_translation(&updates, "sc-gated");
-    assert_eq!(translation["outbound_traffic_policy"], json!("REGISTRY_ONLY"));
+    assert_eq!(
+        translation["outbound_traffic_policy"],
+        json!("REGISTRY_ONLY")
+    );
     assert_eq!(
         translation["outbound_traffic_policy_enforced"],
         json!(false),

@@ -447,7 +447,10 @@ fn registry_plugin_injected(
     let mesh = outbound_policy_mesh(sidecar_policy);
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
     let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
-    prepared.plugin_configs.iter().any(|p| p.id == REGISTRY_PLUGIN_ID)
+    prepared
+        .plugin_configs
+        .iter()
+        .any(|p| p.id == REGISTRY_PLUGIN_ID)
 }
 
 /// A workload-scoped `REGISTRY_ONLY` arms the HTTP-family gate even though the

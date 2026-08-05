@@ -436,7 +436,8 @@ fn sidecar_outbound_traffic_policy_overrides_the_mesh_wide_policy() {
             .iter()
             .any(|p| p.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID);
         assert_eq!(
-            injected, expect_plugin,
+            injected,
+            expect_plugin,
             "mesh-wide {mesh_wide:?} + Sidecar {sidecar_mode:?} must \
              {} the registry gate",
             if expect_plugin { "arm" } else { "disarm" }
