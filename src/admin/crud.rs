@@ -2723,15 +2723,14 @@ impl AdminResource for Upstream {
             let items_len = page.items.len() as i64;
 
             for proxy in page.items {
-                if proxy.upstream_id.as_deref() == Some(resource.id.as_str()) {
-                    if let Some(subset_name) = proxy.upstream_subset.as_deref()
-                        && !subset_names.contains(subset_name)
-                    {
-                        errors.push(format!(
-                            "upstream '{}' cannot remove subset '{}' while proxy '{}' references it",
-                            resource.id, subset_name, proxy.id
-                        ));
-                    }
+                if proxy.upstream_id.as_deref() == Some(resource.id.as_str())
+                    && let Some(subset_name) = proxy.upstream_subset.as_deref()
+                    && !subset_names.contains(subset_name)
+                {
+                    errors.push(format!(
+                        "upstream '{}' cannot remove subset '{}' while proxy '{}' references it",
+                        resource.id, subset_name, proxy.id
+                    ));
                 }
             }
 
