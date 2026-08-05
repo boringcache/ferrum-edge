@@ -2881,12 +2881,12 @@ fn virtual_service_l4_candidate_count(object: &K8sObject) -> Result<usize, K8sTr
             total = total.checked_add(count).ok_or_else(|| {
                 invalid_resource(object, "VirtualService L4 match candidate count overflow")
             })?;
-            if total > crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS {
+            if total > MAX_L4_CANDIDATE_PROXIES {
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "VirtualService tcp[]/tls[] may contain at most {} total match candidates",
-                        crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS
+                        "VirtualService L4 routing may materialize at most {} candidate stream proxies",
+                        MAX_L4_CANDIDATE_PROXIES
                     ),
                 ));
             }
@@ -3059,6 +3059,34 @@ fn l4_export_namespaces(
     Ok((namespaces, public))
 }
 
+/// Upper bound on how many L4 stream-proxy *candidates* one VirtualService may
+/// materialize from its `tcp[]` / `tls[]` routes **before** `exportTo`
+/// namespace projection.
+///
+/// This is the CRD-controlled fan-out: a hostile VirtualService author governs
+/// how many match ports / TLS matches a single resource expands into. The
+/// namespace count that projection later multiplies by is environmental
+/// (omitted/empty/`*` `exportTo` resolves to `known_namespaces`) rather than
+/// attacker-set. Kept at 64 as a conservative per-VS candidate ceiling,
+/// independently tunable from
+/// [`crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS`] (per-proxy arm
+/// criteria) and from [`MAX_PROJECTED_L4_PROXIES`] (post-projection product).
+pub const MAX_L4_CANDIDATE_PROXIES: usize = 64;
+
+/// Upper bound on how many stream proxies one VirtualService may materialize
+/// after L4 `exportTo` namespace projection (`candidates × export namespaces`).
+///
+/// Public or wildcard visibility expands each L4 candidate across every known
+/// export namespace. That namespace factor is environmental — omitted or empty
+/// `exportTo` (Istio's default) resolves to `known_namespaces`, which grows
+/// with every watched namespaced object — not a quantity a single CRD author
+/// directly sets. Without a product backstop, translation still owes
+/// O(candidates × namespaces) clones through validation and reload. 1024 is a
+/// conservative cluster-scale ceiling that still admits large but realistic
+/// multi-namespace meshes for ordinary single-route VirtualServices while
+/// remaining independently tunable from [`MAX_L4_CANDIDATE_PROXIES`].
+pub const MAX_PROJECTED_L4_PROXIES: usize = 1024;
+
 fn project_l4_proxy_visibility(
     object: &K8sObject,
     acc: &K8sAccumulator,
@@ -3083,7 +3111,35 @@ fn project_l4_proxy_visibility(
         }
     }
 
-    let mut projected = Vec::new();
+    // Bound the CRD-controlled candidate fan-out before multiplying by the
+    // environmental namespace set. `virtual_service_l4_candidate_count` already
+    // enforces the same ceiling pre-materialization; this is the projection-
+    // site fail-closed backstop on `proxies.len()`.
+    if proxies.len() > MAX_L4_CANDIDATE_PROXIES {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService L4 routing may materialize at most {} candidate stream proxies",
+                MAX_L4_CANDIDATE_PROXIES
+            ),
+        ));
+    }
+
+    let projected_proxy_count = proxies
+        .len()
+        .checked_mul(export_namespaces.len())
+        .ok_or_else(|| invalid_resource(object, "VirtualService L4 projection count overflow"))?;
+    if projected_proxy_count > MAX_PROJECTED_L4_PROXIES {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService L4 visibility may project at most {} stream proxies",
+                MAX_PROJECTED_L4_PROXIES
+            ),
+        ));
+    }
+
+    let mut projected = Vec::with_capacity(projected_proxy_count);
     for proxy in proxies {
         let Some(criteria) = proxy.stream_match.as_ref() else {
             continue;
@@ -11270,7 +11326,7 @@ extensionProviders:
 
     #[test]
     fn virtual_service_l4_total_candidate_bound_is_checked_before_materialization() {
-        let matches = (0..=crate::proxy::stream_match::MAX_STREAM_MATCH_ARMS)
+        let matches = (0..=MAX_L4_CANDIDATE_PROXIES)
             .map(|_| serde_json::json!({"port": 3306}))
             .collect::<Vec<_>>();
         let err = translate_k8s_objects(
@@ -11287,9 +11343,14 @@ extensionProviders:
             options(),
         )
         .expect_err("an unbounded shared-listener candidate list must fail closed");
+        let message = format!("{err}");
         assert!(
-            format!("{err}").contains("at most 64 total match candidates"),
-            "got {err}"
+            message.contains("candidate stream proxies"),
+            "candidate-cap diagnostic required: {err}"
+        );
+        assert!(
+            !message.contains("may project at most"),
+            "must not report the projection-cap diagnostic: {err}"
         );
     }
 
