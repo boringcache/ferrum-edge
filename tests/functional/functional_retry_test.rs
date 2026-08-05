@@ -89,6 +89,65 @@ fn write_frontend_certs(scratch: &std::path::Path, ca_name: &str) -> (String, St
     )
 }
 
+/// Spawn the HTTP/3 gateway on a freshly reserved HTTPS port.
+///
+/// `FERRUM_PROXY_HTTPS_PORT` is fixed for one harness spawn. The harness's
+/// ordinary retry loop can replace its own proxy/admin ports, but it cannot
+/// change this env-pinned TCP+UDP port after another parallel process steals
+/// the TCP half between reservation release and gateway bind. Retry the whole
+/// spawn with a fresh reservation instead; one inner attempt avoids retrying a
+/// port that can no longer succeed.
+async fn spawn_h3_retry_gateway(
+    yaml: &str,
+    cert_path: &str,
+    key_path: &str,
+) -> (GatewayHarness, u16) {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_error = None;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let reservation = match reserve_port().await {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
+            }
+        };
+        let https_port = reservation.drop_and_take_port();
+
+        let result = GatewayHarness::builder()
+            .file_config(yaml.to_string())
+            .log_level("info")
+            .capture_output()
+            .max_attempts(1)
+            .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path.to_string())
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path.to_string())
+            .env("FERRUM_TLS_NO_VERIFY", "true")
+            .env("FERRUM_POOL_WARMUP_ENABLED", "true")
+            .spawn()
+            .await;
+
+        match result {
+            Ok(harness) => return (harness, https_port),
+            Err(error) => {
+                eprintln!(
+                    "spawn_h3_retry_gateway attempt {attempt}/{MAX_ATTEMPTS} failed \
+                     (https_port={https_port}): {error}"
+                );
+                last_error = Some(error.to_string());
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    panic!(
+        "spawn_h3_retry_gateway exhausted {MAX_ATTEMPTS} fresh HTTPS ports; last error: {}",
+        last_error.as_deref().unwrap_or("no recorded error")
+    );
+}
+
 /// File-mode YAML for one HTTP proxy with an explicit retry policy.
 fn http_with_retry(port: u16, retry: serde_json::Value) -> String {
     let config = json!({
@@ -384,15 +443,8 @@ async fn post_h3_downgrade_subsequent_requests_route_via_cross_protocol_bridge()
         .spawn()
         .expect("spawn h3");
 
-    // Frontend HTTPS port for the H3 client. We enable HTTP/3 on the
-    // gateway and let it send H3 to the H3 backend.
-    let reservation = reserve_port().await.expect("reserve https port");
-    let https_port = reservation.port;
-    drop(reservation);
-
     let scratch = tempfile::tempdir().expect("scratch");
     let (cert_path, key_path) = write_frontend_certs(scratch.path(), "phase8-retry-gw");
-    Box::leak(Box::new(scratch));
 
     let yaml = https_with_retry(
         backend_port,
@@ -402,19 +454,9 @@ async fn post_h3_downgrade_subsequent_requests_route_via_cross_protocol_bridge()
             "retryable_methods": ["GET"],
         }),
     );
-    let harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    let (harness, https_port) = spawn_h3_retry_gateway(&yaml, &cert_path, &key_path).await;
+    // The successful subprocess keeps using these paths for its lifetime.
+    Box::leak(Box::new(scratch));
 
     // Wait for the warmup probe to populate the registry with h3=Supported.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
