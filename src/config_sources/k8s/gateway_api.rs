@@ -288,7 +288,11 @@ pub(super) fn collect_backend_lb_policy(
     let resource = K8sResourceKey::from_object(object);
     let record = GatewayBackendSessionPolicy {
         resource: resource.clone(),
-        creation_timestamp: object.metadata.creation_timestamp,
+        creation_timestamp: object
+            .metadata
+            .creation_timestamp
+            .as_deref()
+            .and_then(parse_k8s_timestamp),
         session: Ok(session),
     };
 
