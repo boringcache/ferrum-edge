@@ -53,11 +53,11 @@ use ferrum_edge::identity::workload_api::proto::{
     X509svidResponse,
 };
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, EastWestGateway, MeshConfig, MeshConsistentHash, MeshDestinationRule, MeshEndpoint,
-    MeshLoadBalancer, MeshPolicy, MeshRule, MeshService, MeshSimpleLb, MeshTrafficPolicy, MtlsMode,
-    MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, Resolution,
-    ServiceEntry, ServiceEntryLocation, ServicePort, ServiceTargetPort, TrustBundle, TrustBundleSet,
-    Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
+    AppProtocol, EastWestGateway, MeshConfig, MeshConsistentHash, MeshDestinationRule,
+    MeshEndpoint, MeshLoadBalancer, MeshPolicy, MeshRule, MeshService, MeshSimpleLb,
+    MeshTrafficPolicy, MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope,
+    PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, ServiceTargetPort,
+    TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::xds::XdsAdsServer;
@@ -1761,7 +1761,12 @@ async fn drive_dr_live_visibility(
 async fn functional_mesh_dr_namespace_local_rule_does_not_reach_another_namespace() {
     let observed = drive_dr_live_visibility(
         "hidden-service-rule",
-        vec![dr_live_rule("service-dr", DR_LIVE_SERVICE_NAMESPACE, &["."], true)],
+        vec![dr_live_rule(
+            "service-dr",
+            DR_LIVE_SERVICE_NAMESPACE,
+            &["."],
+            true,
+        )],
     )
     .await;
 
@@ -1782,7 +1787,12 @@ async fn functional_mesh_dr_namespace_local_rule_does_not_reach_another_namespac
 async fn functional_mesh_dr_root_namespace_rule_applies_when_exported() {
     let observed = drive_dr_live_visibility(
         "visible-root-rule",
-        vec![dr_live_rule("root-dr", DR_LIVE_ROOT_NAMESPACE, &["*"], true)],
+        vec![dr_live_rule(
+            "root-dr",
+            DR_LIVE_ROOT_NAMESPACE,
+            &["*"],
+            true,
+        )],
     )
     .await;
 

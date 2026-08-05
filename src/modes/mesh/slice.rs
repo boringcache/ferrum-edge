@@ -5770,8 +5770,16 @@ mod tests {
         // Saturated: an unseen namespace takes no key and fails toward
         // visibility rather than going silent.
         let before = reported.len();
-        assert!(record_destination_rule_ambiguity_in(&mut reported, "late", 7));
-        assert!(record_destination_rule_ambiguity_in(&mut reported, "late", 7));
+        assert!(record_destination_rule_ambiguity_in(
+            &mut reported,
+            "late",
+            7
+        ));
+        assert!(record_destination_rule_ambiguity_in(
+            &mut reported,
+            "late",
+            7
+        ));
         assert_eq!(reported.len(), before, "and it retains no new key");
 
         // A namespace admitted before saturation keeps its steady-state dedup.
