@@ -1611,7 +1611,7 @@ async fn restore_bundle_rejects_intervening_hand_owned_upstream_subset_change() 
 }
 
 #[tokio::test]
-async fn restore_bundle_rejects_intervening_hand_owned_mesh_retry_change() {
+async fn restore_bundle_accepts_intervening_hand_owned_mesh_retry_change() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
     let ns = "ferrum";
@@ -1649,17 +1649,12 @@ async fn restore_bundle_rejects_intervening_hand_owned_mesh_retry_change() {
             .expect("intervening mesh upstream update failed")
     );
 
-    let error = store
+    store
         .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
         .await
-        .expect_err("new mesh transport/retry conflict must reject compensation");
-    let message = error.to_string();
-    assert!(
-        message.contains("enables retry") && message.contains("mesh.hbone"),
-        "unexpected mesh retry validation error: {error:#}"
-    );
-    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
-    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+        .expect("mesh transport targets must remain valid with retries");
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_some());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_some());
     assert!(
         store
             .get_upstream(ns, &upstream_id)
@@ -1672,7 +1667,7 @@ async fn restore_bundle_rejects_intervening_hand_owned_mesh_retry_change() {
                     .map(String::as_str)
                     == Some("true")
             }),
-        "rejected compensation must preserve the intervening mesh upstream"
+        "restore must preserve the intervening mesh upstream"
     );
 }
 

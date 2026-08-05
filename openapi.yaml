@@ -25125,10 +25125,18 @@ components:
                 node id; it contains no credentials. Counts active spool files
                 (*.ndjson / *.ndjson.zst), atomic-write temps
                 (*.write-<process_tag>-<generation>.tmp), in-flight replay claims
-                (*.inflight), and quarantined (*.corrupt) / dead-letter metadata
-                files. A pending write is sized before admission under the spool write
-                lock; the oldest evictable owned file is dropped until the incoming
-                encoded file fits. In-flight claims, temps under an active write,
+                (*.inflight), and quarantined (*.corrupt) / dead-letter payload and
+                metadata files. Ordinary pending writes are sized before admission;
+                incrementally streamed dead-letter payloads are admitted before each
+                bounded replay-batch append. Admission/inventory/eviction and the
+                corresponding mutation hold one stable ownership-bound exclusive
+                filesystem lock shared by every manager, plugin generation, and
+                cooperating Ferrum process using the namespace. The private
+                no-follow lock inode and spool.meta.json identity are revalidated
+                after acquisition; lock/identity failures refuse the mutation. The
+                zero-length coordination file is excluded from quota/status counts.
+                The oldest evictable owned file is dropped until the incoming bytes fit.
+                In-flight claims, temps under an active write,
                 and records carrying another owner's tag are never evictable, so a
                 write that cannot fit is rejected rather than exceeding the ceiling
                 or destroying another owner's or another delivery's records. Each
@@ -25523,6 +25531,14 @@ components:
                 prepare_failures_total:
                   type: integer
                   minimum: 0
+                replay_attempts_total:
+                  type: integer
+                  minimum: 0
+                  description: ClickHouse HTTP attempts made by bounded replay, including permanent-failure isolation children.
+                dead_letter_rows_total:
+                  type: integer
+                  minimum: 0
+                  description: Permanently rejected rows durably handed to the private dead-letter payload store.
                 unbound_files:
                   type: integer
                   minimum: 0
@@ -25675,12 +25691,20 @@ components:
               type: integer
             files:
               type: integer
-              description: Count of owned spool files (active data, temps, in-flight claims, and quarantined).
+              description: Count of owned spool files (active data, temps, in-flight claims, corrupt quarantine, and dead-letter payload/metadata files).
             bytes:
               type: integer
-              description: Total encoded on-disk bytes for owned spool files (active data, temps, in-flight claims, and quarantined).
+              description: Total encoded on-disk bytes for owned spool files (active data, temps, in-flight claims, corrupt quarantine, and dead-letter payload/metadata files).
             drops_total:
               type: integer
+            replay_attempts_total:
+              type: integer
+              minimum: 0
+              description: ClickHouse HTTP attempts made by bounded replay, including permanent-failure isolation children.
+            dead_letter_rows_total:
+              type: integer
+              minimum: 0
+              description: Permanently rejected rows durably handed to the private dead-letter payload store.
             unbound_files:
               type: integer
               description: |

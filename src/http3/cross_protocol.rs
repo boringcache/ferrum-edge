@@ -3520,18 +3520,19 @@ fn build_h3_grpc_backend_headers(
 /// `proxy_headers` into a minimal map.
 ///
 /// The H3 gRPC dispatch builds its backend header set up-front
-/// ([`build_h3_grpc_backend_headers`]) and passes empty `proxy_headers` to the
-/// gRPC core so the canonical forwarding headers it synthesised
-/// (`x-forwarded-*`, `via`, `forwarded`) are not re-merged. But the core's
-/// `merge_proxy_headers_and_strip_for_grpc` strips reserved identity headers
-/// from the base map and re-adds them ONLY from its `proxy_headers` arg (so a
-/// client cannot forge a principal). An empty arg therefore drops the
-/// gateway-verified assertions that `build_h3_grpc_backend_headers` copied in,
-/// hiding the authenticated principal or geo result from the backend. Passing
-/// this minimal map preserves those trusted assertions while still keeping the
-/// forwarding headers from being re-merged. Empty when no assertion was
-/// produced — the merge then strips any client-forged value and adds nothing,
-/// preserving the spoof protection.
+/// ([`build_h3_grpc_backend_headers`]). The shared gRPC core's
+/// [`crate::proxy::headers::merge_proxy_headers_and_strip_for_grpc`] treats the
+/// `proxy_headers` arg as the authoritative post-plugin view: absent keys are
+/// plugin removals, not passthrough. Passing only assertions (or an empty map)
+/// therefore wipes finalized application headers such as `content-type` and
+/// `grpc-encoding` from the prebuilt map. Callers must pass
+/// [`merge_proxy_headers_for_prebuilt_h3_grpc`], which folds the prebuilt map
+/// into that authoritative view and layers trusted assertions on top so:
+/// * forwarding headers already synthesised on the prebuilt map are retained
+///   (and not re-merged from the original plugin map),
+/// * reserved assertions are stripped from the base and re-added only when
+///   gateway-verified,
+/// * client-forged assertions still fail closed when none were produced.
 fn trusted_plugin_assertion_proxy_headers(
     proxy_headers: &HashMap<String, String>,
 ) -> HashMap<String, String> {
@@ -3552,6 +3553,42 @@ fn trusted_plugin_assertion_proxy_headers(
         }
     }
     assertions
+}
+
+/// Authoritative merge view for an already-finalized H3→gRPC backend
+/// [`HeaderMap`].
+///
+/// Folds every UTF-8 field line with the same separators plugin materialization
+/// uses, then overlays [`trusted_plugin_assertion_proxy_headers`]. Matching
+/// folded values keep the prebuilt raw lines (including repeated / `-bin`
+/// metadata); trusted assertions replace any client-forged reserved names.
+fn merge_proxy_headers_for_prebuilt_h3_grpc(
+    prebuilt: &HeaderMap,
+    proxy_headers: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut view = HashMap::with_capacity(prebuilt.keys_len());
+    for name in prebuilt.keys() {
+        let separator = crate::plugins::repeated_request_header_separator(name.as_str());
+        let mut folded = String::new();
+        let mut saw_value = false;
+        for value in prebuilt.get_all(name) {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            if saw_value {
+                folded.push_str(separator);
+            }
+            folded.push_str(value);
+            saw_value = true;
+        }
+        if saw_value {
+            view.insert(name.as_str().to_string(), folded);
+        }
+    }
+    for (key, value) in trusted_plugin_assertion_proxy_headers(proxy_headers) {
+        view.insert(key, value);
+    }
+    view
 }
 
 /// Stream a live gRPC backend response (`GrpcResponseKind::Streaming`) onto an
@@ -4601,16 +4638,14 @@ where
             }
         };
     record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
-    // `hmap` already contains the complete backend-bound header set
-    // (plugin-transformed end-to-end headers + canonical forwarding
-    // headers synthesized by this bridge). Passing the original
-    // `proxy_headers` again would let the shared gRPC core overwrite
-    // canonical forwarding values (`x-forwarded-*`, `via`, `forwarded`), so
-    // pass ONLY the gateway-trusted plugin assertions: the core's merge strips
-    // reserved `x-consumer-*` and `x-geo-country` from `hmap` and re-adds them
-    // solely from this arg, so an empty map would drop the authenticated
-    // principal and authoritative geo result.
-    let trusted_assertion_headers = trusted_plugin_assertion_proxy_headers(proxy_headers);
+    // `initial_hmap` already contains the complete backend-bound header set
+    // (plugin-transformed end-to-end headers + canonical forwarding headers
+    // synthesized by this bridge). The shared gRPC core merge treats its
+    // `proxy_headers` arg as authoritative — absent keys are removals — so
+    // pass a folded view of the prebuilt map plus trusted assertions rather
+    // than assertions alone (which would wipe `content-type` / metadata).
+    let merge_proxy_headers =
+        merge_proxy_headers_for_prebuilt_h3_grpc(&initial_hmap, proxy_headers);
     let grpc_connection_proxy =
         crate::proxy::resolve_backend_connection_proxy_for_target(proxy, current_target.as_deref());
     let grpc_dispatch_proxy = grpc_connection_proxy.as_ref();
@@ -4623,7 +4658,7 @@ where
         &current_url,
         &state.grpc_pool,
         &state.dns_cache,
-        &trusted_assertion_headers,
+        &merge_proxy_headers,
         stream_grpc_response,
         effective_max_response_body_size_bytes,
         ctx.grpc_deadline_at(),
@@ -4805,6 +4840,8 @@ where
                     current_target.as_deref(),
                 );
             let grpc_retry_dispatch_proxy = grpc_retry_connection_proxy.as_ref();
+            let retry_merge_proxy_headers =
+                merge_proxy_headers_for_prebuilt_h3_grpc(&hmap, proxy_headers);
             result = proxy_grpc_request_from_bytes(
                 hyper_method.clone(),
                 hmap.clone(),
@@ -4815,7 +4852,7 @@ where
                 &current_url,
                 &state.grpc_pool,
                 &state.dns_cache,
-                &trusted_assertion_headers,
+                &retry_merge_proxy_headers,
                 stream_grpc_response,
                 effective_max_response_body_size_bytes,
                 ctx.grpc_deadline_at(),
@@ -6054,13 +6091,12 @@ pub(crate) async fn dispatch_grpc_streaming(
 
     // Dispatch with the channel-backed streaming body. No retry: the request
     // body is consumed on the wire. `hmap` already carries the canonical
-    // forwarding headers, so don't re-pass the full `proxy_headers` (the core
-    // would re-merge and overwrite them) — pass only the gateway-trusted plugin
-    // assertions, since the core's merge strips reserved `x-consumer-*` and
-    // `x-geo-country` from `hmap` and re-adds them solely from this arg. An empty
-    // map would drop the authenticated principal and authoritative geo result.
+    // forwarding headers; pass a folded prebuilt merge view (plus trusted
+    // assertions) so the core's authoritative-removal merge cannot wipe
+    // `content-type` / application metadata while still re-applying
+    // gateway-verified identity assertions.
     let body_size_exceeded = Arc::new(AtomicBool::new(false));
-    let trusted_assertion_headers = trusted_plugin_assertion_proxy_headers(proxy_headers);
+    let merge_proxy_headers = merge_proxy_headers_for_prebuilt_h3_grpc(&hmap, proxy_headers);
     let grpc_connection_proxy =
         crate::proxy::resolve_backend_connection_proxy_for_target(proxy, current_target.as_deref());
     let grpc_dispatch_proxy = grpc_connection_proxy.as_ref();
@@ -6075,7 +6111,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         grpc_dispatch_proxy,
         backend_url,
         &state.grpc_pool,
-        &trusted_assertion_headers,
+        &merge_proxy_headers,
         effective_max_grpc_recv_size_bytes,
         Arc::clone(&body_size_exceeded),
         Arc::clone(&backend_upload_cancelled),
@@ -9723,11 +9759,12 @@ mod tests {
     }
 
     /// Regression guard: the H3 gRPC dispatch must forward gateway-trusted
-    /// consumer identity and geo assertions to the backend. The shared gRPC
-    /// core's `merge_proxy_headers_and_strip_for_grpc` strips these reserved
-    /// headers from the pre-built map and re-adds them ONLY from its
-    /// proxy_headers arg, so passing an empty map drops the assertions. Both the
-    /// buffered and streaming paths must pass the trusted-assertion map instead.
+    /// consumer identity and geo assertions to the backend WITHOUT wiping the
+    /// prebuilt application headers. The shared gRPC core's
+    /// `merge_proxy_headers_and_strip_for_grpc` treats absent proxy_headers keys
+    /// as removals, so both the buffered and streaming paths must pass
+    /// `merge_proxy_headers_for_prebuilt_h3_grpc` (prebuilt fold + assertions),
+    /// never assertions alone or an empty map.
     #[test]
     fn h3_grpc_dispatch_preserves_trusted_plugin_assertions() {
         let src = include_str!("cross_protocol.rs");
@@ -9735,14 +9772,36 @@ mod tests {
             src.contains("fn trusted_plugin_assertion_proxy_headers"),
             "the trusted-assertion extraction helper must exist"
         );
+        assert!(
+            src.contains("fn merge_proxy_headers_for_prebuilt_h3_grpc"),
+            "prebuilt H3 gRPC dispatch must fold the finalized HeaderMap into the merge view"
+        );
+        assert!(
+            src.contains("merge_proxy_headers_for_prebuilt_h3_grpc(&initial_hmap, proxy_headers)"),
+            "buffered H3 gRPC dispatch must use the prebuilt merge view"
+        );
+        assert!(
+            src.contains("merge_proxy_headers_for_prebuilt_h3_grpc(&hmap, proxy_headers)"),
+            "streaming H3 gRPC dispatch must use the prebuilt merge view"
+        );
         // Build the forbidden pattern from parts so this assertion's own source
         // text does not trip the `include_str!` self-scan.
         let forbidden_empty = ["let empty", "_proxy_headers"].concat();
         assert!(
             !src.contains(&forbidden_empty),
             "regression: an H3 gRPC dispatch declares an empty proxy_headers map for the \
-             gRPC core, whose merge would then DROP the trusted x-consumer-* and \
-             x-geo-country assertions"
+             gRPC core, whose merge would then DROP finalized application headers and \
+             trusted x-consumer-* / x-geo-country assertions"
+        );
+        let forbidden_assertions_only = [
+            "let trusted_assertion_headers = trusted_plugin",
+            "_assertion_proxy_headers",
+        ]
+        .concat();
+        assert!(
+            !src.contains(&forbidden_assertions_only),
+            "regression: passing assertions alone to the gRPC core merge wipes \
+             prebuilt content-type / metadata under authoritative-removal semantics"
         );
     }
 
@@ -9785,6 +9844,89 @@ mod tests {
         let mut proxy_headers = HashMap::new();
         proxy_headers.insert("host".to_string(), "example.test".to_string());
         assert!(super::trusted_plugin_assertion_proxy_headers(&proxy_headers).is_empty());
+    }
+
+    #[test]
+    fn prebuilt_h3_grpc_merge_view_keeps_content_type_and_assertions() {
+        let mut prebuilt = HeaderMap::new();
+        prebuilt.insert(
+            hyper::header::CONTENT_TYPE,
+            "application/grpc".parse().unwrap(),
+        );
+        prebuilt.append("x-repeated", "one".parse().unwrap());
+        prebuilt.append("x-repeated", "two".parse().unwrap());
+        prebuilt.insert("x-consumer-username", "forged-client".parse().unwrap());
+        let mut proxy_headers = HashMap::new();
+        proxy_headers.insert("content-type".to_string(), "application/grpc".to_string());
+        proxy_headers.insert("X-Consumer-Username".to_string(), "alice".to_string());
+        proxy_headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+
+        let view = super::merge_proxy_headers_for_prebuilt_h3_grpc(&prebuilt, &proxy_headers);
+
+        assert_eq!(
+            view.get("content-type").map(String::as_str),
+            Some("application/grpc")
+        );
+        assert_eq!(
+            view.get("x-repeated").map(String::as_str),
+            Some("one, two"),
+            "unchanged repeated metadata must fold with the materialization separator"
+        );
+        assert_eq!(
+            view.get("x-consumer-username").map(String::as_str),
+            Some("alice"),
+            "gateway-verified assertion must replace any client-forged base value"
+        );
+        assert!(
+            !view.contains_key("grpc-encoding"),
+            "headers absent from the prebuilt map must not be resurrected from the plugin map"
+        );
+
+        let mut merged = prebuilt.clone();
+        crate::proxy::headers::merge_proxy_headers_and_strip_for_grpc(&mut merged, &view);
+        assert_eq!(
+            merged
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/grpc")
+        );
+        assert_eq!(
+            merged
+                .get_all("x-repeated")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
+        assert_eq!(
+            merged
+                .get("x-consumer-username")
+                .and_then(|v| v.to_str().ok()),
+            Some("alice")
+        );
+        assert_eq!(
+            merged.get(hyper::header::TE).and_then(|v| v.to_str().ok()),
+            Some("trailers")
+        );
+    }
+
+    #[test]
+    fn assertion_only_merge_view_would_wipe_prebuilt_content_type() {
+        // Documents the failure mode this PR repairs: assertions-only overlay
+        // under authoritative-removal semantics clears finalized application
+        // headers from the prebuilt H3 gRPC map.
+        let mut prebuilt = HeaderMap::new();
+        prebuilt.insert(
+            hyper::header::CONTENT_TYPE,
+            "application/grpc".parse().unwrap(),
+        );
+        let assertions = HashMap::new();
+        let mut wiped = prebuilt.clone();
+        crate::proxy::headers::merge_proxy_headers_and_strip_for_grpc(&mut wiped, &assertions);
+        assert!(
+            wiped.get(hyper::header::CONTENT_TYPE).is_none(),
+            "assertions-only merge must not be used for prebuilt H3 gRPC headers"
+        );
     }
 
     /// Regression guard (codex P2): a late client-upload overflow on the streaming

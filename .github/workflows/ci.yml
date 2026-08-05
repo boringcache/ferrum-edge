@@ -734,7 +734,6 @@ jobs:
               integration::admin_mesh_policy_denies_tests
               integration::admin_mesh_remote_clusters_tests
               integration::admin_mesh_runtime_overlay_tests
-              integration::admin_mesh_route_dispatch_sni_admission_tests
               integration::admin_mesh_service_graph_tests
               integration::admin_node_waypoint_identities_tests
               integration::admin_upstream_proxy_sni_admission_tests
@@ -792,6 +791,7 @@ jobs:
               integration::mesh_sidecar_e2e_tests
               integration::mesh_config_revision_tests
               integration::mesh_subscribe_validation_tests
+              integration::mesh_retry_rotation_tests
               integration::cp_dp_grpc_tests
               integration::cp_grpc_handshake_admission_tests
               integration::cp_multi_namespace_tests

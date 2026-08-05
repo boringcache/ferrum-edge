@@ -6503,6 +6503,34 @@ pub mod _test_support {
         crate::proxy::backend_dispatch::error_class_is_post_wire_backend_failure(Some(class))
     }
 
+    /// Return the fail-closed direct-dispatch refusal for a retry target whose
+    /// tags require a secure mesh transport.
+    pub fn direct_http_mesh_transport_refusal_for_test(
+        target: &crate::config::types::UpstreamTarget,
+    ) -> Option<&'static str> {
+        crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(Some(target))
+    }
+
+    /// Whether the inbound request declared a request body on the wire, as the
+    /// retry loop's replay gate evaluates it.
+    pub fn inbound_request_declares_body_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        crate::proxy::inbound_request_declares_body(ctx)
+    }
+
+    /// The exact replay-safety gate `proxy_to_backend_inner` applies at the top
+    /// of its retry loop, covering the mesh, native-H3, and reqwest replay
+    /// transports. `false` means the loop refuses to replay and surfaces the
+    /// original backend failure instead.
+    pub fn retry_replay_preserves_request_body_for_test(
+        inbound_declares_body: bool,
+        retained_body_present: bool,
+    ) -> bool {
+        crate::proxy::retry_replay_preserves_request_body(
+            inbound_declares_body,
+            retained_body_present,
+        )
+    }
+
     /// An isolated aggregate retained-response budget built from the SAME
     /// [`crate::proxy::response_buffer_budget`] code the process-global one uses
     /// — same clamping, same non-blocking admission, same charge attachment —
