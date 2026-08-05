@@ -374,7 +374,7 @@ must name a `FERRUM_*` variable.
 A failed ClickHouse export uses `retry.max_attempts` total attempts (including
 the initial try; valid range **1–32**). `0` is rejected rather than silently
 rewritten. `clickhouse.timeout_ms` is bounded to **1–600000** ms per attempt so
-the cross-process spool claim lease is finite and remains longer than the
+the cross-process spool claim horizon is finite and remains longer than the
 accepted request/retry budget. Batch `size` is capped at **10000** and
 `flush_interval_ms` at **600000** to match the shared `BatchingLogger` admission
 limits. Each of
@@ -507,12 +507,15 @@ claims** each candidate by renaming it to
 before any ClickHouse delivery. The rename is the mutual-exclusion primitive: on
 a shared volume exactly one accepted generation or process can win it, and the
 loser simply moves on to the next file. `process_tag` is a per-process nonce
-drawn with 128 bits at startup, so a restart never mistakes a crashed run's claim
-for live work. The lease deadline is derived from the configured worst-case
+drawn with 128 bits at startup, so a restart can identify a prior run's claim for
+diagnostics without treating it as live work. The lease deadline is derived from
+the configured worst-case
 delivery budget (`clickhouse.timeout_ms` × `retry.max_attempts` plus the retry
 backoff schedule, ×4, with a 300-second floor and no shorter ceiling).
 Multi-chunk replay renews the claim before each chunk, so the aggregate delivery
-of one file cannot outlive a lease sized for one bounded request/retry budget.
+of one file does not get reported as stranded during an ordinary bounded
+request/retry budget. A deadline is liveness evidence only; it never authorizes
+restoring a descriptor-free pathname.
 
 Claim disposition:
 
@@ -524,25 +527,26 @@ Claim disposition:
   private dead-letter payload file and described by safe metadata before the
   source claim is removed.
 - **Unreadable** — the claim is quarantined as `<data-name>.corrupt`.
+- **Descriptor lost / pathname unproven** — the claim remains inert under its
+  `.inflight` name, remains counted in owned spool usage, and is reported for
+  operator verification and reconciliation. It is never automatically restored.
 
 In-flight claims count toward `spool.max_bytes` but are **never** eviction
 candidates; when only claimed or foreign-owned files remain, an admission that
-cannot fit fails closed instead of destroying them. Recovery at prepare time
-returns a claim to its durable name only when this process demonstrably abandoned
-it (same `process_tag`, no live lease) or when a peer's lease deadline has
-passed.
+cannot fit fails closed instead of destroying them. Only the live claim handle's
+pinned descriptor can release a claim to its durable name. Prepare never restores
+an abandoned, expired, or unattributed descriptor-free claim: a same-UID actor
+could have replaced that pathname while preserving its ownership-bearing
+filename, and a lease horizon cannot prove otherwise.
 
 Within one process the exclusion is absolute: a live claim holds an in-memory
-lease, so no other accepted generation can recover it. Across processes sharing a
-volume the exclusion is the atomic rename plus a *time* bound, not a proof that
-the peer stopped: a peer stalled past its lease (host pause, `SIGSTOP`, or clock
-skew between replicas) can still be delivering a claim another process has
-recovered. The lease is sized at four times the accepted worst-case delivery
-budget and renewed before every chunk so that window is not reachable by ordinary
-slow delivery, and the residual case is a duplicate insert — not a lost or
-misrouted record — which the stable `event_id` / `ReplacingMergeTree` idempotency
-contract deduplicates. A claim is never delivered to a destination other than the
-one its `owner_tag` names.
+lease, so no other accepted generation can mutate it. Across processes sharing a
+volume, the atomic rename provides exclusion while the live owner retains its
+descriptor. If the descriptor is lost through task abort or process failure,
+automatic recovery fails closed: the claim is left inert even after its deadline
+and must be reconciled by an operator who can establish its provenance. This
+trades unattended crash recovery for destination integrity; Ferrum never promotes
+an unproven pathname merely because its filename contains an `owner_tag`.
 
 Queued export and spool-delivery events retain the same byte leases under
 `batch.buffer_max_bytes`; transferring an event to the spool worker does not
@@ -648,8 +652,9 @@ fields are never logged.
   path, or when they are foreign/unattributable **and** older than the stale-temp
   age (300 s). A reloaded generation therefore cannot unlink the active temp of
   an older accepted generation or of a peer process sharing the volume.
-- In-flight replay claims are recovered to durable replayable names during live
-  prepare, subject to the lease rules above.
+- Descriptor-free in-flight replay claims are reported during live prepare but
+  remain inert until an operator verifies and reconciles them. Live handles use
+  the descriptor-bound release path for ordinary retryable outcomes.
 
 Dead-letter payloads/metadata, corrupt files, temps, and in-flight claims remain
 under the managed namespace and count toward `spool.max_bytes`. Dead-letter
