@@ -702,3 +702,116 @@ fn destination_rule_applied_subset_http_fields_are_not_deferred() {
         "message must not claim applied fields are deferred: {message}"
     );
 }
+
+/// `idleTimeout` / `http2MaxRequests` are applied at top-level and
+/// `portLevelSettings` scope, but the subset apply layer projects only
+/// `h2UpgradePolicy` / `maxRetries` / `http1MaxPendingRequests` into
+/// `ResolvedSubsetTrafficPolicy` — a subset-scoped value reaches no effective
+/// proxy. Status must say so, or `kubectl describe` shows a fully-accepted
+/// DestinationRule whose knob silently does nothing.
+#[test]
+fn destination_rule_subset_scoped_idle_timeout_and_http2_max_requests_are_deferred() {
+    let obj = object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "reviews",
+        json!({
+            "host": "reviews.default.svc.cluster.local",
+            // Top-level: both fields ARE applied — must NOT be deferred.
+            "trafficPolicy": {
+                "connectionPool": { "http": {
+                    "idleTimeout": "30s",
+                    "http2MaxRequests": 100
+                } }
+            },
+            "subsets": [{
+                "name": "v1",
+                "labels": { "version": "v1" },
+                "trafficPolicy": {
+                    "connectionPool": { "http": {
+                        // Subset: dropped by the apply layer — must be deferred.
+                        "idleTimeout": "45s",
+                        "http2MaxRequests": 10,
+                        // Subset: applied — must NOT be deferred.
+                        "http1MaxPendingRequests": 64
+                    } }
+                }
+            }]
+        }),
+    );
+    let updates = plan_istio_status_updates(&[obj], options());
+    let detail = updates[0].ferrum_detail.as_ref().unwrap();
+    let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+        .as_array()
+        .expect("deferred_fields array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+
+    for field in ["idleTimeout", "http2MaxRequests"] {
+        let expected = format!("subsets[].trafficPolicy.connectionPool.http.{field}");
+        assert!(
+            deferred.iter().any(|l| l.starts_with(expected.as_str())),
+            "subset-scoped {field} is inert and must be reported deferred; got: {deferred:?}"
+        );
+    }
+    assert!(
+        !deferred.iter().any(|label| label.contains("PendingRequests")),
+        "subset http1MaxPendingRequests IS applied and must not be deferred: {deferred:?}"
+    );
+    // The top-level forms are applied; nothing may report the bare
+    // `trafficPolicy.connectionPool.http.*` labels as deferred.
+    assert!(
+        !deferred
+            .iter()
+            .any(|label| label.starts_with("connectionPool.http.idleTimeout")
+                || label.starts_with("connectionPool.http.http2MaxRequests")),
+        "top-level idleTimeout/http2MaxRequests are applied and must not be deferred: {deferred:?}"
+    );
+}
+
+/// The same two fields at top-level / `portLevelSettings` scope only — no
+/// subset uses them — must produce NO deferred entry at all.
+#[test]
+fn destination_rule_top_level_idle_timeout_and_http2_max_requests_are_not_deferred() {
+    let obj = object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "ratings",
+        json!({
+            "host": "ratings.default.svc.cluster.local",
+            "trafficPolicy": {
+                "connectionPool": { "http": {
+                    "idleTimeout": "30s",
+                    "http2MaxRequests": 100
+                } },
+                "portLevelSettings": [{
+                    "port": {"number": 8080},
+                    "connectionPool": { "http": {
+                        "idleTimeout": "10s",
+                        "http2MaxRequests": 20
+                    } }
+                }]
+            },
+            "subsets": [{
+                "name": "v1",
+                "labels": { "version": "v1" },
+                "trafficPolicy": {
+                    "connectionPool": { "http": { "maxRetries": 1 } }
+                }
+            }]
+        }),
+    );
+    let updates = plan_istio_status_updates(&[obj], options());
+    let detail = updates[0].ferrum_detail.as_ref().unwrap();
+    let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+        .as_array()
+        .expect("deferred_fields array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        deferred.is_empty(),
+        "top-level/per-port idleTimeout+http2MaxRequests are applied at those scopes: {deferred:?}"
+    );
+}

@@ -407,6 +407,59 @@ fn dr_subset_connection_pool_http_combined() {
     assert_eq!(http.http1_max_pending_requests, Some(7));
 }
 
+/// `subsets[].trafficPolicy.connectionPool.http.{idleTimeout,http2MaxRequests}`
+/// are validated exactly like their top-level forms but dropped by the subset
+/// apply layer (`ResolvedSubsetTrafficPolicy` carries neither), so subset scope
+/// must warn. The identical fields at top-level scope ARE applied and must stay
+/// silent — otherwise every DR with a top-level `idleTimeout` grows a spurious
+/// "not applied" warning.
+#[test]
+fn dr_subset_connection_pool_http_idle_timeout_and_h2_max_requests_deferred() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "subsets[].trafficPolicy.connectionPool.http.{idleTimeout,http2MaxRequests}",
+        status = Status::Deferred,
+        notes = "Parsed and validated, but not projected at subset scope: ResolvedSubsetTrafficPolicy carries only h2UpgradePolicy, maxRetries, and http1MaxPendingRequests. Translation warns and status reports the fields as deferred; set them at trafficPolicy or portLevelSettings scope.",
+    );
+    let result = translate_k8s_objects(
+        &[destination_rule(json!({
+            "host": "echo.default.svc.cluster.local",
+            "trafficPolicy": {
+                "connectionPool": {"http": {"idleTimeout": "30s", "http2MaxRequests": 100}}
+            },
+            "subsets": [{
+                "name": "legacy",
+                "labels": {"version": "v1"},
+                "trafficPolicy": {"connectionPool": {"http": {
+                    "idleTimeout": "45s",
+                    "http2MaxRequests": 10
+                }}}
+            }]
+        }))],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    for field in ["idleTimeout", "http2MaxRequests"] {
+        let matching: Vec<&String> = result
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains(field) && warning.contains("not applied"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly the SUBSET-scoped {field} must warn (top-level is applied): {:?}",
+            result.warnings
+        );
+        assert!(
+            matching[0].contains("subsets[].trafficPolicy.connectionPool.http"),
+            "the warning must name the subset scope: {}",
+            matching[0]
+        );
+    }
+}
+
 /// `trafficPolicy.loadBalancer.simple = ROUND_ROBIN` → `RoundRobin`.
 #[test]
 fn dr_load_balancer_simple_round_robin() {

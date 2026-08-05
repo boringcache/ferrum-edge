@@ -1191,7 +1191,8 @@ async fn run_plain_attempt_local_policy_or_reject<S>(
     backend_start: Instant,
     current_url: &str,
     effective_host: &str,
-    dispatch_port: u16,
+    dispatch_dial_port: u16,
+    dispatch_policy_port: u16,
     bytes_sent: u64,
     halt_request_body_before_reject: bool,
     ctx: &mut RequestContext,
@@ -1336,14 +1337,23 @@ where
         return Ok(Err(outcome));
     }
 
-    let pending_cap =
-        crate::proxy::resolve_backend_http1_max_pending_requests(dispatch_proxy, dispatch_port)
-            .filter(|_| {
-                crate::proxy::reqwest_dispatch_is_http1_only(state, dispatch_proxy, current_target)
-            });
+    // Cap lookup AND lane key use the DR policy port (`dispatch_policy_port`),
+    // never the dial port — same identity `proxy_to_backend` /
+    // `proxy_to_backend_retry` derive via `dispatch_policy_port_for_target`. A
+    // `targetPort`-remapped Service (80 → 8080) otherwise gives the H3 bridge
+    // its own `host|8080|subset` lane while H1/H2 counts in `host|80|subset`,
+    // so a cap of N admits 2N combined, and an explicit
+    // `portLevelSettings[{port: 80}]` cap would be invisible here.
+    let pending_cap = crate::proxy::resolve_backend_http1_max_pending_requests(
+        dispatch_proxy,
+        dispatch_policy_port,
+    )
+    .filter(|_| {
+        crate::proxy::reqwest_dispatch_is_http1_only(state, dispatch_proxy, current_target)
+    });
     match state.backend_pending_limit.try_acquire_for_subset(
         effective_host,
-        dispatch_port,
+        dispatch_policy_port,
         dispatch_proxy.upstream_subset.as_deref(),
         pending_cap,
     ) {
@@ -1352,7 +1362,7 @@ where
             warn!(
                 proxy_id = %dispatch_proxy.id,
                 backend_host = %effective_host,
-                backend_port = dispatch_port,
+                backend_port = dispatch_dial_port,
                 pending_requests = limit.current,
                 max_pending_requests = limit.cap,
                 "Shedding cross-protocol H3→HTTP request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
@@ -1719,10 +1729,18 @@ where
                         .as_deref()
                         .map(|t| t.host.as_str())
                         .unwrap_or(dispatch_proxy.backend_host.as_str());
-                    let dispatch_port = current_target
+                    let dispatch_dial_port = current_target
                         .as_deref()
                         .map(|t| t.port)
                         .unwrap_or(dispatch_proxy.backend_port);
+                    // DR policy identity for this attempt: the declared Service
+                    // port under `targetPort` remapping. Shared with
+                    // `proxy_to_backend`/`proxy_to_backend_retry` so all three
+                    // frontends admit H1 requests in ONE lane per destination.
+                    let dispatch_policy_port = crate::proxy::dispatch_policy_port_for_target(
+                        dispatch_proxy,
+                        current_target.as_deref(),
+                    );
 
                     let mut pending_slot = match run_plain_attempt_local_policy_or_reject(
                         state,
@@ -1736,7 +1754,8 @@ where
                         backend_start,
                         &current_url,
                         effective_host,
-                        dispatch_port,
+                        dispatch_dial_port,
+                        dispatch_policy_port,
                         bytes_sent,
                         false,
                         ctx,
@@ -2177,10 +2196,17 @@ where
                     .as_deref()
                     .map(|t| t.host.as_str())
                     .unwrap_or(dispatch_proxy.backend_host.as_str());
-                let dispatch_port = current_target
+                let dispatch_dial_port = current_target
                     .as_deref()
                     .map(|t| t.port)
                     .unwrap_or(dispatch_proxy.backend_port);
+                // Same DR policy-port identity the H1/H2 path uses, so the
+                // streaming bridge shares one H1 admission lane per destination
+                // instead of opening a dial-port-keyed second one.
+                let dispatch_policy_port = crate::proxy::dispatch_policy_port_for_target(
+                    dispatch_proxy,
+                    current_target.as_deref(),
+                );
 
                 let mut pending_slot = match run_plain_attempt_local_policy_or_reject(
                     state,
@@ -2194,7 +2220,8 @@ where
                     backend_start,
                     &current_url,
                     effective_host,
-                    dispatch_port,
+                    dispatch_dial_port,
+                    dispatch_policy_port,
                     0,
                     true,
                     ctx,
@@ -9308,6 +9335,59 @@ mod tests {
         assert_eq!(
             effective_sd.backend_connect_timeout_ms, 1_500,
             "the bridge must apply the SD top-level fallback on a runtime-resolved port"
+        );
+    }
+
+    /// The H3→HTTP bridge's `http1MaxPendingRequests` admission must key by the
+    /// DestinationRule POLICY port, not the dial port. For a `targetPort`-remapped
+    /// Service (declared port 80 → workload port 8080) the dial port is not a
+    /// policy source at all: an explicit `portLevelSettings[{port: 80}]` cap is
+    /// invisible under it, and acquiring in a `host|8080|subset` lane while the
+    /// H1/H2 frontend acquires in `host|80|subset` lets a cap of N admit 2N
+    /// combined.
+    #[test]
+    fn h3_plain_bridge_pending_admission_keys_the_policy_port() {
+        let mut proxy = minimal_proxy();
+        proxy.upstream_id = Some("reviews".to_string());
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            80u16,
+            crate::config::types::ResolvedPortOverride {
+                http1_max_pending_requests: Some(4),
+                ..Default::default()
+            },
+        )]));
+
+        // Declared Service port 80 remapped onto workload port 8080.
+        let mut target = target_for_test(8080);
+        target.service_port_policy_key = Some(80);
+
+        let policy_port = crate::proxy::dispatch_policy_port_for_target(&proxy, Some(&target));
+        assert_eq!(
+            policy_port, 80,
+            "the bridge's admission port must be the declared Service port"
+        );
+        assert_eq!(
+            crate::proxy::resolve_backend_http1_max_pending_requests(&proxy, policy_port),
+            Some(4),
+            "an explicit portLevelSettings cap must be visible to the H3 bridge"
+        );
+        assert_eq!(
+            crate::proxy::resolve_backend_http1_max_pending_requests(&proxy, target.port),
+            None,
+            "fixture guard: the dial port resolves NO cap, so keying by it silently uncaps the bridge"
+        );
+
+        // A target with no remapping keys by its own port, and a direct-backend
+        // proxy with no selected target keys by `backend_port` — same fallbacks
+        // `proxy_to_backend` uses.
+        let plain = target_for_test(8443);
+        assert_eq!(
+            crate::proxy::dispatch_policy_port_for_target(&proxy, Some(&plain)),
+            8443
+        );
+        assert_eq!(
+            crate::proxy::dispatch_policy_port_for_target(&proxy, None),
+            proxy.backend_port
         );
     }
 

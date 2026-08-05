@@ -649,8 +649,12 @@ fn destination_rule_status(
             // Deferred fields: the parsed-but-dropped connectionPool.http knobs
             // the translator only warns on. `maxRequestsPerConnection` is
             // universally deferred because Ferrum does not enforce
-            // close-after-N backend requests. The other top-level/port
-            // connectionPool.http knobs are projected/enforced as documented.
+            // close-after-N backend requests. `idleTimeout` and
+            // `http2MaxRequests` are enforced at top-level/port scope but NOT at
+            // subset scope (`ResolvedSubsetTrafficPolicy` carries neither), so
+            // they are deferred only when they appear under
+            // `subsets[].trafficPolicy`. `h2UpgradePolicy`, `maxRetries`, and
+            // `http1MaxPendingRequests` are enforced in all three scopes.
             // Now APPLIED (no longer deferred): per-subset
             // connectionPool.tcp.connectTimeout (overrides backend_connect_timeout_ms
             // for subset-bound proxies), portLevelSettings[].tls (per-port backend
@@ -715,13 +719,42 @@ fn destination_rule_status(
 ///
 /// `maxRequestsPerConnection` is universally deferred: it is parsed and
 /// validated, but not projected because the backend pools do not support
-/// close-after-N-request semantics. `idleTimeout`, `http2MaxRequests`,
-/// `maxRetries`, `h2UpgradePolicy`, and `http1MaxPendingRequests` are
-/// projected/enforced at top-level, port, and subset scope.
+/// close-after-N-request semantics.
+///
+/// Exact enforcement scopes of the remaining knobs:
+///
+/// * `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests` — enforced at
+///   top-level, `portLevelSettings`, AND subset scope.
+/// * `idleTimeout`, `http2MaxRequests` — enforced at top-level and
+///   `portLevelSettings` scope ONLY. `ResolvedSubsetTrafficPolicy` carries
+///   neither, so a subset-scoped value never reaches an effective proxy; see
+///   [`DEFERRED_SUBSET_ONLY_CONNECTION_POOL_HTTP_FIELDS`].
 const DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[(
     "maxRequestsPerConnection",
     "connectionPool.http.maxRequestsPerConnection (not applied: backend close-after-N-requests is unsupported)",
 )];
+
+/// `connectionPool.http` knobs that ARE enforced at top-level and
+/// `portLevelSettings` scope but are silently dropped at SUBSET scope: the
+/// apply layer projects only `h2UpgradePolicy` / `maxRetries` /
+/// `http1MaxPendingRequests` into `ResolvedSubsetTrafficPolicy`
+/// (`src/modes/mesh/mod.rs`, `src/config/types.rs`), so a subset's
+/// `idleTimeout` / `http2MaxRequests` never reaches an effective proxy.
+///
+/// Reported as deferred ONLY when they appear under `subsets[].trafficPolicy`,
+/// so `kubectl describe` tells the operator the knob is inert instead of
+/// showing a fully-accepted DestinationRule that does nothing. Keep in sync
+/// with the subset-scope warnings in `translate_connection_pool_http`.
+const DEFERRED_SUBSET_ONLY_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[
+    (
+        "idleTimeout",
+        "subsets[].trafficPolicy.connectionPool.http.idleTimeout (not applied: subset-scoped idleTimeout is unsupported; set it at trafficPolicy or portLevelSettings scope)",
+    ),
+    (
+        "http2MaxRequests",
+        "subsets[].trafficPolicy.connectionPool.http.http2MaxRequests (not applied: subset-scoped http2MaxRequests is unsupported; set it at trafficPolicy or portLevelSettings scope)",
+    ),
+];
 
 /// Subset-scoped `portLevelSettings` are never parsed or applied. Keep the
 /// label in sync with the warning in `translate_subset`.
@@ -743,7 +776,13 @@ fn subset_has_port_level_settings(spec: &Value) -> bool {
         })
 }
 
-/// Collect the deferred `connectionPool.http.*` field labels in every scope.
+/// Collect the deferred `connectionPool.http.*` field labels.
+///
+/// Two tiers, because deferral is scope-dependent:
+/// [`DEFERRED_CONNECTION_POOL_HTTP_FIELDS`] is checked across top-level,
+/// `portLevelSettings`, and subset policies, while
+/// [`DEFERRED_SUBSET_ONLY_CONNECTION_POOL_HTTP_FIELDS`] is checked against
+/// subset policies alone (those fields ARE enforced at the other two scopes).
 ///
 /// Mirrors the translator's warning emission so the same gap shows up in
 /// `kubectl describe`.
@@ -754,7 +793,7 @@ fn deferred_connection_pool_http_fields(spec: &Value) -> Vec<&'static str> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten();
-    let subset_policies: Vec<&Value> = spec
+    let subset_scope_policies: Vec<&Value> = spec
         .get("subsets")
         .and_then(Value::as_array)
         .into_iter()
@@ -765,7 +804,7 @@ fn deferred_connection_pool_http_fields(spec: &Value) -> Vec<&'static str> {
     let all_scope_policies: Vec<&Value> = top_level
         .into_iter()
         .chain(port_level_policies)
-        .chain(subset_policies.iter().copied())
+        .chain(subset_scope_policies.iter().copied())
         .collect();
 
     let http_has = |policy: &Value, field: &str| {
@@ -776,7 +815,7 @@ fn deferred_connection_pool_http_fields(spec: &Value) -> Vec<&'static str> {
             .is_some()
     };
 
-    let deferred: Vec<&'static str> = DEFERRED_CONNECTION_POOL_HTTP_FIELDS
+    let mut deferred: Vec<&'static str> = DEFERRED_CONNECTION_POOL_HTTP_FIELDS
         .iter()
         .filter(|(field, _)| {
             all_scope_policies
@@ -785,6 +824,19 @@ fn deferred_connection_pool_http_fields(spec: &Value) -> Vec<&'static str> {
         })
         .map(|(_, label)| *label)
         .collect();
+
+    // Fields enforced at top-level/port scope but dropped by the subset apply
+    // layer are deferred ONLY when they appear under `subsets[].trafficPolicy`.
+    deferred.extend(
+        DEFERRED_SUBSET_ONLY_CONNECTION_POOL_HTTP_FIELDS
+            .iter()
+            .filter(|(field, _)| {
+                subset_scope_policies
+                    .iter()
+                    .any(|policy| http_has(policy, field))
+            })
+            .map(|(_, label)| *label),
+    );
 
     deferred
 }

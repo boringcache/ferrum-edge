@@ -1013,3 +1013,67 @@ fn h3_cross_protocol_http1_admission_uses_selected_subset_lane() {
         "the H3-to-plain bridge must not collapse selected subsets into the unmatched H1 admission lane"
     );
 }
+
+/// The H1 admission lane must be keyed by the DestinationRule POLICY port —
+/// `UpstreamTarget::dispatch_policy_port()`, the declared Service port under
+/// `targetPort` remapping — exactly like `proxy_to_backend` /
+/// `proxy_to_backend_retry`. Keying the bridge by the DIAL port instead splits
+/// one destination's in-flight budget across two lanes (`host|80|s…` for
+/// H1/H2, `host|8080|s…` for H3), so a cap of N admits 2N combined, and it
+/// makes an explicit `portLevelSettings[{port: 80}]` cap invisible to the
+/// bridge.
+#[test]
+fn h3_cross_protocol_http1_admission_keys_the_policy_port_not_the_dial_port() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let pending_gate = source
+        .find("let pending_cap =")
+        .expect("H3-to-plain pending gate");
+    let gate_tail = &source[pending_gate..];
+    let acquisition = gate_tail
+        .find(".try_acquire_for_subset(")
+        .expect("subset-keyed H1 admission");
+    let cap_lookup = &gate_tail[..acquisition];
+    let acquisition_tail = &gate_tail[acquisition..];
+    let acquisition_end = acquisition_tail
+        .find("pending_cap,")
+        .expect("pending cap argument");
+    let acquisition_call = &acquisition_tail[..acquisition_end];
+
+    assert!(
+        cap_lookup.contains("dispatch_policy_port"),
+        "the per-port http1MaxPendingRequests cap lookup must use the DR policy port"
+    );
+    assert!(
+        !cap_lookup.contains("dispatch_dial_port"),
+        "the dial port is a transport address, not a policy source"
+    );
+    assert!(
+        acquisition_call.contains("dispatch_policy_port,"),
+        "the H3-to-plain bridge must acquire in the policy-port lane the H1/H2 path uses"
+    );
+    assert!(
+        !acquisition_call.contains("dispatch_dial_port"),
+        "the H3 bridge must not open a dial-port-keyed second admission lane"
+    );
+
+    // Both bridge dispatch sites (buffered retry loop and streaming dispatch)
+    // must derive that port through the one shared helper.
+    let helper = "let dispatch_policy_port = crate::proxy::dispatch_policy_port_for_target(";
+    assert_eq!(
+        source.matches(helper).count(),
+        2,
+        "both H3-to-plain dispatch sites must derive the policy port via the shared helper"
+    );
+
+    // ...and the H1/H2 path must derive it through the same helper, so the two
+    // frontends cannot drift apart again.
+    let h1h2 = include_str!("../../../src/proxy/mod.rs");
+    for binding in ["pending_policy_port", "retry_policy_port"] {
+        let expected =
+            format!("let {binding} = dispatch_policy_port_for_target(proxy, upstream_target);");
+        assert!(
+            h1h2.contains(&expected),
+            "the H1/H2 H1-admission lane port `{binding}` must come from the shared helper"
+        );
+    }
+}

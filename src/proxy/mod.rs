@@ -1132,9 +1132,13 @@ type WarmupTask =
 /// gating phase can decide per-target whether to materialize the task at all
 /// (skipping is much cheaper than building a task and dropping it unrun).
 struct ReqwestWarmupCandidate {
-    /// Representative proxy used to build the `reqwest::Client`. Multiple
-    /// proxies sharing the same `(scheme, host, port)` collapse onto the
-    /// first one collected — same as the original warmup behaviour.
+    /// Representative proxy used to build the `reqwest::Client`. This is the
+    /// per-target EFFECTIVE proxy (`resolve_effective_proxy_for_target`), so
+    /// the warmup client is built and keyed exactly like the dispatch client
+    /// for this target — including a DestinationRule `DO_NOT_UPGRADE` ALPN
+    /// restriction reached through the per-port/subset/top-level tiers.
+    /// Multiple proxies sharing the same `(pool key, host, port)` collapse
+    /// onto the first one collected — same as the original warmup behaviour.
     proxy: Proxy,
     host: String,
     port: u16,
@@ -1258,7 +1262,7 @@ fn proxy_config_forces_reqwest_dispatch(
 /// candidates must wait for the refresh so the gating phase can consult
 /// the registry.
 ///
-/// `pool_key` is the proxy's `ConnectionPool::pool_key_for_warmup(proxy)` —
+/// `pool_key_for` yields `ConnectionPool::pool_key_for_warmup(proxy)` —
 /// the same identity the connection pool uses to keep distinct
 /// `reqwest::Client`s. Including it in the dedup key (instead of just
 /// `(scheme, host, port)`) ensures two proxies that share a backend
@@ -1268,6 +1272,11 @@ fn proxy_config_forces_reqwest_dispatch(
 /// at runtime. Without TLS-aware dedup, only the first-collected
 /// proxy's client gets warmed and the others pay a cold connect on
 /// the first real request despite warmup being enabled.
+///
+/// It is a callback rather than a precomputed string because the key is
+/// derived from the PER-TARGET EFFECTIVE proxy
+/// (`resolve_effective_proxy_for_target`), not the base proxy — see the
+/// per-target resolution below.
 ///
 /// `forces_reqwest` is the per-proxy verdict from
 /// `proxy_config_forces_reqwest_dispatch` — `true` when the proxy's
@@ -1284,11 +1293,11 @@ fn proxy_config_forces_reqwest_dispatch(
 /// log lines key off the per-target description, not insertion order.
 ///
 /// Free function so it's callable from tests without constructing a full
-/// `ProxyState`. Tests pass arbitrary `pool_key` strings to exercise the
-/// dedup contract directly.
+/// `ProxyState`. Tests pass a stand-in `pool_key_for` closure to exercise
+/// the dedup contract directly.
 fn collect_reqwest_warmup_candidates_for_proxy(
     proxy: &Proxy,
-    pool_key: &str,
+    pool_key_for: &dyn Fn(&Proxy) -> String,
     forces_reqwest: bool,
     upstream_map: &HashMap<(&str, &str), &crate::config::types::Upstream>,
     http_candidates: &mut HashMap<String, ReqwestWarmupCandidate>,
@@ -1299,7 +1308,19 @@ fn collect_reqwest_warmup_candidates_for_proxy(
         _ => "https",
     };
 
-    let mut targets: Vec<(String, u16)> = Vec::new();
+    // Each entry carries the per-target EFFECTIVE proxy, not the base proxy:
+    // `resolve_effective_proxy_for_target` is what dispatch applies before it
+    // builds/keys a reqwest client, and the DestinationRule
+    // `connectionPool.http` tiers it resolves (explicit `portLevelSettings`,
+    // the selected subset, and the top-level overlay — the latter two ride
+    // `Proxy.dispatch_port_override_fallback`) include `h2UpgradePolicy`.
+    // A `DO_NOT_UPGRADE` there both restricts the client's advertised ALPN to
+    // `http/1.1` and adds the `h1` discriminator to the pool key, so warming
+    // from the base proxy would (a) ALPN-negotiate h2 against a backend the
+    // operator explicitly forbade H2 for and (b) park that idle connection on
+    // a client the data path never uses. This is a cold startup path, so the
+    // resolution runs per target with no fast-path pretense.
+    let mut targets: Vec<(String, u16, std::borrow::Cow<'_, Proxy>)> = Vec::new();
     if let Some(ref upstream_id) = proxy.upstream_id
         && let Some(upstream) = upstream_map.get(&(proxy.namespace.as_str(), upstream_id.as_str()))
     {
@@ -1314,16 +1335,26 @@ fn collect_reqwest_warmup_candidates_for_proxy(
             {
                 continue;
             }
-            targets.push((target.host.clone(), target.port));
+            targets.push((
+                target.host.clone(),
+                target.port,
+                resolve_effective_proxy_for_target(proxy, Some(target)),
+            ));
         }
     }
     // Fall back to the proxy's own backend only when it has one. A mesh egress
     // proxy carries `upstream_id` + an empty `backend_host`, so once its
     // mesh-tagged targets are filtered out above, `targets` is empty and there
     // is nothing to warm — do NOT synthesize a `:0` candidate from the empty
-    // backend.
+    // backend. A direct-backend proxy has no LB-selected target, so dispatch
+    // resolves nothing either (`resolve_effective_proxy_for_target(_, None)`
+    // borrows the base proxy) — mirror that exactly.
     if targets.is_empty() && !proxy.backend_host.is_empty() {
-        targets.push((proxy.backend_host.clone(), proxy.backend_port));
+        targets.push((
+            proxy.backend_host.clone(),
+            proxy.backend_port,
+            std::borrow::Cow::Borrowed(proxy),
+        ));
     }
 
     let bucket = if scheme == "http" {
@@ -1332,14 +1363,19 @@ fn collect_reqwest_warmup_candidates_for_proxy(
         https_candidates
     };
 
-    for (host, port) in targets {
+    for (host, port, effective_proxy) in targets {
         // Dedup key composes the connection pool's TLS-aware client key
         // with the per-target host:port. Multiple targets in one upstream
         // share a pool key but get distinct dedup keys (each target
         // connection in reqwest's internal pool needs its own HEAD).
         // Multiple proxies sharing the same (host, port) but different
         // TLS configs have distinct pool keys → distinct dedup keys →
-        // each `reqwest::Client` gets its own warmup task.
+        // each `reqwest::Client` gets its own warmup task. The key comes
+        // from the per-target effective proxy so two ports of one upstream
+        // that resolve to different client behavior (force-H1 ALPN,
+        // per-port TLS, per-port idle timeout) never collapse onto one
+        // warmup task.
+        let pool_key = pool_key_for(effective_proxy.as_ref());
         let dedup_key = format!("{}|{}:{}", pool_key, host, port);
         bucket
             .entry(dedup_key)
@@ -1349,7 +1385,7 @@ fn collect_reqwest_warmup_candidates_for_proxy(
                 existing.requires_reqwest_warmup |= forces_reqwest;
             })
             .or_insert_with(|| ReqwestWarmupCandidate {
-                proxy: proxy.clone(),
+                proxy: effective_proxy.into_owned(),
                 host,
                 port,
                 scheme,
@@ -8659,17 +8695,15 @@ impl ProxyState {
         let mut https_candidates: HashMap<String, ReqwestWarmupCandidate> =
             HashMap::with_capacity(cap_hint);
         let pool_config = self.connection_pool.global_pool_config();
-        // Candidates are computed from the BASE `proxy` here — before any
-        // `resolve_effective_proxy_for_target` per-port resolution. One
-        // consequence (P3, intentional): a DestinationRule
-        // `h2UpgradePolicy: DO_NOT_UPGRADE` per-port override builds a SEPARATE
-        // force-H1 reqwest client (ALPN restricted to `http/1.1`, distinct
-        // force-H1 pool key) that is NOT pre-warmed here. This is correct, only
-        // unoptimized: that client is built LAZILY on its first real dispatch
-        // under its own pool key, so behavior is identical — only the one-time
-        // warm-connection is missed for the force-H1 client. Resolving effective
-        // proxies during warmup is a broader change tracked as a follow-up; see
-        // `docs/mesh.md` "Warmup pre-warm of DR force-H1 clients".
+        // Warmup keys and builds each candidate from the PER-TARGET EFFECTIVE
+        // proxy (`collect_reqwest_warmup_candidates_for_proxy` resolves it), so
+        // the startup probe speaks the same ALPN and lands on the same pool key
+        // as the first real dispatch. In particular a DestinationRule
+        // `h2UpgradePolicy: DO_NOT_UPGRADE` reached through the per-port,
+        // selected-subset, or top-level tier pre-warms its force-H1 client
+        // instead of ALPN-negotiating h2 to a backend the operator forbade H2
+        // for and parking that connection on a client dispatch never uses.
+        let pool_key_for = |candidate: &Proxy| self.connection_pool.pool_key_for_warmup(candidate);
         for proxy in &config.proxies {
             if !proxy.dispatch_kind.is_http_family() {
                 continue;
@@ -8689,10 +8723,9 @@ impl ProxyState {
                 per_proxy_pool.enable_http2,
                 requires_request_body_buffering,
             );
-            let pool_key = self.connection_pool.pool_key_for_warmup(proxy);
             collect_reqwest_warmup_candidates_for_proxy(
                 proxy,
-                &pool_key,
+                &pool_key_for,
                 forces_reqwest,
                 &upstream_map,
                 &mut http_candidates,
@@ -32646,6 +32679,29 @@ pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16)
         .and_then(|override_config| override_config.max_connections)
 }
 
+/// The DestinationRule policy port for one backend dispatch: the LB-selected
+/// target's `dispatch_policy_port()` (its declared Service port when
+/// `targetPort` remapping applies), or the proxy's own `backend_port` when no
+/// target is selected.
+///
+/// This is the ONE derivation every frontend must use for the
+/// `http1MaxPendingRequests` gate — both the per-port cap lookup
+/// ([`resolve_backend_http1_max_pending_requests`]) and the
+/// `BackendPendingLimiter::try_acquire_for_subset` lane key. Keying the lane by
+/// the DIAL port instead would split one destination's admission across two
+/// lanes when the H1/H2 and HTTP/3 frontends both serve a `targetPort`-remapped
+/// upstream (combined in-flight would reach `2N` for a cap of `N`), and would
+/// miss an explicit `portLevelSettings[{port: <service port>}]` cap entirely.
+/// The dial port stays a transport address; it belongs only in log lines.
+pub(crate) fn dispatch_policy_port_for_target(
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> u16 {
+    upstream_target
+        .map(UpstreamTarget::dispatch_policy_port)
+        .unwrap_or(proxy.backend_port)
+}
+
 /// Resolve the DestinationRule `connectionPool.http.http1MaxPendingRequests`
 /// cap for the destination port a backend dial will target.
 ///
@@ -32655,11 +32711,11 @@ pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16)
 /// matches [`resolve_backend_max_connections`]: a single field read on the
 /// precomputed `Proxy.dispatch_port_overrides` map, no `ArcSwap` load.
 ///
-/// `dispatch_port` is the DestinationRule policy key: callers with a selected
-/// target pass `UpstreamTarget::dispatch_policy_port()`, while a direct-backend
-/// proxy with no selected target passes `proxy.backend_port`. A remapped
-/// workload port or mesh listener remains a transport address, not the policy
-/// source.
+/// `dispatch_port` is the DestinationRule policy key, always derived through
+/// [`dispatch_policy_port_for_target`]: `UpstreamTarget::dispatch_policy_port()`
+/// for a selected target, `proxy.backend_port` for a direct-backend proxy with
+/// none. A remapped workload port or mesh listener remains a transport address,
+/// not the policy source.
 ///
 /// FIELD-level fallback: when the per-port entry carries no
 /// `http1_max_pending_requests`, inherit the selected-subset/top-level overlay
@@ -33099,9 +33155,7 @@ pub(crate) async fn proxy_to_backend_retry(
     let retry_dial_port = upstream_target
         .map(|t| t.port)
         .unwrap_or(proxy.backend_port);
-    let retry_policy_port = upstream_target
-        .map(UpstreamTarget::dispatch_policy_port)
-        .unwrap_or(proxy.backend_port);
+    let retry_policy_port = dispatch_policy_port_for_target(proxy, upstream_target);
     let retry_pending_cap = resolve_backend_http1_max_pending_requests(proxy, retry_policy_port)
         .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
     let retry_pending_slot = match state.backend_pending_limit.try_acquire_for_subset(
@@ -35434,9 +35488,7 @@ async fn proxy_to_backend(
     let pending_dial_port = upstream_target
         .map(|t| t.port)
         .unwrap_or(proxy.backend_port);
-    let pending_policy_port = upstream_target
-        .map(UpstreamTarget::dispatch_policy_port)
-        .unwrap_or(proxy.backend_port);
+    let pending_policy_port = dispatch_policy_port_for_target(proxy, upstream_target);
     let pending_cap = resolve_backend_http1_max_pending_requests(proxy, pending_policy_port)
         // Only an HTTP/1.1-determined reqwest dispatch consults the gate; a
         // reqwest fallback that may ALPN-negotiate h2 ignores the `http1*` cap.
@@ -48670,6 +48722,13 @@ mod tests {
         format!("test-pool-key|{proxy_id}")
     }
 
+    /// Wrap a fixed key string as the `pool_key_for` callback the collector
+    /// takes. Production derives the key from the PER-TARGET EFFECTIVE proxy;
+    /// the dedup-contract tests only need a stable stand-in that ignores it.
+    fn const_pool_key(key: &str) -> impl Fn(&Proxy) -> String + '_ {
+        move |_: &Proxy| key.to_string()
+    }
+
     #[tokio::test]
     async fn capability_targets_include_mesh_route_dispatch_override_upstreams() {
         let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
@@ -49113,7 +49172,7 @@ mod tests {
 
         collect_reqwest_warmup_candidates_for_proxy(
             &http_proxy,
-            &fake_pool_key("h"),
+            &const_pool_key(&fake_pool_key("h")),
             true, // HTTP backends always force reqwest dispatch
             &upstreams,
             &mut http_candidates,
@@ -49121,7 +49180,7 @@ mod tests {
         );
         collect_reqwest_warmup_candidates_for_proxy(
             &https_proxy,
-            &fake_pool_key("s"),
+            &const_pool_key(&fake_pool_key("s")),
             false,
             &upstreams,
             &mut http_candidates,
@@ -49163,7 +49222,7 @@ mod tests {
 
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_a,
-            shared_pool_key,
+            &const_pool_key(shared_pool_key),
             false,
             &upstreams,
             &mut http_candidates,
@@ -49171,7 +49230,7 @@ mod tests {
         );
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_b,
-            shared_pool_key,
+            &const_pool_key(shared_pool_key),
             false,
             &upstreams,
             &mut http_candidates,
@@ -49211,7 +49270,7 @@ mod tests {
 
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_a,
-            "pool-key-tls-A",
+            &const_pool_key("pool-key-tls-A"),
             false,
             &upstreams,
             &mut http_candidates,
@@ -49219,7 +49278,7 @@ mod tests {
         );
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_b,
-            "pool-key-tls-B",
+            &const_pool_key("pool-key-tls-B"),
             false,
             &upstreams,
             &mut http_candidates,
@@ -49266,7 +49325,7 @@ mod tests {
         let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy,
-            "pool-key-upstream-up1",
+            &const_pool_key("pool-key-upstream-up1"),
             false,
             &upstreams,
             &mut http_candidates,
@@ -49277,6 +49336,72 @@ mod tests {
         let mut hosts: Vec<&str> = https_candidates.values().map(|c| c.host.as_str()).collect();
         hosts.sort();
         assert_eq!(hosts, vec!["a.test", "b.test", "c.test"]);
+    }
+
+    /// A DestinationRule `h2UpgradePolicy: DO_NOT_UPGRADE` that reaches a proxy
+    /// through the SUBSET (or top-level) tier rides
+    /// `Proxy.dispatch_port_override_fallback`, NOT `Proxy.h2_upgrade_policy`,
+    /// so the BASE proxy's `forces_backend_http1_only()` is false. Warmup must
+    /// resolve the per-target effective proxy before it keys and builds the
+    /// client — otherwise the startup HEAD advertises `[h2, http/1.1]` to a
+    /// backend the operator explicitly forbade H2 for, and parks the resulting
+    /// idle connection on a client keyed WITHOUT the `h1` discriminator that
+    /// dispatch actually uses.
+    #[test]
+    fn collect_keys_subset_force_h1_targets_by_the_force_h1_pool_key() {
+        let mut proxy = warmup_test_proxy("v1", BackendScheme::Https, "fallback.test", 443);
+        proxy.upstream_id = Some("reviews".to_string());
+        proxy.upstream_subset = Some("v1".to_string());
+        // Exactly the shape `resolve_dispatch_port_overrides` produces for a
+        // subset-scoped `connectionPool.http.h2UpgradePolicy: DO_NOT_UPGRADE`
+        // with no explicit `portLevelSettings` entry for the target's port.
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            h2_upgrade_policy: Some(crate::config::types::H2UpgradePolicy::DoNotUpgrade),
+            ..Default::default()
+        });
+        assert!(
+            !proxy.forces_backend_http1_only(),
+            "fixture precondition: the subset tier does not set the BASE proxy's h2_upgrade_policy"
+        );
+
+        let upstream = upstream_with_targets("reviews", &[("a.test", 8443)]);
+        let mut upstreams: HashMap<(&str, &str), &Upstream> = HashMap::new();
+        upstreams.insert(
+            (upstream.namespace.as_str(), upstream.id.as_str()),
+            &upstream,
+        );
+
+        // Stand-in for `ConnectionPool::pool_key_for_warmup`, which appends the
+        // `h1` discriminator exactly when the proxy handed to it forces H1.
+        let pool_key_for = |candidate: &Proxy| {
+            if candidate.forces_backend_http1_only() {
+                "pool-key|h1".to_string()
+            } else {
+                "pool-key|".to_string()
+            }
+        };
+
+        let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy,
+            &pool_key_for,
+            true,
+            &upstreams,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+
+        assert!(http_candidates.is_empty());
+        assert_eq!(https_candidates.len(), 1);
+        let (dedup_key, candidate) = https_candidates.iter().next().expect("one candidate");
+        assert!(
+            dedup_key.starts_with("pool-key|h1|"),
+            "warmup must dedup/key the subset force-H1 target by its FORCE-H1 pool key; got {dedup_key}"
+        );
+        assert!(
+            candidate.proxy.forces_backend_http1_only(),
+            "the warmup client must be built from the effective proxy so its advertised ALPN is restricted to http/1.1"
+        );
     }
 
     #[test]
@@ -49298,7 +49423,7 @@ mod tests {
         let (mut http1, mut https1) = empty_candidate_maps();
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_skip,
-            shared_pool_key,
+            &const_pool_key(shared_pool_key),
             false,
             &upstreams,
             &mut http1,
@@ -49306,7 +49431,7 @@ mod tests {
         );
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_force,
-            shared_pool_key,
+            &const_pool_key(shared_pool_key),
             true,
             &upstreams,
             &mut http1,
@@ -49324,7 +49449,7 @@ mod tests {
         let (mut http2, mut https2) = empty_candidate_maps();
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_force,
-            shared_pool_key,
+            &const_pool_key(shared_pool_key),
             true,
             &upstreams,
             &mut http2,
@@ -49332,7 +49457,7 @@ mod tests {
         );
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_skip,
-            shared_pool_key,
+            &const_pool_key(shared_pool_key),
             false,
             &upstreams,
             &mut http2,

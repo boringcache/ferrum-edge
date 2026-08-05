@@ -184,6 +184,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with per-port > selected-subset > top-level precedence, target-rotation-safe
   dispatch resolution, transport/pool isolation, and subset-keyed RAII H1
   admission (issues #3228, #3240, #3241, and #3242).
+  Startup pool warmup resolves the per-target effective proxy before it builds
+  and keys each reqwest warmup client, so a `DO_NOT_UPGRADE` reached through the
+  subset or top-level tier pre-warms its force-H1 client instead of
+  ALPN-negotiating HTTP/2 to a backend the operator forbade H2 for and parking
+  that idle connection on a pool key the data path never uses. The HTTP/3→HTTP
+  bridge now derives its `http1MaxPendingRequests` cap lookup and admission-lane
+  key from the DestinationRule policy port (`dispatch_policy_port()`) like the
+  H1/H2 path, so a `targetPort`-remapped Service no longer splits one
+  destination's in-flight budget across two lanes (a cap of N admitting 2N when
+  both frontends serve it) and an explicit `portLevelSettings` cap is visible to
+  the bridge. Subset-scoped `connectionPool.http.idleTimeout` and
+  `http2MaxRequests` — which the subset apply layer does not project — are now
+  reported honestly through a translate-time warning and
+  `status.ferrum.translation.deferred_fields` instead of being silently ignored
+  by a fully-accepted DestinationRule.
 
 - DestinationRule-only create/update/removal now atomically republishes the
   affected route table (and LB) before mesh status/revision reports the
