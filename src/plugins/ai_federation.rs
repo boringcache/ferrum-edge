@@ -5163,8 +5163,13 @@ const META_STREAM_OUTCOME: &str = "ai_federation.streaming_outcome";
 /// How a committed streaming provider chain finished.
 ///
 /// Exactly one of these is recorded per claim, by whichever terminal point wins
-/// the reservation. Everything else — including a dropped request context or a
-/// dropped inspector — falls through to [`StreamOutcome::Released`].
+/// the reservation. A non-2xx provider status known at response headers is
+/// staged first and applied when the body ends or the lifecycle drops, so a
+/// client disconnect after those headers still scores the provider verdict
+/// rather than falling through to [`StreamOutcome::Released`]. Only paths with
+/// no staged provider verdict — including a dropped request context before
+/// headers, a dropped inspector with no header verdict, and a pre-dispatch
+/// fail-closed rejection — land on [`StreamOutcome::Released`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamOutcome {
     /// The provider proved a complete generation: a 2xx event stream terminated
@@ -5175,11 +5180,12 @@ enum StreamOutcome {
     /// an unusable 2xx representation, or a stream that never proved a valid
     /// terminal marker.
     Failed,
-    /// No provider verdict exists. Client disconnect, a downstream policy cut, a
-    /// pre-dispatch fail-closed rejection, and plain cancellation all land here:
-    /// capacity and the half-open probe slot are returned WITHOUT scoring the
-    /// circuit, because scoring an outcome the provider never produced would
-    /// either open a healthy circuit or close a broken one.
+    /// No provider verdict exists. Client disconnect before headers, a
+    /// downstream policy cut of an unresolved 2xx body, a pre-dispatch
+    /// fail-closed rejection, and plain cancellation all land here: capacity
+    /// and the half-open probe slot are returned WITHOUT scoring the circuit,
+    /// because scoring an outcome the provider never produced would either
+    /// open a healthy circuit or close a broken one.
     Released,
 }
 
@@ -5221,12 +5227,21 @@ struct FederationStreamReservation {
 /// client disconnect, downstream policy cuts, pre-header cancellation, and a
 /// dropped request context alike.
 ///
+/// A non-2xx provider status is staged at response headers without taking the
+/// reservation: the permit stays held while the error body streams, and the
+/// staged verdict is applied exactly once when the body ends or this lifecycle
+/// drops (so a client disconnect after those headers still scores the provider,
+/// never a gateway-neutral release).
+///
 /// Nothing here is serialized, logged, or exposed: it is reached only through
 /// the private claim, and only after an owner match.
 struct FederationStreamLifecycle {
     /// `None` once resolved. The mutex is touched only at terminal points — a
     /// claim, a header decision, a stream terminal, or a drop — never per chunk.
     reservation: std::sync::Mutex<Option<FederationStreamReservation>>,
+    /// Provider outcome known from non-2xx response headers before the body
+    /// ends. Consumed exactly once when [`Self::resolve`] takes the reservation.
+    staged_outcome: std::sync::Mutex<Option<StreamOutcome>>,
     /// The outcome that actually resolved the reservation, for the terminal
     /// metadata write-back. Written under the same take.
     resolved_outcome: std::sync::Mutex<Option<StreamOutcome>>,
@@ -5236,17 +5251,42 @@ impl FederationStreamLifecycle {
     fn new(reservation: FederationStreamReservation) -> Self {
         Self {
             reservation: std::sync::Mutex::new(Some(reservation)),
+            staged_outcome: std::sync::Mutex::new(None),
             resolved_outcome: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Stage a provider outcome known from response headers without releasing
+    /// capacity or scoring the circuit yet.
+    ///
+    /// Used for non-2xx envelopes whose body may still be streaming. First stage
+    /// wins; later stages and stages after a resolve are no-ops.
+    fn stage(&self, outcome: StreamOutcome) {
+        let still_open = match self.reservation.lock() {
+            Ok(slot) => slot.is_some(),
+            Err(_) => return,
+        };
+        if !still_open {
+            return;
+        }
+        if let Ok(mut staged) = self.staged_outcome.lock() {
+            if staged.is_none() {
+                *staged = Some(outcome);
+            }
         }
     }
 
     /// Resolve the reservation exactly once.
     ///
-    /// Later calls are no-ops, so a stream that terminates through the inspector
-    /// and is then dropped never double-releases capacity nor scores the circuit
-    /// twice. A poisoned mutex cannot occur (nothing here can panic while
-    /// holding it) but is handled without `unwrap` regardless: the permit is
-    /// then returned by the reservation's own drop instead.
+    /// When a non-2xx provider verdict was staged at headers, that staged
+    /// outcome wins over `outcome` so body termination and Drop apply the
+    /// already-known circuit score instead of converting it to
+    /// [`StreamOutcome::Released`]. Later calls are no-ops, so a stream that
+    /// terminates through the inspector and is then dropped never
+    /// double-releases capacity nor scores the circuit twice. A poisoned mutex
+    /// cannot occur (nothing here can panic while holding it) but is handled
+    /// without `unwrap` regardless: the permit is then returned by the
+    /// reservation's own drop instead.
     fn resolve(&self, outcome: StreamOutcome) {
         let taken = match self.reservation.lock() {
             Ok(mut slot) => slot.take(),
@@ -5254,6 +5294,10 @@ impl FederationStreamLifecycle {
         };
         let Some(reservation) = taken else {
             return;
+        };
+        let outcome = match self.staged_outcome.lock() {
+            Ok(mut staged) => staged.take().unwrap_or(outcome),
+            Err(_) => outcome,
         };
         if let Ok(mut recorded) = self.resolved_outcome.lock() {
             *recorded = Some(outcome);
@@ -5285,10 +5329,10 @@ impl FederationStreamLifecycle {
 
 impl Drop for FederationStreamLifecycle {
     fn drop(&mut self) {
-        // The cancellation backstop. Reached when the request context and the
-        // inspector are both gone without a terminal decision: a client
-        // disconnect before or during the stream, a dropped dispatch future, or
-        // a shutdown. Releasing rather than scoring is deliberate.
+        // Cancellation / body-end backstop. Reached when the request context and
+        // any inspector are both gone. A staged non-2xx provider verdict is
+        // preserved by [`Self::resolve`]; only an unresolved claim releases
+        // without scoring.
         self.resolve(StreamOutcome::Released);
     }
 }
@@ -6059,6 +6103,14 @@ impl AiFederation {
     fn resolve_owned_stream(&self, ctx: &RequestContext, outcome: StreamOutcome) {
         if let Some(lifecycle) = self.owned_stream_lifecycle(ctx) {
             lifecycle.resolve(outcome);
+        }
+    }
+
+    /// Stage a known provider outcome on THIS instance's streaming reservation
+    /// without releasing capacity. A no-op when already resolved or staged.
+    fn stage_owned_stream(&self, ctx: &RequestContext, outcome: StreamOutcome) {
+        if let Some(lifecycle) = self.owned_stream_lifecycle(ctx) {
+            lifecycle.stage(outcome);
         }
     }
 
@@ -6921,9 +6973,10 @@ impl Plugin for AiFederation {
     /// Response-header handling for a claimed stream.
     ///
     /// Runs before any body byte is released, so this is the LAST point a
-    /// claimed stream can still fail with a real status. Resolves the circuit
-    /// for a non-2xx, refuses a content-coded or non-event-stream 2xx, and
-    /// re-authors the representation fields an SSE relay owns.
+    /// claimed stream can still fail with a real status. Stages the circuit
+    /// outcome for a non-2xx without releasing capacity (the error body may
+    /// still be streaming), refuses a content-coded or non-event-stream 2xx,
+    /// and re-authors the representation fields an SSE relay owns.
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -6952,6 +7005,12 @@ impl Plugin for AiFederation {
             // non-2xx (an ordinary 400/401/404 the provider chose to return) is
             // a provider that answered correctly. Penalising those would open a
             // healthy circuit on client errors.
+            //
+            // Stage only — do not resolve yet. `max_concurrent_requests` bounds
+            // the whole provider response, so the owned permit stays held while
+            // a slow non-2xx error body streams. Body termination /
+            // `on_response_stream_terminated` / Drop apply the staged verdict
+            // exactly once (including a client disconnect after these headers).
             let outcome = if self.fallback_status_codes.contains(&response_status)
                 || (300..400).contains(&response_status)
             {
@@ -6959,7 +7018,7 @@ impl Plugin for AiFederation {
             } else {
                 StreamOutcome::Succeeded
             };
-            self.resolve_owned_stream(ctx, outcome);
+            self.stage_owned_stream(ctx, outcome);
             // A provider error envelope reaches the client with its real status.
             // This is still PRE-commit for the body, so no stream was spliced
             // and none is owed.
@@ -7040,9 +7099,10 @@ impl Plugin for AiFederation {
 
     /// Fold the streamed provider outcome into the transaction record.
     ///
-    /// The reservation is already resolved by the inspector at this point; this
-    /// hook only publishes the resolved outcome, and it resolves nothing itself
-    /// beyond the cancellation case the inspector never reached.
+    /// A 2xx SSE body is ordinarily already resolved by the inspector; a
+    /// non-2xx envelope was only staged at headers and resolves here (or on
+    /// Drop) so capacity covers the whole error body. This hook also covers a
+    /// body that ended without any inspector verdict.
     async fn on_response_stream_terminated(
         &self,
         ctx: &mut RequestContext,
@@ -7052,9 +7112,9 @@ impl Plugin for AiFederation {
         let Some(lifecycle) = self.owned_stream_lifecycle(ctx) else {
             return;
         };
-        // A stream whose body task ended without any inspector verdict (client
-        // gone, runtime shut down) resolves as released here rather than waiting
-        // for the last `Arc` to drop.
+        // Prefer a staged non-2xx provider verdict; otherwise release without
+        // scoring (client gone before headers, unresolved 2xx cut, shutdown).
+        // Exact-once: a prior inspector resolve makes this a no-op.
         lifecycle.resolve(StreamOutcome::Released);
         if let Some(outcome) = lifecycle.outcome() {
             ctx.metadata.insert(
@@ -8056,9 +8116,29 @@ pub mod test_helpers {
             .map(StreamOutcome::as_str)
     }
 
+    /// Whether a non-2xx provider outcome has been staged but not yet resolved.
+    pub fn stream_outcome_staged_for_test(
+        plugin: &AiFederation,
+        ctx: &RequestContext,
+    ) -> Option<&'static str> {
+        let lifecycle = plugin.owned_stream_lifecycle(ctx)?;
+        lifecycle
+            .staged_outcome
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .map(StreamOutcome::as_str)
+    }
+
     /// Free permits left in this instance's `max_concurrent_requests` semaphore.
     pub fn available_request_slots_for_test(plugin: &AiFederation) -> usize {
         plugin.request_slots.available_permits()
+    }
+
+    /// Whether the provider circuit at `index` is currently closed.
+    pub fn circuit_is_closed_for_test(plugin: &AiFederation, index: usize) -> Option<bool> {
+        let circuit = plugin.providers.get(index)?.circuit.as_ref()?;
+        Some(circuit.open_until_monotonic_ms.load(Ordering::Acquire) == 0)
     }
 
     /// Whether the provider at `index` currently has a half-open probe reserved.

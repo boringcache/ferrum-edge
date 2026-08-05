@@ -9,6 +9,7 @@ use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, priority,
 };
+use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use ferrum_edge::{
     config::{BackendAllowIps, PoolConfig},
     dns::{DnsCache, DnsConfig},
@@ -1346,6 +1347,9 @@ async fn streaming_cancellation_frees_the_half_open_probe_slot() {
 /// Circuit outcomes match the buffered path exactly: a configured fallback
 /// status and a redirect are failures, an ordinary non-fallback 4xx is not, and
 /// an unusable 2xx representation is (root finding 2).
+///
+/// Non-2xx verdicts are staged at headers and applied at body termination so the
+/// concurrency permit covers the whole error body.
 #[tokio::test]
 async fn streaming_circuit_outcome_matches_the_buffered_status_policy() {
     async fn outcome_for(status: u16, content_type: &str) -> (Option<&'static str>, Option<u16>) {
@@ -1364,6 +1368,17 @@ async fn streaming_circuit_outcome_matches_the_buffered_status_policy() {
             .after_proxy(&mut ctx, status, &mut response_headers)
             .await;
         let rejected = reject_status(&after).map(|(status, _)| status);
+        if rejected.is_none() && !(200..300).contains(&status) {
+            // Non-2xx is staged until the body ends.
+            assert_eq!(
+                test_helpers::stream_outcome_for_test(&plugin, &ctx),
+                None,
+                "non-2xx headers must not resolve the reservation early"
+            );
+            plugin
+                .on_response_stream_terminated(&mut ctx, status, &BodyOutcome::success(0))
+                .await;
+        }
         (
             test_helpers::stream_outcome_for_test(&plugin, &ctx),
             rejected,
@@ -1390,6 +1405,188 @@ async fn streaming_circuit_outcome_matches_the_buffered_status_policy() {
         (Some("failed"), Some(502)),
         "a 2xx that is not an event stream is a refused provider representation"
     );
+}
+
+/// Ordinary non-2xx holds the concurrency permit past response headers and
+/// returns it exactly once when the streamed error body ends.
+#[tokio::test]
+async fn streaming_non_2xx_holds_permit_until_body_termination() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "max_concurrent_requests": 1,
+        "fallback_on_status_codes": [429],
+        "providers": [openai_provider(json!({}))]
+    }));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 0);
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let after = plugin
+        .after_proxy(&mut ctx, 404, &mut response_headers)
+        .await;
+    assert!(matches!(after, PluginResult::Continue), "{after:?}");
+    assert_eq!(
+        test_helpers::available_request_slots_for_test(&plugin),
+        0,
+        "non-2xx headers must keep the whole-response concurrency permit"
+    );
+    assert_eq!(test_helpers::stream_outcome_for_test(&plugin, &ctx), None);
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        Some("succeeded"),
+        "ordinary non-fallback 4xx is staged as provider success"
+    );
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 404, Some("application/json"))
+            .is_none(),
+        "non-2xx must not install the SSE contract guard"
+    );
+
+    // A second claim is still refused while the error body is in flight.
+    let (_second, _headers, second) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    let (status, body) = reject_status(&second).expect("capacity must stay exhausted");
+    assert_eq!(status, 503);
+    assert!(body.contains("provider_concurrency_exhausted"), "{body}");
+
+    plugin
+        .on_response_stream_terminated(&mut ctx, 404, &BodyOutcome::success(32))
+        .await;
+    assert_eq!(
+        test_helpers::available_request_slots_for_test(&plugin),
+        1,
+        "error-body termination must return the permit exactly once"
+    );
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("succeeded")
+    );
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        None,
+        "staging is consumed by the single resolve"
+    );
+
+    // Terminal hook is exact-once: a second termination must not double-score.
+    plugin
+        .on_response_stream_terminated(&mut ctx, 404, &BodyOutcome::success(32))
+        .await;
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 1);
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("succeeded")
+    );
+}
+
+/// Fallback / redirect non-2xx statuses stage a failure and apply it at body end.
+#[tokio::test]
+async fn streaming_fallback_non_2xx_stages_failure_until_body_end() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "max_concurrent_requests": 1,
+        "fallback_on_status_codes": [429],
+        "providers": [openai_provider(json!({
+            "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 30}
+        }))]
+    }));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let after = plugin
+        .after_proxy(&mut ctx, 429, &mut response_headers)
+        .await;
+    assert!(matches!(after, PluginResult::Continue), "{after:?}");
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 0);
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        Some("failed")
+    );
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(true),
+        "headers alone must not open the circuit yet"
+    );
+
+    plugin
+        .on_response_stream_terminated(&mut ctx, 429, &BodyOutcome::success(8))
+        .await;
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 1);
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("failed")
+    );
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(false),
+        "fallback status must open the circuit exactly once at body end"
+    );
+}
+
+/// Client disconnect after non-2xx headers releases capacity and preserves the
+/// already-known provider verdict instead of converting it to Released.
+#[tokio::test]
+async fn streaming_non_2xx_client_disconnect_preserves_staged_provider_verdict() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "max_concurrent_requests": 2,
+        "fallback_enabled": false,
+        "providers": [openai_provider(json!({
+            "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 30, "success_threshold": 1}
+        }))]
+    }));
+    assert!(test_helpers::open_and_cool_down_circuit_for_test(
+        &plugin, 0
+    ));
+
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(true)
+    );
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let after = plugin
+        .after_proxy(&mut ctx, 404, &mut response_headers)
+        .await;
+    assert!(matches!(after, PluginResult::Continue), "{after:?}");
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 1);
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        Some("succeeded")
+    );
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(true),
+        "probe stays reserved while the non-2xx body is still live"
+    );
+
+    // Client gone after headers: Drop must apply the staged success, not Released.
+    drop(ctx);
+    assert_eq!(
+        test_helpers::available_request_slots_for_test(&plugin),
+        2,
+        "disconnect must return the concurrency permit"
+    );
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(false)
+    );
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(true),
+        "staged ordinary 4xx must close the half-open probe as success, not release it"
+    );
+
+    // The closed circuit admits a normal claim again.
+    let (next, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    drop(next);
 }
 
 /// A truncated body is a provider FAILURE even though the headers were a 2xx.

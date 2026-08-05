@@ -43,9 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call: it holds one non-queuing `max_concurrent_requests` permit and one real
   `ProviderCircuit` admission (so a half-open circuit still grants exactly one
   concurrent probe) in a clone-safe reservation that is released exactly once on
-  completion, client disconnect, downstream policy cut, backend error,
-  pre-header cancellation, or a fail-closed final-body rejection; a 2xx is
-  scored a circuit success only after a valid terminal marker. `model_mapping` /
+  completion, non-2xx body termination, client disconnect, downstream policy cut,
+  backend error, pre-header cancellation, or a fail-closed final-body rejection
+  — including while a slow non-2xx error body is still streaming after headers;
+  a non-2xx circuit verdict is staged at headers and applied at body end/drop so
+  a disconnect after those headers keeps the provider score; a 2xx is scored a
+  circuit success only after a valid terminal marker. `model_mapping` /
   `default_model` apply to streams through an owner-scoped request transform
   that rewrites the provider-visible top-level `model` and re-asserts
   `stream: true` (a body with duplicate JSON members is deliberately left
