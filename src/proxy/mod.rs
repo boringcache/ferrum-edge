@@ -5735,18 +5735,20 @@ pub struct ProxyState {
     #[allow(dead_code)]
     pub bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
     /// Per-destination open-connection limiter enforcing DestinationRule
-    /// `connectionPool.tcp.maxConnections` for the HTTP-family WebSocket
-    /// dispatch path (H1/H2 here and H3 in `src/http3/websocket.rs`). A
-    /// proxied WebSocket session opens one dedicated, non-pooled backend
-    /// connection whose lifetime equals the session, so an RAII
-    /// [`crate::backend_conn_limit::BackendConnectionGuard`] held for the
-    /// session bounds concurrent open connections per `(host, port)` —
-    /// matching Envoy `maxConnections` semantics and the raw-TCP path's
-    /// `BackendInflightGuard`. The pooled, multiplexed HTTP-family
-    /// transports (reqwest H1/H2, direct H2, gRPC, H3, HBONE) do not
-    /// consume this limiter; see `docs/mesh.md` and the module docs in
-    /// `src/backend_conn_limit.rs` for why their pool-internal connection
-    /// lifecycle makes a request-keyed counter the wrong control.
+    /// `connectionPool.tcp.maxConnections` across EVERY backend transport
+    /// whose physical connection lifecycle Ferrum owns: raw TCP/TCP+TLS,
+    /// WebSocket (H1/H2 here and H3 in `src/http3/websocket.rs`), the pooled
+    /// multiplexed transports (direct H2, gRPC, native H3, HBONE, mesh-mTLS),
+    /// and reqwest HTTP/1.1. A dedicated session holds an RAII
+    /// [`crate::backend_conn_limit::BackendConnectionGuard`] for the session;
+    /// a pooled connection holds a
+    /// [`crate::backend_conn_limit::SharedBackendConnectionGuard`] handed to
+    /// its own connection driver, so the slot retires exactly when the socket
+    /// dies (handshake failure, idle eviction, pool drain, reload/delete, SVID
+    /// drain, shutdown) and reuse/multiplexing takes no extra slot. One shared
+    /// instance means the ceiling is per destination `(host, policy port)`, not
+    /// per transport. See `docs/mesh.md` and the module docs in
+    /// `src/backend_conn_limit.rs`.
     pub backend_conn_limit: Arc<crate::backend_conn_limit::BackendConnectionLimiter>,
     /// Per-destination in-flight-request limiter enforcing DestinationRule
     /// `connectionPool.http.http1MaxPendingRequests` on the reqwest/HTTP-1.1
@@ -6995,6 +6997,17 @@ impl ProxyState {
         let backend_svid_generation = Arc::new(AtomicU64::new(0));
         let (backend_svid_rotation_tx, backend_svid_rotation_rx) =
             tokio::sync::watch::channel(0u64);
+        // ONE `connectionPool.tcp.maxConnections` counter for the whole
+        // gateway: raw TCP, WebSocket, and every pooled multiplexed transport
+        // admit on the same per-`(host, policy port)` lane, so a destination's
+        // ceiling is a real per-destination ceiling rather than one ceiling per
+        // transport. Constructed before the pools so each can be handed a
+        // reference at construction time (see `attach_backend_conn_limit`).
+        let backend_conn_limit = Arc::new(
+            crate::backend_conn_limit::BackendConnectionLimiter::with_shard_amount(
+                pool_shard_amount,
+            ),
+        );
         let grpc_pool = Arc::new(
             GrpcConnectionPool::new_with_svid_generation_and_shared_crls(
                 global_pool_config.clone(),
@@ -7053,6 +7066,14 @@ impl ProxyState {
             dns_cache.clone(),
             backend_svid_generation.clone(),
         ));
+        // Wire the shared destination ceiling into every socket-owning pool.
+        // Additive and idempotent (`OnceLock::set`): a pool constructed without
+        // it (focused tests, standalone callers) simply never enforces a cap.
+        grpc_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        http2_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        hbone_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        mesh_mtls_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        h3_pool.attach_backend_conn_limit(backend_conn_limit.clone());
         let backend_capabilities = Arc::new(BackendCapabilityRegistry::with_shard_amount(
             pool_shard_amount,
         ));
@@ -7435,11 +7456,7 @@ impl ProxyState {
             backend_svid_rotation_tx,
             backend_svid_generation,
             bpf_metrics_state,
-            backend_conn_limit: Arc::new(
-                crate::backend_conn_limit::BackendConnectionLimiter::with_shard_amount(
-                    pool_shard_amount,
-                ),
-            ),
+            backend_conn_limit,
             backend_pending_limit: Arc::new(
                 crate::backend_pending_limit::BackendPendingLimiter::with_shard_amount(
                     pool_shard_amount,
@@ -33054,12 +33071,19 @@ pub(crate) fn resolve_backend_connection_proxy_for_target<'a>(
     if let Some(target) = upstream_target {
         let policy_port = target.dispatch_policy_port();
         if policy_port != target.port
-            && let Some(policy_override) = effective
+            && let Some(mut policy_override) = effective
                 .dispatch_port_overrides
                 .as_ref()
                 .and_then(|overrides| overrides.get(&policy_port))
                 .cloned()
         {
+            // Stamp the service port the policy came from. The pools read this
+            // entry by dial port, so without the stamp the
+            // `connectionPool.tcp.maxConnections` counter lane would key on the
+            // workload port while WebSocket/raw-TCP sessions to the same
+            // destination key on the service port — two lanes, so an effective
+            // 2×cap ceiling. See `ResolvedPortOverride::policy_port`.
+            policy_override.policy_port = Some(policy_port);
             // Direct H2 and gRPC pools receive only this effective proxy, then
             // look up socket keepalive by `proxy.backend_port`. Mirror the selected
             // service-port policy onto that dial port in the per-dispatch clone so
@@ -33402,8 +33426,54 @@ pub(crate) async fn proxy_to_backend_retry(
         }
     };
 
-    let mut reqwest_backend_guard =
-        Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
+    // DestinationRule `connectionPool.tcp.maxConnections` for the retry attempt.
+    // Same lane and same H1-only predicate as the initial attempt; the initial
+    // attempt's slot is released before the retry loop runs, so an attempt and
+    // its retry never double-count.
+    let retry_conn_cap = resolve_backend_max_connections(proxy, retry_policy_port)
+        .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
+    let retry_backend_conn_slot = match retry_conn_cap {
+        Some(cap) => match state.backend_conn_limit.try_acquire_shared(
+            effective_host,
+            retry_policy_port,
+            cap,
+        ) {
+            Ok(slot) => Some(slot),
+            Err(limit) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_host = %effective_host,
+                    backend_port = retry_dial_port,
+                    open_connections = limit.current,
+                    max_connections = limit.cap,
+                    "Shedding HTTP/1.1 retry: DestinationRule maxConnections reached for backend"
+                );
+                // Gateway-side ceiling shed before the retry dial, classified
+                // exactly like the `http1MaxPendingRequests` shed above: no
+                // backend was dialed, so it must stay neutral to backend
+                // health / circuit breaker / adaptive concurrency.
+                return retry::BackendResponse {
+                    status_code: 503,
+                    body: ResponseBody::buffered(
+                        r#"{"error":"Backend connection limit exceeded"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
+                    error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                };
+            }
+        },
+        None => None,
+    };
+
+    let mut reqwest_backend_guard = Some(
+        crate::runtime_metrics::global_ref()
+            .reqwest_backend_request_guard()
+            .with_backend_connection_slot(retry_backend_conn_slot),
+    );
     let send_result = match crate::plugins::await_grpc_deadline(
         request_ctx.grpc_deadline_at(),
         req_builder.send(),
@@ -35745,6 +35815,66 @@ async fn proxy_to_backend(
         }
     };
 
+    // DestinationRule `connectionPool.tcp.maxConnections` on the reqwest path.
+    //
+    // reqwest fully owns and hides its socket pool, so Ferrum cannot hold a
+    // slot for a socket's lifetime there. It CAN hold one for the request's
+    // lifetime, and on a dispatch KNOWN to be HTTP/1.1 those are the same
+    // thing: an H1 request occupies exactly one backend socket from checkout
+    // until its response body completes, and hyper-util only dials when
+    // checkout finds no idle socket — so bounding concurrent in-flight H1
+    // requests to N bounds concurrently-open H1 sockets to N. The slot rides
+    // `reqwest_backend_guard`, which the streaming-response path already hands
+    // to the response body, so it spans dispatch -> body completion rather than
+    // being released at response headers like the `http1MaxPendingRequests`
+    // gate above (that knob measures a different window on purpose).
+    //
+    // A dispatch that may ALPN-negotiate h2 is deliberately NOT gated: its
+    // requests multiplex onto one shared socket per destination, so gating them
+    // would bound streams instead of sockets. hyper-util converges that path on
+    // a single connection per destination, which already satisfies any
+    // `maxConnections >= 1` (zero is rejected at translate time).
+    let backend_conn_cap = resolve_backend_max_connections(proxy, pending_policy_port)
+        .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
+    let backend_conn_slot = match backend_conn_cap {
+        Some(cap) => match state.backend_conn_limit.try_acquire_shared(
+            effective_host,
+            pending_policy_port,
+            cap,
+        ) {
+            Ok(slot) => Some(slot),
+            Err(limit) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_host = %effective_host,
+                    backend_port = pending_dial_port,
+                    open_connections = limit.current,
+                    max_connections = limit.cap,
+                    "Shedding HTTP/1.1 request: DestinationRule maxConnections reached for backend"
+                );
+                // Gateway-side ceiling shed before any backend dial: neutral to
+                // backend health, circuit breaker and adaptive concurrency, and
+                // not retried — the same posture as the overflow shed above.
+                return backend_dispatch_response(
+                    retry::BackendResponse {
+                        status_code: 503,
+                        body: ResponseBody::buffered(
+                            r#"{"error":"Backend connection limit exceeded"}"#
+                                .as_bytes()
+                                .to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                    },
+                    None,
+                    None,
+                );
+            }
+        },
+        None => None,
+    };
     backend_admission_permits = match preacquired_backend_admission.take_or_run(
         backend_admission_plugins,
         request_ctx,
@@ -35762,8 +35892,11 @@ async fn proxy_to_backend(
     *backend_admission_started_at = Instant::now();
 
     // Send
-    let mut reqwest_backend_guard =
-        Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
+    let mut reqwest_backend_guard = Some(
+        crate::runtime_metrics::global_ref()
+            .reqwest_backend_request_guard()
+            .with_backend_connection_slot(backend_conn_slot),
+    );
     let send_result = match crate::plugins::await_grpc_deadline(
         request_ctx.grpc_deadline_at(),
         req_builder.send(),

@@ -249,7 +249,10 @@ impl RuntimeMetrics {
     pub fn reqwest_backend_request_guard(&'static self) -> ReqwestBackendRequestGuard {
         self.reqwest_active_backend_requests
             .fetch_add(1, Ordering::Relaxed);
-        ReqwestBackendRequestGuard { metrics: self }
+        ReqwestBackendRequestGuard {
+            metrics: self,
+            backend_conn_slot: None,
+        }
     }
 
     pub fn reqwest_active_backend_requests(&self) -> u64 {
@@ -520,6 +523,33 @@ impl RuntimeMetrics {
 
 pub struct ReqwestBackendRequestGuard {
     metrics: &'static RuntimeMetrics,
+    /// Optional DestinationRule `connectionPool.tcp.maxConnections` slot for a
+    /// known-HTTP/1.1 reqwest dispatch.
+    ///
+    /// reqwest owns its socket pool internally and exposes no connection-close
+    /// hook, so the physical-connection slot rides this guard instead: on an H1
+    /// dispatch one in-flight request occupies exactly one backend socket, and
+    /// this guard is already handed to the streaming response body, so the slot
+    /// spans dispatch → response-body completion — the true socket-busy window.
+    /// `None` on every uncapped destination and on any dispatch that might
+    /// negotiate h2 (multiplexed streams must not be counted as sockets).
+    ///
+    /// Pure RAII — never read, only dropped.
+    #[allow(dead_code)]
+    backend_conn_slot: Option<crate::backend_conn_limit::SharedBackendConnectionGuard>,
+}
+
+impl ReqwestBackendRequestGuard {
+    /// Attach the destination's `maxConnections` slot to this request guard so
+    /// it is released exactly when the guard is (buffered completion, streaming
+    /// body completion / client disconnect, or any error exit).
+    pub fn with_backend_connection_slot(
+        mut self,
+        slot: Option<crate::backend_conn_limit::SharedBackendConnectionGuard>,
+    ) -> Self {
+        self.backend_conn_slot = slot;
+        self
+    }
 }
 
 impl Drop for ReqwestBackendRequestGuard {

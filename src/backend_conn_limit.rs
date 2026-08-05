@@ -7,32 +7,42 @@
 //!
 //! # Scope
 //!
-//! This limiter is consumed by the **WebSocket** dispatch path (H1/H2 in
-//! `src/proxy/mod.rs` and H3 in `src/http3/websocket.rs`). A proxied
-//! WebSocket session opens exactly one dedicated, non-pooled backend
-//! TCP/TLS connection whose lifetime equals the session, so an RAII guard
-//! held for the session duration bounds concurrent *open* connections per
-//! destination target — the same semantics Envoy gives `maxConnections`,
-//! and the same RAII pattern the raw-TCP path uses in
-//! `src/proxy/tcp_proxy.rs` (now sharing this same primitive). Keying is per
-//! resolved `(host, port)` endpoint, not per logical cluster — a destination
-//! with N endpoint hosts sharing one port has an effective ceiling of N×cap,
-//! which diverges from Envoy's per-cluster total. For the typical single-host
-//! mesh destination the two are equivalent.
+//! This limiter is consumed by **every** backend transport whose physical
+//! connection lifecycle Ferrum owns:
 //!
-//! The pooled, multiplexed HTTP-family transports (reqwest H1/H2, direct
-//! H2, gRPC, HTTP/3, HBONE) do NOT consume this limiter. Their backend
-//! connections are created and reused inside connection pools
-//! (`src/connection_pool.rs`, `src/proxy/http2_pool.rs`,
-//! `src/proxy/grpc_proxy.rs`, `src/proxy/hbone_pool.rs`,
-//! `src/http3/client.rs`), so "open a new backend connection" is not an
-//! event the request hot path observes — it is decoupled from the request
-//! by pool reuse, sharding (`http2_connections_per_host`), and idle
-//! eviction. Counting per request there would measure request concurrency
-//! (Envoy's `http2MaxRequests` / `maxPendingRequests` territory, already
-//! mapped via `h2_max_concurrent_streams`), not open connections, and
-//! would risk decrement leaks across the streaming/retry/error exits.
-//! See `docs/mesh.md` for the full rationale.
+//! * **Raw TCP / TCP+TLS stream proxy** (`src/proxy/tcp_proxy.rs`) — one
+//!   dedicated backend socket per relay session.
+//! * **WebSocket** dispatch (H1/H2 in `src/proxy/mod.rs`, H3 in
+//!   `src/http3/websocket.rs`) — one dedicated, non-pooled backend TCP/TLS
+//!   connection whose lifetime equals the session.
+//! * **The pooled, multiplexed transports** — direct H2
+//!   (`src/proxy/http2_pool.rs`), gRPC (`src/proxy/grpc_proxy.rs`), native
+//!   HTTP/3 (`src/http3/client.rs`), HBONE (`src/proxy/hbone_pool.rs`), and
+//!   Sidecar mesh-mTLS (`src/proxy/mesh_mtls_pool.rs`). Each acquires a
+//!   [`SharedBackendConnectionGuard`] at the exact moment a new physical
+//!   connection is about to be constructed and hands it to that connection's
+//!   own driver (the spawned hyper/h2 connection task, or the pooled QUIC
+//!   handle), so the slot retires exactly when the socket dies — handshake
+//!   failure, idle eviction, pool drain, reload/update/delete, SVID rotation
+//!   drain, or shutdown. Reuse of a pooled connection takes NO new slot, so
+//!   an arbitrary number of multiplexed streams still share one admitted
+//!   connection.
+//! * **reqwest HTTP/1.1** — reqwest owns its socket pool internally and
+//!   exposes no connection-lifetime hook, so the slot is instead held for the
+//!   in-flight request. On a known-HTTP/1.1 dispatch one in-flight request
+//!   occupies exactly one backend socket for its whole lifetime, and
+//!   hyper-util only dials when checkout finds no idle socket, so bounding
+//!   concurrent in-flight H1 requests bounds concurrently-open H1 sockets.
+//!   See `docs/mesh.md` for the derivation and the reqwest-h2 residual.
+//!
+//! Keying is per resolved `(host, DestinationRule policy port)` endpoint, not
+//! per logical cluster — a destination with N endpoint hosts sharing one port
+//! has an effective ceiling of N×cap, which diverges from Envoy's per-cluster
+//! total. For the typical single-host mesh destination the two are equivalent.
+//! Every transport admits on the **policy** port
+//! (`UpstreamTarget::dispatch_policy_port()`), never the dial/transport port,
+//! so a `targetPort` remap and the mesh tunnel listeners (`:15008` / `:15006`)
+//! all share the one destination lane instead of splitting the ceiling.
 //!
 //! # Hot-path discipline
 //!
@@ -146,6 +156,17 @@ impl BackendConnectionLimiter {
         let Some(cap) = cap else {
             return Ok(None);
         };
+        self.acquire_slot(host, port, cap).map(Some)
+    }
+
+    /// Shared CAS admission used by both the optional-cap and the mandatory-cap
+    /// entry points, so the two can never drift.
+    fn acquire_slot(
+        &self,
+        host: &str,
+        port: u16,
+        cap: u32,
+    ) -> Result<BackendConnectionGuard, BackendConnectionLimitExceeded> {
         let counter = self.counter_for(host, port);
         let cap_u64 = u64::from(cap);
         loop {
@@ -166,10 +187,31 @@ impl BackendConnectionLimiter {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Ok(Some(BackendConnectionGuard { counter })),
+                Ok(_) => return Ok(BackendConnectionGuard { counter }),
                 Err(_) => continue,
             }
         }
+    }
+
+    /// Reserve one slot and return a **shareable** guard.
+    ///
+    /// Pooled transports need the guard to outlive the function that opened
+    /// the connection: it is moved into the spawned connection-driver task (or
+    /// stored on the pooled connection handle) so the slot is released exactly
+    /// when the physical connection dies. `Arc` also lets a DNS-candidate loop
+    /// clone the reservation into each attempt without double-counting — every
+    /// failed attempt drops its clone, and the count only stays held while some
+    /// clone (i.e. some live connection driver) still exists.
+    ///
+    /// Unlike [`Self::try_acquire`] the cap is mandatory here: callers resolve
+    /// "no cap configured" once, up front, and skip this call entirely.
+    pub fn try_acquire_shared(
+        &self,
+        host: &str,
+        port: u16,
+        cap: u32,
+    ) -> Result<SharedBackendConnectionGuard, BackendConnectionLimitExceeded> {
+        self.acquire_slot(host, port, cap).map(Arc::new)
     }
 
     /// Current open-connection count for a destination. Test/metrics only —
@@ -202,6 +244,96 @@ impl Drop for BackendConnectionGuard {
         // test suite asserts the count returns to zero so any guard-lifetime
         // regression surfaces immediately.
         self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A [`BackendConnectionGuard`] that several holders can keep alive at once.
+///
+/// The slot is released when the LAST clone drops. Pooled transports clone one
+/// reservation into every DNS-candidate attempt and move the surviving clone
+/// into the connection's driver task, so "slot held" is exactly "a physical
+/// backend connection is (or is being) established".
+pub type SharedBackendConnectionGuard = Arc<BackendConnectionGuard>;
+
+/// Shared handle to the one gateway-wide [`BackendConnectionLimiter`].
+///
+/// Pools store this behind a `OnceLock` that `ProxyState` installs at
+/// construction, so a pool built without it (focused tests, standalone
+/// callers) simply never enforces a cap.
+pub type SharedBackendConnectionLimiter = Arc<BackendConnectionLimiter>;
+
+/// A resolved `connectionPool.tcp.maxConnections` reservation source for one
+/// about-to-be-constructed pooled backend connection.
+///
+/// Built once on the pool's cold connection-establishment path (never on the
+/// per-request hot path) and borrowed for the duration of that establishment.
+/// Constructing it is the "is a cap configured for this destination?" check, so
+/// a `None` return means the transport dials unconditionally with zero further
+/// work — no map touch, no allocation.
+#[derive(Clone, Copy)]
+pub struct PooledConnectionAdmission<'a> {
+    limiter: &'a BackendConnectionLimiter,
+    host: &'a str,
+    policy_port: u16,
+    cap: u32,
+}
+
+impl<'a> PooledConnectionAdmission<'a> {
+    /// Resolve the admission lane for a dial, or `None` when nothing is capped.
+    ///
+    /// `override_port` is the key the caller uses to read
+    /// `Proxy.dispatch_port_overrides`. For the socket-owning HTTP pools that
+    /// is `proxy.backend_port` (the per-dispatch clone built by
+    /// `resolve_backend_connection_proxy_for_target` mirrors a `targetPort`-
+    /// remapped service-port policy onto the dial port). For the mesh tunnels
+    /// it is the destination's app/service policy port, because the transport
+    /// dial is `:15008` / `:15006` and must never become the policy source.
+    ///
+    /// The resulting counter lane is keyed by the DestinationRule **policy**
+    /// port — `ResolvedPortOverride::policy_port` when the entry was mirrored
+    /// from a remapped service port, else `override_port` — so a pooled socket
+    /// and a WebSocket/raw-TCP session to the same destination share one
+    /// ceiling instead of getting one each.
+    pub fn resolve(
+        limiter: Option<&'a BackendConnectionLimiter>,
+        proxy: &'a crate::config::types::Proxy,
+        dial_host: &'a str,
+        override_port: u16,
+    ) -> Option<Self> {
+        let limiter = limiter?;
+        let entry = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&override_port))?;
+        let cap = entry.max_connections?;
+        Some(Self {
+            limiter,
+            host: dial_host,
+            policy_port: entry.policy_port.unwrap_or(override_port),
+            cap,
+        })
+    }
+
+    /// Reserve one physical-connection slot for this destination.
+    pub fn acquire(&self) -> Result<SharedBackendConnectionGuard, BackendConnectionLimitExceeded> {
+        self.limiter
+            .try_acquire_shared(self.host, self.policy_port, self.cap)
+    }
+
+    /// Destination host this lane counts sockets for (diagnostics/logging).
+    pub fn host(&self) -> &str {
+        self.host
+    }
+
+    /// DestinationRule policy port this lane counts sockets for.
+    pub fn policy_port(&self) -> u16 {
+        self.policy_port
+    }
+
+    /// Configured `connectionPool.tcp.maxConnections` for this lane.
+    #[allow(dead_code)]
+    pub fn cap(&self) -> u32 {
+        self.cap
     }
 }
 

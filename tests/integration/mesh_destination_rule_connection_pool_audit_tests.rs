@@ -157,8 +157,16 @@ async fn max_requests_per_connection_does_not_close_h1_backend_after_n_requests(
     );
 }
 
+/// The reqwest `Client` itself is still socket-unbounded — that is exactly why
+/// `connectionPool.tcp.maxConnections` cannot be enforced *inside* the shared
+/// client and is instead enforced at dispatch (issue #3290): `proxy_to_backend`
+/// holds one `BackendConnectionLimiter` slot per in-flight known-HTTP/1.1
+/// request, which bounds sockets because hyper-util only dials when checkout
+/// finds no idle socket. This test pins the client-level behavior the dispatch
+/// gate compensates for; the gate itself is covered by
+/// `mesh_destination_rule_max_connections_tests.rs`.
 #[tokio::test]
-async fn max_connections_is_not_silently_approximated_on_reqwest_h1_sockets() {
+async fn reqwest_client_alone_is_socket_unbounded_so_the_cap_lives_at_dispatch() {
     let (backend, accepted, _backend_task) =
         start_counting_h1_backend(Duration::from_millis(150)).await;
     let mut proxy = proxy_for_backend(backend.port());
@@ -186,7 +194,7 @@ async fn max_connections_is_not_silently_approximated_on_reqwest_h1_sockets() {
 
     assert!(
         accepted.load(Ordering::SeqCst) >= 2,
-        "reqwest H1 opened multiple backend sockets despite a maxConnections=1 override; the cap is unsupported for this pooled transport and must remain documented/statused as such"
+        "the shared reqwest client applies no per-destination socket ceiling of its own, so the maxConnections cap must stay enforced by the dispatch-layer in-flight gate rather than by client configuration"
     );
 }
 

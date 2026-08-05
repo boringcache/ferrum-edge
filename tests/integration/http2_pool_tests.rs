@@ -7,8 +7,11 @@
 //! and live connection lifecycle against a real TLS+H2 echo backend.
 
 use bytes::Bytes;
+use ferrum_edge::backend_conn_limit::BackendConnectionLimiter;
 use ferrum_edge::config::PoolConfig;
-use ferrum_edge::config::types::{AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy};
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResolvedPortOverride,
+};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
 use ferrum_edge::proxy::http2_pool::{Http2ConnectionPool, Http2PoolError};
@@ -22,6 +25,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -375,6 +379,12 @@ async fn test_http2_pool_backend_unavailable() {
                 pool_key
             );
         }
+        Http2PoolError::MaxConnectionsExceeded { message: msg } => {
+            panic!(
+                "Expected BackendUnavailable or BackendTimeout, got MaxConnectionsExceeded: {}",
+                msg
+            );
+        }
     }
     assert_eq!(
         pool.pool_size(),
@@ -416,6 +426,9 @@ async fn test_http2_pool_backend_timeout() {
                 "Expected BackendTimeout, got BackendSelectedHttp1 for pool_key: {}",
                 pool_key
             );
+        }
+        Http2PoolError::MaxConnectionsExceeded { message: msg } => {
+            panic!("Expected BackendTimeout, got MaxConnectionsExceeded: {}", msg);
         }
     }
 }
@@ -1174,5 +1187,214 @@ async fn test_http2_pool_sender_is_not_closed() {
     assert!(
         !sender.is_closed(),
         "Sender should not be closed immediately after creation"
+    );
+}
+
+// ============================================================================
+// DestinationRule `connectionPool.tcp.maxConnections` on a pooled multiplexed
+// transport (issue #3290).
+//
+// These are the physical-socket proofs: an h2c backend counts every accepted
+// TCP connection, so the assertions are on real sockets rather than on the
+// gateway's own bookkeeping.
+// ============================================================================
+
+/// h2c echo backend that counts every accepted TCP connection.
+async fn start_counting_h2c_backend() -> (u16, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind h2c backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let task_accepted = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            task_accepted.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                let service = service_fn(|_req: Request<Incoming>| async move {
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await;
+            });
+        }
+    });
+    (port, accepted)
+}
+
+/// Cleartext-h2c proxy pinned to the loopback backend by `dns_override` (no DNS
+/// dependency), carrying a per-port `maxConnections` cap exactly as the mesh
+/// projection materializes it onto `dispatch_port_overrides`.
+fn h2c_proxy_with_max_connections(port: u16, cap: Option<u32>) -> Proxy {
+    let mut proxy = create_test_proxy();
+    proxy.backend_scheme = Some(BackendScheme::Http);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Http);
+    proxy.backend_host = "maxconn-h2c.test".to_string();
+    proxy.backend_port = port;
+    proxy.dns_override = Some("127.0.0.1".to_string());
+    proxy.backend_connect_timeout_ms = 5_000;
+    if let Some(cap) = cap {
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            port,
+            ResolvedPortOverride {
+                max_connections: Some(cap),
+                ..Default::default()
+            },
+        );
+        proxy.dispatch_port_overrides = Some(overrides);
+    }
+    proxy
+}
+
+/// Poll `current()` until it reaches `expected` or the deadline passes.
+async fn await_open_connection_count(
+    limiter: &BackendConnectionLimiter,
+    host: &str,
+    port: u16,
+    expected: u64,
+) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let current = limiter.current(host, port);
+        if current == expected || Instant::now() >= deadline {
+            return current;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn test_grpc_h2c_pool_max_connections_bounds_physical_connections() {
+    let (port, accepted) = start_counting_h2c_backend().await;
+
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    let pool = Arc::new(GrpcConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    ));
+    pool.attach_backend_conn_limit(Arc::clone(&limiter));
+    let proxy = h2c_proxy_with_max_connections(port, Some(1));
+
+    // One physical connection is admitted and established.
+    let first = pool
+        .get_sender(&proxy)
+        .await
+        .expect("first h2c sender should establish the single admitted connection");
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        1,
+        "exactly one backend socket must be opened under maxConnections=1"
+    );
+    assert_eq!(
+        limiter.current("maxconn-h2c.test", port),
+        1,
+        "the admitted connection must hold exactly one slot"
+    );
+
+    // A concurrent burst must MULTIPLEX onto that one socket: the pool's shard
+    // ring cannot open a second connection, so every dispatch is served by the
+    // already-established one and the backend still sees a single accept.
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let pool = Arc::clone(&pool);
+        let proxy = proxy.clone();
+        tasks.push(tokio::spawn(async move {
+            pool.get_sender(&proxy).await.map(|_sender| ())
+        }));
+    }
+    for task in tasks {
+        task.await
+            .expect("burst task join")
+            .expect("a capped destination must keep serving by multiplexing, not by failing");
+    }
+
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        1,
+        "16 concurrent dispatches must multiplex onto the single admitted socket"
+    );
+    assert_eq!(
+        limiter.current("maxconn-h2c.test", port),
+        1,
+        "multiplexed streams must not be counted as physical connections"
+    );
+    drop(first);
+}
+
+#[tokio::test]
+async fn test_grpc_h2c_pool_max_connections_slot_is_released_when_connection_retires() {
+    let (port, accepted) = start_counting_h2c_backend().await;
+
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    let pool = GrpcConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    );
+    pool.attach_backend_conn_limit(Arc::clone(&limiter));
+    let proxy = h2c_proxy_with_max_connections(port, Some(1));
+
+    let sender = pool.get_sender(&proxy).await.expect("first h2c sender");
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    assert_eq!(limiter.current("maxconn-h2c.test", port), 1);
+
+    // Config reload / delete / SVID drain all retire pooled connections through
+    // the same drain path. Dropping the pool entry ends the connection driver,
+    // which is what releases the slot — there is no separate retirement hook to
+    // forget.
+    pool.force_drain_all();
+    drop(sender);
+    assert_eq!(
+        await_open_connection_count(&limiter, "maxconn-h2c.test", port, 0).await,
+        0,
+        "draining the pool must release the destination's connection slot"
+    );
+
+    // The destination recovers: a fresh dispatch opens a NEW physical socket.
+    let _reconnected = pool
+        .get_sender(&proxy)
+        .await
+        .expect("the destination must accept a new connection after retirement");
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        2,
+        "a second physical socket must be opened only after the first retired"
+    );
+    assert_eq!(limiter.current("maxconn-h2c.test", port), 1);
+}
+
+#[tokio::test]
+async fn test_grpc_h2c_pool_without_cap_is_unbounded_and_untracked() {
+    // No `maxConnections` on the destination: the pool must never touch the
+    // limiter, so the hot path stays exactly as it was before issue #3290.
+    let (port, accepted) = start_counting_h2c_backend().await;
+
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    let pool = GrpcConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    );
+    pool.attach_backend_conn_limit(Arc::clone(&limiter));
+    let proxy = h2c_proxy_with_max_connections(port, None);
+
+    let _sender = pool
+        .get_sender(&proxy)
+        .await
+        .expect("uncapped destination connects normally");
+    assert!(accepted.load(Ordering::Relaxed) >= 1);
+    assert_eq!(
+        limiter.current("maxconn-h2c.test", port),
+        0,
+        "an uncapped destination must never allocate a counter slot"
     );
 }

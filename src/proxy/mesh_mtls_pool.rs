@@ -26,8 +26,8 @@ use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
 use std::fmt::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
@@ -413,6 +413,11 @@ pub struct MeshMtlsConnectionPool {
     dns_cache: DnsCache,
     pool_config: PoolConfig,
     last_idle_prune_unix_secs: AtomicU64,
+    /// Shared gateway-wide DestinationRule `connectionPool.tcp.maxConnections`
+    /// counter, installed once by `ProxyState` via
+    /// [`MeshMtlsConnectionPool::attach_backend_conn_limit`]. Unset for focused
+    /// tests and standalone callers, in which case no cap is enforced.
+    backend_conn_limit: OnceLock<crate::backend_conn_limit::SharedBackendConnectionLimiter>,
 }
 
 struct MeshMtlsSvidIdentityCache {
@@ -497,7 +502,39 @@ impl MeshMtlsConnectionPool {
             dns_cache,
             pool_config,
             last_idle_prune_unix_secs: AtomicU64::new(0),
+            backend_conn_limit: OnceLock::new(),
         }
+    }
+
+    /// Install the gateway-wide `connectionPool.tcp.maxConnections` counter so
+    /// Sidecar mesh-mTLS connections are admitted against the same
+    /// per-destination ceiling as every other transport. Idempotent; later
+    /// calls are ignored.
+    pub fn attach_backend_conn_limit(
+        &self,
+        limiter: crate::backend_conn_limit::SharedBackendConnectionLimiter,
+    ) {
+        let _ = self.backend_conn_limit.set(limiter);
+    }
+
+    /// Resolve the `maxConnections` admission lane for a mesh-mTLS dial.
+    ///
+    /// Keyed by the DIAL host (the peer sidecar whose socket is opened) and the
+    /// destination's APP/service policy port — never the `:15006` transport
+    /// listener — so a mesh-mTLS connection shares one ceiling with the
+    /// destination's WebSocket, raw-TCP, and other pooled connections.
+    fn conn_admission<'a>(
+        &'a self,
+        proxy: &'a Proxy,
+        dial_host: &'a str,
+        app_policy_port: u16,
+    ) -> Option<crate::backend_conn_limit::PooledConnectionAdmission<'a>> {
+        crate::backend_conn_limit::PooledConnectionAdmission::resolve(
+            self.backend_conn_limit.get().map(|limiter| &**limiter),
+            proxy,
+            dial_host,
+            app_policy_port,
+        )
     }
 
     pub fn pool_size(&self) -> usize {
@@ -814,6 +851,10 @@ impl MeshMtlsConnectionPool {
             .and_then(|o| o.connect_timeout_ms)
             .unwrap_or(proxy.backend_connect_timeout_ms);
         let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
+        // Each raw-TCP / datagram tunnel session dials its OWN connection, so it
+        // is admitted on the destination's `maxConnections` lane (keyed by the
+        // dial peer + the APP/service policy port, never `:15006`).
+        let conn_admission = self.conn_admission(proxy, dial_host, target_policy_port);
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
@@ -827,6 +868,7 @@ impl MeshMtlsConnectionPool {
             &pool_config,
             keepalive_override,
             Some(connect_timeout),
+            conn_admission.as_ref(),
         )
         .await?;
         tokio::time::timeout(
@@ -920,6 +962,10 @@ impl MeshMtlsConnectionPool {
             .and_then(|o| o.connect_timeout_ms)
             .unwrap_or(proxy.backend_connect_timeout_ms);
         let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
+        // Each raw-TCP / datagram tunnel session dials its OWN connection, so it
+        // is admitted on the destination's `maxConnections` lane (keyed by the
+        // dial peer + the APP/service policy port, never `:15006`).
+        let conn_admission = self.conn_admission(proxy, dial_host, target_policy_port);
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
@@ -933,6 +979,7 @@ impl MeshMtlsConnectionPool {
             &pool_config,
             keepalive_override,
             Some(connect_timeout),
+            conn_admission.as_ref(),
         )
         .await?;
         let baggage = crate::modes::mesh::hbone::baggage_header_for_source(&source_identity);
@@ -1022,6 +1069,8 @@ impl MeshMtlsConnectionPool {
             .as_ref()
             .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
+        // A WebSocket-over-mesh-mTLS session dials its OWN 1:1 connection.
+        let ws_conn_admission = self.conn_admission(proxy, dial_host, app_policy_port);
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
@@ -1039,6 +1088,7 @@ impl MeshMtlsConnectionPool {
             &pool_config,
             keepalive_override,
             None,
+            ws_conn_admission.as_ref(),
         )
         .await?;
         tokio::time::timeout(
@@ -1128,6 +1178,7 @@ impl MeshMtlsConnectionPool {
             .as_ref()
             .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
+        let pooled_conn_admission = self.conn_admission(proxy, target_host, app_policy_port);
         let sender = match tokio::time::timeout(
             remaining,
             self.create_sender(
@@ -1142,6 +1193,7 @@ impl MeshMtlsConnectionPool {
                 remaining,
                 effective_connect_timeout_ms,
                 crls_before_dial.clone(),
+                pooled_conn_admission.as_ref(),
             ),
         )
         .await
@@ -1305,7 +1357,26 @@ impl MeshMtlsConnectionPool {
         connect_budget: Duration,
         effective_connect_timeout_ms: u64,
         crls: crate::tls::CrlList,
+        // DestinationRule `connectionPool.tcp.maxConnections` lane for the
+        // destination's APP/service policy port. `None` = uncapped destination.
+        // A reserved slot is handed to the spawned connection driver below, so
+        // it retires exactly when this pooled mesh-mTLS connection closes.
+        conn_admission: Option<&crate::backend_conn_limit::PooledConnectionAdmission<'_>>,
     ) -> Result<MeshMtlsSender, HbonePoolError> {
+        let conn_slot = match conn_admission {
+            Some(admission) => match admission.acquire() {
+                Ok(slot) => Some(slot),
+                Err(limit) => {
+                    return Err(HbonePoolError::MaxConnectionsExceeded {
+                        host: admission.host().to_string(),
+                        port: admission.policy_port(),
+                        current: limit.current,
+                        cap: limit.cap,
+                    });
+                }
+            },
+            None => None,
+        };
         let candidates = self
             .dns_cache
             .resolve_candidates(
@@ -1356,6 +1427,9 @@ impl MeshMtlsConnectionPool {
         crate::dns::connect_candidates(&candidates, mtls_port, connect_budget, |sock_addr| {
             let connector = connector.clone();
             let server_name = server_name.clone();
+            // One reservation, cloned per DNS candidate: a failed attempt drops
+            // its clone, so only an established connection keeps the slot.
+            let conn_slot = conn_slot.clone();
             async move {
                 let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                     .await
@@ -1422,6 +1496,9 @@ impl MeshMtlsConnectionPool {
 
                 // TLS ALPN already proved H2 for this sidecar candidate.
                 tokio::spawn(async move {
+                    // The `maxConnections` slot lives exactly as long as the
+                    // connection driver, i.e. as long as the socket is open.
+                    let _conn_slot = conn_slot;
                     if let Err(e) = connection.await {
                         debug!(
                             "mesh_mtls_pool: sidecar mTLS HTTP/2 connection closed: {}",

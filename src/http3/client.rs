@@ -13,8 +13,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -702,6 +702,18 @@ type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes
 struct H3PooledConnection {
     send_request: H3SendRequest,
     connection: quinn::Connection,
+    /// DestinationRule `connectionPool.tcp.maxConnections` slot for this
+    /// physical QUIC connection. `None` when the destination has no cap.
+    ///
+    /// Held on the pooled value rather than on the h3 driver task so the slot
+    /// also covers in-flight requests that still hold a clone after the pool
+    /// entry itself was evicted/drained — the socket really is still open then.
+    /// Released when the LAST clone drops: idle eviction, unhealthy replace,
+    /// `clear()` / `force_drain_*` on reload/update/delete, or shutdown.
+    ///
+    /// Pure RAII — never read, only dropped.
+    #[allow(dead_code)]
+    conn_slot: Option<crate::backend_conn_limit::SharedBackendConnectionGuard>,
 }
 
 impl H3PooledConnection {
@@ -709,7 +721,18 @@ impl H3PooledConnection {
         Self {
             send_request,
             connection,
+            conn_slot: None,
         }
+    }
+
+    /// Same as [`Self::new`] but carrying the destination's `maxConnections`
+    /// slot for the lifetime of this QUIC connection.
+    fn with_conn_slot(
+        mut self,
+        conn_slot: Option<crate::backend_conn_limit::SharedBackendConnectionGuard>,
+    ) -> Self {
+        self.conn_slot = conn_slot;
+        self
     }
 
     /// Returns `true` once the underlying QUIC connection has reached a
@@ -1028,6 +1051,13 @@ pub struct Http3ConnectionPool {
     ipv4_endpoint: tokio::sync::OnceCell<quinn::Endpoint>,
     /// Shared QUIC endpoint for IPv6 backends.
     ipv6_endpoint: tokio::sync::OnceCell<quinn::Endpoint>,
+    /// Shared gateway-wide DestinationRule `connectionPool.tcp.maxConnections`
+    /// counter, installed once by `ProxyState` via
+    /// [`Http3ConnectionPool::attach_backend_conn_limit`]. A QUIC connection is
+    /// a physical backend connection, so it is admitted on the same
+    /// per-destination lane as every other transport. Unset for focused tests
+    /// and standalone callers, in which case no cap is enforced.
+    backend_conn_limit: OnceLock<crate::backend_conn_limit::SharedBackendConnectionLimiter>,
 }
 
 #[derive(Clone)]
@@ -1139,7 +1169,19 @@ impl Http3ConnectionPool {
             backend_svid_generation,
             ipv4_endpoint: tokio::sync::OnceCell::new(),
             ipv6_endpoint: tokio::sync::OnceCell::new(),
+            backend_conn_limit: OnceLock::new(),
         }
+    }
+
+    /// Install the gateway-wide `connectionPool.tcp.maxConnections` counter so
+    /// this pool's physical QUIC connections are admitted against the same
+    /// per-destination ceiling as every other transport. Idempotent; later
+    /// calls are ignored.
+    pub fn attach_backend_conn_limit(
+        &self,
+        limiter: crate::backend_conn_limit::SharedBackendConnectionLimiter,
+    ) {
+        let _ = self.backend_conn_limit.set(limiter);
     }
 
     /// Get or lazily create the shared QUIC endpoint for the given address family.
@@ -1823,6 +1865,32 @@ impl Http3ConnectionPool {
 
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
+        // DestinationRule `connectionPool.tcp.maxConnections`. A QUIC
+        // connection is a physical backend connection, so reserve the slot
+        // BEFORE dialing and hand it to the pooled value: it is released when
+        // the last handle to this connection drops (idle eviction, unhealthy
+        // replace, pool clear / SVID drain on reload/update/delete, shutdown),
+        // never per request — unlimited multiplexed H3 streams ride one
+        // admitted connection.
+        let conn_admission = crate::backend_conn_limit::PooledConnectionAdmission::resolve(
+            self.backend_conn_limit.get().map(|limiter| &**limiter),
+            proxy,
+            host,
+            port,
+        );
+        let conn_slot = match conn_admission {
+            Some(admission) => match admission.acquire() {
+                Ok(slot) => Some(slot),
+                Err(limit) => {
+                    return Err(anyhow::anyhow!(
+                        "HTTP/3 pool: {limit} for backend {}:{}",
+                        admission.host(),
+                        admission.policy_port()
+                    ));
+                }
+            },
+            None => None,
+        };
         let candidates = resolve_backend_addrs_cached(
             host,
             &self.dns_cache,
@@ -1837,6 +1905,9 @@ impl Http3ConnectionPool {
         let (pooled, addr) =
             crate::dns::connect_candidates(&candidates, port, connect_timeout, |addr| {
                 let client_config = client_config.clone();
+                // One reservation, cloned per DNS candidate: a failed attempt
+                // drops its clone, so only the established connection holds it.
+                let conn_slot = conn_slot.clone();
                 async move {
                     let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
                     let connection = endpoint
@@ -1857,7 +1928,7 @@ impl Http3ConnectionPool {
                         let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
                         debug!("HTTP/3 pool connection driver closed: {}", err);
                     });
-                    Ok(H3PooledConnection::new(send_request, quic_conn))
+                    Ok(H3PooledConnection::new(send_request, quic_conn).with_conn_slot(conn_slot))
                 }
             })
             .await
@@ -1918,6 +1989,32 @@ impl Http3ConnectionPool {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
 
+        // DestinationRule `connectionPool.tcp.maxConnections`. A QUIC
+        // connection is a physical backend connection, so reserve the slot
+        // BEFORE dialing and hand it to the pooled value: it is released when
+        // the last handle to this connection drops (idle eviction, unhealthy
+        // replace, pool clear / SVID drain on reload/update/delete, shutdown),
+        // never per request — unlimited multiplexed H3 streams ride one
+        // admitted connection.
+        let conn_admission = crate::backend_conn_limit::PooledConnectionAdmission::resolve(
+            self.backend_conn_limit.get().map(|limiter| &**limiter),
+            proxy,
+            host,
+            port,
+        );
+        let conn_slot = match conn_admission {
+            Some(admission) => match admission.acquire() {
+                Ok(slot) => Some(slot),
+                Err(limit) => {
+                    return Err(anyhow::anyhow!(
+                        "HTTP/3 pool: {limit} for backend {}:{}",
+                        admission.host(),
+                        admission.policy_port()
+                    ));
+                }
+            },
+            None => None,
+        };
         let candidates = resolve_backend_addrs_cached(
             host,
             &self.dns_cache,
@@ -1932,6 +2029,9 @@ impl Http3ConnectionPool {
         let (pooled, addr) =
             crate::dns::connect_candidates(&candidates, port, connect_timeout, |addr| {
                 let client_config = client_config.clone();
+                // One reservation, cloned per DNS candidate: a failed attempt
+                // drops its clone, so only the established connection holds it.
+                let conn_slot = conn_slot.clone();
                 async move {
                     let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
                     let connection = endpoint
@@ -1952,7 +2052,7 @@ impl Http3ConnectionPool {
                         let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
                         debug!("HTTP/3 pool connection driver closed: {}", err);
                     });
-                    Ok(H3PooledConnection::new(send_request, quic_conn))
+                    Ok(H3PooledConnection::new(send_request, quic_conn).with_conn_slot(conn_slot))
                 }
             })
             .await

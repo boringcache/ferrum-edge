@@ -357,6 +357,11 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
                 // failure — `request_reached_wire` is false so connect-failure
                 // retry can redial.
                 GrpcBackendUnavailableKind::DispatchCanceled => ErrorClass::ConnectionPoolError,
+                // Gateway-side `connectionPool.tcp.maxConnections` refusal: the
+                // destination is at its physical-connection ceiling and no new
+                // socket was opened. Pre-wire pool refusal, so
+                // `retry_on_connect_failure` may rotate to another LB target.
+                GrpcBackendUnavailableKind::MaxConnections => ErrorClass::ConnectionPoolError,
             }
         }
         GrpcProxyError::ResourceExhausted(_) => ErrorClass::RequestError,
