@@ -10201,8 +10201,13 @@ pub const REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT: &[&str] = &[
 /// `ai_response_guard` is here for the same reason: its runtime constructor
 /// reads the `grpc.descriptor_path` `FileDescriptorSet`, while its request-body
 /// answer is the trait default and never depends on that file.
+///
+/// `ai_transcript_audit` joins them once native gRPC capture is enrolled: its
+/// runtime constructor loads the same kind of descriptor set off local disk,
+/// but whether it buffers the request body is decided by the config shape
+/// alone.
 pub const REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY: &[&str] =
-    &["ai_response_guard", "body_validator"];
+    &["ai_response_guard", "ai_transcript_audit", "body_validator"];
 
 /// Why the request-body-buffering screen could not evaluate a plugin config.
 ///
@@ -10308,7 +10313,7 @@ impl RequestBodyBufferingScreener {
             return RequestBodyBufferingScreen::Streams;
         }
         if REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY.contains(&plugin_name) {
-            return Self::screen_shape_only(plugin_name, config);
+            return self.screen_shape_only(plugin_name, config);
         }
         if !is_builtin_plugin_name(plugin_name) {
             return RequestBodyBufferingScreen::Indeterminate(
@@ -10339,10 +10344,15 @@ impl RequestBodyBufferingScreener {
 
     /// Screen a plugin listed in [`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`]
     /// through its shape-only constructor.
-    fn screen_shape_only(plugin_name: &str, config: &Value) -> RequestBodyBufferingScreen {
+    fn screen_shape_only(&self, plugin_name: &str, config: &Value) -> RequestBodyBufferingScreen {
         let answer = match plugin_name {
             "ai_response_guard" => ai_response_guard::AiResponseGuard::new_shape_only(config)
                 .map(|plugin| plugin.requires_request_body_buffering()),
+            "ai_transcript_audit" => ai_transcript_audit::AiTranscriptAudit::new_shape_only(
+                config,
+                self.http_client.clone(),
+            )
+            .map(|plugin| plugin.requires_request_body_buffering()),
             "body_validator" => body_validator::BodyValidator::new_shape_only(config)
                 .map(|plugin| plugin.requires_request_body_buffering()),
             // Unreachable today. A name added to the shape-only list without a
@@ -10411,6 +10421,12 @@ pub(crate) fn validate_plugin_config_with_http_client(
         // files installed on data-plane nodes. Mode-aware dependency
         // validation and runtime construction handle the FileDescriptorSet.
         return ai_response_guard::AiResponseGuard::validate_config(config);
+    }
+    if name == "ai_transcript_audit" {
+        // Shape-only: CP/admin admission must not require gRPC descriptor
+        // files installed on data-plane nodes. Mode-aware dependency
+        // validation and runtime construction handle the FileDescriptorSet.
+        return ai_transcript_audit::AiTranscriptAudit::validate_config(config, http_client);
     }
     if name == "udp_logging" {
         // Shape-only: shared Admin / CP validation must not open node-local
