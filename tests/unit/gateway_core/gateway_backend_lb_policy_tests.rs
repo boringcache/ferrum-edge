@@ -55,7 +55,11 @@ fn object(kind: &str, api_version: &str, name: &str, spec: serde_json::Value) ->
 
 /// Extract the `name=value` pair's value from a `Set-Cookie` header value.
 fn set_cookie_value(header: &str, name: &str) -> String {
-    let pair = header.split(';').next().map(str::trim).expect("cookie pair");
+    let pair = header
+        .split(';')
+        .next()
+        .map(str::trim)
+        .expect("cookie pair");
     pair.strip_prefix(&format!("{name}="))
         .unwrap_or_else(|| panic!("expected cookie named {name}, got {header}"))
         .to_string()

@@ -6825,6 +6825,11 @@ async fn handle_h3_request(
         // would suppress `retry_on_connect_failure` and mis-account a
         // pre-wire failure as a 502 status fault on CB / passive health.
         let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
+        // Set when the retry loop breaks on the egress screen for a ROTATED
+        // candidate that was never dialed. `final_target` still points at that
+        // candidate for outcome/logging attribution, but nothing served this
+        // response, so it must not become a sticky-affinity binding.
+        let mut sticky_dispatch_refused = false;
         let (
             mut response_status,
             response_body,
@@ -7026,6 +7031,7 @@ async fn handle_h3_request(
                         error_class: Some(crate::retry::ErrorClass::DispatchPolicyRejected),
                         request_on_wire: false,
                     };
+                    sticky_dispatch_refused = true;
                     break;
                 }
 
@@ -7241,13 +7247,30 @@ async fn handle_h3_request(
 
         // Sticky session cookie injection. The buffered variant also records the
         // cookie as gateway-owned so a committed-hook deadline cannot strip it.
+        //
+        // This is the one H3 path with retry rotation, so the binding decision is
+        // re-derived against the target that actually served the response: an
+        // honored cookie that retry rotated away from is reissued for the final
+        // backend, and a rotated candidate the egress screen refused to dial
+        // mints nothing.
         if !after_proxy_rejected {
+            let sticky_served_target = if sticky_dispatch_refused {
+                None
+            } else {
+                final_target.as_deref()
+            };
+            let sticky_reissue_target =
+                crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
+                    sticky_cookie_needed,
+                    upstream_target.as_deref(),
+                    sticky_served_target,
+                );
             inject_sticky_cookie_with_deadline_provenance(
                 &mut ctx,
                 &epoch,
                 &proxy,
-                upstream_target.as_deref(),
-                sticky_cookie_needed,
+                sticky_reissue_target,
+                sticky_reissue_target.is_some(),
                 &mut response_headers,
             );
         }
@@ -8212,8 +8235,18 @@ fn build_h3_backend_headers(
 }
 
 /// Classify an h3/quinn error into an `ErrorClass` for retry and CB recording.
-/// Inject a sticky-session `Set-Cookie` header when the LB strategy is cookie-based
-/// and the cookie was not present in the original request.
+/// Inject a sticky-session `Set-Cookie` header when the LB strategy is
+/// cookie-based and the response must (re)bind the client to a backend.
+///
+/// `served_target` is the backend that ACTUALLY produced the response and
+/// `reissue_needed` is the already-derived binding decision. On a retry-capable
+/// path that decision must come from
+/// [`crate::proxy::backend_dispatch::sticky_cookie_reissue_target`], because the
+/// selection-time flag alone is stale once retry rotates off the bound target.
+/// Callers on paths that cannot rotate (`proxy_to_backend_h3_streaming`,
+/// `proxy_to_backend_h3_refined_response`, `dispatch_grpc_native_h3` — none of
+/// them call `select_next_retry_target`) pass the selection flag and their only
+/// target directly.
 ///
 /// Returns whether a cookie was actually injected. Buffered callers use this to
 /// record `set-cookie` as gateway-owned in gRPC-deadline provenance before
@@ -8226,12 +8259,12 @@ fn build_h3_backend_headers(
 pub(crate) fn inject_sticky_cookie(
     epoch: &crate::request_epoch::RequestEpoch,
     proxy: &Proxy,
-    upstream_target: Option<&UpstreamTarget>,
-    sticky_cookie_needed: bool,
+    served_target: Option<&UpstreamTarget>,
+    reissue_needed: bool,
     response_headers: &mut HashMap<String, String>,
 ) -> bool {
-    if sticky_cookie_needed
-        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
+    if reissue_needed
+        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, served_target)
     {
         let strategy = crate::proxy::backend_dispatch::hash_on_strategy_for_selected_target(
             proxy,
@@ -8286,15 +8319,15 @@ pub(crate) fn inject_sticky_cookie_with_deadline_provenance(
     ctx: &mut RequestContext,
     epoch: &crate::request_epoch::RequestEpoch,
     proxy: &Proxy,
-    upstream_target: Option<&UpstreamTarget>,
-    sticky_cookie_needed: bool,
+    served_target: Option<&UpstreamTarget>,
+    reissue_needed: bool,
     response_headers: &mut HashMap<String, String>,
 ) -> bool {
     if !inject_sticky_cookie(
         epoch,
         proxy,
-        upstream_target,
-        sticky_cookie_needed,
+        served_target,
+        reissue_needed,
         response_headers,
     ) {
         return false;

@@ -11295,6 +11295,10 @@ async fn handle_websocket_request_authenticated(
     // `client_headers`). Stable across retry attempts.
     let ws_client_host = ctx.headers.get("host").cloned();
     let mut current_backend_url = backend_url;
+    // The target selection bound this request to, retained across the retry
+    // loop's rotations so the successful upgrade response can tell "the honored
+    // affinity cookie still names the serving backend" from "retry moved us".
+    let sticky_selected_target = upstream_target.clone();
     let mut current_target = upstream_target;
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
     let mut backend_admission_start: Instant;
@@ -12047,9 +12051,18 @@ async fn handle_websocket_request_authenticated(
         response_status.as_u16(),
         &mut response_headers,
     );
-    if sticky_cookie_needed
-        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
-    {
+    // `current_target` is the FINAL rotated target: this response is only built
+    // after a successful upgrade, so it is the backend that actually served the
+    // handshake. Re-derive the binding decision against it so a retry that moved
+    // off the client's bound backend reissues for the one that answered.
+    if let (Some(upstream_id), Some(target)) = (
+        &proxy.upstream_id,
+        backend_dispatch::sticky_cookie_reissue_target(
+            sticky_cookie_needed,
+            sticky_selected_target.as_deref(),
+            current_target.as_deref(),
+        ),
+    ) {
         let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
             &proxy,
             &epoch.load_balancer,
@@ -29231,11 +29244,20 @@ async fn handle_proxy_request_inner(
                     }
                 }
 
-                // Inject sticky session cookie for gRPC responses
-                if sticky_cookie_needed
-                    && let (Some(upstream_id), Some(target)) =
-                        (&proxy.upstream_id, &upstream_target)
-                {
+                // Inject sticky session cookie for gRPC responses, bound to the
+                // target that ACTUALLY produced this response. The direct gRPC
+                // retry loop rotates targets, and `grpc_final_upstream_target`
+                // is restored to the pre-rotation target whenever a rotated
+                // candidate was never dispatched to (its breaker rejected);
+                // every other rotated refusal returns before reaching here.
+                if let (Some(upstream_id), Some(target)) = (
+                    &proxy.upstream_id,
+                    backend_dispatch::sticky_cookie_reissue_target(
+                        sticky_cookie_needed,
+                        upstream_target.as_deref(),
+                        grpc_final_upstream_target.as_deref(),
+                    ),
+                ) {
                     let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
                         &proxy,
                         &epoch.load_balancer,
@@ -29919,6 +29941,13 @@ async fn handle_proxy_request_inner(
     // `StreamingH2` relay so native gRPC without a client deadline does not
     // fall back to the outer proxy default.
     let mut streaming_h2_read_timeout_ms;
+    // Set when the retry loop breaks on a gateway-synthesized dispatch refusal
+    // for a ROTATED candidate that was never dialed (mesh-transport / secured
+    // transport screens). `final_upstream_target` deliberately points at that
+    // rejected candidate for logging and `backend_target` attribution, but no
+    // backend served this response, so the sticky-affinity reissue below must
+    // not pin the client to it.
+    let mut sticky_dispatch_refused = false;
     let (backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
         retry_config
     {
@@ -30274,6 +30303,7 @@ async fn handle_proxy_request_inner(
                     }
                 };
                 final_upstream_target = current_target.clone();
+                sticky_dispatch_refused = true;
                 backend_admission_started_at = Instant::now();
                 // No backend attempt was made for the rotated target. Keep the
                 // synthetic policy refusal neutral for CB/passive-health.
@@ -30323,6 +30353,7 @@ async fn handle_proxy_request_inner(
                     }
                 };
                 final_upstream_target = current_target.clone();
+                sticky_dispatch_refused = true;
                 backend_admission_started_at = Instant::now();
                 skip_final_cb_record = true;
                 break;
@@ -30344,6 +30375,7 @@ async fn handle_proxy_request_inner(
                     retry::ErrorClass::DispatchPolicyRejected,
                 );
                 final_upstream_target = current_target.clone();
+                sticky_dispatch_refused = true;
                 backend_admission_started_at = Instant::now();
                 skip_final_cb_record = true;
                 break;
@@ -30627,6 +30659,26 @@ async fn handle_proxy_request_inner(
         };
         (resp, cb_target_key.clone(), upstream_target.clone())
     };
+    // Re-derive the Gateway API session-persistence decision now that dispatch
+    // is final. Selection made its call BEFORE any backend was dialed, so an
+    // honored binding carried `false` even when the retry loop above then
+    // rotated onto a different backend — which would leave the client pinned to
+    // the endpoint that just failed (retry rotation does not necessarily eject
+    // it). The reissue therefore names the target that ACTUALLY served this
+    // response, and a rotated candidate the gateway refused to dial names
+    // nothing. Resolved here, ahead of the streaming trailer-policy capture
+    // below, because a gateway-authored `set-cookie` is a header-phase write.
+    let sticky_served_target = if sticky_dispatch_refused {
+        None
+    } else {
+        final_upstream_target.as_deref()
+    };
+    let sticky_cookie_needed = backend_dispatch::sticky_cookie_reissue_target(
+        sticky_cookie_needed,
+        upstream_target.as_deref(),
+        sticky_served_target,
+    )
+    .is_some();
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
@@ -31342,8 +31394,12 @@ async fn handle_proxy_request_inner(
     // Inject the sticky-session cookie before committed exporters observe the
     // final header view. This remains after every rejection/body replacement so
     // the cookie lands on the same response that will be sent downstream.
+    //
+    // `sticky_cookie_needed` here is the post-dispatch derivation above — true
+    // only when this response must (re)bind the client — and
+    // `sticky_served_target` is the backend that actually served it.
     if sticky_cookie_needed
-        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
+        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, sticky_served_target)
     {
         let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
             &proxy,
@@ -36109,9 +36165,12 @@ fn buffered_collect_retain_failure(
 /// (Gateway API materializes one route-scoped upstream per persistent route
 /// rule) cannot resolve inside another upstream's binding index.
 ///
-/// Callers must pass the target that ACTUALLY served the successful response.
-/// Every call site sits after retry rotation for exactly that reason: a client
-/// must never be pinned to a backend that did not produce its response.
+/// Callers must pass the target that ACTUALLY served the response, and must
+/// decide *whether* to call through
+/// [`crate::proxy::backend_dispatch::sticky_cookie_reissue_target`] rather than
+/// from selection's pre-dispatch flag: a client must never be pinned to a
+/// backend that did not produce its response, and every retry-capable path can
+/// rotate off the target selection bound.
 ///
 /// The derivation is unkeyed and deterministic, so affinity survives a gateway
 /// restart and is identical across replicas of a horizontally scaled gateway.

@@ -310,13 +310,14 @@ pub(crate) fn select_upstream_target(
     let mut sticky_rebind_needed = false;
     if !needs_set
         && effective_algorithm == Some(LoadBalancerAlgorithm::ConsistentHashing)
-        && matches!(strategy, HashOnStrategy::Cookie(_))
+        && let HashOnStrategy::Cookie(ref presented_cookie_name) = strategy
     {
-        match LoadBalancerCache::select_sticky_from(
+        match resolve_sticky_binding(
+            proxy,
             balancers,
-            &proxy.namespace,
             upstream_id,
             &hash_key,
+            presented_cookie_name,
             port_scope,
             subset_name,
             Some(&health_ctx),
@@ -331,7 +332,9 @@ pub(crate) fn select_upstream_target(
                 };
             }
             None => {
-                // Never log or echo the presented token.
+                // Never log or echo the presented token. This arm also covers a
+                // binding whose target sits in a per-port policy lane that no
+                // longer elects this cookie — see `resolve_sticky_binding`.
                 debug!(
                     proxy_id = %proxy.id,
                     upstream_id = %upstream_id,
@@ -578,6 +581,137 @@ pub(crate) fn hash_on_strategy_for_selected_target(
         port_scope,
         proxy.upstream_subset.as_deref(),
     )
+}
+
+/// Resolve a presented Gateway API session-persistence cookie to the backend it
+/// binds, or `None` when the caller must fall back to ordinary load-balanced
+/// selection and mint a fresh binding.
+///
+/// Two gates, both fail-closed:
+///
+/// 1. [`LoadBalancer::select_sticky`] resolves the opaque token inside the
+///    `(subset ∩ port)` candidate pool the caller would have load-balanced over,
+///    with the same active/passive health filtering.
+/// 2. The resolved target's OWN per-port policy lane must still elect this
+///    cookie. The lookup necessarily runs before the target is known, so gate 1
+///    is validated against the INITIAL dispatch port's lane — and when that port
+///    carries no per-port override the pool is the whole upstream, so a resolved
+///    target may sit in a *different* `dispatch_policy_port()` lane whose
+///    effective algorithm is not consistent hashing, or whose `hashOn` names a
+///    different cookie. Honoring a binding there would let a token reach past
+///    the per-port policy that actually governs the target — the precedence
+///    every other path applies through
+///    [`hash_on_strategy_for_selected_target`] and the post-selection
+///    recomputation in [`select_upstream_target`].
+///
+/// Cold path: reached only when a syntactically valid token was presented, and
+/// gate 2 costs two snapshot map lookups only when the target lands in a
+/// different lane than selection was scoped to. No allocation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_sticky_binding(
+    proxy: &Proxy,
+    balancers: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    presented_token: &str,
+    presented_cookie_name: &str,
+    selection_port_scope: Option<u16>,
+    subset_name: Option<&str>,
+    health: Option<&HealthContext<'_>>,
+) -> Option<Arc<UpstreamTarget>> {
+    let target = LoadBalancerCache::select_sticky_from(
+        balancers,
+        &proxy.namespace,
+        upstream_id,
+        presented_token,
+        selection_port_scope,
+        subset_name,
+        health,
+    )?;
+
+    let target_port = target.dispatch_policy_port();
+    let target_has_override =
+        has_effective_port_override(proxy, balancers, upstream_id, target_port);
+    let target_scope = target_has_override.then_some(target_port);
+    if target_scope == selection_port_scope {
+        // The binding landed in the very lane it was validated against.
+        return Some(target);
+    }
+
+    if LoadBalancerCache::effective_algorithm_from(
+        balancers,
+        &proxy.namespace,
+        upstream_id,
+        target_scope,
+        subset_name,
+    ) != Some(LoadBalancerAlgorithm::ConsistentHashing)
+    {
+        return None;
+    }
+    match LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+        balancers,
+        &proxy.namespace,
+        upstream_id,
+        target_scope,
+        subset_name,
+    ) {
+        HashOnStrategy::Cookie(name) if name == presented_cookie_name => Some(target),
+        _ => None,
+    }
+}
+
+/// Resolve the target a response must mint a fresh backend-bound affinity
+/// cookie for, or `None` when the response must leave the client's session
+/// cookie alone.
+///
+/// `selection_needs_set` is [`select_upstream_target`]'s decision, taken BEFORE
+/// any backend was dialed: `true` when the request presented no usable binding
+/// (a fresh one has to be minted), `false` when a valid binding was honored.
+/// That flag alone is not the answer, because every retry-capable dispatch path
+/// may rotate off the selected target after selection returned. A client left
+/// holding the honored cookie would be steered straight back to the backend
+/// that just failed — exactly what Gateway API session persistence must stop
+/// doing once the pinned endpoint is no longer usable, and retry rotation does
+/// not necessarily eject that endpoint. So a rotation is itself a reissue
+/// trigger, and the reissued cookie names the FINAL successful target.
+///
+/// `served_target` must be the target that ACTUALLY produced the response.
+/// Gateway-synthesized refusals that dialed nothing (mesh-transport and egress
+/// denials screened on a rotated candidate) pass `None`, so a rejected response
+/// never pins a client to a backend that did not serve it.
+///
+/// Callers still mint only when the returned target's own lane resolves to
+/// [`HashOnStrategy::Cookie`] (via [`hash_on_strategy_for_selected_target`]), so
+/// a rotation into a non-cookie port lane writes nothing.
+///
+/// Hot path: one pointer comparison in the common no-rotation case, at worst a
+/// port compare plus a host string compare. No allocation.
+#[inline]
+pub(crate) fn sticky_cookie_reissue_target<'a>(
+    selection_needs_set: bool,
+    selected_target: Option<&UpstreamTarget>,
+    served_target: Option<&'a UpstreamTarget>,
+) -> Option<&'a UpstreamTarget> {
+    let served = served_target?;
+    if selection_needs_set {
+        return Some(served);
+    }
+    match selected_target {
+        // The honored binding still names the backend that served the
+        // response: re-minting the identical token would be pure wire noise.
+        Some(selected) if same_affinity_endpoint(selected, served) => None,
+        _ => Some(served),
+    }
+}
+
+/// Whether two targets name the same backend endpoint for affinity purposes.
+///
+/// The sticky token is derived from the namespace-qualified upstream identity
+/// plus `host:port` (`load_balancer::sticky_session_token`), so `host:port` is
+/// exactly the identity that decides whether an honored cookie still names the
+/// serving backend.
+#[inline]
+fn same_affinity_endpoint(a: &UpstreamTarget, b: &UpstreamTarget) -> bool {
+    std::ptr::eq(a, b) || (a.port == b.port && a.host == b.host)
 }
 
 /// Replace a wildcard upstream target host (for example `*.example.com`) with

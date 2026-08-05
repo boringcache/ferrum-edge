@@ -1957,7 +1957,9 @@ fn sticky_session_token_from_target_key(scoped_target_key: &str) -> String {
 #[inline]
 pub fn is_sticky_session_token(value: &str) -> bool {
     value.len() == STICKY_SESSION_TOKEN_LEN
-        && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// `true` when a resolved hash-on strategy is the cookie form that mints

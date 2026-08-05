@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use chrono::Utc;
 use dashmap::DashMap;
 use ferrum_edge::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, SubsetDefinition, Upstream, UpstreamPortOverride,
+    GatewayConfig, LoadBalancerAlgorithm, Proxy, SubsetDefinition, Upstream, UpstreamPortOverride,
     UpstreamTarget,
 };
 use ferrum_edge::load_balancer::{
@@ -486,4 +486,401 @@ fn unknown_upstream_identity_never_panics() {
         )
         .is_none()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Retry-rotation reissue (root review finding 1)
+// ---------------------------------------------------------------------------
+//
+// Selection decides "does this response need a cookie?" BEFORE any backend is
+// dialed, so an honored binding carries `false`. Every retry-capable dispatch
+// path (H1/H2, direct gRPC, WebSocket incl. H2 extended CONNECT, native H3, the
+// H3→HTTP and H3→gRPC cross-protocol bridges, H3 WebSocket) can then rotate off
+// that target. Carrying the stale `false` through to response-cookie injection
+// leaves the client pinned to the backend that just failed — retry rotation
+// does not necessarily eject it. These pin the shared derivation every one of
+// those paths now routes through.
+
+/// Two distinct `UpstreamTarget` values for the same endpoint, so the assertion
+/// cannot pass merely because both sides are the same allocation.
+fn distinct_clone(t: &UpstreamTarget) -> UpstreamTarget {
+    target(&t.host, t.port)
+}
+
+#[test]
+fn honored_binding_that_served_its_own_backend_is_not_reissued() {
+    let bound = target("10.1.0.10", 8080);
+    let served = distinct_clone(&bound);
+
+    assert!(
+        ferrum_edge::_test_support::sticky_cookie_reissue_target_for_test(
+            false,
+            Some(&bound),
+            Some(&served),
+        )
+        .is_none(),
+        "a binding honored end-to-end must not re-mint the identical token"
+    );
+}
+
+#[test]
+fn honored_binding_reissues_for_the_backend_a_retry_rotated_onto() {
+    let bound = target("10.1.0.10", 8080);
+    let rotated = target("10.1.0.11", 8080);
+
+    let reissue = ferrum_edge::_test_support::sticky_cookie_reissue_target_for_test(
+        // Selection honored the presented cookie: `false` at selection time.
+        false,
+        Some(&bound),
+        // Retry then rotated; this is the backend that produced the response.
+        Some(&rotated),
+    )
+    .expect("a rotation off the bound backend must reissue");
+    assert_eq!((reissue.host.as_str(), reissue.port), ("10.1.0.11", 8080));
+
+    // ... and the token that reissue mints resolves back to that same backend,
+    // so the client's NEXT request lands there instead of on the failed one.
+    let cache = cache_for(sticky_upstream(vec![bound.clone(), rotated.clone()]));
+    let next = LoadBalancerCache::select_sticky_from(
+        &cache.load(),
+        NAMESPACE,
+        UPSTREAM_ID,
+        &token_for(NAMESPACE, UPSTREAM_ID, reissue),
+        None,
+        None,
+        None,
+    )
+    .expect("the reissued token must resolve");
+    assert_eq!(next.host, rotated.host);
+    assert_eq!(next.port, rotated.port);
+    assert!(
+        next.host != bound.host || next.port != bound.port,
+        "the reissued binding must not point back at the rotated-away backend"
+    );
+}
+
+#[test]
+fn a_rotation_that_only_changed_ports_still_reissues() {
+    // Affinity identity is `host:port`: the same host on a different port is a
+    // different endpoint and a different token.
+    let bound = target("10.1.0.10", 8080);
+    let rotated = target("10.1.0.10", 9090);
+
+    let reissue = ferrum_edge::_test_support::sticky_cookie_reissue_target_for_test(
+        false,
+        Some(&bound),
+        Some(&rotated),
+    )
+    .expect("a port rotation is still a different backend");
+    assert_eq!(reissue.port, 9090);
+    assert_ne!(
+        token_for(NAMESPACE, UPSTREAM_ID, &bound),
+        token_for(NAMESPACE, UPSTREAM_ID, &rotated),
+    );
+}
+
+#[test]
+fn a_first_ever_request_always_mints_for_the_backend_that_served_it() {
+    let selected = target("10.1.0.10", 8080);
+    let rotated = target("10.1.0.11", 8080);
+
+    for served in [&selected, &rotated] {
+        let reissue = ferrum_edge::_test_support::sticky_cookie_reissue_target_for_test(
+            true,
+            Some(&selected),
+            Some(served),
+        )
+        .expect("a request with no usable binding always mints one");
+        assert_eq!(reissue.host, served.host);
+        assert_eq!(reissue.port, served.port);
+    }
+}
+
+#[test]
+fn a_response_no_backend_served_never_claims_a_binding() {
+    // Gateway-synthesized refusals (mesh-transport / egress screens on a
+    // ROTATED candidate that was never dialed, or no target at all) pass
+    // `None`: a rejected response must not pin the client to a backend that
+    // did not serve it — least of all one the gateway refuses to dial.
+    let selected = target("10.1.0.10", 8080);
+    for needs_set in [false, true] {
+        assert!(
+            ferrum_edge::_test_support::sticky_cookie_reissue_target_for_test(
+                needs_set,
+                Some(&selected),
+                None,
+            )
+            .is_none()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Selected-port policy precedence for a resolved binding (root review finding 2)
+// ---------------------------------------------------------------------------
+//
+// The binding lookup runs before the target is known, so it is validated
+// against the INITIAL dispatch port's lane. When that port carries no per-port
+// override the candidate pool is the whole upstream, so a resolved target can
+// sit in a DIFFERENT `dispatch_policy_port()` lane whose effective algorithm is
+// not consistent hashing, or whose `hashOn` names a different cookie. Honoring
+// a binding there would reach past the per-port policy that actually governs
+// the target. `resolve_sticky_binding` fails closed to ordinary selection and a
+// fresh binding instead.
+
+const COOKIE_NAME: &str = "lb-affinity-fe-0123456789abcdef";
+
+/// Production-shaped `(cache, proxy)` pair: `resolve_dispatch_port_overrides`
+/// projects the upstream's `port_overrides` onto the proxy exactly as config
+/// resolution does, so `has_effective_port_override` sees what it sees at
+/// runtime.
+fn resolved_fixture(
+    upstream: Upstream,
+    proxy_backend_port: u16,
+    subset: Option<&str>,
+) -> (LoadBalancerCache, Proxy) {
+    let proxy_json = serde_json::json!({
+        "id": "sticky-proxy",
+        "listen_path": "/sticky",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": proxy_backend_port,
+        "upstream_id": UPSTREAM_ID,
+    });
+    let mut proxy: Proxy = serde_json::from_value(proxy_json).expect("proxy fixture");
+    proxy.namespace = NAMESPACE.to_string();
+    proxy.upstream_subset = subset.map(str::to_string);
+
+    let mut config = GatewayConfig {
+        upstreams: vec![upstream],
+        proxies: vec![proxy],
+        ..GatewayConfig::default()
+    };
+    config.resolve_dispatch_port_overrides();
+    let proxy = config.proxies[0].clone();
+    (LoadBalancerCache::new(&config), proxy)
+}
+
+fn port_override(
+    algorithm: Option<LoadBalancerAlgorithm>,
+    hash_on: Option<&str>,
+) -> UpstreamPortOverride {
+    UpstreamPortOverride {
+        algorithm,
+        hash_on: hash_on.map(str::to_string),
+        ..UpstreamPortOverride::default()
+    }
+}
+
+#[test]
+fn binding_fails_closed_when_the_targets_port_lane_is_not_cookie_hashing() {
+    // Initial dispatch port 8080 has no override, so the raw binding index
+    // spans the whole upstream — but 9090 is a round-robin lane.
+    let http = target("10.1.0.10", 8080);
+    let other_lane = target("10.1.0.11", 9090);
+    let mut upstream = sticky_upstream(vec![http.clone(), other_lane.clone()]);
+    upstream.port_overrides.insert(
+        9090,
+        port_override(Some(LoadBalancerAlgorithm::RoundRobin), None),
+    );
+    let (cache, proxy) = resolved_fixture(upstream, 8080, None);
+    let snapshot = cache.load();
+    let token = token_for(NAMESPACE, UPSTREAM_ID, &other_lane);
+
+    // The raw index alone WOULD hand back the cross-lane target: the guard is
+    // load-bearing, not a restatement of `select_sticky`'s own scoping.
+    assert!(
+        LoadBalancerCache::select_sticky_from(
+            &snapshot,
+            NAMESPACE,
+            UPSTREAM_ID,
+            &token,
+            None,
+            None,
+            None,
+        )
+        .is_some(),
+        "fixture must actually exercise the cross-lane case"
+    );
+    assert!(
+        ferrum_edge::_test_support::resolve_sticky_binding_for_test(
+            &proxy,
+            &snapshot,
+            UPSTREAM_ID,
+            &token,
+            COOKIE_NAME,
+            None,
+            None,
+        )
+        .is_none(),
+        "a round-robin port lane must not honor a session-persistence binding"
+    );
+
+    // A binding inside the un-overridden lane the lookup was validated against
+    // is still honored, so the guard is not simply refusing everything.
+    let same_lane = ferrum_edge::_test_support::resolve_sticky_binding_for_test(
+        &proxy,
+        &snapshot,
+        UPSTREAM_ID,
+        &token_for(NAMESPACE, UPSTREAM_ID, &http),
+        COOKIE_NAME,
+        None,
+        None,
+    )
+    .expect("same-lane binding stays honored");
+    assert_eq!(same_lane.port, 8080);
+}
+
+#[test]
+fn binding_fails_closed_when_the_targets_port_lane_names_another_cookie() {
+    let http = target("10.1.0.10", 8080);
+    let other_lane = target("10.1.0.11", 9090);
+    let mut upstream = sticky_upstream(vec![http, other_lane.clone()]);
+    upstream.port_overrides.insert(
+        9090,
+        port_override(
+            Some(LoadBalancerAlgorithm::ConsistentHashing),
+            Some("cookie:some-other-session"),
+        ),
+    );
+    let (cache, proxy) = resolved_fixture(upstream, 8080, None);
+
+    assert!(
+        ferrum_edge::_test_support::resolve_sticky_binding_for_test(
+            &proxy,
+            &cache.load(),
+            UPSTREAM_ID,
+            &token_for(NAMESPACE, UPSTREAM_ID, &other_lane),
+            COOKIE_NAME,
+            None,
+            None,
+        )
+        .is_none(),
+        "a lane keyed on a different cookie must not honor this cookie's binding"
+    );
+}
+
+#[test]
+fn binding_is_honored_when_the_targets_port_lane_keeps_the_same_cookie() {
+    let http = target("10.1.0.10", 8080);
+    let other_lane = target("10.1.0.11", 9090);
+    let mut upstream = sticky_upstream(vec![http, other_lane.clone()]);
+    upstream.port_overrides.insert(
+        9090,
+        port_override(
+            Some(LoadBalancerAlgorithm::ConsistentHashing),
+            Some(&format!("cookie:{COOKIE_NAME}")),
+        ),
+    );
+    let (cache, proxy) = resolved_fixture(upstream, 8080, None);
+
+    let bound = ferrum_edge::_test_support::resolve_sticky_binding_for_test(
+        &proxy,
+        &cache.load(),
+        UPSTREAM_ID,
+        &token_for(NAMESPACE, UPSTREAM_ID, &other_lane),
+        COOKIE_NAME,
+        None,
+        None,
+    )
+    .expect("an equivalent cookie lane keeps the session");
+    assert_eq!(bound.port, 9090);
+}
+
+#[test]
+fn port_lane_precedence_composes_with_subset_scoping() {
+    // The subset dimension keeps its own scoping under the port guard: an
+    // in-lane, in-subset binding is honored; the same target outside the
+    // selected subset is not, and neither is a cross-lane one.
+    let v1 = tagged_target("10.1.0.10", 8080, &[("version", "v1")]);
+    let v2 = tagged_target("10.1.0.11", 9090, &[("version", "v2")]);
+    let mut upstream = sticky_upstream(vec![v1.clone(), v2.clone()]);
+    upstream.subsets = Some(vec![
+        SubsetDefinition {
+            name: "v1".to_string(),
+            labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+            traffic_policy: None,
+        },
+        SubsetDefinition {
+            name: "v2".to_string(),
+            labels: HashMap::from([("version".to_string(), "v2".to_string())]),
+            traffic_policy: None,
+        },
+    ]);
+    upstream.port_overrides.insert(
+        9090,
+        port_override(Some(LoadBalancerAlgorithm::RoundRobin), None),
+    );
+    let (cache, proxy) = resolved_fixture(upstream, 8080, Some("v1"));
+    let snapshot = cache.load();
+
+    assert!(
+        ferrum_edge::_test_support::resolve_sticky_binding_for_test(
+            &proxy,
+            &snapshot,
+            UPSTREAM_ID,
+            &token_for(NAMESPACE, UPSTREAM_ID, &v1),
+            COOKIE_NAME,
+            None,
+            Some("v1"),
+        )
+        .is_some(),
+        "an in-subset, in-lane binding stays honored"
+    );
+    assert!(
+        ferrum_edge::_test_support::resolve_sticky_binding_for_test(
+            &proxy,
+            &snapshot,
+            UPSTREAM_ID,
+            &token_for(NAMESPACE, UPSTREAM_ID, &v2),
+            COOKIE_NAME,
+            None,
+            Some("v1"),
+        )
+        .is_none(),
+        "subset scoping still rejects a foreign-subset binding"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Anti-drift: every mint site routes through the shared derivation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_retry_capable_mint_site_uses_the_shared_reissue_derivation() {
+    // The defect this guards is copy-paste drift: a response path that mints
+    // from the immutable selection-time flag instead of the post-dispatch
+    // derivation silently pins clients to rotated-away backends again. Each
+    // dispatch file that can rotate targets must reference the shared
+    // derivation, and the mint-site count is locked so a NEW site cannot be
+    // added without revisiting this contract.
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    let h3_server_src = include_str!("../../../src/http3/server.rs");
+    let h3_cross_src = include_str!("../../../src/http3/cross_protocol.rs");
+    let h3_ws_src = include_str!("../../../src/http3/websocket.rs");
+
+    for (label, source) in [
+        ("proxy/mod.rs", proxy_src),
+        ("http3/server.rs", h3_server_src),
+        ("http3/cross_protocol.rs", h3_cross_src),
+        ("http3/websocket.rs", h3_ws_src),
+    ] {
+        assert!(
+            source.contains("sticky_cookie_reissue_target("),
+            "{label} owns a retry-capable sticky dispatch path and must derive \
+             the reissue decision from \
+             backend_dispatch::sticky_cookie_reissue_target"
+        );
+    }
+
+    // `build_sticky_cookie_header` mint sites: 3 calls + 1 definition in
+    // proxy/mod.rs (plain H1/H2, buffered gRPC, WebSocket), 1 call in the H3
+    // injector, 1 call on the H3 WebSocket upgrade. The H3 cross-protocol
+    // bridges mint through `http3::server::inject_sticky_cookie*`, never
+    // directly.
+    let mint_sites = |src: &str| src.matches("build_sticky_cookie_header(").count();
+    assert_eq!(mint_sites(proxy_src), 4);
+    assert_eq!(mint_sites(h3_server_src), 1);
+    assert_eq!(mint_sites(h3_ws_src), 1);
+    assert_eq!(mint_sites(h3_cross_src), 0);
 }

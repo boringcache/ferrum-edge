@@ -130,6 +130,52 @@ pub mod _test_support {
         )
     }
 
+    /// Test-only view of the sticky-binding lookup used by
+    /// `backend_dispatch::select_upstream_target`'s early return (#3278).
+    ///
+    /// This is the production resolver, so a test through it also covers the
+    /// selected-port precedence guard: a token whose target lives in a per-port
+    /// policy lane that no longer elects this cookie must fail closed to
+    /// ordinary selection instead of being honored. `health: None` keeps the
+    /// test focused on pool/lane scoping; health filtering is covered directly
+    /// through `LoadBalancerCache::select_sticky_from`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_sticky_binding_for_test(
+        proxy: &crate::config::types::Proxy,
+        balancers: &crate::load_balancer::LoadBalancerCacheInner,
+        upstream_id: &str,
+        presented_token: &str,
+        presented_cookie_name: &str,
+        selection_port_scope: Option<u16>,
+        subset_name: Option<&str>,
+    ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
+        crate::proxy::backend_dispatch::resolve_sticky_binding(
+            proxy,
+            balancers,
+            upstream_id,
+            presented_token,
+            presented_cookie_name,
+            selection_port_scope,
+            subset_name,
+            None,
+        )
+    }
+
+    /// Test-only view of the shared retry-rotation reissue derivation every
+    /// response path uses to decide whether — and for which backend — a
+    /// sticky-session cookie must be minted (#3278).
+    pub fn sticky_cookie_reissue_target_for_test<'a>(
+        selection_needs_set: bool,
+        selected_target: Option<&crate::config::types::UpstreamTarget>,
+        served_target: Option<&'a crate::config::types::UpstreamTarget>,
+    ) -> Option<&'a crate::config::types::UpstreamTarget> {
+        crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
+            selection_needs_set,
+            selected_target,
+            served_target,
+        )
+    }
+
     /// Public mirror of the crate-private TCP SO_REUSEPORT accept-loop peer class.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TcpAcceptLoopClass {

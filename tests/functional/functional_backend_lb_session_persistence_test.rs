@@ -311,3 +311,192 @@ plugin_configs: []
         );
     }
 }
+
+/// Live proof for the retry-rotation reissue contract (root review finding 1).
+///
+/// Selection resolves a presented, VALID binding and returns
+/// `sticky_cookie_needed: false` before any backend is dialed. If that flag is
+/// carried unchanged into response-cookie injection, a retry that rotates onto
+/// a different backend serves the response from one endpoint while leaving the
+/// client pinned to another — the one that just failed, and which retry
+/// rotation did not necessarily eject. The next request then goes straight back
+/// to the dead endpoint.
+///
+/// This drives the real binary over the real load-balancer + retry path:
+///
+/// 1. a cookie bound to a LIVE backend is honored and NOT re-issued (no
+///    rotation happened) — the control that keeps step 2 from passing simply
+///    because the gateway re-mints on every response;
+/// 2. a cookie bound to a backend that refuses connections is honored,
+///    dialed, fails pre-wire, rotates to the live backend, and the response
+///    carries a FRESH cookie for the backend that actually served it;
+/// 3. that fresh cookie returns the client to the live backend.
+///
+/// Deterministic: the dead target is a port that was bound and released, so
+/// every dial is an immediate `ECONNREFUSED` (no sleeps, no polling, no
+/// retry-until-pass).
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backend_lb_session_persistence_reissues_after_retry_rotation() {
+    use ferrum_edge::config::types::UpstreamTarget;
+
+    let backend_live = spawn_http_identifying("sticky-rotation-live")
+        .await
+        .expect("spawn sticky-rotation-live");
+
+    // A port nothing listens on: bind to :0, take the port, drop the listener.
+    // Every connect to it is refused immediately, which is exactly the
+    // connect-class failure `retry_on_connect_failure` retries on.
+    let dead_port = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve a dead port");
+        listener.local_addr().expect("dead port addr").port()
+    };
+
+    let upstream_id = "rotation-sticky-upstream";
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "rotation-sticky-proxy"
+    listen_path: "/rotation"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {live}
+    strip_listen_path: true
+    upstream_id: "{upstream_id}"
+    retry:
+      max_retries: 1
+      retry_on_connect_failure: true
+      backoff: !fixed
+        delay_ms: 1
+upstreams:
+  - id: "{upstream_id}"
+    name: "BackendLBPolicy Cookie sessionPersistence with retry"
+    algorithm: consistent_hashing
+    hash_on: "cookie:{cookie_name}"
+    hash_on_cookie_config:
+      path: "/"
+      session_cookie: true
+      http_only: true
+    targets:
+      - host: "127.0.0.1"
+        port: {live}
+        weight: 1
+      - host: "127.0.0.1"
+        port: {dead}
+        weight: 1
+consumers: []
+plugin_configs: []
+"#,
+        live = backend_live.port,
+        dead = dead_port,
+        upstream_id = upstream_id,
+        cookie_name = COOKIE_NAME,
+    );
+
+    let gateway = TestGateway::builder()
+        .mode_file(config)
+        .log_level("warn")
+        .reserve_listener_port(backend_live.port)
+        .reserve_listener_port(dead_port)
+        .spawn()
+        .await
+        .expect("start sticky rotation gateway");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("http client");
+
+    // The gateway's own binding derivation, so the test presents exactly the
+    // token a prior response would have minted for each target.
+    let scope = format!("ferrum|{upstream_id}");
+    let token_for_port = |port: u16| {
+        ferrum_edge::load_balancer::sticky_session_token(
+            &scope,
+            &UpstreamTarget {
+                host: "127.0.0.1".to_string(),
+                port,
+                service_port_policy_key: None,
+                weight: 1,
+                tags: std::collections::HashMap::new(),
+                locality: None,
+                path: None,
+            },
+        )
+    };
+    let live_cookie = format!("{COOKIE_NAME}={}", token_for_port(backend_live.port));
+    let dead_cookie = format!("{COOKIE_NAME}={}", token_for_port(dead_port));
+
+    // --- Control: an honored binding that needed no rotation is NOT re-issued
+    let honored = client
+        .get(gateway.proxy_url("/rotation/honored"))
+        .header(reqwest::header::COOKIE, &live_cookie)
+        .send()
+        .await
+        .expect("honored binding request");
+    assert!(
+        honored.status().is_success(),
+        "honored binding status {}",
+        honored.status()
+    );
+    assert!(
+        affinity_set_cookie(&honored).is_none(),
+        "a binding honored without rotation must not be re-issued"
+    );
+    assert_eq!(
+        parse_server_name(&honored.text().await.expect("honored body")),
+        "sticky-rotation-live",
+        "the live binding must be honored, proving the token derivation matches"
+    );
+
+    // --- A valid binding whose backend refuses: rotate, then RE-ISSUE --------
+    let rotated = client
+        .get(gateway.proxy_url("/rotation/rotated"))
+        .header(reqwest::header::COOKIE, &dead_cookie)
+        .send()
+        .await
+        .expect("rotated binding request");
+    assert!(
+        rotated.status().is_success(),
+        "a retry must rescue the request off the refusing backend, got {}",
+        rotated.status()
+    );
+    let reissued = affinity_set_cookie(&rotated).expect(
+        "a retry that rotated off the bound backend must re-issue the cookie \
+         for the backend that actually served the response",
+    );
+    let rebound = cookie_pair_from_set_cookie(&reissued, COOKIE_NAME);
+    assert_ne!(
+        rebound, dead_cookie,
+        "the re-issued binding must not point back at the refusing backend"
+    );
+    assert_eq!(
+        rebound, live_cookie,
+        "the re-issued binding must name the backend that served the response"
+    );
+    assert_eq!(
+        parse_server_name(&rotated.text().await.expect("rotated body")),
+        "sticky-rotation-live"
+    );
+
+    // --- The re-issued cookie returns the client to that same backend -------
+    let confirm = client
+        .get(gateway.proxy_url("/rotation/confirm"))
+        .header(reqwest::header::COOKIE, &rebound)
+        .send()
+        .await
+        .expect("rebound request");
+    assert!(confirm.status().is_success(), "rebound status");
+    assert!(
+        affinity_set_cookie(&confirm).is_none(),
+        "the re-issued binding is now honored end-to-end and must not re-mint"
+    );
+    assert_eq!(
+        parse_server_name(&confirm.text().await.expect("rebound body")),
+        "sticky-rotation-live"
+    );
+}

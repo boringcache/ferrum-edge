@@ -733,6 +733,10 @@ pub(crate) async fn handle_h3_websocket(
         &plugins,
     );
     let mut current_backend_url = backend_url;
+    // The target selection bound this request to, retained across the retry
+    // loop's rotations so the successful upgrade response can tell "the honored
+    // affinity cookie still names the serving backend" from "retry moved us".
+    let sticky_selected_target = upstream_target.clone();
     let mut current_target = upstream_target;
     let mut current_cb_target_key = cb_target_key;
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
@@ -1225,9 +1229,18 @@ pub(crate) async fn handle_h3_websocket(
     // Sticky session cookie on the WS upgrade response, mirroring the
     // H1/H2 path. Gateway affinity is injected after operator response
     // policy so the selected-target cookie cannot be removed or replaced.
-    if sticky_cookie_needed
-        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
-    {
+    //
+    // This response is only built after a successful upgrade, so the retry
+    // loop's final `current_target` is the backend that actually served the
+    // handshake. Re-derive the binding against it so a rotation reissues.
+    if let (Some(upstream_id), Some(target)) = (
+        &proxy.upstream_id,
+        crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
+            sticky_cookie_needed,
+            sticky_selected_target.as_deref(),
+            current_target.as_deref(),
+        ),
+    ) {
         let strategy = crate::proxy::backend_dispatch::hash_on_strategy_for_selected_target(
             &proxy,
             &epoch.load_balancer,

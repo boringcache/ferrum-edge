@@ -2784,12 +2784,23 @@ where
     // buffered branch below hands this response to `response_committed` hooks
     // under `grpc_web_deadline_at`; a deadline rebuild there keeps gateway-owned
     // headers only, and an unrecorded cookie would be dropped.
+    //
+    // The binding decision is re-derived against `current_target`, the target
+    // that actually produced this response: the retry loop above rotates it, and
+    // every rotated candidate this bridge refuses to dial writes its refusal
+    // straight to the stream and never reaches here. An honored cookie that
+    // retry moved away from is reissued for the final backend.
+    let sticky_reissue_target = crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
+        sticky_cookie_needed,
+        upstream_target,
+        current_target.as_deref(),
+    );
     crate::http3::server::inject_sticky_cookie_with_deadline_provenance(
         ctx,
         epoch,
         proxy,
-        current_target.as_deref(),
-        sticky_cookie_needed,
+        sticky_reissue_target,
+        sticky_reissue_target.is_some(),
         &mut response_headers,
     );
 
@@ -4861,6 +4872,20 @@ where
 
     let final_backend_resolved_ip =
         resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
+
+    // Re-derive the sticky-affinity binding decision against the target that
+    // actually produced this response: the retry loop above rotates
+    // `current_target`, and every rotated candidate this bridge refuses to dial
+    // (mesh-transport screen, backend-path mismatch) returns before reaching
+    // here, so `current_target` is the served backend. Without this an honored
+    // cookie would survive a rotation and steer the next request straight back
+    // to the endpoint that just failed.
+    let sticky_cookie_needed = crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
+        sticky_cookie_needed,
+        upstream_target,
+        current_target.as_deref(),
+    )
+    .is_some();
 
     match result {
         Ok(GrpcResponseKind::Buffered(resp)) => {
