@@ -247,8 +247,7 @@ fn delta_removing_audit_policy() -> IncrementalResult {
 /// deterministic rather than dependent on how arbitrary bytes happen to decode.
 fn write_unparseable_descriptor(directory: &TempDir) -> String {
     let path = directory.path().join("unparseable.bin");
-    std::fs::write(&path, [0xFFu8; 32])
-        .expect("write the unparseable descriptor fixture");
+    std::fs::write(&path, [0xFFu8; 32]).expect("write the unparseable descriptor fixture");
     path.to_string_lossy().into_owned()
 }
 
@@ -311,7 +310,9 @@ async fn enabling_a_grpc_block_publishes_a_grpc_capable_generation() {
     let instance = audit_instance(&state, ProxyProtocol::Grpc)
         .expect("the published generation must be effective on the gRPC view");
     assert!(
-        instance.supported_protocols().contains(&ProxyProtocol::Grpc),
+        instance
+            .supported_protocols()
+            .contains(&ProxyProtocol::Grpc),
         "the published instance must itself declare gRPC support"
     );
     assert!(
