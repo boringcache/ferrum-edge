@@ -7075,6 +7075,31 @@ impl SpoolManager {
         Ok(())
     }
 
+    /// Prove a managed spool file currently exists before treating it as the
+    /// authoritative source for destructive sibling cleanup.
+    fn assert_existing_managed_file(&self, path: &Path) -> Result<(), String> {
+        self.assert_managed_path(path)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+                "{PLUGIN_NAME}: refusing to operate on symlinked spool path '{}'",
+                path.display()
+            )),
+            Ok(metadata) if metadata.is_file() => Ok(()),
+            Ok(_) => Err(format!(
+                "{PLUGIN_NAME}: managed spool source '{}' is not a regular file",
+                path.display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+                "{PLUGIN_NAME}: managed spool source '{}' no longer exists",
+                path.display()
+            )),
+            Err(error) => Err(format!(
+                "{PLUGIN_NAME}: failed to lstat managed spool source '{}': {error}",
+                path.display()
+            )),
+        }
+    }
+
     fn meta_path(&self) -> PathBuf {
         self.namespace_root.join(SPOOL_META_FILENAME)
     }
@@ -8413,6 +8438,7 @@ impl PublishedDeadLetterPayload {
 /// while it is fsynced/renamed. Only after the payload and safe metadata are
 /// both durable does finalization remove the source claim.
 struct DeadLetterPayloadWriter {
+    source_path: PathBuf,
     temp_path: PathBuf,
     final_path: PathBuf,
     file: Option<File>,
@@ -8427,7 +8453,7 @@ impl DeadLetterPayloadWriter {
         let (temp_path, final_path) = dead_letter_payload_paths(spool, source_path)?;
         let (_, prior_meta_path) = dead_letter_meta_paths(source_path)?;
         let _guard = spool.lock_spool_mutation()?;
-        spool.assert_managed_path(source_path)?;
+        spool.assert_existing_managed_file(source_path)?;
         spool.assert_managed_path(&temp_path)?;
         spool.assert_managed_path(&final_path)?;
         spool.assert_managed_path(&prior_meta_path)?;
@@ -8476,6 +8502,7 @@ impl DeadLetterPayloadWriter {
             )
         })?;
         Ok(Self {
+            source_path: source_path.to_path_buf(),
             temp_path,
             final_path,
             file: Some(file),
@@ -8560,6 +8587,7 @@ impl DeadLetterPayloadWriter {
         };
 
         let _guard = spool.lock_spool_mutation()?;
+        spool.assert_existing_managed_file(&self.source_path)?;
         spool.assert_managed_path(&self.temp_path)?;
         spool.assert_managed_path(&self.final_path)?;
         // Before mutating any prior partial handoff, prove the live temp path
@@ -8924,7 +8952,7 @@ fn write_dead_letter_meta(
     let _guard = spool.lock_spool_mutation()?;
     spool.assert_managed_path(&meta_path)?;
     spool.assert_managed_path(&tmp_path)?;
-    spool.assert_managed_path(source_path)?;
+    spool.assert_existing_managed_file(source_path)?;
     spool.evict_until_can_admit(bytes.len() as u64)?;
     // Measured after eviction: a reclaim that already deleted this record has
     // accounted for it, so re-measuring here cannot double-subtract.
@@ -11810,7 +11838,7 @@ fn finalize_replayed_spool_file(
     let meta_path = write_dead_letter_meta(spool, file, &meta)?;
     {
         let _guard = spool.lock_spool_mutation()?;
-        spool.assert_managed_path(file)?;
+        spool.assert_existing_managed_file(file)?;
         published_payload.revalidate(spool)?;
         let source_len = spool_regular_file_len(file);
         fs::remove_file(file).map_err(|error| {

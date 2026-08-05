@@ -8807,6 +8807,46 @@ fn probe_helpers_fail_closed_on_ceiling_starvation_and_invalid_rows() {
 }
 
 #[test]
+fn stale_dead_letter_claim_cannot_delete_completed_handoff() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-stale-dead-letter-claim")])
+        .unwrap();
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim should be acquired");
+    let stale_claim_path = claim.claim_path_for_tests().to_path_buf();
+    let row = br#"{"event_id":"evt-stale-dead-letter-claim"}"#;
+
+    let payload_path = publish_dead_letter_payload_for_tests(&spool, &stale_claim_path, row)
+        .expect("initial dead-letter payload should publish");
+    let payload_name = payload_path.file_name().unwrap().to_string_lossy();
+    let base = payload_name
+        .strip_suffix(".rejected.ndjson")
+        .expect("dead-letter payload suffix");
+    let meta_path = payload_path.with_file_name(format!("{base}.rejected.meta"));
+    fs::write(&meta_path, b"{}").expect("completed metadata should model a recovered peer handoff");
+    fs::remove_file(&stale_claim_path).expect("completed handoff removes source claim");
+
+    let error = publish_dead_letter_payload_for_tests(&spool, &stale_claim_path, row)
+        .expect_err("stale claim must not reopen dead-letter writer");
+    assert!(
+        error.contains("no longer exists"),
+        "unexpected stale-claim diagnostic: {error}"
+    );
+    assert!(
+        payload_path.exists(),
+        "stale peer must not delete completed rejected payload"
+    );
+    assert!(
+        meta_path.exists(),
+        "stale peer must not delete completed rejected metadata"
+    );
+}
+
+#[test]
 fn decode_spool_helper_and_path_swap_probe_fail_closed_on_missing_inputs() {
     let missing = std::env::temp_dir().join(format!(
         "ferrum-chargeback-missing-{}.ndjson",
