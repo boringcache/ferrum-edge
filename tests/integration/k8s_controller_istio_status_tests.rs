@@ -756,7 +756,9 @@ fn destination_rule_subset_scoped_idle_timeout_and_http2_max_requests_are_deferr
         );
     }
     assert!(
-        !deferred.iter().any(|label| label.contains("PendingRequests")),
+        !deferred
+            .iter()
+            .any(|label| label.contains("PendingRequests")),
         "subset http1MaxPendingRequests IS applied and must not be deferred: {deferred:?}"
     );
     // The top-level forms are applied; nothing may report the bare
