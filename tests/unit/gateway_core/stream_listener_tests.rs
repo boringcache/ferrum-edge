@@ -148,6 +148,81 @@ async fn ephemeral_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+/// Start a TCP stream-listener fixture on a fresh port, retrying only the
+/// demonstrated bind-and-release race from `ephemeral_port()`.
+///
+/// The production manager owns its listener bind, so the test cannot hand it a
+/// reservation. Another parallel test can therefore claim the released port
+/// between allocation and `reconcile()`. A failed attempt is retryable only
+/// when every reported failure is the expected `Port ... is already in use`
+/// error for that exact port; configuration, TLS, and lifecycle failures remain
+/// immediate test failures. Each attempt uses a new kernel-assigned port.
+async fn start_manager_on_fresh_tcp_port<F>(mut build_config: F) -> (StreamListenerManager, u16)
+where
+    F: FnMut(u16) -> GatewayConfig,
+{
+    const MAX_BIND_ATTEMPTS: usize = 8;
+
+    let mut bind_races = Vec::new();
+    for attempt in 1..=MAX_BIND_ATTEMPTS {
+        let port = ephemeral_port().await;
+        let config = build_config(port);
+        assert!(config.validate_stream_proxies().is_ok());
+
+        let manager = create_manager(config);
+        let failures = manager.reconcile().await;
+        if failures.is_empty() {
+            let started = manager
+                .wait_until_started(Duration::from_secs(5))
+                .await;
+            if started.is_ok() {
+                return (manager, port);
+            }
+
+            // Reconcile first probes the port, then the listener task performs
+            // the owning bind. A competing test can win that second, even
+            // narrower interval. Retry only when the manager's structured
+            // snapshot proves that exact EADDRINUSE class; a generic startup
+            // timeout or any other degradation remains a hard assertion.
+            let async_failures = manager.stream_bind_failures();
+            let only_async_port_collision = !async_failures.is_empty()
+                && async_failures.iter().all(|failure| {
+                    failure.listen_port == port
+                        && matches!(failure.kind, StreamListenerDegradation::BindFailed)
+                        && failure.error.contains("already in use")
+                });
+            manager.shutdown_all().await;
+            assert!(
+                only_async_port_collision,
+                "stream listener on fresh port {port} did not start: {started:?}; \
+                 failures={async_failures:?}"
+            );
+            bind_races.push(format!(
+                "attempt {attempt}, port {port}, async failures: {async_failures:?}"
+            ));
+            continue;
+        }
+
+        let expected_prefix = format!("Port {port} is already in use on ");
+        let only_released_port_collision =
+            failures.iter().all(|(_, failed_port, message)| {
+                *failed_port == port && message.starts_with(&expected_prefix)
+            });
+        manager.shutdown_all().await;
+        assert!(
+            only_released_port_collision,
+            "stream-listener setup failed for a reason other than the released-port race: {failures:?}"
+        );
+        bind_races.push(format!(
+            "attempt {attempt}, port {port}, reconcile failures: {failures:?}"
+        ));
+    }
+
+    panic!(
+        "could not acquire a frontend port after {MAX_BIND_ATTEMPTS} fresh, narrowly classified attempts: {bind_races:?}"
+    );
+}
+
 fn create_manager(config: GatewayConfig) -> StreamListenerManager {
     let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
     create_manager_with_config_arc(config_arc, &config)
@@ -291,33 +366,26 @@ async fn test_reconcile_starts_single_hosted_passthrough_as_sni_listener() {
 
 #[tokio::test]
 async fn shared_l4_catchall_is_grouped_and_preserves_declaration_order() {
-    let frontend_port = ephemeral_port().await;
     let constrained_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let catchall_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let constrained_backend_port = constrained_backend.local_addr().unwrap().port();
+    let catchall_backend_port = catchall_backend.local_addr().unwrap().port();
 
     // Put the catch-all first deliberately. Runtime planning must group it on
     // the shared socket without changing VirtualService first-match order.
-    let mut catchall = create_stream_proxy("catchall", BackendScheme::Tcp, frontend_port);
-    catchall.backend_port = catchall_backend.local_addr().unwrap().port();
-    let mut constrained = create_stream_proxy("constrained", BackendScheme::Tcp, frontend_port);
-    constrained.backend_port = constrained_backend.local_addr().unwrap().port();
-    constrain_to_loopback(&mut constrained);
-    let config = GatewayConfig {
-        proxies: vec![catchall, constrained],
-        ..empty_config()
-    };
-    assert!(config.validate_stream_proxies().is_ok());
-
-    let manager = create_manager(config);
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "catch-all and constrained candidates must share one listener: {failures:?}"
-    );
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .unwrap();
+    let (manager, frontend_port) = start_manager_on_fresh_tcp_port(|frontend_port| {
+        let mut catchall = create_stream_proxy("catchall", BackendScheme::Tcp, frontend_port);
+        catchall.backend_port = catchall_backend_port;
+        let mut constrained =
+            create_stream_proxy("constrained", BackendScheme::Tcp, frontend_port);
+        constrained.backend_port = constrained_backend_port;
+        constrain_to_loopback(&mut constrained);
+        GatewayConfig {
+            proxies: vec![catchall, constrained],
+            ..empty_config()
+        }
+    })
+    .await;
     let _client = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
         .await
         .unwrap();
@@ -341,28 +409,26 @@ async fn shared_l4_catchall_is_grouped_and_preserves_declaration_order() {
 
 #[tokio::test]
 async fn shared_l4_double_digit_ids_preserve_declaration_order() {
-    let frontend_port = ephemeral_port().await;
     let match_two_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let match_ten_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let match_two_backend_port = match_two_backend.local_addr().unwrap().port();
+    let match_ten_backend_port = match_ten_backend.local_addr().unwrap().port();
 
-    let mut match_two = create_stream_proxy("route-match-2", BackendScheme::Tcp, frontend_port);
-    match_two.backend_port = match_two_backend.local_addr().unwrap().port();
-    constrain_to_loopback(&mut match_two);
-    let mut match_ten = create_stream_proxy("route-match-10", BackendScheme::Tcp, frontend_port);
-    match_ten.backend_port = match_ten_backend.local_addr().unwrap().port();
-    constrain_to_loopback(&mut match_ten);
-    let config = GatewayConfig {
-        proxies: vec![match_two, match_ten],
-        ..empty_config()
-    };
-    assert!(config.validate_stream_proxies().is_ok());
-
-    let manager = create_manager(config);
-    assert!(manager.reconcile().await.is_empty());
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .unwrap();
+    let (manager, frontend_port) = start_manager_on_fresh_tcp_port(|frontend_port| {
+        let mut match_two =
+            create_stream_proxy("route-match-2", BackendScheme::Tcp, frontend_port);
+        match_two.backend_port = match_two_backend_port;
+        constrain_to_loopback(&mut match_two);
+        let mut match_ten =
+            create_stream_proxy("route-match-10", BackendScheme::Tcp, frontend_port);
+        match_ten.backend_port = match_ten_backend_port;
+        constrain_to_loopback(&mut match_ten);
+        GatewayConfig {
+            proxies: vec![match_two, match_ten],
+            ..empty_config()
+        }
+    })
+    .await;
     let _client = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
         .await
         .unwrap();
@@ -386,38 +452,36 @@ async fn shared_l4_double_digit_ids_preserve_declaration_order() {
 
 #[tokio::test]
 async fn passthrough_same_sni_double_digit_ids_preserve_declaration_order() {
-    let frontend_port = ephemeral_port().await;
     let match_two_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let match_ten_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let match_two_backend_port = match_two_backend.local_addr().unwrap().port();
+    let match_ten_backend_port = match_ten_backend.local_addr().unwrap().port();
 
-    let mut match_two = create_stream_proxy("route-match-2", BackendScheme::Tcp, frontend_port);
-    match_two.backend_port = match_two_backend.local_addr().unwrap().port();
-    match_two.passthrough = true;
-    match_two.hosts = vec!["secure.example.com".to_string()];
-    constrain_to_loopback(&mut match_two);
-    let mut match_ten = create_stream_proxy("route-match-10", BackendScheme::Tcp, frontend_port);
-    match_ten.backend_port = match_ten_backend.local_addr().unwrap().port();
-    match_ten.passthrough = true;
-    match_ten.hosts = vec!["secure.example.com".to_string()];
-    match_ten.stream_match = Some(StreamMatchCriteria {
-        arms: vec![StreamMatchArm {
-            source_subnets: vec!["127.0.0.1/32".to_string()],
-            ..Default::default()
-        }],
-    });
-    match_ten.normalize_fields();
-    let config = GatewayConfig {
-        proxies: vec![match_two, match_ten],
-        ..empty_config()
-    };
-    assert!(config.validate_stream_proxies().is_ok());
-
-    let manager = create_manager(config);
-    assert!(manager.reconcile().await.is_empty());
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .unwrap();
+    let (manager, frontend_port) = start_manager_on_fresh_tcp_port(|frontend_port| {
+        let mut match_two =
+            create_stream_proxy("route-match-2", BackendScheme::Tcp, frontend_port);
+        match_two.backend_port = match_two_backend_port;
+        match_two.passthrough = true;
+        match_two.hosts = vec!["secure.example.com".to_string()];
+        constrain_to_loopback(&mut match_two);
+        let mut match_ten =
+            create_stream_proxy("route-match-10", BackendScheme::Tcp, frontend_port);
+        match_ten.backend_port = match_ten_backend_port;
+        match_ten.passthrough = true;
+        match_ten.hosts = vec!["secure.example.com".to_string()];
+        match_ten.stream_match = Some(StreamMatchCriteria {
+            arms: vec![StreamMatchArm {
+                source_subnets: vec!["127.0.0.1/32".to_string()],
+                ..Default::default()
+            }],
+        });
+        match_ten.normalize_fields();
+        GatewayConfig {
+            proxies: vec![match_two, match_ten],
+            ..empty_config()
+        }
+    })
+    .await;
     let mut client = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
         .await
         .unwrap();
