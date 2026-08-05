@@ -267,12 +267,15 @@ fn start_gateway_with_extra_env(
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
         .env("FERRUM_ADMIN_HTTPS_PORT", "0")
-        // The auto-sized production default enables SO_REUSEPORT. Parallel
-        // subprocess tests could otherwise join the same released ephemeral
-        // proxy port and kernel-distribute a request to the wrong gateway.
+        // Match the shared functional harness: the production auto-sized
+        // default enables SO_REUSEPORT, so parallel subprocess tests can join
+        // one released ephemeral proxy port and kernel-distribute a request to
+        // the wrong gateway. One accept socket makes the second binder fail
+        // and lets the retry loop choose a genuinely free port. An explicit
+        // test override below remains authoritative.
         .env("FERRUM_ACCEPT_THREADS", "1")
-        // Readiness must identify this exact child, not merely any process that
-        // answered on the released proxy port.
+        // Prove readiness through this exact child instead of accepting any
+        // parallel gateway that happens to answer after bind/drop selection.
         .env("FERRUM_METRICS_BEARER_TOKEN", &observability_token)
         .env_remove("FERRUM_METRICS_ALLOWED_CIDRS")
         .env("RUST_LOG", "ferrum_edge=debug")
@@ -672,8 +675,8 @@ async fn wait_for_gateway(
 /// Prove both listeners belong to the subprocess selected by this attempt.
 ///
 /// The admin detail-tier probe is keyed by a per-attempt credential, so a
-/// foreign gateway cannot satisfy readiness. The h2c probe then establishes
-/// that this identified process also owns its proxy listener.
+/// foreign gateway cannot satisfy readiness. The subsequent h2c probe then
+/// establishes that this identified process has also bound its proxy listener.
 async fn wait_for_owned_gateway(
     gateway_port: u16,
     admin_port: u16,
