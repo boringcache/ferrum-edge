@@ -955,7 +955,10 @@ fn is_ferrum_policy_ancestor(ancestor: &Value) -> bool {
 /// One `ancestorRef` field, with an absent optional field read as empty so a
 /// server-normalized live entry still matches the desired one.
 fn ancestor_ref_field<'a>(ancestor_ref: &'a Value, field: &str) -> &'a str {
-    ancestor_ref.get(field).and_then(Value::as_str).unwrap_or("")
+    ancestor_ref
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or("")
 }
 
 /// Field-wise `ancestorRef` identity.
@@ -12381,11 +12384,15 @@ mod tests {
         let foreign = "example.com/other-controller";
         let ferrum = "ferrum.io/gateway-controller";
         assert!(
-            ancestors.iter().any(|entry| entry["controllerName"] == foreign),
+            ancestors
+                .iter()
+                .any(|entry| entry["controllerName"] == foreign),
             "a foreign controller's ancestor must survive Ferrum's apply document"
         );
         assert!(
-            ancestors.iter().any(|entry| entry["controllerName"] == ferrum),
+            ancestors
+                .iter()
+                .any(|entry| entry["controllerName"] == ferrum),
             "Ferrum still reports its own ancestor"
         );
 
