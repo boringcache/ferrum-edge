@@ -543,22 +543,14 @@ plugin_configs: []
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn dtls_passthrough_sni_routes_to_correct_backend() {
-    // Backend A: records every datagram it sees. Accepts 1 datagram.
+    // Keep both backend sockets bound while the gateway starts. The gateway
+    // helper may spend up to 20 seconds on a failed health-check attempt;
+    // spawning the scripted backends before it returns would let their
+    // 10-second expect deadlines expire and drop the sockets before a retry.
     let res_a = reserve_udp_port().await.expect("reserve a");
     let backend_a_port = res_a.port;
-    let backend_a = ScriptedUdpBackend::builder(res_a.into_socket())
-        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
-        .spawn()
-        .expect("spawn backend a");
-
-    // Backend B: records every datagram it sees. Expects nothing —
-    // we'll assert `received_datagrams().is_empty()`.
     let res_b = reserve_udp_port().await.expect("reserve b");
     let backend_b_port = res_b.port;
-    let backend_b = ScriptedUdpBackend::builder(res_b.into_socket())
-        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
-        .spawn()
-        .expect("spawn backend b");
 
     // Two passthrough proxies sharing a frontend listen_port. The
     // `stream_listener` reconciler groups them into a single
@@ -593,6 +585,18 @@ plugin_configs: []
     };
     let fx = start_gateway_with_retry(build_yaml, Vec::new(), true).await;
     let gateway_addr: SocketAddr = format!("127.0.0.1:{}", fx.udp_port).parse().unwrap();
+
+    // Start the scripts only after the gateway is ready. Backend A expects
+    // the routed ClientHello. Backend B deliberately stays silent while
+    // recording any misrouted datagram for the assertion below.
+    let backend_a = ScriptedUdpBackend::builder(res_a.into_socket())
+        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
+        .spawn()
+        .expect("spawn backend a");
+    let backend_b = ScriptedUdpBackend::builder(res_b.into_socket())
+        .step(UdpStep::Silence(Duration::from_secs(5)))
+        .spawn()
+        .expect("spawn backend b");
 
     // Craft a DTLS 1.2 ClientHello with SNI = backend-a.test and
     // send it to the gateway. The gateway peeks SNI, routes to
