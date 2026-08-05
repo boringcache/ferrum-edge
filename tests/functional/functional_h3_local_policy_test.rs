@@ -52,8 +52,10 @@ async fn functional_h3_local_policy_pending_cap_rejects_before_backend_admission
         "second request should be shed by the local pending cap, got {second:?}"
     );
     assert!(
-        second.body_text().contains("pending request queue full"),
-        "local pending-cap response must not be masked by backend admission or retry: {:?}",
+        second
+            .body_text()
+            .contains("in-flight request limit reached"),
+        "local in-flight-cap response must not be masked by backend admission or retry: {:?}",
         second.body_text()
     );
     assert_backend_hits_eq(&backend_hits, 1, Duration::from_millis(250)).await;

@@ -1408,13 +1408,14 @@ fn translate_connection_pool_http(
         None => None,
     };
 
-    // `http1MaxPendingRequests` — the HTTP/1.1 connection-pending-queue cap.
-    // Validated as a positive integer like the other uint32 knobs (zero
-    // rejected: a `0` pending cap would shed every H1 request, which is not
-    // what an operator setting a pending budget means). Applied at runtime as
-    // a per-`(host, port, subset)` pending gate on the reqwest/H1 dispatch path (503
-    // "upstream overflow" when full); see `Proxy.pool_http1_max_pending_requests`
-    // and `src/backend_pending_limit.rs`. No longer deferred at top-level/port.
+    // `http1MaxPendingRequests` — honestly reinterpreted as a concurrent
+    // in-flight HTTP/1.1 request cap because reqwest exposes no true
+    // connection-pending-queue hook. Validated as a positive integer like the
+    // other uint32 knobs (zero would shed every H1 request). Applied at runtime
+    // as a per-`(host, policy port, selected subset)` in-flight gate on the
+    // reqwest/H1 dispatch path (503 "upstream overflow" when full); see
+    // `Proxy.pool_http1_max_pending_requests` and
+    // `src/backend_pending_limit.rs`. No longer deferred at top-level/port.
     let http1_max_pending_requests = match http.get("http1MaxPendingRequests") {
         Some(v) => Some(translate_http_uint32(
             object,

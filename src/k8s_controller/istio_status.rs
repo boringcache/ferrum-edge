@@ -2280,8 +2280,9 @@ mod tests {
     #[test]
     fn destination_rule_port_level_http1_max_pending_requests_is_applied_not_deferred() {
         // F5.1 final knob: `http1MaxPendingRequests` is now PROJECTED and
-        // ENFORCED at top-level / `portLevelSettings` (per-`(host,port)` pending
-        // gate on the reqwest/H1 path), so it must NOT appear in
+        // ENFORCED at top-level / `portLevelSettings` as a per-`(host, policy
+        // port, selected subset)` concurrent in-flight gate on the reqwest/H1
+        // path, so it must NOT appear in
         // `deferred_fields` at port level. `maxRequestsPerConnection` remains
         // the only universally deferred connectionPool.http knob.
         let obj = object(

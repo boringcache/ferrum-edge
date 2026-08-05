@@ -5751,8 +5751,8 @@ pub struct ProxyState {
     /// Per-destination in-flight-request limiter enforcing DestinationRule
     /// `connectionPool.http.http1MaxPendingRequests` on the reqwest/HTTP-1.1
     /// backend-dispatch path. Bounds how many requests can be simultaneously
-    /// in flight for a `(host, port, selected subset)`; an over-cap request
-    /// is shed with a 503 ("upstream overflow") before backend dispatch
+    /// in flight for a `(host, policy port, selected subset)`; an over-cap
+    /// request is shed with a 503 ("upstream overflow") before backend dispatch
     /// via an RAII [`crate::backend_pending_limit::BackendPendingGuard`] held
     /// only until dispatch returns. HTTP/1.1-scoped: the multiplexed transports
     /// (direct H2, gRPC, H3, HBONE, mesh-mTLS) do NOT consume it — their
@@ -33341,7 +33341,8 @@ pub(crate) async fn proxy_to_backend_retry(
     }
 
     // DestinationRule `connectionPool.http.http1MaxPendingRequests`: re-enter the
-    // same per-`(host, policy-port)` pending gate as the initial attempt
+    // same per-`(host, policy port, selected subset)` in-flight gate as the
+    // initial attempt
     // (`proxy_to_backend`). The initial attempt's slot was already released
     // before the retry loop ran (it drops the moment that attempt's `send()`
     // returns), so a retry no longer overlaps it — without acquiring here, a
@@ -33370,8 +33371,8 @@ pub(crate) async fn proxy_to_backend_retry(
                 proxy_id = %proxy.id,
                 backend_host = %effective_host,
                 backend_port = retry_dial_port,
-                pending_requests = limit.current,
-                max_pending_requests = limit.cap,
+                in_flight_requests = limit.current,
+                max_in_flight_requests = limit.cap,
                 "Shedding HTTP/1.1 retry: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
             );
             // Gateway-side capacity shed before the retry dial: classify
@@ -33384,7 +33385,7 @@ pub(crate) async fn proxy_to_backend_retry(
             return retry::BackendResponse {
                 status_code: 503,
                 body: ResponseBody::buffered(
-                    r#"{"error":"Upstream pending request queue full"}"#
+                    r#"{"error":"HTTP/1.1 in-flight request limit reached"}"#
                         .as_bytes()
                         .to_vec(),
                 ),
@@ -35705,15 +35706,15 @@ async fn proxy_to_backend(
                 proxy_id = %proxy.id,
                 backend_host = %effective_host,
                 backend_port = pending_dial_port,
-                pending_requests = limit.current,
-                max_pending_requests = limit.cap,
+                in_flight_requests = limit.current,
+                max_in_flight_requests = limit.cap,
                 "Shedding HTTP/1.1 request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
             );
             return backend_dispatch_response(
                 retry::BackendResponse {
                     status_code: 503,
                     body: ResponseBody::buffered(
-                        r#"{"error":"Upstream pending request queue full"}"#
+                        r#"{"error":"HTTP/1.1 in-flight request limit reached"}"#
                             .as_bytes()
                             .to_vec(),
                     ),

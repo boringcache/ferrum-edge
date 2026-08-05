@@ -1379,8 +1379,8 @@ where
                 proxy_id = %dispatch_proxy.id,
                 backend_host = %effective_host,
                 backend_port = dispatch_dial_port,
-                pending_requests = limit.current,
-                max_pending_requests = limit.cap,
+                in_flight_requests = limit.current,
+                max_in_flight_requests = limit.cap,
                 "Shedding cross-protocol H3→HTTP request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
             );
             record_backend_outcome_no_conn_end(
@@ -1404,7 +1404,7 @@ where
                 stream,
                 ctx,
                 StatusCode::SERVICE_UNAVAILABLE,
-                r#"{"error":"Upstream pending request queue full"}"#,
+                r#"{"error":"HTTP/1.1 in-flight request limit reached"}"#,
                 None,
                 backend_start,
                 bytes_sent,

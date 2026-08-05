@@ -303,8 +303,8 @@ async fn functional_subset_http1_pending_admission_is_subset_isolated() {
     );
     let shed_body = shed.text().await.unwrap_or_default();
     assert!(
-        shed_body.contains("pending request queue full") || shed_body.contains("upstream overflow"),
-        "pending-cap response body should identify the shed: {shed_body}"
+        shed_body.contains("in-flight request limit reached"),
+        "in-flight-cap response body should identify the shed honestly: {shed_body}"
     );
     assert_eq!(
         hits.load(Ordering::SeqCst),
