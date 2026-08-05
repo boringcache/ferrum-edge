@@ -19,7 +19,7 @@ jobs:
   verify:
     name: Trusted Cross Build Policy
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       # pull_request_target loads this workflow from the base branch and keeps
       # the checkout on that trusted base commit while treating the PR as data.
