@@ -530,31 +530,29 @@ Claim disposition:
 - **Descriptor lost / pathname unproven** — the claim remains inert under its
   `.inflight` name, remains counted in owned spool usage, and is reported for
   operator verification and reconciliation. It is never automatically restored.
-  A substituted regular file or a completed (missing) claim additionally
-  authorizes no rejected-payload or rejected-metadata publication: those final
-  renames can replace existing evidence and are destructive mutations too. A
-  planted non-file (for example a directory) is the one narrow exception, and
-  only for evidence that is purely constructive: the rejected rows already read
-  from this replay's own validated descriptor may still be published, but only
-  while no `.rejected.*` sibling exists to clobber, and never with any unlink,
-  replacement, release, or accounting against the replaced pathname. Otherwise a
-  same-UID actor could suppress the audit trail for permanently rejected rows
-  just by planting a directory. That emptiness proof only ever accepts an
-  explicit "absent" answer — a sibling lookup that fails for any other reason
-  (permissions, I/O) leaves it unknown whether evidence is already published and
-  therefore authorizes nothing.
 
-  The admission is not a licence to clobber later either. Both halves of a
-  constructive-only handoff — the `.rejected.ndjson` payload and the
-  `.rejected.meta` record — are published **create-only**: the completed,
-  fsynced temp is linked into place in a single kernel operation that refuses an
-  occupied name, and the temp alias is then dropped by exact node identity so the
-  published file keeps exactly one link. A same-UID peer that takes either name
-  in the window between the authorization check and the publication is refused,
-  never overwritten, and rollback of a create-only publish never unlinks the
-  final. Recovery driven by the exact pinned claim keeps its deliberate
-  replace-and-account behavior, because that claim genuinely owns the derived
-  sibling namespace.
+  Dead-letter publication is authorized by exactly one predicate: the claim
+  pathname still resolves, under the namespace mutation lock, to the pinned
+  descriptor this replay opened and validated. Every other state — a missing
+  (completed) claim, a same-UID substituted regular file, a planted non-file such
+  as a directory, and a classification that cannot be completed at all — fails
+  closed with no exception. There is no weaker "constructive evidence is
+  harmless" admission, because the `.rejected.ndjson` and `.rejected.meta` names
+  are *derived from the claim pathname*: a handoff that can no longer prove it
+  owns that pathname owns none of the names derived from it either, and shape is
+  not authority.
+
+  On any non-live state nothing at all happens for that handoff: no handoff temp
+  is created or opened, no rejected row is admitted or appended, no quota
+  candidate is evicted on its behalf, no sibling is removed or replaced, no
+  payload or metadata final is published, no maintained usage accounting changes,
+  and the claim is not released, promoted, quarantined, removed, or accounted.
+  No further external delivery is attempted for it. The hostile pathname is left
+  exactly as found, for operator reconciliation.
+
+  Recovery driven by the exact pinned claim keeps its deliberate replace, unlink,
+  and account-out behavior, because that claim genuinely owns the derived sibling
+  namespace.
 
 Claim candidates that cannot be pinned at all are isolated rather than allowed
 to abort a replay tick. An artifact that is not a single-linked regular file
@@ -663,12 +661,11 @@ fields are never logged.
   derived from a compressed source never transiently exceeds
   `spool.max_bytes`. A quota refusal removes the temp and restores the
   authoritative source for a later/operator-assisted attempt. The completed
-  temp is fsynced, atomically published, and directory-fsynced before the sibling
+  temp is fsynced, atomically renamed, and directory-fsynced before the sibling
   `.rejected.meta` document is published; only then is the authoritative source
-  removed. Publication is a replacing rename only when the exact pinned claim
-  authorized it; the constructive-only disposition above publishes create-only
-  instead. The metadata contains the payload filename, byte length, SHA-256,
-  aggregate
+  removed. That publishing rename is reached only after the exact pinned claim
+  authorized it. The metadata contains the payload filename, byte length,
+  SHA-256, aggregate
   `rejected_rows`, safe `outcomes` (`reason`, optional `http_status`, and
   `row_count`), and `quarantined_at_unix`. Rejections are accumulated into a
   fixed-size per-status tally whose footprint is independent of the artifact's
@@ -678,14 +675,16 @@ fields are never logged.
   credentials, or charge-record fields. The payload file intentionally contains
   original billing rows and must remain access-controlled. If any payload,
   metadata, quota, or source-removal step fails, the original file remains
-  replayable. The claim is re-authorized under the namespace lock before opening
-  the handoff, before every payload append, before the payload publication,
-  before metadata publication, and before source removal. Only the exact pinned
-  claim authorizes the destructive half, so a missing, substituted, or planted
-  pathname can never replace completed evidence merely by colliding with its
-  derived final pathname. While the source remains authoritative, a later attempt
-  removes prior partial metadata/payload siblings under the namespace lock before
-  rebuilding them, so recovery does not require quota for two rejected payloads.
+  replayable. The claim is re-proved against the pinned descriptor under the
+  namespace lock before opening the handoff, before every payload append, before
+  the payload rename, before metadata publication, and before source removal —
+  each boundary on its own, never inheriting an earlier one's proof. Only the
+  exact pinned claim authorizes any of them, so a missing, substituted, or
+  planted pathname can never create, replace, or account for anything in the
+  namespace derived from it. While the source remains authoritative, a later
+  attempt removes prior partial metadata/payload siblings under the namespace
+  lock before rebuilding them, so recovery does not require quota for two
+  rejected payloads.
   Successfully inserted rows may be retried with their unchanged `event_id`
   idempotency identity.
 - Temps left by an interrupted atomic write are reconciled only when this process

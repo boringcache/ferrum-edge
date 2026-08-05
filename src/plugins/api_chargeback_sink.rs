@@ -5750,34 +5750,6 @@ pub enum SpoolFsFault {
     /// interleaving in which a path-based rollback would unlink an entry this
     /// attempt no longer owns.
     PeerRepublishThenDirSync,
-    /// The existence probe for a `.rejected.*` sibling fails with something
-    /// other than `NotFound`. Models an unreadable pathname that must never be
-    /// mistaken for an absent one when a constructive-only publication is
-    /// authorized.
-    SiblingLookup,
-    /// A peer creates the dead-letter final between this attempt's
-    /// authorization check and its create-only publication. Models exactly the
-    /// check-to-publish window a replacing `rename` would clobber.
-    PeerOccupiesFinalBeforePublish,
-    /// The create-only publication itself fails. Models rollback of a
-    /// constructive-only handoff that never reached its final name.
-    CreateOnlyPublish,
-}
-
-/// How a completed temp becomes the durable final entry.
-///
-/// The distinction is a security boundary, not a performance one: `rename`
-/// replaces whatever the final name currently resolves to, so it may only be
-/// used where this attempt has proven it owns that name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpoolPublishMode {
-    /// Replace the final entry. Authorized only by the exact pinned claim,
-    /// which is what makes the `.rejected.*` sibling namespace this handoff's
-    /// to overwrite.
-    Replace,
-    /// Publish only if the final name does not already exist, in one kernel
-    /// operation that cannot be split into a check and a mutation.
-    CreateOnly,
 }
 
 /// Whether this write attempt exclusively owns the name it publishes to.
@@ -5811,20 +5783,10 @@ pub enum SpoolFinalOwnership {
 struct SpoolFsOps {
     sync_file: fn(&File, &Path) -> Result<(), String>,
     rename: fn(&Path, &Path) -> Result<(), String>,
-    /// Create-only publication of a fully written temp at its final name.
-    link: fn(&Path, &Path) -> Result<(), String>,
-    /// Runs immediately BEFORE a create-only publication. Production wires it to
-    /// a no-op; tests use it to occupy the final path in the exact window
-    /// between this attempt's authorization check and its publication.
-    before_publish: fn(&Path),
     /// Runs immediately after a successful rename. Production wires it to a
     /// no-op; tests use it to interleave a peer republication of the final path
     /// between this attempt's rename and its parent-directory fsync.
     after_rename: fn(&Path),
-    /// Non-following existence probe for a `.rejected.*` sibling. Production
-    /// wires it to `fs::symlink_metadata`; tests inject a non-`NotFound`
-    /// failure to prove authorization fails closed on an unreadable pathname.
-    lookup: fn(&Path) -> std::io::Result<fs::Metadata>,
     open_dir: fn(&Path) -> Result<File, String>,
     sync_dir: fn(&File, &Path) -> Result<(), String>,
 }
@@ -5833,10 +5795,7 @@ impl SpoolFsOps {
     const REAL: Self = Self {
         sync_file: real_sync_spool_file,
         rename: real_rename_spool_file,
-        link: real_link_spool_file,
-        before_publish: noop_before_publish,
         after_rename: noop_after_rename,
-        lookup: real_lookup_spool_path,
         open_dir: real_open_spool_dir,
         sync_dir: real_sync_spool_dir,
     };
@@ -5853,19 +5812,12 @@ impl SpoolFsOps {
                 ops.after_rename = republish_final_path_as_peer;
                 ops.sync_dir = fail_sync_spool_dir;
             }
-            SpoolFsFault::SiblingLookup => ops.lookup = fail_lookup_spool_path,
-            SpoolFsFault::PeerOccupiesFinalBeforePublish => {
-                ops.before_publish = occupy_final_path_as_peer;
-            }
-            SpoolFsFault::CreateOnlyPublish => ops.link = fail_link_spool_file,
         }
         ops
     }
 }
 
 fn noop_after_rename(_final_path: &Path) {}
-
-fn noop_before_publish(_final_path: &Path) {}
 
 fn real_sync_spool_file(file: &File, path: &Path) -> Result<(), String> {
     file.sync_all().map_err(|error| {
@@ -5884,41 +5836,6 @@ fn real_rename_spool_file(from: &Path, to: &Path) -> Result<(), String> {
             to.display()
         )
     })
-}
-
-/// Publish `from` at `to` without ever replacing an existing entry.
-///
-/// A same-filesystem hard link is the only primitive that publishes a complete
-/// file under a new name and refuses an occupied name in a single kernel
-/// operation. `rename` cannot express "only if absent", and a stat-then-rename
-/// pair is not atomic: a same-UID peer can create the final between the two and
-/// have its file silently replaced.
-///
-/// Both names are siblings under the managed namespace, so this is always a
-/// same-filesystem link. Where the platform or volume cannot create one at all,
-/// the publication fails closed and the authoritative source stays replayable —
-/// which is the correct residual, since this mode is only ever reached after a
-/// same-UID actor has already interfered with the claim pathname.
-fn real_link_spool_file(from: &Path, to: &Path) -> Result<(), String> {
-    fs::hard_link(from, to).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            format!(
-                "{PLUGIN_NAME}: refusing to replace existing spool artifact '{}' while publishing '{}' without clobbering",
-                to.display(),
-                from.display()
-            )
-        } else {
-            format!(
-                "{PLUGIN_NAME}: failed to publish spool temp file '{}' at '{}' without clobbering: {error}",
-                from.display(),
-                to.display()
-            )
-        }
-    })
-}
-
-fn real_lookup_spool_path(path: &Path) -> std::io::Result<fs::Metadata> {
-    fs::symlink_metadata(path)
 }
 
 fn real_open_spool_dir(path: &Path) -> Result<File, String> {
@@ -5982,42 +5899,6 @@ fn republish_final_path_as_peer(final_path: &Path) {
 #[doc(hidden)]
 #[allow(dead_code)]
 pub const PEER_REPUBLISH_MARKER: &[u8] = b"{\"peer_republished\":true}\n";
-
-/// Occupy the final path a create-only publication is about to claim, as a
-/// same-UID peer racing this attempt would. Created exclusively, so the seam
-/// itself can never clobber and a surviving marker proves this attempt did not
-/// replace it either.
-#[allow(dead_code)] // reachable only through the test-only faulted constructors
-fn occupy_final_path_as_peer(final_path: &Path) {
-    let _ = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(final_path)
-        .and_then(|mut file| file.write_all(PEER_OCCUPANT_MARKER));
-}
-
-/// Contents written by [`occupy_final_path_as_peer`]; asserted by tests that
-/// check a peer's entry survived another writer's create-only publication.
-#[doc(hidden)]
-#[allow(dead_code)]
-pub const PEER_OCCUPANT_MARKER: &[u8] = b"{\"peer_occupied\":true}\n";
-
-#[allow(dead_code)] // reachable only through the test-only faulted constructors
-fn fail_link_spool_file(from: &Path, to: &Path) -> Result<(), String> {
-    Err(format!(
-        "{PLUGIN_NAME}: injected fault: failed to publish spool temp file '{}' at '{}' without clobbering",
-        from.display(),
-        to.display()
-    ))
-}
-
-#[allow(dead_code)] // reachable only through the test-only faulted constructors
-fn fail_lookup_spool_path(path: &Path) -> std::io::Result<fs::Metadata> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        format!("injected fault: cannot lstat '{}'", path.display()),
-    ))
-}
 
 #[allow(dead_code)] // reachable only through the test-only faulted constructors
 fn fail_sync_spool_dir(_dir: &File, path: &Path) -> Result<(), String> {
@@ -6271,13 +6152,12 @@ fn directory_is_within_canonical_root(canonical_root: &Path, dir: &Path) -> Resu
 /// artifact this handoff opened, so [`ManagedClaimState::ReplacedRegularFile`]
 /// is kept distinct from [`ManagedClaimState::LiveClaim`]. Missing and
 /// wrong-type claims stay distinct from both so diagnostics can distinguish a
-/// completed handoff from hostile interference, and so evidence publication is
-/// not gated on the same predicate that protects completed `.rejected.*`
-/// siblings and the terminal claim unlink. No state but
-/// [`ManagedClaimState::LiveClaim`] ever authorizes replacing, unlinking, or
-/// accounting out a sibling; see
-/// [`SpoolManager::authorize_dead_letter_publication`] for the one narrowly
-/// admitted constructive case.
+/// completed handoff from hostile interference. No state but
+/// [`ManagedClaimState::LiveClaim`] ever authorizes creating, replacing,
+/// unlinking, publishing, or accounting a claim pathname or any of its derived
+/// siblings; see [`SpoolManager::require_live_claim`], which is the single
+/// predicate every destructive and every constructive dead-letter step goes
+/// through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedClaimState {
     /// The claim pathname still resolves to the exact pinned authoritative
@@ -7148,7 +7028,6 @@ impl SpoolManager {
                 bytes.as_slice(),
                 self.fs_ops,
                 SpoolFinalOwnership::Unique,
-                SpoolPublishMode::Replace,
             )
         };
         write_result?;
@@ -7417,9 +7296,10 @@ impl SpoolManager {
     ///   unlink durable siblings or the claim pathname, and refuse to open a new
     ///   writer against the stale claim.
     /// - [`ManagedClaimState::NotRegularFile`]: hostile interference at the
-    ///   claim path. Skip every mutation of that pathname and of every existing
-    ///   sibling; only a clobber-free publication of evidence read from the
-    ///   already-open authoritative descriptor may still complete.
+    ///   claim path. Skip every mutation of that pathname, of every existing
+    ///   sibling, and of the derived `.rejected.*` namespace: shape is not
+    ///   authority, and nothing about the substituted pathname proves this
+    ///   handoff still owns the names derived from it.
     /// - [`ManagedClaimState::ReplacedRegularFile`]: same-UID substitution of a
     ///   *different* regular file at the claim pathname — or an extra hard link
     ///   on the pinned inode. Shape is not authority, and the replacement may be
@@ -7472,6 +7352,16 @@ impl SpoolManager {
     /// cannot be completed is [`ClaimMutationError::Unauthorized`] as well: an
     /// unproven claim never authorizes a mutation. If the live descriptor is
     /// later lost, the claim stays inert for operator reconciliation.
+    ///
+    /// This is also the authorization predicate for dead-letter *publication*.
+    /// The `.rejected.ndjson` / `.rejected.meta` namespace is derived from the
+    /// claim pathname, so publishing into it is only this handoff's to do while
+    /// that pathname still names the exact artifact this handoff opened. There
+    /// is deliberately no weaker "constructive-only" admission for a wrong-type
+    /// or otherwise unproven pathname: a state that cannot authorize the
+    /// destructive half cannot authorize creating a handoff temp, appending to
+    /// it, evicting quota candidates for it, or publishing a final under a name
+    /// it does not own either.
     fn require_live_claim(
         &self,
         path: &Path,
@@ -7485,76 +7375,6 @@ impl SpoolManager {
             ))),
             Err(error) => Err(ClaimMutationError::Unauthorized(error)),
         }
-    }
-
-    /// Authorize one step of a dead-letter publication transaction.
-    ///
-    /// The returned state tells the caller whether the *destructive* half is
-    /// authorized as well: only [`ManagedClaimState::LiveClaim`] may unlink or
-    /// replace a completed `.rejected.*` sibling, account bytes out of the owned
-    /// inventory, or perform the terminal claim operation.
-    ///
-    /// [`ManagedClaimState::NotRegularFile`] is admitted for the constructive
-    /// half alone, and only while no `replaceable` sibling exists. A directory or
-    /// other non-file planted at the claim pathname can never be a data file, a
-    /// claim marker, or any other honest handoff's artifact, so it does not make
-    /// the derived `<data-name>.rejected.*` namespace somebody else's; the rows
-    /// being written come from the descriptor this replay opened and validated,
-    /// not from the replaced pathname. Refusing here instead would let a
-    /// same-UID actor suppress the audit trail for rows the gateway has already
-    /// permanently rejected, simply by planting a directory. Nothing about the
-    /// replaced pathname is mutated, released, removed, or accounted either way.
-    ///
-    /// [`ManagedClaimState::Missing`] (the handoff already completed elsewhere)
-    /// and [`ManagedClaimState::ReplacedRegularFile`] (a same-UID regular file
-    /// that may be another live handoff's data artifact for this exact name)
-    /// authorize nothing at all.
-    ///
-    /// The `replaceable` emptiness proof is an authorization input, so only
-    /// `NotFound` counts as absence. A permission, I/O, or any other lookup
-    /// failure leaves it unknown whether evidence is already published there,
-    /// and an unknown answer must never authorize a publication into that
-    /// namespace. This admission is also not a licence to clobber later: the
-    /// constructive-only publication that follows is create-only, so a peer
-    /// that occupies the name after this check still cannot be replaced.
-    fn authorize_dead_letter_publication(
-        &self,
-        source: &Path,
-        artifact: &PinnedClaimArtifact,
-        replaceable: &[&Path],
-    ) -> Result<ManagedClaimState, ClaimMutationError> {
-        let state = self
-            .managed_claim_state(source, artifact)
-            .map_err(ClaimMutationError::Unauthorized)?;
-        if state == ManagedClaimState::LiveClaim {
-            return Ok(state);
-        }
-        if state == ManagedClaimState::NotRegularFile {
-            let mut occupied = false;
-            for path in replaceable.iter().copied() {
-                match (self.fs_ops.lookup)(path) {
-                    Ok(_) => {
-                        occupied = true;
-                        break;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(ClaimMutationError::Unauthorized(format!(
-                            "{PLUGIN_NAME}: refusing to publish dead-letter evidence for spool claim '{}': failed to lstat existing dead-letter sibling '{}': {error}",
-                            source.display(),
-                            path.display()
-                        )));
-                    }
-                }
-            }
-            if !occupied {
-                return Ok(state);
-            }
-        }
-        Err(ClaimMutationError::Unauthorized(format!(
-            "{PLUGIN_NAME}: refusing to mutate spool claim '{}': the pathname no longer resolves to the authoritative claimed artifact",
-            source.display()
-        )))
     }
 
     fn meta_path(&self) -> PathBuf {
@@ -7594,7 +7414,6 @@ impl SpoolManager {
             &bytes,
             self.fs_ops,
             SpoolFinalOwnership::Shared,
-            SpoolPublishMode::Replace,
         )
     }
 
@@ -9178,16 +8997,13 @@ impl DeadLetterPayloadWriter {
         let (_, prior_meta_path) = dead_letter_meta_paths(source_path)?;
         let _guard = spool.lock_spool_mutation()?;
         // Opening begins a publication transaction whose later rename may
-        // replace a completed sibling. Authorize it up front: the exact pinned
-        // claim authorizes the whole transaction, a planted non-file authorizes
-        // only the constructive half over an empty sibling set, and a missing or
-        // substituted regular pathname authorizes nothing.
-        let claim_state = spool
-            .authorize_dead_letter_publication(
-                source_path,
-                artifact,
-                &[prior_meta_path.as_path(), final_path.as_path()],
-            )
+        // replace a completed sibling, and whose temp already consumes owned
+        // quota. Require the exact pinned claim up front; a missing, wrong-type,
+        // or substituted pathname authorizes no part of that transaction, so no
+        // temp is created, no quota candidate is evicted for it, and no sibling
+        // is touched.
+        spool
+            .require_live_claim(source_path, artifact)
             .map_err(ClaimMutationError::into_message)?;
         spool.assert_managed_path(&temp_path)?;
         spool.assert_managed_path(&final_path)?;
@@ -9198,16 +9014,9 @@ impl DeadLetterPayloadWriter {
         // handoff artifacts under the namespace lock before rebuilding so
         // recovery never needs quota for two complete rejected payloads and
         // never evicts unrelated active spool data merely to duplicate one.
-        // Only the exact pinned claim authorizes that destructive cleanup; every
-        // other admitted state iterates an empty set (and was admitted only
-        // because no such sibling exists), so the body stays shared.
-        let authorized_siblings = [(&prior_meta_path, "metadata"), (&final_path, "payload")];
-        let prior_siblings: &[(&PathBuf, &str)] = if claim_state == ManagedClaimState::LiveClaim {
-            &authorized_siblings
-        } else {
-            &authorized_siblings[..0]
-        };
-        for (path, kind) in prior_siblings.iter().copied() {
+        // Only the exact pinned claim reaches this cleanup.
+        let prior_siblings = [(&prior_meta_path, "metadata"), (&final_path, "payload")];
+        for (path, kind) in prior_siblings {
             let removed_len = spool_regular_file_len(path);
             match fs::remove_file(path) {
                 Ok(()) => {
@@ -9280,14 +9089,10 @@ impl DeadLetterPayloadWriter {
         })?;
         let _guard = spool.lock_spool_mutation()?;
         // Admission may evict other replayable files, and the append mutates
-        // this handoff's temp. Re-authorize the publication before either action;
+        // this handoff's temp. Revalidate the exact claim before either action;
         // a substitution between delivery chunks authorizes neither.
         spool
-            .authorize_dead_letter_publication(
-                &self.source_path,
-                artifact,
-                &[self.final_path.as_path()],
-            )
+            .require_live_claim(&self.source_path, artifact)
             .map_err(ClaimMutationError::into_message)?;
         spool.assert_managed_path(&self.temp_path)?;
         spool.assert_managed_path(&self.final_path)?;
@@ -9347,19 +9152,13 @@ impl DeadLetterPayloadWriter {
 
         let _guard = spool.lock_spool_mutation()?;
         // The final rename can replace an existing payload and is destructive
-        // even when no explicit cleanup runs. Authorize the whole publish under
-        // the namespace lock, naming that replaceable final: a state admitted
-        // only for constructive publication can never reach a rename that would
-        // clobber an existing sibling.
+        // even when no explicit cleanup runs. Bind the entire publish to the
+        // exact pinned claim, under the namespace lock.
         spool.assert_managed_path(&self.source_path)?;
         spool.assert_managed_path(&self.temp_path)?;
         spool.assert_managed_path(&self.final_path)?;
-        let claim_state = spool
-            .authorize_dead_letter_publication(
-                &self.source_path,
-                artifact,
-                &[self.final_path.as_path()],
-            )
+        spool
+            .require_live_claim(&self.source_path, artifact)
             .map_err(ClaimMutationError::into_message)?;
         // Before mutating any prior partial handoff, prove the live temp path
         // still names the descriptor whose completed metadata we captured at
@@ -9385,21 +9184,19 @@ impl DeadLetterPayloadWriter {
         // since the claim was validated: a missing, non-file, or substituted
         // claim must not authorize that unlink (completed handoff, hostile
         // directory plant, planted regular file).
-        if claim_state == ManagedClaimState::LiveClaim {
-            let replaced_payload_len = spool_regular_file_len(&self.final_path);
-            match fs::remove_file(&self.final_path) {
-                Ok(()) => {
-                    if let Some(len) = replaced_payload_len {
-                        spool.usage.account_sub(1, len);
-                    }
+        let replaced_payload_len = spool_regular_file_len(&self.final_path);
+        match fs::remove_file(&self.final_path) {
+            Ok(()) => {
+                if let Some(len) = replaced_payload_len {
+                    spool.usage.account_sub(1, len);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "{PLUGIN_NAME}: failed to replace prior dead-letter payload '{}': {error}",
-                        self.final_path.display()
-                    ));
-                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: failed to replace prior dead-letter payload '{}': {error}",
+                    self.final_path.display()
+                ));
             }
         }
         // The temp and still-authoritative source are both present in the
@@ -9407,7 +9204,7 @@ impl DeadLetterPayloadWriter {
         // protected files leave no room, the temp is dropped and the source is
         // restored for a later/operator-assisted attempt.
         spool.evict_until_can_admit(0)?;
-        let pre_publish_identity = {
+        let pre_rename_identity = {
             let file = self.file.as_mut().ok_or_else(|| {
                 format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
             })?;
@@ -9418,28 +9215,13 @@ impl DeadLetterPayloadWriter {
                 DeadLetterIdentityExpectation::Exact(synced_identity),
             )?
         };
-        // Only the exact pinned claim owns the `.rejected.*` namespace derived
-        // from its pathname, so only it may publish with a replacing `rename`.
-        // The constructive-only state was admitted purely because no sibling
-        // existed at authorization time, and that observation is not a lock: a
-        // same-UID peer can create one in the window that follows. Publishing it
-        // create-only makes "no sibling exists" a property of the publication
-        // itself instead of a stale check, and a peer that won the race is
-        // refused rather than silently overwritten.
-        if claim_state == ManagedClaimState::LiveClaim {
-            (spool.fs_ops.rename)(&self.temp_path, &self.final_path)?;
-        } else {
-            (spool.fs_ops.before_publish)(&self.final_path);
-            (spool.fs_ops.link)(&self.temp_path, &self.final_path)?;
-            unlink_create_only_temp_alias(&self.temp_path, &self.final_path)?;
-        }
+        (spool.fs_ops.rename)(&self.temp_path, &self.final_path)?;
         (spool.fs_ops.after_rename)(&self.final_path);
-        // Publish while the original descriptor remains open, then prove the
+        // Rename while the original descriptor remains open, then prove the
         // published name resolves to that same node and still contains exactly
-        // the bytes hashed from the rejected rows. Publication may legitimately
-        // update inode metadata (both `rename` and the create-only link/unlink
-        // pair change ctime), so this first final-path check pins node identity
-        // and returns the new complete metadata snapshot.
+        // the bytes hashed from the rejected rows. Rename may legitimately
+        // update inode metadata, so this first final-path check pins node
+        // identity and returns the new complete metadata snapshot.
         let published_identity = {
             let file = self.file.as_mut().ok_or_else(|| {
                 format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
@@ -9449,7 +9231,7 @@ impl DeadLetterPayloadWriter {
                 &self.final_path,
                 self.byte_len,
                 &expected_sha256,
-                DeadLetterIdentityExpectation::SameNode(pre_publish_identity),
+                DeadLetterIdentityExpectation::SameNode(pre_rename_identity),
             ) {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -9481,9 +9263,9 @@ impl DeadLetterPayloadWriter {
         }
         self._live.take();
         // The published payload is an owned spool file. Account for it only on
-        // this success path: every failure return above either never reached the
-        // final name or unlinks the entry it published while that entry is still
-        // provably this handoff's, so it never entered the maintained gauges.
+        // this success path: every failure return above unlinks the rename
+        // result while it is still provably this handoff's, so it never entered
+        // the maintained gauges.
         spool.usage.account_add(1, self.byte_len);
         invalidate_status_cache();
         let file = self.file.take().ok_or_else(|| {
@@ -9672,68 +9454,6 @@ fn verify_dead_letter_payload(
     )
 }
 
-/// Drop the temp alias left behind by a create-only publication, so the
-/// published final ends up as the sole name for the node the two share.
-///
-/// A hard link publishes by adding a name, not by moving one, so immediately
-/// after it both entries denote the same node. Removing the temp restores the
-/// single-link invariant every later dead-letter validation asserts.
-///
-/// Both entries are `lstat`ed and required to be regular files resolving to the
-/// same node, carrying exactly the two links this handoff created. Anything else
-/// — a peer that replaced the published entry, an extra planted link, a
-/// disappeared temp — fails closed without removing anything, because once the
-/// published entry can no longer be proven to be this attempt's, unlinking it
-/// could destroy somebody else's evidence. Callers still roll back their own
-/// attributed temp; none of them unlinks the final after a create-only failure.
-/// The residual (an attributed temp, plus a complete artifact at the final name)
-/// is reclaimable by stale-temp reconciliation and refused as an occupied
-/// sibling by the next attempt, which is strictly the safe side of that trade.
-fn unlink_create_only_temp_alias(temp_path: &Path, final_path: &Path) -> Result<(), String> {
-    let temp_metadata = fs::symlink_metadata(temp_path).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to stat spool temp file '{}' after create-only publication: {error}",
-            temp_path.display()
-        )
-    })?;
-    let final_metadata = fs::symlink_metadata(final_path).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to stat published spool artifact '{}' after create-only publication: {error}",
-            final_path.display()
-        )
-    })?;
-    if !temp_metadata.file_type().is_file() || !final_metadata.file_type().is_file() {
-        return Err(format!(
-            "{PLUGIN_NAME}: create-only publication of '{}' did not leave two regular files",
-            final_path.display()
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if temp_metadata.nlink() != 2 || final_metadata.nlink() != 2 {
-            return Err(format!(
-                "{PLUGIN_NAME}: create-only publication of '{}' does not carry exactly this handoff's two links",
-                final_path.display()
-            ));
-        }
-    }
-    let temp_identity = SpoolFileIdentity::from_metadata(&temp_metadata);
-    let final_identity = SpoolFileIdentity::from_metadata(&final_metadata);
-    if !temp_identity.same_file_node(&final_identity) {
-        return Err(format!(
-            "{PLUGIN_NAME}: published spool artifact '{}' no longer names this handoff's temp file",
-            final_path.display()
-        ));
-    }
-    fs::remove_file(temp_path).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to remove spool temp file '{}' after create-only publication: {error}",
-            temp_path.display()
-        )
-    })
-}
-
 /// Best-effort rollback may unlink only a path that still resolves to the open
 /// writer descriptor. A planted replacement is left untouched for operator
 /// inspection while the authoritative source remains replayable.
@@ -9809,56 +9529,43 @@ fn write_dead_letter_meta(
     spool.assert_managed_path(&meta_path)?;
     spool.assert_managed_path(&tmp_path)?;
     // The final metadata rename can replace an existing record and is
-    // destructive even when no explicit cleanup runs. Authorize the whole
-    // publish transaction under this namespace lock, naming that replaceable
-    // final so a constructive-only state never reaches a replacing rename at
-    // all; what it does reach is create-only and cannot clobber a peer that
-    // took the name after this check.
+    // destructive even when no explicit cleanup runs. Bind the whole publish
+    // transaction to the exact pinned claim under this namespace lock; a
+    // missing, wrong-type, or substituted pathname reaches neither the
+    // quota admission below nor any mutation of the derived record name.
     spool.assert_managed_path(source_path)?;
-    let claim_state = spool
-        .authorize_dead_letter_publication(source_path, artifact, &[meta_path.as_path()])
+    spool
+        .require_live_claim(source_path, artifact)
         .map_err(ClaimMutationError::into_message)?;
     spool.evict_until_can_admit(bytes.len() as u64)?;
     // Measured after eviction: a reclaim that already deleted this record has
     // accounted for it, so re-measuring here cannot double-subtract. The
     // identity check runs under the same namespace mutation lock as the unlink.
-    if claim_state == ManagedClaimState::LiveClaim {
-        let replaced_meta_len = spool_regular_file_len(&meta_path);
-        match fs::remove_file(&meta_path) {
-            Ok(()) => {
-                if let Some(len) = replaced_meta_len {
-                    spool.usage.account_sub(1, len);
-                }
+    let replaced_meta_len = spool_regular_file_len(&meta_path);
+    match fs::remove_file(&meta_path) {
+        Ok(()) => {
+            if let Some(len) = replaced_meta_len {
+                spool.usage.account_sub(1, len);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "{PLUGIN_NAME}: failed to replace dead-letter metadata '{}': {error}",
-                    meta_path.display()
-                ));
-            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "{PLUGIN_NAME}: failed to replace dead-letter metadata '{}': {error}",
+                meta_path.display()
+            ));
         }
     }
     let _live = LiveSpoolPathGuard::new(tmp_path.clone());
     // `<ulid>.<owner_tag>.<ext>.rejected.meta` inherits the uniqueness of the
-    // ULID-named source artifact it describes, so for the exact pinned claim
-    // this final is exclusively this attempt's and a failed publish rolls it
-    // back. The constructive-only state does not own that name — it was admitted
-    // only because the record happened to be absent a moment earlier — so it
-    // publishes create-only, exactly like the payload above, and its rollback
-    // never unlinks the final.
-    let publish_mode = if claim_state == ManagedClaimState::LiveClaim {
-        SpoolPublishMode::Replace
-    } else {
-        SpoolPublishMode::CreateOnly
-    };
+    // ULID-named source artifact it describes, so this final is exclusively this
+    // attempt's and a failed publish rolls it back.
     write_private_file_atomically_with_ops(
         &tmp_path,
         &meta_path,
         bytes.as_slice(),
         spool.fs_ops,
         SpoolFinalOwnership::Unique,
-        publish_mode,
     )?;
     // Publish the new metadata record into the maintained gauges. Removing the
     // authoritative source, accounting for it, and re-enforcing the owned-byte
@@ -11520,13 +11227,12 @@ pub fn publish_dead_letter_payload_replacing_prior_for_tests(
     )
 }
 
-fn publish_dead_letter_payload_inner_for_tests(
+/// Reserve and build the one-row streaming batch every dead-letter probe feeds
+/// through the real append protocol.
+fn single_row_replay_batch_for_tests(
     spool: &SpoolManager,
-    source_path: &Path,
-    pinned: &PinnedClaimArtifact,
     row: &[u8],
-    prior_payload: Option<&[u8]>,
-) -> Result<(PathBuf, SpoolStats), String> {
+) -> Result<StreamingReplayBatch, String> {
     if row.is_empty() || row.len() > SPOOL_MAX_ROW_BYTES {
         return Err(format!(
             "{PLUGIN_NAME}: dead-letter append probe row is outside the hard row bound"
@@ -11547,11 +11253,69 @@ fn publish_dead_letter_payload_inner_for_tests(
         .ok_or_else(|| {
             format!("{PLUGIN_NAME}: dead-letter append probe could not reserve its row index")
         })?;
-    let batch = StreamingReplayBatch {
+    Ok(StreamingReplayBatch {
         payload,
         lines: vec![(0, row.len())],
         _line_reservation: line_reservation,
-    };
+    })
+}
+
+/// Stage of one dead-letter payload handoff at which an external test stages
+/// hostile interference with the claim pathname.
+///
+/// Every stage re-proves the claim independently, so interference staged
+/// *between* two stages is the only way to show the later stage is bound on its
+/// own rather than inheriting the earlier stage's proof. Production reaches the
+/// same interleavings across bounded replay batches and across the streaming /
+/// finalization boundary.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // external unit tests only
+pub enum DeadLetterHandoffStageForTests {
+    /// After the writer opened its temp, before the first row is admitted or
+    /// appended.
+    BeforeAppend,
+    /// After the row was appended, before the completed temp is published.
+    BeforePublish,
+}
+
+/// Drive one dead-letter payload handoff through the production
+/// open/append/publish protocol, running `interfere` at `stage`.
+///
+/// The claim is pinned before any interference, exactly as replay pins it before
+/// the initial claim rename, so the probe carries the same authorization
+/// capability production does.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn probe_dead_letter_handoff_interference_for_tests(
+    spool: &SpoolManager,
+    source_path: &Path,
+    row: &[u8],
+    stage: DeadLetterHandoffStageForTests,
+    interfere: &dyn Fn(&Path),
+) -> Result<PathBuf, String> {
+    let batch = single_row_replay_batch_for_tests(spool, row)?;
+    let pinned = PinnedClaimArtifact::pin_path(source_path);
+    let mut writer = DeadLetterPayloadWriter::open(spool, source_path, &pinned)?;
+    if stage == DeadLetterHandoffStageForTests::BeforeAppend {
+        interfere(source_path);
+    }
+    writer.append_batch(spool, &pinned, &batch, &[0])?;
+    if stage == DeadLetterHandoffStageForTests::BeforePublish {
+        interfere(source_path);
+    }
+    let published = writer.publish(spool, &pinned)?;
+    Ok(published.path)
+}
+
+fn publish_dead_letter_payload_inner_for_tests(
+    spool: &SpoolManager,
+    source_path: &Path,
+    pinned: &PinnedClaimArtifact,
+    row: &[u8],
+    prior_payload: Option<&[u8]>,
+) -> Result<(PathBuf, SpoolStats), String> {
+    let batch = single_row_replay_batch_for_tests(spool, row)?;
     let mut writer = DeadLetterPayloadWriter::open(spool, source_path, pinned)?;
     writer.append_batch(spool, pinned, &batch, &[0])?;
     if let Some(prior) = prior_payload {
@@ -12071,14 +11835,7 @@ pub fn write_private_file_atomically_for_tests(
     ownership: SpoolFinalOwnership,
 ) -> Result<(), String> {
     let ops = SpoolFsOps::REAL;
-    write_private_file_atomically_with_ops(
-        tmp_path,
-        final_path,
-        bytes,
-        ops,
-        ownership,
-        SpoolPublishMode::Replace,
-    )
+    write_private_file_atomically_with_ops(tmp_path, final_path, bytes, ops, ownership)
 }
 
 /// Exercise the durable-write contract with one step forced to fail.
@@ -12092,14 +11849,7 @@ pub fn write_private_file_atomically_with_fault_for_tests(
     ownership: SpoolFinalOwnership,
 ) -> Result<(), String> {
     let ops = SpoolFsOps::with_fault(fault);
-    write_private_file_atomically_with_ops(
-        tmp_path,
-        final_path,
-        bytes,
-        ops,
-        ownership,
-        SpoolPublishMode::Replace,
-    )
+    write_private_file_atomically_with_ops(tmp_path, final_path, bytes, ops, ownership)
 }
 
 fn write_private_file_atomically_with_ops(
@@ -12108,9 +11858,8 @@ fn write_private_file_atomically_with_ops(
     bytes: &[u8],
     ops: SpoolFsOps,
     ownership: SpoolFinalOwnership,
-    mode: SpoolPublishMode,
 ) -> Result<(), String> {
-    let result = write_private_file_atomically_inner(tmp_path, final_path, bytes, ops, mode);
+    let result = write_private_file_atomically_inner(tmp_path, final_path, bytes, ops);
     let Err(primary_error) = result else {
         return Ok(());
     };
@@ -12158,15 +11907,7 @@ fn write_private_file_atomically_with_ops(
     // next prepare validates the manifest against this sink's identity and
     // regenerates or fails closed on it. Deleting a peer's publication is not
     // recoverable, so the residual is deliberately pushed to the safe side.
-    //
-    // A [`SpoolPublishMode::CreateOnly`] publish is skipped for the same reason
-    // even under a `Unique` name. Create-only exists precisely because this
-    // attempt could NOT prove it owns the final name, so the entry now sitting
-    // there may be a peer's — either one that won the create-only race (in which
-    // case this attempt never wrote it) or one that replaced this attempt's
-    // publication afterwards. The temp alias unlink above is the only removal
-    // that stays proven, and it is guarded by exact node identity.
-    if ownership == SpoolFinalOwnership::Unique && mode == SpoolPublishMode::Replace {
+    if ownership == SpoolFinalOwnership::Unique {
         match fs::remove_file(final_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -12203,20 +11944,13 @@ fn write_private_file_atomically_with_ops(
     }
 }
 
-/// Publish `bytes` at `final_path` durably: private temp, write, fsync,
-/// publication, parent-directory fsync. Rollback of a partial sequence is the
-/// caller's job.
-///
-/// Publication is a replacing `rename` only for [`SpoolPublishMode::Replace`].
-/// [`SpoolPublishMode::CreateOnly`] links the completed temp into place instead,
-/// which refuses an occupied name in one kernel operation, then drops the temp
-/// alias by exact node identity.
+/// Publish `bytes` at `final_path` durably: private temp, write, fsync, rename,
+/// parent-directory fsync. Rollback of a partial sequence is the caller's job.
 fn write_private_file_atomically_inner(
     tmp_path: &Path,
     final_path: &Path,
     bytes: &[u8],
     ops: SpoolFsOps,
-    mode: SpoolPublishMode,
 ) -> Result<(), String> {
     if let Some(parent) = tmp_path.parent() {
         ensure_private_dir(parent)?;
@@ -12252,33 +11986,22 @@ fn write_private_file_atomically_inner(
     })?;
     (ops.sync_file)(&file, tmp_path)?;
     drop(file);
-    match mode {
-        SpoolPublishMode::Replace => (ops.rename)(tmp_path, final_path)?,
-        SpoolPublishMode::CreateOnly => {
-            // Test-only interleaving point: production wires this to a no-op,
-            // and the fault-injection suite uses it to occupy `final_path` as a
-            // peer would, in the window between the caller's authorization check
-            // and this publication.
-            (ops.before_publish)(final_path);
-            (ops.link)(tmp_path, final_path)?;
-            unlink_create_only_temp_alias(tmp_path, final_path)?;
-        }
-    }
+    (ops.rename)(tmp_path, final_path)?;
     // Test-only interleaving point: production wires this to a no-op, and the
     // fault-injection suite uses it to republish `final_path` as a peer would
     // before the directory fsync below fails.
     (ops.after_rename)(final_path);
-    // Durably persist the publication itself. The file contents were fsynced
-    // above, but the directory entry pointing at them is only guaranteed after
-    // an fsync of the containing directory. On Unix a parent-directory open or
-    // fsync failure is therefore a write failure: it is reported to the caller
-    // and the publish is rolled back, before any snapshot baseline can advance.
+    // Durably persist the rename itself. The file contents were fsynced above,
+    // but the directory entry pointing at them is only guaranteed after an fsync
+    // of the containing directory. On Unix a parent-directory open or fsync
+    // failure is therefore a write failure: it is reported to the caller and the
+    // publish is rolled back, before any snapshot baseline can advance.
     //
     // Directory fsync is a Unix concept. On platforms without it (notably
-    // Windows) a successful file sync plus publication is the durability
-    // boundary this plugin can offer, and the documentation states that limit
-    // rather than claiming a guarantee the platform does not provide. Both
-    // platforms run the same fault-injection contract tests.
+    // Windows) a successful file sync plus rename is the durability boundary
+    // this plugin can offer, and the documentation states that limit rather than
+    // claiming a guarantee the platform does not provide. Both platforms run the
+    // same fault-injection contract tests.
     #[cfg(unix)]
     {
         let Some(parent) = final_path.parent() else {
