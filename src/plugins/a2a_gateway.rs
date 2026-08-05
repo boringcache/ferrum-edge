@@ -2615,27 +2615,29 @@ const MAX_AGENT_CARD_URL_BYTES: usize = 4096;
 /// Only the boolean verdict leaves this function: the parsed/normalized form is
 /// never emitted, so the backend's own bytes are what get preserved when no
 /// rewrite is needed.
-fn http_scheme_rest(value: &str) -> Option<(&'static str, &str)> {
-    if let Some(rest) = value.get(7..) {
-        if value[..7].eq_ignore_ascii_case("http://") {
-            return Some(("http", rest));
-        }
+fn http_scheme_rest(value: &str) -> Option<&str> {
+    if value
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        return value.get(7..);
     }
-    if let Some(rest) = value.get(8..) {
-        if value[..8].eq_ignore_ascii_case("https://") {
-            return Some(("https", rest));
-        }
+    if value
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        return value.get(8..);
     }
     None
 }
 
 /// Require a canonical absolute `http`/`https` authority spelling on the wire.
 fn has_explicit_http_authority_spelling(value: &str) -> bool {
-    let Some((_, rest)) = http_scheme_rest(value) else {
+    let Some(rest) = http_scheme_rest(value) else {
         return false;
     };
     let authority = rest
-        .split(|byte| matches!(byte, b'/' | b'?' | b'#'))
+        .split(|character| matches!(character, '/' | '?' | '#'))
         .next()
         .unwrap_or("");
     !authority.is_empty()
