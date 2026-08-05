@@ -9157,7 +9157,10 @@ fn claim_renewal_refuses_a_substituted_pathname_as_unauthorized() {
         !fs::read_dir(&day)
             .unwrap()
             .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_string_lossy().ends_with(&renewed_suffix)),
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(&renewed_suffix)),
         "a refused renewal must not create the renewed lease name"
     );
     assert!(
@@ -9499,7 +9502,11 @@ async fn spool_replay_fails_closed_on_non_file_hardlink_symlink_and_declared_zst
 
         assert_eq!(fs::read(&outside).unwrap(), br#"{"event_id":"symlink"}"#);
         assert!(
-            linked_path.symlink_metadata().unwrap().file_type().is_symlink(),
+            linked_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "the symlink must be left exactly as planted"
         );
         assert!(

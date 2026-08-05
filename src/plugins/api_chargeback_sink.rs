@@ -8210,8 +8210,8 @@ impl SpoolManager {
         claim: &mut SpoolClaimHandle,
         lease_deadline: i64,
     ) -> Result<(), ClaimMutationError> {
-        let durable = spool_claim_restore_path(claim.path())
-            .map_err(ClaimMutationError::Retryable)?;
+        let durable =
+            spool_claim_restore_path(claim.path()).map_err(ClaimMutationError::Retryable)?;
         let renewed = spool_claim_path(&durable, self.generation, lease_deadline)
             .map_err(ClaimMutationError::Retryable)?;
         if renewed == claim.path {
@@ -9090,10 +9090,10 @@ impl DeadLetterPayloadWriter {
         source_path: &Path,
         artifact: &PinnedClaimArtifact,
     ) -> Result<Self, ClaimMutationError> {
-        let (temp_path, final_path) = dead_letter_payload_paths(spool, source_path)
-            .map_err(ClaimMutationError::Retryable)?;
-        let (_, prior_meta_path) = dead_letter_meta_paths(source_path)
-            .map_err(ClaimMutationError::Retryable)?;
+        let (temp_path, final_path) =
+            dead_letter_payload_paths(spool, source_path).map_err(ClaimMutationError::Retryable)?;
+        let (_, prior_meta_path) =
+            dead_letter_meta_paths(source_path).map_err(ClaimMutationError::Retryable)?;
         let _guard = spool
             .lock_spool_mutation()
             .map_err(ClaimMutationError::Retryable)?;
