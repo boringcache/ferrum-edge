@@ -1331,7 +1331,8 @@ fn parse_keepalive_duration_seconds(
 /// `connectionPool.http.maxRetries` is a cluster-wide outstanding-retry
 /// concurrency budget; Ferrum's retry model is per-request, so the field is
 /// projected as a per-request retry-count CAP (see `docs/mesh.md` and
-/// `cap_proxy_retry_for_target`). It is validated as a non-negative integer;
+/// `route_retry_ceiling` / `retry_attempt_allowed_for_target`). It is
+/// validated as a non-negative integer;
 /// zero explicitly disables an existing retry policy for the destination.
 ///
 /// `http1MaxPendingRequests` is honestly reinterpreted as a max-concurrent-

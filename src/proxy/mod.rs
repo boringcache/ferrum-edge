@@ -53218,8 +53218,16 @@ mod tests {
             "H3 WebSocket retry loop must call {helper}"
         );
         assert!(
+            include_str!("../http3/websocket.rs").contains("route_retry_ceiling"),
+            "H3 WebSocket path must retain the original route retry ceiling"
+        );
+        assert!(
             include_str!("../http3/cross_protocol.rs").contains(helper),
             "H3 cross-protocol HTTP/gRPC retry selection must call {helper}"
+        );
+        assert!(
+            include_str!("../http3/cross_protocol.rs").contains("route_retry_ceiling"),
+            "H3 cross-protocol path must retain the original route retry ceiling"
         );
         assert!(
             include_str!("../http3/cross_protocol.rs")

@@ -5057,10 +5057,10 @@ async fn handle_h3_request(
                 // Only Plain and Grpc flavors reach this bridge (WebSocket
                 // returned via its dedicated bridge above), and both resolve
                 // the per-target effective proxy per attempt inside their own
-                // dispatch loops — so hand them the retry-capped but otherwise
-                // UNRESOLVED base proxy. Passing the first target's effective
-                // proxy would bake its port-level TLS/SNI/H1 policy into every
-                // retry attempt.
+                // dispatch loops — so hand them the post-selection UNRESOLVED
+                // base proxy (original route retry ceiling retained). Passing
+                // the first target's effective proxy would bake its port-level
+                // TLS/SNI/H1 policy into every retry attempt.
                 proxy: selected_base_proxy.as_ref(),
                 stream: &mut stream,
                 method: &method,
@@ -6856,9 +6856,10 @@ async fn handle_h3_request(
             let mut current_dispatch_h3 = true;
 
             // Resolve the dispatch proxy for THIS attempt's target from the
-            // retry-capped BASE proxy — never from the first target's effective
-            // proxy — mirroring the per-attempt re-resolution the H3->plain
-            // bridge (`dispatch_plain`) and the H1/H2 retry path
+            // post-selection BASE proxy (original route retry ceiling retained)
+            // — never from the first target's effective proxy — mirroring the
+            // per-attempt re-resolution the H3->plain bridge (`dispatch_plain`)
+            // and the H1/H2 retry path
             // (`proxy_to_backend_retry`) perform. Rotation is port-lane-pinned
             // only when the failed target's policy port has a live per-port
             // override, so a rotation can cross from the SD fallback into a
@@ -7099,7 +7100,7 @@ async fn handle_h3_request(
                 );
 
                 // Re-resolve the effective proxy for the (possibly rotated)
-                // retry target from the retry-capped BASE proxy, so this
+                // retry target from the post-selection BASE proxy, so this
                 // attempt dials with ITS policy port's TLS/SNI/connectTimeout
                 // posture instead of inheriting the first target's (see the
                 // pre-loop resolution comment above).

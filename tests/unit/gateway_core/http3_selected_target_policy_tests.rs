@@ -65,8 +65,12 @@ fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
         .find("let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(")
         .expect("H3 frontend must resolve selected-target effective proxy");
     assert!(
+        after_selection.contains("route_retry_ceiling"),
+        "H3 frontend must retain the original route retry ceiling after target selection"
+    );
+    assert!(
         after_selection[effective..].contains("&selected_base_proxy"),
-        "H3 effective proxy resolution must use the retry-capped selected base proxy"
+        "H3 effective proxy resolution must use the post-selection selected base proxy"
     );
     let has_retry = after_selection
         .find("let has_retry = match backend_http_flavor")
@@ -131,14 +135,14 @@ fn h3_native_retry_loop_resolves_effective_proxy_per_attempt() {
         .expect("buffered native-H3 retry loop must remain present");
     let loop_src = &source[retry_loop..];
 
-    // Initial attempt: resolve from the retry-capped BASE proxy (never the
+    // Initial attempt: resolve from the post-selection BASE proxy (never the
     // first target's effective proxy) before dispatching.
     let initial_resolve = loop_src
         .find("let attempt_dispatch_proxy = crate::proxy::resolve_effective_proxy_for_target(")
         .expect("native-H3 retry loop must resolve the attempt dispatch proxy");
     assert!(
         loop_src[initial_resolve..].contains("&selected_base_proxy"),
-        "per-attempt resolution must feed from the retry-capped base proxy"
+        "per-attempt resolution must feed from the post-selection base proxy"
     );
     let initial_dispatch = loop_src
         .find("proxy_to_backend_h3(")
@@ -209,7 +213,7 @@ fn h3_websocket_bridge_keeps_unresolved_base_proxy_for_retries() {
     let websocket_args = &source[websocket_call..];
     let proxy_arg = websocket_args
         .find("Arc::clone(&selected_base_proxy)")
-        .expect("H3 WebSocket bridge must receive the capped unresolved base proxy");
+        .expect("H3 WebSocket bridge must receive the post-selection unresolved base proxy");
     let effective_proxy_arg = websocket_args
         .find("\n            proxy,")
         .unwrap_or(usize::MAX);
@@ -361,6 +365,10 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
     assert!(
         cross_protocol.contains("retry_attempt_allowed_for_target("),
         "cross-protocol candidate selection must re-resolve DestinationRule maxRetries"
+    );
+    assert!(
+        cross_protocol.contains("route_retry_ceiling"),
+        "cross-protocol HTTP/gRPC retries must authorize against the original route ceiling"
     );
     let grpc_retry = cross_protocol
         .rfind("let retry_target = select_next_cross_protocol_retry_target(")
