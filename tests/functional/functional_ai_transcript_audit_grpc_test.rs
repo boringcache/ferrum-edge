@@ -21,6 +21,7 @@
 //! Run with:
 //! `cargo test --test functional_tests functional_ai_transcript_audit_grpc -- --ignored --nocapture`
 
+use crate::common::TestGateway;
 use crate::scaffolding::ports::reserve_port;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -32,11 +33,9 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
@@ -88,6 +87,7 @@ fn grpc_frame(payload: &[u8]) -> Vec<u8> {
 
 fn gzip_grpc_frame(payload: &[u8]) -> Vec<u8> {
     use flate2::write::GzEncoder;
+    use std::io::Write;
 
     let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(payload).expect("gzip write");
@@ -249,96 +249,91 @@ fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
     crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
+/// True only when captured startup evidence shows the child lost an ephemeral
+/// port bind race. Every other failure — spawn/config errors, non-bind exits,
+/// authenticated readiness timeouts while the child is still alive, and any
+/// unclassified diagnostic — must stop the outer loop immediately.
+fn gateway_startup_failure_is_bind_race(diagnostic: &str) -> bool {
+    let lower = diagnostic.to_ascii_lowercase();
+    lower.contains("address already in use")
+        || lower.contains("eaddrinuse")
+        || lower.contains("addrinuse")
+        || lower.contains("already in use on")
+        || (lower.contains("bind") && lower.contains("already in use"))
 }
 
-fn start_gateway(
-    config_path: &str,
-    http_port: u16,
-    admin_port: u16,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let child = std::process::Command::new(gateway_binary_path())
-        .env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", config_path)
-        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        .env("RUST_LOG", "ferrum_edge=debug")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    Ok(child)
-}
+/// Spawn a file-mode gateway through the shared harness. Each outer-loop
+/// iteration gets fresh ports, temp config, and a per-attempt observability
+/// token; only address-in-use/bind-race evidence is retryable.
+async fn spawn_audit_gateway_with_bind_race_retry(
+    config_yaml: &str,
+) -> Result<TestGateway, Box<dyn std::error::Error + Send + Sync>> {
+    const MAX_BIND_RACE_ATTEMPTS: u32 = 3;
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+    let mut last_bind_race = String::new();
 
-async fn wait_for_gateway(
-    admin_port: u16,
-    gateway_port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-            && tokio::net::TcpStream::connect(("127.0.0.1", gateway_port))
-                .await
-                .is_ok()
+    for attempt in 1..=MAX_BIND_RACE_ATTEMPTS {
+        match TestGateway::builder()
+            .mode_file(config_yaml.to_string())
+            .skip_auto_build()
+            .max_attempts(1)
+            .capture_output()
+            .health_timeout(STARTUP_TIMEOUT)
+            .log_level("debug")
+            .env("RUST_LOG", "ferrum_edge=debug")
+            .spawn()
+            .await
         {
-            return Ok(());
+            Ok(gateway) => return Ok(gateway),
+            Err(error) => {
+                let diagnostic = error.to_string();
+                if !gateway_startup_failure_is_bind_race(&diagnostic) {
+                    return Err(format!("gateway startup failed (non-retryable): {diagnostic}").into());
+                }
+                last_bind_race = diagnostic;
+                eprintln!(
+                    "Gateway bind-race retry {attempt}/{MAX_BIND_RACE_ATTEMPTS}: \
+                     address-in-use evidence recorded"
+                );
+            }
         }
-        sleep(Duration::from_millis(250)).await;
     }
-    Err("Gateway did not become healthy within 15 seconds".into())
+
+    Err(format!(
+        "gateway startup failed after {MAX_BIND_RACE_ATTEMPTS} bind-race retries: {last_bind_race}"
+    )
+    .into())
 }
 
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
-    const MAX_ATTEMPTS: u32 = 3;
-    for attempt in 1..=MAX_ATTEMPTS {
-        // Hold both reservations at the same time so the OS cannot hand the
-        // just-released proxy port back for the admin listener. The child
-        // cannot inherit these sockets, so release them together immediately
-        // before spawn; the bounded retry below remains the handoff guard
-        // against an unrelated process winning either port.
-        let gateway_reservation = reserve_port().await.expect("reserve gateway port");
-        let admin_reservation = reserve_port().await.expect("reserve admin port");
-        let gateway_port = gateway_reservation.port;
-        let admin_port = admin_reservation.port;
-        drop(gateway_reservation);
-        drop(admin_reservation);
-        let mut child = match start_gateway(config_path, gateway_port, admin_port) {
-            Ok(child) => child,
-            Err(e) => {
-                eprintln!(
-                    "Gateway spawn attempt {}/{} failed: {}",
-                    attempt, MAX_ATTEMPTS, e
-                );
-                if attempt < MAX_ATTEMPTS {
-                    sleep(Duration::from_secs(1)).await;
-                }
-                continue;
-            }
-        };
-        match wait_for_gateway(admin_port, gateway_port).await {
-            Ok(()) => return (child, gateway_port, admin_port),
-            Err(e) => {
-                eprintln!(
-                    "Gateway health attempt {}/{} failed: {}",
-                    attempt, MAX_ATTEMPTS, e
-                );
-                let _ = child.kill();
-                let _ = child.wait();
-                if attempt < MAX_ATTEMPTS {
-                    sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
+#[cfg(test)]
+mod gateway_startup_classifier_tests {
+    use super::gateway_startup_failure_is_bind_race;
+
+    #[test]
+    fn accepts_address_in_use_evidence() {
+        assert!(gateway_startup_failure_is_bind_race(
+            "gateway process exited before proving ownership\n\
+             --- captured gateway output ---\n\
+             FATAL: Port 38421 is already in use on 127.0.0.1: Address already in use (os error 98)"
+        ));
+        assert!(gateway_startup_failure_is_bind_race(
+            "failed to bind admin listener: EADDRINUSE"
+        ));
     }
-    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
+
+    #[test]
+    fn rejects_generic_startup_errors() {
+        assert!(!gateway_startup_failure_is_bind_race(
+            "gateway did not prove ownership of admin port 38421 within 60s \
+             (last observation: HTTP 503: identified gateway is not ready yet)"
+        ));
+        assert!(!gateway_startup_failure_is_bind_race(
+            "invalid config: grpc.descriptor_path does not exist"
+        ));
+        assert!(!gateway_startup_failure_is_bind_race(
+            "cargo build spawn failed: No such file or directory"
+        ));
+    }
 }
 
 struct GrpcCall {
@@ -412,18 +407,17 @@ async fn send_grpc_request(
     })
 }
 
-/// Write a file-mode config with one `ai_transcript_audit` instance whose
+/// Build a file-mode config with one `ai_transcript_audit` instance whose
 /// `grpc` block enrolls `/test.Greeter/SayHello`, plus optional extra plugin
 /// entries/configs (used to install a `before_proxy` short-circuit).
-fn write_audit_config(
-    config_path: &std::path::Path,
+fn build_audit_config_yaml(
     backend_port: u16,
     collector_port: u16,
     extra_proxy_plugins: &str,
     extra_plugin_configs: &str,
-) {
+) -> String {
     let descriptor = descriptor_path();
-    let config = format!(
+    format!(
         r#"
 version: "1"
 proxies:
@@ -467,9 +461,7 @@ plugin_configs:
             response_type: "test.HelloResponse"
 {extra_plugin_configs}
 "#
-    );
-    let mut file = std::fs::File::create(config_path).expect("create config file");
-    file.write_all(config.as_bytes()).expect("write config");
+    )
 }
 
 /// A 100%-abort `fault_injection` instance. Its priority (2940) is after
@@ -489,12 +481,11 @@ const ABORT_PLUGIN_CONFIG: &str = r#"  - id: "grpc-abort"
 "#;
 
 struct Harness {
-    gateway: std::process::Child,
+    gateway: TestGateway,
     backend: tokio::task::JoinHandle<()>,
     collector: tokio::task::JoinHandle<()>,
     records: CollectedRecords,
     addr: String,
-    _temp: TempDir,
 }
 
 impl Harness {
@@ -502,24 +493,22 @@ impl Harness {
         build_gateway().expect("build gateway binary");
         let (backend_port, backend) = start_grpc_echo_backend().await;
         let (collector_port, records, collector) = start_audit_collector().await;
-        let temp = TempDir::new().expect("temp dir");
-        let config_path = temp.path().join("config.yaml");
-        write_audit_config(
-            &config_path,
+        let config_yaml = build_audit_config_yaml(
             backend_port,
             collector_port,
             extra_proxy_plugins,
             extra_plugin_configs,
         );
-        let (gateway, port, _admin) =
-            start_gateway_with_retry(config_path.to_str().expect("utf-8 path")).await;
+        let gateway = spawn_audit_gateway_with_bind_race_retry(&config_yaml)
+            .await
+            .expect("spawn audit gateway");
+        let addr = format!("127.0.0.1:{}", gateway.proxy_port);
         Self {
             gateway,
             backend,
             collector,
             records,
-            addr: format!("127.0.0.1:{}", port),
-            _temp: temp,
+            addr,
         }
     }
 
@@ -536,8 +525,7 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        let _ = self.gateway.kill();
-        let _ = self.gateway.wait();
+        self.gateway.shutdown();
         self.backend.abort();
         self.collector.abort();
     }
