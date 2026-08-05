@@ -1024,6 +1024,7 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
                     }),
                     port_level_settings,
                     subsets,
+                    export_to: vec!["*".to_string()],
                 }],
                 ..MeshConfig::default()
             })),
@@ -1144,6 +1145,7 @@ fn destination_rule_subset_zero_pending_fails_while_zero_retries_is_valid() {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         })),
