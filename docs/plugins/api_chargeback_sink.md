@@ -565,14 +565,26 @@ Claim disposition:
   No further external delivery is attempted for it. The hostile pathname is left
   exactly as found, for operator reconciliation.
 
-  This classification is carried, not flattened. Losing claim authorization while
-  the streaming dead-letter payload writer is being opened or appended to is
-  **not** a retryable storage failure, so it never enters the release path: it is
-  reported as `unauthorized dead-letter payload open` / `… payload append`
-  wrapping the original pathname-scoped refusal, counted in the sink's failure
-  metrics, and returned. Reporting it as retryable would attempt a release that
-  is correctly refused anyway, but would replace the diagnostic that says where
-  authorization was actually lost with the refusal's own.
+  This classification is carried, not flattened, at **every** claim-bound step of
+  the live replay pipeline. Losing claim authorization is **not** a retryable
+  storage failure, so it never enters the release path: it is reported as
+  `unauthorized <stage>` wrapping the original pathname-scoped refusal verbatim,
+  counted in the sink's failure metrics, and returned. Reporting it as retryable
+  would attempt a release that is correctly refused anyway, but would replace the
+  diagnostic that says where authorization was actually lost with the refusal's
+  own. The stages are:
+
+  | Stage | Claim-bound step |
+  | --- | --- |
+  | `claim renewal` | the between-chunks rename onto a fresh lease deadline |
+  | `dead-letter payload open` | creating this handoff's private payload temp |
+  | `dead-letter payload append` | admitting and appending rejected rows |
+  | `dead-letter payload publish` | the replacing rename of `<data-name>.rejected.ndjson` |
+  | `dead-letter metadata publish` | the replacing rename of `<data-name>.rejected.meta` |
+  | `terminal claim removal` | unlinking the authoritative source and accounting it out |
+
+  Ordinary I/O, capacity, quota, and accounting failures stay retryable — but
+  only when the exact live claim is still proven at the moment they are taken.
 
   Recovery driven by the exact pinned claim keeps its deliberate replace, unlink,
   and account-out behavior, because that claim genuinely owns the derived sibling

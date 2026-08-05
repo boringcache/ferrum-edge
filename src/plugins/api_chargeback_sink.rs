@@ -6351,6 +6351,56 @@ impl ClaimMutationError {
     }
 }
 
+/// Preserve a claim-mutation refusal's classification while naming the stage
+/// that observed it.
+///
+/// Only the unauthorized message is prefixed: the classification is what decides
+/// whether the caller may release the claim, and the stage name is what tells an
+/// operator *where* authorization was lost. The prefix is a compiled-in literal
+/// and the wrapped message is the pathname-scoped refusal
+/// [`SpoolManager::require_live_claim`] already produces; no row bytes, charge
+/// fields, or credentials are involved on this path.
+fn claim_stage_error(stage: &'static str, error: ClaimMutationError) -> ClaimMutationError {
+    match error {
+        ClaimMutationError::Unauthorized(message) => ClaimMutationError::Unauthorized(format!(
+            "{PLUGIN_NAME}: unauthorized {stage}: {message}"
+        )),
+        retryable @ ClaimMutationError::Retryable(_) => retryable,
+    }
+}
+
+/// External-test view of a refused claim mutation, classification intact.
+///
+/// The variants mirror the internal `ClaimMutationError`: only `Retryable` may
+/// be followed by releasing the claim back to its durable replayable name, so a
+/// regression test that asserts the *classification* — not merely the message —
+/// is what keeps an authorization loss out of the release path.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // external unit tests only
+pub enum ClaimMutationOutcomeForTests {
+    Unauthorized(String),
+    Retryable(String),
+}
+
+impl ClaimMutationOutcomeForTests {
+    #[allow(dead_code)] // external unit tests only
+    fn into_message(self) -> String {
+        match self {
+            Self::Unauthorized(message) | Self::Retryable(message) => message,
+        }
+    }
+}
+
+impl From<ClaimMutationError> for ClaimMutationOutcomeForTests {
+    fn from(error: ClaimMutationError) -> Self {
+        match error {
+            ClaimMutationError::Unauthorized(message) => Self::Unauthorized(message),
+            ClaimMutationError::Retryable(message) => Self::Retryable(message),
+        }
+    }
+}
+
 /// Reject a managed path that is itself a symlink.
 ///
 /// Spool maintenance must operate on the real file it enumerated, never on a
@@ -6829,8 +6879,30 @@ impl SpoolManager {
         claim: &mut SpoolClaimHandle,
         lease_deadline_unix: i64,
     ) -> Result<(), String> {
-        let _guard = self.lock_spool_mutation()?;
+        self.probe_renew_claim_at_for_tests(claim, lease_deadline_unix)
+            .map_err(ClaimMutationOutcomeForTests::into_message)
+    }
+
+    /// Renew a held claim and report the exact refusal classification.
+    ///
+    /// Renewal is the one destructive claim-pathname step whose rename only
+    /// happens when the lease deadline actually moves, so an end-to-end replay
+    /// tick reaches it only when a chunk boundary crosses a wall-clock second.
+    /// External tests drive it here with an explicit deadline to prove
+    /// deterministically that an authorization loss stays
+    /// [`ClaimMutationOutcomeForTests::Unauthorized`] and mutates nothing.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn probe_renew_claim_at_for_tests(
+        &self,
+        claim: &mut SpoolClaimHandle,
+        lease_deadline_unix: i64,
+    ) -> Result<(), ClaimMutationOutcomeForTests> {
+        let _guard = self
+            .lock_spool_mutation()
+            .map_err(ClaimMutationOutcomeForTests::Retryable)?;
         self.renew_claim_locked_at(claim, lease_deadline_unix)
+            .map_err(ClaimMutationOutcomeForTests::from)
     }
 
     /// Claim one replay candidate, returning `None` when another owner,
@@ -8112,7 +8184,11 @@ impl SpoolManager {
     /// A single spool file can contain multiple replay chunks. Renewing between
     /// chunks prevents the aggregate file-delivery time from outliving a lease
     /// that is intentionally derived from one bounded request/retry budget.
-    fn renew_claim_locked(&self, claim: &mut SpoolClaimHandle) -> Result<(), String> {
+    ///
+    /// The two-valued outcome is load-bearing: renewal renames the claim
+    /// pathname, so losing the pinned claim here is an authorization loss and
+    /// never an ordinary storage failure. See [`Self::renew_claim_locked_at`].
+    fn renew_claim_locked(&self, claim: &mut SpoolClaimHandle) -> Result<(), ClaimMutationError> {
         let lease_delta = self.claim_lease_secs.min(i64::MAX as u64) as i64;
         let lease_deadline = unix_timestamp_seconds().saturating_add(lease_delta);
         self.renew_claim_locked_at(claim, lease_deadline)
@@ -8123,13 +8199,21 @@ impl SpoolManager {
     /// Split out from [`Self::renew_claim_locked`] so the rename half of the
     /// protocol is exercised deterministically instead of only when a chunk
     /// boundary happens to cross a wall-clock second.
+    ///
+    /// [`ClaimMutationError::Unauthorized`] means the claim pathname stopped
+    /// resolving to the opened authoritative artifact. Collapsing that into a
+    /// retryable failure would send the caller into the claim-release path,
+    /// where the release is correctly refused but the diagnostic that says
+    /// authorization was lost *at renewal* is replaced by the refusal's own.
     fn renew_claim_locked_at(
         &self,
         claim: &mut SpoolClaimHandle,
         lease_deadline: i64,
-    ) -> Result<(), String> {
-        let durable = spool_claim_restore_path(claim.path())?;
-        let renewed = spool_claim_path(&durable, self.generation, lease_deadline)?;
+    ) -> Result<(), ClaimMutationError> {
+        let durable = spool_claim_restore_path(claim.path())
+            .map_err(ClaimMutationError::Retryable)?;
+        let renewed = spool_claim_path(&durable, self.generation, lease_deadline)
+            .map_err(ClaimMutationError::Retryable)?;
         if renewed == claim.path {
             return Ok(());
         }
@@ -8139,18 +8223,18 @@ impl SpoolManager {
         // fresh lease and inherit this handoff's authority. The rename keeps the
         // node the descriptor pin compares, so an honest renewal chain never
         // invalidates the claim identity.
-        self.require_live_claim(claim.path(), claim.artifact())
-            .map_err(ClaimMutationError::into_message)?;
-        self.assert_managed_path(&renewed)?;
+        self.require_live_claim(claim.path(), claim.artifact())?;
+        self.assert_managed_path(&renewed)
+            .map_err(ClaimMutationError::Retryable)?;
         // Register the renewed name before the atomic rename so another
         // generation in this process cannot observe an unleased path.
         let renewed_live = LiveSpoolPathGuard::new(renewed.clone());
         fs::rename(claim.path(), &renewed).map_err(|error| {
-            format!(
+            ClaimMutationError::Retryable(format!(
                 "{PLUGIN_NAME}: failed to renew in-flight spool claim '{}' as '{}': {error}",
                 claim.path().display(),
                 renewed.display()
-            )
+            ))
         })?;
         claim.path = renewed;
         let old_live = std::mem::replace(&mut claim._live, renewed_live);
@@ -9160,35 +9244,67 @@ impl DeadLetterPayloadWriter {
         Ok(())
     }
 
+    /// Same two-valued contract as [`Self::open`] and [`Self::append_batch`]:
+    /// losing the pinned claim between the last append and this replacing rename
+    /// is [`ClaimMutationError::Unauthorized`], never a retryable storage
+    /// failure. Collapsing it would send the caller into the claim-release path,
+    /// where the release is correctly refused but this stage's diagnostic is
+    /// replaced by the refusal's own.
     fn publish(
         mut self,
         spool: &SpoolManager,
         artifact: &PinnedClaimArtifact,
-    ) -> Result<PublishedDeadLetterPayload, String> {
+    ) -> Result<PublishedDeadLetterPayload, ClaimMutationError> {
         if self.rows == 0 {
-            return Err(format!(
+            return Err(ClaimMutationError::Retryable(format!(
                 "{PLUGIN_NAME}: refusing to publish an empty dead-letter payload"
-            ));
+            )));
         }
         let expected_sha256 = hex::encode(self.hasher.clone().finalize());
         let synced_identity = {
             let file = self.file.as_mut().ok_or_else(|| {
-                format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
+                ClaimMutationError::Retryable(format!(
+                    "{PLUGIN_NAME}: dead-letter payload writer is already closed"
+                ))
             })?;
-            (spool.fs_ops.sync_file)(file, &self.temp_path)?;
-            dead_letter_payload_identity(file, &self.temp_path, self.byte_len)?
+            (spool.fs_ops.sync_file)(file, &self.temp_path)
+                .map_err(ClaimMutationError::Retryable)?;
+            dead_letter_payload_identity(file, &self.temp_path, self.byte_len)
+                .map_err(ClaimMutationError::Retryable)?
         };
 
-        let _guard = spool.lock_spool_mutation()?;
+        let _guard = spool
+            .lock_spool_mutation()
+            .map_err(ClaimMutationError::Retryable)?;
         // The final rename can replace an existing payload and is destructive
         // even when no explicit cleanup runs. Bind the entire publish to the
         // exact pinned claim, under the namespace lock.
-        spool.assert_managed_path(&self.source_path)?;
-        spool.assert_managed_path(&self.temp_path)?;
-        spool.assert_managed_path(&self.final_path)?;
         spool
-            .require_live_claim(&self.source_path, artifact)
-            .map_err(ClaimMutationError::into_message)?;
+            .assert_managed_path(&self.source_path)
+            .map_err(ClaimMutationError::Retryable)?;
+        spool
+            .assert_managed_path(&self.temp_path)
+            .map_err(ClaimMutationError::Retryable)?;
+        spool
+            .assert_managed_path(&self.final_path)
+            .map_err(ClaimMutationError::Retryable)?;
+        spool.require_live_claim(&self.source_path, artifact)?;
+        self.publish_authorized(spool, &expected_sha256, synced_identity)
+            .map_err(ClaimMutationError::Retryable)
+    }
+
+    /// Complete publication once the exact pinned claim has been proved under
+    /// the namespace mutation lock held by [`Self::publish`].
+    ///
+    /// Everything that can fail from here on is an ordinary storage, identity,
+    /// or quota failure taken while the claim is still live, so every one of
+    /// them is retryable and the caller may release the claim.
+    fn publish_authorized(
+        &mut self,
+        spool: &SpoolManager,
+        expected_sha256: &str,
+        synced_identity: SpoolFileIdentity,
+    ) -> Result<PublishedDeadLetterPayload, String> {
         // Before mutating any prior partial handoff, prove the live temp path
         // still names the descriptor whose completed metadata we captured at
         // fsync. This is a cheap fail-closed boundary; the exact streamed hash
@@ -9259,7 +9375,7 @@ impl DeadLetterPayloadWriter {
                 file,
                 &self.final_path,
                 self.byte_len,
-                &expected_sha256,
+                expected_sha256,
                 DeadLetterIdentityExpectation::SameNode(pre_rename_identity),
             ) {
                 Ok(identity) => identity,
@@ -9303,7 +9419,7 @@ impl DeadLetterPayloadWriter {
         Ok(PublishedDeadLetterPayload {
             path: self.final_path.clone(),
             byte_len: self.byte_len,
-            sha256: expected_sha256,
+            sha256: expected_sha256.to_string(),
             file,
             identity: published_identity,
         })
@@ -9614,41 +9730,68 @@ fn dead_letter_meta_paths(path: &Path) -> Result<(PathBuf, PathBuf), String> {
     Ok((tmp_path, meta_path))
 }
 
+/// Publish the payload-free dead-letter metadata record for one claimed source.
+///
+/// Two-valued like every other claim-bound step:
+/// [`ClaimMutationError::Unauthorized`] means the claim pathname stopped
+/// resolving to the opened authoritative artifact, so nothing may be released,
+/// renamed, quarantined, unlinked, or accounted for it — and reporting that as a
+/// retryable storage failure would replace this stage's diagnostic with the
+/// (correctly) refused release's own.
 fn write_dead_letter_meta(
     spool: &SpoolManager,
     source_path: &Path,
     artifact: &PinnedClaimArtifact,
     meta: &DeadLetterMeta<'_>,
-) -> Result<PathBuf, String> {
-    let (tmp_path, meta_path) = dead_letter_meta_paths(source_path)?;
+) -> Result<PathBuf, ClaimMutationError> {
+    let (tmp_path, meta_path) =
+        dead_letter_meta_paths(source_path).map_err(ClaimMutationError::Retryable)?;
     let bytes =
         materialize_reserved_payload(spool.ceiling, SPOOL_MAX_DEAD_LETTER_META_BYTES, |writer| {
             serde_json::to_writer(writer, meta).map_err(|error| error.to_string())
         })
         .map_err(|error| {
-            format!(
+            ClaimMutationError::Retryable(format!(
                 "{PLUGIN_NAME}: failed to serialize bounded dead-letter metadata: {}",
                 error.reason()
-            )
+            ))
         })?;
-    let _guard = spool.lock_spool_mutation()?;
-    spool.assert_managed_path(&meta_path)?;
-    spool.assert_managed_path(&tmp_path)?;
+    let _guard = spool
+        .lock_spool_mutation()
+        .map_err(ClaimMutationError::Retryable)?;
+    spool
+        .assert_managed_path(&meta_path)
+        .map_err(ClaimMutationError::Retryable)?;
+    spool
+        .assert_managed_path(&tmp_path)
+        .map_err(ClaimMutationError::Retryable)?;
     // The final metadata rename can replace an existing record and is
     // destructive even when no explicit cleanup runs. Bind the whole publish
     // transaction to the exact pinned claim under this namespace lock; a
     // missing, wrong-type, or substituted pathname reaches neither the
     // quota admission below nor any mutation of the derived record name.
-    spool.assert_managed_path(source_path)?;
     spool
-        .require_live_claim(source_path, artifact)
-        .map_err(ClaimMutationError::into_message)?;
+        .assert_managed_path(source_path)
+        .map_err(ClaimMutationError::Retryable)?;
+    spool.require_live_claim(source_path, artifact)?;
+    write_dead_letter_meta_authorized(spool, &tmp_path, &meta_path, bytes.as_slice())
+        .map_err(ClaimMutationError::Retryable)
+}
+
+/// Publish the metadata record once the exact pinned claim has been proved under
+/// the namespace mutation lock held by [`write_dead_letter_meta`].
+fn write_dead_letter_meta_authorized(
+    spool: &SpoolManager,
+    tmp_path: &Path,
+    meta_path: &Path,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
     spool.evict_until_can_admit(bytes.len() as u64)?;
     // Measured after eviction: a reclaim that already deleted this record has
     // accounted for it, so re-measuring here cannot double-subtract. The
     // identity check runs under the same namespace mutation lock as the unlink.
-    let replaced_meta_len = spool_regular_file_len(&meta_path);
-    match fs::remove_file(&meta_path) {
+    let replaced_meta_len = spool_regular_file_len(meta_path);
+    match fs::remove_file(meta_path) {
         Ok(()) => {
             if let Some(len) = replaced_meta_len {
                 spool.usage.account_sub(1, len);
@@ -9662,15 +9805,15 @@ fn write_dead_letter_meta(
             ));
         }
     }
-    let _live = LiveSpoolPathGuard::new(tmp_path.clone());
+    let _live = LiveSpoolPathGuard::new(tmp_path.to_path_buf());
     // `<ulid>.<owner_tag>.<ext>.rejected.meta` inherits the uniqueness of the
     // ULID-named source artifact it describes, so no other writer of this
     // protocol publishes to it and a failed publish rolls back the entry it
     // published — descriptor-bound, so a hostile replacement is left alone.
     write_private_file_atomically_with_ops(
-        &tmp_path,
-        &meta_path,
-        bytes.as_slice(),
+        tmp_path,
+        meta_path,
+        bytes,
         spool.fs_ops,
         SpoolFinalOwnership::Unique,
     )?;
@@ -9680,7 +9823,7 @@ fn write_dead_letter_meta(
     // the durable dead-letter payload revalidates.
     spool.usage.account_add(1, bytes.len() as u64);
     invalidate_status_cache();
-    Ok(meta_path)
+    Ok(meta_path.to_path_buf())
 }
 
 fn spool_file_matches(path: &Path, class: SpoolFileClass) -> bool {
@@ -9882,8 +10025,20 @@ pub enum SpoolReplayHookPoint {
     BeforeDeadLetterPayloadAppend,
     /// Streaming finished and its reader was dropped; the dead-letter
     /// finalization that publishes durable evidence and performs the terminal
-    /// claim operation has not started.
+    /// claim operation has not started. The first claim-bound step it reaches is
+    /// the rejected-payload publication.
     BeforeReplayFinalize,
+    /// The durable rejected payload was published while the claim was still
+    /// live; the metadata record's own claim-bound publication has not run. A
+    /// substitution staged here models the same actor racing *between* the two
+    /// durable publications.
+    BeforeDeadLetterMetaPublish,
+    /// Payload and metadata are both durable; the terminal claim-bound removal
+    /// of the authoritative source has not run. A substitution staged here
+    /// models the last window in the handoff, where an unproven pathname must
+    /// not be unlinked or accounted out even though the evidence beside it is
+    /// complete.
+    BeforeTerminalClaimRemoval,
 }
 
 /// The hook carries the namespace root of the [`SpoolManager`] that reached the
@@ -11262,7 +11417,10 @@ pub fn probe_empty_dead_letter_publish_with_identity_for_tests(
 ) -> Result<(), String> {
     let writer = DeadLetterPayloadWriter::open(spool, source_path, &pinned.0)
         .map_err(ClaimMutationError::into_message)?;
-    writer.publish(spool, &pinned.0).map(|_| ())
+    writer
+        .publish(spool, &pinned.0)
+        .map(|_| ())
+        .map_err(ClaimMutationError::into_message)
 }
 
 /// Opaque pinned replay-claim artifact for external tests.
@@ -11426,7 +11584,9 @@ pub fn probe_dead_letter_handoff_interference_for_tests(
     if stage == DeadLetterHandoffStageForTests::BeforePublish {
         interfere(source_path);
     }
-    let published = writer.publish(spool, &pinned)?;
+    let published = writer
+        .publish(spool, &pinned)
+        .map_err(ClaimMutationError::into_message)?;
     Ok(published.path)
 }
 
@@ -11454,7 +11614,10 @@ fn publish_dead_letter_payload_inner_for_tests(
         spool.usage.account_add(1, prior.len() as u64);
     }
     let accounted_before_publish = spool.cached_stats();
-    let path = writer.publish(spool, pinned)?.path;
+    let path = writer
+        .publish(spool, pinned)
+        .map_err(ClaimMutationError::into_message)?
+        .path;
     Ok((path, accounted_before_publish))
 }
 
@@ -11527,6 +11690,7 @@ pub fn write_dead_letter_meta_with_identity_for_tests(
         payload_sha256,
     };
     write_dead_letter_meta(spool, source_path, &pinned.0, &meta)
+        .map_err(ClaimMutationError::into_message)
 }
 
 /// Bytes one spool line-index / worklist entry occupies.
@@ -12852,9 +13016,12 @@ async fn replay_stream_batch(
             let _guard = spool
                 .lock_spool_mutation()
                 .map_err(ReplayStreamError::Retryable)?;
+            // Renewal renames the claim pathname. A claim substituted between
+            // delivery chunks is an authorization loss, not a storage failure,
+            // so it must not be answered with a claim release.
             spool
                 .renew_claim_locked(claim)
-                .map_err(ReplayStreamError::Retryable)?;
+                .map_err(|error| replay_stage_error("claim renewal", error))?;
         }
         let body = batch
             .body_range(start, end)
@@ -12947,7 +13114,7 @@ fn append_dead_letter_rows(
             hook(SpoolReplayHookPoint::BeforeDeadLetterPayloadOpen, source);
         }
         let writer = DeadLetterPayloadWriter::open(spool, source, artifact)
-            .map_err(|error| dead_letter_stage_error("payload open", error))?;
+            .map_err(|error| replay_stage_error("dead-letter payload open", error))?;
         *payload = Some(writer);
     }
     let Some(writer) = payload.as_mut() else {
@@ -12960,21 +13127,17 @@ fn append_dead_letter_rows(
     }
     writer
         .append_batch(spool, artifact, batch, row_indices)
-        .map_err(|error| dead_letter_stage_error("payload append", error))
+        .map_err(|error| replay_stage_error("dead-letter payload append", error))
 }
 
-/// Carry a dead-letter staging failure up without losing its classification.
+/// Carry a claim-bound replay failure up without losing its classification.
 ///
 /// The unauthorized diagnostic is preserved verbatim and only prefixed with the
-/// stage that observed it, so an operator can tell *where* authorization was
-/// lost. The prefix is a compiled-in literal and the wrapped message is the
-/// pathname-scoped refusal `require_live_claim` already produces; no row bytes,
-/// charge fields, or credentials are involved on this path.
-fn dead_letter_stage_error(stage: &'static str, error: ClaimMutationError) -> ReplayStreamError {
-    match error {
-        ClaimMutationError::Unauthorized(message) => ReplayStreamError::Unauthorized(format!(
-            "{PLUGIN_NAME}: unauthorized dead-letter {stage}: {message}"
-        )),
+/// stage that observed it (see [`claim_stage_error`]), so an operator can tell
+/// *where* authorization was lost.
+fn replay_stage_error(stage: &'static str, error: ClaimMutationError) -> ReplayStreamError {
+    match claim_stage_error(stage, error) {
+        ClaimMutationError::Unauthorized(message) => ReplayStreamError::Unauthorized(message),
         ClaimMutationError::Retryable(message) => ReplayStreamError::Retryable(message),
     }
 }
@@ -13019,9 +13182,12 @@ fn finalize_replayed_spool_file(
             payload.rows
         )));
     }
+    // Publication is claim-bound like every other destructive step, so losing
+    // the pinned claim between streaming and here is an authorization loss and
+    // stays one all the way to the caller.
     let mut published_payload = payload
         .publish(spool, artifact)
-        .map_err(ClaimMutationError::Retryable)?;
+        .map_err(|error| claim_stage_error("dead-letter payload publish", error))?;
     let payload_file = published_payload
         .path
         .file_name()
@@ -13041,8 +13207,14 @@ fn finalize_replayed_spool_file(
         payload_bytes: published_payload.byte_len,
         payload_sha256: published_payload.sha256.clone(),
     };
+    if let Some(hook) = snapshot_spool_replay_hook_for_tests() {
+        hook(SpoolReplayHookPoint::BeforeDeadLetterMetaPublish, file);
+    }
     let meta_path = write_dead_letter_meta(spool, file, artifact, &meta)
-        .map_err(ClaimMutationError::Retryable)?;
+        .map_err(|error| claim_stage_error("dead-letter metadata publish", error))?;
+    if let Some(hook) = snapshot_spool_replay_hook_for_tests() {
+        hook(SpoolReplayHookPoint::BeforeTerminalClaimRemoval, file);
+    }
     {
         let _guard = spool
             .lock_spool_mutation()
@@ -13055,7 +13227,9 @@ fn finalize_replayed_spool_file(
         // claim — durable payload and metadata above are already published, and
         // the caller is told the claim is gone so it performs no release,
         // rename, quarantine, or accounting on this pathname either.
-        spool.require_live_claim(file, artifact)?;
+        spool
+            .require_live_claim(file, artifact)
+            .map_err(|error| claim_stage_error("terminal claim removal", error))?;
         published_payload
             .revalidate(spool)
             .map_err(ClaimMutationError::Retryable)?;

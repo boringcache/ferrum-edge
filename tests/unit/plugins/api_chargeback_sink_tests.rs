@@ -37,7 +37,7 @@ use ferrum_edge::plugins::api_chargeback_sink::{
 };
 #[cfg(unix)]
 use ferrum_edge::plugins::api_chargeback_sink::{
-    SpoolReplayHookPoint, probe_streaming_replay_path_swap_for_tests,
+    ClaimMutationOutcomeForTests, SpoolReplayHookPoint, probe_streaming_replay_path_swap_for_tests,
     set_spool_replay_hook_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
@@ -8489,6 +8489,15 @@ async fn claim_substituted_before_finalization_publishes_nothing_and_never_mutat
     drop(clear);
 
     assert!(fired.load(Ordering::SeqCst));
+    // The first claim-bound step finalization reaches is the rejected-payload
+    // publication, and its own stage diagnostic is what must come back: a
+    // retryable classification here would send the tick into the claim-release
+    // path, where the release is correctly refused but its refusal replaces the
+    // message that says where authorization was lost.
+    assert!(
+        error.contains("unauthorized dead-letter payload publish"),
+        "the payload publish stage's unauthorized diagnostic must be the one returned: {error}"
+    );
     assert!(
         error.contains("no longer resolves to the authoritative claimed artifact"),
         "unexpected terminal-claim diagnostic: {error}"
@@ -8577,6 +8586,10 @@ async fn wrong_type_claim_before_finalization_publishes_nothing_and_never_mutate
     drop(clear);
 
     assert!(fired.load(Ordering::SeqCst));
+    assert!(
+        error.contains("unauthorized dead-letter payload publish"),
+        "the payload publish stage's unauthorized diagnostic must be the one returned: {error}"
+    );
     assert!(
         error.contains("no longer resolves to the authoritative claimed artifact"),
         "unexpected wrong-type finalization diagnostic: {error}"
@@ -8840,10 +8853,16 @@ async fn finalize_authorization_precedes_generic_publication_failure() {
 
     assert!(fired.load(Ordering::SeqCst));
     // Claim authorization is checked before payload/meta publication can reach
-    // the unrelated occupied metadata-temp path.
+    // the unrelated occupied metadata-temp path, so the authorization refusal —
+    // not the blocked metadata store, and not a release refusal standing in for
+    // either — is what the tick reports.
+    assert!(
+        error.contains("unauthorized dead-letter payload publish"),
+        "the payload publish stage's unauthorized diagnostic must be the one returned: {error}"
+    );
     assert!(
         error.contains("no longer resolves to the authoritative claimed artifact"),
-        "the refused release must be reported: {error}"
+        "the authorization refusal must be reported: {error}"
     );
     let claim = claim_slot
         .lock()
@@ -8870,6 +8889,310 @@ async fn finalize_authorization_precedes_generic_publication_failure() {
     assert!(
         !dead_letter_payload_path(&source).exists(),
         "claim authorization must run before rejected-payload publication"
+    );
+}
+
+/// Claim authorization lost at the *metadata* publication, after the durable
+/// rejected payload was already published under a live claim.
+///
+/// Metadata publication ends in a replacing rename of a name derived from the
+/// claim pathname, so it is claim-bound like every other destructive step. A
+/// retryable classification here would send the tick into the release path,
+/// where the release is correctly refused but replaces the diagnostic that says
+/// authorization was lost at metadata publication.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn substituted_claim_before_metadata_publish_is_unauthorized_not_retryable() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-substitute-before-meta-publish")])
+        .unwrap();
+    let day = source.parent().unwrap().to_path_buf();
+    let authoritative_bytes = fs::read(&source).unwrap();
+    let before = spool.cached_stats_for_tests();
+    let displaced = outside.path().join("displaced-authoritative-source.ndjson");
+
+    let clear = ClearReplayHookOnDrop;
+    let (fired, claim_slot) = install_claim_substitution_hook(
+        spool.namespace_root_for_tests().to_path_buf(),
+        displaced.clone(),
+        SpoolReplayHookPoint::BeforeDeadLetterMetaPublish,
+    );
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("a substituted claim at metadata publication must fail the tick");
+    drop(clear);
+
+    assert!(fired.load(Ordering::SeqCst));
+    assert!(
+        error.contains("unauthorized dead-letter metadata publish"),
+        "the metadata publish stage's unauthorized diagnostic must be the one returned: {error}"
+    );
+    assert!(
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "the original authorization diagnostic must be preserved verbatim: {error}"
+    );
+
+    // Evidence completed while the claim was still live stays published; the
+    // record derived from a pathname this handoff can no longer prove it owns
+    // does not, and neither does its handoff temp.
+    let payload_path = dead_letter_payload_path(&source);
+    assert!(
+        payload_path.is_file(),
+        "the payload published under a live claim must stay published"
+    );
+    assert!(
+        !dead_letter_meta_path(&source).exists(),
+        "an unauthorized metadata publish must publish no record"
+    );
+    assert!(
+        !dead_letter_meta_temp_path(&source).exists(),
+        "an unauthorized metadata publish must leave no handoff temp"
+    );
+
+    let claim = claim_slot
+        .lock()
+        .expect("planted claim slot")
+        .clone()
+        .expect("the race plants exactly one claim pathname");
+    assert_eq!(
+        fs::read(&claim).unwrap(),
+        PLANTED_CLAIM_SUBSTITUTE,
+        "the planted regular file must be byte-identical and never rewritten"
+    );
+    assert!(
+        !source.exists(),
+        "an unauthorized metadata publish must never release the substitute back to the replayable name"
+    );
+    assert!(
+        !spool_day_has_quarantine(&day),
+        "an unauthorized metadata publish must never quarantine the substitute"
+    );
+    assert_eq!(fs::read(&displaced).unwrap(), authoritative_bytes);
+
+    // Exactly the live-claim payload publication is accounted: the refused
+    // record adds nothing, and the still-present source is never accounted out.
+    let payload_bytes = fs::metadata(&payload_path).unwrap().len();
+    let after = spool.cached_stats_for_tests();
+    assert_eq!(
+        after.files,
+        before.files + 1,
+        "only the payload published under a live claim may be accounted"
+    );
+    assert_eq!(
+        after.bytes,
+        before.bytes + payload_bytes,
+        "only the payload published under a live claim may be accounted"
+    );
+}
+
+/// Claim authorization lost at the *terminal* claim removal, with both durable
+/// dead-letter siblings already published under a live claim.
+///
+/// This is the last window in the handoff, and the most destructive step: it
+/// unlinks the authoritative artifact and accounts its bytes out. Shape is not
+/// authority, so a planted directory holding the claim pathname authorizes
+/// neither the unlink nor a release, and the completed evidence beside it is not
+/// a substitute for the missing proof.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn wrong_type_claim_before_terminal_removal_is_unauthorized_not_retryable() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-wrong-type-before-terminal-removal")])
+        .unwrap();
+    let day = source.parent().unwrap().to_path_buf();
+    let authoritative_bytes = fs::read(&source).unwrap();
+    let before = spool.cached_stats_for_tests();
+    let displaced = outside.path().join("displaced-authoritative-source.ndjson");
+
+    let clear = ClearReplayHookOnDrop;
+    let (fired, claim_slot) = install_claim_directory_substitution_hook(
+        spool.namespace_root_for_tests().to_path_buf(),
+        displaced.clone(),
+        SpoolReplayHookPoint::BeforeTerminalClaimRemoval,
+    );
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("a wrong-type claim at terminal removal must fail the tick");
+    drop(clear);
+
+    assert!(fired.load(Ordering::SeqCst));
+    assert!(
+        error.contains("unauthorized terminal claim removal"),
+        "the terminal removal stage's unauthorized diagnostic must be the one returned: {error}"
+    );
+    assert!(
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "the original authorization diagnostic must be preserved verbatim: {error}"
+    );
+
+    let payload_path = dead_letter_payload_path(&source);
+    let meta_path = dead_letter_meta_path(&source);
+    assert!(
+        payload_path.is_file(),
+        "evidence published under a live claim must stay published"
+    );
+    assert!(
+        meta_path.is_file(),
+        "evidence published under a live claim must stay published"
+    );
+
+    let planted = claim_slot
+        .lock()
+        .expect("planted claim slot")
+        .clone()
+        .expect("the race plants exactly one claim pathname");
+    assert!(
+        planted.is_dir(),
+        "the planted directory must be left exactly where it was planted"
+    );
+    assert!(
+        !source.exists(),
+        "an unauthorized terminal removal must never release the pathname back to the replayable name"
+    );
+    assert!(
+        !spool_day_has_quarantine(&day),
+        "an unauthorized terminal removal must never quarantine the pathname"
+    );
+    assert_eq!(fs::read(&displaced).unwrap(), authoritative_bytes);
+
+    // Both siblings published under the live claim are accounted; the source the
+    // terminal step refused to unlink is never accounted out.
+    let payload_bytes = fs::metadata(&payload_path).unwrap().len();
+    let meta_bytes = fs::metadata(&meta_path).unwrap().len();
+    let after = spool.cached_stats_for_tests();
+    assert_eq!(
+        after.files,
+        before.files + 2,
+        "a refused terminal removal must not account the source out"
+    );
+    assert_eq!(
+        after.bytes,
+        before.bytes + payload_bytes + meta_bytes,
+        "a refused terminal removal must not account the source out"
+    );
+}
+
+/// Claim renewal renames the claim pathname onto a fresh lease deadline, so a
+/// pathname that stopped resolving to the pinned artifact must refuse it as an
+/// authorization loss rather than an ordinary storage failure.
+///
+/// Driven through the explicit-deadline seam because the production renewal
+/// renames only when the deadline actually moves — an end-to-end tick reaches
+/// the rename only when a delivery chunk boundary happens to cross a wall-clock
+/// second, which is exactly the nondeterminism this classification must not
+/// depend on. A retryable classification here would send the tick into the
+/// claim-release path.
+#[cfg(unix)]
+#[test]
+fn claim_renewal_refuses_a_substituted_pathname_as_unauthorized() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-renewal-substitution")])
+        .unwrap();
+    let day = source.parent().unwrap().to_path_buf();
+    let authoritative_bytes = fs::read(&source).unwrap();
+    let mut claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("the owner claims its own durable record");
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+
+    // Same-UID substitution: the authoritative artifact keeps its inode outside
+    // the managed tree and a different regular file takes the claim pathname.
+    let displaced = outside.path().join("displaced-authoritative-source.ndjson");
+    fs::rename(&claim_path, &displaced).unwrap();
+    fs::write(&claim_path, PLANTED_CLAIM_SUBSTITUTE).unwrap();
+    let before = spool.cached_stats_for_tests();
+
+    // 2100-01-01T00:00:00Z, unambiguously distinct from the initial deadline, so
+    // the renewal rename is always attempted.
+    let far_future = 4_102_444_800i64;
+    let renewed_suffix = format!("-{far_future}.inflight");
+    match spool
+        .probe_renew_claim_at_for_tests(&mut claim, far_future)
+        .expect_err("a substituted claim pathname must not be renewed")
+    {
+        ClaimMutationOutcomeForTests::Unauthorized(message) => {
+            assert!(
+                message.contains("no longer resolves to the authoritative claimed artifact"),
+                "unexpected renewal refusal diagnostic: {message}"
+            );
+            assert!(
+                message.contains(&claim_path.display().to_string()),
+                "the refusal must name the claim pathname it refused: {message}"
+            );
+        }
+        ClaimMutationOutcomeForTests::Retryable(message) => panic!(
+            "renewal must not report an authorization loss as a retryable failure: {message}"
+        ),
+    }
+
+    assert_eq!(
+        fs::read(&claim_path).unwrap(),
+        PLANTED_CLAIM_SUBSTITUTE,
+        "the planted regular file must be byte-identical and never rewritten"
+    );
+    assert_eq!(
+        claim.claim_path_for_tests(),
+        claim_path,
+        "a refused renewal must not move the live claim handle onto a new lease name"
+    );
+    assert!(
+        !fs::read_dir(&day)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(&renewed_suffix)),
+        "a refused renewal must not create the renewed lease name"
+    );
+    assert!(
+        !source.exists(),
+        "a refused renewal must never release the substitute back to the replayable name"
+    );
+    assert!(
+        !spool_day_has_quarantine(&day),
+        "a refused renewal must never quarantine the substitute"
+    );
+    assert!(
+        !spool_day_has_dead_letter_residue(&day),
+        "a refused renewal must publish no dead-letter evidence"
+    );
+    assert_eq!(
+        fs::read(&displaced).unwrap(),
+        authoritative_bytes,
+        "the displaced authoritative artifact must remain intact"
+    );
+    assert!(
+        spool
+            .list_replayable_spool_files_for_tests()
+            .unwrap()
+            .is_empty(),
+        "the substituted artifact must never enter the replay worklist"
+    );
+
+    let after = spool.cached_stats_for_tests();
+    assert_eq!(
+        after.files, before.files,
+        "a refused renewal must not change the owned-file accounting"
+    );
+    assert_eq!(
+        after.bytes, before.bytes,
+        "a refused renewal must not change the owned-byte accounting"
     );
 }
 
@@ -9062,102 +9385,202 @@ async fn spool_replay_quarantines_hostile_json_shapes_and_whitespace_only_artifa
     }
 }
 
+/// The unreachable ClickHouse endpoint every hostile-artifact scenario below
+/// replays against: reaching it at all would mean an artifact was admitted for
+/// delivery, and the resulting `network` deferral would mask the fail-closed
+/// decision under test.
+#[cfg(unix)]
+const UNREACHABLE_INSERT_URL: &str = "http://127.0.0.1:1/";
+
+/// Prepare one isolated spool namespace and its day directory.
+///
+/// `replay_spool_once` processes the whole owned inventory rather than a named
+/// target, so scenarios may not share a spool: a case that legitimately leaves a
+/// replayable record behind (a mode-000 file carries no descriptor to bind, so
+/// it is left exactly where it is) would otherwise be selected by a later
+/// case's tick, reach the unreachable endpoint, and return `network` before the
+/// artifact under test was ever inspected.
+#[cfg(unix)]
+fn isolated_replay_fixture(temp: &tempfile::TempDir) -> (SpoolManager, std::path::PathBuf) {
+    let spool = test_spool(temp);
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    (spool, day)
+}
+
+#[cfg(unix)]
+fn quarantine_sibling(path: &Path) -> std::path::PathBuf {
+    path.with_file_name(format!(
+        "{}.corrupt",
+        path.file_name().unwrap().to_string_lossy()
+    ))
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn spool_replay_fails_closed_on_non_file_hardlink_symlink_and_declared_zstd_size() {
     use std::fs::hard_link;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    let temp = tempfile::tempdir().unwrap();
-    let spool = test_spool(&temp);
-    let day = spool.namespace_root_for_tests().join("20260524");
-    fs::create_dir_all(&day).unwrap();
+    // A directory wearing a durable data name is never a replay candidate: the
+    // inventory walk enumerates real nodes and only regular files reach a claim.
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let (spool, day) = isolated_replay_fixture(&temp);
+        let directory = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FF4"));
+        fs::create_dir(&directory).unwrap();
 
-    let directory = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FF4"));
-    fs::create_dir(&directory).unwrap();
-    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
-        .await
-        .expect(
-            "a directory planted as a spool artifact is skipped/quarantine-failed without aborting the tick",
+        replay_spool_once_for_tests(&spool, UNREACHABLE_INSERT_URL)
+            .await
+            .expect("a directory planted as a spool artifact must not abort the tick");
+
+        assert!(
+            directory.is_dir(),
+            "the planted directory must be left exactly where it was planted"
         );
-
-    let linked = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FF5"));
-    fs::write(&linked, br#"{"event_id":"hardlink"}"#).unwrap();
-    let alias = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FF6"));
-    hard_link(&linked, &alias).unwrap();
-    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
-        .await
-        .expect("hard-linked artifacts are unreadable and must not abort later replay");
-    assert!(
-        linked
-            .with_file_name(format!(
-                "{}.corrupt",
-                linked.file_name().unwrap().to_string_lossy()
-            ))
-            .exists()
-            || alias
-                .with_file_name(format!(
-                    "{}.corrupt",
-                    alias.file_name().unwrap().to_string_lossy()
-                ))
-                .exists()
-            || (!linked.exists() && !alias.exists()),
-        "at least one hard-linked name must leave the live replay set"
-    );
-
-    let outside = temp.path().join("outside-symlink-target");
-    fs::write(&outside, br#"{"event_id":"symlink"}"#).unwrap();
-    let linked_path = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FF7"));
-    symlink(&outside, &linked_path).unwrap();
-    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
-        .await
-        .expect("symlink inventory entries must not abort the tick");
-    assert_eq!(fs::read(&outside).unwrap(), br#"{"event_id":"symlink"}"#);
-
-    // A same-UID mode-000 data file still appears in inventory but fails the
-    // secure open; that is an unreadable quarantine path, not a retry.
-    let denied = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FFB"));
-    fs::write(&denied, br#"{"event_id":"mode-denied"}"#).unwrap();
-    let mut denied_perms = fs::metadata(&denied).unwrap().permissions();
-    denied_perms.set_mode(0o000);
-    fs::set_permissions(&denied, denied_perms).unwrap();
-    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
-        .await
-        .expect("permission-denied opens are unreadable, not retryable");
-    let denied_corrupt = denied.with_file_name(format!(
-        "{}.corrupt",
-        denied.file_name().unwrap().to_string_lossy()
-    ));
-    let restore_path = if denied_corrupt.exists() {
-        denied_corrupt
-    } else {
-        denied.clone()
-    };
-    if restore_path.exists() {
-        let mut restore = fs::metadata(&restore_path).unwrap().permissions();
-        restore.set_mode(0o600);
-        fs::set_permissions(&restore_path, restore).unwrap();
+        assert!(
+            !quarantine_sibling(&directory).exists(),
+            "a wrong-type pathname must never be quarantined"
+        );
+        assert!(
+            spool
+                .list_replayable_spool_files_for_tests()
+                .unwrap()
+                .is_empty(),
+            "a directory must never enter the replay worklist"
+        );
     }
 
-    let declared = day.join(format!(
-        "01ARZ3NDEKTSV4RRFFQ69G5FF8.{}.ndjson.zst",
-        default_test_owner_tag()
-    ));
-    let frame =
-        encode_zstd_declaring_content_size_for_tests(spool_artifact_byte_limit_for_tests() + 1);
-    fs::write(&declared, frame).unwrap();
-    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
-        .await
-        .expect("an oversized declared zstd size is quarantined before decode");
-    assert!(
-        declared
-            .with_file_name(format!(
-                "{}.corrupt",
-                declared.file_name().unwrap().to_string_lossy()
-            ))
-            .exists(),
-        "declared-size overflow must quarantine the planted frame"
-    );
+    // Both names of a hard-linked pair fail the single-link claim proof. Each is
+    // demoted to its own `.corrupt` sibling, bound to the exact inode the
+    // refusal opened, and neither is ever delivered.
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let (spool, day) = isolated_replay_fixture(&temp);
+        let linked = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FF5"));
+        fs::write(&linked, br#"{"event_id":"hardlink"}"#).unwrap();
+        let alias = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FF6"));
+        hard_link(&linked, &alias).unwrap();
+
+        replay_spool_once_for_tests(&spool, UNREACHABLE_INSERT_URL)
+            .await
+            .expect("hard-linked artifacts are unreadable and must not abort the tick");
+
+        assert!(
+            quarantine_sibling(&linked).is_file() && quarantine_sibling(&alias).is_file(),
+            "every hard-linked name must be demoted to its own quarantine sibling"
+        );
+        assert!(
+            !linked.exists() && !alias.exists(),
+            "no hard-linked name may remain under a replayable name"
+        );
+        assert!(
+            spool
+                .list_replayable_spool_files_for_tests()
+                .unwrap()
+                .is_empty(),
+            "quarantined artifacts must leave the live replay set"
+        );
+    }
+
+    // A symlink under a durable data name is ignored by the walk, so nothing it
+    // points at — inside or outside the managed tree — is read or mutated.
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let (spool, day) = isolated_replay_fixture(&temp);
+        let outside = temp.path().join("outside-symlink-target");
+        fs::write(&outside, br#"{"event_id":"symlink"}"#).unwrap();
+        let linked_path = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FF7"));
+        symlink(&outside, &linked_path).unwrap();
+
+        replay_spool_once_for_tests(&spool, UNREACHABLE_INSERT_URL)
+            .await
+            .expect("symlink inventory entries must not abort the tick");
+
+        assert_eq!(fs::read(&outside).unwrap(), br#"{"event_id":"symlink"}"#);
+        assert!(
+            linked_path.symlink_metadata().unwrap().file_type().is_symlink(),
+            "the symlink must be left exactly as planted"
+        );
+        assert!(
+            !quarantine_sibling(&linked_path).exists(),
+            "a symlink must never be quarantined"
+        );
+        assert!(
+            spool
+                .list_replayable_spool_files_for_tests()
+                .unwrap()
+                .is_empty(),
+            "a symlink must never enter the replay worklist"
+        );
+    }
+
+    // A same-UID mode-000 data file appears in inventory but fails the secure
+    // open. That refusal carries no descriptor, so the candidate is left exactly
+    // where it is, reported, and never delivered — and it is not a retry.
+    // (The suite runs unprivileged; as root the open would succeed and this is
+    // no longer the case under test.)
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let (spool, day) = isolated_replay_fixture(&temp);
+        let denied = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FFB"));
+        fs::write(&denied, br#"{"event_id":"mode-denied"}"#).unwrap();
+        let mut denied_perms = fs::metadata(&denied).unwrap().permissions();
+        denied_perms.set_mode(0o000);
+        fs::set_permissions(&denied, denied_perms).unwrap();
+
+        replay_spool_once_for_tests(&spool, UNREACHABLE_INSERT_URL)
+            .await
+            .expect("permission-denied opens are unreadable, not retryable");
+
+        assert!(
+            denied.is_file(),
+            "an unopenable candidate must be left inert under its own name"
+        );
+        assert!(
+            !quarantine_sibling(&denied).exists(),
+            "a refusal that opened no descriptor must not rename anything"
+        );
+
+        // Restore the mode so the fixture directory is removable.
+        let mut restore = fs::metadata(&denied).unwrap().permissions();
+        restore.set_mode(0o600);
+        fs::set_permissions(&denied, restore).unwrap();
+    }
+
+    // A zstd frame declaring a content size past the artifact ceiling is refused
+    // before any decode is attempted, and quarantined.
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let (spool, day) = isolated_replay_fixture(&temp);
+        let declared = day.join(format!(
+            "01ARZ3NDEKTSV4RRFFQ69G5FF8.{}.ndjson.zst",
+            default_test_owner_tag()
+        ));
+        let frame =
+            encode_zstd_declaring_content_size_for_tests(spool_artifact_byte_limit_for_tests() + 1);
+        fs::write(&declared, frame).unwrap();
+
+        replay_spool_once_for_tests(&spool, UNREACHABLE_INSERT_URL)
+            .await
+            .expect("an oversized declared zstd size is quarantined before decode");
+
+        assert!(
+            quarantine_sibling(&declared).is_file(),
+            "declared-size overflow must quarantine the planted frame"
+        );
+        assert!(
+            !declared.exists(),
+            "the refused frame must not remain under a replayable name"
+        );
+        assert!(
+            spool
+                .list_replayable_spool_files_for_tests()
+                .unwrap()
+                .is_empty(),
+            "the refused frame must leave the live replay set"
+        );
+    }
 }
 
 /// An unpinnable candidate whose quarantine name is already occupied must be
