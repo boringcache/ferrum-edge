@@ -25,6 +25,7 @@ use crate::scaffolding::ports::{reserve_udp_port, unbound_port, unbound_udp_port
 use std::net::SocketAddr;
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::time::Instant;
 
 /// Locate the already-built `ferrum-edge` binary. Match the same fallback
 /// order the other functional tests use.
@@ -591,10 +592,11 @@ plugin_configs: []
     // recording any misrouted datagram for the assertion below.
     let backend_a = ScriptedUdpBackend::builder(res_a.into_socket())
         .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
+        .expect_deadline(Duration::from_secs(25))
         .spawn()
         .expect("spawn backend a");
     let backend_b = ScriptedUdpBackend::builder(res_b.into_socket())
-        .step(UdpStep::Silence(Duration::from_secs(5)))
+        .step(UdpStep::Silence(Duration::from_secs(25)))
         .spawn()
         .expect("spawn backend b");
 
@@ -605,13 +607,26 @@ plugin_configs: []
     let client = UdpClient::connect(gateway_addr).await.expect("client");
     client.send_datagram(&hello).await.expect("send hello");
 
-    // Give the gateway time to establish the session + forward. The
-    // gateway's UDP recv → SNI peek → session create → backend
-    // socket bind → send round trip is well under 500 ms; 2 s is
-    // generous tolerance for CI runners.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let a_dgrams = backend_a.received_datagrams().await;
+    // Wait on the routing behavior itself. A fixed sleep races a contended
+    // runner: snapshotting immediately afterward can observe the backend just
+    // before its receive task records the already-forwarded datagram.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let a_dgrams = loop {
+        let observed = backend_a.received_datagrams().await;
+        if observed.iter().any(|d| d.payload == hello) {
+            break observed;
+        }
+        if Instant::now() >= deadline {
+            let b_dgrams = backend_b.received_datagrams().await;
+            panic!(
+                "backend A did not receive the DTLS ClientHello within 20 seconds; \
+                 backend A saw {} datagrams, backend B saw {b_dgrams:?}. Gateway logs:\n{}",
+                observed.len(),
+                fx.captured_stderr()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     let b_dgrams = backend_b.received_datagrams().await;
 
     assert!(
