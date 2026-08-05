@@ -1801,30 +1801,39 @@ fn validate_ecds_mesh_slice_carrier(resource: &AccumulatedResource) -> Result<()
 ///
 /// Decoding proves the carrier's SHAPE; it does not prove that the
 /// security-relevant fields inside it are supported. The VirtualService CORS
-/// carrier gained an `exportTo` list (issue #2465) whose evaluator is the same
-/// one that bounds DestinationRule visibility, so it gets the same fail-closed
+/// carrier's `exportTo` list (issue #2465) and the root-namespace carrier that
+/// grants mesh-wide policy authority (issue #2469) get the same fail-closed
 /// treatment the reserved DestinationRule carrier already had: an unsupported
-/// or self-conflicting list NACKs the ECDS response, `handle_ads_response`
-/// restores the accumulator snapshot, and the last accepted slice keeps
-/// serving. Without this the carrier is ACKed and the bad list only becomes
-/// visible later, as a silently non-matching (or over-matching) policy.
+/// value NACKs the ECDS response, `handle_ads_response` restores the accumulator
+/// snapshot, and the last accepted slice keeps serving. Without this the
+/// carrier is ACKed and the bad value becomes policy input after the boundary.
 ///
-/// Diagnostics name the carrier field and the offending INDEX only — never the
-/// carrier-supplied namespace, name, host, or `exportTo` value.
+/// Diagnostics identify the carrier field (and the offending INDEX for list
+/// entries) but never echo a carrier-supplied namespace, name, host, or
+/// `exportTo` value.
 fn validate_recognized_mesh_slice_carrier(
     carrier: &crate::xds::carrier::MeshSliceCarrier,
 ) -> Result<(), String> {
     use crate::xds::carrier::MeshSliceCarrier;
-    let MeshSliceCarrier::VirtualServiceCorsPolicies(policies) = carrier else {
-        return Ok(());
-    };
     let mut errors = Vec::new();
-    for (index, policy) in policies.iter().enumerate() {
-        crate::modes::mesh::config::validate_mesh_export_to(
-            &format!("xDS VirtualService CORS carrier[{index}]"),
-            &policy.export_to,
-            &mut errors,
-        );
+    match carrier {
+        MeshSliceCarrier::VirtualServiceCorsPolicies(policies) => {
+            for (index, policy) in policies.iter().enumerate() {
+                crate::modes::mesh::config::validate_mesh_export_to(
+                    &format!("xDS VirtualService CORS carrier[{index}]"),
+                    &policy.export_to,
+                    &mut errors,
+                );
+            }
+        }
+        MeshSliceCarrier::IstioRootNamespace(namespace) => {
+            crate::modes::mesh::config::validate_mesh_root_namespace(
+                "xDS Istio root-namespace carrier",
+                namespace,
+                &mut errors,
+            );
+        }
+        _ => return Ok(()),
     }
     if errors.is_empty() {
         Ok(())
@@ -4756,6 +4765,63 @@ mod tests {
             FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL,
             policies_json.as_bytes().to_vec(),
         )
+    }
+
+    fn root_namespace_carrier_resource(namespace: &str) -> proto::Any {
+        use crate::xds::carrier::{
+            FERRUM_ECDS_ISTIO_ROOT_NAMESPACE_TYPE_URL, carrier_resource_name_for_type_url,
+        };
+        let name = carrier_resource_name_for_type_url(FERRUM_ECDS_ISTIO_ROOT_NAMESPACE_TYPE_URL)
+            .expect("root-namespace carrier has a reserved resource name");
+        typed_extension_resource(
+            name,
+            FERRUM_ECDS_ISTIO_ROOT_NAMESPACE_TYPE_URL,
+            serde_json::to_vec(namespace).expect("encode root namespace"),
+        )
+    }
+
+    /// Issue #2469: the carried root namespace grants mesh-wide policy
+    /// authority. A malformed non-blank value must NACK at the ECDS boundary
+    /// and preserve the last accepted provenance rather than becoming a new
+    /// policy tier.
+    #[test]
+    fn ecds_invalid_root_namespace_is_rejected_and_retains_last_good() {
+        let hostile = format!("Bad/{}", "SECRET".repeat(40));
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[root_namespace_carrier_resource("istio-system")],
+                "v1",
+            )
+            .expect("valid root namespace applies");
+
+        let err = accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[root_namespace_carrier_resource(&hostile)],
+                "v2",
+            )
+            .expect_err("a malformed root namespace must reject the carrier");
+        assert!(err.contains("xDS Istio root-namespace carrier"), "{err}");
+        assert!(
+            !err.contains(&hostile),
+            "the diagnostic must not echo the carrier-supplied value: {err}"
+        );
+
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate")
+            .expect("all required types present");
+        assert_eq!(slice.istio_root_namespace, "istio-system");
+        assert_eq!(
+            accumulator
+                .versions_by_type
+                .get(ECDS_TYPE_URL)
+                .map(String::as_str),
+            Some("v1"),
+            "a rejected ECDS response must not advance the accepted version"
+        );
     }
 
     /// The CORS mesh-slice carrier carries an `exportTo` list evaluated by the

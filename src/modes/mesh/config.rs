@@ -2912,6 +2912,11 @@ impl MeshConfig {
             self.trust_bundles.as_ref(),
             self.multi_cluster.as_ref(),
         );
+        validate_mesh_root_namespace(
+            "MeshConfig.istio_root_namespace",
+            &self.istio_root_namespace,
+            &mut errors,
+        );
         validate_virtual_service_cors_policies(&self.virtual_service_cors_policies, &mut errors);
         errors
     }
@@ -4174,6 +4179,20 @@ pub fn validate_mesh_export_to(context: &str, export_to: &[String], errors: &mut
         errors.push(format!(
             "{context}.exportTo: '*' is mesh-wide and conflicts with the other {} entries; declare either '*' alone or an explicit namespace list",
             export_to.len() - 1
+        ));
+    }
+}
+
+/// Validate the policy-authority namespace carried by a mesh config or xDS
+/// slice (issue #2469).
+///
+/// The root namespace decides which tenant may supply mesh-wide policy, so a
+/// non-empty but malformed value must be rejected at the source boundary. The
+/// diagnostic intentionally withholds the operator/CP-supplied value.
+pub fn validate_mesh_root_namespace(context: &str, namespace: &str, errors: &mut Vec<String>) {
+    if !is_dns1123_namespace_label(namespace.trim()) {
+        errors.push(format!(
+            "{context}: must be a lowercase RFC 1123 namespace name of at most 63 characters"
         ));
     }
 }

@@ -49,6 +49,30 @@ fn empty_mesh_config_passes_validation() {
     assert!(errors.is_empty());
 }
 
+/// Issue #2469: the root namespace is a policy-authority boundary, not an
+/// arbitrary label. Native/file config must reject malformed values just as
+/// the xDS carrier boundary does, without echoing hostile input.
+#[test]
+fn mesh_config_rejects_malformed_istio_root_namespace_without_echoing_it() {
+    let hostile = format!("Bad/{}", "SECRET".repeat(40));
+    let mesh = MeshConfig {
+        istio_root_namespace: hostile.clone(),
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("MeshConfig.istio_root_namespace")),
+        "the policy-authority namespace must be rejected: {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|error| error.contains(&hostile)),
+        "the diagnostic must name the field without echoing hostile input: {errors:?}"
+    );
+}
+
 #[test]
 fn workload_validates_trust_domain_consistency() {
     let mut wl = fresh_workload();

@@ -112,7 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whitespace-only root provenance fails closed: Unscoped rules are refused,
   independently provable client/service tiers still apply, and a legitimate
   root-tier default is unavailable rather than guessed. Blank root carriers are
-  ignored so they cannot clear trustworthy provenance.
+  ignored so they cannot clear trustworthy provenance. Non-blank values are
+  now validated as lowercase RFC 1123 namespace labels at both the native/file
+  config boundary and the xDS ACK boundary; a malformed xDS value is NACKed
+  while the last accepted slice remains live, and diagnostics never echo it.
 
 - That materialization-time refusal now resolves the matched destination host's
   owning namespace with the SAME shared helper, in the same precedence order,
