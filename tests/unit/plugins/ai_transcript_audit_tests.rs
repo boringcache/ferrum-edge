@@ -10936,7 +10936,11 @@ async fn grpc_final_hook_headers_are_authoritative_for_request_framing() {
         .await;
 
     let records = wait_for_records(&server).await;
-    assert_eq!(records.len(), 1, "expected one audit record, got {records:?}");
+    assert_eq!(
+        records.len(),
+        1,
+        "expected one audit record, got {records:?}"
+    );
     let request_body = records[0]
         .get("request_body")
         .and_then(Value::as_str)
@@ -11003,7 +11007,11 @@ async fn grpc_final_hook_unsupported_encoding_omits_with_framing_reason() {
         .await;
 
     let records = wait_for_records(&server).await;
-    assert_eq!(records.len(), 1, "expected one audit record, got {records:?}");
+    assert_eq!(
+        records.len(),
+        1,
+        "expected one audit record, got {records:?}"
+    );
     assert_eq!(
         records[0]
             .get("request_body_omitted_reason")

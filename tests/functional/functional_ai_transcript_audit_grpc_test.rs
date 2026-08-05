@@ -243,7 +243,9 @@ async fn start_audit_collector() -> (u16, CollectedRecords, tokio::task::JoinHan
                         )
                     }
                 });
-                let _ = Http1ServerBuilder::new().serve_connection(io, service).await;
+                let _ = Http1ServerBuilder::new()
+                    .serve_connection(io, service)
+                    .await;
             });
         }
     });
@@ -569,7 +571,11 @@ async fn grpc_audit_captures_live_unary_request_and_response() {
         .await
         .expect("gRPC call");
     assert_eq!(call.status, 200);
-    assert_eq!(call.grpc_status(), "0", "unary call must succeed end to end");
+    assert_eq!(
+        call.grpc_status(),
+        "0",
+        "unary call must succeed end to end"
+    );
 
     let records = harness.records.wait_for(1).await;
     assert_eq!(
