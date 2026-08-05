@@ -132,7 +132,11 @@ runs:
           -o "Dir::Etc::sourceparts=-" \
           -o "APT::Get::List-Cleanup=0" \
           -o "Acquire::Retries=3"
-        sudo apt-get install -y --no-install-recommends "${required_packages[@]}"
+        sudo apt-get \
+          -o "Dir::Etc::sourcelist=${ubuntu_sources}" \
+          -o "Dir::Etc::sourceparts=-" \
+          -o "Acquire::Retries=3" \
+          install -y --no-install-recommends "${required_packages[@]}"
 
     - name: Install optional fast-linker packages (best-effort)
       if: runner.os == 'Linux'
@@ -177,7 +181,11 @@ runs:
           -o "Dir::Etc::sourceparts=-" \
           -o "APT::Get::List-Cleanup=0" \
           -o "Acquire::Retries=3"
-        sudo apt-get install -y --no-install-recommends "${optional_packages[@]}"
+        sudo apt-get \
+          -o "Dir::Etc::sourcelist=${ubuntu_sources}" \
+          -o "Dir::Etc::sourceparts=-" \
+          -o "Acquire::Retries=3" \
+          install -y --no-install-recommends "${optional_packages[@]}"
 
     - uses: ./.github/actions/setup-fast-linker
       with:
