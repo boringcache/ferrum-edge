@@ -4381,7 +4381,7 @@ jobs:
           fi
           if [ "${RUN_WRR}" = "true" ]; then
             {
-              echo "WRR selection contention guard executed: 4-thread/1-thread throughput speedup >= 1.10x across 4/32/129-target fixtures."
+              echo "WRR selection contention guard executed: mandatory 4-thread/1-thread throughput speedup >= 1.10x on 32/129-target fixtures; 4-target 5:1:1:1 fixture remains measured (informational parallel speedup under Arc strong-count hotspot; 4/32 1-thread serial-wall ratio ceiling)."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi
