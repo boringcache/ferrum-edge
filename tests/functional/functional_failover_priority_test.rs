@@ -245,8 +245,10 @@ async fn retry_get(client: &Http1Client, url: &str) -> ClientResponse {
 async fn start_gateway(
     preferred_port: u16,
     secondary_port: u16,
-) -> Result<(GatewayConfig, u16, watch::Sender<bool>, JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>>
-{
+) -> Result<
+    (GatewayConfig, u16, watch::Sender<bool>, JoinHandle<()>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let proxy = reserve_port().await?;
     let admin = reserve_port().await?;
     let proxy_port = proxy.port;
@@ -291,16 +293,12 @@ async fn start_gateway(
     };
 
     let (shutdown_tx, _) = watch::channel(false);
-    let handles = ferrum_edge::modes::file::serve(
-        env_config,
-        prepared.clone(),
-        opts,
-        shutdown_tx.clone(),
-    )
-    .await
-    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        format!("file::serve failed: {e}").into()
-    })?;
+    let handles =
+        ferrum_edge::modes::file::serve(env_config, prepared.clone(), opts, shutdown_tx.clone())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("file::serve failed: {e}").into()
+            })?;
     let join = tokio::spawn(async move {
         if let Err(err) = handles.join().await {
             eprintln!("failoverPriority gateway listener panicked: {err}");
