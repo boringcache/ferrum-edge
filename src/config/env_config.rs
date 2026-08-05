@@ -278,6 +278,32 @@ impl std::fmt::Display for DbTlsMode {
     }
 }
 
+/// Result of inspecting a PostgreSQL/MySQL URL for a peer-authenticating TLS
+/// mode parameter (`sslmode` / `ssl-mode`).
+///
+/// Used by the FIPS admission gate when `FERRUM_DB_TLS_MODE` is unset so
+/// URL-owned verifying modes remain valid while absent or weaker parameters
+/// are refused. Diagnostics name the parameter only; the URL and credentials
+/// are never carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SqlUrlTlsPeerAuth {
+    /// At least one mode parameter is present and every one authenticates the
+    /// peer (`verify-ca` / `verify-full`, or MySQL `VERIFY_CA` /
+    /// `VERIFY_IDENTITY`).
+    Verified,
+    /// A mode-selecting parameter is present but does not authenticate the peer.
+    Unverified {
+        /// Canonical parameter name from [`EnvConfig::db_tls_mode_url_param_names`].
+        param: &'static str,
+    },
+    /// No mode-selecting TLS parameter is present, or the URL is unparseable
+    /// so verification cannot be demonstrated.
+    Absent {
+        /// Canonical parameter an operator should set.
+        expected_param: &'static str,
+    },
+}
+
 fn validate_k8s_namespace(ns: &str) -> Result<(), String> {
     if ns.is_empty() {
         return Err("namespace must not be empty".to_string());
@@ -4776,6 +4802,68 @@ impl EnvConfig {
             ],
             _ => &[],
         }
+    }
+
+    /// Mode-selecting TLS query parameter names for a SQL dialect.
+    ///
+    /// Subset of [`Self::db_tls_url_param_names`] that chooses the TLS
+    /// verification policy (`sslmode` for PostgreSQL; `ssl-mode` / `ssl_mode`
+    /// for MySQL). Kept adjacent to the full vocabulary so the FIPS gate and
+    /// URL-append path agree on which keys name the mode.
+    pub(crate) fn db_tls_mode_url_param_names(db_type: &str) -> &'static [&'static str] {
+        match db_type {
+            "postgres" => &["sslmode"],
+            "mysql" => &["ssl-mode", "ssl_mode"],
+            _ => &[],
+        }
+    }
+
+    /// Whether `value` is a peer-authenticating TLS mode for `db_type`.
+    fn sql_url_tls_mode_is_verifying(db_type: &str, value: &str) -> bool {
+        match db_type {
+            "postgres" => {
+                value.eq_ignore_ascii_case("verify-ca") || value.eq_ignore_ascii_case("verify-full")
+            }
+            "mysql" => {
+                value.eq_ignore_ascii_case("VERIFY_CA")
+                    || value.eq_ignore_ascii_case("VERIFY_IDENTITY")
+            }
+            _ => false,
+        }
+    }
+
+    /// Inspect a PostgreSQL/MySQL URL for a peer-authenticating TLS mode.
+    ///
+    /// Admits only when every recognized mode-selecting query parameter is a
+    /// verifying value and at least one is present. Unparseable URLs fail
+    /// closed as [`SqlUrlTlsPeerAuth::Absent`] — verification cannot be
+    /// demonstrated. Never retains the URL or credentials.
+    pub(crate) fn sql_url_tls_peer_auth(base_url: &str, db_type: &str) -> SqlUrlTlsPeerAuth {
+        let mode_params = Self::db_tls_mode_url_param_names(db_type);
+        let expected_param = mode_params.first().copied().unwrap_or("sslmode");
+
+        let Ok(parsed) = url::Url::parse(base_url) else {
+            return SqlUrlTlsPeerAuth::Absent { expected_param };
+        };
+
+        let mut found: Vec<(&'static str, String)> = Vec::new();
+        for (name, value) in parsed.query_pairs() {
+            let name = name.to_ascii_lowercase();
+            if let Some(&canonical) = mode_params.iter().find(|known| name == **known) {
+                found.push((canonical, value.into_owned()));
+            }
+        }
+
+        if found.is_empty() {
+            return SqlUrlTlsPeerAuth::Absent { expected_param };
+        }
+
+        for (param, value) in &found {
+            if !Self::sql_url_tls_mode_is_verifying(db_type, value) {
+                return SqlUrlTlsPeerAuth::Unverified { param };
+            }
+        }
+        SqlUrlTlsPeerAuth::Verified
     }
 
     pub fn db_tls_enabled(&self) -> bool {
