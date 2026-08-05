@@ -69,6 +69,7 @@ fn upstream_with_locality_lb(
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: Some(source_locality.to_string()),
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: Some(setting),
         backend_tls_client_cert_path: None,
@@ -266,6 +267,7 @@ fn locality_distribute_first_wave_buckets_are_not_lockstep() {
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -374,6 +376,7 @@ fn locality_distribute_weighted_bucket_pick_stays_proportional() {
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -489,6 +492,7 @@ fn port_override_lane_round_robin_stays_even_under_concurrency() {
         subsets: None,
         port_overrides,
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,

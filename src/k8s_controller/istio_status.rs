@@ -668,6 +668,7 @@ fn destination_rule_status(
             // Surface the rest so operators see the gap in `kubectl describe`.
             let mut deferred: Vec<&'static str> = Vec::new();
             deferred.extend(deferred_connection_pool_http_fields(&object.spec));
+            deferred.extend(deferred_locality_lb_fields(&object.spec));
             let message = if deferred.is_empty() {
                 format!("Ferrum accepted this DestinationRule (host: {host})")
             } else {
@@ -746,6 +747,69 @@ const SUBSET_DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[
         "subsets[].trafficPolicy.connectionPool.http.http1MaxPendingRequests (not applied for subsets)",
     ),
 ];
+
+/// Surface when an accepted `failoverPriority` is inert because its effective
+/// DestinationRule policy has no `outlierDetection`. Ferrum active health can
+/// also enable the ranks, but that signal is outside the Istio object and
+/// therefore cannot be inferred by this status projection.
+fn deferred_locality_lb_fields(spec: &Value) -> Vec<&'static str> {
+    let mut deferred = Vec::new();
+    let Some(traffic_policy) = spec.get("trafficPolicy") else {
+        return deferred;
+    };
+    // A `subsets[].trafficPolicy.outlierDetection` resolves into that subset's
+    // `SubsetDefinition.traffic_policy.passive_health_check`, which the load
+    // balancer's `failover_enabled_for_subset` / `failover_enabled_for_port_subset`
+    // treat as an activating signal. Reporting "inactive" while a subset lane is
+    // in fact ranking would be a wrong advisory, so any subset-scoped
+    // outlierDetection suppresses it the same way a top-level one does.
+    let subset_outlier = spec
+        .get("subsets")
+        .and_then(Value::as_array)
+        .is_some_and(|subsets| {
+            subsets.iter().any(|subset| {
+                subset
+                    .get("trafficPolicy")
+                    .is_some_and(|policy| policy.get("outlierDetection").is_some())
+            })
+        });
+    let activating_outlier = traffic_policy.get("outlierDetection").is_some() || subset_outlier;
+    let top_level_failover_priority = traffic_policy
+        .get("loadBalancer")
+        .and_then(|lb| lb.get("localityLbSetting"))
+        .is_some_and(has_failover_priority);
+    if top_level_failover_priority && !activating_outlier {
+        deferred.push(
+            "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority (accepted but inactive without applicable outlierDetection or Ferrum active health; baseline locality selection is unchanged)",
+        );
+    }
+    if let Some(ports) = traffic_policy
+        .get("portLevelSettings")
+        .and_then(Value::as_array)
+    {
+        for entry in ports {
+            let port_failover_priority = entry
+                .get("loadBalancer")
+                .and_then(|lb| lb.get("localityLbSetting"))
+                .is_some_and(has_failover_priority);
+            let port_outlier = entry.get("outlierDetection").is_some();
+            if port_failover_priority && !activating_outlier && !port_outlier {
+                deferred.push(
+                    "trafficPolicy.portLevelSettings[].loadBalancer.localityLbSetting.failoverPriority (accepted but inactive without applicable outlierDetection or Ferrum active health; baseline locality selection is unchanged)",
+                );
+                break;
+            }
+        }
+    }
+    deferred
+}
+
+fn has_failover_priority(locality: &Value) -> bool {
+    locality
+        .get("failoverPriority")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| !entries.is_empty())
+}
 
 /// Collect the deferred `connectionPool.http.*` field labels. Two layers:
 /// 1. `DEFERRED_CONNECTION_POOL_HTTP_FIELDS` — deferred in EVERY scope; scanned

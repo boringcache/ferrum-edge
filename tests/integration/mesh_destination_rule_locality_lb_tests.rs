@@ -117,6 +117,7 @@ fn matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
@@ -231,7 +232,36 @@ fn k8s_translator_rejects_combined_locality_lb_modes() {
 }
 
 #[test]
-fn k8s_translator_rejects_unsupported_failover_priority() {
+fn k8s_translator_parses_failover_priority_entries() {
+    let (_, setting) = translate_dr_locality(serde_json::json!({
+        "host": "reviews.default.svc.cluster.local",
+        "trafficPolicy": {
+            "loadBalancer": {
+                "localityLbSetting": {
+                    "failoverPriority": [
+                        "topology.kubernetes.io/region",
+                        "topology.kubernetes.io/zone",
+                        "version=v1"
+                    ]
+                }
+            }
+        }
+    }));
+    assert!(setting.enabled);
+    assert!(setting.distribute.is_empty());
+    assert!(setting.failover.is_empty());
+    assert_eq!(
+        setting.failover_priority,
+        vec![
+            "topology.kubernetes.io/region".to_string(),
+            "topology.kubernetes.io/zone".to_string(),
+            "version=v1".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn k8s_translator_rejects_empty_failover_priority() {
     let object = istio_object(
         "DestinationRule",
         "reviews",
@@ -240,6 +270,60 @@ fn k8s_translator_rejects_unsupported_failover_priority() {
             "trafficPolicy": {
                 "loadBalancer": {
                     "localityLbSetting": {
+                        "failoverPriority": []
+                    }
+                }
+            }
+        }),
+    );
+    let err = translate_k8s_objects(&[object], k8s_options())
+        .expect_err("empty failoverPriority must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("failoverPriority must not be empty"),
+        "expected empty failoverPriority rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn k8s_translator_rejects_invalid_failover_priority_entry() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": ["=novalue"]
+                    }
+                }
+            }
+        }),
+    );
+    let err = translate_k8s_objects(&[object], k8s_options())
+        .expect_err("invalid failoverPriority entry must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("failoverPriority[0]") && msg.contains("not a valid label key"),
+        "expected invalid failoverPriority rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn k8s_translator_rejects_combined_failover_priority_and_distribute() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "distribute": [{
+                            "from": "us-west",
+                            "to": { "us-east": 100 }
+                        }],
                         "failoverPriority": ["topology.kubernetes.io/region"]
                     }
                 }
@@ -247,11 +331,230 @@ fn k8s_translator_rejects_unsupported_failover_priority() {
         }),
     );
     let err = translate_k8s_objects(&[object], k8s_options())
-        .expect_err("unsupported failoverPriority must be rejected");
+        .expect_err("combined locality LB modes must be rejected");
     let msg = format!("{err}");
     assert!(
-        msg.contains("localityLbSetting.failoverPriority is not supported"),
-        "expected failoverPriority unsupported rejection, got: {msg}"
+        msg.contains("must set only one of distribute, failover, or failoverPriority"),
+        "expected mutually-exclusive locality mode rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn k8s_translator_rejects_combined_failover_priority_and_failover() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failover": [{"from": "us-west", "to": "us-east"}],
+                        "failoverPriority": ["topology.kubernetes.io/region"]
+                    }
+                }
+            }
+        }),
+    );
+    let err = translate_k8s_objects(&[object], k8s_options())
+        .expect_err("combined failover + failoverPriority must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("must set only one of distribute, failover, or failoverPriority"),
+        "expected mutually-exclusive locality mode rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn k8s_translator_rejects_non_string_failover_priority_entry() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": [1]
+                    }
+                }
+            }
+        }),
+    );
+    let err = translate_k8s_objects(&[object], k8s_options())
+        .expect_err("non-string failoverPriority entry must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("failoverPriority[0]") && msg.contains("must be a string"),
+        "expected non-string failoverPriority rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn k8s_translator_rejects_whitespace_failover_priority_entry() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": [" version"]
+                    }
+                }
+            }
+        }),
+    );
+    let err = translate_k8s_objects(&[object], k8s_options())
+        .expect_err("leading whitespace failoverPriority entry must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("failoverPriority[0]") && msg.contains("not a valid label key"),
+        "expected whitespace failoverPriority rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn k8s_translator_rejects_key_value_override_with_multiple_equals() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": ["version=a=b"]
+                    }
+                }
+            }
+        }),
+    );
+    let err = translate_k8s_objects(&[object], k8s_options())
+        .expect_err("multiple-equals override must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("failoverPriority[0]") && msg.contains("not a valid label key"),
+        "expected multiple-equals fail-closed rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn failover_priority_projects_updates_and_clears_through_mesh_apply() {
+    // Create → update → delete (clear) of failoverPriority through the K8s
+    // translator and mesh apply path, verifying Upstream.locality_lb_setting
+    // stays in sync with the owning DestinationRule.
+    let create = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": [
+                            "topology.kubernetes.io/region",
+                            "version=v1"
+                        ]
+                    }
+                }
+            }
+        }),
+    );
+    let created = translate_k8s_objects(&[create], k8s_options()).expect("create translate");
+    let mut config = created.config;
+    config.upstreams.push(multi_port_upstream(
+        "reviews-u",
+        "reviews.default.svc.cluster.local",
+    ));
+    config.normalize_fields();
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("create apply");
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.id == "reviews-u")
+        .expect("upstream after create");
+    let setting = upstream
+        .locality_lb_setting
+        .as_ref()
+        .expect("failoverPriority projected on create");
+    assert_eq!(
+        setting.failover_priority,
+        vec![
+            "topology.kubernetes.io/region".to_string(),
+            "version=v1".to_string(),
+        ]
+    );
+    assert!(setting.distribute.is_empty());
+    assert!(setting.failover.is_empty());
+
+    // Update: replace the priority list.
+    let update = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": ["topology.kubernetes.io/zone"]
+                    }
+                }
+            }
+        }),
+    );
+    let updated = translate_k8s_objects(&[update], k8s_options()).expect("update translate");
+    let mut config = updated.config;
+    config.upstreams.push(multi_port_upstream(
+        "reviews-u",
+        "reviews.default.svc.cluster.local",
+    ));
+    config.normalize_fields();
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("update apply");
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.id == "reviews-u")
+        .expect("upstream after update");
+    assert_eq!(
+        upstream
+            .locality_lb_setting
+            .as_ref()
+            .expect("failoverPriority projected on update")
+            .failover_priority,
+        vec!["topology.kubernetes.io/zone".to_string()]
+    );
+
+    // Delete / clear: a DR without localityLbSetting clears the slot.
+    let clear = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "simple": "ROUND_ROBIN"
+                }
+            }
+        }),
+    );
+    let cleared = translate_k8s_objects(&[clear], k8s_options()).expect("clear translate");
+    let mut config = cleared.config;
+    config.upstreams.push(multi_port_upstream(
+        "reviews-u",
+        "reviews.default.svc.cluster.local",
+    ));
+    config.normalize_fields();
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("clear apply");
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.id == "reviews-u")
+        .expect("upstream after clear");
+    assert!(
+        upstream.locality_lb_setting.is_none(),
+        "removing localityLbSetting must clear failoverPriority projection"
     );
 }
 
@@ -601,6 +904,7 @@ fn multi_port_upstream(id: &str, host_fqdn: &str) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
@@ -756,6 +1060,7 @@ fn port_level_locality_lb_drives_distribute_at_dispatch() {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: Some("us-west/us-west-1/a".to_string()),
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
@@ -783,6 +1088,7 @@ fn port_level_locality_lb_drives_distribute_at_dispatch() {
                     to: distribute_to,
                 }],
                 failover: Vec::new(),
+                failover_priority: Vec::new(),
             }),
             ..UpstreamPortOverride::default()
         },

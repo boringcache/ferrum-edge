@@ -25,7 +25,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -531,6 +531,225 @@ fn test_idle_timeout_arms_publish_policy_close_before_teardown() {
         assert!(
             idle_arm.contains("send_bounded_ws_close"),
             "{marker} must attempt a bounded polite Close write"
+        );
+    }
+}
+
+/// Models hyper's upgraded HTTP/2 writer (`H2Upgraded`): `start_send` hands the
+/// frame to a bounded, capacity-1 channel that a *separate* task drains, and
+/// `poll_flush` only reports readiness once that task has run. A relay half is
+/// therefore routinely parked inside `sink.send(frame)` — not inside its stream
+/// read — at the moment the opposite half publishes a policy Close and cancels.
+/// H1 does not behave this way: its flush lands directly in the socket buffer.
+struct DeferredFlushSink {
+    sent: Arc<std::sync::Mutex<Vec<Message>>>,
+    stalled: Arc<AtomicBool>,
+}
+
+impl Sink<Message> for DeferredFlushSink {
+    type Error = WsError;
+
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        self.sent.lock().expect("sink log").push(item);
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.stalled.load(Ordering::SeqCst) {
+            // The drain task has not run yet, so no waker is registered — the
+            // same shape as a capacity-1 channel nobody has polled. Only the
+            // cancellation token can wake this half.
+            return Poll::Pending;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn close_frames(log: &Arc<std::sync::Mutex<Vec<Message>>>) -> Vec<Option<CloseFrame>> {
+    log.lock()
+        .expect("sink log")
+        .iter()
+        .filter_map(|message| match message {
+            Message::Close(frame) => Some(frame.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Regression for the H2 flake in `functional_ws_message_size_limit_h2_*`
+/// (PR #3589): the relay's cancel-aware send `select!` used a bare `break` on
+/// the cancel arm. `break` leaves the forwarding loop for good, so the outer
+/// cancel branch — the only other place that writes the polite Close — is never
+/// re-entered. A half parked in a stalled flush therefore dropped its sink with
+/// no Close at all, and the peer surfaced `ResetWithoutClosingHandshake`
+/// instead of the published 1009.
+///
+/// This models the exact arm: a stalled sink, an opposite half that publishes
+/// 1009 and cancels, and the bounded policy write the arm must now perform.
+#[tokio::test]
+async fn test_mid_send_cancel_arm_still_delivers_the_policy_close() {
+    use futures_util::SinkExt;
+
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stalled = Arc::new(AtomicBool::new(true));
+    let mut sink = DeferredFlushSink {
+        sent: Arc::clone(&sent),
+        stalled: Arc::clone(&stalled),
+    };
+    let cancel = CancellationToken::new();
+    let policy_close = std::sync::OnceLock::new();
+    let cancel_forwarding = cancel.clone();
+
+    // Opposite half: rejects an oversized frame, publishes the 1009, cancels.
+    let publishing_half = async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        ferrum_edge::_test_support::publish_ws_policy_close_for_test(
+            &policy_close,
+            &cancel,
+            Some(CloseFrame {
+                code: CloseCode::Size,
+                reason: "plugin frame limit".into(),
+            }),
+        );
+        // The upgraded writer's drain task finally runs.
+        stalled.store(false, Ordering::SeqCst);
+    };
+
+    // This half is mid-`send` when the cancel lands. Note that the handler
+    // reborrows `sink`: `tokio::select!` drops its future tuple before running
+    // handlers, which is what makes the production fix expressible.
+    let forwarding_half = async {
+        tokio::select! {
+            biased;
+            _ = cancel_forwarding.cancelled() => {
+                ferrum_edge::_test_support::send_bounded_ws_close_for_test(
+                    &mut sink,
+                    policy_close.get().cloned(),
+                )
+                .await;
+            }
+            _ = sink.send(Message::Binary(vec![1u8; 4].into())) => {
+                panic!("the stalled sink must not complete its flush before cancel");
+            }
+        }
+    };
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(publishing_half, forwarding_half)
+    })
+    .await
+    .expect("mid-send cancel teardown must stay bounded");
+
+    let closes = close_frames(&sent);
+    assert_eq!(
+        closes.len(),
+        1,
+        "the cancelled mid-send arm must write exactly one policy Close, not tear \
+         the transport down bare and not duplicate it",
+    );
+    let close = closes[0]
+        .clone()
+        .expect("the policy Close must carry the published code and reason");
+    assert_eq!(close.code, CloseCode::Size);
+    assert_eq!(close.reason.as_str(), "plugin frame limit");
+}
+
+/// Contrast test documenting the pre-fix shape, in the same spirit as
+/// `test_select_drops_unfinished_half_and_loses_frames`: a cancel arm that only
+/// `break`s leaves the peer with a bare reset. If someone reinstates the bare
+/// `break`, the partner test above fails while this one keeps passing, making
+/// the intent impossible to misread.
+#[tokio::test]
+async fn test_mid_send_cancel_without_bounded_close_leaves_peer_without_a_close() {
+    use futures_util::SinkExt;
+
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stalled = Arc::new(AtomicBool::new(true));
+    let mut sink = DeferredFlushSink {
+        sent: Arc::clone(&sent),
+        stalled: Arc::clone(&stalled),
+    };
+    let cancel = CancellationToken::new();
+    let cancel_forwarding = cancel.clone();
+
+    let publishing_half = async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.cancel();
+        stalled.store(false, Ordering::SeqCst);
+    };
+
+    let forwarding_half = async {
+        tokio::select! {
+            biased;
+            _ = cancel_forwarding.cancelled() => {
+                // Pre-fix: leave the loop with no Close write.
+            }
+            _ = sink.send(Message::Binary(vec![1u8; 4].into())) => {
+                panic!("the stalled sink must not complete its flush before cancel");
+            }
+        }
+    };
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(publishing_half, forwarding_half)
+    })
+    .await
+    .expect("modelled teardown must stay bounded");
+
+    assert!(
+        close_frames(&sent).is_empty(),
+        "documenting the defect: a bare `break` on the cancel arm sends no Close, \
+         so the peer observes ResetWithoutClosingHandshake",
+    );
+}
+
+/// Every cancel arm that can end a relay half must first attempt the bounded
+/// policy Close. The mid-send arms `break` out of the forwarding loop and the
+/// peer-Close-forward arms fall through to a `break`, so in all four cases the
+/// outer cancel branch is unreachable afterwards. These arms live deep inside a
+/// private relay closure with no externally reachable seam, so — like
+/// `test_size_policy_rejections_use_explicit_error_classes` — they are pinned
+/// at the source level rather than by widening a runtime API.
+#[test]
+fn test_cancel_arms_that_end_a_relay_half_write_a_bounded_close() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+
+    for marker in [
+        "Client->backend: cancel fired mid-send",
+        "Backend->client: cancel fired mid-send",
+        "Client->backend: cancel fired during client-close forward",
+        "Backend->client: cancel fired during backend-close forward",
+    ] {
+        let arm_body = source
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("missing relay cancel arm: {marker}"))
+            .1
+            .lines()
+            // The handler opens at 32-space indentation, so the first line that
+            // dedents back to a closing brace at or above that level ends it.
+            .take_while(|line| {
+                let indent = line.len() - line.trim_start().len();
+                !(line.trim() == "}" && indent <= 32)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            arm_body.contains("send_bounded_ws_close"),
+            "{marker} must attempt a bounded polite Close before ending the half; \
+             a bare break leaves the peer with a transport reset and no Close",
+        );
+        assert!(
+            arm_body.contains("policy_close_"),
+            "{marker} must write the arbitrated policy Close, not an ad hoc frame",
         );
     }
 }
