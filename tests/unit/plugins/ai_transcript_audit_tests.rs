@@ -11368,7 +11368,7 @@ fn hello_request_bytes_with_age(name: &str, age: i32) -> Vec<u8> {
     msg.encode_to_vec()
 }
 
-fn grpc_audit_plugin(endpoint: &str) -> AiTranscriptAudit {
+fn live_grpc_audit_plugin(endpoint: &str) -> AiTranscriptAudit {
     let plugin = AiTranscriptAudit::new(
         &config_with_sink(endpoint, grpc_audit_overrides()),
         loopback_http_client(),
@@ -11413,7 +11413,7 @@ async fn grpc_enrollment_opts_into_binary_request_body_bytes() {
 async fn grpc_non_utf8_request_stages_and_captures_on_a_before_proxy_short_circuit() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
-    let plugin = grpc_audit_plugin(&endpoint);
+    let plugin = live_grpc_audit_plugin(&endpoint);
 
     let payload = hello_request_bytes_with_age("binary-safe-subject", -1);
     let request = grpc_frame(&payload);
@@ -11489,7 +11489,7 @@ async fn grpc_non_utf8_request_stages_and_captures_on_a_before_proxy_short_circu
 async fn grpc_short_circuit_framing_uses_the_staged_witness_not_ctx_headers() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
-    let plugin = grpc_audit_plugin(&endpoint);
+    let plugin = live_grpc_audit_plugin(&endpoint);
 
     let request = gzip_grpc_frame(&hello_request_bytes("witness-framed-subject"));
     let mut ctx = grpc_ctx("/test.Greeter/SayHello");
@@ -11543,7 +11543,7 @@ async fn grpc_short_circuit_framing_uses_the_staged_witness_not_ctx_headers() {
 async fn grpc_final_hook_headers_outrank_the_staged_framing_witness() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
-    let plugin = grpc_audit_plugin(&endpoint);
+    let plugin = live_grpc_audit_plugin(&endpoint);
 
     let mut ctx = grpc_ctx("/test.Greeter/SayHello");
     // `before_proxy` sees identity framing over the pre-transform body.
