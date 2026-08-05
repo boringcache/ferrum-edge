@@ -260,10 +260,7 @@ fn start_gateway_with_extra_env(
     let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")?
         .local_addr()?
         .port();
-    let observability_token = format!(
-        "ferrum-edge-grpc-probe-{}",
-        uuid::Uuid::new_v4().simple()
-    );
+    let observability_token = format!("ferrum-edge-grpc-probe-{}", uuid::Uuid::new_v4().simple());
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
@@ -685,12 +682,8 @@ async fn wait_for_owned_gateway(
     admin_port: u16,
     observability_token: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    crate::common::probe_gateway_identity(
-        admin_port,
-        observability_token,
-        Duration::from_secs(15),
-    )
-    .await?;
+    crate::common::probe_gateway_identity(admin_port, observability_token, Duration::from_secs(15))
+        .await?;
     wait_for_gateway(gateway_port).await
 }
 
@@ -713,24 +706,30 @@ async fn start_gateway_with_retry_extra_env(
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
         match start_gateway_with_extra_env(config_path, gateway_port, extra_env) {
-            Ok((mut child, admin_port, observability_token)) => match wait_for_owned_gateway(
-                gateway_port,
-                admin_port,
-                &observability_token,
-            )
-            .await
-            {
-                Ok(()) => match child.try_wait() {
-                    Ok(Some(status)) => {
-                        last_err = format!("gateway exited during startup with status {status}");
-                        eprintln!(
-                            "Gateway startup attempt {}/{} failed (port {}): {}",
-                            attempt, MAX_ATTEMPTS, gateway_port, last_err
-                        );
-                    }
-                    Ok(None) => return (child, gateway_port),
+            Ok((mut child, admin_port, observability_token)) => {
+                match wait_for_owned_gateway(gateway_port, admin_port, &observability_token).await {
+                    Ok(()) => match child.try_wait() {
+                        Ok(Some(status)) => {
+                            last_err =
+                                format!("gateway exited during startup with status {status}");
+                            eprintln!(
+                                "Gateway startup attempt {}/{} failed (port {}): {}",
+                                attempt, MAX_ATTEMPTS, gateway_port, last_err
+                            );
+                        }
+                        Ok(None) => return (child, gateway_port),
+                        Err(e) => {
+                            last_err = format!("failed to inspect gateway process status: {e}");
+                            eprintln!(
+                                "Gateway startup attempt {}/{} failed (port {}): {}",
+                                attempt, MAX_ATTEMPTS, gateway_port, last_err
+                            );
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                    },
                     Err(e) => {
-                        last_err = format!("failed to inspect gateway process status: {e}");
+                        last_err = e.to_string();
                         eprintln!(
                             "Gateway startup attempt {}/{} failed (port {}): {}",
                             attempt, MAX_ATTEMPTS, gateway_port, last_err
@@ -738,17 +737,8 @@ async fn start_gateway_with_retry_extra_env(
                         let _ = child.kill();
                         let _ = child.wait();
                     }
-                },
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Gateway startup attempt {}/{} failed (port {}): {}",
-                        attempt, MAX_ATTEMPTS, gateway_port, last_err
-                    );
-                    let _ = child.kill();
-                    let _ = child.wait();
                 }
-            },
+            }
             Err(e) => {
                 last_err = e.to_string();
                 eprintln!(
