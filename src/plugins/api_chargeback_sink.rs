@@ -7101,6 +7101,7 @@ impl SpoolManager {
     ///   claim path. Skip destructive sibling cleanup, but let constructive
     ///   publication continue; final claim removal then fails through the
     ///   natural `remove_file` / "failed to remove replay source" path.
+    ///
     /// Symlinks stay refused via [`Self::assert_managed_path`].
     fn managed_claim_state(&self, path: &Path) -> Result<ManagedClaimState, String> {
         self.assert_managed_path(path)?;
