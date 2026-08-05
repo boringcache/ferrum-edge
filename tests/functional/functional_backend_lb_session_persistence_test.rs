@@ -3,20 +3,25 @@
 //!
 //! There is no Kubernetes CRD / live-translator functional harness for these
 //! policies yet, so this test starts the real `ferrum-edge` binary in file
-//! mode with the **translator-equivalent** Upstream shapes that
-//! `translate_k8s_objects` emits for Cookie and Header `sessionPersistence`:
+//! mode with the **translator-equivalent** Upstream shape that
+//! `translate_k8s_objects` emits for supported Cookie `sessionPersistence`:
 //!
 //! - Cookie → `algorithm: consistent_hashing`, `hash_on: cookie:<sessionName>`,
 //!   `hash_on_cookie_config.session_cookie: true` (Session lifetimeType)
-//! - Header → `algorithm: consistent_hashing`, `hash_on: header:<sessionName>`
 //!
 //! Proves through actual gateway traffic (not `translate_k8s_objects`,
 //! `LoadBalancerCache::select`, or the test-only sticky-cookie helper) that:
 //! - a first cookie request receives the configured sticky `Set-Cookie`
 //!   (session cookie: no `Max-Age`) and subsequent requests carrying that
 //!   cookie pin to one live backend;
-//! - distinct cookie / header affinity keys spread across at least two
-//!   distinguishable live backends.
+//! - distinct cookie affinity keys spread across at least two distinguishable
+//!   live backends.
+//!
+//! Gateway API Header persistence is intentionally rejected because Ferrum
+//! cannot synthesize the required response session token. Translation and
+//! status regressions cover that fail-closed decision; a hand-written runtime
+//! `hash_on: header:...` upstream is not evidence that the Gateway API policy
+//! shape is implemented.
 //!
 //! Policy reload/update/delete stays covered by the focused translation
 //! lifecycle tests (`backend_lb_policy_update_changes_session_name`,
@@ -36,7 +41,6 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 const COOKIE_NAME: &str = "lb-affinity";
-const HEADER_NAME: &str = "x-session-affinity";
 
 fn parse_server_name(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
@@ -61,7 +65,7 @@ fn cookie_pair_from_set_cookie(set_cookie: &str, name: &str) -> String {
 
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn backend_lb_session_persistence_cookie_and_header_pin_live_backends() {
+async fn backend_lb_session_persistence_cookie_pins_live_backends() {
     let backend_a = spawn_http_identifying("sticky-a")
         .await
         .expect("spawn sticky-a");
@@ -83,14 +87,6 @@ proxies:
     backend_port: {a}
     strip_listen_path: true
     upstream_id: "cookie-sticky-upstream"
-  - id: "header-sticky-proxy"
-    listen_path: "/header-sticky"
-    backend_scheme: http
-    backend_host: "127.0.0.1"
-    backend_port: {a}
-    strip_listen_path: true
-    upstream_id: "header-sticky-upstream"
-
 upstreams:
   - id: "cookie-sticky-upstream"
     name: "BackendLBPolicy Cookie sessionPersistence"
@@ -110,21 +106,6 @@ upstreams:
       - host: "127.0.0.1"
         port: {c}
         weight: 1
-  - id: "header-sticky-upstream"
-    name: "XBackendTrafficPolicy Header sessionPersistence"
-    algorithm: consistent_hashing
-    hash_on: "header:{header_name}"
-    targets:
-      - host: "127.0.0.1"
-        port: {a}
-        weight: 1
-      - host: "127.0.0.1"
-        port: {b}
-        weight: 1
-      - host: "127.0.0.1"
-        port: {c}
-        weight: 1
-
 consumers: []
 plugin_configs: []
 "#,
@@ -132,7 +113,6 @@ plugin_configs: []
         b = backend_b.port,
         c = backend_c.port,
         cookie_name = COOKIE_NAME,
-        header_name = HEADER_NAME,
     );
 
     let gateway = TestGateway::builder()
@@ -227,54 +207,5 @@ plugin_configs: []
     assert!(
         cookie_hosts.len() >= 2,
         "distinct sticky cookie keys must reach ≥2 live backends, got {cookie_hosts:?}"
-    );
-
-    // --- Header affinity (XBackendTrafficPolicy Header type shape) ---
-    let header_first = client
-        .get(gateway.proxy_url("/header-sticky/probe"))
-        .header(HEADER_NAME, "tenant-alpha")
-        .send()
-        .await
-        .expect("header probe request");
-    assert!(header_first.status().is_success());
-    let header_pinned = parse_server_name(&header_first.text().await.expect("header probe body"));
-    assert!(
-        !header_pinned.is_empty(),
-        "header probe body must identify a backend"
-    );
-
-    for i in 0..12 {
-        let resp = client
-            .get(gateway.proxy_url(&format!("/header-sticky/pinned-{i}")))
-            .header(HEADER_NAME, "tenant-alpha")
-            .send()
-            .await
-            .unwrap_or_else(|e| panic!("pinned header request {i} failed: {e}"));
-        assert!(resp.status().is_success());
-        let server = parse_server_name(&resp.text().await.expect("pinned header body"));
-        assert_eq!(
-            server, header_pinned,
-            "header tenant-alpha must pin to {header_pinned}, got {server} on request {i}"
-        );
-    }
-
-    let mut header_hosts = HashSet::new();
-    header_hosts.insert(header_pinned);
-    for i in 0..40 {
-        let resp = client
-            .get(gateway.proxy_url(&format!("/header-sticky/spread-{i}")))
-            .header(HEADER_NAME, format!("tenant-spread-{i}"))
-            .send()
-            .await
-            .unwrap_or_else(|e| panic!("spread header request {i} failed: {e}"));
-        assert!(resp.status().is_success());
-        let server = parse_server_name(&resp.text().await.expect("spread header body"));
-        if !server.is_empty() {
-            header_hosts.insert(server);
-        }
-    }
-    assert!(
-        header_hosts.len() >= 2,
-        "distinct sticky header keys must reach ≥2 live backends, got {header_hosts:?}"
     );
 }
