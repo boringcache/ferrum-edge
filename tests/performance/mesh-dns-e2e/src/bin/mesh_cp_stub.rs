@@ -12,7 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use mesh_dns_e2e_perf::STUB_SLICE_VERSION;
 use mesh_dns_e2e_perf::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
-use mesh_dns_e2e_perf::proto::{MeshConfigUpdate, MeshSubscribeRequest};
+use mesh_dns_e2e_perf::proto::{
+    MeshConfigUpdate, MeshSliceStatusReport, MeshSliceStatusResponse, MeshSubscribeRequest,
+};
 use mesh_dns_e2e_perf::slice::build_synthetic_slice;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -71,6 +73,9 @@ impl MeshConfigSync for StubMeshServer {
             mesh_slice_json,
             ferrum_version: self.ferrum_version.clone(),
             heartbeat: false,
+            config_authority: String::new(),
+            config_sequence: 0,
+            session_token: "mesh-dns-e2e-session".to_string(),
         };
 
         // Send the initial slice, then keep the stream alive so the gateway's
@@ -85,6 +90,13 @@ impl MeshConfigSync for StubMeshServer {
             tx.closed().await;
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    async fn report_mesh_slice_status(
+        &self,
+        _request: Request<MeshSliceStatusReport>,
+    ) -> Result<Response<MeshSliceStatusResponse>, Status> {
+        Ok(Response::new(MeshSliceStatusResponse {}))
     }
 }
 

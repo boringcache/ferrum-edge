@@ -214,6 +214,16 @@
     "emission": "when_plugin_enabled"
   },
   {
+    "name": "chargeback_sink_spool_dead_letter_rows_total",
+    "type": "counter",
+    "help": "Permanently rejected rows durably handed to the private dead-letter payload store.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
     "name": "chargeback_sink_spool_drops_total",
     "type": "counter",
     "help": "Chargeback sink spool files dropped to enforce max_bytes.",
@@ -277,6 +287,16 @@
     "name": "chargeback_sink_spool_prepare_failures_total",
     "type": "counter",
     "help": "Chargeback sink committed spool storage preparation failures.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_spool_replay_attempts_total",
+    "type": "counter",
+    "help": "ClickHouse HTTP attempts made by bounded spool replay, including permanent-failure isolation children.",
     "labels": [],
     "subsystem": "api_chargeback_sink",
     "export_surface": "/metrics",
@@ -1476,6 +1496,20 @@
     "emission": "when_process_initialized"
   },
   {
+    "name": "ferrum_mesh_bpf_accept_to_first_byte_microseconds",
+    "type": "histogram",
+    "help": "Time from captured TCP passive-established accept to the first inbound application-data byte on the same accepted socket, in microseconds. Missing, raced, stale, reversed, or corrupt correlation evidence emits no sample; fixed le buckets plus sum/count; sum overflow or counter saturation drops the sample.",
+    "labels": [
+      "le"
+    ],
+    "subsystem": "mesh_bpf",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled",
+    "name_template": "{prefix}_accept_to_first_byte_microseconds",
+    "default_prefix": "ferrum_mesh_bpf"
+  },
+  {
     "name": "ferrum_mesh_bpf_drop_reasons",
     "type": "gauge",
     "help": "Well-known BPF drop reason labels (gauge=1 to make the label set self-documenting).",
@@ -1542,7 +1576,7 @@
   {
     "name": "ferrum_mesh_bpf_srtt_microseconds",
     "type": "histogram",
-    "help": "TCP smoothed RTT samples in microseconds. Fixed le buckets plus sum/count; zero samples are ignored and sum overflow drops the sample.",
+    "help": "TCP smoothed RTT samples in microseconds. Fixed le buckets plus sum/count; zero samples are ignored and sum overflow or counter saturation drops the sample.",
     "labels": [
       "le"
     ],
@@ -1556,7 +1590,7 @@
   {
     "name": "ferrum_mesh_bpf_syn_to_ack_microseconds",
     "type": "histogram",
-    "help": "Time between SYN send and ACK observation in microseconds. Fixed le buckets plus sum/count; zero samples are ignored and sum overflow drops the sample.",
+    "help": "Time between SYN send and ACK observation in microseconds. Fixed le buckets plus sum/count; zero samples are ignored and sum overflow or counter saturation drops the sample.",
     "labels": [
       "le"
     ],
@@ -1982,6 +2016,31 @@
     "subsystem": "mesh",
     "export_surface": "/metrics",
     "bundled": "alert_and_dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_slice_drift_data_planes",
+    "type": "gauge",
+    "help": "Tracked mesh data planes by CP-side slice convergence state.",
+    "labels": [
+      "state",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_slice_drift_tracked_data_planes",
+    "type": "gauge",
+    "help": "Total mesh data planes retained in the CP slice-drift registry.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
     "emission": "conditional"
   },
   {

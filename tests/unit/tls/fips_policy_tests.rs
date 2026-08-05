@@ -13,7 +13,7 @@
 //! `--no-default-features --features fips` (the hosted FIPS lane).
 
 use chrono::Utc;
-use ferrum_edge::config::env_config::EnvConfig;
+use ferrum_edge::config::env_config::{DbTlsMode, EnvConfig};
 use ferrum_edge::config::types::{Consumer, GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::fips;
 use ferrum_edge::fips::policy;
@@ -335,6 +335,92 @@ fn env_policy_rejects_every_mongodb_config_store_shape() {
         assert!(err.contains("FERRUM_DB_TYPE=mongodb"), "{err}");
         assert!(err.contains("database-driver cryptography"), "{err}");
         assert!(!err.contains("user:secret"), "database URL leaked: {err}");
+    }
+}
+
+#[test]
+fn env_policy_rejects_unverified_sql_config_database_tls_modes() {
+    for (mode, mode_name) in [
+        (DbTlsMode::Disable, "disable"),
+        (DbTlsMode::Allow, "allow"),
+        (DbTlsMode::Prefer, "prefer"),
+        (DbTlsMode::Require, "require"),
+    ] {
+        for db_type in ["postgres", "mysql", "POSTGRES", "MYSQL"] {
+            let env_config = EnvConfig {
+                db_type: Some(db_type.to_string()),
+                db_tls_mode: Some(mode),
+                ..EnvConfig::default()
+            };
+            let err = policy::check_env_config_enforced(&env_config)
+                .expect_err(&format!("{mode_name} for {db_type} is refused"));
+            assert!(
+                err.contains(&format!("FERRUM_DB_TLS_MODE={mode_name}")),
+                "{err}"
+            );
+            assert!(
+                err.contains("verify-ca") && err.contains("verify-full"),
+                "{err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn env_policy_accepts_verified_sql_tls_modes() {
+    for db_tls_mode in [DbTlsMode::VerifyCa, DbTlsMode::VerifyFull] {
+        for db_type in ["postgres", "mysql"] {
+            let env_config = EnvConfig {
+                db_type: Some(db_type.to_string()),
+                db_tls_mode: Some(db_tls_mode),
+                ..EnvConfig::default()
+            };
+            policy::check_env_config_enforced(&env_config).expect("verified SQL TLS is admitted");
+        }
+    }
+}
+
+#[test]
+fn env_policy_leaves_unset_sql_db_tls_mode_to_url_or_driver() {
+    for db_type in ["postgres", "mysql"] {
+        let env_config = EnvConfig {
+            db_type: Some(db_type.to_string()),
+            db_tls_mode: None,
+            ..EnvConfig::default()
+        };
+        policy::check_env_config_enforced(&env_config)
+            .expect("unset SQL config-database TLS mode is not refused by this check");
+    }
+}
+
+#[test]
+fn env_policy_sql_tls_check_does_not_apply_to_sqlite_or_mongodb() {
+    for mode in [
+        DbTlsMode::Disable,
+        DbTlsMode::Allow,
+        DbTlsMode::Prefer,
+        DbTlsMode::Require,
+    ] {
+        let sqlite = EnvConfig {
+            db_type: Some("sqlite".to_string()),
+            db_tls_mode: Some(mode),
+            ..EnvConfig::default()
+        };
+        policy::check_env_config_enforced(&sqlite)
+            .expect("sqlite is outside the SQL network TLS admission check");
+
+        let mongodb = EnvConfig {
+            db_type: Some("mongodb".to_string()),
+            db_tls_mode: Some(mode),
+            ..EnvConfig::default()
+        };
+        let err = policy::check_env_config_enforced(&mongodb)
+            .expect_err("mongodb is refused by its own config-store rule");
+        assert!(err.contains("FERRUM_DB_TYPE=mongodb"), "{err}");
+        assert!(
+            !err.contains("FERRUM_DB_TLS_MODE"),
+            "mongodb refusal must not double-report SQL TLS diagnostics: {err}"
+        );
     }
 }
 

@@ -1,10 +1,10 @@
-//! `__mesh_bpf_metrics` — surfaces BPF SOCK_OPS counters as Prometheus
+//! `__mesh_bpf_metrics` — surfaces BPF TCP counters as Prometheus
 //! metrics.
 //!
-//! GAP-SC3 introduces a `BPF_PROG_TYPE_SOCK_OPS` program that emits
-//! TCP-layer events (Connect, AcceptEstablished, Rst, FinSent/Received,
-//! SRTT samples) plus connect-hook drop-reason hits to a userspace
-//! ringbuf. The [`crate::ebpf::event_consumer::SockOpsConsumer`] drains
+//! GAP-SC3 uses SOCK_OPS for lifecycle/handshake timing, SK_SKB for the first
+//! accepted application-data byte, and connect hooks for drop-reason hits.
+//! They emit to a userspace ringbuf. The
+//! [`crate::ebpf::event_consumer::SockOpsConsumer`] drains
 //! that ringbuf and updates a shared [`BpfMetricsState`]. This plugin
 //! exposes that state in Prometheus exposition format via the
 //! authenticated production `GET /metrics` scrape (appended once from the
@@ -32,11 +32,11 @@
 //!   `_in_overrun_regime` companion gauge stays at 1 between the warn
 //!   and recovery transitions so dashboards can alert without scraping
 //!   logs.
-//! - **TCP-layer latency histograms** (SRTT, syn→ack) as canonical
+//! - **TCP-layer latency histograms** (SRTT, syn→ack, accept→first-byte) as canonical
 //!   Prometheus histograms: fixed microsecond `le` buckets plus the
-//!   historical `_sum`/`_count` series for mean derivation. Accept-to-
-//!   first-byte is omitted until a verifier-safe producer exists
-//!   (SOCK_OPS has no first-inbound-data-byte callback).
+//!   historical `_sum`/`_count` series for mean derivation. Capture
+//!   accept-to-first-application-byte is produced by a SOCK_OPS timestamp plus
+//!   SK_SKB first-data hook on the same accepted socket cookie.
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -179,7 +179,7 @@ impl MeshBpfMetrics {
 }
 
 fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String {
-    let mut out = String::with_capacity(4096);
+    let mut out = String::with_capacity(8192);
     let p = prefix;
 
     // TCP-layer event counters.
@@ -249,7 +249,7 @@ fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String
         p,
         "srtt_microseconds",
         "TCP smoothed RTT samples in microseconds. Fixed le buckets plus sum/count; \
-         zero samples are ignored and sum overflow drops the sample.",
+         zero samples are ignored and sum overflow or counter saturation drops the sample.",
         &snap.srtt_cumulative_buckets(),
         snap.srtt_sample_us_sum,
         snap.srtt_count,
@@ -259,10 +259,19 @@ fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String
         p,
         "syn_to_ack_microseconds",
         "Time between SYN send and ACK observation in microseconds. Fixed le buckets \
-         plus sum/count; zero samples are ignored and sum overflow drops the sample.",
+         plus sum/count; zero samples are ignored and sum overflow or counter saturation drops the sample.",
         &snap.syn_to_ack_cumulative_buckets(),
         snap.syn_to_ack_us_sum,
         snap.syn_to_ack_count,
+    );
+    render_latency_histogram(
+        &mut out,
+        p,
+        "accept_to_first_byte_microseconds",
+        "Time from captured TCP passive-established accept to the first inbound application-data byte on the same accepted socket, in microseconds. Missing, raced, stale, reversed, or corrupt correlation evidence emits no sample; fixed le buckets plus sum/count; sum overflow or counter saturation drops the sample.",
+        &snap.accept_to_first_byte_cumulative_buckets(),
+        snap.accept_to_first_byte_us_sum,
+        snap.accept_to_first_byte_count,
     );
 
     // Ringbuf health.

@@ -4549,6 +4549,7 @@ mod tests {
                     request.extensions().get(),
                 )
                 .map_err(|(status, _)| status)?;
+                // Identity is verified; the stub does not track CP-side drift.
             }
 
             let slice_update = MeshConfigUpdate {
@@ -4569,6 +4570,7 @@ mod tests {
                     .revision
                     .as_ref()
                     .map_or(0, |revision| revision.sequence),
+                session_token: String::new(),
             };
             let heartbeat = MeshConfigUpdate {
                 version: self.slice.version.clone(),
@@ -4578,6 +4580,7 @@ mod tests {
                 heartbeat: true,
                 config_authority: String::new(),
                 config_sequence: 0,
+                session_token: String::new(),
             };
 
             let items: Vec<Result<MeshConfigUpdate, Status>> = match self.behavior {
@@ -4605,6 +4608,15 @@ mod tests {
             };
             let stream: Self::MeshSubscribeStream = Box::pin(tokio_stream::iter(items));
             Ok(Response::new(stream))
+        }
+
+        async fn report_mesh_slice_status(
+            &self,
+            _request: Request<crate::grpc::proto::MeshSliceStatusReport>,
+        ) -> Result<Response<crate::grpc::proto::MeshSliceStatusResponse>, Status> {
+            Ok(Response::new(
+                crate::grpc::proto::MeshSliceStatusResponse {},
+            ))
         }
     }
 

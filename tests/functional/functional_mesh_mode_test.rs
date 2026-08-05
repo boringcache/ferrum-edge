@@ -61,7 +61,7 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::xds::XdsAdsServer;
 
-use crate::common::ensure_gateway_built;
+use crate::common::{TestGateway, ensure_gateway_built};
 use crate::scaffolding::ports::reserve_port;
 
 const GRPC_SECRET: &str = "ferrum-edge-functional-mesh-grpc-secret00";
@@ -158,6 +158,7 @@ impl MeshConfigSync for StaticMeshControlPlane {
                 .revision
                 .as_ref()
                 .map_or(0, |revision| revision.sequence),
+            session_token: "functional-test-session".to_string(),
         };
         let heartbeat = MeshConfigUpdate {
             version: self.slice.version.clone(),
@@ -167,11 +168,21 @@ impl MeshConfigSync for StaticMeshControlPlane {
             heartbeat: true,
             config_authority: String::new(),
             config_sequence: 0,
+            session_token: String::new(),
         };
         let heartbeats = IntervalStream::new(tokio::time::interval(Duration::from_secs(60)))
             .map(move |_| Ok(heartbeat.clone()));
         let stream = stream::once(async move { Ok(update) }).chain(heartbeats);
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn report_mesh_slice_status(
+        &self,
+        _request: Request<ferrum_edge::grpc::proto::MeshSliceStatusReport>,
+    ) -> Result<Response<ferrum_edge::grpc::proto::MeshSliceStatusResponse>, Status> {
+        Ok(Response::new(
+            ferrum_edge::grpc::proto::MeshSliceStatusResponse {},
+        ))
     }
 }
 
@@ -3919,6 +3930,697 @@ fn grpc_framed_payload(payload: &[u8]) -> Vec<u8> {
     body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     body.extend_from_slice(payload);
     body
+}
+
+#[derive(Debug)]
+struct MeshRetryBackendObservation {
+    repeated: Vec<Vec<u8>>,
+    repeated_bin: Vec<Vec<u8>>,
+    te: Option<Vec<u8>>,
+    content_lengths: Vec<Vec<u8>>,
+    x_forwarded_for: Option<Vec<u8>>,
+    x_forwarded_proto: Option<Vec<u8>>,
+    baggage: Option<Vec<u8>>,
+    body: Vec<u8>,
+    trailers: Option<hyper::HeaderMap>,
+}
+
+fn mesh_retry_mtls_server_config(svid: &GeneratedGatewaySvid) -> Arc<rustls::ServerConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ca_pem = std::fs::read(&svid.trust_bundle_path).expect("read mesh retry trust bundle");
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut ca_pem.as_slice()).filter_map(|cert| cert.ok()) {
+        roots.add(cert).expect("add mesh retry client root");
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .expect("build mesh retry client verifier");
+    let cert_pem = std::fs::read(&svid.cert_path).expect("read mesh retry server SVID");
+    let key_pem = std::fs::read(&svid.key_path).expect("read mesh retry server key");
+    let chain = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .filter_map(|cert| cert.ok())
+        .collect();
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .expect("parse mesh retry server key")
+        .expect("mesh retry server key present");
+    let mut config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(chain, key)
+        .expect("build mesh retry server config");
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(config)
+}
+
+/// Classification of the first byte on a mesh-retry mTLS fixture connection.
+///
+/// File-mode gateways still run an initial backend-capability refresh that dials
+/// plaintext backends with the HTTP/2 prior-knowledge preface (`PRI *…`, first
+/// byte `0x50` / `b'P'`) even when `FERRUM_POOL_WARMUP_ENABLED=false`. That same
+/// preface is also how a plaintext application attempt begins, so `b'P'` alone
+/// cannot prove a connection is harmless preflight. Classification therefore
+/// requires the fixture's application phase bit sampled at accept time:
+/// * preflight + `P` → discard as the known capability probe,
+/// * application phase + `P` → hard-fail (the mTLS bypass under test),
+/// * any other first byte → application record (must be TLS `0x16`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshRetryInboundFirstByte {
+    PreflightCapabilityProbe,
+    ApplicationPlaintextHttp2,
+    ApplicationRecord(u8),
+}
+
+fn classify_mesh_retry_inbound_first_byte(
+    first_byte: u8,
+    application_phase_armed_at_accept: bool,
+) -> MeshRetryInboundFirstByte {
+    if first_byte == b'P' {
+        if application_phase_armed_at_accept {
+            MeshRetryInboundFirstByte::ApplicationPlaintextHttp2
+        } else {
+            MeshRetryInboundFirstByte::PreflightCapabilityProbe
+        }
+    } else {
+        MeshRetryInboundFirstByte::ApplicationRecord(first_byte)
+    }
+}
+
+/// Pins the probe/application correlation boundary without running the live
+/// gateway fixture: `P` is preflight only before application-phase arming, and
+/// the same byte hard-fails afterward so a plaintext application attempt cannot
+/// be discarded as a capability probe.
+#[test]
+fn mesh_retry_mtls_first_byte_classification_is_phase_armed() {
+    assert_eq!(
+        classify_mesh_retry_inbound_first_byte(b'P', false),
+        MeshRetryInboundFirstByte::PreflightCapabilityProbe,
+        "preflight may discard the known h2c capability-probe preface"
+    );
+    assert_eq!(
+        classify_mesh_retry_inbound_first_byte(b'P', true),
+        MeshRetryInboundFirstByte::ApplicationPlaintextHttp2,
+        "post-arm plaintext HTTP/2 preface must hard-fail as the mTLS bypass"
+    );
+    assert_eq!(
+        classify_mesh_retry_inbound_first_byte(0x16, false),
+        MeshRetryInboundFirstByte::ApplicationRecord(0x16)
+    );
+    assert_eq!(
+        classify_mesh_retry_inbound_first_byte(0x16, true),
+        MeshRetryInboundFirstByte::ApplicationRecord(0x16)
+    );
+    assert_eq!(
+        classify_mesh_retry_inbound_first_byte(b'G', true),
+        MeshRetryInboundFirstByte::ApplicationRecord(b'G'),
+        "non-preface bytes are application records regardless of phase"
+    );
+}
+
+/// Source guard: the live mesh-retry mTLS fixture must phase-arm observation
+/// around the application request instead of unconditionally discarding every
+/// `P` connection (which would also mask a plaintext application attempt).
+#[test]
+fn mesh_retry_mtls_fixture_phase_arms_before_application_request() {
+    let backend = mesh_test_fn_body("start_mesh_retry_mtls_backend");
+    assert!(
+        backend.contains("classify_mesh_retry_inbound_first_byte("),
+        "fixture must classify first bytes through the phase-armed helper"
+    );
+    assert!(
+        backend.contains("MeshRetryInboundFirstByte::PreflightCapabilityProbe"),
+        "fixture must preserve preflight capability-probe discard"
+    );
+    assert!(
+        backend.contains("MeshRetryInboundFirstByte::ApplicationPlaintextHttp2"),
+        "fixture must hard-fail post-arm plaintext HTTP/2 prefaces"
+    );
+    assert!(
+        backend.contains("armed_at_accept"),
+        "fixture must sample application phase at accept time"
+    );
+    assert!(
+        backend.contains("successful secured retry must begin with a TLS handshake record"),
+        "fixture must keep the successful-retry TLS 0x16 assertion"
+    );
+    // Build the forbidden pattern from parts so this assertion's own source
+    // text does not trip the `include_str!` self-scan.
+    let unconditional_p_discard = [
+        "if record_type[0] == b'",
+        "P' {\n                drop(stream);\n                continue;",
+    ]
+    .concat();
+    assert!(
+        !backend.contains(&unconditional_p_discard),
+        "regression: unconditionally discarding every first-byte `P` connection \
+         masks a plaintext HTTP/2 application attempt as a capability probe"
+    );
+
+    let live = mesh_test_fn_body(
+        "functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers",
+    );
+    let arm = live
+        .find("arm_application_phase")
+        .expect("live fixture must arm application phase before the request");
+    let request = live
+        .find("grpc_mesh_retry_request(gateway.proxy_port, &payload, None)")
+        .expect("live fixture application request not found");
+    assert!(
+        arm < request,
+        "application phase must be armed before the secured mesh retry request"
+    );
+    assert!(
+        live.contains("0x16"),
+        "live fixture must keep the failed-attempt TLS handshake assertion"
+    );
+    assert!(
+        live.contains("application_hits.load(Ordering::SeqCst), 1"),
+        "live fixture must keep the single application-delivery assertion"
+    );
+}
+
+/// Hold one destination port for the failed application attempt and its retry.
+///
+/// The returned [`watch::Sender`] arms application-phase observation. Callers
+/// must arm it only after gateway readiness and immediately before the test's
+/// application request so startup h2c capability probes accepted in preflight
+/// can be discarded without also masking a post-arm plaintext application
+/// attempt. Once armed:
+/// 1. a first byte of `P` panics (plaintext HTTP/2 is the bypass under test),
+/// 2. the first application record is observed (must be TLS `0x16`) and dropped,
+/// 3. the next application record must also be `0x16`, is prepended, completes
+///    mTLS, and serves one gRPC request.
+///
+/// Keeping the listener bound throughout removes the close/rebind race that
+/// would make a retry fixture timing-dependent.
+async fn start_mesh_retry_mtls_backend(
+    listener: TcpListener,
+    server_config: Arc<rustls::ServerConfig>,
+    application_hits: Arc<AtomicUsize>,
+) -> (
+    watch::Sender<bool>,
+    oneshot::Receiver<u8>,
+    oneshot::Receiver<MeshRetryBackendObservation>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::io::Error as IoError;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+
+    /// Re-inject a consumed first TLS record byte before rustls reads the socket.
+    struct PrefixedTcpStream {
+        prefix: Option<u8>,
+        inner: TcpStream,
+    }
+
+    impl AsyncRead for PrefixedTcpStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<Result<(), IoError>> {
+            if let Some(byte) = self.prefix.take() {
+                if buf.remaining() == 0 {
+                    self.prefix = Some(byte);
+                    return Poll::Ready(Ok(()));
+                }
+                buf.put_slice(&[byte]);
+                return Poll::Ready(Ok(()));
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for PrefixedTcpStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, IoError>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), IoError>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    let (application_phase_tx, mut application_phase_rx) = watch::channel(false);
+    let (first_record_tx, first_record_rx) = oneshot::channel();
+    let (observation_tx, observation_rx) = oneshot::channel();
+    let observation_tx = Arc::new(Mutex::new(Some(observation_tx)));
+    let task = tokio::spawn(async move {
+        let mut first_record_tx = Some(first_record_tx);
+        let success = loop {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
+                .await
+                .expect("mesh retry accept timed out")
+                .expect("accept mesh retry connection");
+            // Sample the phase at accept so a capability probe that connected
+            // during preflight stays preflight even if the test arms before the
+            // first byte is read.
+            let armed_at_accept = *application_phase_rx.borrow();
+            let mut record_type = [0u8; 1];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut record_type))
+                .await
+                .expect("mesh retry connection sent no bytes")
+                .expect("read mesh retry record type");
+            match classify_mesh_retry_inbound_first_byte(record_type[0], armed_at_accept) {
+                MeshRetryInboundFirstByte::PreflightCapabilityProbe => {
+                    drop(stream);
+                    continue;
+                }
+                MeshRetryInboundFirstByte::ApplicationPlaintextHttp2 => {
+                    panic!(
+                        "mesh retry fixture saw plaintext HTTP/2 preface after application \
+                         phase arming; this is the mTLS bypass under test, not a capability probe"
+                    );
+                }
+                MeshRetryInboundFirstByte::ApplicationRecord(record) => {
+                    if !armed_at_accept {
+                        application_phase_rx
+                            .wait_for(|armed| *armed)
+                            .await
+                            .expect("mesh retry application phase arm dropped");
+                    }
+                    if let Some(tx) = first_record_tx.take() {
+                        let _ = tx.send(record);
+                        // Failed application attempt: observe the TLS record, then
+                        // drop before handshake/request so the gateway retries once.
+                        drop(stream);
+                        continue;
+                    }
+                    break PrefixedTcpStream {
+                        prefix: Some(record),
+                        inner: stream,
+                    };
+                }
+            }
+        };
+
+        assert_eq!(
+            success.prefix,
+            Some(0x16),
+            "successful secured retry must begin with a TLS handshake record"
+        );
+
+        let tls = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_rustls::TlsAcceptor::from(server_config).accept(success),
+        )
+        .await
+        .expect("mesh retry mTLS handshake timed out")
+        .expect("mesh retry mTLS handshake failed");
+        assert_eq!(
+            tls.get_ref().1.alpn_protocol(),
+            Some(b"h2".as_slice()),
+            "secured retry must negotiate HTTP/2"
+        );
+
+        let observation_tx = Arc::clone(&observation_tx);
+        let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let observation_tx = Arc::clone(&observation_tx);
+            let application_hits = Arc::clone(&application_hits);
+            async move {
+                application_hits.fetch_add(1, Ordering::SeqCst);
+                let repeated = req
+                    .headers()
+                    .get_all("x-repeated")
+                    .iter()
+                    .map(|value| value.as_bytes().to_vec())
+                    .collect();
+                let repeated_bin = req
+                    .headers()
+                    .get_all("x-repeated-bin")
+                    .iter()
+                    .map(|value| value.as_bytes().to_vec())
+                    .collect();
+                let te = req
+                    .headers()
+                    .get("te")
+                    .map(|value| value.as_bytes().to_vec());
+                let content_lengths: Vec<Vec<u8>> = req
+                    .headers()
+                    .get_all("content-length")
+                    .iter()
+                    .map(|value| value.as_bytes().to_vec())
+                    .collect();
+                let x_forwarded_for = req
+                    .headers()
+                    .get("x-forwarded-for")
+                    .map(|value| value.as_bytes().to_vec());
+                let x_forwarded_proto = req
+                    .headers()
+                    .get("x-forwarded-proto")
+                    .map(|value| value.as_bytes().to_vec());
+                let baggage = req
+                    .headers()
+                    .get("baggage")
+                    .map(|value| value.as_bytes().to_vec());
+                let collected = req.into_body().collect().await?;
+                let trailers = collected.trailers().cloned();
+                let body = collected.to_bytes().to_vec();
+                if let Some(tx) = observation_tx.lock().expect("observation lock").take() {
+                    let _ = tx.send(MeshRetryBackendObservation {
+                        repeated,
+                        repeated_bin,
+                        te,
+                        content_lengths,
+                        x_forwarded_for,
+                        x_forwarded_proto,
+                        baggage,
+                        body: body.clone(),
+                        trailers,
+                    });
+                }
+
+                let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(2);
+                let _ = tx.send(Ok(Frame::data(Bytes::from(body)))).await;
+                let mut response_trailers = hyper::HeaderMap::new();
+                response_trailers
+                    .insert("grpc-status", hyper::header::HeaderValue::from_static("0"));
+                let _ = tx.send(Ok(Frame::trailers(response_trailers))).await;
+                drop(tx);
+                Ok::<_, hyper::Error>(
+                    hyper::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .body(StreamBody::new(ReceiverStream::new(rx)))
+                        .expect("build mesh retry response"),
+                )
+            }
+        });
+        let result = Http2ServerBuilder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(tls), service)
+            .await;
+        if let Err(error) = result
+            && !error.to_string().contains("connection closed")
+        {
+            panic!("mesh retry HTTP/2 server failed: {error}");
+        }
+    });
+    (application_phase_tx, first_record_rx, observation_rx, task)
+}
+
+async fn grpc_mesh_retry_request(
+    port: u16,
+    body: &[u8],
+    request_trailers: Option<hyper::HeaderMap>,
+) -> Result<GrpcEgressResponse, Box<dyn std::error::Error + Send + Sync>> {
+    use hyper::client::conn::http2;
+
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .map_err(|_| "mesh retry client connect timed out")??;
+    let (mut sender, connection) = tokio::time::timeout(
+        Duration::from_secs(5),
+        http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
+    )
+    .await
+    .map_err(|_| "mesh retry client HTTP/2 handshake timed out")??;
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let mut frames = vec![Ok::<_, std::convert::Infallible>(Frame::data(
+        Bytes::copy_from_slice(body),
+    ))];
+    if let Some(trailers) = request_trailers {
+        frames.push(Ok(Frame::trailers(trailers)));
+    }
+    let mut request = hyper::Request::builder()
+        .method("POST")
+        .uri("http://retry.mesh.test/echo.Mesh/Retry")
+        .header("content-type", "application/grpc")
+        .header("content-length", body.len().to_string())
+        .header(
+            "baggage",
+            "source.principal=spiffe://attacker.invalid/ns/default/sa/forged,user.key=kept",
+        )
+        .header("te", "trailers")
+        .body(StreamBody::new(stream::iter(frames)))?;
+    request
+        .headers_mut()
+        .append("x-repeated", hyper::header::HeaderValue::from_static("one"));
+    request
+        .headers_mut()
+        .append("x-repeated", hyper::header::HeaderValue::from_static("two"));
+    request.headers_mut().append(
+        "x-repeated-bin",
+        hyper::header::HeaderValue::from_static("AAE="),
+    );
+    request.headers_mut().append(
+        "x-repeated-bin",
+        hyper::header::HeaderValue::from_static("AgM="),
+    );
+
+    let response = tokio::time::timeout(Duration::from_secs(10), sender.send_request(request))
+        .await
+        .map_err(|_| "mesh retry response headers timed out")??;
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    let mut response_body = Vec::new();
+    let mut response_trailers = HashMap::new();
+    let mut incoming = response.into_body();
+    loop {
+        let frame = match tokio::time::timeout(Duration::from_secs(10), incoming.frame()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(Some(Err(error))) => return Err(Box::new(error)),
+            Ok(None) => break,
+            Err(_) => return Err("mesh retry response body timed out".into()),
+        };
+        if frame.is_data() {
+            if let Ok(data) = frame.into_data() {
+                response_body.extend_from_slice(&data);
+            }
+        } else if frame.is_trailers()
+            && let Ok(trailers) = frame.into_trailers()
+        {
+            for (name, value) in &trailers {
+                if let Ok(value) = value.to_str() {
+                    response_trailers.insert(name.as_str().to_string(), value.to_string());
+                }
+            }
+        }
+    }
+    connection_task.abort();
+    let _ = connection_task.await;
+    Ok(GrpcEgressResponse {
+        status,
+        headers,
+        body: response_body,
+        trailers: response_trailers,
+    })
+}
+
+/// Live issue #3285 regression: a retry-enabled static target is admitted to
+/// the Sidecar mesh transport. Its first connection dies after emitting a TLS
+/// record but before an HTTP/2 request can be written; the replay succeeds over
+/// a fresh SVID-mTLS connection with exact repeated/binary metadata and exactly
+/// one application delivery. Native request trailers are then rejected before
+/// another backend stream is admitted because this generic intake cannot prove
+/// them safe to replay.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers() {
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/retry-client";
+    let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/retry-backend";
+    let identities = TempDir::new().expect("mesh retry identity tempdir");
+    let svids = generate_two_gateway_svids(identities.path(), a_spiffe, b_spiffe);
+    let listener = bind_fixture_listener(loopback_ephemeral())
+        .await
+        .expect("bind held mesh retry listener");
+    let backend_port = listener
+        .local_addr()
+        .expect("mesh retry listener addr")
+        .port();
+    let application_hits = Arc::new(AtomicUsize::new(0));
+    let (arm_application_phase, first_record, observation, backend_task) =
+        start_mesh_retry_mtls_backend(
+            listener,
+            mesh_retry_mtls_server_config(&svids.b),
+            Arc::clone(&application_hits),
+        )
+        .await;
+
+    let config = format!(
+        r#"version: "1"
+proxies:
+  - id: "mesh-mtls-live-retry"
+    listen_path: "/"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    upstream_id: "mesh-mtls-live-retry-upstream"
+    retry:
+      max_retries: 1
+      retryable_status_codes: []
+      retryable_methods: ["POST"]
+      retry_on_connect_failure: true
+      backoff: !fixed
+        delay_ms: 100
+upstreams:
+  - id: "mesh-mtls-live-retry-upstream"
+    algorithm: round_robin
+    targets:
+      - host: "127.0.0.1"
+        port: {backend_port}
+        tags:
+          mesh.mtls: "true"
+          mesh.mtls_port: "{backend_port}"
+          mesh.spiffe_id: "{b_spiffe}"
+consumers: []
+plugin_configs: []
+"#
+    );
+    let mut gateway = TestGateway::builder()
+        .mode_file(config)
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_GATEWAY_SVID_CERT_PATH", &svids.a.cert_path)
+        .env("FERRUM_GATEWAY_SVID_KEY_PATH", &svids.a.key_path)
+        .env(
+            "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+            &svids.a.trust_bundle_path,
+        )
+        .capture_output()
+        .reserve_listener_port(backend_port)
+        .spawn()
+        .await
+        .expect("spawn retry-enabled mesh gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("mesh retry gateway ready");
+
+    // Arm only after readiness and immediately before the application request so
+    // startup h2c capability probes remain preflight, while any post-arm
+    // plaintext `P` preface hard-fails as the mTLS bypass under test.
+    arm_application_phase
+        .send(true)
+        .expect("mesh retry backend application phase receiver dropped");
+
+    let payload = grpc_framed_payload(b"mesh-replay-body");
+    let response = grpc_mesh_retry_request(gateway.proxy_port, &payload, None)
+        .await
+        .expect("secured mesh retry request");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), first_record)
+            .await
+            .expect("first TLS observation timed out")
+            .expect("first TLS observation sender dropped"),
+        0x16,
+        "the failed application attempt must be a TLS handshake record, never plaintext HTTP"
+    );
+    let observed = tokio::time::timeout(Duration::from_secs(2), observation)
+        .await
+        .expect("successful retry observation timed out")
+        .expect("successful retry observation sender dropped");
+    assert_eq!(response.status, 200, "secured retry response: {response:?}");
+    assert_eq!(
+        response.trailers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "successful retry must preserve response trailers: {response:?}"
+    );
+    assert_eq!(response.body, payload, "replayed body must be echoed once");
+    assert_eq!(
+        observed.body, payload,
+        "backend must receive the exact replay bytes"
+    );
+    assert_eq!(
+        observed.repeated,
+        vec![b"one".to_vec(), b"two".to_vec()],
+        "unchanged repeated metadata must retain separate field lines"
+    );
+    assert_eq!(
+        observed.repeated_bin,
+        vec![b"AAE=".to_vec(), b"AgM=".to_vec()],
+        "unchanged repeated binary metadata must retain separate field lines"
+    );
+    assert_eq!(observed.te.as_deref(), Some(b"trailers".as_slice()));
+    // The client's `content-length` field line is stripped with the rest of the
+    // backend-request framing headers; hyper then regenerates a single
+    // authoritative value from the replay body's exact size hint. Assert the
+    // regenerated framing rather than its absence: a replayed client value would
+    // survive as a second field line, and a stale value would disagree with the
+    // bytes the backend actually received.
+    assert!(
+        observed.content_lengths.len() <= 1,
+        "HTTP/2 mesh dispatch must not replay the client Content-Length: {observed:?}"
+    );
+    if let Some(value) = observed.content_lengths.first() {
+        assert_eq!(
+            value.as_slice(),
+            payload.len().to_string().as_bytes(),
+            "regenerated Content-Length must match the replayed body length"
+        );
+    }
+    assert!(
+        observed
+            .x_forwarded_for
+            .as_deref()
+            .is_some_and(|value| value.starts_with(b"127.0.0.1")),
+        "gateway-owned forwarding identity must be regenerated: {observed:?}"
+    );
+    assert_eq!(
+        observed.x_forwarded_proto.as_deref(),
+        Some(b"http".as_slice())
+    );
+    assert_eq!(
+        observed.baggage.as_deref(),
+        Some(b"user.key=kept".as_slice()),
+        "identity baggage must be stripped without dropping unrelated baggage"
+    );
+    assert!(
+        observed.trailers.is_none(),
+        "ordinary unary request has no trailers"
+    );
+    assert_eq!(application_hits.load(Ordering::SeqCst), 1);
+
+    let mut native_trailers = hyper::HeaderMap::new();
+    native_trailers.insert(
+        "x-native-request-trailer",
+        hyper::header::HeaderValue::from_static("must-not-disappear"),
+    );
+    let rejected = grpc_mesh_retry_request(gateway.proxy_port, &payload, Some(native_trailers))
+        .await
+        .expect("native trailer refusal response");
+    assert_eq!(
+        rejected.status, 200,
+        "gRPC refusal uses Trailers-Only HTTP 200"
+    );
+    assert_eq!(
+        rejected.headers.get("grpc-status").map(String::as_str),
+        Some("12"),
+        "native trailers must fail closed before a retryable mesh dispatch: {rejected:?}"
+    );
+    assert_eq!(
+        application_hits.load(Ordering::SeqCst),
+        1,
+        "native trailer refusal must not create another application stream"
+    );
+
+    gateway.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), backend_task)
+        .await
+        .expect("mesh retry backend teardown timed out")
+        .expect("mesh retry backend task panicked");
 }
 
 /// h2c gRPC echo backend that responds with REAL HTTP/2 trailers: one DATA

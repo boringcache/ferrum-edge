@@ -4,12 +4,12 @@
 //! across program reloads and can be read by the proxy.
 
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf};
+use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf, SockHash};
 use ferrum_ebpf_common::{
-    BpfCaptureConfig, CidrKey4, CidrKey6, ConnTuple4, ConnTuple6, InboundRedirectKey4,
-    InboundRedirectKey6, IncludePortsPolicy, NodeProbePortKey4, NodeProbePortKey6, OrigDst4,
-    OrigDst6, OrigDstKey, PodInfo, WorkloadIdentity, SOCK_OPS_RINGBUF_DEFAULT_BYTES,
-    SOCK_OPS_STATS_LEN,
+    AcceptFirstByteState, BpfCaptureConfig, CidrKey4, CidrKey6, ConnTuple4, ConnTuple6,
+    InboundRedirectKey4, InboundRedirectKey6, IncludePortsPolicy, NodeProbePortKey4,
+    NodeProbePortKey6, OrigDst4, OrigDst6, OrigDstKey, PodInfo, WorkloadIdentity,
+    ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES, SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN,
 };
 
 /// Original IPv4 destination before connect rewrite, keyed by socket cookie.
@@ -178,3 +178,20 @@ pub static FERRUM_SOCK_OPS_STATS: PerCpuArray<u64> =
 #[map]
 pub static FERRUM_SOCK_OPS_CONNECT_TS: LruHashMap<u64, u64> =
     LruHashMap::with_max_entries(65536, 0);
+
+/// Accepted sockets whose first inbound application byte is observed by the
+/// SK_SKB stream parser. A SOCKHASH gives the parser the actual accepted
+/// socket, so tuple, listener, and redirect-layer reuse cannot alias samples.
+/// The kernel removes closed sockets from a sockhash automatically; the BPF
+/// userspace ringbuf consumer deletes entries after first byte and a bounded
+/// grace period so removal never races an active SK_SKB callback.
+#[map]
+pub static FERRUM_ACCEPT_FIRST_BYTE_SOCKETS: SockHash<u64> =
+    SockHash::with_max_entries(ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES, 0);
+
+/// Accept timestamp and correlation phase keyed by accepted socket cookie. LRU
+/// bounds stale/failed handoffs; BPF_EXIST confirmation cannot resurrect a
+/// first-data deletion, and first byte/close explicitly delete the entry.
+#[map]
+pub static FERRUM_ACCEPT_FIRST_BYTE_STATE: LruHashMap<u64, AcceptFirstByteState> =
+    LruHashMap::with_max_entries(ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES, 0);

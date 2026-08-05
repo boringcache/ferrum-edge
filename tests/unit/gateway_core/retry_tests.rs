@@ -334,6 +334,137 @@ fn test_terminal_gateway_errors_are_never_retried_as_connection_failures() {
     }
 }
 
+#[test]
+fn http_retry_re_resolves_mesh_transport_before_each_dispatch() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let retry_loop = src
+        .find("while retry::should_retry(retry_config, &method, &result, attempt)")
+        .expect("HTTP retry loop not found");
+    let retry_tail = &src[retry_loop..];
+    let end = retry_tail
+        .find("(result, current_cb_target_key, final_upstream_target)")
+        .expect("HTTP retry loop end not found");
+    let retry_body = &retry_tail[..end];
+
+    let selection = retry_body
+        .find("select_next_retry_target(")
+        .expect("retry target rotation not found");
+    let hbone = retry_body
+        .find("target_hbone_enabled")
+        .expect("HBONE transport resolution not found");
+    let mesh_mtls = retry_body
+        .find("target_mesh_mtls_enabled")
+        .expect("sidecar mTLS transport resolution not found");
+    let admission = retry_body
+        .find("run_backend_admission_plugins(")
+        .expect("per-attempt backend admission not found");
+    let mesh_dispatch = retry_body
+        .find("proxy_to_backend_mesh_retry(")
+        .expect("mesh retry dispatch not found");
+    let plain_dispatch = retry_body
+        .find("proxy_to_backend_retry(")
+        .expect("plain retry dispatch not found");
+
+    assert!(selection < hbone && selection < mesh_mtls);
+    assert!(hbone < admission && mesh_mtls < admission);
+    assert!(admission < mesh_dispatch && mesh_dispatch < plain_dispatch);
+
+    // Capability-aware mesh dispatch stays preferred, but any mesh-required
+    // shape that cannot ride HBONE/mTLS — including cross-cluster-only — must
+    // still hit the shared refusal helper before CB/admission/plain dial.
+    let refusal = retry_body
+        .find("direct_http_mesh_transport_refusal(")
+        .expect(
+            "generic retry loop must screen mesh-required shapes via \
+             direct_http_mesh_transport_refusal before plain dial",
+        );
+    assert!(
+        hbone < refusal && mesh_mtls < refusal,
+        "refusal must follow per-attempt transport resolution"
+    );
+    assert!(
+        refusal < admission,
+        "mesh refusal must precede backend admission and dial"
+    );
+    assert!(
+        retry_body[refusal..].contains("!retry_dispatch_hbone")
+            && retry_body[refusal..].contains("!retry_dispatch_mesh_mtls"),
+        "refusal gate must only fire when neither mesh transport is dispatchable"
+    );
+
+    let mesh_unavailable = retry_body
+        .find("Mesh retry target cannot be dispatched securely; failing closed")
+        .expect("mesh transport unavailable fail-closed not found");
+    let grpc_shape = retry_body[mesh_unavailable..]
+        .find("mesh_grpc_unavailable_response(")
+        .expect("gRPC mesh-unavailable fail-closed must use Trailers-Only UNAVAILABLE");
+    let json_shape = retry_body[mesh_unavailable..]
+        .find("Mesh transport dispatch required for this backend target")
+        .expect("plain HTTP mesh-unavailable fail-closed must keep JSON 502");
+    assert!(
+        grpc_shape < json_shape,
+        "is_grpc_request must select mesh_grpc_unavailable_response before the JSON 502 arm"
+    );
+    assert!(
+        retry_body[mesh_unavailable..].contains("skip_final_cb_record = true"),
+        "mesh dispatch refusal must stay backend-health-neutral"
+    );
+}
+
+#[test]
+fn mesh_retry_replays_finalized_bytes_without_rerunning_body_hooks() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let helper = src
+        .find("async fn proxy_to_backend_mesh_retry(")
+        .expect("mesh retry helper not found");
+    let helper_tail = &src[helper..];
+    let end = helper_tail
+        .find("/// Proxy the request to the backend.")
+        .expect("mesh retry helper end not found");
+    let helper_body = &helper_tail[..end];
+
+    assert!(helper_body.contains("MeshClientRequestBody::Replayable {"));
+    assert!(helper_body.contains("resolve_effective_proxy_for_target("));
+    assert!(!helper_body.contains("apply_request_body_plugins_with_context("));
+    assert!(!helper_body.contains("run_final_request_body_hooks("));
+}
+
+#[test]
+fn buffered_mesh_request_refuses_native_trailers_independent_of_retry_retain() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let helper = src
+        .find("async fn prepare_mesh_request_body(")
+        .expect("prepare_mesh_request_body not found");
+    let helper_tail = &src[helper..];
+    let end = helper_tail
+        .find("pub(crate) fn store_request_body_metadata(")
+        .expect("prepare_mesh_request_body end not found");
+    let helper_body = &helper_tail[..end];
+
+    assert!(
+        helper_body.contains("ClientRequestBody::Streaming(request) if stream_request_body =>"),
+        "streaming native requests must remain the unchanged fast path"
+    );
+    assert!(
+        helper_body.contains(
+            ".trailers\n        .as_ref()\n        .is_some_and(|trailers| !trailers.is_empty())"
+        ),
+        "buffered mesh path must refuse any non-empty native inbound trailers"
+    );
+    assert!(
+        !helper_body.contains("if retain_request_body\n        && buffered"),
+        "native trailer refusal must not be gated on retain_request_body / retries"
+    );
+    assert!(
+        helper_body.contains("ErrorClass::DispatchPolicyRejected"),
+        "native trailer refusal must stay health-neutral DispatchPolicyRejected"
+    );
+    assert!(
+        helper_body.contains("staged_request_trailers"),
+        "validated gRPC-Web staged trailers must still populate Replayable"
+    );
+}
+
 // --- classify_grpc_proxy_error tests ---
 
 #[test]
@@ -1600,7 +1731,8 @@ fn test_eager_buffer_body_read_never_reports_a_pre_wire_class() {
 /// buffered arm, which has no streaming-content-type exemption (unbounded when
 /// `max_response_body_size_bytes` is `0`). Hosted acceptance coverage is
 /// `functional_retry_test::retry_streams_sse_that_succeeds_before_the_final_attempt`;
-/// this guard only pins the wiring at both dispatch arms.
+/// this guard pins the wiring at every retry dispatch arm (mesh, native-H3,
+/// and reqwest).
 #[test]
 fn retry_dispatch_arms_pass_the_streaming_decision_on_every_attempt() {
     let proxy_src = include_str!("../../../src/proxy/mod.rs");
@@ -1613,18 +1745,19 @@ fn retry_dispatch_arms_pass_the_streaming_decision_on_every_attempt() {
         .expect("bounded attempt dispatch block");
 
     assert!(
-        dispatch.contains("proxy_to_backend_http3_retry(")
+        dispatch.contains("proxy_to_backend_mesh_retry(")
+            && dispatch.contains("proxy_to_backend_http3_retry(")
             && dispatch.contains("proxy_to_backend_retry("),
-        "the bounded block must cover both retry dispatch arms"
+        "the bounded block must cover mesh, native-H3, and reqwest retry dispatch arms"
     );
     assert!(
         !dispatch.contains("is_last_attempt")
             && !dispatch.contains("attempt >= retry_config.max_retries"),
-        "neither retry dispatch arm may gate the response-streaming decision on the attempt index"
+        "no retry dispatch arm may gate the response-streaming decision on the attempt index"
     );
     assert_eq!(
         dispatch.matches("should_stream,").count(),
-        2,
-        "both the native-H3 and reqwest retry arms must forward `should_stream` unchanged"
+        3,
+        "mesh, native-H3, and reqwest retry arms must each forward `should_stream` unchanged"
     );
 }
