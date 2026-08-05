@@ -4137,9 +4137,8 @@ fn openapi_grpc_services_default_is_the_canonical_a2a_03_service() {
             continue;
         }
         if inside {
-            let is_sibling_key = line.starts_with("    ")
-                && !line.starts_with("     ")
-                && !line.trim().is_empty();
+            let is_sibling_key =
+                line.starts_with("    ") && !line.starts_with("     ") && !line.trim().is_empty();
             if is_sibling_key {
                 break;
             }
