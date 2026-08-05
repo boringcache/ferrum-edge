@@ -792,16 +792,17 @@ impl ResolvedPortOverride {
             && self.http1_max_pending_requests.is_none()
     }
 
-    /// Field-by-field seed of inherited `connectionPool.http` fields from the
-    /// proxy fallback onto this explicit per-port entry.
+    /// Field-by-field materialization of inherited `connectionPool.http`
+    /// fields from a proxy fallback onto an explicit per-port entry.
     ///
     /// For each supported `connectionPool.http` field, the per-port value wins
     /// when set; otherwise the fallback's value is inherited. This mirrors
     /// Ferrum's documented field-level merge. Inherited top-level/subset values
-    /// are carried separately on `Proxy.dispatch_port_override_fallback` and
-    /// merged HERE at dispatch, so
-    /// an unrelated per-port field (e.g. `connectTimeout`/`tls`) no longer wipes
-    /// an inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`.
+    /// are carried separately on `Proxy.dispatch_port_override_fallback`.
+    /// Runtime dispatch resolves the same field precedence directly through
+    /// borrowed references so it does not clone this structure per request; an
+    /// unrelated per-port field (e.g. `connectTimeout`/`tls`) therefore does not
+    /// wipe an inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`.
     ///
     /// Only `connectionPool.http` fields are merged; the fallback only ever
     /// carries those (it is built solely from the DR top-level

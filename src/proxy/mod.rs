@@ -32580,28 +32580,17 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     // inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`. This
     // matches the NON-SD apply-time layering exactly (top-level fan-out, then a
     // partial per-port overlay; see `apply_connection_pool_http_to_port_override`
-    // in `src/modes/mesh/mod.rs`). Either side may be absent; the owned merge only
-    // fires when BOTH are present (the rare SD-with-explicit-port case).
+    // in `src/modes/mesh/mod.rs`). Resolve each field through borrowed references:
+    // cloning the whole per-port value here would allocate on EVERY request for
+    // an SD destination that combines an explicit port entry with a fallback.
     let per_port = proxy
         .dispatch_port_overrides
         .as_ref()
         .and_then(|overrides| overrides.get(&target.dispatch_policy_port()));
     let fallback = proxy.dispatch_port_override_fallback.as_ref();
-    let merged: Option<std::borrow::Cow<'_, crate::config::types::ResolvedPortOverride>> =
-        match (per_port, fallback) {
-            (Some(per_port), Some(fallback)) => {
-                let mut owned = per_port.clone();
-                owned.seed_connection_pool_http_from_fallback(fallback);
-                Some(std::borrow::Cow::Owned(owned))
-            }
-            (Some(per_port), None) => Some(std::borrow::Cow::Borrowed(per_port)),
-            (None, Some(fallback)) => Some(std::borrow::Cow::Borrowed(fallback)),
-            (None, None) => None,
-        };
-    let Some(override_config) = merged else {
+    if per_port.is_none() && fallback.is_none() {
         return std::borrow::Cow::Borrowed(proxy);
-    };
-    let override_config = override_config.as_ref();
+    }
 
     // Compare each candidate override against the proxy's current value and
     // build an owned clone only when at least one field actually differs.
@@ -32610,25 +32599,32 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     // matches current value" branches still return a borrowed proxy without
     // allocating.
 
-    let connect_override = override_config
-        .connect_timeout_ms
+    // The fallback is derived solely from the inherited
+    // `connectionPool.http` block, so non-HTTP fields always come from the
+    // explicit per-port entry.
+    let connect_override = per_port
+        .and_then(|override_config| override_config.connect_timeout_ms)
         .filter(|&v| v != proxy.backend_connect_timeout_ms);
 
     // `pool_http2_max_concurrent_streams` lives on the proxy as
     // `Option<u32>`; project the per-port value when it differs from what
     // the proxy already carries (treating `None` as "no proxy default").
-    let h2_streams_override = override_config
-        .h2_max_concurrent_streams
+    let h2_streams_override = per_port
+        .and_then(|override_config| override_config.h2_max_concurrent_streams)
+        .or_else(|| fallback.and_then(|fallback| fallback.h2_max_concurrent_streams))
         .filter(|new| Some(*new) != proxy.pool_http2_max_concurrent_streams);
 
     // Per-port HTTP idle timeout is exposed as milliseconds on the override
     // and as whole seconds on the proxy (`pool_idle_timeout_seconds`). The
     // translator already rejects sub-second durations, so the conversion is
     // lossless here.
-    let idle_seconds_override = override_config.http_idle_timeout_ms.and_then(|ms| {
-        let secs = ms / 1000;
-        (Some(secs) != proxy.pool_idle_timeout_seconds).then_some(secs)
-    });
+    let idle_seconds_override = per_port
+        .and_then(|override_config| override_config.http_idle_timeout_ms)
+        .or_else(|| fallback.and_then(|fallback| fallback.http_idle_timeout_ms))
+        .and_then(|ms| {
+            let secs = ms / 1000;
+            (Some(secs) != proxy.pool_idle_timeout_seconds).then_some(secs)
+        });
 
     // `maxRequestsPerConnection` is intentionally not projected from
     // DestinationRule-derived port overrides. It has no backend close-after-N
@@ -32640,17 +32636,17 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     // for dials to this port. `resolved_tls` identity fields are part of the
     // backend pool key (built from this effective proxy), so a distinct per-port
     // TLS posture fragments its own pool instead of sharing a connection.
-    let tls_override = override_config
-        .tls
-        .as_ref()
+    let tls_override = per_port
+        .and_then(|override_config| override_config.tls.as_ref())
         .filter(|t| **t != proxy.resolved_tls);
 
     // Per-port `h2UpgradePolicy` (DestinationRule `connectionPool.http`). Drives
     // the plain-HTTPS H2-vs-H1 dispatch fork in `proxy_to_backend` via the
     // effective proxy's `h2_upgrade_policy`. Project it when the per-port value
     // differs from what the proxy already carries.
-    let h2_upgrade_override = override_config
-        .h2_upgrade_policy
+    let h2_upgrade_override = per_port
+        .and_then(|override_config| override_config.h2_upgrade_policy)
+        .or_else(|| fallback.and_then(|fallback| fallback.h2_upgrade_policy))
         .filter(|new| Some(*new) != proxy.h2_upgrade_policy);
 
     // Per-port `http1MaxPendingRequests` (DestinationRule `connectionPool.http`).
@@ -32658,8 +32654,9 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     // `proxy_to_backend` via the effective proxy's
     // `pool_http1_max_pending_requests`. Project it when the per-port value
     // differs from what the proxy already carries.
-    let http1_pending_override = override_config
-        .http1_max_pending_requests
+    let http1_pending_override = per_port
+        .and_then(|override_config| override_config.http1_max_pending_requests)
+        .or_else(|| fallback.and_then(|fallback| fallback.http1_max_pending_requests))
         .filter(|new| Some(*new) != proxy.pool_http1_max_pending_requests);
 
     if connect_override.is_none()
