@@ -8126,6 +8126,8 @@ async fn dead_letter_handoff_preserves_evidence_when_the_source_path_becomes_a_d
     let displaced_for_mock = displaced.clone();
     let changed = Arc::new(AtomicBool::new(false));
     let changed_for_mock = Arc::clone(&changed);
+    let planted_claim: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
+    let planted_claim_for_mock = Arc::clone(&planted_claim);
     Mock::given(method("POST"))
         .respond_with(move |_: &Request| {
             if !changed_for_mock.swap(true, Ordering::SeqCst) {
@@ -8133,6 +8135,7 @@ async fn dead_letter_handoff_preserves_evidence_when_the_source_path_becomes_a_d
                 fs::rename(&claim, &displaced_for_mock)
                     .expect("the race preserves the original claimed inode");
                 fs::create_dir(&claim).expect("the race plants a directory at the claim path");
+                *planted_claim_for_mock.lock().expect("planted claim slot") = Some(claim);
             }
             ResponseTemplate::new(400)
         })
@@ -8141,16 +8144,25 @@ async fn dead_letter_handoff_preserves_evidence_when_the_source_path_becomes_a_d
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("source removal must fail after the durable dead-letter handoff");
+        .expect_err("the terminal claim operation must refuse a replaced claim pathname");
 
     assert!(changed.load(Ordering::SeqCst));
     assert!(
-        error.contains("failed to remove replay source"),
-        "unexpected source-removal refusal: {error}"
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "unexpected terminal claim refusal: {error}"
+    );
+    let planted = planted_claim
+        .lock()
+        .expect("planted claim slot")
+        .clone()
+        .expect("the race plants exactly one claim path");
+    assert!(
+        planted.is_dir(),
+        "the planted directory must be left exactly where it was planted"
     );
     assert!(
-        source.is_dir(),
-        "claim release restores the planted path without deleting it"
+        !source.exists(),
+        "a claim pathname that stopped resolving to the pinned artifact must never be released back to the replayable name"
     );
     let displaced_bytes = fs::read(&displaced).unwrap();
     assert!(
@@ -8159,6 +8171,299 @@ async fn dead_letter_handoff_preserves_evidence_when_the_source_path_becomes_a_d
     );
     assert!(dead_letter_payload_path(&source).exists());
     assert!(dead_letter_meta_path(&source).exists());
+}
+
+// ---------------------------------------------------------------------------
+// Same-UID substitution of the claim pathname through the production replay
+// path. The authoritative artifact is a descriptor this replay opened and
+// validated, not a metadata snapshot, so a planted regular file at the claim
+// pathname must never be renamed, removed, quarantined, released, or accounted
+// out — while the dead-letter evidence this attempt constructed must still be
+// published durably.
+// ---------------------------------------------------------------------------
+
+/// Bytes of the file a same-UID racer plants at the claim pathname.
+#[cfg(unix)]
+const PLANTED_CLAIM_SUBSTITUTE: &[u8] = b"{\"event_id\":\"planted-not-the-claimed-artifact\"}\n";
+
+/// Clears the process-global replay hook on every exit path, panics included.
+#[cfg(unix)]
+struct ClearReplayHookOnDrop;
+
+#[cfg(unix)]
+impl Drop for ClearReplayHookOnDrop {
+    fn drop(&mut self) {
+        set_spool_replay_hook_for_tests(None);
+    }
+}
+
+/// Install a one-shot substitution of the claim pathname at `point`.
+///
+/// The authoritative artifact is renamed out of the managed tree first, so its
+/// inode survives exactly as a hostile racer would leave it, and a *different*
+/// regular file then occupies the claim pathname. Returns the "fired" flag and
+/// the claim pathname the race observed.
+#[cfg(unix)]
+fn install_claim_substitution_hook(
+    namespace_root: std::path::PathBuf,
+    displaced: std::path::PathBuf,
+    point: SpoolReplayHookPoint,
+) -> (Arc<AtomicBool>, Arc<Mutex<Option<std::path::PathBuf>>>) {
+    let fired = Arc::new(AtomicBool::new(false));
+    let claim_slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
+    let fired_for_hook = Arc::clone(&fired);
+    let claim_for_hook = Arc::clone(&claim_slot);
+    set_spool_replay_hook_for_tests(Some(Arc::new(move |observed, claimed| {
+        if observed != point || !claimed.starts_with(&namespace_root) {
+            return;
+        }
+        if fired_for_hook.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        fs::rename(claimed, &displaced).expect("the race preserves the claimed inode");
+        fs::write(claimed, PLANTED_CLAIM_SUBSTITUTE)
+            .expect("the race plants a substitute regular file");
+        *claim_for_hook.lock().expect("planted claim slot") = Some(claimed.to_path_buf());
+    })));
+    (fired, claim_slot)
+}
+
+#[cfg(unix)]
+fn spool_day_has_quarantine(day: &Path) -> bool {
+    fs::read_dir(day)
+        .expect("spool day remains readable")
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().ends_with(".corrupt"))
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn claim_substituted_after_the_validated_replay_open_is_never_mutated() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-substitute-after-validated-open")])
+        .unwrap();
+    let day = source.parent().unwrap().to_path_buf();
+    let authoritative_bytes = fs::read(&source).unwrap();
+    let before = spool.cached_stats_for_tests();
+    let displaced = outside.path().join("displaced-authoritative-source.ndjson");
+
+    let clear = ClearReplayHookOnDrop;
+    let (fired, claim_slot) = install_claim_substitution_hook(
+        spool.namespace_root_for_tests().to_path_buf(),
+        displaced.clone(),
+        SpoolReplayHookPoint::AfterMatchingReplayOpen,
+    );
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("a substituted claim pathname must fail the tick");
+    drop(clear);
+
+    assert!(fired.load(Ordering::SeqCst));
+    // The refusal can surface either at claim renewal (a rename of the claim
+    // pathname) or at the terminal claim operation, depending on whether this
+    // batch crosses a lease second. Both are the same fail-closed decision and
+    // both must leave the substitute alone, so the assertions below hold either
+    // way; the deterministic evidence-publication case is covered by
+    // `claim_substituted_before_finalization_still_publishes_but_never_mutates`.
+    assert!(
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "unexpected substituted-claim diagnostic: {error}"
+    );
+    let claim = claim_slot
+        .lock()
+        .expect("planted claim slot")
+        .clone()
+        .expect("the race plants exactly one claim pathname");
+    assert_eq!(
+        fs::read(&claim).unwrap(),
+        PLANTED_CLAIM_SUBSTITUTE,
+        "the planted regular file must be byte-identical and never rewritten"
+    );
+    assert!(
+        !source.exists(),
+        "a substituted claim must never be released back to the replayable name"
+    );
+    assert!(
+        !spool_day_has_quarantine(&day),
+        "a substituted claim must never be quarantined"
+    );
+    assert_eq!(
+        fs::read(&displaced).unwrap(),
+        authoritative_bytes,
+        "the displaced authoritative artifact must remain intact"
+    );
+    let after = spool.cached_stats_for_tests();
+    assert!(
+        after.files >= before.files && after.bytes >= before.bytes,
+        "no owned-file or owned-byte accounting may be released for a pathname that stopped resolving to the pinned artifact"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn claim_substituted_before_finalization_still_publishes_but_never_mutates() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-substitute-before-finalize")])
+        .unwrap();
+    let day = source.parent().unwrap().to_path_buf();
+    let authoritative_bytes = fs::read(&source).unwrap();
+    let before = spool.cached_stats_for_tests();
+    let displaced = outside.path().join("displaced-authoritative-source.ndjson");
+
+    let clear = ClearReplayHookOnDrop;
+    let (fired, claim_slot) = install_claim_substitution_hook(
+        spool.namespace_root_for_tests().to_path_buf(),
+        displaced.clone(),
+        SpoolReplayHookPoint::BeforeReplayFinalize,
+    );
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("the terminal claim operation must refuse a substituted claim pathname");
+    drop(clear);
+
+    assert!(fired.load(Ordering::SeqCst));
+    assert!(
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "unexpected terminal-claim diagnostic: {error}"
+    );
+
+    // Constructive evidence is NOT suppressed by the substitution: both durable
+    // rejected artifacts are published for the rows this replay actually read
+    // from its own validated descriptor.
+    let payload_path = dead_letter_payload_path(&source);
+    let meta_path = dead_letter_meta_path(&source);
+    assert_eq!(
+        fs::read(&payload_path).unwrap(),
+        authoritative_bytes,
+        "the rejected payload must hold exactly the rows the validated descriptor produced"
+    );
+    let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta["rejected_rows"], 1);
+
+    // Publishing that evidence authorizes nothing against the substitute.
+    let claim = claim_slot
+        .lock()
+        .expect("planted claim slot")
+        .clone()
+        .expect("the race plants exactly one claim pathname");
+    assert_eq!(
+        fs::read(&claim).unwrap(),
+        PLANTED_CLAIM_SUBSTITUTE,
+        "the planted regular file must be byte-identical and never rewritten"
+    );
+    assert!(
+        !source.exists(),
+        "the substitute must never be released back to the replayable name"
+    );
+    assert!(
+        !spool_day_has_quarantine(&day),
+        "the substitute must never be quarantined"
+    );
+    assert_eq!(fs::read(&displaced).unwrap(), authoritative_bytes);
+
+    // Exactly two owned records were added and nothing was accounted out.
+    let payload_len = fs::metadata(&payload_path).unwrap().len();
+    let meta_len = fs::metadata(&meta_path).unwrap().len();
+    let after = spool.cached_stats_for_tests();
+    assert_eq!(
+        after.files,
+        before.files.saturating_add(2),
+        "the substituted claim must not be accounted out of the owned inventory"
+    );
+    assert_eq!(
+        after.bytes,
+        before.bytes.saturating_add(payload_len).saturating_add(meta_len),
+        "only the newly published evidence may change owned bytes"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn generic_finalize_failure_never_releases_a_substituted_claim() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-generic-finalize-failure")])
+        .unwrap();
+    let day = source.parent().unwrap().to_path_buf();
+    let meta_path = dead_letter_meta_path(&source);
+    // Ordinary I/O failure inside finalization: the metadata temp name is
+    // occupied by a directory, exactly as in
+    // `replay_keeps_original_when_dead_letter_metadata_cannot_be_written`.
+    let meta_temp = meta_path.with_file_name(format!(
+        "{}.tmp",
+        meta_path.file_name().and_then(|name| name.to_str()).unwrap()
+    ));
+    fs::create_dir(&meta_temp).unwrap();
+    let displaced = outside.path().join("displaced-authoritative-source.ndjson");
+
+    let clear = ClearReplayHookOnDrop;
+    let (fired, claim_slot) = install_claim_substitution_hook(
+        spool.namespace_root_for_tests().to_path_buf(),
+        displaced.clone(),
+        SpoolReplayHookPoint::BeforeReplayFinalize,
+    );
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("a blocked metadata store must still fail the tick");
+    drop(clear);
+
+    assert!(fired.load(Ordering::SeqCst));
+    // The ordinary retryable cause is preserved, and the release it would
+    // normally perform is refused because the pathname is no longer the claim.
+    assert!(
+        error.contains("failed to create spool temp file"),
+        "the generic finalize failure must still be reported: {error}"
+    );
+    assert!(
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "the refused release must be reported: {error}"
+    );
+    let claim = claim_slot
+        .lock()
+        .expect("planted claim slot")
+        .clone()
+        .expect("the race plants exactly one claim pathname");
+    assert_eq!(
+        fs::read(&claim).unwrap(),
+        PLANTED_CLAIM_SUBSTITUTE,
+        "the generic finalize-error path must not rewrite the substitute"
+    );
+    assert!(
+        !source.exists(),
+        "the generic finalize-error release must not rename the substitute into the replayable namespace"
+    );
+    assert!(
+        !spool_day_has_quarantine(&day),
+        "the generic finalize-error path must not quarantine the substitute"
+    );
+    assert!(
+        !meta_path.exists(),
+        "partial metadata must not be published when its store is blocked"
+    );
+    assert!(
+        dead_letter_payload_path(&source).exists(),
+        "a payload published before the metadata failure remains recoverable"
+    );
 }
 
 #[cfg(unix)]
@@ -8888,8 +9193,9 @@ fn substituted_regular_file_at_claim_cannot_clear_completed_dead_letter_siblings
         "the substitute must be a regular file for this to be the identity case"
     );
 
-    let error = probe_empty_dead_letter_publish_with_identity_for_tests(&spool, &claim_path, pinned)
-        .expect_err("empty publish must still be refused");
+    let error =
+        probe_empty_dead_letter_publish_with_identity_for_tests(&spool, &claim_path, &pinned)
+            .expect_err("empty publish must still be refused");
     assert!(
         error.contains("refusing to publish an empty"),
         "unexpected empty-publish diagnostic: {error}"
@@ -8932,8 +9238,9 @@ fn exact_live_claim_identity_still_clears_prior_dead_letter_siblings() {
 
     // The claim is untouched, so the pinned identity still matches and the
     // intended partial-handoff replacement must go ahead.
-    let error = probe_empty_dead_letter_publish_with_identity_for_tests(&spool, &claim_path, pinned)
-        .expect_err("empty publish must still be refused");
+    let error =
+        probe_empty_dead_letter_publish_with_identity_for_tests(&spool, &claim_path, &pinned)
+            .expect_err("empty publish must still be refused");
     assert!(
         error.contains("refusing to publish an empty"),
         "unexpected empty-publish diagnostic: {error}"
@@ -8978,7 +9285,7 @@ fn substituted_regular_file_at_claim_cannot_account_out_prior_dead_letter_artifa
         publish_dead_letter_payload_with_identity_for_tests(
             &spool,
             &claim_path,
-            pinned,
+            &pinned,
             row,
             Some(prior_payload),
         )
@@ -9008,7 +9315,7 @@ fn substituted_regular_file_at_claim_cannot_account_out_prior_dead_letter_artifa
     write_dead_letter_meta_with_identity_for_tests(
         &spool,
         &claim_path,
-        pinned,
+        &pinned,
         &payload_path,
         row,
         2,
