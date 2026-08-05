@@ -344,16 +344,17 @@ fn dr_connection_pool_http_max_retries() {
 }
 
 /// `trafficPolicy.connectionPool.http.http1MaxPendingRequests` (F5.1 final knob):
-/// projected onto the HTTP overlay and enforced at runtime as a per-`(host,port)`
-/// HTTP/1.1 pending-request gate (503 "upstream overflow" when full). No longer
-/// deferred at top-level / `portLevelSettings`.
+/// projected onto the HTTP overlay and honestly reinterpreted at runtime as a
+/// per-`(host, policy port, selected subset)` concurrent in-flight HTTP/1.1 gate
+/// (503 "upstream overflow" when full). No longer deferred at top-level /
+/// `portLevelSettings`.
 #[test]
 fn dr_connection_pool_http_http1_max_pending_requests_supported() {
     register_feature!(
         category = CATEGORY,
         feature = "trafficPolicy.connectionPool.http.http1MaxPendingRequests",
         status = Status::Supported,
-        notes = "Projected onto port_overrides[port].http1_max_pending_requests → Proxy.pool_http1_max_pending_requests; enforced as a 503-on-overflow pending-request gate on the reqwest/HTTP-1.1 dispatch path (src/backend_pending_limit.rs).",
+        notes = "Projected onto port_overrides[port].http1_max_pending_requests → Proxy.pool_http1_max_pending_requests; honestly reinterpreted as a 503-on-overflow concurrent in-flight-request gate on the reqwest/HTTP-1.1 dispatch path (src/backend_pending_limit.rs).",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",

@@ -175,8 +175,9 @@ need them, or because they are blocked upstream / architecturally:
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
   but **Deferred** in status; backend close-after-N-requests is unsupported, so
   it is not projected as effective policy. Use `http2MaxRequests`.
-  (`http1MaxPendingRequests` IS enforced — a 503-on-overflow pending-request gate
-  on the HTTP/1.1 dispatch path; see the DR table in `docs/mesh.md`.)
+  (`http1MaxPendingRequests` IS enforced through Ferrum's documented honest
+  reinterpretation — a 503-on-overflow concurrent in-flight-request gate on the
+  HTTP/1.1 dispatch path; see the DR table in `docs/mesh.md`.)
 - **DR `subsets[].trafficPolicy.portLevelSettings`** — detected and listed in
   `deferred_fields` with a translate-time warning, but not applied. Ferrum
   honors only top-level `trafficPolicy.portLevelSettings` (Istio's

@@ -673,22 +673,21 @@ pub struct UpstreamPortOverride {
     /// retries and never synthesizes a retry policy when the proxy has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
-    /// Per-port cap on concurrent *pending* (connection-waiting) HTTP/1.1
-    /// requests, mapped from DestinationRule
+    /// Per-port cap on concurrent in-flight HTTP/1.1 requests, mapped from
+    /// DestinationRule
     /// `connectionPool.http.http1MaxPendingRequests`. Enforced on the
     /// reqwest/HTTP-1.1 backend-dispatch path by
     /// [`crate::backend_pending_limit::BackendPendingLimiter`]: a request that
-    /// cannot get a pending slot is shed with a 503 ("upstream overflow") in
-    /// the connection-pending phase, rather than queued unboundedly. Projected
-    /// onto the per-target effective proxy's `pool_http1_max_pending_requests`.
-    /// The cap is keyed per resolved `(host, port)` endpoint, not per logical
-    /// cluster (same keying tradeoff as `max_connections`).
+    /// cannot get an in-flight slot is shed with a 503 ("upstream overflow")
+    /// before backend dispatch, rather than queued unboundedly. Projected onto
+    /// the per-target effective proxy's `pool_http1_max_pending_requests`. The
+    /// cap is keyed per resolved `(host, policy port, selected subset name)`
+    /// lane, without logical upstream/Service identity.
     ///
     /// HTTP/1.1-scoped: the multiplexed transports (direct H2, gRPC, HTTP/3,
     /// HBONE, mesh-mTLS) do NOT consult this field — their request concurrency
-    /// is governed by `http2MaxRequests` (`h2_max_concurrent_streams`), not a
-    /// connection-pending queue. Always positive when set (zero rejected at
-    /// translate time).
+    /// is governed by `http2MaxRequests` (`h2_max_concurrent_streams`). Always
+    /// positive when set (zero rejected at translate time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http1_max_pending_requests: Option<u32>,
 }
@@ -2334,12 +2333,12 @@ pub struct Proxy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_max_requests_per_connection: Option<u64>,
     /// Istio DestinationRule `connectionPool.http.http1MaxPendingRequests`. The
-    /// cap on concurrent *pending* (connection-waiting) requests on the
+    /// honestly reinterpreted cap on concurrent in-flight requests on the
     /// reqwest/HTTP-1.1 backend-dispatch path. Consulted by `proxy_to_backend`
     /// via [`crate::backend_pending_limit::BackendPendingLimiter`]: a request
-    /// that cannot get a pending slot for its `(host, port)` is shed with a 503
-    /// ("upstream overflow") in the connection-pending phase. Does NOT gate
-    /// direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch.
+    /// that cannot get a slot for its `(host, policy port, selected subset)`
+    /// lane is shed with a 503 ("upstream overflow") before backend dispatch.
+    /// Does NOT gate direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch.
     ///
     /// **Derived-only — never an input field.** It is projected at dispatch
     /// time by `resolve_effective_proxy_for_target` from the DestinationRule

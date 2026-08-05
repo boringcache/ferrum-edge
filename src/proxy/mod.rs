@@ -5748,11 +5748,11 @@ pub struct ProxyState {
     /// `src/backend_conn_limit.rs` for why their pool-internal connection
     /// lifecycle makes a request-keyed counter the wrong control.
     pub backend_conn_limit: Arc<crate::backend_conn_limit::BackendConnectionLimiter>,
-    /// Per-destination *pending-request* limiter enforcing DestinationRule
+    /// Per-destination in-flight-request limiter enforcing DestinationRule
     /// `connectionPool.http.http1MaxPendingRequests` on the reqwest/HTTP-1.1
     /// backend-dispatch path. Bounds how many requests can be simultaneously
     /// in flight for a `(host, port, selected subset)`; an over-cap request
-    /// is shed with a 503 ("upstream overflow") in the connection-pending phase
+    /// is shed with a 503 ("upstream overflow") before backend dispatch
     /// via an RAII [`crate::backend_pending_limit::BackendPendingGuard`] held
     /// only until dispatch returns. HTTP/1.1-scoped: the multiplexed transports
     /// (direct H2, gRPC, H3, HBONE, mesh-mTLS) do NOT consume it — their
@@ -32654,7 +32654,7 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
         .filter(|new| Some(*new) != proxy.h2_upgrade_policy);
 
     // Per-port `http1MaxPendingRequests` (DestinationRule `connectionPool.http`).
-    // Drives the reqwest/H1 dispatch path's pending-request gate in
+    // Drives the reqwest/H1 dispatch path's in-flight-request gate in
     // `proxy_to_backend` via the effective proxy's
     // `pool_http1_max_pending_requests`. Project it when the per-port value
     // differs from what the proxy already carries.
@@ -32940,7 +32940,7 @@ pub(crate) fn resolve_backend_http1_max_pending_requests(
 
 /// Whether the reqwest-backed backend client for this (effective) proxy is
 /// **known to dispatch over HTTP/1.1 at acquire time** — the only transport the
-/// `connectionPool.http.http1MaxPendingRequests` pending-request gate applies
+/// `connectionPool.http.http1MaxPendingRequests` in-flight-request gate applies
 /// to. The gate is consulted ONLY when this returns `true`, so a backend that
 /// MIGHT negotiate h2 is left uncapped (an `http1*` knob must not 503 an h2
 /// backend — that is `http2MaxRequests`'s job).
