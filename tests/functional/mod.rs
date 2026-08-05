@@ -7,6 +7,7 @@ mod functional_ai_response_guard_grpc_test;
 mod functional_ai_semantic_firewall_streaming_test;
 mod functional_ai_stream_router_boundary_test;
 mod functional_ai_stream_router_test;
+mod functional_ai_transcript_audit_grpc_test;
 mod functional_allowed_methods_logging_test;
 mod functional_allowed_methods_test;
 mod functional_auth_acl_test;

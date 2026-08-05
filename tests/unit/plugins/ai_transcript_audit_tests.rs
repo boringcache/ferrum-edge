@@ -11338,3 +11338,291 @@ async fn grpc_walk_ceiling_omits_with_the_scan_limit_reason() {
         "an omitted excerpt must export no partial body: {request_body}"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Binary-safe staging, short-circuit framing, deterministic map ordinals
+// ══════════════════════════════════════════════════════════════════════
+
+/// `test.HelloRequest` with an explicit `age`. A negative `int32` encodes as a
+/// ten-byte varint of `0xFF` bytes, so the resulting frame is guaranteed NOT to
+/// be valid UTF-8 — the shape ordinary native protobuf traffic takes and the
+/// UTF-8-only `request_body` metadata view cannot represent.
+fn hello_request_bytes_with_age(name: &str, age: i32) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value as ProtoValue};
+
+    let bytes = std::fs::read(grpc_descriptor_path()).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("test.HelloRequest").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("name", ProtoValue::String(name.to_string()));
+    msg.set_field_by_name("age", ProtoValue::I32(age));
+    msg.encode_to_vec()
+}
+
+fn grpc_audit_plugin(endpoint: &str) -> AiTranscriptAudit {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid audit grpc config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin
+}
+
+/// The binary snapshot opt-in is what makes non-UTF-8 protobuf stageable before
+/// `before_proxy` returns. It is instance-scoped, so an HTTP-only instance must
+/// not pay for it.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_enrollment_opts_into_binary_request_body_bytes() {
+    let grpc_plugin = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid audit grpc config");
+    assert!(
+        grpc_plugin.needs_request_body_bytes(),
+        "an enrolled gRPC instance must retain the binary request body: native \
+         protobuf is routinely not valid UTF-8"
+    );
+
+    let http_only = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid http-only audit config");
+    assert!(
+        !http_only.needs_request_body_bytes(),
+        "an HTTP-only instance must not pay for a second body representation"
+    );
+}
+
+/// Without binary-safe staging an enrolled protobuf request never becomes a
+/// candidate in `before_proxy`, so a later `before_proxy` plugin that returns a
+/// synthetic response or a rejection consumes the transaction unaudited.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_non_utf8_request_stages_and_captures_on_a_before_proxy_short_circuit() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = grpc_audit_plugin(&endpoint);
+
+    let payload = hello_request_bytes_with_age("binary-safe-subject", -1);
+    let request = grpc_frame(&payload);
+    assert!(
+        std::str::from_utf8(&request).is_err(),
+        "the fixture must be non-UTF-8 for this test to mean anything"
+    );
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    // Exactly what the proxy publishes for a non-UTF-8 body: no `request_body`
+    // text view, only the retained binary snapshot.
+    ctx.request_body_bytes = Some(Bytes::copy_from_slice(&request));
+    assert!(!ctx.metadata.contains_key("request_body"));
+
+    let mut proxy_headers = grpc_headers();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert!(
+        ctx.metadata.contains_key("ai_transcript_audit.record_id"),
+        "an enrolled binary gRPC request must stage before a later before_proxy \
+         plugin can short-circuit it: {:?}",
+        ctx.metadata
+    );
+
+    // A later `before_proxy` plugin terminates with a synthetic response: no
+    // final request-body hook runs for this transaction.
+    ctx.metadata.insert(
+        "ferrum:synthetic_short_circuit".to_string(),
+        "true".to_string(),
+    );
+    plugin
+        .capture_final_response_body(
+            &mut ctx,
+            200,
+            &grpc_headers(),
+            &grpc_frame(&hello_response_bytes("short-circuit reply")),
+        )
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "a short-circuited enrolled request must still be audited: {records:?}"
+    );
+    assert_eq!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
+        None,
+        "a binary request must not omit its excerpt: {}",
+        records[0]
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        request_body.contains("/test.Greeter/SayHello"),
+        "the excerpt must name the enrolled method: {request_body}"
+    );
+    assert!(
+        request_body.contains("binary-safe-subject"),
+        "a non-UTF-8 protobuf request must still export its decoded excerpt: \
+         {request_body}"
+    );
+}
+
+/// On a `before_proxy` short-circuit there is no finalized hook header map, and
+/// `ctx.headers` is a lightweight clone that can be missing the authoritative
+/// `grpc-encoding`. Framing must come from the witness recorded while the
+/// `before_proxy` map was live, or a compressed request omits as malformed.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_short_circuit_framing_uses_the_staged_witness_not_ctx_headers() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = grpc_audit_plugin(&endpoint);
+
+    let request = gzip_grpc_frame(&hello_request_bytes("witness-framed-subject"));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    // Stale context map: no `grpc-encoding` at all.
+    ctx.headers.remove("grpc-encoding");
+    ctx.request_body_bytes = Some(Bytes::copy_from_slice(&request));
+
+    // Authoritative `before_proxy` map: the request IS gzip-framed.
+    let mut proxy_headers = grpc_headers();
+    proxy_headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+
+    ctx.metadata.insert(
+        "ferrum:synthetic_short_circuit".to_string(),
+        "true".to_string(),
+    );
+    plugin
+        .capture_final_response_body(
+            &mut ctx,
+            200,
+            &grpc_headers(),
+            &grpc_frame(&hello_response_bytes("clean")),
+        )
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "expected one audit record: {records:?}");
+    assert_eq!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
+        None,
+        "the staged framing witness must decode the gzip request: {}",
+        records[0]
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        request_body.contains("witness-framed-subject"),
+        "the inflated excerpt must carry the decoded field: {request_body}"
+    );
+}
+
+/// The witness is a short-circuit fallback only. On ordinary dispatch the final
+/// request-body hook's own header parameter stays authoritative, so a late
+/// `grpc-encoding` rewrite after `before_proxy` is honored rather than being
+/// overridden by the earlier witness.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_final_hook_headers_outrank_the_staged_framing_witness() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = grpc_audit_plugin(&endpoint);
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    // `before_proxy` sees identity framing over the pre-transform body.
+    let identity = grpc_frame(&hello_request_bytes("pre-transform"));
+    ctx.request_body_bytes = Some(Bytes::copy_from_slice(&identity));
+    let mut proxy_headers = grpc_headers();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+
+    // A request transform then compresses the backend-visible body and rewrites
+    // `grpc-encoding` on the finalized map.
+    let mut hook_headers = grpc_headers();
+    hook_headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let final_body = gzip_grpc_frame(&hello_request_bytes("backend-visible-subject"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &hook_headers, &final_body)
+        .await;
+    plugin
+        .capture_final_response_body(
+            &mut ctx,
+            200,
+            &grpc_headers(),
+            &grpc_frame(&hello_response_bytes("clean")),
+        )
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "expected one audit record: {records:?}");
+    assert_eq!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
+        None,
+        "the hook's own header map must decode the rewritten framing: {}",
+        records[0]
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        request_body.contains("backend-visible-subject"),
+        "the backend-visible body must be the captured one: {request_body}"
+    );
+}
+
+/// Protobuf map entries live in a `HashMap`, so ordinal labels assigned from
+/// iteration order would name different entries run to run — and, under a
+/// bounded excerpt, change which entries survive truncation. Ordinals must come
+/// from a deterministic canonical key order while the keys themselves stay out
+/// of the transcript.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_map_ordinals_are_deterministic_and_key_ordered() {
+    // Deliberately inserted out of order.
+    let payload = || AuditPayload {
+        prompt: Some("map ordering"),
+        metadata: vec![
+            ("k_charlie", "map-value-charlie"),
+            ("k_alpha", "map-value-alpha"),
+            ("k_delta", "map-value-delta"),
+            ("k_bravo", "map-value-bravo"),
+        ],
+        ..AuditPayload::default()
+    };
+
+    let first = audit_grpc_request_excerpt(payload()).await;
+    let second = audit_grpc_request_excerpt(payload()).await;
+    assert_eq!(
+        first, second,
+        "identical input must produce an identical excerpt"
+    );
+
+    for (ordinal, expected) in [
+        (0, "map-value-alpha"),
+        (1, "map-value-bravo"),
+        (2, "map-value-charlie"),
+        (3, "map-value-delta"),
+    ] {
+        let label = format!("\"metadata.{ordinal}\":\"{expected}\"");
+        assert!(
+            first.contains(&label),
+            "map ordinals must follow canonical key order, missing {label}: {first}"
+        );
+    }
+    for key in ["k_alpha", "k_bravo", "k_charlie", "k_delta"] {
+        assert!(
+            !first.contains(key),
+            "literal map key {key} must never be exported: {first}"
+        );
+    }
+}

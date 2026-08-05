@@ -854,6 +854,17 @@ struct AuditStaging {
     /// uncommitted reservation when the candidate is discarded, loses staging,
     /// expires, or does not emit.
     rate_reservation: Option<RateLimitReservation>,
+    /// Minimal request framing witness for an enrolled native-gRPC candidate:
+    /// the `grpc-encoding` message encoding, resolved while the authoritative
+    /// `before_proxy` header map was still live.
+    ///
+    /// A `before_proxy` short-circuit (reject or synthetic response) never runs
+    /// the final request-body hook, so no authoritative header parameter exists
+    /// on that path and `ctx.headers` is a lightweight, possibly stale clone.
+    /// This is deliberately the ONLY request header fact retained: it selects a
+    /// bounded frame decoder and nothing else. No other request header, and no
+    /// header value, is stored. `None` on the HTTP JSON path.
+    grpc_request_encoding: Option<GrpcMessageEncoding>,
 }
 
 impl AuditStaging {
@@ -2748,14 +2759,16 @@ impl AiTranscriptAudit {
     /// Stage an enrolled native-gRPC candidate. Classification is enrollment,
     /// not JSON AI heuristics — unenrolled methods never reach this path.
     ///
-    /// `headers` must be the hook's authoritative request-header map (the
-    /// `before_proxy` / final-body parameter), never a stale `ctx.headers`
-    /// clone: gRPC framing reads `grpc-encoding` from this map.
+    /// `encoding` must be resolved from the hook's authoritative request-header
+    /// map (the `before_proxy` / final-body parameter), never from a stale
+    /// `ctx.headers` clone. It is retained on the staging entry as the framing
+    /// witness a later `before_proxy`-short-circuit capture uses, because no
+    /// authoritative header map exists on that path.
     fn stage_grpc_candidate(
         &self,
         ctx: &mut RequestContext,
         body: &[u8],
-        headers: &HashMap<String, String>,
+        encoding: GrpcMessageEncoding,
         phase: BodyPhase,
     ) -> PluginResult {
         if body.is_empty() {
@@ -2788,7 +2801,7 @@ impl AiTranscriptAudit {
         };
         let sample_hit = sample_from_record_id(&record_id) < self.sampling.rate;
         let capture = match phase {
-            BodyPhase::Final => self.capture_grpc_request(ctx, body, headers, sample_hit),
+            BodyPhase::Final => self.capture_grpc_request(ctx, body, encoding, sample_hit),
             BodyPhase::Provisional => RequestCapture::default(),
         };
 
@@ -2844,6 +2857,7 @@ impl AiTranscriptAudit {
                 captured: phase == BodyPhase::Final,
                 capture_skipped: capture.skipped,
                 rate_reservation: capture.rate_reservation,
+                grpc_request_encoding: Some(encoding),
             },
         );
 
@@ -2871,7 +2885,7 @@ impl AiTranscriptAudit {
         &self,
         ctx: &RequestContext,
         body: &[u8],
-        headers: &HashMap<String, String>,
+        encoding: GrpcMessageEncoding,
         sample_hit: bool,
     ) -> RequestCapture {
         let reservation = match self.capture_skip_reason(sample_hit) {
@@ -2888,11 +2902,12 @@ impl AiTranscriptAudit {
         self.request_captures.fetch_add(1, Ordering::Relaxed);
         let hash = self.redactor.keyed_hash_hex(body);
         let shaped = if self.capture.request {
-            // Use the hook's finalized request headers, not `ctx.headers`: on
-            // H1/H2 the context is a lightweight clone whose header map can be
-            // stale while the explicit hook parameter is the backend-visible
-            // map (including a late `grpc-encoding` rewrite).
-            self.shape_grpc_body(ctx, body, headers, GrpcBodyDirection::Request)
+            // `encoding` is resolved by the caller from the hook's finalized
+            // request headers (or, on a `before_proxy` short-circuit, from the
+            // framing witness recorded while that map was live) — never from
+            // `ctx.headers`, which on H1/H2 is a lightweight clone that can be
+            // stale relative to the backend-visible map.
+            self.shape_grpc_body(ctx, body, encoding, GrpcBodyDirection::Request)
         } else {
             ShapedBody::default()
         };
@@ -2910,14 +2925,16 @@ impl AiTranscriptAudit {
 
     /// Complete an already-staged gRPC candidate from the FINAL request body.
     ///
-    /// `headers` is the authoritative backend-visible request-header map from
-    /// the calling hook (final-body `headers`, or the live `before_proxy`
-    /// parameter on a short-circuit refresh) — required for `grpc-encoding`.
+    /// `framing` says where the authoritative request `grpc-encoding` comes
+    /// from: the calling hook's own backend-visible header parameter on
+    /// ordinary dispatch, or the staging entry's framing witness on a
+    /// `before_proxy` short-circuit, where no such parameter exists and
+    /// `ctx.headers` is a stale lightweight clone.
     fn capture_staged_grpc_request(
         &self,
         ctx: &mut RequestContext,
         body: &[u8],
-        headers: &HashMap<String, String>,
+        framing: GrpcRequestFraming,
     ) {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
@@ -2926,7 +2943,7 @@ impl AiTranscriptAudit {
             Some(hit) => hit,
             None => return,
         };
-        {
+        let encoding = {
             // Read-only probe: the mutating borrow is taken again below, after
             // the capture work, so a shared shard guard is enough here.
             let Some(staged) = self.staging.get(&record_id) else {
@@ -2935,8 +2952,19 @@ impl AiTranscriptAudit {
             if staged.captured {
                 return;
             }
-        }
-        let mut capture = self.capture_grpc_request(ctx, body, headers, sample_hit);
+            match framing {
+                GrpcRequestFraming::Header(encoding) => encoding,
+                // The witness is always written beside an enrolled gRPC staging
+                // entry. A missing one can only mean the entry was staged on the
+                // HTTP JSON path, so fail closed on identity framing rather than
+                // guessing a decoder from a stale header clone: a compressed
+                // frame then omits with `grpc_framing_error`.
+                GrpcRequestFraming::StagedWitness => staged
+                    .grpc_request_encoding
+                    .unwrap_or(GrpcMessageEncoding::Identity),
+            }
+        };
+        let mut capture = self.capture_grpc_request(ctx, body, encoding, sample_hit);
         self.publish_request_capture(ctx, &capture);
         if let Some(mut staged) = self.staging.get_mut(&record_id) {
             staged.captured = true;
@@ -2997,11 +3025,35 @@ impl AiTranscriptAudit {
         }
     }
 
+    /// Capture an already-staged enrolled gRPC candidate on a `before_proxy`
+    /// short-circuit (reject or synthetic response), where no final
+    /// request-body hook ran.
+    ///
+    /// Prefers a peer-rewritten UTF-8 `request_body` view so a redacting
+    /// terminator's output is what gets audited, and otherwise falls back to
+    /// the retained binary snapshot: native protobuf is routinely non-UTF-8, so
+    /// the text view alone would silently drop the capture for exactly the
+    /// requests this path exists to record. Framing comes from the staging
+    /// witness, never from the stale `ctx.headers` clone.
+    fn capture_short_circuit_grpc_request(&self, ctx: &mut RequestContext) {
+        if let Some(body) = ctx.metadata.remove("request_body") {
+            self.capture_staged_grpc_request(
+                ctx,
+                body.as_bytes(),
+                GrpcRequestFraming::StagedWitness,
+            );
+            ctx.metadata.insert("request_body".to_string(), body);
+        } else if let Some(body) = ctx.request_body_bytes.clone() {
+            // `Bytes::clone` shares the already-bounded buffer.
+            self.capture_staged_grpc_request(ctx, &body, GrpcRequestFraming::StagedWitness);
+        }
+    }
+
     fn shape_grpc_body(
         &self,
         ctx: &RequestContext,
         body: &[u8],
-        headers: &HashMap<String, String>,
+        encoding: GrpcMessageEncoding,
         direction: GrpcBodyDirection,
     ) -> ShapedBody {
         if !self.mode.captures_body() {
@@ -3028,7 +3080,6 @@ impl AiTranscriptAudit {
             return ShapedBody::default();
         };
 
-        let encoding = grpc_message_encoding(headers);
         let max_bytes = match direction {
             GrpcBodyDirection::Request => self.limits.max_request_bytes,
             GrpcBodyDirection::Response => self.limits.max_response_bytes,
@@ -3438,6 +3489,8 @@ impl AiTranscriptAudit {
                 captured: phase == BodyPhase::Final,
                 capture_skipped: capture.skipped,
                 rate_reservation: capture.rate_reservation,
+                // HTTP JSON path: there is no gRPC framing to witness.
+                grpc_request_encoding: None,
             },
         );
 
@@ -4120,6 +4173,21 @@ impl Plugin for AiTranscriptAudit {
         self.active
     }
 
+    /// Native protobuf routinely contains non-UTF-8 bytes, so the UTF-8-only
+    /// `ctx.metadata["request_body"]` view is simply absent for ordinary
+    /// enrolled gRPC calls. Without the binary snapshot such a request could not
+    /// be staged in `before_proxy`, and a later `before_proxy` reject or
+    /// synthetic response would leave the transaction unaudited — the exact
+    /// bypass staging exists to close.
+    ///
+    /// The flag is instance-scoped (the trait takes no context), so only
+    /// instances that actually configure `grpc` enrollment pay the
+    /// `Bytes::copy_from_slice`, and only on requests this plugin already asked
+    /// to buffer. HTTP-only instances keep the default.
+    fn needs_request_body_bytes(&self) -> bool {
+        self.active && self.grpc.is_some()
+    }
+
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         if !self.active {
             return false;
@@ -4143,20 +4211,35 @@ impl Plugin for AiTranscriptAudit {
             return PluginResult::Continue;
         }
         if self.grpc_capture_applies(ctx) {
-            let Some(body) = ctx.metadata.remove("request_body") else {
+            // Resolve framing from the live `before_proxy` header map (not
+            // `ctx.headers`): the handler may have moved headers out of the
+            // context, and any later FINAL capture on a short-circuit path must
+            // not fall back to a stale copy for `grpc-encoding`. The resolved
+            // encoding is retained on the staging entry as that path's witness.
+            let encoding = grpc_message_encoding(headers);
+            // Native protobuf is routinely non-UTF-8, so the UTF-8-only
+            // `request_body` metadata view is absent for ordinary enrolled
+            // calls. Prefer a peer-rewritten text view when one exists, and
+            // otherwise stage from the retained binary snapshot
+            // (`needs_request_body_bytes`) — without it an enrolled binary
+            // request would never stage, and a later `before_proxy` reject or
+            // synthetic response would leave the transaction unaudited.
+            let stage_result = if let Some(body) = ctx.metadata.remove("request_body") {
+                let staged = self.stage_grpc_candidate(
+                    ctx,
+                    body.as_bytes(),
+                    encoding,
+                    BodyPhase::Provisional,
+                );
+                ctx.metadata.insert("request_body".to_string(), body);
+                staged
+            } else if let Some(body) = ctx.request_body_bytes.clone() {
+                // `Bytes::clone` shares the already-bounded buffer; it does not
+                // duplicate it.
+                self.stage_grpc_candidate(ctx, &body, encoding, BodyPhase::Provisional)
+            } else {
                 return PluginResult::Continue;
             };
-            // Pass the live `before_proxy` header map (not `ctx.headers`): the
-            // handler may have moved headers out of the context, and any later
-            // FINAL capture on a short-circuit path must not fall back to a
-            // stale copy for `grpc-encoding`.
-            let stage_result = self.stage_grpc_candidate(
-                ctx,
-                body.as_bytes(),
-                headers,
-                BodyPhase::Provisional,
-            );
-            ctx.metadata.insert("request_body".to_string(), body);
             if !matches!(stage_result, PluginResult::Continue) {
                 return stage_result;
             }
@@ -4212,7 +4295,14 @@ impl Plugin for AiTranscriptAudit {
         // bytes, so this is where the transaction's single capture pass runs.
         if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
             if self.grpc_capture_applies(ctx) {
-                self.capture_staged_grpc_request(ctx, body, headers);
+                // Ordinary dispatch: this hook's own `headers` parameter is the
+                // authoritative backend-visible map, so it stays the framing
+                // source and the staged witness is not consulted.
+                self.capture_staged_grpc_request(
+                    ctx,
+                    body,
+                    GrpcRequestFraming::Header(grpc_message_encoding(headers)),
+                );
             } else {
                 self.capture_staged_request(ctx, body);
             }
@@ -4223,7 +4313,12 @@ impl Plugin for AiTranscriptAudit {
             return self.request_phase_commit_admission(ctx);
         }
         if self.grpc_capture_applies(ctx) {
-            let stage_result = self.stage_grpc_candidate(ctx, body, headers, BodyPhase::Final);
+            let stage_result = self.stage_grpc_candidate(
+                ctx,
+                body,
+                grpc_message_encoding(headers),
+                BodyPhase::Final,
+            );
             if !matches!(stage_result, PluginResult::Continue) {
                 return stage_result;
             }
@@ -4278,23 +4373,16 @@ impl Plugin for AiTranscriptAudit {
         {
             return PluginResult::Continue;
         }
-        if !flag(&ctx.metadata, MD_FINAL_REQ_SEEN)
-            && let Some(body) = ctx.metadata.remove("request_body")
-        {
+        if !flag(&ctx.metadata, MD_FINAL_REQ_SEEN) {
             if self.grpc_capture_applies(ctx) {
-                // No final-body hook ran (before_proxy short-circuit). The
-                // context header map is the post-`before_proxy` request view
-                // restored by the proxy — there is no separate finalized hook
-                // map on this path. Take it out briefly so capture can borrow
-                // headers and mutate staging/metadata without overlapping
-                // borrows of `ctx`.
-                let request_headers = std::mem::take(&mut ctx.headers);
-                self.capture_staged_grpc_request(ctx, body.as_bytes(), &request_headers);
-                ctx.headers = request_headers;
-            } else {
+                // No final-body hook ran (before_proxy short-circuit), so there
+                // is no authoritative finalized header map here and the body may
+                // be non-UTF-8 protobuf.
+                self.capture_short_circuit_grpc_request(ctx);
+            } else if let Some(body) = ctx.metadata.remove("request_body") {
                 self.capture_staged_request(ctx, body.as_bytes());
+                ctx.metadata.insert("request_body".to_string(), body);
             }
-            ctx.metadata.insert("request_body".to_string(), body);
         }
         if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY)
             && !ctx
@@ -4415,21 +4503,16 @@ impl Plugin for AiTranscriptAudit {
         // classification or the `stream` marker. `AuditStaging::captured` is the
         // second guard that keeps the expensive pass to one per transaction when
         // both this hook and `after_proxy` see the same short-circuit.
-        if flag(&ctx.metadata, SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
-            && let Some(body) = ctx.metadata.remove("request_body")
-        {
+        if flag(&ctx.metadata, SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY) {
             if self.grpc_capture_applies(ctx) {
-                // Synthetic short-circuit never ran the final-body hook, so
-                // there is no separate finalized request-header map. Use the
-                // post-`before_proxy` context headers (taken briefly to avoid
-                // overlapping borrows) for `grpc-encoding`.
-                let request_headers = std::mem::take(&mut ctx.headers);
-                self.capture_staged_grpc_request(ctx, body.as_bytes(), &request_headers);
-                ctx.headers = request_headers;
-            } else {
+                // A synthetic short-circuit never ran the final-body hook, so
+                // there is no finalized request-header map and the body may be
+                // non-UTF-8 protobuf.
+                self.capture_short_circuit_grpc_request(ctx);
+            } else if let Some(body) = ctx.metadata.remove("request_body") {
                 self.capture_staged_request(ctx, body.as_bytes());
+                ctx.metadata.insert("request_body".to_string(), body);
             }
-            ctx.metadata.insert("request_body".to_string(), body);
         }
 
         // Peek (do not consume) the staging entry for the fail-closed gate. The
@@ -4546,7 +4629,12 @@ impl Plugin for AiTranscriptAudit {
         }
         let shaped = if captures_response_body {
             if self.grpc_capture_applies(ctx) {
-                self.shape_grpc_body(ctx, body, response_headers, GrpcBodyDirection::Response)
+                self.shape_grpc_body(
+                    ctx,
+                    body,
+                    grpc_message_encoding(response_headers),
+                    GrpcBodyDirection::Response,
+                )
             } else {
                 self.shape_body(body, self.limits.max_response_bytes)
             }
@@ -7268,6 +7356,20 @@ enum GrpcBodyDirection {
     Response,
 }
 
+/// Where the authoritative request `grpc-encoding` for a staged gRPC capture
+/// comes from.
+#[derive(Clone, Copy)]
+enum GrpcRequestFraming {
+    /// Resolved from the calling hook's own authoritative backend-visible
+    /// request-header map (ordinary final-request-body dispatch).
+    Header(GrpcMessageEncoding),
+    /// A `before_proxy` short-circuit: no finalized hook header map exists on
+    /// this path, so use the minimal framing witness recorded on the staging
+    /// entry while the authoritative `before_proxy` map was live. Reading
+    /// `ctx.headers` here would consult a stale lightweight clone.
+    StagedWitness,
+}
+
 /// One parsed gRPC length-prefixed frame with its payload in identity form.
 struct GrpcFrame<'a> {
     payload: Cow<'a, [u8]>,
@@ -7453,6 +7555,13 @@ impl GrpcWalkBudget {
         self.nodes += 1;
         Ok(())
     }
+
+    /// Nodes still chargeable in this frame's walk. Used to bound a
+    /// collection-sized working allocation to something the walk could actually
+    /// afford to visit.
+    fn remaining_nodes(&self) -> usize {
+        GRPC_MAX_MESSAGE_NODES.saturating_sub(self.nodes)
+    }
 }
 
 /// `Ok(true)` means the message tree carries unknown fields (so no excerpt may
@@ -7535,6 +7644,33 @@ fn sensitive_map_key(key: &MapKey) -> bool {
     }
 }
 
+/// Total, allocation-free ordering token for a protobuf map key.
+///
+/// `prost-reflect` stores map entries in a `HashMap`, so iteration order varies
+/// between processes and between runs. Assigning ordinal transcript labels
+/// straight from that order would make `metadata.0` / `metadata.1` name
+/// different entries on identical input, and — because the excerpt is bounded —
+/// could change WHICH entries survive truncation. Sorting by this token first
+/// makes both deterministic.
+///
+/// The token is a canonical representation of the key, never an exported one:
+/// literal map keys stay out of the transcript and out of selection labels, and
+/// are consulted only by [`sensitive_map_key`] for redaction. A protobuf map's
+/// keys are all one type, so the leading variant discriminant only exists to
+/// make the order total; within a real map the second and third components
+/// decide it. Signed and unsigned integer keys widen into `i128` so no key
+/// range aliases.
+fn map_key_sort_token(key: &MapKey) -> (u8, i128, &str) {
+    match key {
+        MapKey::Bool(value) => (0, i128::from(*value), ""),
+        MapKey::I32(value) => (1, i128::from(*value), ""),
+        MapKey::I64(value) => (2, i128::from(*value), ""),
+        MapKey::U32(value) => (3, i128::from(*value), ""),
+        MapKey::U64(value) => (4, i128::from(*value), ""),
+        MapKey::String(value) => (5, 0, value.as_str()),
+    }
+}
+
 fn collect_string_fields(
     message: &DynamicMessage,
     path: &mut Vec<String>,
@@ -7610,7 +7746,24 @@ fn collect_string_value(
             // only as redaction evidence: a `metadata` map carrying an
             // `authorization` entry must redact exactly as the equivalent JSON
             // object key would.
-            for (index, (key, entry)) in entries.iter().enumerate() {
+            //
+            // The ordinal is assigned over a DETERMINISTIC order, not over
+            // `HashMap` iteration order, so identical input always produces
+            // identical labels and identical bounded truncation.
+            //
+            // The ordering vector is bounded by the SAME node ceiling the walk
+            // itself enforces: a map with more entries than the remaining budget
+            // could never be walked to completion anyway, so refuse it up front
+            // rather than materializing an attacker-sized vector for it. The
+            // outcome is unchanged (`grpc_scan_limit`), only reached earlier.
+            if entries.len() > budget.remaining_nodes() {
+                return Err(());
+            }
+            let mut ordered: Vec<_> = entries.iter().collect();
+            ordered.sort_by(|left, right| {
+                map_key_sort_token(left.0).cmp(&map_key_sort_token(right.0))
+            });
+            for (index, (key, entry)) in ordered.into_iter().enumerate() {
                 let nested = sensitive || sensitive_map_key(key);
                 path.push(index.to_string());
                 collect_string_value(entry, path, nested, out, budget)?;

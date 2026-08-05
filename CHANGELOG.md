@@ -33,7 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `metadata.0`, and the key is consulted only for the redaction decision) —
   repeated elements inherit their field's decision instead of being judged on
   the numeric index, and JSON embedded in a protobuf string is decoded and
-  redacted before export.
+  redacted before export. Map ordinals are assigned over a deterministic
+  canonical key order rather than protobuf map iteration order, so identical
+  input always produces identical labels and identical bounded truncation.
+  Enrolled requests stage binary-safe from a bounded retained snapshot of the
+  buffered body — native protobuf is routinely non-UTF-8 — so a later
+  `before_proxy` reject or synthetic response cannot leave the transaction
+  unaudited; that short-circuit capture reads the request `grpc-encoding` from
+  a minimal framing witness taken while the authoritative `before_proxy` header
+  map was live, and no other request header is retained or logged.
 - `ai_semantic_firewall` streamed `inspect` mode now accepts
   `streaming.window: tokens` with an explicitly selected bounded tokenizer
   (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft
