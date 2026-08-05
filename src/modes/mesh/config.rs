@@ -2080,9 +2080,11 @@ pub struct MeshTrafficPolicy {
     /// Optional `DestinationRule.trafficPolicy.localityLbSetting`. When
     /// present, the mesh apply layer projects this onto the resolved
     /// `Upstream.locality_lb_setting`; the load balancer then honours
-    /// `distribute` weights and `failover` region overrides on top of the
-    /// existing priority-tier (exact/zone/region) preference. Old DPs
-    /// reading new slices see this as a no-op via the serde default.
+    /// mutually exclusive `distribute` weights, `failover` region overrides,
+    /// or ordered `failover_priority` label tiers. Failover-priority tiers
+    /// replace the existing exact/zone/region preference only when applicable
+    /// active/passive health enables failover; otherwise they remain inert.
+    /// Old DPs reading new slices see this as a no-op via the serde default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality_lb_setting: Option<MeshLocalityLbSetting>,
     /// Cap on inflight backend TCP connections per target, mapped from
@@ -2317,16 +2319,20 @@ pub struct MeshConsistentHash {
 /// `enabled` defaults to `true` when the block is present (matches Istio
 /// semantics — an explicit `enabled: false` disables locality-aware LB
 /// entirely, including the priority-tier preference projected by
-/// `Upstream.source_locality`). `distribute` and `failover` are mutually
-/// exclusive at evaluation time: when a `distribute` entry matches the
-/// source locality the load balancer uses per-locality weights and ignores
-/// the priority-tier preference; otherwise `failover` (when configured)
-/// adds a fourth tier consulted after `region` and before the unfiltered
-/// fallback set.
+/// `Upstream.source_locality`). Exactly one of `distribute`, `failover`,
+/// or `failover_priority` may be set (Istio mutual exclusivity). When a
+/// `distribute` entry matches the source locality the load balancer uses
+/// per-locality weights and ignores the priority-tier preference;
+/// otherwise `failover` (when configured) adds a fourth tier consulted
+/// after `region` and before the unfiltered fallback set. When
+/// `failover_priority` is set and applicable active/passive health enables
+/// failover, it replaces the default region/zone/subzone tiers with ordered
+/// workload-label priority tiers. Without that signal it is inert.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshLocalityLbSetting {
     /// When `false`, disables all locality preference (priority tier,
-    /// distribute weighting, and failover override). Defaults to `true`.
+    /// distribute weighting, failover override, and failover-priority
+    /// tiers). Defaults to `true`.
     #[serde(default = "default_true_bool")]
     pub enabled: bool,
     /// Per-source-locality weighted distribution to target localities.
@@ -2339,6 +2345,11 @@ pub struct MeshLocalityLbSetting {
     /// target exists in the source's exact/zone/region tiers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failover: Vec<MeshLocalityFailover>,
+    /// Ordered Istio `failoverPriority` label keys (`key`) or key/value
+    /// overrides containing exactly one equals sign (`key=value`). Mutually
+    /// exclusive with `distribute` and `failover`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failover_priority: Vec<String>,
 }
 
 fn default_true_bool() -> bool {
@@ -2351,6 +2362,7 @@ impl Default for MeshLocalityLbSetting {
             enabled: true,
             distribute: Vec::new(),
             failover: Vec::new(),
+            failover_priority: Vec::new(),
         }
     }
 }
@@ -4208,6 +4220,70 @@ fn validate_mesh_traffic_policy(
     }
     if let Some(tls) = policy.tls.as_ref() {
         validate_mesh_traffic_policy_tls(format!("{context}.tls"), tls, errors);
+    }
+    if let Some(locality) = policy.locality_lb_setting.as_ref() {
+        validate_mesh_locality_lb_setting(
+            format!("{context}.locality_lb_setting"),
+            locality,
+            errors,
+        );
+    }
+}
+
+fn validate_mesh_locality_lb_setting(
+    context: String,
+    locality: &MeshLocalityLbSetting,
+    errors: &mut Vec<String>,
+) {
+    let has_distribute = !locality.distribute.is_empty();
+    let has_failover = !locality.failover.is_empty();
+    let has_failover_priority = !locality.failover_priority.is_empty();
+    let mode_count = has_distribute as u8 + has_failover as u8 + has_failover_priority as u8;
+    if mode_count > 1 {
+        errors.push(format!(
+            "{context}: must set only one of distribute, failover, or failover_priority"
+        ));
+    }
+
+    for (idx, entry) in locality.distribute.iter().enumerate() {
+        if entry.from.trim().is_empty() {
+            errors.push(format!(
+                "{context}.distribute[{idx}].from: must not be empty"
+            ));
+        }
+        if entry.to.is_empty() {
+            errors.push(format!("{context}.distribute[{idx}].to: must not be empty"));
+        }
+    }
+
+    for (idx, entry) in locality.failover.iter().enumerate() {
+        if entry.from.trim().is_empty() {
+            errors.push(format!("{context}.failover[{idx}].from: must not be empty"));
+        }
+        if entry.to.trim().is_empty() {
+            errors.push(format!("{context}.failover[{idx}].to: must not be empty"));
+        }
+        if !entry.from.is_empty() && entry.from == entry.to {
+            errors.push(format!(
+                "{context}.failover[{idx}]: cannot fail over a region to itself"
+            ));
+        }
+    }
+
+    for (idx, raw) in locality.failover_priority.iter().enumerate() {
+        let Some((key, _override)) = crate::config::types::parse_failover_priority_entry(raw)
+        else {
+            errors.push(format!(
+                "{context}.failover_priority[{idx}]: must be a non-empty label key or key=value \
+                 entry with exactly one '=' and without leading/trailing whitespace"
+            ));
+            continue;
+        };
+        if key.chars().any(|c| c.is_whitespace()) {
+            errors.push(format!(
+                "{context}.failover_priority[{idx}]: key must not contain whitespace"
+            ));
+        }
     }
 }
 

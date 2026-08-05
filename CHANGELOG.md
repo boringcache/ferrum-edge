@@ -184,6 +184,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finish/safety/usage, function calls, bounded provider errors), and
   malformed/oversized/unrepresentable frames fail closed under the existing
   stream bounds without logging credentials or oversized payloads.
+- Istio DestinationRule `trafficPolicy.loadBalancer.localityLbSetting.failoverPriority`
+  is implemented end to end (#3238). The K8s translator and native/file/xDS mesh
+  validators accept ordered label keys (`key`) and key/value overrides with
+  exactly one equals sign (`key=value`), reject empty or malformed entries and
+  mutually exclusive combinations with `distribute` / `failover` (fail closed —
+  never silently degrades to another locality mode), and project the list onto
+  mesh upstreams.
+  Outbound/service-discovery targets stamp workload labels plus derived topology
+  metadata so endpoint matching does not silently broaden. Source labels on
+  mesh upstreams keep authoritative `MeshSlice.labels` and fail closed when
+  same-SPIFFE local replicas disagree on enrichment or topology (no sibling
+  first-match overwrite). The load balancer precomputes deterministic priority
+  tiers from source workload labels against endpoint labels/locality (including
+  `mesh.network`/`mesh.cluster` fallbacks), uses non-truncating ranks, prefers
+  the best healthy rank, and recomputes on endpoint/locality/label reload.
+  Istio-compatible activation keeps the ranks inert until applicable upstream,
+  per-port, or per-subset active/passive health enables failover. An entirely
+  empty source-label map creates no tiers; with a non-empty map, individually
+  missing labels compare as empty strings.
+  Duplicate list positions are kept; expected values follow Istio's override-map
+  semantics (last `key=value` wins for that key at every position, including
+  bare-key entries), with a warning on duplicate identical raw strings.
+  FerrumAccepted status reports field-specific rejection diagnostics and an
+  inactive-policy advisory when the applicable DestinationRule policy lacks
+  `outlierDetection`. Docs, OpenAPI, and focused create/update/delete/data-path
+  tests cover the behavior.
+- **Behavior change (bundled with #3238):** mesh `source_locality` projection no
+  longer picks the first same-SPIFFE local sibling. When multiple label-
+  compatible local workloads share the mesh SPIFFE but disagree on locality,
+  Ferrum now returns `None` and turns locality-first preference off for that
+  slice (fail closed). Previously the result was ordering-dependent. Same-SPIFFE
+  local siblings that agree, or a single matching workload, are unchanged.
 
 - A required two-control-plane/two-data-plane multicluster poller gate now uses
   verified TLS/mTLS, audience-bound per-remote credentials, and four independent
@@ -332,6 +364,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/upstream-*-patches/` off the lightweight documentation path.
 
 ### Fixed
+
+- Corrected stale `prometheus_metrics` source documentation that claimed
+  `TransactionSummary.client_disconnected` was "hardcoded false in all literal
+  constructors" and that `ferrum_client_disconnects_total` could not yet fire
+  (#3257). The HTTP-family plumbing has been live since the deferred-log path
+  landed: `ProxyBody` classifies the terminal body state and
+  `DeferredTransactionLogger` writes it into the summary for HTTP/1.1, HTTP/2,
+  and gRPC, while HTTP/3 populates it synchronously from `H3StreamResult`. The
+  comments now record which paths set the flag, why a backend-side reset keeps
+  it false, why buffered responses always report false, and that WebSocket
+  sessions are counted by `ferrum_websocket_sessions_total` instead. Added the
+  previously missing regression coverage tying terminal body classification to
+  the rendered counter, including its `proxy_id`-only cardinality bound and
+  stale-entry eviction.
 
 - DestinationRule-only create/update/removal now atomically republishes the
   affected route table (and LB) before mesh status/revision reports the

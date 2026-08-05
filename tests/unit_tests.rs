@@ -11,4 +11,8 @@
 //!
 //! Run with: cargo test --test unit_tests
 
+#[path = "common/isolated_audit_fallback.rs"]
+mod isolated_audit_fallback;
+pub use isolated_audit_fallback::isolated_audit_fallback_dir;
+
 mod unit;
