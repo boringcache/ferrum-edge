@@ -21,6 +21,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callback-lock recursion, raced handoff, stale state, and `ktime` wrap from
   fabricating samples. The metric has fixed microsecond buckets with saturating
   count/bucket counters, drops sum overflow, and adds no per-flow labels (#3309).
+- `ai_transcript_audit` native gRPC payload capture via an explicit descriptor-based
+  `grpc` enrollment block (issue #3304). Enrolled methods are framed, bounded,
+  schema-decoded, and redacted under the same capture `mode` contract as HTTP;
+  unenrolled methods stay undecoded. Enrollment is decided against the
+  BACKEND-EFFECTIVE method, which `grpc_method_router` only republishes in
+  `on_backend_path_resolved` — after the request-body buffering decision and
+  `before_proxy` have already run — so a proxy with a `grpc` block buffers every
+  native gRPC request and the final request-body hook makes the authoritative
+  call. A client path that only becomes enrolled after listen-path stripping is
+  therefore captured instead of escaping onto the streaming fast path, and a
+  provisional enrollment the backend-effective method refutes has its staging
+  entry discarded with no record emitted and no protobuf reinterpreted through
+  the HTTP/JSON capture path. A request that short-circuits before routing never
+  resolves a backend path, so its client-path method stays authoritative for it.
+  `grpc.max_message_bytes` and `grpc.max_messages` carry immutable deployment
+  maxima (8 MiB and 1024 frames) enforced at admission: the decoded-byte scan
+  budget bounds decoded payload, not frame count, so legal zero-length frames
+  would otherwise let an operator-configured frame count drive an unbounded
+  frame vector. Descriptor-tree depth/node ceilings are aggregate across the
+  complete buffered body rather than resetting for each frame. Malformed,
+  oversized, undecodable, or scan-exhausting bodies omit excerpts with
+  compiled-in reasons rather than exporting partial or unredacted bytes.
+  Name-based redaction matches the HTTP JSON contract exactly: a value is
+  replaced when any enclosing name is
+  sensitive — the field, an ancestor message field, or a protobuf map key
+  (never exported as a label; map values use collision-free ordinal paths such
+  as `metadata.0`, and the key is consulted only for the redaction decision) —
+  repeated elements inherit their field's decision instead of being judged on
+  the numeric index; configured `text_fields` retain every repeated value under
+  a collision-free indexed path rather than silently selecting the first; and
+  JSON embedded in a protobuf string is decoded and redacted before export.
+  Map ordinals are assigned over a deterministic
+  canonical key order rather than protobuf map iteration order, so identical
+  input always produces identical labels and identical bounded truncation.
+  Enrolled requests stage binary-safe from a bounded retained snapshot of the
+  buffered body — native protobuf is routinely non-UTF-8 — so a later
+  `before_proxy` reject or synthetic response cannot leave the transaction
+  unaudited; that short-circuit capture reads the request `grpc-encoding` from
+  a minimal framing witness taken while the authoritative `before_proxy` header
+  map was live, and no other request header is retained or logged. Framed gRPC
+  bodies never enter the HTTP/JSON capture path, including
+  `application/grpc+json`, which satisfies the JSON media-type test while
+  carrying length-prefixed frames.
 - `ai_semantic_firewall` streamed `inspect` mode now accepts
   `streaming.window: tokens` with an explicitly selected bounded tokenizer
   (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft
@@ -236,6 +279,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Applied DestinationRule subset-scoped
+  `connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}`
+  with per-port > selected-subset > top-level precedence, target-rotation-safe
+  dispatch resolution, transport/pool isolation, and subset-keyed RAII H1
+  admission (issues #3228, #3240, #3241, and #3242). Retry loops retain the
+  original route/`Proxy.retry` ceiling and re-resolve each target's effective
+  `maxRetries` after load-balancer rotation so a stricter (or zero) mixed-port
+  candidate is never dispatched, while a looser candidate may continue up to
+  `min(original_route_ceiling, candidate_cap)` rather than being blocked by a
+  permanently lowered initial-port projection.
+  Startup pool warmup resolves the per-target effective proxy before it builds
+  and keys each reqwest warmup client, so a `DO_NOT_UPGRADE` reached through the
+  subset or top-level tier pre-warms its force-H1 client instead of
+  ALPN-negotiating HTTP/2 to a backend the operator forbade H2 for and parking
+  that idle connection on a pool key the data path never uses. The HTTP/3→HTTP
+  bridge now derives its `http1MaxPendingRequests` cap lookup and admission-lane
+  key from the DestinationRule policy port (`dispatch_policy_port()`) like the
+  H1/H2 path, so a `targetPort`-remapped Service no longer splits one
+  destination's in-flight budget across two lanes (a cap of N admitting 2N when
+  both frontends serve it) and an explicit `portLevelSettings` cap is visible to
+  the bridge. Subset-scoped `connectionPool.http.idleTimeout` and
+  `http2MaxRequests` — which the subset apply layer does not project — are now
+  reported honestly through a translate-time warning and
+  `status.ferrum.translation.deferred_fields` instead of being silently ignored
+  by a fully-accepted DestinationRule.
 - Corrected stale `prometheus_metrics` source documentation that claimed
   `TransactionSummary.client_disconnected` was "hardcoded false in all literal
   constructors" and that `ferrum_client_disconnects_total` could not yet fire
@@ -307,6 +375,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reqwest backend TLS clients built via `use_preconfigured_tls` /
+  `BackendTlsConfigBuilder::build_rustls_for_reqwest` now advertise ALPN
+  `[h2, http/1.1]` unless the proxy forces HTTP/1.1 (`h2UpgradePolicy:
+  DO_NOT_UPGRADE` or `pool_enable_http2: false`). Previously the
+  BuiltRustls path left ALPN empty, so production reqwest dials never
+  negotiated HTTP/2 on main. **Behavior change for existing deployments:**
+  every non-force-H1 HTTPS reqwest dispatch — including retry-configured
+  proxies, traffic routed to reqwest by body-buffering plugins or body-size
+  limits, and capability-`Unknown` targets — now offers h2 and will switch
+  from HTTP/1.1 to multiplexed HTTP/2 against dual-ALPN backends. Direct-H2 /
+  H3/QUIC builders are unchanged. Enables DestinationRule
+  `h2UpgradePolicy: UPGRADE` on the default reqwest path (issues #3228,
+  #3240–#3242).
 - Required CI owners now declare `merge_group` triggers and event-aware
   base/head selection so a future `main` merge queue can run the six required
   checks (`Tests`, `Merge Coverage`, `Gateway API Conformance`,

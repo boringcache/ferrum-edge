@@ -981,7 +981,15 @@ pub(crate) async fn handle_h3_websocket(
                 let ws_egress_denied =
                     matches!(ws_error_class, retry::ErrorClass::DispatchPolicyRejected);
                 let retry_delay = proxy.retry.as_ref().and_then(|retry_config| {
-                    (ws_attempt < retry_config.max_retries
+                    let route_retry_ceiling =
+                        crate::proxy::route_retry_ceiling(&proxy).unwrap_or(0);
+                    (ws_attempt < route_retry_ceiling
+                        && crate::proxy::current_retry_attempt_allowed(
+                            route_retry_ceiling,
+                            &proxy,
+                            current_target.as_deref(),
+                            ws_attempt,
+                        )
                         && retry_config.retry_on_connect_failure
                         && ws_is_pre_wire
                         && !ws_egress_denied)
@@ -992,6 +1000,9 @@ pub(crate) async fn handle_h3_websocket(
                 let mut backend_outcome_already_recorded = false;
 
                 if let Some(delay) = retry_delay {
+                    // Safety: retry_delay is only Some when proxy.retry is Some.
+                    let route_retry_ceiling =
+                        crate::proxy::route_retry_ceiling(&proxy).unwrap_or(0);
                     if let Some(permits) = backend_admission_permits.take() {
                         permits.record_backend_outcome(BackendAdmissionOutcome {
                             response_status: 502,
@@ -1045,6 +1056,18 @@ pub(crate) async fn handle_h3_websocket(
                             warn!(
                                 proxy_id = %proxy.id,
                                 "Aborting H3 WebSocket retry because the candidate would change the authorized backend method path"
+                            );
+                        } else if !crate::proxy::retry_attempt_allowed_for_target(
+                            route_retry_ceiling,
+                            &proxy,
+                            &next,
+                            ws_attempt,
+                        ) {
+                            retry_path_mismatch = true;
+                            warn!(
+                                proxy_id = %proxy.id,
+                                attempt = ws_attempt,
+                                "Aborting H3 WebSocket retry because the candidate exceeds its DestinationRule maxRetries cap"
                             );
                         } else {
                             retry_backend_url =

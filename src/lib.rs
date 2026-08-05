@@ -582,6 +582,21 @@ pub mod _test_support {
     }
 
     /// Whether an incremental rebuild would reconstruct an active
+    /// `ai_transcript_audit` with a node-local descriptor.
+    pub fn ai_transcript_audit_descriptor_preload_required_for_test(
+        cache: &crate::PluginCache,
+        config: &crate::config::types::GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<crate::config::db_backend::NamespacedResourceId>,
+        rebuild_globals: bool,
+    ) -> bool {
+        cache.ai_transcript_audit_descriptor_preload_required(
+            config,
+            proxy_ids_to_rebuild,
+            rebuild_globals,
+        )
+    }
+
+    /// Whether an incremental rebuild would reconstruct an active
     /// `body_validator` with a node-local descriptor (parity helper for tests).
     pub fn body_validator_descriptor_preload_required_for_test(
         cache: &crate::PluginCache,

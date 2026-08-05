@@ -469,6 +469,20 @@ pub struct SubsetTrafficPolicy {
     /// precedence over the DestinationRule's top-level `connectTimeout`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_timeout_ms: Option<u64>,
+    /// Plain-HTTP backend upgrade policy inherited by subset-bound proxies.
+    /// An explicit `portLevelSettings.connectionPool.http.h2UpgradePolicy`
+    /// remains the more-specific tier and wins for that destination port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_upgrade_policy: Option<H2UpgradePolicy>,
+    /// Per-request retry-count cap for this subset. This never creates a retry
+    /// policy; it only caps an existing [`RetryConfig`] after target selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    /// Maximum concurrent in-flight HTTP/1.1 requests admitted for this subset
+    /// and destination. The limiter key includes the selected subset name so
+    /// sibling subsets cannot consume one another's allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http1_max_pending_requests: Option<u32>,
     /// Per-subset passive health (Istio `subsets[].trafficPolicy.outlierDetection`),
     /// already resolved from the Istio outlier shape. The ejection *thresholds*
     /// (consecutive errors, interval, base-ejection time, min-health) are
@@ -651,28 +665,29 @@ pub struct UpstreamPortOverride {
     /// Per-port retry-count cap, mapped from DestinationRule
     /// `connectionPool.http.maxRetries`. Interpreted as an upper bound on the
     /// per-request `Proxy.retry.max_retries` (NOT Envoy's cluster-wide
-    /// outstanding-retry budget — see `docs/mesh.md`). Applied via
-    /// `cap_proxy_retry_for_target` once the dispatch target port is known:
-    /// effective `max_retries = min(existing, this)`; never increases retries
-    /// and never synthesizes a retry policy when the proxy has none.
+    /// outstanding-retry budget — see `docs/mesh.md`). The original route
+    /// ceiling is retained on `Proxy.retry`; each attempt/candidate is
+    /// authorized through `retry_attempt_allowed_for_target` as
+    /// `max_retries = min(original_route_ceiling, target_cap)` when
+    /// load-balancer rotation can change the policy port. Never increases
+    /// retries and never synthesizes a retry policy when the proxy has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
-    /// Per-port cap on concurrent *pending* (connection-waiting) HTTP/1.1
-    /// requests, mapped from DestinationRule
+    /// Per-port cap on concurrent in-flight HTTP/1.1 requests, mapped from
+    /// DestinationRule
     /// `connectionPool.http.http1MaxPendingRequests`. Enforced on the
     /// reqwest/HTTP-1.1 backend-dispatch path by
     /// [`crate::backend_pending_limit::BackendPendingLimiter`]: a request that
-    /// cannot get a pending slot is shed with a 503 ("upstream overflow") in
-    /// the connection-pending phase, rather than queued unboundedly. Projected
-    /// onto the per-target effective proxy's `pool_http1_max_pending_requests`.
-    /// The cap is keyed per resolved `(host, port)` endpoint, not per logical
-    /// cluster (same keying tradeoff as `max_connections`).
+    /// cannot get an in-flight slot is shed with a 503 ("upstream overflow")
+    /// before backend dispatch, rather than queued unboundedly. Projected onto
+    /// the per-target effective proxy's `pool_http1_max_pending_requests`. The
+    /// cap is keyed per resolved `(host, policy port, selected subset name)`
+    /// lane, without logical upstream/Service identity.
     ///
     /// HTTP/1.1-scoped: the multiplexed transports (direct H2, gRPC, HTTP/3,
     /// HBONE, mesh-mTLS) do NOT consult this field — their request concurrency
-    /// is governed by `http2MaxRequests` (`h2_max_concurrent_streams`), not a
-    /// connection-pending queue. Always positive when set (zero rejected at
-    /// translate time).
+    /// is governed by `http2MaxRequests` (`h2_max_concurrent_streams`). Always
+    /// positive when set (zero rejected at translate time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http1_max_pending_requests: Option<u32>,
 }
@@ -777,21 +792,17 @@ impl ResolvedPortOverride {
             && self.http1_max_pending_requests.is_none()
     }
 
-    /// Field-by-field seed of the `connectionPool.http` fields from a
-    /// service-discovery TOP-LEVEL fallback overlay onto this (per-port) entry.
+    /// Field-by-field materialization of inherited `connectionPool.http`
+    /// fields from a proxy fallback onto an explicit per-port entry.
     ///
     /// For each supported `connectionPool.http` field, the per-port value wins
     /// when set; otherwise the fallback's value is inherited. This mirrors
-    /// Ferrum's documented NON-SD apply-time field-level merge exactly: there,
-    /// the top-level
-    /// `connectionPool.http` is fanned onto the port slot FIRST and a partial
-    /// per-port `portLevelSettings.connectionPool.http` then overlays only the
-    /// fields it sets (see `apply_connection_pool_http_to_port_override` in
-    /// `src/modes/mesh/mod.rs`). SD upstreams cannot fan out at apply time, so
-    /// the top-level overlay is carried separately on
-    /// `Proxy.dispatch_port_override_fallback` and merged HERE at dispatch — so
-    /// an unrelated per-port field (e.g. `connectTimeout`/`tls`) no longer wipes
-    /// an inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`.
+    /// Ferrum's documented field-level merge. Inherited top-level/subset values
+    /// are carried separately on `Proxy.dispatch_port_override_fallback`.
+    /// Runtime dispatch resolves the same field precedence directly through
+    /// borrowed references so it does not clone this structure per request; an
+    /// unrelated per-port field (e.g. `connectTimeout`/`tls`) therefore does not
+    /// wipe an inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`.
     ///
     /// Only `connectionPool.http` fields are merged; the fallback only ever
     /// carries those (it is built solely from the DR top-level
@@ -812,29 +823,51 @@ impl ResolvedPortOverride {
             .http1_max_pending_requests
             .or(fallback.http1_max_pending_requests);
     }
+
+    /// Overlay the subset-inheritable HTTP connection-pool fields onto this
+    /// inherited fallback. This is a replacement at the subset tier: an
+    /// explicitly configured subset value wins over the top-level value.
+    /// Explicit per-port values are kept separately in
+    /// `Proxy.dispatch_port_overrides` and are merged ahead of this fallback at
+    /// dispatch, so the resulting precedence is port > subset > top-level.
+    pub fn overlay_subset_connection_pool_http(&mut self, subset: &ResolvedSubsetTrafficPolicy) {
+        if let Some(policy) = subset.h2_upgrade_policy {
+            self.h2_upgrade_policy = Some(policy);
+        }
+        if let Some(max_retries) = subset.max_retries {
+            self.max_retries = Some(max_retries);
+        }
+        if let Some(pending) = subset.http1_max_pending_requests {
+            self.http1_max_pending_requests = Some(pending);
+        }
+    }
 }
 
-/// Project an upstream's service-discovery TOP-LEVEL `connectionPool.http`
-/// overlay (`Upstream.dispatch_port_override_fallback`) into the resolved
+/// Project an upstream's inherited TOP-LEVEL `connectionPool.http` overlay
+/// (`Upstream.dispatch_port_override_fallback`) into the resolved
 /// [`ResolvedPortOverride`] shape carried on a referencing `Proxy`
 /// (`Proxy.dispatch_port_override_fallback`).
 ///
-/// Returns `None` for the common non-SD case (no top-level overlay) and for an
-/// overlay that resolves empty. Shared by config-build projection
-/// ([`GatewayConfig::resolve_dispatch_port_overrides`]) and the route-override
-/// path (`apply_route_overrides_inner` in `src/plugins/mod.rs`) so a route that
-/// swaps the destination upstream recomputes (or clears) the fallback exactly
-/// like `dispatch_port_overrides`, never leaking one upstream's overlay onto a
+/// Returns `None` when no inherited overlay exists or it resolves empty. This is
+/// the top-level tier only — callers that know the exact effective selected
+/// subset must use
+/// [`dispatch_port_override_fallback_for_selected_subset`] so subset HTTP fields
+/// overlay with the same precedence as
+/// [`GatewayConfig::resolve_dispatch_port_overrides`].
+///
+/// Shared by config-build projection and the route-override path
+/// (`apply_route_overrides_inner` in `src/plugins/mod.rs`) so a route that swaps
+/// the destination upstream recomputes (or clears) the fallback exactly like
+/// `dispatch_port_overrides`, never leaking one upstream's overlay onto a
 /// different destination.
 pub(crate) fn dispatch_port_override_fallback_from_upstream(
     upstream: &Upstream,
 ) -> Option<ResolvedPortOverride> {
-    // TOP-LEVEL `connectionPool.http` overlay ONLY.
-    // An explicit per-port `portLevelSettings` still WINS via the dispatch-time
-    // per-port lookup in `resolve_effective_proxy_for_target`: discovered mesh
-    // targets carry their owning declared Service port in
-    // `UpstreamTarget.service_port_policy_key`, while ordinary targets key by
-    // their resolved dial port.
+    // TOP-LEVEL `connectionPool.http` overlay ONLY. An explicit per-port
+    // `portLevelSettings` still WINS via the dispatch-time per-port lookup in
+    // `resolve_effective_proxy_for_target`: discovered mesh targets carry their
+    // owning declared Service port in `UpstreamTarget.service_port_policy_key`,
+    // while ordinary targets key by their resolved dial port.
     // We deliberately do NOT fold the upstream's `port_overrides` into this fallback:
     // a multi-port upstream would cross-leak one port's `connectionPool.http` onto a
     // different port (codex r3). Immediate route rebuild on a DR-only edit of this
@@ -845,6 +878,30 @@ pub(crate) fn dispatch_port_override_fallback_from_upstream(
         .dispatch_port_override_fallback
         .as_ref()
         .and_then(ResolvedPortOverride::from_upstream_override)
+}
+
+/// Build the inherited dispatch-policy fallback for one exact selected subset:
+/// top-level `connectionPool.http` first, then the selected subset's
+/// [`ResolvedSubsetTrafficPolicy`] overlay. Precedence matches
+/// [`GatewayConfig::resolve_dispatch_port_overrides`]: explicit per-port >
+/// selected subset > top-level. Does not mutate the shared upstream and never
+/// consults a sibling subset.
+pub(crate) fn dispatch_port_override_fallback_for_selected_subset(
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+) -> Option<ResolvedPortOverride> {
+    let mut inherited = dispatch_port_override_fallback_from_upstream(upstream);
+    let subset_policy = selected_subset.and_then(|subset| upstream.resolved_subset_tls.get(subset));
+    if let Some(subset_policy) = subset_policy
+        && (subset_policy.h2_upgrade_policy.is_some()
+            || subset_policy.max_retries.is_some()
+            || subset_policy.http1_max_pending_requests.is_some())
+    {
+        inherited
+            .get_or_insert_with(ResolvedPortOverride::default)
+            .overlay_subset_connection_pool_http(subset_policy);
+    }
+    inherited
 }
 
 /// A named subset of upstream targets identified by label selectors.
@@ -867,13 +924,12 @@ pub struct SubsetDefinition {
 /// Same pattern as [`ResolvedPortOverride`]: the upstream owns the mesh-derived
 /// policy ([`SubsetTrafficPolicy`]) and the gateway pre-computes the resolved
 /// view at cold-path apply so request dispatch never re-derives the
-/// DestinationRule TLS overlay. Currently carries only `tls`; future fields
-/// (subset-scoped connectionPool, outlierDetection, etc.) live here too.
+/// DestinationRule TLS or HTTP connection-pool overlay.
 ///
-/// Stored on [`Upstream::resolved_subset_tls`] keyed by subset name and
-/// projected onto `Proxy.resolved_tls` by
-/// [`GatewayConfig::resolve_upstream_tls`] when a proxy's `upstream_subset`
-/// selects a subset that carries a TLS override.
+/// Stored on [`Upstream::resolved_subset_tls`] keyed by subset name. TLS is
+/// projected by [`GatewayConfig::resolve_upstream_tls`]; HTTP connection-pool
+/// fields are projected by [`GatewayConfig::resolve_dispatch_port_overrides`]
+/// when a proxy's `upstream_subset` selects the entry.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedSubsetTrafficPolicy {
     /// Subset-resolved backend TLS posture. `Some` when the subset's
@@ -894,25 +950,40 @@ pub struct ResolvedSubsetTrafficPolicy {
     /// applies only when a single dispatch port is resolvable pre-selection;
     /// for subset dispatch on a multi-port upstream the subset cap governs.
     pub passive_health_check: Option<PassiveHealthCheck>,
+    /// Subset-scoped plain-HTTP H2 upgrade posture.
+    pub h2_upgrade_policy: Option<H2UpgradePolicy>,
+    /// Subset-scoped per-request retry-count cap.
+    pub max_retries: Option<u32>,
+    /// Subset-scoped concurrent in-flight HTTP/1.1 cap.
+    pub http1_max_pending_requests: Option<u32>,
 }
 
 impl ResolvedSubsetTrafficPolicy {
-    /// Build from a fully-resolved subset TLS and/or passive-health overlay.
-    /// Returns `None` when neither is present (so callers can skip inserting
-    /// empty entries into [`Upstream::resolved_subset_tls`]).
+    /// Build from the fully resolved subset overlays. Returns `None` only when
+    /// every carried field is absent, so callers can skip empty entries.
     pub fn new(
         tls: Option<BackendTlsConfig>,
         passive_health_check: Option<PassiveHealthCheck>,
+        h2_upgrade_policy: Option<H2UpgradePolicy>,
+        max_retries: Option<u32>,
+        http1_max_pending_requests: Option<u32>,
     ) -> Option<Self> {
         let resolved = Self {
             tls,
             passive_health_check,
+            h2_upgrade_policy,
+            max_retries,
+            http1_max_pending_requests,
         };
         (!resolved.is_empty()).then_some(resolved)
     }
 
     fn is_empty(&self) -> bool {
-        self.tls.is_none() && self.passive_health_check.is_none()
+        self.tls.is_none()
+            && self.passive_health_check.is_none()
+            && self.h2_upgrade_policy.is_none()
+            && self.max_retries.is_none()
+            && self.http1_max_pending_requests.is_none()
     }
 }
 
@@ -1580,19 +1651,16 @@ pub struct Upstream {
     /// `Upstream.subsets[].traffic_policy.tls`.
     #[serde(skip)]
     pub resolved_subset_tls: HashMap<String, ResolvedSubsetTrafficPolicy>,
-    /// Top-level (non-`portLevelSettings`) DestinationRule `connectionPool.http`
-    /// overlay for a **service-discovery** upstream.
+    /// Inherited (non-`portLevelSettings`) DestinationRule
+    /// `connectionPool.http` overlay.
     ///
-    /// Non-SD upstreams fan the top-level `connectionPool.http` block out onto
-    /// every served `port_overrides` entry at apply time. SD upstreams cannot —
-    /// their target ports are resolved at runtime, not at apply — so the
-    /// top-level overlay is captured here instead and applied by the
-    /// LB-**selected** target port at dispatch. `resolve_dispatch_port_overrides`
-    /// projects this onto `Proxy.dispatch_port_override_fallback`, which the
-    /// HTTP-family dispatch resolvers (`resolve_effective_proxy_for_target` /
-    /// `cap_proxy_retry_for_target`) consult only when the selected port has no
-    /// explicit per-port override — so an explicit `portLevelSettings` entry
-    /// still wins. Not serialized — derived from the matching DestinationRule.
+    /// This carries the top-level block for service-discovery upstreams and the
+    /// three subset-inheritable fields (`h2UpgradePolicy`, `maxRetries`, and
+    /// `http1MaxPendingRequests`) for every upstream. During proxy projection a
+    /// selected subset overlays those three fields onto this base. Dispatch
+    /// merges an explicit per-port entry first, then this inherited fallback,
+    /// giving exact `port-level > subset-level > top-level` field precedence.
+    /// Not serialized — derived from the matching DestinationRule.
     #[serde(default, skip)]
     pub dispatch_port_override_fallback: Option<UpstreamPortOverride>,
     /// ID of the `ApiSpec` that created this upstream via the spec-import admin API.
@@ -2185,20 +2253,20 @@ pub struct Proxy {
     /// `apply_destination_rules` has written into `Upstream.port_overrides`.
     #[serde(skip)]
     pub dispatch_port_overrides: Option<HashMap<u16, ResolvedPortOverride>>,
-    /// Top-level (non-`portLevelSettings`) DestinationRule `connectionPool.http`
-    /// overlay for a **service-discovery** upstream, projected from
+    /// Inherited (non-`portLevelSettings`) DestinationRule
+    /// `connectionPool.http` overlay, projected from
     /// `Upstream.dispatch_port_override_fallback` by
     /// `GatewayConfig::resolve_dispatch_port_overrides()`.
     ///
-    /// SD upstreams have no apply-time port set to fan the top-level overlay
-    /// onto (targets resolve at runtime), so `dispatch_port_overrides` is empty
-    /// for the discovered ports. The HTTP-family dispatch resolvers
+    /// Service-discovery upstreams use this because target ports resolve at
+    /// runtime. All upstreams also use it for the subset-inheritable fields,
+    /// after the selected subset has overlaid the top-level values. The
+    /// HTTP-family dispatch resolvers
     /// (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
     /// fall back to this overlay when the LB-selected target port has no
     /// explicit per-port override — so an explicit `portLevelSettings` entry for
-    /// that port still wins. `None` for the common (non-SD, or SD without a
-    /// top-level `connectionPool.http`) case, so the hot path skips it with a
-    /// single field read. `#[serde(skip)]` (derived-only) like
+    /// that port still wins. `None` when no inherited field applies, so the hot
+    /// path skips it with a single field read. `#[serde(skip)]` (derived-only) like
     /// `dispatch_port_overrides`; DB/file loaders start it `None`.
     #[serde(skip)]
     pub dispatch_port_override_fallback: Option<ResolvedPortOverride>,
@@ -2272,12 +2340,12 @@ pub struct Proxy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_max_requests_per_connection: Option<u64>,
     /// Istio DestinationRule `connectionPool.http.http1MaxPendingRequests`. The
-    /// cap on concurrent *pending* (connection-waiting) requests on the
+    /// honestly reinterpreted cap on concurrent in-flight requests on the
     /// reqwest/HTTP-1.1 backend-dispatch path. Consulted by `proxy_to_backend`
     /// via [`crate::backend_pending_limit::BackendPendingLimiter`]: a request
-    /// that cannot get a pending slot for its `(host, port)` is shed with a 503
-    /// ("upstream overflow") in the connection-pending phase. Does NOT gate
-    /// direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch.
+    /// that cannot get a slot for its `(host, policy port, selected subset)`
+    /// lane is shed with a 503 ("upstream overflow") before backend dispatch.
+    /// Does NOT gate direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch.
     ///
     /// **Derived-only — never an input field.** It is projected at dispatch
     /// time by `resolve_effective_proxy_for_target` from the DestinationRule
@@ -3016,6 +3084,32 @@ pub(crate) fn proxy_retry_is_effective(
     }
 }
 
+/// Whether `target` is selectable for the named upstream subset. Admission
+/// paths use the same label containment rule as the load balancer so a policy
+/// attached only to a sibling subset cannot affect the selected destination.
+/// An unknown subset remains unfiltered here because reference validation
+/// reports that independent error; retaining every target also keeps the
+/// remaining admission checks fail-closed while errors are accumulated.
+fn upstream_target_selected_by_subset(
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+    target: &UpstreamTarget,
+) -> bool {
+    let subset = selected_subset.and_then(|subset_name| {
+        upstream
+            .subsets
+            .as_ref()
+            .and_then(|subsets| subsets.iter().find(|subset| subset.name == subset_name))
+    });
+    match subset {
+        Some(subset) => subset
+            .labels
+            .iter()
+            .all(|(key, value)| target.tags.get(key).is_some_and(|tag| tag == value)),
+        None => true,
+    }
+}
+
 /// Project a single referenced upstream's per-port / top-level connection
 /// policy onto a throwaway proxy clone for per-resource admission paths.
 ///
@@ -3024,8 +3118,14 @@ pub(crate) fn proxy_retry_is_effective(
 /// [`GatewayConfig::resolve_dispatch_port_overrides`] populates over a full
 /// config. A proxy that arrives straight off the admin request body therefore has
 /// both fields `None`. This projection is still used by the backend-TLS SNI
-/// direct-H2 compatibility validation and mirrors the full-config resolution.
-pub(crate) fn proxy_with_resolved_port_caps(proxy: &Proxy, upstream: &Upstream) -> Proxy {
+/// direct-H2 compatibility validation and mirrors the full-config resolution,
+/// including the exact effective selected subset (which may differ from
+/// `proxy.upstream_subset` on a route-override destination).
+pub(crate) fn proxy_with_resolved_port_caps(
+    proxy: &Proxy,
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+) -> Proxy {
     let mut resolved = proxy.clone();
     resolved.dispatch_port_overrides = if upstream.port_overrides.is_empty() {
         None
@@ -3040,7 +3140,7 @@ pub(crate) fn proxy_with_resolved_port_caps(proxy: &Proxy, upstream: &Upstream) 
         (!ports.is_empty()).then_some(ports)
     };
     resolved.dispatch_port_override_fallback =
-        dispatch_port_override_fallback_from_upstream(upstream);
+        dispatch_port_override_fallback_for_selected_subset(upstream, selected_subset);
     resolved
 }
 
@@ -3122,14 +3222,26 @@ fn screen_plugin_config_for_sni_buffering(
     }
 }
 
+/// Whether a backend TLS SNI override applies proxy-wide or only on one
+/// DestinationRule policy port.
+#[derive(Debug, Clone, Copy)]
+enum SniPolicyScope {
+    ProxyWide,
+    Port(u16),
+}
+
 /// Source description for a backend TLS SNI override that forces direct-H2.
 fn proxy_plain_https_sni_sources<'a>(
     proxy: &'a Proxy,
     upstream: Option<&'a Upstream>,
-) -> Vec<(&'a str, String)> {
+) -> Vec<(&'a str, String, SniPolicyScope)> {
     let mut sources = Vec::new();
     if let Some(sni) = proxy.resolved_tls.sni.as_deref() {
-        sources.push((sni, "resolved backend TLS SNI".to_string()));
+        sources.push((
+            sni,
+            "resolved backend TLS SNI".to_string(),
+            SniPolicyScope::ProxyWide,
+        ));
     }
     if let Some(overrides) = proxy.dispatch_port_overrides.as_ref() {
         for (port, ovr) in overrides {
@@ -3137,6 +3249,7 @@ fn proxy_plain_https_sni_sources<'a>(
                 sources.push((
                     sni,
                     format!("DestinationRule per-port TLS SNI on port {port}"),
+                    SniPolicyScope::Port(*port),
                 ));
             }
         }
@@ -3148,22 +3261,156 @@ fn proxy_plain_https_sni_sources<'a>(
                 sources.push((
                     sni,
                     format!("DestinationRule per-port TLS SNI on port {port}"),
+                    SniPolicyScope::Port(*port),
                 ));
             }
         }
         if let Some(sni) = upstream.backend_tls_sni.as_deref()
             && proxy.resolved_tls.sni.is_none()
         {
-            sources.push((sni, "upstream backend_tls_sni".to_string()));
+            sources.push((
+                sni,
+                "upstream backend_tls_sni".to_string(),
+                SniPolicyScope::ProxyWide,
+            ));
         }
     }
     sources
 }
 
+/// Effective `h2UpgradePolicy` for one policy port, mirroring
+/// [`crate::proxy::resolve_effective_proxy_for_target`] field precedence:
+/// explicit per-port (including `DEFAULT` clearing an inherited value) >
+/// selected-subset/top-level fallback > `Proxy.h2_upgrade_policy`.
+fn effective_h2_upgrade_policy_for_sni(
+    proxy: &Proxy,
+    upstream: Option<&Upstream>,
+    port: Option<u16>,
+) -> Option<H2UpgradePolicy> {
+    let per_port = port.and_then(|policy_port| {
+        proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&policy_port))
+            .and_then(|ovr| ovr.h2_upgrade_policy)
+            .or_else(|| {
+                upstream
+                    .and_then(|u| u.port_overrides.get(&policy_port))
+                    .and_then(|ovr| ovr.h2_upgrade_policy)
+            })
+    });
+    let inherited = proxy
+        .dispatch_port_override_fallback
+        .as_ref()
+        .and_then(|fallback| fallback.h2_upgrade_policy)
+        .or(proxy.h2_upgrade_policy);
+    per_port.or(inherited)
+}
+
+/// Policy ports a proxy-wide backend TLS SNI override can dial through.
+/// Prefer concrete upstream targets so a more-specific per-port
+/// `UPGRADE`/`DEFAULT` clearing an inherited `DO_NOT_UPGRADE` does not
+/// false-reject when no selectable target still inherits force-H1.
+fn policy_ports_for_proxy_wide_sni(proxy: &Proxy, upstream: Option<&Upstream>) -> Vec<u16> {
+    if let Some(upstream) = upstream
+        && !upstream.targets.is_empty()
+    {
+        let mut ports: Vec<u16> = upstream
+            .targets
+            .iter()
+            .filter(|target| {
+                upstream_target_selected_by_subset(
+                    upstream,
+                    proxy.upstream_subset.as_deref(),
+                    target,
+                )
+            })
+            .map(UpstreamTarget::dispatch_policy_port)
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        return ports;
+    }
+    let mut ports = Vec::new();
+    if let Some(overrides) = proxy.dispatch_port_overrides.as_ref() {
+        ports.extend(overrides.keys().copied());
+    } else if let Some(upstream) = upstream {
+        ports.extend(upstream.port_overrides.keys().copied());
+    }
+    if ports.is_empty() {
+        ports.push(proxy.backend_port);
+    } else {
+        ports.sort_unstable();
+        ports.dedup();
+    }
+    ports
+}
+
+fn h2_upgrade_policy_forces_http1(policy: Option<H2UpgradePolicy>) -> bool {
+    matches!(policy, Some(H2UpgradePolicy::DoNotUpgrade))
+}
+
+/// Whether the effective `h2UpgradePolicy` for this SNI scope forces HTTP/1.1
+/// and therefore makes the direct-H2 SNI route impossible.
+fn sni_scope_conflicts_with_h2_upgrade_policy(
+    proxy: &Proxy,
+    upstream: Option<&Upstream>,
+    scope: SniPolicyScope,
+) -> bool {
+    match scope {
+        SniPolicyScope::Port(port) => h2_upgrade_policy_forces_http1(
+            effective_h2_upgrade_policy_for_sni(proxy, upstream, Some(port)),
+        ),
+        SniPolicyScope::ProxyWide => {
+            let ports = policy_ports_for_proxy_wide_sni(proxy, upstream);
+            ports.iter().any(|port| {
+                h2_upgrade_policy_forces_http1(effective_h2_upgrade_policy_for_sni(
+                    proxy,
+                    upstream,
+                    Some(*port),
+                ))
+            })
+        }
+    }
+}
+
+/// Build a throwaway proxy for backend-TLS-SNI / direct-H2 admission against
+/// one exact `(upstream, selected_subset)` destination. Projects the same
+/// dispatch-port / subset HTTP fallback and resolved TLS the runtime uses
+/// before the SNI gate, and installs the effective retry for that destination.
+pub(crate) fn proxy_for_sni_direct_h2_admission(
+    proxy: &Proxy,
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+    effective_retry: Option<RetryConfig>,
+) -> Proxy {
+    let mut admission = proxy_with_resolved_port_caps(proxy, upstream, selected_subset);
+    admission.upstream_subset = selected_subset.map(str::to_owned);
+    admission.retry = effective_retry;
+    admission.resolved_tls = BackendTlsConfig::from_upstream(upstream);
+    if let Some(subset_name) = selected_subset
+        && let Some(subset_tls) = upstream
+            .resolved_subset_tls
+            .get(subset_name)
+            .and_then(|resolved| resolved.tls.clone())
+    {
+        admission.resolved_tls = subset_tls;
+    }
+    admission.dispatch_kind = DispatchKind::from(admission.effective_scheme());
+    admission
+}
+
 /// Reject plain-HTTPS proxies whose backend TLS SNI override cannot dispatch
 /// on the direct-H2 pool (retry body replay, request-body buffering plugins,
-/// or `pool_enable_http2: false`). Covers proxy-level and DestinationRule
-/// per-port TLS overlays so `validate` catches guaranteed total outages.
+/// `pool_enable_http2: false`, or effective `h2UpgradePolicy: DO_NOT_UPGRADE`).
+/// Covers proxy-level and DestinationRule per-port TLS overlays so `validate`
+/// catches guaranteed total outages.
+///
+/// Effective `h2UpgradePolicy` mirrors
+/// [`crate::proxy::resolve_effective_proxy_for_target`]: explicit per-port >
+/// selected subset > top-level. Only scopes whose effective policy forces H1
+/// are rejected; a more-specific `UPGRADE`/`DEFAULT` port is not false-rejected
+/// by an inherited `DO_NOT_UPGRADE`.
 ///
 /// The buffering leg is derived from the runtime
 /// [`crate::plugins::Plugin::requires_request_body_buffering`] answer of a
@@ -3188,7 +3435,7 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
     }
     let sni_desc = sources
         .iter()
-        .map(|(sni, source)| format!("'{sni}' ({source})"))
+        .map(|(sni, source, _)| format!("'{sni}' ({source})"))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -3197,6 +3444,20 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
         errors.push(format!(
             "Proxy '{}' sets backend TLS SNI override ({sni_desc}) but pool_enable_http2 is false; \
              plain HTTPS SNI overrides require the direct HTTP/2 backend pool",
+            proxy.id
+        ));
+    }
+    let h2_policy_conflict_desc = sources
+        .iter()
+        .filter(|(_, _, scope)| sni_scope_conflicts_with_h2_upgrade_policy(proxy, upstream, *scope))
+        .map(|(sni, source, _)| format!("'{sni}' ({source})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !h2_policy_conflict_desc.is_empty() {
+        errors.push(format!(
+            "Proxy '{}' sets backend TLS SNI override ({h2_policy_conflict_desc}) but \
+             h2UpgradePolicy is DO_NOT_UPGRADE; plain HTTPS SNI overrides require the \
+             direct HTTP/2 backend pool",
             proxy.id
         ));
     }
@@ -3742,18 +4003,15 @@ impl GatewayConfig {
             .filter(|(_, m)| !m.is_empty())
             .collect();
 
-        // Service-discovery top-level `connectionPool.http` fallback, applied by
-        // the LB-selected port at dispatch when that port has no explicit
-        // per-port override. Keyed by (namespace, upstream id), separate from
-        // the per-port map above so an explicit `portLevelSettings` entry
-        // still wins.
-        let fallback_by_upstream: HashMap<(&str, &str), ResolvedPortOverride> = self
+        // Inherited top-level `connectionPool.http` fallback. The three fields
+        // supported at subset scope are overlaid per proxy via the shared
+        // selected-subset helper so admission and runtime stay aligned. The
+        // per-port map stays separate and is consulted first at dispatch,
+        // preserving port > subset > top-level.
+        let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
             .upstreams
             .iter()
-            .filter_map(|u| {
-                dispatch_port_override_fallback_from_upstream(u)
-                    .map(|resolved| ((u.namespace.as_str(), u.id.as_str()), resolved))
-            })
+            .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
             .collect();
 
         for proxy in &mut self.proxies {
@@ -3762,8 +4020,14 @@ impl GatewayConfig {
                 .as_deref()
                 .map(|uid| (proxy.namespace.as_str(), uid));
             proxy.dispatch_port_overrides = key.and_then(|key| by_upstream.get(&key)).cloned();
-            proxy.dispatch_port_override_fallback =
-                key.and_then(|key| fallback_by_upstream.get(&key)).cloned();
+            proxy.dispatch_port_override_fallback = key.and_then(|key| {
+                upstream_by_key.get(&key).and_then(|upstream| {
+                    dispatch_port_override_fallback_for_selected_subset(
+                        upstream,
+                        proxy.upstream_subset.as_deref(),
+                    )
+                })
+            });
         }
     }
 
@@ -4242,8 +4506,9 @@ impl GatewayConfig {
     ///
     /// Plain-HTTPS proxies with a backend TLS SNI override are likewise screened
     /// for combinations that cannot use the direct-H2 pool (effective retry,
-    /// request-body-buffering plugins, `pool_enable_http2: false`), including
-    /// DestinationRule per-port TLS overlays (issue #2954).
+    /// request-body-buffering plugins, `pool_enable_http2: false`, effective
+    /// `h2UpgradePolicy: DO_NOT_UPGRADE`), including DestinationRule per-port
+    /// TLS overlays and `mesh_route_dispatch` override destinations (issue #2954).
     pub fn validate_upstream_references(&self) -> Result<(), Vec<String>> {
         // Upstream references are namespace-local. A bare-id index would accept
         // a dangling same-namespace reference whenever another tenant owns
@@ -4283,8 +4548,8 @@ impl GatewayConfig {
 
             // Backend TLS SNI on plain HTTPS requires direct-H2; reject
             // combinations that cannot dispatch (retry / body-buffering /
-            // pool_enable_http2=false), including DestinationRule per-port
-            // TLS overlays projected onto this proxy.
+            // pool_enable_http2=false / effective DO_NOT_UPGRADE), including
+            // DestinationRule per-port TLS overlays projected onto this proxy.
             let upstream = proxy.upstream_id.as_deref().and_then(|uid| {
                 upstreams_by_key
                     .get(&(proxy.namespace.as_str(), uid))
@@ -6259,6 +6524,13 @@ impl SharedProtobufDescriptorLoadError {
         match self {
             Self::Unavailable => "ai_response_guard: failed to read protobuf descriptor file",
             Self::Invalid => "ai_response_guard: failed to parse protobuf descriptor",
+        }
+    }
+
+    fn ai_transcript_audit_message(self) -> &'static str {
+        match self {
+            Self::Unavailable => "ai_transcript_audit: failed to read protobuf descriptor file",
+            Self::Invalid => "ai_transcript_audit: failed to parse protobuf descriptor",
         }
     }
 }
@@ -8253,8 +8525,8 @@ impl Upstream {
     /// Reject mesh-PROJECTED fields that an OPERATOR must not set directly.
     ///
     /// `port_overrides`, `source_locality`, `source_labels`, `locality_lb_strict`,
-    /// `locality_lb_setting`, and the `tls`, `connect_timeout_ms`, and
-    /// `passive_health_check` fields nested under `subsets[].traffic_policy` are
+    /// `locality_lb_setting`, and the mesh-derived fields nested under
+    /// `subsets[].traffic_policy` are
     /// all populated by the mesh slice-apply layer (from DestinationRules / the
     /// workload locality / labels / `FERRUM_MESH_LOCALITY_LB_STRICT`), NOT by operators.
     /// The top-level projected fields are not persisted by the SQL / MongoDB
@@ -8345,6 +8617,20 @@ impl Upstream {
                          DestinationRule and cannot be set directly via the admin API — express \
                          subset connection-pool policy as a DestinationRule"
                     ));
+                }
+                for (field, configured) in [
+                    ("h2_upgrade_policy", policy.h2_upgrade_policy.is_some()),
+                    ("max_retries", policy.max_retries.is_some()),
+                    (
+                        "http1_max_pending_requests",
+                        policy.http1_max_pending_requests.is_some(),
+                    ),
+                ] {
+                    if configured {
+                        errors.push(format!(
+                            "{field_prefix}.{field} is projected from a mesh DestinationRule and cannot be set directly via the admin API — express subset HTTP connection-pool policy as a DestinationRule"
+                        ));
+                    }
                 }
                 if policy.passive_health_check.is_some() {
                     errors.push(format!(
@@ -9203,9 +9489,9 @@ impl GatewayConfig {
     }
 
     /// Validate file dependencies for plugins that reference external files
-    /// (e.g., geo_restriction `.mmdb` databases, `body_validator` and
-    /// `ai_response_guard` protobuf descriptors, and `udp_logging` DTLS
-    /// sources).
+    /// (e.g., geo_restriction `.mmdb` databases, `body_validator`,
+    /// `ai_response_guard`, and `ai_transcript_audit` protobuf descriptors, and
+    /// `udp_logging` DTLS sources).
     ///
     /// This is separate from `validate_all_fields_with_ip_policy()` so that
     /// each mode can handle missing files independently:
@@ -9258,14 +9544,16 @@ impl GatewayConfig {
     ) -> Vec<String> {
         let mut errors = Vec::new();
         let mut validated_paths = std::collections::HashSet::new();
-        // Shared across body_validator and ai_response_guard so a path used by
-        // both families is read and decoded at most once per pass.
+        // Shared across body_validator, ai_response_guard, and
+        // ai_transcript_audit so a path used by multiple families is read and
+        // decoded at most once per pass.
         let mut protobuf_descriptor_cache = std::collections::HashMap::<
             String,
             Result<prost_reflect::DescriptorPool, SharedProtobufDescriptorLoadError>,
         >::new();
         let mut reported_body_validator_path_errors = std::collections::HashSet::new();
         let mut reported_guard_path_errors = std::collections::HashSet::new();
+        let mut reported_transcript_audit_path_errors = std::collections::HashSet::new();
         // Identical enabled UDP DTLS validation inputs share one materialization
         // (provider/file read) per pass; cached errors are still attached to
         // each affected PluginConfig id.
@@ -9345,6 +9633,39 @@ impl GatewayConfig {
                                     "PluginConfig '{}': {}",
                                     pc.id,
                                     error.ai_response_guard_message()
+                                ));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                    }
+                }
+            }
+            if pc.plugin_name == "ai_transcript_audit" {
+                use crate::plugins::ai_transcript_audit as audit;
+                match audit::grpc_descriptor_path(&pc.config) {
+                    Ok(Some(path)) => {
+                        let cached = protobuf_descriptor_cache
+                            .entry(path.clone())
+                            .or_insert_with(|| load_shared_protobuf_descriptor_pool(&path));
+                        match cached {
+                            Ok(pool) => {
+                                if let Err(error) =
+                                    audit::validate_grpc_descriptor_config(&pc.config, pool)
+                                {
+                                    errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                                }
+                            }
+                            Err(error)
+                                if reported_transcript_audit_path_errors.insert(path.clone()) =>
+                            {
+                                errors.push(format!(
+                                    "PluginConfig '{}': {}",
+                                    pc.id,
+                                    error.ai_transcript_audit_message()
                                 ));
                             }
                             Err(_) => {}

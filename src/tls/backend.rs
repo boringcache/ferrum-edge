@@ -689,13 +689,19 @@ impl<'a> BackendTlsConfigBuilder<'a> {
     /// `DO_NOT_UPGRADE` must actually prevent HTTP/2 on a TLS backend, not
     /// merely skip the direct-H2 pool. reqwest's `use_preconfigured_tls`
     /// (`BuiltRustls`) path uses this config's ALPN VERBATIM — the connector
-    /// does NOT re-derive ALPN from reqwest's `http1_only()` for a preconfigured
-    /// config — and reqwest only speaks H2 when the wire-negotiated ALPN is
-    /// `h2`. So for a force-H1 proxy we restrict the advertised ALPN to
-    /// `http/1.1`: the backend can no longer ALPN-select h2. The same
-    /// restriction applies when `pool_enable_http2=false` resolves for this
-    /// proxy; otherwise disabling the direct-H2 pool would still leave reqwest
-    /// free to negotiate h2.
+    /// does NOT re-derive ALPN from reqwest's `http1_only()` / default
+    /// `HttpVersionPref::All` for a preconfigured config — and reqwest only
+    /// speaks H2 when the wire-negotiated ALPN is `h2`. So:
+    ///
+    /// * force-H1 (`DO_NOT_UPGRADE` or `pool_enable_http2=false`) restricts
+    ///   advertised ALPN to `http/1.1` so the backend cannot ALPN-select h2;
+    /// * every other H2-capable client must explicitly advertise
+    ///   `[h2, http/1.1]`. Leaving ALPN empty is NOT "unrestricted": the
+    ///   handshake completes with no negotiated protocol, reqwest stays on
+    ///   HTTP/1.1 against dual-ALPN backends (silently defeating
+    ///   `h2UpgradePolicy: UPGRADE` on the default nonzero body-limit
+    ///   reqwest path), and an H2-only backend hangs until connect timeout
+    ///   then 502s.
     ///
     /// This is reqwest-specific (the shared `build_rustls` is left untouched, so
     /// the direct-H2 and H3/QUIC backend configs keep their own ALPN). The
@@ -705,6 +711,11 @@ impl<'a> BackendTlsConfigBuilder<'a> {
         let mut rustls_config = self.build_rustls()?;
         if self.proxy.forces_backend_http1_only() || !enable_http2 {
             rustls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        } else {
+            // Match reqwest's non-preconfigured `HttpVersionPref::All` ALPN and
+            // the direct-H2 pool's offer so Upgrade/default clients can actually
+            // negotiate h2 on the BuiltRustls path.
+            rustls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         }
         Ok(rustls_config)
     }
@@ -1404,18 +1415,20 @@ mod tests {
 
         // codex round-1 Finding 1: a `DO_NOT_UPGRADE` proxy's reqwest rustls
         // config must advertise ONLY `http/1.1` so a TLS backend cannot
-        // ALPN-negotiate h2. The default (probe-driven) config leaves ALPN
-        // unrestricted (reqwest's preconfigured-rustls path uses it verbatim).
+        // ALPN-negotiate h2. BuiltRustls uses ALPN verbatim, so the H2-capable
+        // client must explicitly offer `[h2, http/1.1]` — empty is not
+        // "unrestricted" and cannot negotiate h2 (subset Upgrade H2-only
+        // fixture 502 / silent H1 on dual-ALPN backends).
         let mut proxy = test_proxy();
+        let h2_capable_alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-        // Default proxy: ALPN not restricted to http/1.1-only.
+        // Default proxy: advertise h2 + http/1.1 so reqwest can negotiate H2.
         let default_cfg = builder_for(&proxy, None, false, None, None, &[])
             .build_rustls_for_reqwest(true)
             .expect("build default reqwest rustls config");
-        assert_ne!(
-            default_cfg.alpn_protocols,
-            vec![b"http/1.1".to_vec()],
-            "default proxy must NOT be force-restricted to http/1.1 ALPN"
+        assert_eq!(
+            default_cfg.alpn_protocols, h2_capable_alpn,
+            "default H2-capable reqwest client must advertise [h2, http/1.1]"
         );
 
         // DO_NOT_UPGRADE proxy: ALPN restricted to http/1.1 only.
@@ -1430,16 +1443,15 @@ mod tests {
              backend cannot ALPN-negotiate h2"
         );
 
-        // Upgrade / Default are probe-driven — not force-restricted.
+        // Upgrade / Default must keep the H2-capable ALPN offer.
         for probe_driven in [H2UpgradePolicy::Upgrade, H2UpgradePolicy::Default] {
             proxy.h2_upgrade_policy = Some(probe_driven);
             let cfg = builder_for(&proxy, None, false, None, None, &[])
                 .build_rustls_for_reqwest(true)
                 .expect("build probe-driven reqwest rustls config");
-            assert_ne!(
-                cfg.alpn_protocols,
-                vec![b"http/1.1".to_vec()],
-                "{probe_driven:?} must not force http/1.1-only ALPN"
+            assert_eq!(
+                cfg.alpn_protocols, h2_capable_alpn,
+                "{probe_driven:?} must advertise [h2, http/1.1] on BuiltRustls"
             );
         }
 
