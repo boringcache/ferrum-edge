@@ -87,10 +87,10 @@ fn backend_lb_policy_cookie_affinity_selects_stable_target_on_lb_path() {
             ]
         }),
     );
-    endpoints.metadata.labels.insert(
-        "kubernetes.io/service-name".to_string(),
-        "api".to_string(),
-    );
+    endpoints
+        .metadata
+        .labels
+        .insert("kubernetes.io/service-name".to_string(), "api".to_string());
     let route = object(
         "HTTPRoute",
         "gateway.networking.k8s.io/v1",

@@ -1252,10 +1252,7 @@ pub struct HashOnCookieConfig {
     pub ttl_seconds: u64,
     /// When true, omit `Max-Age` so the cookie is a browser session cookie
     /// (Gateway API `sessionPersistence.cookieConfig.lifetimeType: Session`).
-    #[serde(
-        default,
-        skip_serializing_if = "std::ops::Not::not"
-    )]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_cookie: bool,
     /// Optional `Domain` attribute.
     #[serde(default, skip_serializing_if = "Option::is_none")]

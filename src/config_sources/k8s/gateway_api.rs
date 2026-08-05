@@ -14,8 +14,8 @@ use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerPolicy,
     GatewayApiListenerValidationError, GatewayApiNamespaceSelector,
     GatewayApiNamespaceSelectorExpression, GatewayApiNamespaceSelectorOperator,
-    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewaySessionPersistence,
-    K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslationOptions,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewaySessionPersistence, K8sAccumulator,
+    K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslationOptions,
     MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
     attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
     mesh_route_dispatch_plugin_from_rules, namespaced_resource_key, optional_port_field,
@@ -220,7 +220,10 @@ pub(super) fn collect_backend_lb_policy(
         .get("targetRefs")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            invalid_resource(object, "spec.targetRefs is required and must be a non-empty array")
+            invalid_resource(
+                object,
+                "spec.targetRefs is required and must be a non-empty array",
+            )
         })?;
     if target_refs.is_empty() {
         return Err(invalid_resource(
@@ -234,10 +237,7 @@ pub(super) fn collect_backend_lb_policy(
         let kind = string_field(target, "kind").unwrap_or("Service");
         let group = string_field(target, "group").unwrap_or("");
         let name = string_field(target, "name").ok_or_else(|| {
-            invalid_resource(
-                object,
-                format!("spec.targetRefs[{index}].name is required"),
-            )
+            invalid_resource(object, format!("spec.targetRefs[{index}].name is required"))
         })?;
         if kind != "Service" || !group.is_empty() {
             return Err(invalid_resource(
@@ -276,9 +276,7 @@ pub(super) fn collect_backend_lb_policy(
                     "{} {}/{} sessionPersistence.absoluteTimeout on Session \
                      cookies is not gateway-enforced; emitting a browser \
                      session cookie without Max-Age",
-                    object.kind,
-                    object.metadata.namespace,
-                    object.metadata.name
+                    object.kind, object.metadata.namespace, object.metadata.name
                 ));
             }
             Some(parsed)
@@ -349,10 +347,7 @@ fn backend_policy_is_preferred(
     candidate: &GatewayBackendSessionPolicy,
     existing: &GatewayBackendSessionPolicy,
 ) -> bool {
-    match (
-        candidate.creation_timestamp,
-        existing.creation_timestamp,
-    ) {
+    match (candidate.creation_timestamp, existing.creation_timestamp) {
         (Some(c), Some(e)) => match c.cmp(&e) {
             Ordering::Less => true,
             Ordering::Greater => false,
@@ -547,10 +542,7 @@ fn resolve_rule_session_persistence(
                                 "backendRefs target Services with conflicting \
                                  BackendLB/XBackendTraffic sessionPersistence \
                                  (Service {}/{} vs Service {}/{})",
-                                prior_key.0,
-                                prior_key.1,
-                                key.0,
-                                key.1
+                                prior_key.0, prior_key.1, key.0, key.1
                             ),
                         ));
                     }
@@ -565,10 +557,7 @@ fn resolve_rule_session_persistence(
                     format!(
                         "backend Service {}/{} has rejected session policy \
                          {}/{}: {message}",
-                        key.0,
-                        key.1,
-                        policy.resource.namespace,
-                        policy.resource.name
+                        key.0, key.1, policy.resource.namespace, policy.resource.name
                     ),
                 ));
             }
@@ -649,9 +638,7 @@ fn validate_backend_lb_policy_for_status(object: &K8sObject) -> Result<(), Strin
         .spec
         .get("targetRefs")
         .and_then(Value::as_array)
-        .ok_or_else(|| {
-            "spec.targetRefs is required and must be a non-empty array".to_string()
-        })?;
+        .ok_or_else(|| "spec.targetRefs is required and must be a non-empty array".to_string())?;
     if target_refs.is_empty() {
         return Err("spec.targetRefs is required and must be a non-empty array".to_string());
     }
@@ -3805,12 +3792,8 @@ fn http_route_resources(
             let request_transform = gateway_request_header_modifier_rules(rule);
             let redirect = gateway_request_redirect_value(object, rule, default_redirect_port)?;
             let backend_resolution = route_backends(object, rule, acc)?;
-            let session_persistence = resolve_rule_session_persistence(
-                object,
-                rule,
-                &backend_resolution.backends,
-                acc,
-            )?;
+            let session_persistence =
+                resolve_rule_session_persistence(object, rule, &backend_resolution.backends, acc)?;
             let backend_ref_fault = backend_resolution.fault_reason.map(|reason| {
                 backend_ref_fault_value_with_percentage(
                     reason,
@@ -3840,9 +3823,7 @@ fn http_route_resources(
                     None,
                     false,
                 )
-            } else if backend_resolution.backends.len() == 1
-                && session_persistence.is_none()
-            {
+            } else if backend_resolution.backends.len() == 1 && session_persistence.is_none() {
                 let Some(backend) = backend_resolution.backends.into_iter().next() else {
                     continue;
                 };
@@ -11463,10 +11444,7 @@ mod tests {
             upstream.algorithm,
             crate::config::types::LoadBalancerAlgorithm::ConsistentHashing
         );
-        assert_eq!(
-            upstream.hash_on.as_deref(),
-            Some("cookie:lb-affinity")
-        );
+        assert_eq!(upstream.hash_on.as_deref(), Some("cookie:lb-affinity"));
         let cookie = upstream
             .hash_on_cookie_config
             .as_ref()
@@ -11545,12 +11523,9 @@ mod tests {
                 }
             }),
         );
-        let err = translate_k8s_objects(&[policy], options())
-            .expect_err("idleTimeout must fail closed");
-        assert!(
-            err.to_string().contains("idleTimeout"),
-            "got: {err}"
-        );
+        let err =
+            translate_k8s_objects(&[policy], options()).expect_err("idleTimeout must fail closed");
+        assert!(err.to_string().contains("idleTimeout"), "got: {err}");
     }
 
     #[test]
@@ -11567,10 +11542,7 @@ mod tests {
         );
         let err = translate_k8s_objects(&[policy], options())
             .expect_err("Permanent without absoluteTimeout must fail");
-        assert!(
-            err.to_string().contains("absoluteTimeout"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("absoluteTimeout"), "got: {err}");
     }
 
     #[test]
@@ -11588,10 +11560,7 @@ mod tests {
         );
         let err = translate_k8s_objects(&[policy], options())
             .expect_err("non-Service targetRef must fail closed");
-        assert!(
-            err.to_string().contains("Service"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("Service"), "got: {err}");
     }
 
     #[test]
@@ -11607,11 +11576,8 @@ mod tests {
             }),
         );
         let route = http_route_to_service("api");
-        let with_policy = translate_k8s_objects(
-            &[policy, route.clone()],
-            options(),
-        )
-        .expect("with policy");
+        let with_policy =
+            translate_k8s_objects(&[policy, route.clone()], options()).expect("with policy");
         assert_eq!(
             with_policy.config.upstreams[0].hash_on.as_deref(),
             Some("cookie:lb-affinity")
@@ -11639,20 +11605,12 @@ mod tests {
             }),
         );
         let route = http_route_to_service("api");
-        let v1 = translate_k8s_objects(&[policy.clone(), route.clone()], options())
-            .expect("v1");
-        assert_eq!(
-            v1.config.upstreams[0].hash_on.as_deref(),
-            Some("cookie:v1")
-        );
+        let v1 = translate_k8s_objects(&[policy.clone(), route.clone()], options()).expect("v1");
+        assert_eq!(v1.config.upstreams[0].hash_on.as_deref(), Some("cookie:v1"));
 
-        policy.spec["sessionPersistence"]["sessionName"] =
-            serde_json::json!("v2");
+        policy.spec["sessionPersistence"]["sessionName"] = serde_json::json!("v2");
         let v2 = translate_k8s_objects(&[policy, route], options()).expect("v2");
-        assert_eq!(
-            v2.config.upstreams[0].hash_on.as_deref(),
-            Some("cookie:v2")
-        );
+        assert_eq!(v2.config.upstreams[0].hash_on.as_deref(), Some("cookie:v2"));
     }
 
     #[test]
@@ -11697,7 +11655,10 @@ mod tests {
         let result = translate_k8s_objects(&[policy, http_route_to_service("api")], options())
             .expect("retryConstraint alone must not block sessionPersistence");
         assert!(
-            result.warnings.iter().any(|w| w.contains("retryConstraint")),
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("retryConstraint")),
             "expected retryConstraint warning, got {:?}",
             result.warnings
         );
