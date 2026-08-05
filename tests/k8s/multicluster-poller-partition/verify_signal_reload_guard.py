@@ -80,12 +80,18 @@ def fail(message: str) -> None:
     raise GuardFailure(message)
 
 
-def extract_signal_reload_inner(text: str) -> str:
+def extract_signal_reload_block(text: str) -> str:
     start = text.find("signal_reload()")
     if start < 0:
         fail("signal_reload() is missing")
-    block = text[start:]
-    match = INNER_SCRIPT_RE.search(block)
+    end = text.find("deploy_topology()", start)
+    if end < 0:
+        fail("deploy_topology() boundary after signal_reload() is missing")
+    return text[start:end]
+
+
+def extract_signal_reload_inner(function_block: str) -> str:
+    match = INNER_SCRIPT_RE.search(function_block)
     if match is None:
         fail("signal_reload inner sh -eu -c script is missing")
     return match.group(1).replace("''", "'")
@@ -108,9 +114,8 @@ def verify_inner(inner: str, function_block: str) -> None:
 
 def verify_run_sh(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
-    start = text.find("signal_reload()")
-    function_block = text[start:text.find("deploy_topology()", start)]
-    verify_inner(extract_signal_reload_inner(text), function_block)
+    function_block = extract_signal_reload_block(text)
+    verify_inner(extract_signal_reload_inner(function_block), function_block)
 
 
 def self_test() -> None:
@@ -119,6 +124,7 @@ def self_test() -> None:
         "  kubectl exec pod/foo -c signal -- sh -eu -c '\n"
         + GOOD_INNER
         + "  '\n}\n"
+        + "deploy_topology() { :; }\n"
     )
     verify_run_sh_from_text(good)
 
@@ -167,6 +173,16 @@ def self_test() -> None:
     if not rejects(bad_cmdline_source):
         fail("self-test: argv parsing must read the process cmdline")
 
+    bad_late_script = (
+        "signal_reload() { :; }\n"
+        "deploy_topology() {\n"
+        "  sh -eu -c '\n"
+        + GOOD_INNER
+        + "  '\n}\n"
+    )
+    if not rejects(bad_late_script):
+        fail("self-test: a later shell block must not satisfy signal_reload")
+
 
 def rejects(text: str) -> bool:
     try:
@@ -177,9 +193,8 @@ def rejects(text: str) -> bool:
 
 
 def verify_run_sh_from_text(text: str) -> None:
-    start = text.find("signal_reload()")
-    function_block = text[start:]
-    verify_inner(extract_signal_reload_inner(text), function_block)
+    function_block = extract_signal_reload_block(text)
+    verify_inner(extract_signal_reload_inner(function_block), function_block)
 
 
 def main(argv: list[str]) -> int:
