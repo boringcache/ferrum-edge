@@ -61,6 +61,7 @@ pub mod config_builder;
 pub mod echo_servers;
 pub mod gateway_harness;
 pub mod hmac_helpers;
+pub mod isolated_audit_fallback;
 pub mod protocol_managed_response_headers;
 
 pub use backend_availability::{
@@ -86,3 +87,4 @@ pub use hmac_helpers::{
     empty_digest_header, generate_hmac_signature, generate_hmac_signature_with_digest,
     generate_hmac_signature_with_query, hmac_authority_from_url,
 };
+pub use isolated_audit_fallback::isolated_audit_fallback_dir;
