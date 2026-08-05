@@ -2762,10 +2762,10 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
     // so a schema-only key can never be accepted by the spec and rejected at
     // load (and vice versa).
     let mut published_streaming_keys: Vec<String> = streaming["properties"]
-        .as_mapping()
-        .expect("streaming properties must be a mapping")
+        .as_object()
+        .expect("streaming properties must be an object")
         .keys()
-        .map(|key| key.as_str().unwrap_or_default().to_string())
+        .cloned()
         .collect();
     published_streaming_keys.sort();
     let mut runtime_streaming_keys: Vec<String> =
