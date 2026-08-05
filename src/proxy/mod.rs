@@ -35675,8 +35675,9 @@ async fn proxy_to_backend(
     // Envoy's true pending-queue depth over reqwest. Mirroring how this repo
     // honestly reinterprets DR `maxRetries` as a per-request cap, the knob is
     // reframed as a **max concurrent in-flight HTTP/1.1 requests per
-    // `(host, policy-port)`** cap (measured dispatch → response-headers), shedding
-    // excess with a 503 ("upstream overflow"). Under that framing a streamed
+    // `(host, DestinationRule policy port, selected subset)`** cap (measured
+    // dispatch → response-headers), shedding excess with a 503 ("upstream
+    // overflow"). Under that framing a streamed
     // upload IS legitimately in-flight, so there is NO body-shape exclusion —
     // bodyless GET/HEAD/OPTIONS (where `stream_request_body` is true) are capped
     // too, which is the most common H1 traffic. The connection-failure retry
