@@ -1033,13 +1033,14 @@ async fn grpc_audit_captures_a_method_only_the_backend_effective_path_enrolls() 
 /// for the refuted method.
 ///
 /// The absence is proven by a BARRIER, not a sleep: after the refuted call
-/// completes, a sentinel call is driven through the transition-IN proxy on the
-/// same gateway. Both instances are global, so both share one sink, and that
-/// sink is a single FIFO queue drained by one worker that awaits each flush
-/// before starting the next (`batch_size: 1` makes every record its own
-/// awaited delivery). A record captured during the refuted call would therefore
-/// be delivered STRICTLY BEFORE the sentinel's. Observing the sentinel as the
-/// first and only record is positive proof the refuted call captured nothing.
+/// completes, a sentinel call is driven through the enrolling proxy on the same
+/// gateway. The audit policy is global-scoped, so both proxies run the SAME
+/// instance and therefore the same sink — a single FIFO queue drained by one
+/// worker that awaits each flush before starting the next (`batch_size: 1`
+/// makes every record its own awaited delivery). A record captured during the
+/// refuted call would therefore be delivered STRICTLY BEFORE the sentinel's, so
+/// observing the sentinel as the first and only record is positive proof the
+/// refuted call captured nothing.
 #[tokio::test]
 #[ignore]
 async fn grpc_audit_discards_a_candidate_the_backend_effective_method_refutes() {
