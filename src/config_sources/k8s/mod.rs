@@ -842,10 +842,8 @@ impl K8sAccumulator {
         let conflicted_policies = self.backend_tls_policies.conflicted_policy_ids();
         for status in &mut self.backend_tls_policy_statuses {
             if status.accepted
-                && conflicted_policies.contains(&(
-                    status.policy.namespace.clone(),
-                    status.policy.name.clone(),
-                ))
+                && conflicted_policies
+                    .contains(&(status.policy.namespace.clone(), status.policy.name.clone()))
             {
                 status.accepted = false;
                 status.accepted_reason = "Conflicted".to_string();

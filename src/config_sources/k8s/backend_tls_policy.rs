@@ -228,7 +228,9 @@ pub(super) fn collect(
     let parsed = if target_refs.len() > MAX_SUPPORTED_TARGET_REFS {
         Err(BackendTlsPolicyError::invalid(format!(
             "spec.targetRefs must contain exactly one entry (received {}); Ferrum follows Gateway API v1.5.1 guidance and does not support multi-target BackendTLSPolicy status",
-            target_refs.len().min(MAX_ADMITTED_TARGET_REFS.saturating_add(1))
+            target_refs
+                .len()
+                .min(MAX_ADMITTED_TARGET_REFS.saturating_add(1))
         )))
     } else {
         match object.spec.get("options") {
@@ -490,14 +492,12 @@ fn parse_service_target_ref(
             "spec.targetRefs[] supports only core Service targets",
         ));
     }
-    if let Some(namespace) = strict_optional_string(
-        target_ref,
-        "namespace",
-        "spec.targetRefs[].namespace",
-    )
-    .map_err(|error| {
-        BackendTlsPolicyError::of(BackendTlsPolicyRejection::RefNotPermitted, error.message)
-    })?
+    if let Some(namespace) =
+        strict_optional_string(target_ref, "namespace", "spec.targetRefs[].namespace").map_err(
+            |error| {
+                BackendTlsPolicyError::of(BackendTlsPolicyRejection::RefNotPermitted, error.message)
+            },
+        )?
         && namespace != object.metadata.namespace
     {
         return Err(BackendTlsPolicyError::of(
@@ -508,23 +508,18 @@ fn parse_service_target_ref(
     let name = strict_optional_string(target_ref, "name", "spec.targetRefs[].name")?
         .filter(|name| !name.is_empty())
         .ok_or_else(|| {
-            BackendTlsPolicyError::invalid(
-                "spec.targetRefs[].name is required for Service targets",
-            )
+            BackendTlsPolicyError::invalid("spec.targetRefs[].name is required for Service targets")
         })?;
-    let section_name = match strict_optional_string(
-        target_ref,
-        "sectionName",
-        "spec.targetRefs[].sectionName",
-    )? {
-        Some("") => {
-            return Err(BackendTlsPolicyError::invalid(
-                "spec.targetRefs[].sectionName must not be empty when present",
-            ));
-        }
-        Some(section_name) => Some(section_name.to_string()),
-        None => None,
-    };
+    let section_name =
+        match strict_optional_string(target_ref, "sectionName", "spec.targetRefs[].sectionName")? {
+            Some("") => {
+                return Err(BackendTlsPolicyError::invalid(
+                    "spec.targetRefs[].sectionName must not be empty when present",
+                ));
+            }
+            Some(section_name) => Some(section_name.to_string()),
+            None => None,
+        };
     Ok((name.to_string(), section_name))
 }
 
@@ -564,11 +559,7 @@ fn parse_validation(
             "spec.validation must be an object",
         ));
     }
-    let hostname = strict_optional_string(
-        validation,
-        "hostname",
-        "spec.validation.hostname",
-    )?
+    let hostname = strict_optional_string(validation, "hostname", "spec.validation.hostname")?
         .filter(|hostname| !hostname.is_empty())
         .ok_or_else(|| BackendTlsPolicyError::invalid("spec.validation.hostname is required"))?;
     validate_backend_tls_sni(hostname)
@@ -707,8 +698,7 @@ fn resolve_ca_certificate_ref(
     )
     .map_err(|error| {
         BackendTlsPolicyError::of(BackendTlsPolicyRejection::RefNotPermitted, error.message)
-    })?
-        && namespace != object.metadata.namespace
+    })? && namespace != object.metadata.namespace
     {
         return Err(BackendTlsPolicyError::of(
             BackendTlsPolicyRejection::RefNotPermitted,
@@ -781,23 +771,23 @@ fn parse_subject_alt_names(validation: &Value) -> Result<Vec<String>, BackendTls
                 "hostname",
                 &format!("spec.validation.subjectAltNames[{index}].hostname"),
             )?
-                .ok_or_else(|| {
-                    BackendTlsPolicyError::invalid(format!(
-                        "spec.validation.subjectAltNames[{index}].hostname is required"
-                    ))
-                })?
-                .to_string(),
+            .ok_or_else(|| {
+                BackendTlsPolicyError::invalid(format!(
+                    "spec.validation.subjectAltNames[{index}].hostname is required"
+                ))
+            })?
+            .to_string(),
             "URI" => strict_optional_string(
                 entry,
                 "uri",
                 &format!("spec.validation.subjectAltNames[{index}].uri"),
             )?
-                .ok_or_else(|| {
-                    BackendTlsPolicyError::invalid(format!(
-                        "spec.validation.subjectAltNames[{index}].uri is required"
-                    ))
-                })?
-                .to_string(),
+            .ok_or_else(|| {
+                BackendTlsPolicyError::invalid(format!(
+                    "spec.validation.subjectAltNames[{index}].uri is required"
+                ))
+            })?
+            .to_string(),
             other => {
                 return Err(BackendTlsPolicyError::invalid(format!(
                     "spec.validation.subjectAltNames[{index}].type '{other}' is unsupported"

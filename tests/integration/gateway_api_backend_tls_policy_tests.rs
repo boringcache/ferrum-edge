@@ -860,11 +860,13 @@ fn backend_tls_policy_status_marks_precedence_loser_conflicted() {
         "runtime and status must use the same oldest-policy winner"
     );
 
-    let newer_update =
-        policy_status_update(&objects, "b-newer").expect("loser status update");
+    let newer_update = policy_status_update(&objects, "b-newer").expect("loser status update");
     let newer_ancestors = ferrum_ancestors(&newer_update);
     let accepted = condition(&newer_ancestors[0], "Accepted");
-    assert_eq!(accepted.get("status").and_then(Value::as_str), Some("False"));
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("False")
+    );
     assert_eq!(
         accepted.get("reason").and_then(Value::as_str),
         Some("Conflicted")
@@ -1000,8 +1002,7 @@ fn backend_tls_policy_status_never_exceeds_sixteen_ancestors() {
         gateway.metadata.name = gateway_name.clone();
         let mut route = http_route(&format!("route-{index:02}"), "reviews", 8080);
         route.spec["parentRefs"][0]["name"] = serde_json::json!(gateway_name);
-        route.spec["hostnames"][0] =
-            serde_json::json!(format!("reviews-{index:02}.example.com"));
+        route.spec["hostnames"][0] = serde_json::json!(format!("reviews-{index:02}.example.com"));
         objects.push(gateway);
         objects.push(route);
     }
