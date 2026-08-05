@@ -78,23 +78,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the data plane can distinguish an admitted root-tier DestinationRule from one
   declared in an arbitrary namespace and **refuse** the latter at
   materialization. This closes the reverse-translated xDS path, where
-  carrier-recovered rules never pass slice admission. A producer that carries no
-  root namespace keeps the earlier permissive bucketing rather than refusing a
-  rule it has no evidence to classify.
+  carrier-recovered rules never pass slice admission. Missing, empty, or
+  whitespace-only root provenance fails closed: Unscoped rules are refused,
+  independently provable client/service tiers still apply, and a legitimate
+  root-tier default is unavailable rather than guessed. Blank root carriers are
+  ignored so they cannot clear trustworthy provenance.
 
 - That materialization-time refusal now resolves the matched destination host's
   owning namespace with the SAME shared helper, in the same precedence order,
   that slice admission uses — `.svc`-qualified syntax, then an
   inventory-confirmed two-label `name.namespace`, then the declaring
-  `ServiceEntry` — instead of reading `.svc` syntax alone and otherwise falling
-  back to the namespace of the upstream carrying the host. An external host
-  pins no namespace in its own syntax, and a `ServiceEntry`-derived
-  EgressGateway upstream is stamped with the gateway's own namespace (not the
-  declaring ServiceEntry's, and not an operator choice), so previously the
-  control plane admitted an owner-authored `trafficPolicy` at the service tier
-  and the data plane refused the same rule, silently discarding TLS
-  origination, outlier detection, and the connect timeout on the egress
-  upstream.
+  `ServiceEntry`. When that owner is resolved it is authoritative for the
+  service tier; an upstream container namespace cannot widen it. Upstream
+  namespace is retained only as a narrow fallback when host ownership cannot be
+  resolved (for example a ServiceEntry-derived EgressGateway upstream whose
+  external host is owned by the visible ServiceEntry). This prevents an
+  operator-authored or multi-target upstream in an unrelated namespace from
+  manufacturing service-tier policy for a host owned elsewhere.
 
 - DestinationRule lookup-tier arbitration on the data plane is now per
   destination HOST rather than per upstream, matching Istio's per-host
@@ -107,6 +107,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared visibility evaluator deliberately never reinterprets padded input and
   ACK-time validation checks a trimmed copy, so an un-normalized `[" beta "]`
   was previously ACKed and then matched nothing.
+- `ai_semantic_firewall` streamed `inspect` mode now accepts
+  `streaming.window: tokens` with an explicitly selected bounded tokenizer
+  (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft
+  `max_window_tokens` / `overlap_tokens` budgets, and deterministic
+  complete-token cuts under the existing `max_window_bytes` memory/CPU cap
+  (issue #3302). Invalid or non-token-window uses of the new fields fail closed
+  with field-specific diagnostics; OpenAPI and `docs/plugins.md` stay in parity.
 - VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
   compile onto a shared precomputed `Proxy.stream_match` carrier and are
