@@ -2516,23 +2516,26 @@ fn build_health_check_client_with_tls(
     // failure, not the input.
     match (cert_path, key_path) {
         (Some(cert_path), Some(key_path)) => {
-            let material = load_probe_tls_material(
-                cert_path,
-                MaterialKind::Cert,
-                "Health check client cert",
-            )
-            .and_then(|cert_data| {
-                load_probe_tls_material(key_path, MaterialKind::Key, "Health check client key")
-                    .map(|key_data| (cert_data, key_data))
-            })
-            .and_then(|(cert_data, key_data)| {
-                let mut combined = cert_data;
-                combined.extend_from_slice(b"\n");
-                combined.extend_from_slice(&key_data);
-                reqwest::Identity::from_pem(&combined).map_err(|e| {
-                    format!("Health check client identity: failed to parse cert/key pair: {e}")
-                })
-            });
+            let material =
+                load_probe_tls_material(cert_path, MaterialKind::Cert, "Health check client cert")
+                    .and_then(|cert_data| {
+                        load_probe_tls_material(
+                            key_path,
+                            MaterialKind::Key,
+                            "Health check client key",
+                        )
+                        .map(|key_data| (cert_data, key_data))
+                    })
+                    .and_then(|(cert_data, key_data)| {
+                        let mut combined = cert_data;
+                        combined.extend_from_slice(b"\n");
+                        combined.extend_from_slice(&key_data);
+                        reqwest::Identity::from_pem(&combined).map_err(|e| {
+                            format!(
+                                "Health check client identity: failed to parse cert/key pair: {e}"
+                            )
+                        })
+                    });
             match material {
                 Ok(identity) => {
                     builder = builder.identity(identity);

@@ -728,7 +728,9 @@ impl TestGatewayBuilder {
     /// THIS child reported a listener bind that failed because the address was
     /// already in use.
     pub async fn spawn_classified(mut self) -> Result<TestGateway, GatewaySpawnFailure> {
-        if self.auto_build && let Err(error) = ensure_gateway_built() {
+        if self.auto_build
+            && let Err(error) = ensure_gateway_built()
+        {
             return GatewaySpawnFailure::from_detail(error.to_string());
         }
         match self.try_spawn().await {

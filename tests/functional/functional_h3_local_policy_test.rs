@@ -149,10 +149,7 @@ async fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_stre
         .expect("start h3 backend-SNI gateway");
 
     let client = Http3Client::insecure().expect("h3 client");
-    let url = format!(
-        "https://localhost:{}/h3-sni-stream/sni",
-        gateway.https_port
-    );
+    let url = format!("https://localhost:{}/h3-sni-stream/sni", gateway.https_port);
     let resp = client
         .post_bytes(&url, b"streamed-request-body".to_vec())
         .await
