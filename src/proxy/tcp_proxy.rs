@@ -4539,8 +4539,11 @@ mod backend_target_selection_tests {
     #[test]
     fn tcp_retry_call_sites_use_endpoint_lane_exclude_helpers() {
         let src = include_str!("tcp_proxy.rs");
+        // Build the markers from fragments so this source-scanning test cannot
+        // match its own string literal before it reaches the production body.
+        let try_next_marker = concat!("fn try_next", "_target(");
         let try_next = src
-            .split("fn try_next_target(")
+            .split(try_next_marker)
             .nth(1)
             .and_then(|rest| rest.split("\nfn ").next())
             .expect("try_next_target body");
@@ -4557,8 +4560,9 @@ mod backend_target_selection_tests {
         );
         // try_next_enforced_target is the only other retry rotator and must
         // delegate to try_next_target (not open-code a second selection path).
+        let enforced_marker = concat!("fn try_next_enforced", "_target(");
         let enforced = src
-            .split("fn try_next_enforced_target(")
+            .split(enforced_marker)
             .nth(1)
             .and_then(|rest| rest.split("\nfn ").next())
             .expect("try_next_enforced_target body");
@@ -4727,18 +4731,20 @@ mod backend_target_selection_tests {
                     tags: HashMap::new(),
                     locality: None,
                 };
-                let expected = LoadBalancerCache::select_next_target_for_port_excluding_endpoint_lane_from(
-                    &snapshot, "ferrum", "orders", &key, 5432, &exclude, None,
-                )?;
-                let failed_host_key = LoadBalancerCache::select_next_target_for_port_excluding_endpoint_lane_from(
-                    &snapshot,
-                    "ferrum",
-                    "orders",
-                    &initial.target.host,
-                    5432,
-                    &exclude,
-                    None,
-                )?;
+                let expected =
+                    LoadBalancerCache::select_next_target_for_port_excluding_endpoint_lane_from(
+                        &snapshot, "ferrum", "orders", &key, 5432, &exclude, None,
+                    )?;
+                let failed_host_key =
+                    LoadBalancerCache::select_next_target_for_port_excluding_endpoint_lane_from(
+                        &snapshot,
+                        "ferrum",
+                        "orders",
+                        &initial.target.host,
+                        5432,
+                        &exclude,
+                        None,
+                    )?;
                 (expected.host != failed_host_key.host)
                     .then(|| (key, (initial.target.host.clone(), initial.target.port)))
             })
