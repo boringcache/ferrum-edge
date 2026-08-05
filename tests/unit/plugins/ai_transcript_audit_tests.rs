@@ -11338,8 +11338,7 @@ async fn grpc_text_fields_preserve_every_repeated_string_with_indexed_paths() {
     ));
     let response = grpc_frame(&audit_ack_bytes(&dir, "ok"));
     let mut overrides = audit_grpc_overrides(&dir);
-    overrides["grpc"]["methods"]["/audit.Sink/Ingest"]["text_fields"] =
-        json!(["api_keys"]);
+    overrides["grpc"]["methods"]["/audit.Sink/Ingest"]["text_fields"] = json!(["api_keys"]);
 
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
@@ -11368,8 +11367,7 @@ async fn grpc_text_fields_preserve_every_repeated_string_with_indexed_paths() {
         "every selected repeated value needs a collision-free indexed path: {excerpt}"
     );
     assert!(
-        !excerpt.contains("first-selected-secret")
-            && !excerpt.contains("second-selected-secret"),
+        !excerpt.contains("first-selected-secret") && !excerpt.contains("second-selected-secret"),
         "selected sensitive repeated values must remain redacted: {excerpt}"
     );
 }

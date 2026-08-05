@@ -3248,8 +3248,7 @@ impl AiTranscriptAudit {
                         return ShapedBody::omitted(OMIT_REASON_GRPC_SCAN_LIMIT);
                     }
                     for captured in selected {
-                        let exported =
-                            self.export_grpc_string(captured.sensitive, &captured.value);
+                        let exported = self.export_grpc_string(captured.sensitive, &captured.value);
                         fields.insert(captured.path, Value::String(exported));
                     }
                 }
@@ -8077,8 +8076,7 @@ fn collect_text_value(
         ProtobufValue::List(items) => {
             for (index, item) in items.iter().enumerate() {
                 output_path.push(index.to_string());
-                let result =
-                    collect_text_value(item, rest, output_path, sensitive, out, budget);
+                let result = collect_text_value(item, rest, output_path, sensitive, out, budget);
                 output_path.pop();
                 result?;
             }
