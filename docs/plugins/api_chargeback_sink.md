@@ -539,7 +539,22 @@ Claim disposition:
   while no `.rejected.*` sibling exists to clobber, and never with any unlink,
   replacement, release, or accounting against the replaced pathname. Otherwise a
   same-UID actor could suppress the audit trail for permanently rejected rows
-  just by planting a directory.
+  just by planting a directory. That emptiness proof only ever accepts an
+  explicit "absent" answer — a sibling lookup that fails for any other reason
+  (permissions, I/O) leaves it unknown whether evidence is already published and
+  therefore authorizes nothing.
+
+  The admission is not a licence to clobber later either. Both halves of a
+  constructive-only handoff — the `.rejected.ndjson` payload and the
+  `.rejected.meta` record — are published **create-only**: the completed,
+  fsynced temp is linked into place in a single kernel operation that refuses an
+  occupied name, and the temp alias is then dropped by exact node identity so the
+  published file keeps exactly one link. A same-UID peer that takes either name
+  in the window between the authorization check and the publication is refused,
+  never overwritten, and rollback of a create-only publish never unlinks the
+  final. Recovery driven by the exact pinned claim keeps its deliberate
+  replace-and-account behavior, because that claim genuinely owns the derived
+  sibling namespace.
 
 Claim candidates that cannot be pinned at all are isolated rather than allowed
 to abort a replay tick. An artifact that is not a single-linked regular file
@@ -648,9 +663,11 @@ fields are never logged.
   derived from a compressed source never transiently exceeds
   `spool.max_bytes`. A quota refusal removes the temp and restores the
   authoritative source for a later/operator-assisted attempt. The completed
-  temp is fsynced, atomically renamed, and directory-fsynced before the sibling
+  temp is fsynced, atomically published, and directory-fsynced before the sibling
   `.rejected.meta` document is published; only then is the authoritative source
-  removed. The metadata contains the payload filename, byte length, SHA-256,
+  removed. Publication is a replacing rename only when the exact pinned claim
+  authorized it; the constructive-only disposition above publishes create-only
+  instead. The metadata contains the payload filename, byte length, SHA-256,
   aggregate
   `rejected_rows`, safe `outcomes` (`reason`, optional `http_status`, and
   `row_count`), and `quarantined_at_unix`. Rejections are accumulated into a
@@ -662,7 +679,7 @@ fields are never logged.
   original billing rows and must remain access-controlled. If any payload,
   metadata, quota, or source-removal step fails, the original file remains
   replayable. The claim is re-authorized under the namespace lock before opening
-  the handoff, before every payload append, before the payload final rename,
+  the handoff, before every payload append, before the payload publication,
   before metadata publication, and before source removal. Only the exact pinned
   claim authorizes the destructive half, so a missing, substituted, or planted
   pathname can never replace completed evidence merely by colliding with its

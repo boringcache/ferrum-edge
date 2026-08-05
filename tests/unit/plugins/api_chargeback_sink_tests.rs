@@ -3132,6 +3132,11 @@ fn dead_letter_payload_path(source_path: &Path) -> std::path::PathBuf {
     source_path.with_file_name(format!("{name}.rejected.ndjson"))
 }
 
+fn dead_letter_meta_temp_path(source_path: &Path) -> std::path::PathBuf {
+    let name = source_path.file_name().and_then(|n| n.to_str()).unwrap();
+    source_path.with_file_name(format!("{name}.rejected.meta.tmp"))
+}
+
 fn assert_rejected_sidecar(source_path: &Path, expected_status: u16, expected_reason: &str) {
     let meta_path = dead_letter_meta_path(source_path);
     assert!(
@@ -9784,6 +9789,326 @@ fn dead_letter_meta_publish_fails_closed_when_prior_meta_is_a_directory() {
     assert!(
         meta_path.is_dir(),
         "failed meta replace must leave the planted prior meta directory"
+    );
+}
+
+/// Spool manager whose durable-write steps carry one injected fault, over the
+/// same owner identity `test_spool` uses.
+fn faulted_test_spool(temp: &tempfile::TempDir, fault: SpoolFsFault) -> SpoolManager {
+    SpoolManager::for_tests_with_owner_and_faults(
+        spool_settings(temp.path(), 1024 * 1024),
+        &test_owner_spec("node-a"),
+        1,
+        fault,
+    )
+    .unwrap()
+}
+
+/// Claim `source` and replace the claim pathname with a directory.
+///
+/// This is the one state that admits the purely constructive half of a
+/// dead-letter handoff: present, wrong type, and never any honest writer's
+/// artifact. The claim handle is dropped here on purpose — every probe below
+/// re-derives the claim state from the pathname exactly as replay does.
+fn claim_then_plant_directory(spool: &SpoolManager, source: &Path) -> std::path::PathBuf {
+    let claim = spool
+        .hold_replay_claim_for_tests(source)
+        .unwrap()
+        .expect("claim should be acquired");
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+    fs::remove_file(&claim_path).unwrap();
+    fs::create_dir(&claim_path).unwrap();
+    claim_path
+}
+
+#[test]
+fn constructive_dead_letter_publication_completes_without_a_prior_sibling() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-constructive-publish")])
+        .unwrap();
+    let payload_path = dead_letter_payload_path(&source);
+    let meta_path = dead_letter_meta_path(&source);
+    let row = br#"{"event_id":"evt-constructive-publish"}"#;
+    let claim_path = claim_then_plant_directory(&spool, &source);
+
+    let before = spool.cached_stats_for_tests();
+    let published = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect("constructive-only evidence must still publish when no sibling exists");
+    assert_eq!(published, payload_path);
+    assert_eq!(fs::read(&payload_path).unwrap(), row);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(&payload_path).unwrap().nlink(),
+            1,
+            "the create-only publication must drop its temp alias"
+        );
+    }
+    write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
+        .expect("constructive-only metadata must publish when no record exists");
+    let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta["rejected_rows"], 1);
+
+    let after = spool.cached_stats_for_tests();
+    assert_eq!(
+        after.files,
+        before.files.saturating_add(2),
+        "both create-only publications must enter the maintained file gauge"
+    );
+    assert_eq!(
+        after.bytes,
+        before
+            .bytes
+            .saturating_add(row.len() as u64)
+            .saturating_add(fs::metadata(&meta_path).unwrap().len()),
+        "create-only publication accounts exactly the bytes it published"
+    );
+    assert!(
+        claim_path.is_dir(),
+        "the planted claim must never be mutated by a constructive-only handoff"
+    );
+}
+
+#[test]
+fn racing_peer_payload_is_never_clobbered_by_constructive_dead_letter_publication() {
+    use ferrum_edge::plugins::api_chargeback_sink::PEER_OCCUPANT_MARKER;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = faulted_test_spool(&temp, SpoolFsFault::PeerOccupiesFinalBeforePublish);
+    let source = spool
+        .write_events(&[sample_event("evt-peer-wins-payload")])
+        .unwrap();
+    let payload_path = dead_letter_payload_path(&source);
+    let meta_path = dead_letter_meta_path(&source);
+    let row = br#"{"event_id":"evt-peer-wins-payload"}"#;
+    let claim_path = claim_then_plant_directory(&spool, &source);
+
+    // Authorization observes an empty sibling set, and only then does the peer
+    // take the name. A replacing rename would silently destroy it here.
+    let before = spool.cached_stats_for_tests();
+    let error = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect_err("a peer that won the publication race must not be replaced");
+    assert!(
+        error.contains("refusing to replace existing spool artifact"),
+        "unexpected create-only refusal diagnostic: {error}"
+    );
+    assert_eq!(
+        fs::read(&payload_path).unwrap(),
+        PEER_OCCUPANT_MARKER,
+        "the peer's rejected payload must survive byte-for-byte"
+    );
+    assert!(
+        !meta_path.exists(),
+        "a refused payload publication must not leave a metadata record"
+    );
+    assert!(
+        claim_path.is_dir(),
+        "the planted claim must stay untouched by the refused handoff"
+    );
+    assert_eq!(
+        spool.cached_stats_for_tests(),
+        before,
+        "a refused publication must not account for anything"
+    );
+}
+
+#[test]
+fn racing_peer_metadata_is_never_clobbered_by_constructive_dead_letter_publication() {
+    use ferrum_edge::plugins::api_chargeback_sink::PEER_OCCUPANT_MARKER;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = faulted_test_spool(&temp, SpoolFsFault::PeerOccupiesFinalBeforePublish);
+    let source = spool
+        .write_events(&[sample_event("evt-peer-wins-meta")])
+        .unwrap();
+    let payload_path = dead_letter_payload_path(&source);
+    let meta_path = dead_letter_meta_path(&source);
+    let meta_temp = dead_letter_meta_temp_path(&source);
+    let row = br#"{"event_id":"evt-peer-wins-meta"}"#;
+    let claim_path = claim_then_plant_directory(&spool, &source);
+
+    let before = spool.cached_stats_for_tests();
+    let error = write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
+        .expect_err("a peer that won the metadata race must not be replaced");
+    assert!(
+        error.contains("refusing to replace existing spool artifact"),
+        "unexpected create-only metadata refusal diagnostic: {error}"
+    );
+    assert_eq!(
+        fs::read(&meta_path).unwrap(),
+        PEER_OCCUPANT_MARKER,
+        "the peer's rejected metadata must survive byte-for-byte"
+    );
+    assert!(
+        !meta_temp.exists(),
+        "rollback must still remove this attempt's own metadata temp"
+    );
+    assert!(
+        claim_path.is_dir(),
+        "the planted claim must stay untouched by the refused handoff"
+    );
+    assert_eq!(
+        spool.cached_stats_for_tests(),
+        before,
+        "a refused metadata publication must not account for anything"
+    );
+}
+
+#[test]
+fn unreadable_dead_letter_sibling_lookup_fails_closed_instead_of_authorizing() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = faulted_test_spool(&temp, SpoolFsFault::SiblingLookup);
+    let source = spool
+        .write_events(&[sample_event("evt-sibling-lookup-fails")])
+        .unwrap();
+    let payload_path = dead_letter_payload_path(&source);
+    let meta_path = dead_letter_meta_path(&source);
+    let row = br#"{"event_id":"evt-sibling-lookup-fails"}"#;
+    let claim_path = claim_then_plant_directory(&spool, &source);
+
+    // Absence is the authorization input, so only `NotFound` may answer it. A
+    // permission failure leaves it unknown whether evidence is already there.
+    let before = spool.cached_stats_for_tests();
+    let payload_error = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect_err("an unreadable sibling lookup must not authorize publication");
+    assert!(
+        payload_error.contains("failed to lstat existing dead-letter sibling"),
+        "unexpected sibling-lookup diagnostic: {payload_error}"
+    );
+    assert!(
+        !payload_path.exists(),
+        "an unauthorized handoff must publish no payload"
+    );
+
+    let meta_error = write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
+        .expect_err("an unreadable sibling lookup must not authorize metadata publication");
+    assert!(
+        meta_error.contains("failed to lstat existing dead-letter sibling"),
+        "unexpected sibling-lookup metadata diagnostic: {meta_error}"
+    );
+    assert!(
+        !meta_path.exists(),
+        "an unauthorized handoff must publish no metadata record"
+    );
+    assert!(
+        claim_path.is_dir(),
+        "a fail-closed authorization must leave the planted claim untouched"
+    );
+    assert_eq!(
+        spool.cached_stats_for_tests(),
+        before,
+        "a fail-closed authorization must not account for anything"
+    );
+}
+
+#[test]
+fn failed_create_only_dead_letter_publication_leaves_no_partial_artifact() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = faulted_test_spool(&temp, SpoolFsFault::CreateOnlyPublish);
+    let source = spool
+        .write_events(&[sample_event("evt-create-only-fails")])
+        .unwrap();
+    let payload_path = dead_letter_payload_path(&source);
+    let meta_path = dead_letter_meta_path(&source);
+    let payload_temp = spool
+        .write_temp_path_for_tests(&payload_path)
+        .expect("dead-letter payload temp path must resolve");
+    let meta_temp = dead_letter_meta_temp_path(&source);
+    let row = br#"{"event_id":"evt-create-only-fails"}"#;
+    let claim_path = claim_then_plant_directory(&spool, &source);
+
+    let before = spool.cached_stats_for_tests();
+    let payload_error = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect_err("a failed create-only publication must not be reported as durable");
+    assert!(
+        payload_error.contains("injected fault: failed to publish spool temp file"),
+        "unexpected create-only failure diagnostic: {payload_error}"
+    );
+    assert!(!payload_path.exists(), "no final may be left behind");
+    assert!(
+        !payload_temp.exists(),
+        "the payload temp must be rolled back"
+    );
+
+    let meta_error = write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
+        .expect_err("a failed create-only metadata publication must not be reported as durable");
+    assert!(
+        meta_error.contains("injected fault: failed to publish spool temp file"),
+        "unexpected create-only metadata failure diagnostic: {meta_error}"
+    );
+    assert!(!meta_path.exists(), "no metadata final may be left behind");
+    assert!(!meta_temp.exists(), "the metadata temp must be rolled back");
+    assert!(
+        claim_path.is_dir(),
+        "a failed create-only handoff must leave the planted claim untouched"
+    );
+    assert_eq!(
+        spool.cached_stats_for_tests(),
+        before,
+        "a failed create-only publication must not account for anything"
+    );
+}
+
+#[test]
+fn live_claim_dead_letter_recovery_still_replaces_its_own_prior_artifacts() {
+    let temp = tempfile::tempdir().unwrap();
+    // The create-only seam is armed, but the exact pinned claim publishes with a
+    // replacing rename and never reaches it: recovery of a partial handoff keeps
+    // its deliberate replace-and-account behavior.
+    let spool = faulted_test_spool(&temp, SpoolFsFault::PeerOccupiesFinalBeforePublish);
+    let source = spool
+        .write_events(&[sample_event("evt-live-claim-replace")])
+        .unwrap();
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim should be acquired");
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+    let row = br#"{"event_id":"evt-live-claim-replace"}"#;
+    let prior_payload = b"prior-rejected-payload-marker-bytes\n";
+    let prior_payload_len = prior_payload.len() as u64;
+
+    let (payload_path, after_prior_payload) =
+        publish_dead_letter_payload_replacing_prior_for_tests(
+            &spool,
+            &claim_path,
+            row,
+            prior_payload,
+        )
+        .expect("the exact pinned claim must still replace its own prior final");
+    assert_eq!(
+        fs::read(&payload_path).unwrap(),
+        row,
+        "live-claim recovery still replaces the prior payload"
+    );
+    let after_payload = spool.cached_stats_for_tests();
+    assert_eq!(
+        after_payload.files, after_prior_payload.files,
+        "replace must account_sub the prior file rather than stacking"
+    );
+    assert_eq!(
+        after_payload.bytes,
+        after_prior_payload
+            .bytes
+            .saturating_sub(prior_payload_len)
+            .saturating_add(row.len() as u64),
+        "replace must decrement exactly the prior length before adding the new payload"
+    );
+
+    let meta_path = write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
+        .expect("initial dead-letter metadata should publish");
+    write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 2)
+        .expect("live claim must still replace prior dead-letter metadata");
+    // The replacing rename really happened: the record now describes the second
+    // publication, not the first.
+    let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta["rejected_rows"], 2);
+    assert!(
+        claim_path.is_file(),
+        "replacement must leave the live claim untouched"
     );
 }
 
