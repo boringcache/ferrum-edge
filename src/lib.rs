@@ -107,6 +107,15 @@ pub mod _test_support {
         crate::modes::data_plane::await_dp_listener_handles(listener_handles, shutdown_tx).await
     }
 
+    /// Test-only view of sticky-session `Set-Cookie` construction (#3278).
+    pub fn build_sticky_cookie_header_for_test(
+        cookie_name: &str,
+        target: &crate::config::types::UpstreamTarget,
+        config: &crate::config::types::HashOnCookieConfig,
+    ) -> String {
+        crate::proxy::build_sticky_cookie_header(cookie_name, target, config)
+    }
+
     /// Public mirror of the crate-private TCP SO_REUSEPORT accept-loop peer class.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TcpAcceptLoopClass {

@@ -1241,14 +1241,22 @@ pub struct HealthCheckConfig {
 /// When consistent hashing uses a cookie as the hash key and the cookie is not
 /// present in the request, the gateway sets a `Set-Cookie` response header so
 /// subsequent requests from the same client stick to the same backend target.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HashOnCookieConfig {
     /// Cookie `Path` attribute. Default: `"/"`.
     #[serde(default = "default_cookie_path")]
     pub path: String,
     /// Cookie `Max-Age` in seconds. Default: 3600 (1 hour).
+    /// Ignored when [`Self::session_cookie`] is true (browser session cookie).
     #[serde(default = "default_cookie_ttl")]
     pub ttl_seconds: u64,
+    /// When true, omit `Max-Age` so the cookie is a browser session cookie
+    /// (Gateway API `sessionPersistence.cookieConfig.lifetimeType: Session`).
+    #[serde(
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub session_cookie: bool,
     /// Optional `Domain` attribute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
@@ -1276,6 +1284,7 @@ impl Default for HashOnCookieConfig {
         Self {
             path: default_cookie_path(),
             ttl_seconds: default_cookie_ttl(),
+            session_cookie: false,
             domain: None,
             http_only: true,
             secure: false,

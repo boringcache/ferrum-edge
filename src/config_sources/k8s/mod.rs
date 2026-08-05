@@ -12,7 +12,7 @@ mod mesh_config;
 pub(crate) use core::secret_object_is_valid_tls_certificate;
 pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
-    namespace_selector_matches, parse_reference_grant_permissions,
+    backend_lb_policy_status, namespace_selector_matches, parse_reference_grant_permissions,
 };
 // Shared with the Istio status writer (`crate::k8s_controller::istio_status`) so
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
@@ -528,6 +528,12 @@ pub(crate) struct K8sAccumulator {
     /// sibling into `Conflicted=True`.
     gateway_api_route_conflicts: Vec<GatewayApiRouteConflict>,
     gateway_api_materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
+    /// Effective session persistence from `BackendLBPolicy` /
+    /// `XBackendTrafficPolicy`, keyed by `(namespace, service_name)`.
+    /// Oldest creationTimestamp (then name) wins when multiple policies target
+    /// the same Service.
+    pub(crate) gateway_api_backend_session_policies:
+        HashMap<(String, String), gateway_api::GatewayBackendSessionPolicy>,
 }
 
 impl K8sAccumulator {
@@ -557,6 +563,7 @@ impl K8sAccumulator {
             namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
             gateway_api_materialized_route_parents: HashSet::new(),
+            gateway_api_backend_session_policies: HashMap::new(),
         }
     }
 
@@ -952,6 +959,11 @@ where
         observe_object_namespace(&mut acc, object);
         if object.kind == "ReferenceGrant" {
             gateway_api::collect_reference_grant(&mut acc, object)?;
+        } else if matches!(
+            object.kind.as_str(),
+            "BackendLBPolicy" | "XBackendTrafficPolicy"
+        ) {
+            gateway_api::collect_backend_lb_policy(&mut acc, object)?;
         } else if object.kind == "Service" {
             collect_service(&mut acc, object)?;
             if acc.options.pod_discovery_enabled {
@@ -2835,12 +2847,23 @@ pub(crate) fn upstream_for_route(
     namespace: String,
     backends: Vec<RouteBackend>,
 ) -> Upstream {
+    upstream_for_route_with_session(id, namespace, backends, None)
+}
+
+/// Build a route Upstream, optionally applying Gateway API session persistence
+/// (cookie/header consistent hashing).
+pub(crate) fn upstream_for_route_with_session(
+    id: String,
+    namespace: String,
+    backends: Vec<RouteBackend>,
+    session: Option<&GatewaySessionPersistence>,
+) -> Upstream {
     let now = Utc::now();
     let first_weight = backends.first().map(|backend| backend.weight).unwrap_or(1);
     let has_weighted_target = backends
         .iter()
         .any(|backend| backend.weight != first_weight);
-    Upstream {
+    let mut upstream = Upstream {
         id: id.clone(),
         name: Some(id),
         namespace,
@@ -2899,7 +2922,28 @@ pub(crate) fn upstream_for_route(
         api_spec_id: None,
         created_at: now,
         updated_at: now,
+    };
+    if let Some(session) = session {
+        apply_session_persistence_to_upstream(&mut upstream, session);
     }
+    upstream
+}
+
+/// Apply Gateway API session persistence onto an Upstream.
+pub(crate) fn apply_session_persistence_to_upstream(
+    upstream: &mut Upstream,
+    session: &GatewaySessionPersistence,
+) {
+    upstream.algorithm = LoadBalancerAlgorithm::ConsistentHashing;
+    upstream.hash_on = Some(session.hash_on.clone());
+    upstream.hash_on_cookie_config = session.cookie_config.clone();
+}
+
+/// Effective Gateway API `sessionPersistence` projected onto a Ferrum Upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GatewaySessionPersistence {
+    pub hash_on: String,
+    pub cookie_config: Option<crate::config::types::HashOnCookieConfig>,
 }
 
 pub(crate) fn service_dns_name(name: &str, namespace: &str, cluster_domain: &str) -> String {

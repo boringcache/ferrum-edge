@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::config::types::{BackendScheme, FrontendTlsNamespaceSource, MAX_TARGET_WEIGHT};
 use crate::modes::mesh::config::{
@@ -14,16 +14,18 @@ use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerPolicy,
     GatewayApiListenerValidationError, GatewayApiNamespaceSelector,
     GatewayApiNamespaceSelectorExpression, GatewayApiNamespaceSelectorOperator,
-    GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sAccumulator, K8sObject, K8sResourceKey,
-    K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
-    RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
-    invalid_resource, mesh_route_dispatch_plugin_from_rules, namespaced_resource_key,
-    optional_port_field, optional_target_weight_field, port_from_u64, proxy_for_route, resource_id,
-    route_backends_require_node_waypoint_authz, route_request_transformer_plugin_for_proxy,
-    service_dns_name, string_array, string_field, upstream_for_route,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewaySessionPersistence,
+    K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslationOptions,
+    MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
+    attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
+    mesh_route_dispatch_plugin_from_rules, namespaced_resource_key, optional_port_field,
+    optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
+    resource_id, route_backends_require_node_waypoint_authz,
+    route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
+    upstream_for_route_with_session,
 };
 use crate::config::db_backend::NamespacedResourceId;
-use crate::config::types::{PluginConfig, Proxy};
+use crate::config::types::{HashOnCookieConfig, PluginConfig, Proxy};
 
 // Use an absolute DNS name (trailing dot) so resolvers must query this exact
 // label and cannot append search domains from resolv.conf.
@@ -173,8 +175,524 @@ pub(super) fn translate(
             Ok(true)
         }
         "ReferenceGrant" => Ok(true),
+        // Collected in the pre-pass; acknowledged here so the main translate
+        // loop does not warn about an "unsupported" kind.
+        "BackendLBPolicy" | "XBackendTrafficPolicy" => Ok(true),
         _ => Ok(false),
     }
+}
+
+/// Default session token name when `sessionPersistence.sessionName` is omitted
+/// (Gateway API marks the field implementation-specific).
+const DEFAULT_SESSION_NAME: &str = "ferrum-session";
+
+/// Accepted/rejected BackendLB / XBackendTraffic policy attachment for a Service.
+#[derive(Debug, Clone)]
+pub(crate) struct GatewayBackendSessionPolicy {
+    pub resource: K8sResourceKey,
+    pub creation_timestamp: Option<DateTime<Utc>>,
+    /// `Ok(None)` = policy accepted but carries no sessionPersistence (e.g.
+    /// retryConstraint-only). `Err` = field-specific rejection reason.
+    pub session: Result<Option<GatewaySessionPersistence>, String>,
+}
+
+fn backend_lb_policy_kinds(kind: &str) -> bool {
+    matches!(kind, "BackendLBPolicy" | "XBackendTrafficPolicy")
+}
+
+/// Collect `BackendLBPolicy` / `XBackendTrafficPolicy` into the accumulator.
+///
+/// Gateway API removed `BackendLBPolicy` from the experimental channel in
+/// v1.3+ (replaced by `XBackendTrafficPolicy` on `gateway.networking.x-k8s.io`).
+/// Ferrum watches and translates both shapes so operators on older CRDs and on
+/// the pinned v1.5.1 experimental channel get the same session-persistence
+/// semantics. `retryConstraint` is not representable today and is warned.
+pub(super) fn collect_backend_lb_policy(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+) -> Result<(), K8sTranslateError> {
+    if !backend_lb_policy_kinds(&object.kind) {
+        return Ok(());
+    }
+
+    let target_refs = object
+        .spec
+        .get("targetRefs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            invalid_resource(object, "spec.targetRefs is required and must be a non-empty array")
+        })?;
+    if target_refs.is_empty() {
+        return Err(invalid_resource(
+            object,
+            "spec.targetRefs is required and must be a non-empty array",
+        ));
+    }
+
+    let mut service_targets = Vec::new();
+    for (index, target) in target_refs.iter().enumerate() {
+        let kind = string_field(target, "kind").unwrap_or("Service");
+        let group = string_field(target, "group").unwrap_or("");
+        let name = string_field(target, "name").ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!("spec.targetRefs[{index}].name is required"),
+            )
+        })?;
+        if kind != "Service" || !group.is_empty() {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "spec.targetRefs[{index}] must target core group Service \
+                     (got group={group:?} kind={kind:?}); other backend kinds \
+                     are not supported"
+                ),
+            ));
+        }
+        service_targets.push(name.to_string());
+    }
+
+    if object.spec.get("retryConstraint").is_some() {
+        acc.warnings.push(format!(
+            "{} {}/{} spec.retryConstraint is not supported; retries are not \
+             budget-gated and the field is ignored fail-closed for budget \
+             enforcement (sessionPersistence still applies when present)",
+            object.kind, object.metadata.namespace, object.metadata.name
+        ));
+    }
+
+    let session = match object.spec.get("sessionPersistence") {
+        None => None,
+        Some(value) => {
+            let parsed = parse_session_persistence(object, value)?;
+            if string_field(value, "type").unwrap_or("Cookie") == "Cookie"
+                && value
+                    .get("cookieConfig")
+                    .and_then(|cfg| string_field(cfg, "lifetimeType"))
+                    .unwrap_or("Session")
+                    == "Session"
+                && string_field(value, "absoluteTimeout").is_some()
+            {
+                acc.warnings.push(format!(
+                    "{} {}/{} sessionPersistence.absoluteTimeout on Session \
+                     cookies is not gateway-enforced; emitting a browser \
+                     session cookie without Max-Age",
+                    object.kind,
+                    object.metadata.namespace,
+                    object.metadata.name
+                ));
+            }
+            Some(parsed)
+        }
+    };
+
+    let resource = K8sResourceKey::from_object(object);
+    let record = GatewayBackendSessionPolicy {
+        resource: resource.clone(),
+        creation_timestamp: object.metadata.creation_timestamp,
+        session: Ok(session),
+    };
+
+    for service_name in service_targets {
+        let key = (object.metadata.namespace.clone(), service_name);
+        let existing = acc
+            .gateway_api_backend_session_policies
+            .get(&key)
+            .map(|policy| {
+                (
+                    backend_policy_is_preferred(&record, policy),
+                    policy.resource.clone(),
+                )
+            });
+        match existing {
+            None => {
+                acc.gateway_api_backend_session_policies
+                    .insert(key, record.clone());
+            }
+            Some((true, old)) => {
+                acc.warnings.push(format!(
+                    "{} {}/{} replaces older backend session policy {}/{} \
+                     for Service {}/{}",
+                    object.kind,
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    old.namespace,
+                    old.name,
+                    key.0,
+                    key.1
+                ));
+                acc.gateway_api_backend_session_policies
+                    .insert(key, record.clone());
+            }
+            Some((false, old)) => {
+                acc.warnings.push(format!(
+                    "{} {}/{} ignored for Service {}/{}; older policy {}/{} wins",
+                    object.kind,
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    key.0,
+                    key.1,
+                    old.namespace,
+                    old.name
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn backend_policy_is_preferred(
+    candidate: &GatewayBackendSessionPolicy,
+    existing: &GatewayBackendSessionPolicy,
+) -> bool {
+    match (
+        candidate.creation_timestamp,
+        existing.creation_timestamp,
+    ) {
+        (Some(c), Some(e)) => match c.cmp(&e) {
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => {
+                (&candidate.resource.namespace, &candidate.resource.name)
+                    < (&existing.resource.namespace, &existing.resource.name)
+            }
+        },
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => {
+            (&candidate.resource.namespace, &candidate.resource.name)
+                < (&existing.resource.namespace, &existing.resource.name)
+        }
+    }
+}
+
+fn parse_session_persistence(
+    object: &K8sObject,
+    value: &Value,
+) -> Result<GatewaySessionPersistence, K8sTranslateError> {
+    if value.get("idleTimeout").is_some() {
+        return Err(invalid_resource(
+            object,
+            "sessionPersistence.idleTimeout is not supported; Ferrum sticky \
+             sessions do not track idle expiry",
+        ));
+    }
+
+    let persistence_type = string_field(value, "type").unwrap_or("Cookie");
+    let session_name = string_field(value, "sessionName")
+        .map(str::to_string)
+        .unwrap_or_else(|| DEFAULT_SESSION_NAME.to_string());
+    if session_name.is_empty() || session_name.len() > 128 {
+        return Err(invalid_resource(
+            object,
+            "sessionPersistence.sessionName must be 1..=128 characters",
+        ));
+    }
+
+    match persistence_type {
+        "Cookie" => {
+            let lifetime = value
+                .get("cookieConfig")
+                .and_then(|cfg| string_field(cfg, "lifetimeType"))
+                .unwrap_or("Session");
+            let absolute_timeout = string_field(value, "absoluteTimeout");
+            let mut cookie_config = HashOnCookieConfig {
+                session_cookie: lifetime == "Session",
+                ..HashOnCookieConfig::default()
+            };
+            match lifetime {
+                "Session" => {
+                    let _ = absolute_timeout;
+                }
+                "Permanent" => {
+                    let Some(raw) = absolute_timeout else {
+                        return Err(invalid_resource(
+                            object,
+                            "sessionPersistence.absoluteTimeout is required when \
+                             cookieConfig.lifetimeType is Permanent",
+                        ));
+                    };
+                    cookie_config.session_cookie = false;
+                    cookie_config.ttl_seconds =
+                        parse_gateway_api_duration_secs(object, raw, "absoluteTimeout")?;
+                }
+                other => {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "sessionPersistence.cookieConfig.lifetimeType must be \
+                             Session or Permanent (got {other:?})"
+                        ),
+                    ));
+                }
+            }
+            Ok(GatewaySessionPersistence {
+                hash_on: format!("cookie:{session_name}"),
+                cookie_config: Some(cookie_config),
+            })
+        }
+        "Header" => {
+            if value.get("cookieConfig").is_some() {
+                return Err(invalid_resource(
+                    object,
+                    "sessionPersistence.cookieConfig can only be set with type Cookie",
+                ));
+            }
+            if string_field(value, "absoluteTimeout").is_some() {
+                // AbsoluteTimeout without a cookie has no Set-Cookie surface;
+                // refuse rather than silently ignore.
+                return Err(invalid_resource(
+                    object,
+                    "sessionPersistence.absoluteTimeout is only supported with type Cookie",
+                ));
+            }
+            Ok(GatewaySessionPersistence {
+                hash_on: format!("header:{session_name}"),
+                cookie_config: None,
+            })
+        }
+        other => Err(invalid_resource(
+            object,
+            format!(
+                "sessionPersistence.type must be Cookie or Header (got {other:?})"
+            ),
+        )),
+    }
+}
+
+fn parse_gateway_api_duration_secs(
+    object: &K8sObject,
+    raw: &str,
+    field: &str,
+) -> Result<u64, K8sTranslateError> {
+    let ms = parse_istio_duration_ms(raw).ok_or_else(|| {
+        invalid_resource(
+            object,
+            format!("sessionPersistence.{field} '{raw}' is not a valid Gateway API duration"),
+        )
+    })?;
+    if ms == 0 {
+        return Err(invalid_resource(
+            object,
+            format!("sessionPersistence.{field} must be greater than 0s"),
+        ));
+    }
+    let secs = ms.div_ceil(1000);
+    if secs > crate::config::types::MAX_TIMEOUT_SECONDS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "sessionPersistence.{field} '{raw}' exceeds the sticky-cookie \
+                 ttl cap of {}s",
+                crate::config::types::MAX_TIMEOUT_SECONDS
+            ),
+        ));
+    }
+    Ok(secs)
+}
+
+fn resolve_rule_session_persistence(
+    object: &K8sObject,
+    rule: &Value,
+    backends: &[RouteBackend],
+    acc: &mut K8sAccumulator,
+) -> Result<Option<GatewaySessionPersistence>, K8sTranslateError> {
+    if let Some(value) = rule.get("sessionPersistence") {
+        let parsed = parse_session_persistence(object, value)?;
+        if let Some(raw) = string_field(value, "absoluteTimeout")
+            && string_field(value, "type").unwrap_or("Cookie") == "Cookie"
+            && value
+                .get("cookieConfig")
+                .and_then(|cfg| string_field(cfg, "lifetimeType"))
+                .unwrap_or("Session")
+                == "Session"
+        {
+            acc.warnings.push(format!(
+                "{} {}/{} sessionPersistence.absoluteTimeout={raw} on Session \
+                 cookies is not gateway-enforced; emitting a browser session \
+                 cookie without Max-Age",
+                object.kind, object.metadata.namespace, object.metadata.name
+            ));
+        }
+        return Ok(Some(parsed));
+    }
+
+    let mut service_keys = BTreeSet::new();
+    for backend in backends {
+        let (Some(ns), Some(name)) = (
+            backend.service_namespace.as_deref(),
+            backend.service_name.as_deref(),
+        ) else {
+            continue;
+        };
+        service_keys.insert((ns.to_string(), name.to_string()));
+    }
+    if service_keys.is_empty() {
+        return Ok(None);
+    }
+
+    let mut resolved: Option<((String, String), GatewaySessionPersistence)> = None;
+    for key in &service_keys {
+        let Some(policy) = acc.gateway_api_backend_session_policies.get(key) else {
+            continue;
+        };
+        match &policy.session {
+            Ok(Some(session)) => {
+                if let Some((ref prior_key, ref existing)) = resolved {
+                    if existing != session {
+                        return Err(invalid_resource(
+                            object,
+                            format!(
+                                "backendRefs target Services with conflicting \
+                                 BackendLB/XBackendTraffic sessionPersistence \
+                                 (Service {}/{} vs Service {}/{})",
+                                prior_key.0,
+                                prior_key.1,
+                                key.0,
+                                key.1
+                            ),
+                        ));
+                    }
+                } else {
+                    resolved = Some((key.clone(), session.clone()));
+                }
+            }
+            Ok(None) => {}
+            Err(message) => {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "backend Service {}/{} has rejected session policy \
+                         {}/{}: {message}",
+                        key.0,
+                        key.1,
+                        policy.resource.namespace,
+                        policy.resource.name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(resolved.map(|(_, session)| session))
+}
+
+/// Build `status.ancestors` for BackendLBPolicy / XBackendTrafficPolicy.
+///
+/// Ancestor is the targeted Service (Direct policy attachment). Accepted is
+/// True when targetRefs and sessionPersistence are representable; False with a
+/// field-specific reason otherwise.
+pub(crate) fn backend_lb_policy_status(object: &K8sObject) -> Value {
+    let (accepted, reason, message) = match validate_backend_lb_policy_for_status(object) {
+        Ok(()) => (
+            true,
+            "Accepted",
+            "Ferrum accepted this backend traffic policy".to_string(),
+        ),
+        Err(message) => (false, "UnsupportedValue", message),
+    };
+
+    let target_refs = object
+        .spec
+        .get("targetRefs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut ancestors = Vec::new();
+    for target in target_refs {
+        let Some(name) = string_field(&target, "name") else {
+            continue;
+        };
+        let kind = string_field(&target, "kind").unwrap_or("Service");
+        let group = string_field(&target, "group").unwrap_or("");
+        ancestors.push(json!({
+            "ancestorRef": {
+                "group": group,
+                "kind": kind,
+                "name": name,
+                "namespace": object.metadata.namespace,
+            },
+            "controllerName": "ferrum.io/gateway-controller",
+            "conditions": [condition_value(
+                object,
+                "Accepted",
+                accepted,
+                reason,
+                &message,
+            )],
+        }));
+    }
+    if ancestors.is_empty() {
+        ancestors.push(json!({
+            "ancestorRef": {
+                "group": "",
+                "kind": "Service",
+                "name": object.metadata.name,
+                "namespace": object.metadata.namespace,
+            },
+            "controllerName": "ferrum.io/gateway-controller",
+            "conditions": [condition_value(
+                object,
+                "Accepted",
+                accepted,
+                reason,
+                &message,
+            )],
+        }));
+    }
+
+    json!({ "ancestors": ancestors })
+}
+
+fn validate_backend_lb_policy_for_status(object: &K8sObject) -> Result<(), String> {
+    let target_refs = object
+        .spec
+        .get("targetRefs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "spec.targetRefs is required and must be a non-empty array".to_string()
+        })?;
+    if target_refs.is_empty() {
+        return Err("spec.targetRefs is required and must be a non-empty array".to_string());
+    }
+    for (index, target) in target_refs.iter().enumerate() {
+        let kind = string_field(target, "kind").unwrap_or("Service");
+        let group = string_field(target, "group").unwrap_or("");
+        if string_field(target, "name").is_none() {
+            return Err(format!("spec.targetRefs[{index}].name is required"));
+        }
+        if kind != "Service" || !group.is_empty() {
+            return Err(format!(
+                "spec.targetRefs[{index}] must target core group Service"
+            ));
+        }
+    }
+    if let Some(value) = object.spec.get("sessionPersistence") {
+        parse_session_persistence(object, value).map_err(|err| match err {
+            K8sTranslateError::InvalidResource { message, .. } => message,
+            other => other.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+fn condition_value(
+    object: &K8sObject,
+    condition_type: &str,
+    accepted: bool,
+    reason: &str,
+    message: &str,
+) -> Value {
+    let status = if accepted { "True" } else { "False" };
+    let observed = object.metadata.generation.unwrap_or(0);
+    json!({
+        "type": condition_type,
+        "status": status,
+        "reason": reason,
+        "message": message,
+        "observedGeneration": observed,
+        "lastTransitionTime": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    })
 }
 
 /// Borrowed, validated ReferenceGrant from×to permission cell.
@@ -3287,6 +3805,12 @@ fn http_route_resources(
             let request_transform = gateway_request_header_modifier_rules(rule);
             let redirect = gateway_request_redirect_value(object, rule, default_redirect_port)?;
             let backend_resolution = route_backends(object, rule, acc)?;
+            let session_persistence = resolve_rule_session_persistence(
+                object,
+                rule,
+                &backend_resolution.backends,
+                acc,
+            )?;
             let backend_ref_fault = backend_resolution.fault_reason.map(|reason| {
                 backend_ref_fault_value_with_percentage(
                     reason,
@@ -3316,7 +3840,9 @@ fn http_route_resources(
                     None,
                     false,
                 )
-            } else if backend_resolution.backends.len() == 1 {
+            } else if backend_resolution.backends.len() == 1
+                && session_persistence.is_none()
+            {
                 let Some(backend) = backend_resolution.backends.into_iter().next() else {
                     continue;
                 };
@@ -3344,10 +3870,11 @@ fn http_route_resources(
                     &object.metadata.name,
                     &route_suffix,
                 );
-                let upstream = upstream_for_route(
+                let upstream = upstream_for_route_with_session(
                     upstream_id.clone(),
                     config_namespace.clone(),
                     backend_resolution.backends,
+                    session_persistence.as_ref(),
                 );
                 (
                     String::new(),
@@ -10883,6 +11410,300 @@ mod tests {
                 .iter()
                 .map(|host| host.to_string())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    fn backend_lb_policy(name: &str, spec: Value) -> K8sObject {
+        let mut policy = object("BackendLBPolicy", spec);
+        policy.api_version = "gateway.networking.k8s.io/v1alpha2".to_string();
+        policy.metadata.name = name.to_string();
+        policy
+    }
+
+    fn x_backend_traffic_policy(name: &str, spec: Value) -> K8sObject {
+        let mut policy = object("XBackendTrafficPolicy", spec);
+        policy.api_version = "gateway.networking.x-k8s.io/v1alpha1".to_string();
+        policy.metadata.name = name.to_string();
+        policy
+    }
+
+    fn http_route_to_service(service: &str) -> K8sObject {
+        object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": service, "port": 8080}]
+                }]
+            }),
+        )
+    }
+
+    #[test]
+    fn backend_lb_policy_cookie_session_forces_consistent_hash_upstream() {
+        let policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "lb-affinity",
+                    "type": "Cookie",
+                    "cookieConfig": {"lifetimeType": "Session"}
+                }
+            }),
+        );
+        let route = http_route_to_service("api");
+        let result = translate_k8s_objects(&[policy, route], options())
+            .expect("BackendLBPolicy cookie session should translate");
+
+        assert_eq!(result.config.upstreams.len(), 1);
+        let upstream = &result.config.upstreams[0];
+        assert_eq!(
+            upstream.algorithm,
+            crate::config::types::LoadBalancerAlgorithm::ConsistentHashing
+        );
+        assert_eq!(
+            upstream.hash_on.as_deref(),
+            Some("cookie:lb-affinity")
+        );
+        let cookie = upstream
+            .hash_on_cookie_config
+            .as_ref()
+            .expect("cookie config");
+        assert!(
+            cookie.session_cookie,
+            "Session lifetimeType must omit Max-Age"
+        );
+        assert_eq!(
+            result.config.proxies[0].upstream_id.as_deref(),
+            Some(upstream.id.as_str()),
+            "single-backend sticky routes must materialize an Upstream so \
+             Set-Cookie injection runs on the live LB path"
+        );
+    }
+
+    #[test]
+    fn x_backend_traffic_policy_permanent_cookie_sets_max_age() {
+        let policy = x_backend_traffic_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "perm",
+                    "type": "Cookie",
+                    "absoluteTimeout": "2h",
+                    "cookieConfig": {"lifetimeType": "Permanent"}
+                }
+            }),
+        );
+        let result = translate_k8s_objects(&[policy, http_route_to_service("api")], options())
+            .expect("XBackendTrafficPolicy permanent cookie should translate");
+        let cookie = result.config.upstreams[0]
+            .hash_on_cookie_config
+            .as_ref()
+            .expect("cookie config");
+        assert!(!cookie.session_cookie);
+        assert_eq!(cookie.ttl_seconds, 7200);
+    }
+
+    #[test]
+    fn http_route_rule_session_persistence_overrides_backend_policy() {
+        let policy = backend_lb_policy(
+            "service-sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "from-policy",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let mut route = http_route_to_service("api");
+        route.spec["rules"][0]["sessionPersistence"] = serde_json::json!({
+            "sessionName": "from-route",
+            "type": "Header"
+        });
+        let result = translate_k8s_objects(&[policy, route], options())
+            .expect("route-level sessionPersistence should win");
+        assert_eq!(
+            result.config.upstreams[0].hash_on.as_deref(),
+            Some("header:from-route")
+        );
+        assert!(result.config.upstreams[0].hash_on_cookie_config.is_none());
+    }
+
+    #[test]
+    fn backend_lb_policy_idle_timeout_fails_closed() {
+        let policy = backend_lb_policy(
+            "idle",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "type": "Cookie",
+                    "idleTimeout": "30s"
+                }
+            }),
+        );
+        let err = translate_k8s_objects(&[policy], options())
+            .expect_err("idleTimeout must fail closed");
+        assert!(
+            err.to_string().contains("idleTimeout"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_permanent_without_absolute_timeout_fails_closed() {
+        let policy = backend_lb_policy(
+            "perm",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "type": "Cookie",
+                    "cookieConfig": {"lifetimeType": "Permanent"}
+                }
+            }),
+        );
+        let err = translate_k8s_objects(&[policy], options())
+            .expect_err("Permanent without absoluteTimeout must fail");
+        assert!(
+            err.to_string().contains("absoluteTimeout"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_unsupported_target_kind_fails_closed() {
+        let policy = backend_lb_policy(
+            "bad-target",
+            serde_json::json!({
+                "targetRefs": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "name": "gw"
+                }],
+                "sessionPersistence": {"type": "Cookie"}
+            }),
+        );
+        let err = translate_k8s_objects(&[policy], options())
+            .expect_err("non-Service targetRef must fail closed");
+        assert!(
+            err.to_string().contains("Service"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_delete_withdraws_session_persistence() {
+        let policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "lb-affinity",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let route = http_route_to_service("api");
+        let with_policy = translate_k8s_objects(
+            &[policy, route.clone()],
+            options(),
+        )
+        .expect("with policy");
+        assert_eq!(
+            with_policy.config.upstreams[0].hash_on.as_deref(),
+            Some("cookie:lb-affinity")
+        );
+
+        let without_policy = translate_k8s_objects(&[route], options())
+            .expect("policy deletion withdraws sticky config");
+        assert!(
+            without_policy.config.upstreams.is_empty(),
+            "without session persistence a single backend stays direct"
+        );
+        assert!(without_policy.config.proxies[0].upstream_id.is_none());
+    }
+
+    #[test]
+    fn backend_lb_policy_update_changes_session_name() {
+        let mut policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "v1",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let route = http_route_to_service("api");
+        let v1 = translate_k8s_objects(&[policy.clone(), route.clone()], options())
+            .expect("v1");
+        assert_eq!(
+            v1.config.upstreams[0].hash_on.as_deref(),
+            Some("cookie:v1")
+        );
+
+        policy.spec["sessionPersistence"]["sessionName"] =
+            serde_json::json!("v2");
+        let v2 = translate_k8s_objects(&[policy, route], options()).expect("v2");
+        assert_eq!(
+            v2.config.upstreams[0].hash_on.as_deref(),
+            Some("cookie:v2")
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_status_rejects_idle_timeout() {
+        let policy = backend_lb_policy(
+            "idle",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "type": "Cookie",
+                    "idleTimeout": "10s"
+                }
+            }),
+        );
+        let status = super::backend_lb_policy_status(&policy);
+        let condition = &status["ancestors"][0]["conditions"][0];
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "UnsupportedValue");
+        assert!(
+            condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("idleTimeout")
+        );
+    }
+
+    #[test]
+    fn x_backend_traffic_policy_retry_constraint_warns_but_applies_session() {
+        let policy = x_backend_traffic_policy(
+            "budget",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "retryConstraint": {
+                    "budget": {"percent": 20, "interval": "10s"}
+                },
+                "sessionPersistence": {
+                    "sessionName": "with-budget",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let result = translate_k8s_objects(&[policy, http_route_to_service("api")], options())
+            .expect("retryConstraint alone must not block sessionPersistence");
+        assert!(
+            result.warnings.iter().any(|w| w.contains("retryConstraint")),
+            "expected retryConstraint warning, got {:?}",
+            result.warnings
+        );
+        assert_eq!(
+            result.config.upstreams[0].hash_on.as_deref(),
+            Some("cookie:with-budget")
         );
     }
 }

@@ -2341,6 +2341,7 @@ fn test_upstream_hash_on_cookie_config_validation() {
     upstream.hash_on_cookie_config = Some(HashOnCookieConfig {
         path: "/".to_string(),
         ttl_seconds: 3600,
+        session_cookie: false,
         domain: None,
         http_only: true,
         secure: false,
@@ -2362,6 +2363,7 @@ fn test_upstream_hash_on_cookie_config_valid() {
     upstream.hash_on_cookie_config = Some(HashOnCookieConfig {
         path: "/api".to_string(),
         ttl_seconds: 7200,
+        session_cookie: false,
         domain: Some("example.com".to_string()),
         http_only: true,
         secure: true,

@@ -36098,10 +36098,11 @@ pub(crate) fn build_sticky_cookie_header(
 
     let raw = target_host_port_key(target);
     let value = hex::encode(Sha256::digest(raw.as_bytes()));
-    let mut cookie = format!(
-        "{}={}; Path={}; Max-Age={}",
-        cookie_name, value, config.path, config.ttl_seconds
-    );
+    let mut cookie = format!("{}={}; Path={}", cookie_name, value, config.path);
+    if !config.session_cookie {
+        cookie.push_str("; Max-Age=");
+        cookie.push_str(&config.ttl_seconds.to_string());
+    }
     if config.http_only {
         cookie.push_str("; HttpOnly");
     }

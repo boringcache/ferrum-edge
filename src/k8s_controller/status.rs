@@ -700,6 +700,9 @@ fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_
             ctx.route_conflicts,
             ctx.route_keys,
         ),
+        "BackendLBPolicy" | "XBackendTrafficPolicy" => {
+            crate::config_sources::k8s::backend_lb_policy_status(object)
+        }
         _ => Value::Object(Default::default()),
     }
 }
@@ -2201,6 +2204,7 @@ fn status_candidate_is_eligible(object: &K8sObject, indexes: &GatewayApiStatusIn
             route_has_managed_parent_ref_indexed(object, indexes)
                 || has_ferrum_parent_status(&object.status)
         }
+        "BackendLBPolicy" | "XBackendTrafficPolicy" => true,
         _ => false,
     }
 }
@@ -2656,7 +2660,14 @@ fn error_is_parent_ref_no_matching(error: &K8sTranslateError) -> bool {
 fn is_status_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "GatewayClass" | "Gateway" | "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
+        "GatewayClass"
+            | "Gateway"
+            | "HTTPRoute"
+            | "GRPCRoute"
+            | "TCPRoute"
+            | "TLSRoute"
+            | "BackendLBPolicy"
+            | "XBackendTrafficPolicy"
     )
 }
 
@@ -2669,6 +2680,8 @@ fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResourc
         ("GRPCRoute", "v1") => "grpcroutes",
         ("TCPRoute", "v1alpha2") => "tcproutes",
         ("TLSRoute", "v1alpha2") => "tlsroutes",
+        ("BackendLBPolicy", "v1alpha2") => "backendlbpolicies",
+        ("XBackendTrafficPolicy", "v1alpha1") => "xbackendtrafficpolicies",
         _ => return None,
     };
 
