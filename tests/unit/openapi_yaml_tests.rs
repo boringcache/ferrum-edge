@@ -2727,6 +2727,28 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
     );
     assert!(provider_properties.get("circuit_breaker").is_some());
 
+    // Issue #3298: the streaming opt-in is a closed object whose event ceiling
+    // matches the runtime bounds exactly.
+    let streaming = schema
+        .pointer("/properties/streaming")
+        .expect("missing streaming block");
+    assert_eq!(streaming["additionalProperties"], false);
+    assert_eq!(streaming["properties"]["enabled"]["default"], false);
+    let (default_event_bytes, min_event_bytes, max_event_bytes) =
+        ferrum_edge::plugins::ai_federation::test_helpers::streaming_bounds_for_test();
+    assert_eq!(
+        streaming["properties"]["max_event_bytes"]["default"],
+        default_event_bytes
+    );
+    assert_eq!(
+        streaming["properties"]["max_event_bytes"]["minimum"],
+        min_event_bytes
+    );
+    assert_eq!(
+        streaming["properties"]["max_event_bytes"]["maximum"],
+        max_event_bytes
+    );
+
     let valid = json!({
         "providers": [{
             "name": "local-openai",

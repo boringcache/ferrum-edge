@@ -587,6 +587,109 @@ impl AiStreamRouterClaim {
     pub(crate) fn committed_query(&self) -> &str {
         &self.committed_query
     }
+
+    /// Opaque owning-instance identity. Only equality against the reader's own
+    /// id is meaningful; the value is never rendered anywhere.
+    #[inline]
+    pub(crate) fn owner(&self) -> u64 {
+        self.owner
+    }
+
+    /// Index into the OWNING plugin instance's own provider list. Meaningless
+    /// to any other instance, and only read after an [`owner`](Self::owner)
+    /// match.
+    #[inline]
+    pub(crate) fn provider_index(&self) -> usize {
+        self.provider_index
+    }
+
+    /// The exact model string that selected the committed provider.
+    ///
+    /// Never log this: model enforcement is fixed-cardinality and must not echo
+    /// a client-controlled value.
+    #[inline]
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The committed backend-visible authority (`Host` / `:authority`).
+    ///
+    /// Read by an external owner's final backend-header policy so the `Host`
+    /// it re-installs is the one the claim committed, never a later transform's
+    /// value.
+    #[inline]
+    pub(crate) fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    /// Whether the request context still targets exactly what this claim
+    /// committed (`GHSA-xhp5-hqj8-3mwg`). Shared with every non-`ai_stream_router`
+    /// owner so the destination witness cannot drift between claim owners.
+    #[inline]
+    pub(crate) fn destination_intact(&self, ctx: &RequestContext) -> bool {
+        route_override_still_targets(ctx, self)
+    }
+}
+
+/// The complete set of values another plugin must commit to mint a provider
+/// claim of its own (`GHSA-xhp5-hqj8-3mwg`).
+///
+/// `ai_federation`'s streaming path is the only external owner today. Keeping
+/// ONE claim type — rather than a second parallel one — is load-bearing: the
+/// stand-down signal every other built-in reads
+/// ([`RequestContext::has_ai_stream_router_claim`]) and the committed-query
+/// re-assertion funnel ([`RequestContext::committed_provider_query`]) are both
+/// defined over this type, so a second type would silently bypass both.
+pub(crate) struct ExternalProviderClaimParts {
+    pub(crate) owner: u64,
+    pub(crate) provider_index: usize,
+    pub(crate) model: String,
+    pub(crate) scheme: BackendScheme,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) path: String,
+    pub(crate) authority: String,
+    pub(crate) resolved_tls: Option<BackendTlsConfig>,
+    pub(crate) committed_query: String,
+}
+
+/// Mint a provider claim owned by a plugin other than `ai_stream_router`.
+///
+/// The owner id MUST come from [`next_provider_claim_owner_id`] so ownership is
+/// decidable across plugin types: every `ai_stream_router` claim-dependent hook
+/// compares `claim.owner` against its own instance id and stands down on a
+/// mismatch, which is exactly the behavior an externally owned claim needs.
+///
+/// `tool_choice_none` and `request_translated` are deliberately fixed to
+/// `false`: they gate `ai_stream_router`'s own Anthropic/Gemini translation
+/// witnesses, and an external owner that performs no translation must not be
+/// able to set either.
+pub(crate) fn mint_external_provider_claim(
+    parts: ExternalProviderClaimParts,
+) -> AiStreamRouterClaim {
+    AiStreamRouterClaim {
+        owner: parts.owner,
+        provider_index: parts.provider_index,
+        model: parts.model,
+        tool_choice_none: false,
+        request_translated: false,
+        scheme: parts.scheme,
+        host: parts.host,
+        port: parts.port,
+        path: parts.path,
+        authority: parts.authority,
+        resolved_tls: parts.resolved_tls,
+        committed_query: parts.committed_query,
+    }
+}
+
+/// Allocate a process-unique provider-claim owner identity.
+///
+/// Shared with every claim owner (this plugin's instances and `ai_federation`'s
+/// streaming path) so two different plugin types can never mint colliding
+/// ownership tokens.
+pub(crate) fn next_provider_claim_owner_id() -> u64 {
+    NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Deliberately opaque: `RequestContext` derives `Debug`, and a derived
@@ -3416,7 +3519,7 @@ impl Plugin for AiStreamRouter {
 /// session-bearing headers (`cookie`, `proxy-authorization`) must be stripped
 /// alongside the API-key/auth headers or browser/application session
 /// credentials would reach the third-party provider.
-fn strip_client_credentials(headers: &mut HashMap<String, String>) {
+pub(crate) fn strip_client_credentials(headers: &mut HashMap<String, String>) {
     const CREDENTIAL_HEADERS: &[&str] = &[
         "authorization",
         "proxy-authorization",
@@ -3447,7 +3550,7 @@ fn strip_client_credentials(headers: &mut HashMap<String, String>) {
 /// `SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY` so proxy core stops
 /// appending them; this strip additionally removes any value a later generic
 /// header rule reintroduced (`GHSA-xhp5-hqj8-3mwg`).
-fn strip_gateway_identity_assertions(headers: &mut HashMap<String, String>) {
+pub(crate) fn strip_gateway_identity_assertions(headers: &mut HashMap<String, String>) {
     headers.retain(|name, _| {
         !name.eq_ignore_ascii_case("x-consumer-username")
             && !name.eq_ignore_ascii_case("x-consumer-custom-id")
@@ -3521,7 +3624,7 @@ fn apply_provider_boundary_headers(
     }
 }
 
-fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
+pub(crate) fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
     headers.retain(|k, _| !k.eq_ignore_ascii_case(name));
 }
 

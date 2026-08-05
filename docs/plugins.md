@@ -5344,7 +5344,35 @@ plugins:
 
 HTTP-family AI gateway that routes OpenAI Chat Completions JSON to supported providers, translates native request/response shapes, and returns an OpenAI-shaped synthetic response. Provider dispatch runs from the finalized-request-egress phase, after request decompression, body transforms, and the complete final request-policy hook pass. Native gRPC is deliberately unsupported rather than advertised with an inert pass-through.
 
-**Streaming is not supported.** Because of the terminate-and-respond design, the plugin buffers the full provider response and re-serializes it as a single JSON object. A request that asks for a streamed response (`"stream": true`) and matches a configured provider is rejected with HTTP `501` and an OpenAI-shaped error body rather than being silently downgraded to a buffered response or forwarded as a stream the gateway cannot relay. There is no streaming opt-in knob; config fields named `stream`, `streaming`, `streaming_enabled`, or `enable_streaming` are rejected during plugin validation so operators do not get a false sense that provider streaming is enabled.
+**Streaming (`"stream": true`) is an explicit opt-in.** The buffered terminate-and-respond path cannot relay a stream, so by default a streaming request that matches a configured provider is rejected with HTTP `501` and an OpenAI-shaped error body rather than being silently downgraded to a buffered response. Adding the root `streaming` block turns on a second, non-buffering execution path (issue #3298):
+
+```yaml
+  - name: ai_federation
+    config:
+      streaming:
+        enabled: true
+        max_event_bytes: 262144   # optional; 4096–1048576, default 262144
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          model_patterns: ["gpt-*"]
+```
+
+With it enabled, `before_proxy` claims the streaming request, commits exactly one provider, and rewrites the routing decision through `RequestContext.route_override_*` so the **normal proxy dispatch path** relays the provider's SSE incrementally. Time to first token, client-disconnect cancellation, byte budgets, retained-response ceilings, and shutdown accounting all come from the shared streaming response machinery rather than a plugin-private relay; the plugin itself creates no queues, channels, or detached tasks.
+
+**The provider commit boundary is fail-closed.** Fallback across providers happens **only** during pre-commit selection, before a single downstream-visible byte exists — an open circuit breaker, a streaming-ineligible provider, or an unusable endpoint moves to the next matching provider in priority order, and `ai_federation.streaming_provider_attempts` records how many were considered. After the claim is written the provider, credential, destination, backend TLS, DNS decision, and backend-visible query are committed exactly once:
+
+- a **non-2xx** provider response still carries a real status and is relayed as the provider's own error envelope; no second provider is tried;
+- a failure once body bytes are committed can only **truncate**, so the stream ends with one gateway-authored terminal SSE `error` event. A second provider is **never** spliced into the same logical stream.
+
+**Streaming eligibility is narrow by design.** A provider may serve a stream only when its native streaming wire format already **is** the OpenAI Chat Completions SSE contract — `openai`, `mistral`, `xai`, `deepseek`, `meta_llama`, `hugging_face`, `azure_openai` — and its credential is a static request header. `anthropic`, `google_gemini`, `google_vertex`, `aws_bedrock`, and `cohere` need provider-native SSE translation and fail closed with a field-specific `501` (`streaming_provider_representation_unsupported`); use [`ai_stream_router`](#ai_stream_router) for Anthropic/Gemini streaming. AWS SigV4 and Google OAuth2 providers fail closed with `streaming_provider_auth_unsupported`: SigV4 signs the exact final body that only exists *after* the claim, and OAuth2 has no per-attempt refresh boundary at this layer.
+
+**Streaming bounds and contract enforcement.** A claimed stream retains exactly one partial SSE event, capped by `streaming.max_event_bytes`, so retention does not grow with stream length. The contract guard forwards events verbatim and in order while enforcing that exactly one terminal `data: [DONE]` reaches the client, that no data follows it, and that a truncated stream (clean EOF with no terminal marker, or a trailing partial event) fails closed. An oversized event, a content-coded stream, and a 2xx that is not `text/event-stream` also fail closed. Every diagnostic is a fixed-cardinality gateway-authored string; no provider byte, header, model, or URL is ever echoed or logged. Terminal usage is relayed unchanged, so OpenAI-compatible clients should send `stream_options.include_usage: true` to receive it.
+
+**Streaming changes composition.** Enabling `streaming` makes the plugin declare a backend-boundary header policy and request header/destination mutation, so it can no longer be composed with `request_deduplication` or `response_caching` on the same proxy — a `before_proxy` fingerprint cannot witness the final provider boundary. A claimed stream mints the same private provider claim `ai_stream_router` uses, so `request_mirror`, `serverless_function`, `mcp_gateway`, and `mesh_route_dispatch` stand down on it identically, and `enforce_final_backend_header_policy` plus `on_final_request_body_with_context` re-assert the credential, destination, and committed model over the finalized backend-visible request (GHSA-xhp5-hqj8-3mwg). Non-streaming federation behavior is unchanged when the block is absent.
+
+Config fields named `stream`, `streaming_enabled`, or `enable_streaming` are still rejected during plugin validation, and a per-provider `streaming` key is rejected too: streaming is configured once at the root.
 
 **Model routing fails closed by default.** JSON POST requests with no final body, malformed/non-UTF-8 JSON, malformed supported tool/stop shapes, or no top-level string `model` field are rejected with an OpenAI-shaped `400`. Model identifiers are limited to 256 ASCII bytes and the characters used by ordinary provider IDs (`A-Z`, `a-z`, digits, `.`, `_`, `-`, `:`, `/`, `+`); traversal, URL userinfo/query/fragment syntax, whitespace, and controls are rejected. Requests whose valid `model` does not match any provider are rejected with an OpenAI-shaped `404`. Set `fail_on_missing_model: false` or `fail_on_no_matching_provider: false` only when intentional pass-through to the normal backend is required.
 
@@ -5362,10 +5390,11 @@ read: OpenAI-shaped `usage.{prompt,completion,total}_tokens`, Anthropic
 `usage.{input,output}_tokens`, Google/Gemini
 `usageMetadata.{prompt,candidates,total}TokenCount`, Bedrock Converse
 `usage.{input,output,total}Tokens`, and Cohere v2 `usage.tokens.{input,output}`.
-When usage is absent, the request falls to `on_unmetered_response`. For streamed clients that are metered directly
-by `ai_rate_limiter` (not via `ai_federation`, which rejects streaming — see
-above), configure OpenAI-compatible callers with `stream_options.include_usage:
-true` so a final usage signal is emitted.
+When usage is absent, the request falls to `on_unmetered_response`. Streamed
+clients are metered by `ai_rate_limiter` from the response stream rather than
+from a buffered federation body — `ai_federation`'s streaming path relays
+provider events unchanged — so configure OpenAI-compatible callers with
+`stream_options.include_usage: true` so a final usage signal is emitted.
 
 **Synthetic-path hook ordering (known divergence).** On the governed synthetic short-circuit path (any plugin-generated 2xx surfaced via `RejectBinary`, including `ai_federation` / `ai_semantic_cache` / `response_mock` bodies, plus final 2xx-5xx `serverless_function` terminate responses) the response-**body** hooks (`on_response_body`, body transforms, `on_final_response_body`) run **before** the `after_proxy` reject hooks, whereas on the normal backend path `after_proxy` runs **before** the body transforms. Provider/protocol normalization is deliberately skipped: a synthetic body is owned by the short-circuiting plugin and is already in its client-visible representation, so request metadata left by an earlier provider router must not reinterpret it as backend-native bytes. This is a deliberate trade-off: the body hooks may *replace* the response when a guardrail rejects the synthetic body, so `after_proxy` must run exactly once and last — over the final response — to preserve one-shot response state (e.g. an `oidc_relying_party` rotated session cookie or a `response_transformer` route override) that would otherwise be consumed against a discarded synthetic response. The consequence is that a body transform which depends on a header/metadata mutation made by an `after_proxy` hook (for example `response_transformer` rewriting `Content-Type` before its JSON body rules) can behave differently on a synthetic response than on an equivalent backend response. If you need such a transform applied identically, drive it from `before_proxy`/body-side configuration rather than from `after_proxy` header mutations on the synthetic path.
 

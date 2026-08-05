@@ -351,6 +351,294 @@ plugin_configs:
 }
 
 // ============================================================================
+// ai_federation incremental streaming (issue #3298)
+// ============================================================================
+
+/// Serve exactly one SSE response, releasing the tail only after the caller
+/// signals that the FIRST event already reached the downstream client.
+///
+/// This is what makes the time-to-first-token assertion behavior-driven rather
+/// than timing-driven: a gateway that buffered the provider response would never
+/// hand the first event to the client, the test would never fire `release`, and
+/// the fixture would never write the tail — the assertion fails by deadlock
+/// avoidance (the bounded request timeout), never by a sleep guess.
+async fn start_sse_provider_on(
+    listener: TcpListener,
+    head: &'static str,
+    tail: &'static str,
+    hits: Arc<AtomicUsize>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut release = Some(release);
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let hits = Arc::clone(&hits);
+        let release = release.take();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 16384];
+            let _ = stream.read(&mut buf).await.unwrap_or(0);
+            hits.fetch_add(1, Ordering::Relaxed);
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.flush().await;
+            if let Some(release) = release {
+                // Bounded: the test always resolves this channel (by sending or
+                // by dropping the sender), so the fixture never hangs.
+                let _ = release.await;
+            }
+            let _ = stream.write_all(tail.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+    }
+}
+
+fn federation_streaming_config(provider_port: u16, backend_port: u16, path: &str) -> String {
+    format!(
+        r#"
+version: "1"
+proxies:
+  - id: "federation-streaming"
+    listen_path: "/federation-streaming"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    pool_enable_http2: false
+plugins:
+  - id: "federation-streaming-plugin"
+    proxy_id: "federation-streaming"
+    plugin_name: "ai_federation"
+    scope: "proxy"
+    enabled: true
+    config:
+      streaming:
+        enabled: true
+      fail_on_no_matching_provider: false
+      providers:
+        - name: "mock-streaming-provider"
+          provider_type: "openai"
+          api_key: "test-key"
+          model_patterns: ["gpt-*"]
+          base_url: "http://127.0.0.1:{provider_port}{path}"
+          allow_plaintext: true
+"#
+    )
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_ai_federation_streams_first_token_before_provider_completes() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_hits = Arc::new(AtomicUsize::new(0));
+    let backend_task = tokio::spawn(start_counted_json_server_on(
+        backend_listener,
+        200,
+        r#"{"backend":true}"#,
+        b"POST /",
+        Arc::clone(&backend_hits),
+    ));
+
+    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_port = provider_listener.local_addr().unwrap().port();
+    let provider_hits = Arc::new(AtomicUsize::new(0));
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let provider_task = tokio::spawn(start_sse_provider_on(
+        provider_listener,
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"He\"}}]}\n\n",
+        concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"llo\"}}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        Arc::clone(&provider_hits),
+        release_rx,
+    ));
+
+    let gateway = TestGateway::builder()
+        .mode_file(federation_streaming_config(
+            provider_port,
+            backend_port,
+            "/v1/chat/completions",
+        ))
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("start federation streaming gateway");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .expect("build streaming client");
+    let mut response = client
+        .post(gateway.proxy_url("/federation-streaming/chat"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true
+            }))
+            .expect("serialize streaming request"),
+        )
+        .send()
+        .await
+        .expect("send streaming request");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("text/event-stream")),
+        "claimed stream must stay an event stream: {:?}",
+        response.headers()
+    );
+
+    // Read until the FIRST provider event is client-visible. The provider is
+    // still holding the rest of the stream, so this can only succeed if the
+    // gateway relayed incrementally.
+    let mut received = Vec::new();
+    let mut release_tx = Some(release_tx);
+    while let Some(chunk) = response.chunk().await.expect("read stream chunk") {
+        received.extend_from_slice(&chunk);
+        if let Some(tx) = release_tx.take() {
+            let text = String::from_utf8_lossy(&received);
+            assert!(
+                text.contains("\"content\":\"He\""),
+                "first client-visible bytes must be the first provider event: {text}"
+            );
+            assert!(
+                !text.contains("[DONE]"),
+                "the provider has not sent the terminal marker yet: {text}"
+            );
+            // Only now may the provider finish the stream.
+            tx.send(()).expect("release provider tail");
+        }
+    }
+
+    let text = String::from_utf8(received).expect("stream is UTF-8");
+    assert!(text.contains("\"content\":\"llo\""), "second event: {text}");
+    assert!(text.contains("\"total_tokens\":5"), "terminal usage: {text}");
+    assert_eq!(
+        text.matches("[DONE]").count(),
+        1,
+        "exactly one terminal marker: {text}"
+    );
+    assert!(text.ends_with("data: [DONE]\n\n"), "terminal ordering: {text}");
+    assert!(!text.contains("event: error"), "clean stream: {text}");
+
+    assert_eq!(provider_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        backend_hits.load(Ordering::Relaxed),
+        0,
+        "a claimed stream must never reach the configured backend"
+    );
+
+    provider_task.abort();
+    backend_task.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_ai_federation_truncated_provider_stream_fails_closed_without_splicing() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_hits = Arc::new(AtomicUsize::new(0));
+    let backend_task = tokio::spawn(start_counted_json_server_on(
+        backend_listener,
+        200,
+        r#"{"backend":true}"#,
+        b"POST /",
+        Arc::clone(&backend_hits),
+    ));
+
+    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_port = provider_listener.local_addr().unwrap().port();
+    let provider_hits = Arc::new(AtomicUsize::new(0));
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    // Head only: the provider closes without ever sending `data: [DONE]`.
+    let provider_task = tokio::spawn(start_sse_provider_on(
+        provider_listener,
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"He\"}}]}\n\n",
+        "",
+        Arc::clone(&provider_hits),
+        release_rx,
+    ));
+
+    let gateway = TestGateway::builder()
+        .mode_file(federation_streaming_config(
+            provider_port,
+            backend_port,
+            "/v1/chat/completions",
+        ))
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("start federation truncated-stream gateway");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .expect("build streaming client");
+    let mut response = client
+        .post(gateway.proxy_url("/federation-streaming/chat"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true
+            }))
+            .expect("serialize streaming request"),
+        )
+        .send()
+        .await
+        .expect("send streaming request");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let mut received = Vec::new();
+    let mut release_tx = Some(release_tx);
+    while let Some(chunk) = response.chunk().await.expect("read stream chunk") {
+        received.extend_from_slice(&chunk);
+        if let Some(tx) = release_tx.take() {
+            // Let the provider close without a terminal marker.
+            tx.send(()).expect("release provider close");
+        }
+    }
+
+    let text = String::from_utf8(received).expect("stream is UTF-8");
+    assert!(
+        text.contains("event: error"),
+        "a truncated provider stream must end with a gateway-authored error event: {text}"
+    );
+    assert!(
+        !text.contains("[DONE]"),
+        "a truncated stream must never look like a completed generation: {text}"
+    );
+    assert!(
+        !text.contains("test-key"),
+        "no credential may appear in the client-visible stream: {text}"
+    );
+    assert_eq!(
+        provider_hits.load(Ordering::Relaxed),
+        1,
+        "post-commit failure must never splice a second provider request"
+    );
+    assert_eq!(backend_hits.load(Ordering::Relaxed), 0);
+
+    provider_task.abort();
+    backend_task.abort();
+}
+
+// ============================================================================
 // ai_prompt_shield tests
 // ============================================================================
 

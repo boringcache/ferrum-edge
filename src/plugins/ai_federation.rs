@@ -9,9 +9,54 @@
 //! `PluginResult::RejectBinary` with the normalized response. The normal proxy
 //! dispatch is skipped entirely. Native gRPC is deliberately outside this
 //! OpenAI Chat Completions JSON contract.
-//! Streaming Chat Completions are intentionally unsupported by this buffered
-//! execution path: matched requests with `"stream": true` are rejected with a
-//! clear 501 error instead of being forwarded to an unimplemented SSE path.
+//!
+//! ## Streaming Chat Completions (issue #3298)
+//!
+//! `"stream": true` is served by a SECOND execution path that never buffers the
+//! generation. Enabling the root `streaming` block makes `before_proxy` claim a
+//! streaming request, commit exactly one provider, rewrite the routing decision
+//! through `RequestContext.route_override_*`, and let the ordinary proxy
+//! dispatch relay the provider's SSE incrementally. Time to first token,
+//! cancellation, byte budgets, and shutdown accounting therefore come from the
+//! shared streaming response machinery rather than a plugin-private relay.
+//!
+//! **The commit boundary is fail-closed.** Provider fallback happens only inside
+//! `before_proxy`, before any downstream-visible byte exists: an open circuit, an
+//! ineligible provider, or an unusable endpoint moves to the next matching
+//! provider. Once the claim is written the provider, credential, destination,
+//! backend TLS, DNS decision, and backend-visible query are committed exactly
+//! once. After that:
+//!
+//! * a non-2xx provider response still has a real status and is relayed as the
+//!   provider's own error envelope — no second provider is tried;
+//! * a failure once body bytes are committed can only TRUNCATE, so the SSE
+//!   contract guard emits one gateway-authored terminal `error` event and ends
+//!   the body. A second provider is never spliced into the same logical stream.
+//!
+//! **Eligibility is narrow by construction.** A provider may serve a stream only
+//! when its NATIVE streaming wire format already is the OpenAI Chat Completions
+//! SSE contract (`openai`, `mistral`, `xai`, `deepseek`, `meta_llama`,
+//! `hugging_face`, `azure_openai`) and its credential is a static request header.
+//! Providers with a provider-native event representation (`anthropic`,
+//! `google_gemini`, `google_vertex`, `aws_bedrock`, `cohere`) and providers
+//! authenticating with AWS SigV4 or refreshed Google OAuth2 are fail-closed with
+//! a field-specific `501`: SigV4 signs the exact final body that only exists
+//! after the claim, and OAuth2 has no per-attempt refresh boundary here. Use
+//! `ai_stream_router` for Anthropic/Gemini streaming translation.
+//!
+//! **Bounds.** The streaming path retains exactly one partial SSE event per
+//! response, capped by `streaming.max_event_bytes`; it creates no queues, no
+//! channels, and no detached tasks of its own. Oversized events, data after the
+//! terminal marker, a duplicated terminal marker, a truncated stream, a
+//! content-coded stream, and a non-event-stream 2xx all fail closed with
+//! fixed-cardinality reasons that never echo a provider byte.
+//!
+//! Enabling `streaming` makes this plugin declare a backend-boundary header
+//! policy and request header/destination mutation, so it can no longer be
+//! composed with `request_deduplication` or `response_caching` on the same
+//! proxy — a before-proxy fingerprint cannot witness the final provider
+//! boundary. Non-streaming federation behavior is unchanged when the block is
+//! absent.
 //!
 //! ## Supported Providers
 //!
@@ -51,13 +96,20 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 use url::{Host, Url};
 
+use super::ai_stream_router::{
+    AiStreamRouterClaim, ExternalProviderClaimParts, mint_external_provider_claim,
+    next_provider_claim_owner_id, remove_header_ci, strip_client_credentials,
+    strip_gateway_identity_assertions,
+};
 use super::utils::aws_sigv4;
-use super::utils::body_transform::is_json_content_type;
+use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use super::{
     AiUsageExport, EXTERNAL_OPERATION_COMPLETED_METADATA_KEY, Plugin, PluginHttpClient,
-    PluginResult, RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext,
+    PluginResult, RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, ResponseStreamAction,
+    ResponseStreamInspector, ResponseStreamInspectorStage, SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY,
 };
+use crate::config::types::{BackendScheme, BackendTlsConfig};
 
 const DEFAULT_MAX_PROVIDER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -73,6 +125,19 @@ const MAX_MODEL_PATTERNS_PER_PROVIDER: usize = 128;
 const MAX_MODEL_MAPPINGS_PER_PROVIDER: usize = 1024;
 const MAX_FORWARDED_PROVIDER_HEADERS: usize = 32;
 const MAX_FORWARDED_PROVIDER_HEADER_VALUE_BYTES: usize = 1024;
+
+// --- Streaming (issue #3298) -----------------------------------------------
+
+/// Default ceiling for one buffered SSE event on the streaming path.
+const DEFAULT_MAX_STREAM_EVENT_BYTES: usize = 256 * 1024;
+/// Hard upper bound an operator may configure for one SSE event.
+const MAX_STREAM_EVENT_BYTES: usize = 1024 * 1024;
+/// Hard lower bound: below this a legitimate tool-call delta cannot fit.
+const MIN_STREAM_EVENT_BYTES: usize = 4 * 1024;
+/// Retained-state ceiling for one claimed stream is exactly one partial event,
+/// so the whole streaming path costs O(max_event_bytes) regardless of how long
+/// the provider streams. Asserted here so a later edit cannot quietly widen it.
+const _: () = assert!(MAX_STREAM_EVENT_BYTES <= 4 * 1024 * 1024);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1048,6 +1113,15 @@ pub struct AiFederation {
     fail_on_no_matching_provider: bool,
     request_slots: Semaphore,
     http_client: PluginHttpClient,
+    /// Incremental provider streaming policy (issue #3298).
+    streaming: StreamingPolicy,
+    /// Opaque per-INSTANCE provider-claim ownership token
+    /// (`GHSA-xhp5-hqj8-3mwg`). Allocated from the same process-wide counter
+    /// `ai_stream_router` uses, so no two claim owners of either plugin type can
+    /// collide. Never rendered into metadata, logs, configuration, or a
+    /// response. Allocated even when streaming is disabled: it costs one relaxed
+    /// atomic increment at construction and keeps the ownership check total.
+    stream_owner_id: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,8 +1133,9 @@ impl AiFederation {
         let config_object = config
             .as_object()
             .ok_or_else(|| "ai_federation: config must be an object".to_string())?;
-        reject_unsupported_streaming_config(config, "config")?;
+        reject_unsupported_streaming_config(config, "config", true)?;
         reject_unknown_config_keys(config_object, "config", AI_FEDERATION_CONFIG_KEYS)?;
+        let streaming = parse_streaming_policy(config)?;
 
         let providers_val = config
             .get("providers")
@@ -1087,7 +1162,7 @@ impl AiFederation {
             let provider_object = pv
                 .as_object()
                 .ok_or_else(|| format!("ai_federation: provider[{i}] must be an object"))?;
-            reject_unsupported_streaming_config(pv, &format!("provider[{i}]"))?;
+            reject_unsupported_streaming_config(pv, &format!("provider[{i}]"), false)?;
             reject_unknown_config_keys(
                 provider_object,
                 &format!("provider[{i}]"),
@@ -1293,6 +1368,8 @@ impl AiFederation {
             fail_on_no_matching_provider,
             request_slots: Semaphore::new(max_concurrent_requests),
             http_client,
+            streaming,
+            stream_owner_id: next_provider_claim_owner_id(),
         })
     }
 }
@@ -1307,7 +1384,11 @@ const AI_FEDERATION_CONFIG_KEYS: &[&str] = &[
     "fail_on_missing_model",
     "fail_on_no_matching_provider",
     "max_concurrent_requests",
+    "streaming",
 ];
+
+/// Accepted keys inside the root `streaming` block (issue #3298).
+const AI_FEDERATION_STREAMING_KEYS: &[&str] = &["enabled", "max_event_bytes"];
 
 const AI_FEDERATION_PROVIDER_KEYS: &[&str] = &[
     "name",
@@ -1446,23 +1527,92 @@ fn parse_provider_circuit(
     }))
 }
 
-fn reject_unsupported_streaming_config(config: &Value, scope: &str) -> Result<(), String> {
-    const UNSUPPORTED_STREAMING_FIELDS: &[&str] = &[
-        "stream",
-        "streaming",
-        "streaming_enabled",
-        "enable_streaming",
-    ];
+/// Reject the ambiguous streaming toggles that never existed.
+///
+/// The one supported spelling is the root `streaming` OBJECT (issue #3298).
+/// `allow_streaming_block` is true only at root scope; per-provider streaming is
+/// not configurable, so a provider entry still rejects all four names with a
+/// field-specific diagnostic rather than silently ignoring them.
+fn reject_unsupported_streaming_config(
+    config: &Value,
+    scope: &str,
+    allow_streaming_block: bool,
+) -> Result<(), String> {
+    const UNSUPPORTED_STREAMING_FIELDS: &[&str] =
+        &["stream", "streaming_enabled", "enable_streaming"];
 
     for field in UNSUPPORTED_STREAMING_FIELDS {
         if config.get(*field).is_some() {
             return Err(format!(
-                "ai_federation: {scope} field '{field}' is unsupported; ai_federation does not implement provider response streaming and rejects matched OpenAI Chat Completions requests with \"stream\": true"
+                "ai_federation: {scope} field '{field}' is unsupported; configure incremental provider streaming with the root 'streaming' object ({{\"enabled\": true}})"
+            ));
+        }
+    }
+    match config.get("streaming") {
+        None => {}
+        Some(Value::Object(_)) if allow_streaming_block => {}
+        Some(_) if allow_streaming_block => {
+            return Err(format!(
+                "ai_federation: {scope} field 'streaming' must be an object with keys: {}",
+                AI_FEDERATION_STREAMING_KEYS.join(", ")
+            ));
+        }
+        Some(_) => {
+            return Err(format!(
+                "ai_federation: {scope} field 'streaming' is unsupported; streaming is configured once at the root of the plugin config, not per provider"
             ));
         }
     }
 
     Ok(())
+}
+
+/// Root streaming policy (issue #3298).
+#[derive(Debug, Clone, Copy)]
+struct StreamingPolicy {
+    enabled: bool,
+    /// Ceiling on one retained partial SSE event. Bounds every buffer the
+    /// streaming path keeps: there is exactly one carry buffer per response.
+    max_event_bytes: usize,
+}
+
+impl Default for StreamingPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_event_bytes: DEFAULT_MAX_STREAM_EVENT_BYTES,
+        }
+    }
+}
+
+fn parse_streaming_policy(config: &Value) -> Result<StreamingPolicy, String> {
+    let Some(value) = config.get("streaming") else {
+        return Ok(StreamingPolicy::default());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "ai_federation: 'streaming' must be an object".to_string())?;
+    reject_unknown_config_keys(object, "streaming", AI_FEDERATION_STREAMING_KEYS)?;
+
+    let enabled = optional_bool(value, "enabled")?.unwrap_or(false);
+    let max_event_bytes = match optional_u64(value, "max_event_bytes")? {
+        None => DEFAULT_MAX_STREAM_EVENT_BYTES,
+        Some(raw) => usize::try_from(raw).map_err(|_| {
+            format!(
+                "ai_federation: streaming max_event_bytes must be between {MIN_STREAM_EVENT_BYTES} and {MAX_STREAM_EVENT_BYTES}"
+            )
+        })?,
+    };
+    if !(MIN_STREAM_EVENT_BYTES..=MAX_STREAM_EVENT_BYTES).contains(&max_event_bytes) {
+        return Err(format!(
+            "ai_federation: streaming max_event_bytes must be between {MIN_STREAM_EVENT_BYTES} and {MAX_STREAM_EVENT_BYTES}"
+        ));
+    }
+
+    Ok(StreamingPolicy {
+        enabled,
+        max_event_bytes,
+    })
 }
 
 fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
@@ -4970,6 +5120,732 @@ fn is_safe_provider_response_header(name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Incremental provider streaming (issue #3298)
+// ---------------------------------------------------------------------------
+
+/// Shared metadata marker telling response-side plugins that this request asked
+/// for a streamed response even without `Accept: text/event-stream`.
+const META_STREAMING_SHARED: &str = "ai_request_streaming";
+const META_STREAM_CLAIMED: &str = "ai_federation.streaming_claimed";
+const META_STREAM_PROVIDER_TYPE: &str = "ai_federation.streaming_provider_type";
+const META_STREAM_ATTEMPTS: &str = "ai_federation.streaming_provider_attempts";
+
+/// Why a matched provider cannot serve an INCREMENTAL stream.
+///
+/// Streaming commits exactly one provider before the first downstream byte, so
+/// an ineligible provider is skipped during the pre-commit selection loop and,
+/// if no provider survives, the request fails closed with the last reason. Every
+/// variant is fixed-cardinality and echoes no configuration value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamIneligibility {
+    /// The provider speaks a native streaming representation that is not the
+    /// OpenAI Chat Completions SSE contract (Anthropic Messages events, Gemini
+    /// `streamGenerateContent`, Bedrock `application/vnd.amazon.eventstream`,
+    /// Cohere v2 events). Relaying it unchanged would break the documented
+    /// client contract, and translating it belongs to `ai_stream_router`.
+    Representation,
+    /// The provider's credential is not a static request header, so it cannot be
+    /// committed at claim time: AWS SigV4 signs the exact final body (which the
+    /// dispatch layer produces after the claim), and Google OAuth2 resolves a
+    /// short-lived token whose refresh has no per-attempt boundary here.
+    Auth,
+    /// The rendered provider endpoint cannot be decomposed into a committed
+    /// scheme / host / port / absolute path destination.
+    Endpoint,
+}
+
+impl StreamIneligibility {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Representation => "streaming_provider_representation_unsupported",
+            Self::Auth => "streaming_provider_auth_unsupported",
+            Self::Endpoint => "streaming_provider_endpoint_unsupported",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Representation => {
+                "No ai_federation provider for this model can stream the OpenAI Chat Completions SSE contract; providers with a native non-OpenAI streaming representation are not eligible"
+            }
+            Self::Auth => {
+                "No ai_federation provider for this model can stream; the matched providers authenticate with request signing or a refreshed OAuth2 token, which cannot be committed before the stream starts"
+            }
+            Self::Endpoint => {
+                "No ai_federation provider for this model can stream; the configured provider endpoint could not be committed as a streaming destination"
+            }
+        }
+    }
+}
+
+/// The destination a streaming claim commits to, derived from the provider's
+/// already SSRF-validated rendered endpoint.
+struct CommittedStreamTarget {
+    scheme: BackendScheme,
+    /// Dial host, normalized (no brackets, no port).
+    host: String,
+    port: u16,
+    /// Absolute backend path. Any endpoint-configured query (for example Azure's
+    /// `api-version`) is already folded in.
+    path: String,
+    /// `Host` / `:authority` exactly as committed.
+    authority: String,
+    /// Whether the endpoint carried its own query, in which case the claim
+    /// commits an EMPTY appendable query so a later generic query rule cannot
+    /// append a normal-backend secret to the third-party URL.
+    endpoint_owns_query: bool,
+}
+
+/// Decide whether `provider` can serve an incremental stream and, if so, what
+/// destination the claim would commit.
+///
+/// Fail-closed by construction: every unsupported provider shape returns an
+/// error rather than falling through to a best-effort relay.
+fn stream_target_for(
+    provider: &ResolvedProvider,
+    resolved_model: &str,
+) -> Result<CommittedStreamTarget, StreamIneligibility> {
+    // Only providers whose NATIVE streaming wire format already is the OpenAI
+    // Chat Completions SSE contract are eligible. Everything else needs a
+    // provider-native SSE normalizer, which lives in `ai_stream_router`.
+    if !provider.provider_type.is_openai_compatible() {
+        return Err(StreamIneligibility::Representation);
+    }
+    match &provider.auth {
+        AuthMethod::BearerToken { .. } | AuthMethod::CustomHeader { .. } => {}
+        AuthMethod::AwsSigV4 { .. } | AuthMethod::GoogleOAuth2 { .. } => {
+            return Err(StreamIneligibility::Auth);
+        }
+    }
+
+    let rendered = build_provider_url(provider, resolved_model);
+    // Re-run the dispatch URL policy: the buffered path checks it per request,
+    // and a streaming claim must not be weaker.
+    validate_dispatch_url(&rendered).map_err(|_| StreamIneligibility::Endpoint)?;
+    let url = Url::parse(&rendered).map_err(|_| StreamIneligibility::Endpoint)?;
+    let scheme = match url.scheme() {
+        "https" => BackendScheme::Https,
+        "http" => BackendScheme::Http,
+        _ => return Err(StreamIneligibility::Endpoint),
+    };
+    let host = normalized_url_hostname(&url).ok_or(StreamIneligibility::Endpoint)?;
+    let port = url
+        .port_or_known_default()
+        .ok_or(StreamIneligibility::Endpoint)?;
+    // `Url::host_str` keeps IPv6 brackets, which is exactly what a `Host`
+    // header needs; the dial host above is the unbracketed form.
+    let host_for_authority = url.host_str().ok_or(StreamIneligibility::Endpoint)?;
+    let default_port = matches!(
+        (scheme, port),
+        (BackendScheme::Https, 443) | (BackendScheme::Http, 80)
+    );
+    let authority = if default_port {
+        host_for_authority.to_string()
+    } else {
+        format!("{host_for_authority}:{port}")
+    };
+
+    let mut path = url.path().to_string();
+    if path.is_empty() {
+        path.push('/');
+    }
+    let endpoint_owns_query = match url.query() {
+        Some(query) if !query.is_empty() => {
+            path.push('?');
+            path.push_str(query);
+            true
+        }
+        _ => false,
+    };
+
+    Ok(CommittedStreamTarget {
+        scheme,
+        host,
+        port,
+        path,
+        authority,
+        endpoint_owns_query,
+    })
+}
+
+/// Whether the model still satisfies this provider's configured pattern policy.
+///
+/// Same rule as [`AiFederation::find_providers_for_model`] (empty patterns are a
+/// deliberate catch-all), factored out so the final backend-visible revalidation
+/// re-applies exactly the selection policy rather than a lookalike.
+fn provider_matches_model(provider: &ResolvedProvider, model: &str) -> bool {
+    provider.model_patterns.is_empty()
+        || provider
+            .model_patterns
+            .iter()
+            .any(|pattern| simple_glob_match(pattern, model))
+}
+
+/// The complete set of request headers a streaming claim owns at the provider
+/// boundary (`GHSA-xhp5-hqj8-3mwg`).
+///
+/// Applied twice by design: once when `before_proxy` claims the request, and
+/// again over the FINAL backend-visible header map after every later generic
+/// header transform. Idempotent, and it never logs a value.
+///
+/// Unlike the buffered path — which builds a fresh provider request and never
+/// exposes the client's own header map to the provider — this route-override
+/// path forwards the client's headers, so client credentials and gateway
+/// identity assertions must be stripped every time.
+fn apply_stream_boundary_headers(
+    provider: &ResolvedProvider,
+    authority: &str,
+    headers: &mut HashMap<String, String>,
+) {
+    strip_client_credentials(headers);
+    strip_gateway_identity_assertions(headers);
+    match &provider.auth {
+        AuthMethod::BearerToken { api_key } => {
+            // `strip_client_credentials` already removed every case variant of
+            // `authorization`, so this insert is the canonical one.
+            headers.insert("authorization".to_string(), format!("Bearer {api_key}"));
+        }
+        AuthMethod::CustomHeader {
+            header_name,
+            api_key,
+        } => {
+            remove_header_ci(headers, header_name);
+            headers.insert(header_name.clone(), api_key.clone());
+        }
+        // Unreachable for a claimed request: `stream_target_for` refuses these
+        // auth methods before a claim exists. Installing nothing is the
+        // fail-closed choice — the provider rejects the unauthenticated call
+        // rather than the gateway forwarding a client credential.
+        AuthMethod::AwsSigV4 { .. } | AuthMethod::GoogleOAuth2 { .. } => {}
+    }
+    remove_header_ci(headers, "host");
+    headers.insert("host".to_string(), authority.to_string());
+    remove_header_ci(headers, "content-type");
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    remove_header_ci(headers, "accept");
+    headers.insert("accept".to_string(), "text/event-stream".to_string());
+    // The SSE contract guard parses line-delimited plaintext events. Ask for
+    // identity so a content coding can never be misread as event bytes;
+    // `after_proxy` still fails closed if the provider ignores this.
+    remove_header_ci(headers, "accept-encoding");
+    headers.insert("accept-encoding".to_string(), "identity".to_string());
+}
+
+/// Fixed-cardinality client-visible reasons for a post-commit streaming
+/// failure. None of them echoes a provider byte, header, model, or URL.
+const STREAM_REASON_OVERSIZED_EVENT: &str =
+    "upstream provider emitted an oversized server-sent event";
+const STREAM_REASON_TRUNCATED: &str =
+    "upstream provider stream ended before the terminal completion marker";
+const STREAM_REASON_AFTER_TERMINAL: &str =
+    "upstream provider emitted stream data after the terminal completion marker";
+const STREAM_REASON_UNSUPPORTED_MEDIA: &str =
+    "upstream provider returned a successful response that is not an event stream";
+const STREAM_REASON_UNSUPPORTED_ENCODING: &str =
+    "upstream provider returned a content-encoded stream";
+
+/// Build the single terminal SSE error frame emitted when a committed stream
+/// fails after the response was already committed downstream.
+///
+/// Post-commit there is no status left to change and no second provider that may
+/// be spliced into the same logical stream, so the only protocol-correct action
+/// is one OpenAI-shaped error event followed by end of body. Deliberately does
+/// NOT emit `data: [DONE]`: a client must be able to tell a completed generation
+/// from a truncated one.
+fn stream_error_frame(reason: &'static str) -> Bytes {
+    let payload = json!({
+        "error": {
+            "message": reason,
+            "type": "upstream_error",
+            "param": Value::Null,
+            "code": "provider_stream_failed",
+        }
+    });
+    // `reason` is one of the fixed constants above and the envelope is built by
+    // `serde_json`, so this string is bounded and fully gateway-authored.
+    let mut frame = String::with_capacity(reason.len() + 128);
+    frame.push_str("event: error\ndata: ");
+    frame.push_str(&payload.to_string());
+    frame.push_str("\n\n");
+    Bytes::from(frame)
+}
+
+/// Terminal marker of the OpenAI Chat Completions SSE contract.
+const SSE_DONE_PAYLOAD: &str = "[DONE]";
+
+/// Return the drained carry allocation to the allocator once it exceeds this
+/// size, so one early large event cannot pin memory for the whole stream.
+const SSE_CARRY_COMPACT_BYTES: usize = 8 * 1024;
+
+/// Find the earliest SSE event terminator, returning the exclusive end offset of
+/// the complete event (terminator included).
+fn next_sse_event_end(buffer: &[u8]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (needle, len) in [
+        (b"\r\n\r\n".as_slice(), 4usize),
+        (b"\n\n".as_slice(), 2),
+        (b"\r\r".as_slice(), 2),
+    ] {
+        if let Some(index) = buffer
+            .windows(needle.len())
+            .position(|window| window == needle)
+        {
+            let end = index + len;
+            best = Some(best.map_or(end, |current: usize| current.min(end)));
+        }
+    }
+    best
+}
+
+/// Whether a complete raw event block is the terminal `data: [DONE]` marker.
+fn sse_event_is_done(event: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(event) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        line.strip_prefix("data:")
+            .is_some_and(|value| value.trim() == SSE_DONE_PAYLOAD)
+    })
+}
+
+/// Whether a complete raw event block carries any `data:` payload at all.
+///
+/// Comment-only blocks (`: keep-alive`) and bare retry/id fields are forwarded
+/// verbatim but must not count as post-terminal data.
+fn sse_event_has_data(event: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(event) else {
+        // Non-UTF-8 bytes cannot be an SSE field line per the WHATWG spec, so
+        // treat them as data and let the ordering rules decide.
+        return true;
+    };
+    text.lines().any(|line| {
+        line.strip_prefix("data:")
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
+/// Bounded, incremental guard over an OpenAI Chat Completions SSE stream.
+///
+/// The eligible providers already emit the client-visible contract, so this
+/// inspector forwards events verbatim and in order — preserving time to first
+/// token — while enforcing the parts of the contract a relay must not lose:
+///
+/// * one partial-event carry buffer, hard-bounded by `max_event_bytes`;
+/// * exactly ONE terminal `data: [DONE]` reaches the client;
+/// * no data after the terminal marker;
+/// * a truncated stream (clean EOF with no terminal marker, or a trailing
+///   partial event) fails closed with one gateway-authored error frame.
+///
+/// Retention is independent of stream length: at most one partial event plus the
+/// release buffer for the current chunk.
+struct FederationSseGuard {
+    buffer: Vec<u8>,
+    max_event_bytes: usize,
+    done_seen: bool,
+    terminated: bool,
+}
+
+impl FederationSseGuard {
+    fn new(max_event_bytes: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            max_event_bytes,
+            done_seen: false,
+            terminated: false,
+        }
+    }
+
+    fn fail_closed(&mut self, reason: &'static str) -> ResponseStreamAction {
+        self.terminated = true;
+        // Drop retained provider bytes as soon as the stream is cut: nothing
+        // downstream may observe them, and holding them would keep the ceiling
+        // occupied for the remainder of the request.
+        self.buffer = Vec::new();
+        ResponseStreamAction::Terminate(Some(stream_error_frame(reason)))
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for FederationSseGuard {
+    fn stage(&self) -> ResponseStreamInspectorStage {
+        // Provider/protocol contract adapter: run before policy inspectors so a
+        // guardrail sees exactly the client-visible event sequence.
+        ResponseStreamInspectorStage::Normalize
+    }
+
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        if self.terminated {
+            return ResponseStreamAction::Forward(Bytes::new());
+        }
+        // Admit the chunk first, then drain every COMPLETE event out of the
+        // carry buffer, and only refuse if what remains — a single unterminated
+        // event — is over the ceiling. Refusing on `buffer + chunk` instead
+        // would cut a legitimate stream whose event boundary happens to straddle
+        // the read. Peak retention is therefore one ceiling plus one transport
+        // read, and it does not grow with stream length.
+        self.buffer.extend_from_slice(chunk);
+
+        let mut release: Vec<u8> = Vec::new();
+        while let Some(end) = next_sse_event_end(&self.buffer) {
+            let event: Vec<u8> = self.buffer.drain(..end).collect();
+            if sse_event_is_done(&event) {
+                if self.done_seen {
+                    // Exactly one terminal marker reaches the client; a repeated
+                    // marker is dropped rather than duplicated downstream.
+                    continue;
+                }
+                self.done_seen = true;
+                release.extend_from_slice(&event);
+                continue;
+            }
+            if self.done_seen && sse_event_has_data(&event) {
+                if !release.is_empty() {
+                    // Bytes already cleared for release in THIS chunk still go
+                    // out; the terminate frame follows them.
+                    let mut out = release;
+                    out.extend_from_slice(&stream_error_frame(STREAM_REASON_AFTER_TERMINAL));
+                    self.terminated = true;
+                    self.buffer = Vec::new();
+                    return ResponseStreamAction::Terminate(Some(Bytes::from(out)));
+                }
+                return self.fail_closed(STREAM_REASON_AFTER_TERMINAL);
+            }
+            release.extend_from_slice(&event);
+        }
+
+        if self.buffer.len() > self.max_event_bytes {
+            return self.fail_closed(STREAM_REASON_OVERSIZED_EVENT);
+        }
+        // Release the carry allocation once it is drained, so a single early
+        // large event cannot pin the ceiling for the rest of the stream.
+        if self.buffer.is_empty() && self.buffer.capacity() > SSE_CARRY_COMPACT_BYTES {
+            self.buffer = Vec::new();
+        }
+        ResponseStreamAction::Forward(Bytes::from(release))
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        if self.terminated {
+            return ResponseStreamAction::Forward(Bytes::new());
+        }
+        // A trailing partial event or a missing terminal marker both mean the
+        // client would otherwise be unable to distinguish a complete generation
+        // from a cut connection.
+        if !self.buffer.is_empty() || !self.done_seen {
+            self.terminated = true;
+            self.buffer = Vec::new();
+            return ResponseStreamAction::Terminate(Some(stream_error_frame(
+                STREAM_REASON_TRUNCATED,
+            )));
+        }
+        ResponseStreamAction::Forward(Bytes::new())
+    }
+
+    fn on_downstream_terminated(&mut self) {
+        self.buffer = Vec::new();
+        self.terminated = true;
+    }
+}
+
+/// Emit exactly one gateway-authored terminal error frame and end the body.
+///
+/// Used when a claimed 2xx response is already committed downstream but is not a
+/// usable event stream (wrong media type, or a content coding the guard refuses
+/// to parse). Headers are gone by then, so truncation with a typed error event
+/// is the only protocol-correct answer.
+struct FederationImmediateStreamError {
+    reason: &'static str,
+    emitted: bool,
+}
+
+impl FederationImmediateStreamError {
+    fn new(reason: &'static str) -> Self {
+        Self {
+            reason,
+            emitted: false,
+        }
+    }
+
+    fn take(&mut self) -> ResponseStreamAction {
+        if self.emitted {
+            return ResponseStreamAction::Forward(Bytes::new());
+        }
+        self.emitted = true;
+        ResponseStreamAction::Terminate(Some(stream_error_frame(self.reason)))
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for FederationImmediateStreamError {
+    fn stage(&self) -> ResponseStreamInspectorStage {
+        ResponseStreamInspectorStage::Normalize
+    }
+
+    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        self.take()
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        self.take()
+    }
+}
+
+impl AiFederation {
+    /// Resolve the provider claim owned by THIS instance, if any.
+    ///
+    /// Ownership comes from the private typed claim, never from
+    /// `ai_federation_provider` metadata: multiple `ai_federation` instances may
+    /// be effective on one proxy and two of them may carry the same provider
+    /// NAME with different endpoints and different keys, so a name match would
+    /// let the losing instance install the wrong credential
+    /// (`GHSA-xhp5-hqj8-3mwg`).
+    fn owned_stream_claim<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+    ) -> Option<(&'a AiStreamRouterClaim, &'a ResolvedProvider)> {
+        let claim = ctx.ai_stream_router_claim.as_deref()?;
+        if claim.owner() != self.stream_owner_id {
+            return None;
+        }
+        let provider = self.providers.get(claim.provider_index())?;
+        Some((claim, provider))
+    }
+
+    /// Pre-commit provider selection and route commitment for a streaming
+    /// request (issue #3298).
+    ///
+    /// THE COMMIT BOUNDARY: everything in this function runs before a single
+    /// downstream-visible response byte exists, so trying the next matching
+    /// provider here is safe and is the ONLY place federation fallback may
+    /// happen for a stream. Once the claim is written the routing decision, the
+    /// credential, and the destination are committed exactly once and consumed
+    /// by the ordinary dispatch path; no later phase may splice a second
+    /// provider into the same logical stream.
+    fn claim_streaming_request(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        openai_body: &Value,
+        model: &str,
+    ) -> PluginResult {
+        // Index-based selection: the claim records an INDEX into this
+        // instance's own provider list (a name could be duplicated across
+        // instances), so selection must yield indices rather than borrows.
+        // Same predicate and same priority order as
+        // [`AiFederation::find_providers_for_model`].
+        let matching_providers: Vec<usize> = self
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| provider_matches_model(provider, model))
+            .map(|(index, _)| index)
+            .collect();
+        if matching_providers.is_empty() {
+            if self.fail_on_no_matching_provider {
+                let echoed_model = truncate_model_for_error(model);
+                return self.openai_error_response(
+                    404,
+                    &format!("No ai_federation provider is configured for model '{echoed_model}'"),
+                    "invalid_request_error",
+                    Some("model"),
+                    Some("model_not_found"),
+                );
+            }
+            return PluginResult::Continue;
+        }
+
+        // Client-representation validation reuses the buffered path's rules so a
+        // streaming request is not admitted under a weaker contract. Multimodal
+        // relaxation is deliberately NOT offered here: the eligible providers
+        // are OpenAI-compatible, so the strict check is the provider contract.
+        if let Err(message) = validate_openai_request(openai_body, false) {
+            return self.openai_error_response(
+                400,
+                &message,
+                "invalid_request_error",
+                None,
+                Some("invalid_request"),
+            );
+        }
+
+        let mut attempts: u32 = 0;
+        let mut last_ineligibility: Option<StreamIneligibility> = None;
+        let mut skipped_open_circuit = false;
+
+        for provider_index in matching_providers {
+            let Some(provider) = self.providers.get(provider_index) else {
+                continue;
+            };
+            // A provider whose circuit is open is skipped exactly like the
+            // buffered path; with fallback disabled the first such provider is
+            // terminal.
+            if provider
+                .circuit
+                .as_ref()
+                .is_some_and(|circuit| !ProviderCircuit::may_admit(circuit))
+            {
+                skipped_open_circuit = true;
+                super::prometheus_metrics::global_registry().record_ai_federation_open_skip();
+                ctx.metadata.insert(
+                    "ai_federation_circuit_last_provider".to_string(),
+                    provider.name.clone(),
+                );
+                ctx.metadata.insert(
+                    "ai_federation_circuit_last_state".to_string(),
+                    "open".to_string(),
+                );
+                if !self.fallback_enabled {
+                    return self.openai_error_response(
+                        503,
+                        "The selected AI provider circuit is open and fallback is disabled",
+                        "server_error",
+                        None,
+                        Some("provider_circuit_open"),
+                    );
+                }
+                continue;
+            }
+
+            let resolved_model = Self::resolve_model(provider, model);
+            if provider_embeds_model_in_url(provider.provider_type)
+                && !is_valid_url_model_component(&resolved_model)
+            {
+                // Same rule as the buffered path: never fall through to another
+                // provider with an attacker-shaped URL path component.
+                return self.openai_error_response(
+                    400,
+                    "Invalid 'model' field: must contain only alphanumeric characters, dot, hyphen, underscore, or colon",
+                    "invalid_request_error",
+                    Some("model"),
+                    Some("invalid_model"),
+                );
+            }
+
+            let target = match stream_target_for(provider, &resolved_model) {
+                Ok(target) => target,
+                Err(reason) => {
+                    last_ineligibility = Some(reason);
+                    attempts = attempts.saturating_add(1);
+                    if self.fallback_enabled {
+                        continue;
+                    }
+                    break;
+                }
+            };
+            attempts = attempts.saturating_add(1);
+
+            // --- COMMIT. Nothing below may fail over to another provider. ---
+            let committed_query = if target.endpoint_owns_query {
+                // The endpoint carries its own query and it is already folded
+                // into the absolute override path; commit an EMPTY appendable
+                // query so no later rule can add a second `?` or a
+                // normal-backend secret.
+                String::new()
+            } else {
+                crate::proxy::effective_backend_query_string(ctx).into_owned()
+            };
+
+            ctx.route_override_backend_scheme = Some(target.scheme);
+            ctx.route_override_backend_host = Some(target.host.clone());
+            ctx.route_override_backend_port = Some(target.port);
+            ctx.route_override_path = Some(target.path.clone());
+            ctx.route_override_path_is_absolute = true;
+            ctx.route_override_authority = Some(target.authority.clone());
+            // A direct provider endpoint, never an upstream/load-balancer
+            // identity: a load balancer must not pick the dial target while this
+            // provider's credential is installed (`GHSA-xhp5-hqj8-3mwg`).
+            ctx.route_override_upstream_id = None;
+            // Host TEXT equality is not destination equality: revoke any
+            // inherited `Proxy.dns_override` explicitly.
+            ctx.route_override_dns_policy = super::RouteOverrideDnsPolicy::ClearInherited;
+            ctx.route_override_resolved_tls = if target.scheme == BackendScheme::Https {
+                Some(BackendTlsConfig::default_verify())
+            } else {
+                // Plaintext provider: no committed TLS configuration at all,
+                // pinned so the witness cannot be satisfied by a later plugin
+                // ADDING one.
+                None
+            };
+
+            apply_stream_boundary_headers(provider, &target.authority, headers);
+
+            let committed_tls = ctx.route_override_resolved_tls.clone();
+            ctx.ai_stream_router_claim = Some(Box::new(mint_external_provider_claim(
+                ExternalProviderClaimParts {
+                    owner: self.stream_owner_id,
+                    provider_index,
+                    model: model.to_string(),
+                    scheme: target.scheme,
+                    host: target.host,
+                    port: target.port,
+                    path: target.path,
+                    authority: target.authority,
+                    resolved_tls: committed_tls,
+                    committed_query,
+                },
+            )));
+
+            // Metadata is observability / cross-plugin coordination ONLY. No
+            // enforcement point below reads any of it back.
+            ctx.metadata
+                .insert(META_STREAM_CLAIMED.to_string(), "true".to_string());
+            ctx.metadata
+                .insert(META_STREAMING_SHARED.to_string(), "true".to_string());
+            ctx.metadata
+                .insert("ai_federation_provider".to_string(), provider.name.clone());
+            ctx.metadata.insert(
+                META_STREAM_PROVIDER_TYPE.to_string(),
+                provider.provider_type.as_str().to_string(),
+            );
+            ctx.metadata
+                .insert(META_STREAM_ATTEMPTS.to_string(), attempts.to_string());
+            // The provider is a third party: proxy core must not append the
+            // gateway-asserted `x-consumer-*` identity headers after the strip
+            // above. The final header policy removes any a later rule adds back.
+            ctx.metadata.insert(
+                SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY.to_string(),
+                "true".to_string(),
+            );
+
+            debug!(
+                provider = %provider.name,
+                provider_type = %provider.provider_type.as_str(),
+                "ai_federation: committed streaming provider and rewrote route"
+            );
+            return PluginResult::Continue;
+        }
+
+        ctx.metadata
+            .insert(META_STREAM_ATTEMPTS.to_string(), attempts.to_string());
+        if let Some(reason) = last_ineligibility {
+            return self.openai_error_response(
+                501,
+                reason.message(),
+                "invalid_request_error",
+                Some("stream"),
+                Some(reason.code()),
+            );
+        }
+        if skipped_open_circuit {
+            return self.openai_error_response(
+                503,
+                "All matching AI provider circuits are open",
+                "server_error",
+                None,
+                Some("provider_circuit_open"),
+            );
+        }
+        self.openai_error_response(
+            502,
+            "No matching AI provider could be committed for streaming",
+            "server_error",
+            None,
+            Some("provider_error"),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin trait implementation
 // ---------------------------------------------------------------------------
 
@@ -5007,10 +5883,382 @@ impl Plugin for AiFederation {
         if ctx.method != "POST" {
             return false;
         }
+        // Once THIS instance owns a streaming claim, its final model and
+        // destination policy must run with a RequestContext even if a later
+        // header transform temporarily relabels the body as non-JSON. The final
+        // backend-header policy restores the provider's JSON contract, so a
+        // mutable `Content-Type` must not be able to suppress the claim owner's
+        // revalidation.
+        if self.owned_stream_claim(ctx).is_some() {
+            return true;
+        }
         let Some(content_type) = ctx.headers.get("content-type") else {
             return false;
         };
         is_json_content_type(content_type)
+    }
+
+    /// The streaming claim is decided from the CLIENT representation, which the
+    /// proxy only publishes into `ctx.metadata["request_body"]` when a plugin
+    /// asks for the pre-`before_proxy` buffer.
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.streaming.enabled
+    }
+
+    fn modifies_request_headers(&self) -> bool {
+        // A claimed stream strips client credentials and installs the provider
+        // credential, `Host`, `Accept`, and `Accept-Encoding`.
+        self.streaming.enabled
+    }
+
+    fn modifies_request_destination(&self) -> bool {
+        // A claimed stream replaces the backend scheme/host/port, authority, and
+        // path with the committed provider destination.
+        self.streaming.enabled
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        // The final revalidation consumes the private claim, so the H1/H2
+        // dispatch path must supply the request context to that hook.
+        self.streaming.enabled
+    }
+
+    fn requires_response_stream_hooks(&self) -> bool {
+        self.streaming.enabled
+    }
+
+    fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
+        // Only for requests THIS instance claimed, so the SSE contract guard is
+        // guaranteed to be wired. Everything else stays on the fast path.
+        self.streaming.enabled && self.owned_stream_claim(ctx).is_some()
+    }
+
+    /// Claim a streaming Chat Completions request and commit exactly one
+    /// provider before any downstream-visible byte exists (issue #3298).
+    ///
+    /// This is the ONLY federation phase that may choose between providers for a
+    /// stream. It runs before dispatch, so a pre-commit failure is invisible to
+    /// the client and safe to fail over; after it returns, the provider is fixed
+    /// for the life of the response.
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if !self.streaming.enabled || ctx.method != "POST" {
+            return PluginResult::Continue;
+        }
+        // First claim wins, across BOTH plugin types. `ai_stream_router` claims
+        // at priority 2984 and this hook runs at 4060, so a router-claimed
+        // request is already bound to a provider and must not be re-routed
+        // (`GHSA-xhp5-hqj8-3mwg`). A second `ai_federation` instance yields for
+        // the same reason.
+        if ctx.ai_stream_router_claim.is_some() {
+            return PluginResult::Continue;
+        }
+        // Intentional router pass-through: the operator disabled fail-closed
+        // missing/unmatched-model behavior there, so the request is genuinely
+        // unclaimed and this plugin may still decide it.
+        let content_type = headers
+            .get("content-type")
+            .map(String::as_str)
+            .unwrap_or("");
+        if !is_json_content_type(content_type) {
+            return PluginResult::Continue;
+        }
+        // Only a UTF-8 JSON client body can carry an OpenAI streaming request.
+        // A missing/non-UTF-8 body is not claimable here; the buffered egress
+        // hook still applies its own fail-closed policy to it.
+        let Some(body_str) = ctx.metadata.get("request_body") else {
+            return PluginResult::Continue;
+        };
+        let Ok(openai_body) = serde_json::from_str::<Value>(body_str) else {
+            return PluginResult::Continue;
+        };
+        // Non-streaming requests keep the existing buffered behavior verbatim.
+        if !request_wants_streaming(&openai_body) {
+            return PluginResult::Continue;
+        }
+
+        let model = match openai_body.get("model") {
+            Some(Value::String(model)) if !model.is_empty() => model.clone(),
+            _ => {
+                if self.fail_on_missing_model {
+                    return self.openai_error_response(
+                        400,
+                        "Missing or invalid 'model' field: expected a non-empty string",
+                        "invalid_request_error",
+                        Some("model"),
+                        Some("missing_model"),
+                    );
+                }
+                return PluginResult::Continue;
+            }
+        };
+        if !is_valid_model_identifier(&model) {
+            return self.openai_error_response(
+                400,
+                "Invalid 'model' field: use a bounded provider model identifier without URL query, fragment, userinfo, traversal, whitespace, or control characters",
+                "invalid_request_error",
+                Some("model"),
+                Some("invalid_model"),
+            );
+        }
+
+        self.claim_streaming_request(ctx, headers, &openai_body, &model)
+    }
+
+    fn enforces_final_backend_header_policy(&self) -> bool {
+        self.streaming.enabled
+    }
+
+    /// Re-assert the provider credential boundary over the FINAL backend-visible
+    /// header map (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// `before_proxy` already applied it, but a later generic header rule, a
+    /// deferred routing pass, or a `pre_proxy` backend overlay can add,
+    /// overwrite, or rename the credential afterwards. The gateway calls this
+    /// wherever the outbound map is complete, so the last word is this policy.
+    fn enforce_final_backend_header_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        let Some((claim, provider)) = self.owned_stream_claim(ctx) else {
+            return;
+        };
+        apply_stream_boundary_headers(provider, claim.authority(), headers);
+    }
+
+    /// Revalidate the FINAL provider-visible body and route against the policy
+    /// that selected the provider (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// Fail-closed with fixed-cardinality diagnostics: the offending model,
+    /// header, or body bytes are never echoed or logged.
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        let (provider_index, destination_intact, committed_model) = {
+            let Some((claim, _)) = self.owned_stream_claim(ctx) else {
+                return PluginResult::Continue;
+            };
+            (
+                claim.provider_index(),
+                claim.destination_intact(ctx),
+                claim.model().to_string(),
+            )
+        };
+
+        // The credential installed at the boundary is only safe if it still goes
+        // to the destination that claimed it: same visible endpoint, no upstream
+        // identity, byte-identical backend TLS, provider-DNS decision intact.
+        // The backend-visible QUERY needs no check here — it is re-asserted from
+        // the claim at `crate::proxy::effective_backend_query_string*`, the
+        // single capture funnel every dispatcher and retry goes through.
+        if !destination_intact {
+            return self.openai_error_response(
+                500,
+                "The routed AI provider destination changed after provider selection",
+                "api_error",
+                None,
+                Some("provider_policy_violation"),
+            );
+        }
+
+        // A duplicate `model` member makes the provider-visible generation
+        // parser-dependent (`serde_json` keeps the last occurrence, a first-wins
+        // provider parser reads the other), so an equality check against either
+        // proves nothing. Screen with the shared bounded scanner before parsing.
+        if ctx.json_scan_memo.ambiguity(body).is_some() {
+            return self.openai_error_response(
+                400,
+                "The final AI provider request body has ambiguous duplicate JSON members",
+                "invalid_request_error",
+                Some("model"),
+                Some("model_policy_violation"),
+            );
+        }
+
+        let Some(provider) = self.providers.get(provider_index) else {
+            return self.openai_error_response(
+                500,
+                "The routed AI provider could not be revalidated before dispatch",
+                "api_error",
+                None,
+                Some("provider_policy_violation"),
+            );
+        };
+        let Ok(final_body) = serde_json::from_slice::<Value>(body) else {
+            return self.openai_error_response(
+                400,
+                "The final AI provider request body is not valid JSON after request transforms",
+                "invalid_request_error",
+                Some("model"),
+                Some("model_policy_violation"),
+            );
+        };
+        let final_model = match final_body.get("model") {
+            Some(Value::String(model)) if !model.is_empty() => model.as_str(),
+            _ => {
+                return self.openai_error_response(
+                    400,
+                    "The final AI provider request body has no usable 'model' field",
+                    "invalid_request_error",
+                    Some("model"),
+                    Some("model_policy_violation"),
+                );
+            }
+        };
+        // The provider sees the RESOLVED model, which `model_mapping` /
+        // `default_model` may rename; compare against the resolution of the
+        // committed client model rather than the client model itself, then
+        // re-check the committed model against this provider's configured
+        // pattern policy.
+        let expected_model = Self::resolve_model(provider, &committed_model);
+        if final_model != expected_model || !provider_matches_model(provider, &committed_model) {
+            return self.openai_error_response(
+                400,
+                "The final AI provider request model does not match the routed model policy",
+                "invalid_request_error",
+                Some("model"),
+                Some("model_policy_violation"),
+            );
+        }
+        // A streaming claim is only committed for a request that asked for one;
+        // a later transform must not be able to turn it into a buffered call the
+        // response pipeline is no longer shaped for.
+        if !request_wants_streaming(&final_body) {
+            return self.openai_error_response(
+                400,
+                "The final AI provider request no longer requests a streamed response",
+                "invalid_request_error",
+                Some("stream"),
+                Some("model_policy_violation"),
+            );
+        }
+
+        PluginResult::Continue
+    }
+
+    /// Response-header handling for a claimed stream.
+    ///
+    /// Runs before any body byte is released, so this is the LAST point a
+    /// claimed stream can still fail with a real status. Records circuit
+    /// outcome, refuses a content-coded stream, and drops framing metadata that
+    /// an event stream must not carry.
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        let provider_index = {
+            let Some((claim, _)) = self.owned_stream_claim(ctx) else {
+                return PluginResult::Continue;
+            };
+            claim.provider_index()
+        };
+        let Some(provider) = self.providers.get(provider_index) else {
+            return PluginResult::Continue;
+        };
+
+        ctx.metadata.insert(
+            "ai_federation_status".to_string(),
+            response_status.to_string(),
+        );
+        // The provider produced response headers, so the billable operation has
+        // a committed outcome. Same marker discipline as the buffered path.
+        ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
+        ctx.metadata.insert(
+            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+
+        if let Some(circuit) = &provider.circuit {
+            // Streaming admits only closed/half-open-eligible circuits and holds
+            // no probe guard across hooks, so the outcome is recorded against a
+            // plain closed admission.
+            if (200..300).contains(&response_status) {
+                circuit.record_success(&provider.name, CircuitAdmission::Closed);
+            } else {
+                circuit.record_failure(&provider.name, CircuitAdmission::Closed);
+            }
+        }
+
+        if !(200..300).contains(&response_status) {
+            // A provider error envelope reaches the client untouched, with its
+            // real status. This is still PRE-commit for the body, so no stream
+            // was spliced and none is owed.
+            return PluginResult::Continue;
+        }
+
+        let content_encoding_present = response_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-encoding")
+                && !value.trim().is_empty()
+                && !value.trim().eq_ignore_ascii_case("identity")
+        });
+        if content_encoding_present {
+            // The boundary asked for `identity`. A content-coded stream cannot
+            // be contract-checked incrementally here, and silently relaying it
+            // would hand the client bytes the guard never validated.
+            return self.openai_error_response(
+                502,
+                STREAM_REASON_UNSUPPORTED_ENCODING,
+                "upstream_error",
+                None,
+                Some("unsupported_content_encoding"),
+            );
+        }
+        let content_type_is_event_stream = response_headers
+            .get("content-type")
+            .is_some_and(|value| is_event_stream_content_type(value));
+        if !content_type_is_event_stream {
+            return self.openai_error_response(
+                502,
+                STREAM_REASON_UNSUPPORTED_MEDIA,
+                "upstream_error",
+                None,
+                Some("unsupported_content_type"),
+            );
+        }
+        // An event stream is unbounded: a framing length from the provider is
+        // never correct for the relayed representation.
+        remove_header_ci(response_headers, "content-length");
+        PluginResult::Continue
+    }
+
+    /// Install the bounded SSE contract guard over a claimed provider stream.
+    fn response_stream_inspector(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        content_type: Option<&str>,
+    ) -> Option<Box<dyn ResponseStreamInspector>> {
+        if !self.streaming.enabled {
+            return None;
+        }
+        // Ownership from the private claim, never from metadata: a second
+        // instance must not install a guard over another instance's stream.
+        self.owned_stream_claim(ctx)?;
+        if !(200..300).contains(&response_status) {
+            return None;
+        }
+        match content_type {
+            Some(value) if is_event_stream_content_type(value) => {
+                Some(Box::new(FederationSseGuard::new(
+                    self.streaming.max_event_bytes,
+                )))
+            }
+            // `after_proxy` already refuses this shape with a real status; this
+            // arm is the fail-closed backstop for a dispatch path that reaches
+            // the body without it, where truncation is the only answer left.
+            _ => Some(Box::new(FederationImmediateStreamError::new(
+                STREAM_REASON_UNSUPPORTED_MEDIA,
+            ))),
+        }
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -5202,22 +6450,29 @@ impl Plugin for AiFederation {
             return PluginResult::Continue;
         }
 
-        // Streaming is not supported by the terminate-and-respond design. We
-        // only check after model routing has found a provider; missing models
-        // and unmatched models have already followed the configured fail-closed
-        // or explicit pass-through policy. Reject with a clear, OpenAI-shaped
-        // error rather than forwarding `stream: true` to the provider — which
-        // would either yield an SSE body that fails JSON normalization (opaque
-        // 502) or silently degrade to a single buffered object for the
-        // translating providers. See finding #11.
+        // A streaming request that reaches the BUFFERED egress phase was not
+        // claimed by the streaming path: either `streaming.enabled` is false, or
+        // the claim declined this request (no model, no matching provider, or a
+        // non-JSON/non-UTF-8 client body under an explicit pass-through opt-in).
+        // The terminate-and-respond path cannot serve it — forwarding
+        // `stream: true` would either yield an SSE body that fails JSON
+        // normalization (opaque 502) or silently degrade to one buffered object
+        // for the translating providers — so fail closed with a diagnostic that
+        // names the supported configuration (issue #3298).
         if request_wants_streaming(&openai_body) {
             debug!(
                 model = %model,
-                "ai_federation: rejecting streaming request — streaming responses are not supported"
+                streaming_enabled = self.streaming.enabled,
+                "ai_federation: rejecting streaming request on the buffered execution path"
             );
+            let message = if self.streaming.enabled {
+                "Streaming responses (\"stream\": true) were not committed to a provider by ai_federation for this request"
+            } else {
+                "Streaming responses (\"stream\": true) are disabled for ai_federation; enable the 'streaming' block to relay provider streams incrementally"
+            };
             return self.openai_error_response(
                 501,
-                "Streaming responses (\"stream\": true) are not supported by ai_federation",
+                message,
                 "invalid_request_error",
                 Some("stream"),
                 Some("streaming_not_supported"),
@@ -5945,6 +7200,63 @@ pub mod test_helpers {
     /// the deterministic pre-I/O concurrency rejection path.
     pub fn close_request_slots_for_test(plugin: &AiFederation) {
         plugin.request_slots.close();
+    }
+
+    /// Streaming bound constants used by external schema/parity tests.
+    pub fn streaming_bounds_for_test() -> (usize, usize, usize) {
+        (
+            DEFAULT_MAX_STREAM_EVENT_BYTES,
+            MIN_STREAM_EVENT_BYTES,
+            MAX_STREAM_EVENT_BYTES,
+        )
+    }
+
+    /// Whether this instance admits streaming requests, and its event ceiling.
+    pub fn streaming_policy_for_test(plugin: &AiFederation) -> (bool, usize) {
+        (plugin.streaming.enabled, plugin.streaming.max_event_bytes)
+    }
+
+    /// Observable projection of the private streaming claim THIS instance owns.
+    ///
+    /// Returns `(provider_name, committed_absolute_path, committed_query)`.
+    /// Deliberately never exposes the ownership token, credential, or TLS
+    /// material — tests assert routing, not claim internals.
+    pub fn owned_stream_claim_for_test(
+        plugin: &AiFederation,
+        ctx: &RequestContext,
+    ) -> Option<(String, String, String)> {
+        let (claim, provider) = plugin.owned_stream_claim(ctx)?;
+        Some((
+            provider.name.clone(),
+            ctx.route_override_path.clone().unwrap_or_default(),
+            claim.committed_query().to_string(),
+        ))
+    }
+
+    /// Whether any provider claim (this plugin's or `ai_stream_router`'s) is
+    /// recorded on the context.
+    pub fn has_provider_claim_for_test(ctx: &RequestContext) -> bool {
+        ctx.ai_stream_router_claim.is_some()
+    }
+
+    /// Construct the bounded SSE contract guard for direct behavioral tests.
+    pub fn sse_guard_for_test(max_event_bytes: usize) -> Box<dyn ResponseStreamInspector> {
+        Box::new(FederationSseGuard::new(max_event_bytes))
+    }
+
+    /// Streaming eligibility decision for a configured provider index, as a
+    /// stable diagnostic code (`None` when the provider is eligible).
+    pub fn stream_ineligibility_code_for_test(
+        plugin: &AiFederation,
+        index: usize,
+        model: &str,
+    ) -> Option<&'static str> {
+        let provider = plugin.providers.get(index)?;
+        let resolved = AiFederation::resolve_model(provider, model);
+        match stream_target_for(provider, &resolved) {
+            Ok(_) => None,
+            Err(reason) => Some(reason.code()),
+        }
     }
 
     /// Resource-bound constants used by external runtime/schema parity tests.

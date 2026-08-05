@@ -571,9 +571,9 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ai_federation",
         classification: BuiltinPluginClassification::Public,
         priority: 4060,
-        active_phases: "finalized request egress (HTTP only)",
+        active_phases: "before_proxy, finalized request egress, enforce_final_backend_header_policy, on_final_request_body_with_context, after_proxy, response_stream_inspector (HTTP only)",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
-        protocol_rationale: "HTTP-only; routes final OpenAI JSON bodies to providers and normalizes bounded responses",
+        protocol_rationale: "HTTP-only; routes final OpenAI JSON bodies to providers, normalizes bounded responses, and relays committed provider SSE incrementally",
     },
     BuiltinPluginParityMeta {
         name: "ai_response_guard",

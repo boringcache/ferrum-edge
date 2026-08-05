@@ -23940,7 +23940,7 @@ components:
     AiFederationConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Dispatches from the finalized-request-egress phase after request-body transforms and the complete final request-policy hook pass, so priority_override cannot move provider I/O ahead of WAF/OpenAPI/body/size policy. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) return 501. Priority fallback is allowed for configured statuses, malformed provider success responses, and proven pre-wire transport failures. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
+      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Dispatches from the finalized-request-egress phase after request-body transforms and the complete final request-policy hook pass, so priority_override cannot move provider I/O ahead of WAF/OpenAPI/body/size policy. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) are served by a separate non-buffering path that is OFF by default: with the root `streaming` block enabled, before_proxy commits exactly ONE provider before any downstream-visible byte and rewrites the routing decision through route_override_* so the ordinary dispatch path relays provider SSE incrementally. Provider fallback for a stream happens only during that pre-commit selection (open circuit, ineligible provider, unusable endpoint); after the commit no second provider is ever spliced into the same logical stream, and a post-commit failure truncates with one gateway-authored terminal SSE `error` event. Streaming eligibility is narrow: only providers whose native streaming wire format already is the OpenAI Chat Completions SSE contract (openai, mistral, xai, deepseek, meta_llama, hugging_face, azure_openai) with a static header credential. anthropic, google_gemini, google_vertex, aws_bedrock, and cohere, and any provider using AWS SigV4 or Google OAuth2, fail closed with a field-specific 501 — use ai_stream_router for Anthropic/Gemini streaming translation. With `streaming.enabled` the plugin declares a backend-boundary header policy plus request header/destination mutation, so it can no longer be composed with request_deduplication or response_caching on the same proxy. Streaming is disabled by default and `stream: true` then returns 501 as before. Priority fallback is allowed for configured statuses, malformed provider success responses, and proven pre-wire transport failures. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
       required: [providers]
       properties:
         providers:
@@ -24191,6 +24191,21 @@ components:
           maximum: 4096
           default: 64
           description: Maximum simultaneous federation provider chains, including fallback and OAuth work. Excess requests fail with 503 without queueing.
+        streaming:
+          type: object
+          additionalProperties: false
+          description: "Incremental provider response streaming for OpenAI Chat Completions requests with `stream: true`. Disabled by default; when absent, streaming requests keep returning 501 and non-streaming federation behavior is unchanged."
+          properties:
+            enabled:
+              type: boolean
+              default: false
+              description: "Claim streaming requests in before_proxy and commit one eligible provider before any downstream-visible byte. Enabling this makes the plugin declare a backend-boundary header policy and request header/destination mutation, so it can no longer be composed with request_deduplication or response_caching on the same proxy."
+            max_event_bytes:
+              type: integer
+              minimum: 4096
+              maximum: 1048576
+              default: 262144
+              description: "Ceiling on one retained partial server-sent event. This is the whole retained state of a claimed stream — there is exactly one carry buffer per response and no queue — so retention does not grow with stream length. An event that exceeds it fails closed with a fixed-cardinality terminal SSE error event that never echoes provider bytes."
 
     AiStreamRouterConfig:
       type: object

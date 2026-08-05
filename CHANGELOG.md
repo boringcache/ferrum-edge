@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ai_federation` incremental provider response streaming behind a new root
+  `streaming` block (issue #3298). With `streaming.enabled`, an OpenAI Chat
+  Completions request carrying `"stream": true` is claimed in `before_proxy`,
+  bound to exactly ONE provider, and routed through `RequestContext.route_override_*`
+  so the ordinary proxy dispatch path relays provider SSE incrementally — time
+  to first token, client-disconnect cancellation, byte budgets, and shutdown
+  accounting all come from the shared streaming response machinery, and the
+  plugin adds no queues, channels, or detached tasks of its own. The provider
+  commit boundary is fail-closed: fallback across providers happens only during
+  pre-commit selection (open circuit, streaming-ineligible provider, unusable
+  endpoint), and after the claim no second provider is ever spliced into the
+  same logical stream — a post-commit failure truncates with one
+  gateway-authored terminal SSE `error` event. Streaming eligibility is limited
+  to providers whose native streaming wire format already is the OpenAI SSE
+  contract (`openai`, `mistral`, `xai`, `deepseek`, `meta_llama`,
+  `hugging_face`, `azure_openai`) with a static header credential; `anthropic`,
+  `google_gemini`, `google_vertex`, `aws_bedrock`, `cohere`, and any AWS
+  SigV4 / Google OAuth2 provider fail closed with a field-specific `501` and
+  belong to `ai_stream_router`. A claimed stream retains exactly one partial SSE
+  event (`streaming.max_event_bytes`, 4 KiB–1 MiB, default 256 KiB); oversized
+  events, data after the terminal marker, a duplicated terminal marker, a
+  truncated stream, a content-coded stream, and a non-`text/event-stream` 2xx
+  all fail closed with fixed-cardinality reasons that never echo a provider
+  byte, header, model, or URL. The claim mints the same private provider claim
+  `ai_stream_router` uses, so `request_mirror`, `serverless_function`,
+  `mcp_gateway`, and `mesh_route_dispatch` stand down identically, and
+  `enforce_final_backend_header_policy` plus `on_final_request_body_with_context`
+  re-assert the credential, destination, and committed model over the finalized
+  backend-visible request (GHSA-xhp5-hqj8-3mwg).
 - NodeWaypoint captured TCP observability now exports the bounded-cardinality
   `ferrum_mesh_bpf_accept_to_first_byte_microseconds` histogram for IPv4 and
   IPv6. SOCK_OPS timestamps passive establishment and enrolls the exact accepted
@@ -350,6 +379,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `ai_federation` config admission: a root `streaming` key is now the supported
+  streaming opt-in and must be an object (issue #3298). `stream`,
+  `streaming_enabled`, and `enable_streaming` are still rejected at every scope,
+  and a per-provider `streaming` key is rejected with a scope-specific
+  diagnostic. Enabling `streaming` makes the plugin declare a backend-boundary
+  header policy plus request header/destination mutation, so such an instance can
+  no longer be composed with `request_deduplication` or `response_caching` on the
+  same proxy; instances without the block are unaffected.
 - Required CI owners now declare `merge_group` triggers and event-aware
   base/head selection so a future `main` merge queue can run the six required
   checks (`Tests`, `Merge Coverage`, `Gateway API Conformance`,
