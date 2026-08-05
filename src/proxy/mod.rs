@@ -36119,6 +36119,15 @@ fn buffered_collect_retain_failure(
 /// index, and within one upstream two entries sharing a pod IP and port but
 /// naming different Services or policy lanes get distinct tokens.
 ///
+/// `target` here is the CONFIGURED target identity, already resolved by
+/// [`crate::load_balancer::LoadBalancer::configured_sticky_identity_target`]
+/// from the backend that served the response. The two differ only for a
+/// wildcard-hosted upstream, where the dialed target is a per-request clone
+/// carrying the concrete request authority; the persistent cookie must name the
+/// configured entry so [`crate::load_balancer::LoadBalancer::select_sticky`] can
+/// resolve it again. The sole caller
+/// ([`inject_sticky_affinity_cookie`]) performs that mapping.
+///
 /// Callers must pass the target that ACTUALLY served the response, and must
 /// decide *whether* to call through
 /// [`crate::proxy::backend_dispatch::sticky_cookie_reissue_target`] rather than
@@ -36180,7 +36189,14 @@ pub(crate) fn build_sticky_cookie_header(
 ///
 /// Nothing is written unless the served target's own per-port policy lane
 /// resolves to [`HashOnStrategy::Cookie`], so a rotation into a non-cookie lane
-/// is a no-op. The append uses the proxy's newline-separated multi-value
+/// is a no-op. The lane is resolved from the SERVED target, because that is the
+/// policy that actually governed the response; the cookie VALUE is then minted
+/// from the configured identity that served target maps to
+/// ([`crate::load_balancer::LoadBalancer::configured_sticky_identity_target`]),
+/// which is what a returning client can resolve. The two agree for every
+/// concrete target and differ only in `host` for a wildcard-hosted upstream,
+/// and `host` does not select a policy lane. The append uses the proxy's
+/// newline-separated multi-value
 /// representation, which [`crate::proxy::headers::apply_response_headers`] emits as
 /// distinct `Set-Cookie` field lines (RFC 6265), so a co-present backend cookie
 /// survives untouched.
@@ -36209,6 +36225,20 @@ pub(crate) fn inject_sticky_affinity_cookie(
     let HashOnStrategy::Cookie(ref cookie_name) = strategy else {
         return false;
     };
+    // The cookie must name the CONFIGURED target identity the balancer's
+    // binding index is keyed by, which is not always the target that was
+    // dialed: a wildcard-hosted upstream serves through a per-request clone
+    // whose `host` is the request authority. Minting from that clone emitted a
+    // token absent from the index, so a returning client missed and was
+    // reissued forever. Dispatch keeps the concrete clone; only the persistent
+    // identity is mapped back here. An all-concrete upstream — every ordinary
+    // one — returns the served target on a precomputed boolean.
+    let identity_target = LoadBalancerCache::configured_sticky_identity_target_from(
+        balancers,
+        &proxy.namespace,
+        upstream_id,
+        target,
+    );
     let upstream = LoadBalancerCache::get_upstream_from(balancers, &proxy.namespace, upstream_id);
     let default_cc = crate::config::types::HashOnCookieConfig::default();
     let cookie_config = upstream
@@ -36219,7 +36249,7 @@ pub(crate) fn inject_sticky_affinity_cookie(
         cookie_name,
         &proxy.namespace,
         upstream_id,
-        target,
+        identity_target,
         cookie_config,
     );
     headers_mod::append_set_cookie_header(response_headers, cookie_val);

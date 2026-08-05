@@ -392,6 +392,14 @@ One route Upstream can legitimately contain the same network endpoint more than 
 
 The encoding is canonical — tags are sorted by key, variable-length fields are length-prefixed, and optional fields carry a presence marker — so it never depends on map iteration order and no rearrangement of two fields can produce the same digest. Two targets that are identical in *all* of the above fields share one binding, which is safe because dispatching to either is indistinguishable. Digests are materialized when the balancer is built (config reload / service-discovery update), not per request.
 
+##### Wildcard-hosted targets: configured identity vs. dial target
+
+A target may be configured with a wildcard host (`*.example.com`) — mesh egress wildcard `ServiceEntry`s with `DNS`/`NONE` resolution are the common case. Such a target is **dialed** through a per-request copy whose host is the concrete request authority that matched the route, because connection, DNS resolution, SNI, and pool keying all need the real name. That per-request copy is a *dial target*, not an identity: it exists for one request and is not an entry the balancer was built from.
+
+Session persistence is expressed in the **configured** identity. A response served through a wildcard target's dial copy mints the cookie for the configured `*.example.com` entry, so a returning client resolves that entry through the binding index and the request is re-concretized for its own dial. (Minting from the dial copy instead would emit a token that is not an index key at all: the client would miss on every return and be issued a new cookie forever, with no stickiness.)
+
+The mapping back to the configured entry matches the served target's host against configured wildcard patterns and requires **every other identity field above to be equal**, so two `backendRefs` sharing a wildcard suffix but naming different Services, policy lanes, subsets, localities, or path overrides keep separate bindings. A concrete configured entry always wins over a wildcard that also matches it, and a request authority that matches no configured wildcard is never handed another target's binding. Upstreams with no wildcard target — that is, nearly all of them — skip this entirely.
+
 ```yaml
 upstreams:
   - id: "session-pool"

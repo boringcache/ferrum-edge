@@ -15,7 +15,10 @@
 //!   to ordinary selection instead of dialing an ineligible target;
 //! - two entries of ONE upstream that share a pod IP and dial port but differ in
 //!   Service identity or declared Service port keep separate bindings, and
-//!   neither reaches into the other's per-port policy lane.
+//!   neither reaches into the other's per-port policy lane;
+//! - a wildcard-hosted target is dialed through a per-request concretized clone
+//!   whose host is the request authority, yet mints — and honors — the cookie of
+//!   the CONFIGURED entry the binding index is keyed by.
 //!
 //! Translation and the emitted `Set-Cookie` shape live in
 //! `gateway_backend_lb_policy_tests.rs`.
@@ -1114,6 +1117,18 @@ fn every_retry_capable_mint_site_uses_the_shared_reissue_derivation() {
     assert_eq!(mint_sites(h3_server_src), 0);
     assert_eq!(mint_sites(h3_ws_src), 0);
     assert_eq!(mint_sites(h3_cross_src), 0);
+
+    // Mapping the served backend onto its CONFIGURED identity is what makes a
+    // wildcard-hosted upstream's cookie resolvable at all. It belongs to that
+    // same single mint site: exactly one use in proxy/mod.rs and none in any
+    // dispatch file, because a path that minted straight from a per-request
+    // dial clone would emit tokens that are not binding-index keys and reissue
+    // the client forever.
+    let identity_mapping = "configured_sticky_identity_target_from(";
+    assert_eq!(proxy_src.matches(identity_mapping).count(), 1);
+    assert_eq!(h3_server_src.matches(identity_mapping).count(), 0);
+    assert_eq!(h3_ws_src.matches(identity_mapping).count(), 0);
+    assert_eq!(h3_cross_src.matches(identity_mapping).count(), 0);
 }
 
 #[test]
@@ -1551,4 +1566,492 @@ fn a_rotation_between_two_services_on_one_endpoint_reissues() {
         quiet.is_none(),
         "an identity-preserving rotation must not re-mint the identical token"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Wildcard upstreams: the DIAL target is not the CONFIGURED identity
+// ---------------------------------------------------------------------------
+//
+// A mesh egress wildcard `ServiceEntry` (or any wildcard-hosted upstream)
+// configures `host: "*.example.com"`. Every request path — H1/H2 and H3 alike —
+// then runs `concretize_wildcard_target_for_request`, which CLONES that entry
+// with `host` replaced by the matched request authority, because the dial, DNS
+// resolution, and SNI have to use the concrete name.
+//
+// `host` is identity-bearing, so the clone's digest is absent from the binding
+// index the balancer built from the configured targets. Minting the response
+// cookie from the clone therefore emitted a token that could never resolve: a
+// returning client missed the index, fell back to ordinary selection, and was
+// reissued a fresh cookie on every single response — session persistence that
+// reported success and delivered nothing. The mint site now maps the served
+// target back to its configured identity while dispatch keeps the concrete
+// clone.
+
+/// The per-request DIAL target the proxy actually builds for `request_host`,
+/// through the production concretization helper.
+fn dialed(configured: &UpstreamTarget, request_host: &str) -> UpstreamTarget {
+    let selected = std::sync::Arc::new(configured.clone());
+    let concrete = ferrum_edge::_test_support::concretize_wildcard_target_for_request_for_test(
+        Some(selected),
+        Some(request_host),
+    )
+    .expect("a selected target survives concretization");
+    (*concrete).clone()
+}
+
+/// The opaque token out of a minted `Set-Cookie` line.
+fn minted_token(response_headers: &HashMap<String, String>) -> String {
+    response_headers
+        .get("set-cookie")
+        .expect("a cookie must have been minted")
+        .split_once('=')
+        .and_then(|(_, rest)| rest.split(';').next())
+        .expect("the mint site emits `name=token; ...`")
+        .to_string()
+}
+
+/// A wildcard-hosted (or plain) `backendRef` distinguished by Service identity.
+fn wildcard_backend(service: &str, host: &str, port: u16) -> UpstreamTarget {
+    identity_target(
+        host,
+        port,
+        None,
+        &[
+            (UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG, "default"),
+            (UPSTREAM_TARGET_SERVICE_NAME_TAG, service),
+        ],
+        None,
+        None,
+    )
+}
+
+#[test]
+fn a_wildcard_dial_clone_mints_its_configured_targets_binding() {
+    let configured = wildcard_backend("egress", "*.example.com", 8080);
+    let (cache, proxy) = resolved_fixture(sticky_upstream(vec![configured.clone()]), 8080, None);
+    let snapshot = cache.load();
+
+    // Dispatch dials the concrete authority, not the pattern.
+    let served = dialed(&configured, "api.example.com");
+    assert_eq!(served.host, "api.example.com");
+    assert_eq!(served.tags, configured.tags);
+    assert_ne!(
+        token_for(NAMESPACE, UPSTREAM_ID, &served),
+        token_for(NAMESPACE, UPSTREAM_ID, &configured),
+        "the dial clone digests to a different value — minting THAT was the defect"
+    );
+    assert!(
+        LoadBalancerCache::select_sticky_from(
+            &snapshot,
+            NAMESPACE,
+            UPSTREAM_ID,
+            &token_for(NAMESPACE, UPSTREAM_ID, &served),
+            None,
+            None,
+            None,
+        )
+        .is_none(),
+        "the dial clone's own digest is not an index key, which is why it could \
+         never resolve"
+    );
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    assert!(mint_like_a_grpc_dispatch_arm(
+        &proxy,
+        &snapshot,
+        true,
+        Some(&served),
+        Some(&served),
+        &mut response_headers,
+    ));
+    assert_eq!(
+        response_headers.get("set-cookie"),
+        Some(&expected_affinity_cookie(&configured)),
+        "the cookie must name the CONFIGURED wildcard target, not the dial clone"
+    );
+
+    // End to end: the emitted value is a live key of the binding index, and the
+    // target it resolves to is re-concretized for its own dial.
+    let bound = LoadBalancerCache::select_sticky_from(
+        &snapshot,
+        NAMESPACE,
+        UPSTREAM_ID,
+        &minted_token(&response_headers),
+        None,
+        None,
+        None,
+    )
+    .expect("a wildcard-backed cookie must resolve to its configured target");
+    assert_eq!(bound.host, "*.example.com");
+    assert_eq!(dialed(&bound, "api.example.com").host, "api.example.com");
+}
+
+#[test]
+fn a_returning_wildcard_binding_is_honored_instead_of_reissued_forever() {
+    // The user-visible defect: every response carried a fresh `Set-Cookie` and
+    // the client was never actually pinned.
+    let a = wildcard_backend("egress-a", "*.example.com", 8080);
+    let b = wildcard_backend("egress-b", "*.example.com", 8080);
+    let (cache, proxy) = resolved_fixture(sticky_upstream(vec![a.clone(), b.clone()]), 8080, None);
+    let snapshot = cache.load();
+
+    // Request 1: no cookie presented, served through a dial clone of `a`.
+    let served = dialed(&a, "api.example.com");
+    let mut first: HashMap<String, String> = HashMap::new();
+    assert!(mint_like_a_grpc_dispatch_arm(
+        &proxy,
+        &snapshot,
+        true,
+        Some(&served),
+        Some(&served),
+        &mut first,
+    ));
+
+    // Request 2: the presented cookie is honored by the production resolver —
+    // including its port-lane guard — and lands on `a`, not `b`.
+    let honored = ferrum_edge::_test_support::resolve_sticky_binding_for_test(
+        &proxy,
+        &snapshot,
+        UPSTREAM_ID,
+        &minted_token(&first),
+        COOKIE_NAME,
+        None,
+        None,
+    )
+    .expect("a returning client's wildcard binding must be honored");
+    assert_eq!(service_name_of(&honored), "egress-a");
+
+    // Selection therefore asked for no fresh binding, and the response it
+    // serves — through the honored target's own dial clone — writes nothing.
+    let honored_dial = dialed(&honored, "api.example.com");
+    let mut second: HashMap<String, String> = HashMap::new();
+    assert!(!mint_like_a_grpc_dispatch_arm(
+        &proxy,
+        &snapshot,
+        false,
+        Some(&honored_dial),
+        Some(&honored_dial),
+        &mut second,
+    ));
+    assert!(
+        second.is_empty(),
+        "an honored wildcard binding must not be re-minted on every response"
+    );
+}
+
+#[test]
+fn two_wildcard_backends_on_one_authority_keep_separate_bindings() {
+    // Both entries concretize onto the SAME dial authority, so mapping a served
+    // clone back by host alone would collapse them into one binding — exactly
+    // the failure the full-identity digest exists to prevent, one level up.
+    let a = wildcard_backend("egress-a", "*.example.com", 8080);
+    let b = wildcard_backend("egress-b", "*.example.com", 8080);
+    let (cache, proxy) = resolved_fixture(sticky_upstream(vec![a.clone(), b.clone()]), 8080, None);
+    let snapshot = cache.load();
+
+    let served_a = dialed(&a, "api.example.com");
+    let served_b = dialed(&b, "api.example.com");
+    assert_eq!(served_a.host, served_b.host);
+
+    let mut cookie_a: HashMap<String, String> = HashMap::new();
+    let mut cookie_b: HashMap<String, String> = HashMap::new();
+    for (served, headers) in [(&served_a, &mut cookie_a), (&served_b, &mut cookie_b)] {
+        assert!(mint_like_a_grpc_dispatch_arm(
+            &proxy,
+            &snapshot,
+            true,
+            Some(served),
+            Some(served),
+            headers,
+        ));
+    }
+    let token_a = minted_token(&cookie_a);
+    let token_b = minted_token(&cookie_b);
+    assert_ne!(
+        token_a, token_b,
+        "two Services behind one wildcard authority must not share a binding"
+    );
+
+    for (token, expected_service) in [(token_a, "egress-a"), (token_b, "egress-b")] {
+        let bound = LoadBalancerCache::select_sticky_from(
+            &snapshot,
+            NAMESPACE,
+            UPSTREAM_ID,
+            &token,
+            None,
+            None,
+            None,
+        )
+        .expect("each wildcard binding resolves");
+        assert_eq!(service_name_of(&bound), expected_service);
+    }
+}
+
+#[test]
+fn wildcard_backends_that_differ_only_in_policy_lane_keep_separate_bindings() {
+    // Same wildcard pattern, same dial port, no tags at all: only the declared
+    // Service port — the `dispatch_policy_port()` lane — differs.
+    let lane_80 = identity_target("*.example.com", 8080, Some(80), &[], None, None);
+    let lane_9090 = identity_target("*.example.com", 8080, Some(9090), &[], None, None);
+    let (cache, proxy) = resolved_fixture(
+        sticky_upstream(vec![lane_80.clone(), lane_9090.clone()]),
+        8080,
+        None,
+    );
+    let snapshot = cache.load();
+
+    let mut minted: Vec<String> = Vec::new();
+    for configured in [&lane_80, &lane_9090] {
+        let served = dialed(configured, "api.example.com");
+        let mut headers: HashMap<String, String> = HashMap::new();
+        assert!(mint_like_a_grpc_dispatch_arm(
+            &proxy,
+            &snapshot,
+            true,
+            Some(&served),
+            Some(&served),
+            &mut headers,
+        ));
+        assert_eq!(
+            headers.get("set-cookie"),
+            Some(&expected_affinity_cookie(configured)),
+            "each policy lane mints its own configured identity"
+        );
+        let bound = LoadBalancerCache::select_sticky_from(
+            &snapshot,
+            NAMESPACE,
+            UPSTREAM_ID,
+            &minted_token(&headers),
+            None,
+            None,
+            None,
+        )
+        .expect("each lane's binding resolves");
+        let lane = configured.service_port_policy_key;
+        assert_eq!(bound.service_port_policy_key, lane);
+        minted.push(minted_token(&headers));
+    }
+    assert_ne!(
+        minted[0], minted[1],
+        "one wildcard authority in two policy lanes must not share a binding"
+    );
+}
+
+#[test]
+fn a_retry_rotation_between_wildcard_backends_reissues_for_the_serving_one() {
+    let a = wildcard_backend("egress-a", "*.example.com", 8080);
+    let b = wildcard_backend("egress-b", "*.example.com", 8080);
+    let (cache, proxy) = resolved_fixture(sticky_upstream(vec![a.clone(), b.clone()]), 8080, None);
+    let snapshot = cache.load();
+
+    // Selection honored the client's binding to `a` and the request dialed a's
+    // clone. `select_next_retry_target` then hands back the CONFIGURED `b`, so
+    // cover both shapes the served target can take: the configured entry, and a
+    // concretized clone of it.
+    let bound_dial = dialed(&a, "api.example.com");
+    for served in [b.clone(), dialed(&b, "api.example.com")] {
+        let reissue = ferrum_edge::_test_support::sticky_cookie_reissue_target_for_test(
+            false,
+            Some(&bound_dial),
+            Some(&served),
+        )
+        .expect("a rotation onto the other wildcard backend must reissue");
+        assert_eq!(service_name_of(reissue), "egress-b");
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        assert!(ferrum_edge::_test_support::inject_sticky_affinity_cookie_for_test(
+            &proxy,
+            &snapshot,
+            Some(reissue),
+            true,
+            &mut headers,
+        ));
+        assert_eq!(
+            headers.get("set-cookie"),
+            Some(&expected_affinity_cookie(&b)),
+            "the reissued cookie must name the backend that actually served"
+        );
+        let bound = LoadBalancerCache::select_sticky_from(
+            &snapshot,
+            NAMESPACE,
+            UPSTREAM_ID,
+            &minted_token(&headers),
+            None,
+            None,
+            None,
+        )
+        .expect("the reissued token must resolve");
+        assert_eq!(
+            service_name_of(&bound), "egress-b",
+            "the client must not be sent back to the rotated-away backend"
+        );
+    }
+}
+
+#[test]
+fn an_authority_outside_the_configured_wildcard_is_granted_no_binding() {
+    let configured = wildcard_backend("egress", "*.example.com", 8080);
+    let (cache, proxy) = resolved_fixture(sticky_upstream(vec![configured.clone()]), 8080, None);
+    let snapshot = cache.load();
+
+    // A request authority that does not match the pattern is not concretized at
+    // all, so no dial clone — and no binding — is invented for it.
+    assert_eq!(dialed(&configured, "example.net").host, "*.example.com");
+
+    // And a served target carrying a foreign concrete authority, identical to
+    // the configured entry in every other identity field, must NOT be folded
+    // onto that entry's binding: the mapping is host-matched, not "any
+    // wildcard in the upstream".
+    let foreign = identity_target(
+        "api.other.test",
+        8080,
+        None,
+        &[
+            (UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG, "default"),
+            (UPSTREAM_TARGET_SERVICE_NAME_TAG, "egress"),
+        ],
+        None,
+        None,
+    );
+    let mut headers: HashMap<String, String> = HashMap::new();
+    assert!(mint_like_a_grpc_dispatch_arm(
+        &proxy,
+        &snapshot,
+        true,
+        Some(&foreign),
+        Some(&foreign),
+        &mut headers,
+    ));
+    let token = minted_token(&headers);
+    let configured_token = token_for(NAMESPACE, UPSTREAM_ID, &configured);
+    assert_ne!(
+        token, configured_token,
+        "an unmatched authority must not be handed the wildcard target's token"
+    );
+    assert!(
+        LoadBalancerCache::select_sticky_from(
+            &snapshot,
+            NAMESPACE,
+            UPSTREAM_ID,
+            &token,
+            None,
+            None,
+            None,
+        )
+        .is_none(),
+        "an unmatched authority must not resolve into the eligible pool"
+    );
+}
+
+#[test]
+fn a_concrete_backend_beside_a_wildcard_keeps_its_own_binding() {
+    // The wildcard concretizes onto the very authority the concrete entry
+    // names, so both dial `api.example.com:8080`. They are still distinct
+    // configured identities and must keep distinct bindings.
+    let wildcard = wildcard_backend("egress", "*.example.com", 8080);
+    let concrete = wildcard_backend("direct", "api.example.com", 8080);
+    let (cache, proxy) = resolved_fixture(
+        sticky_upstream(vec![wildcard.clone(), concrete.clone()]),
+        8080,
+        None,
+    );
+    let snapshot = cache.load();
+
+    for (served, expected) in [
+        (dialed(&wildcard, "api.example.com"), &wildcard),
+        (concrete.clone(), &concrete),
+    ] {
+        assert_eq!(served.host, "api.example.com");
+        let mut headers: HashMap<String, String> = HashMap::new();
+        assert!(mint_like_a_grpc_dispatch_arm(
+            &proxy,
+            &snapshot,
+            true,
+            Some(&served),
+            Some(&served),
+            &mut headers,
+        ));
+        assert_eq!(
+            headers.get("set-cookie"),
+            Some(&expected_affinity_cookie(expected)),
+            "a shared dial authority must not collapse two configured identities"
+        );
+    }
+}
+
+#[test]
+fn an_exact_configured_identity_wins_over_a_wildcard_that_also_matches() {
+    // When a concrete entry and a wildcard entry are identical in every field
+    // but `host`, a served clone is indistinguishable from the concrete entry.
+    // The exact configured identity is chosen — deliberately, because a session
+    // pinned to it stays pinned to that host whatever authority the client
+    // sends later, while a wildcard binding follows the authority. Both dial
+    // the same endpoint under the same policy, so neither is a mis-route.
+    let wildcard = wildcard_backend("egress", "*.example.com", 8080);
+    let concrete = wildcard_backend("egress", "api.example.com", 8080);
+    let (cache, proxy) = resolved_fixture(
+        sticky_upstream(vec![wildcard.clone(), concrete.clone()]),
+        8080,
+        None,
+    );
+    let snapshot = cache.load();
+
+    let served = dialed(&wildcard, "api.example.com");
+    let mut headers: HashMap<String, String> = HashMap::new();
+    assert!(mint_like_a_grpc_dispatch_arm(
+        &proxy,
+        &snapshot,
+        true,
+        Some(&served),
+        Some(&served),
+        &mut headers,
+    ));
+    assert_eq!(
+        headers.get("set-cookie"),
+        Some(&expected_affinity_cookie(&concrete)),
+    );
+    let bound = LoadBalancerCache::select_sticky_from(
+        &snapshot,
+        NAMESPACE,
+        UPSTREAM_ID,
+        &minted_token(&headers),
+        None,
+        None,
+        None,
+    )
+    .expect("the binding resolves");
+    assert_eq!(bound.host, "api.example.com");
+}
+
+#[test]
+fn an_all_concrete_upstream_is_untouched_by_the_wildcard_identity_mapping() {
+    // Parity guard: with no wildcard target configured, the mapping is a
+    // precomputed boolean and returns the served target itself — the mint site
+    // behaves exactly as it did before the seam existed, with no scan.
+    let a = target("10.1.0.10", 8080);
+    let b = target("10.1.0.11", 8080);
+    let cache = cache_for(sticky_upstream(vec![a.clone(), b.clone()]));
+    let snapshot = cache.load();
+
+    for served in [&a, &b] {
+        let identity = LoadBalancerCache::configured_sticky_identity_target_from(
+            &snapshot,
+            NAMESPACE,
+            UPSTREAM_ID,
+            served,
+        );
+        assert!(
+            std::ptr::eq(identity, served),
+            "an all-concrete upstream must hand back the served target itself"
+        );
+    }
+
+    // An upstream this snapshot does not know cannot remap anything either.
+    let unknown = LoadBalancerCache::configured_sticky_identity_target_from(
+        &snapshot,
+        "no-such-namespace",
+        "no-such-upstream",
+        &a,
+    );
+    assert!(std::ptr::eq(unknown, &a));
 }

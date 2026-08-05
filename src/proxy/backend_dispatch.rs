@@ -708,35 +708,50 @@ pub(crate) fn sticky_cookie_reissue_target<'a>(
 /// Whether two targets carry the same sticky identity, i.e. whether the token
 /// already held by the client also names the backend that served the response.
 ///
-/// This must mirror the field set `load_balancer::sticky_session_token`
-/// digests (`write_sticky_target_identity`) exactly. Comparing only `host:port`
-/// would skip reissue after a rotation onto a *different* target that happens
-/// to share a pod IP and port — a different Service, per-port policy lane,
-/// subset overlay, locality, or backend path override — leaving the client
-/// pinned to a backend that did not serve it. `weight` is excluded on both
-/// sides for the same reason it is excluded from the digest: it never changes
-/// which backend a pinned session reaches.
+/// Delegates to [`crate::load_balancer::same_sticky_identity`], which lives
+/// beside the digest encoder (`write_sticky_target_identity`) so the two can no
+/// longer drift apart field by field. Comparing only `host:port` would skip
+/// reissue after a rotation onto a *different* target that happens to share a
+/// pod IP and port — a different Service, per-port policy lane, subset overlay,
+/// locality, or backend path override — leaving the client pinned to a backend
+/// that did not serve it. `weight` is excluded on both sides for the same reason
+/// it is excluded from the digest: it never changes which backend a pinned
+/// session reaches.
+///
+/// Both sides are compared as DIALED, i.e. after
+/// [`concretize_wildcard_target_for_request`] has replaced a wildcard host with
+/// the request authority. That is deliberate: this predicate only asks whether
+/// the response came from the endpoint the request was bound to, and two
+/// entries that concretize onto the same authority with every other identity
+/// field equal reach the same backend under the same policy. Which CONFIGURED
+/// identity a reissued cookie then names is a separate question, answered at the
+/// mint site by
+/// [`crate::load_balancer::LoadBalancer::configured_sticky_identity_target`].
 ///
 /// Structural comparison rather than re-deriving two digests keeps this
 /// allocation-free; the encoding is injective over these fields, so equality
 /// here is exactly token equality.
 #[inline]
 fn same_affinity_endpoint(a: &UpstreamTarget, b: &UpstreamTarget) -> bool {
-    if std::ptr::eq(a, b) {
-        return true;
-    }
-    a.port == b.port
-        && a.host == b.host
-        && a.service_port_policy_key == b.service_port_policy_key
-        && a.locality == b.locality
-        && a.path == b.path
-        && a.tags == b.tags
+    crate::load_balancer::same_sticky_identity(a, b)
 }
 
 /// Replace a wildcard upstream target host (for example `*.example.com`) with
 /// the concrete request authority that matched the route. This is used by mesh
 /// egress wildcard ServiceEntries with DNS/None resolution: the proxy route is
 /// wildcard-hosted, but the backend dial target must be the concrete authority.
+///
+/// The returned clone is a DIAL target: it drives connection, DNS resolution,
+/// SNI, pool keying, and circuit-breaker attribution for this request only. It
+/// is NOT the upstream's configured identity — `host` no longer matches any
+/// entry the load balancer was built from, so it is absent from the
+/// sticky-session binding index. Anything that must persist across requests
+/// (today: the Gateway API session-persistence cookie) has to be expressed in
+/// the configured identity instead, via
+/// [`crate::load_balancer::LoadBalancer::configured_sticky_identity_target`].
+///
+/// A request authority that does not match the wildcard leaves the configured
+/// target untouched, so no concretization — and no binding — is invented for it.
 pub(crate) fn concretize_wildcard_target_for_request(
     target: Option<Arc<UpstreamTarget>>,
     request_host: Option<&str>,

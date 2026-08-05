@@ -185,6 +185,21 @@ pub mod _test_support {
         )
     }
 
+    /// Test-only view of the per-request wildcard DIAL concretization every
+    /// H1/H2 and H3 request path applies to the selected target (#3278).
+    ///
+    /// This is the production helper, so a test through it exercises the real
+    /// clone whose `host` is the request authority — the target that is dialed,
+    /// pooled, and resolved, and the one whose identity is deliberately NOT the
+    /// upstream's configured sticky identity.
+    pub fn concretize_wildcard_target_for_request_for_test(
+        target: Option<Arc<crate::config::types::UpstreamTarget>>,
+        request_host: Option<&str>,
+    ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
+        use crate::proxy::backend_dispatch::concretize_wildcard_target_for_request;
+        concretize_wildcard_target_for_request(target, request_host)
+    }
+
     /// Test-only view of the shared retry-rotation reissue derivation every
     /// response path uses to decide whether — and for which backend — a
     /// sticky-session cookie must be minted (#3278).

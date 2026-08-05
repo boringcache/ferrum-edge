@@ -1617,6 +1617,27 @@ impl LoadBalancerCache {
         balancer.select_sticky(token, port, subset_name, health)
     }
 
+    /// Snapshot view of
+    /// [`LoadBalancer::configured_sticky_identity_target`]: the CONFIGURED
+    /// target identity a response served by `served_target` must mint its
+    /// session cookie for.
+    ///
+    /// Returns `served_target` unchanged when the upstream is unknown in this
+    /// snapshot or has no wildcard-hosted target, which is every ordinary
+    /// upstream and the whole of the pre-existing behavior.
+    #[inline]
+    pub fn configured_sticky_identity_target_from<'a>(
+        snapshot: &'a LoadBalancerCacheInner,
+        namespace: &str,
+        upstream_id: &str,
+        served_target: &'a UpstreamTarget,
+    ) -> &'a UpstreamTarget {
+        match snapshot.balancer(namespace, upstream_id) {
+            Some(balancer) => balancer.configured_sticky_identity_target(served_target),
+            None => served_target,
+        }
+    }
+
     /// Select next target, excluding a previously tried target (for retries).
     pub fn select_next_target(
         &self,
@@ -1947,6 +1968,12 @@ pub const STICKY_SESSION_TOKEN_LEN: usize = 64;
 /// a forged token can only steer a client to a target the same upstream would
 /// already have selected for some other client, never outside the
 /// health/subset/port-scoped candidate pool (see [`LoadBalancer::select_sticky`]).
+///
+/// `target` must be a CONFIGURED target of that upstream, not a per-request
+/// dial clone. Callers minting a response cookie resolve the served backend
+/// through [`LoadBalancer::configured_sticky_identity_target`] first; the
+/// binding index is built from the configured targets, so a token derived from
+/// anything else cannot resolve.
 pub fn sticky_session_token(upstream_runtime_key: &str, target: &UpstreamTarget) -> String {
     let mut hasher = StickyHasher::new();
     hasher.update(STICKY_SESSION_TOKEN_DOMAIN.as_bytes());
@@ -1964,7 +1991,12 @@ type StickyHasher = crate::fips::approved::Sha256;
 /// which policy/authorization lane governs it, which TLS material or subset
 /// overlay applies, or what the target *means* is covered:
 ///
-/// - `host` / `port` — the dial destination.
+/// - `host` / `port` — the dial destination *as configured*. For a
+///   wildcard-hosted upstream the configured `host` is the pattern
+///   (`*.example.com`), not the per-request authority the proxy actually dials;
+///   the mint site maps a served concretization back to its configured entry
+///   first (see [`LoadBalancer::configured_sticky_identity_target`]) so both
+///   sides of the index agree.
 /// - `service_port_policy_key` — selects the `dispatch_policy_port()` policy
 ///   lane (its algorithm, `hashOn`, passive-health policy, TLS overlay) and
 ///   records the declared Service port that owns the target.
@@ -2046,6 +2078,40 @@ fn absorb_optional_identity_field(hasher: &mut StickyHasher, value: Option<&str>
         }
         None => hasher.update([0u8]),
     }
+}
+
+/// Whether two targets carry the same sticky identity — i.e. whether
+/// [`sticky_session_token`] would derive the same token for both inside one
+/// upstream scope.
+///
+/// This is the structural twin of [`write_sticky_target_identity`] and must
+/// cover exactly the same field set. The encoding is injective over those
+/// fields, so equality here is precisely token equality — which lets the reissue
+/// decision ([`crate::proxy::backend_dispatch::sticky_cookie_reissue_target`])
+/// answer "does the client already hold this backend's token?" with a structural
+/// compare instead of two digests and two allocations.
+///
+/// `weight` is excluded on both sides for the same reason it is excluded from
+/// the digest: it never changes which backend a pinned session reaches.
+#[inline]
+pub fn same_sticky_identity(a: &UpstreamTarget, b: &UpstreamTarget) -> bool {
+    std::ptr::eq(a, b) || (a.host == b.host && same_sticky_identity_except_host(a, b))
+}
+
+/// [`same_sticky_identity`] with the dial `host` left out.
+///
+/// Used to reconcile a per-request CONCRETIZED clone of a wildcard target with
+/// the configured entry it came from: concretization rewrites `host` and
+/// nothing else, so every other identity field must still match exactly before
+/// the two can be treated as one binding
+/// (see [`LoadBalancer::configured_sticky_identity_target`]).
+#[inline]
+fn same_sticky_identity_except_host(a: &UpstreamTarget, b: &UpstreamTarget) -> bool {
+    a.port == b.port
+        && a.service_port_policy_key == b.service_port_policy_key
+        && a.locality == b.locality
+        && a.path == b.path
+        && a.tags == b.tags
 }
 
 /// Cheap boundary validation for an untrusted cookie value before it is used as
@@ -2423,6 +2489,20 @@ pub struct LoadBalancer {
     /// field collapse to one entry, and because those are interchangeable the
     /// FIRST index wins deterministically across rebuilds.
     sticky_token_index: HashMap<String, usize>,
+    /// `true` when this upstream can mint sticky tokens AND at least one
+    /// CONFIGURED target carries a wildcard host (`*.example.com`).
+    ///
+    /// Only such an upstream can serve a response through a per-request
+    /// CONCRETIZED CLONE of a configured target
+    /// ([`crate::proxy::backend_dispatch::concretize_wildcard_target_for_request`]
+    /// rewrites `host` to the matched request authority so the dial, DNS
+    /// resolution, and SNI use the concrete name). That clone's identity is not
+    /// in `sticky_token_index`, so the mint site must map it back to its
+    /// configured origin — see [`Self::configured_sticky_identity_target`].
+    ///
+    /// `false` for every ordinary upstream, which makes that mapping a single
+    /// boolean test with no scan and no allocation.
+    has_wildcard_host_target: bool,
     algorithm: LoadBalancerAlgorithm,
     /// Round-robin / random / least-latency warm-up selection counters.
     /// Sharded and cache-line padded; see [`SelectionCounterShards`].
@@ -2854,6 +2934,12 @@ impl LoadBalancer {
                 sticky_token_index.entry(token).or_insert(i);
             }
         }
+        // A wildcard-hosted target is dialed through a per-request concretized
+        // clone, so its served identity has to be mapped back to this
+        // configured entry before a cookie is minted. Recorded once here so
+        // every all-concrete upstream skips that mapping outright.
+        let has_wildcard_host_target =
+            mints_sticky_tokens && targets.iter().any(|target| target.host.starts_with("*."));
 
         // Pre-compute per-target distribute weights and failover-region matches
         // against the source locality so the request path stays branch-light.
@@ -2888,6 +2974,7 @@ impl LoadBalancer {
             target_locality_ranks,
             target_index,
             sticky_token_index,
+            has_wildcard_host_target,
             algorithm,
             rr_counter: new_selection_counters(),
             wrr_state: if algorithm == LoadBalancerAlgorithm::WeightedRoundRobin {
@@ -4735,6 +4822,82 @@ impl LoadBalancer {
             return None;
         }
         Some(Arc::clone(&self.targets[idx]))
+    }
+
+    /// Map the target that ACTUALLY served a response onto the CONFIGURED
+    /// target whose identity this balancer's binding index is keyed by.
+    ///
+    /// Selection hands the dispatch path an `Arc<UpstreamTarget>` that is
+    /// usually the configured entry itself. For a WILDCARD-hosted upstream it is
+    /// not: mesh egress wildcard `ServiceEntry`s (and any wildcard-hosted
+    /// upstream) configure `host: "*.example.com"`, and
+    /// [`crate::proxy::backend_dispatch::concretize_wildcard_target_for_request`]
+    /// clones that entry per request with `host` replaced by the matched request
+    /// authority, because the dial, DNS resolution, and SNI must use the
+    /// concrete name. Minting the response cookie from that clone produced a
+    /// token no returning client could ever resolve — `host` is identity-bearing
+    /// (see [`write_sticky_target_identity`]), so the clone's digest is absent
+    /// from `sticky_token_index` and the client was reissued forever.
+    ///
+    /// The dial target and the persistent identity are therefore different
+    /// things, and this is the seam between them: dispatch keeps using the
+    /// concrete clone, while the cookie names the configured entry that
+    /// [`Self::select_sticky`] can hand back on the next request (which is then
+    /// re-concretized for its own dial).
+    ///
+    /// Resolution order inside one upstream scope:
+    ///
+    /// 1. A configured target with the SAME FULL identity, including `host`,
+    ///    wins. A concrete target that is genuinely configured keeps its own
+    ///    binding, so a session pinned to it stays pinned to that host no matter
+    ///    what authority the client sends later.
+    /// 2. Otherwise the first configured WILDCARD target that matches the served
+    ///    host and is identical in every other identity field
+    ///    (`port`, `service_port_policy_key`, `tags`, `locality`, `path`) is the
+    ///    origin. Matching on host alone would collapse two `backendRefs` that
+    ///    share a wildcard suffix but name different Services or policy lanes,
+    ///    so it is the full field set minus `host`, exactly as concretization
+    ///    rewrites `host` and nothing else. Ties (two configured wildcards that
+    ///    match the same authority and are otherwise identical) resolve to the
+    ///    first in config order — deterministic, and safe for the same reason
+    ///    the index collapses identical entries first-index-wins: such targets
+    ///    dial the same endpoint under the same policy.
+    /// 3. Otherwise the served target is returned unchanged. It is then minted
+    ///    verbatim exactly as before this seam existed, so an authority that
+    ///    matched no configured wildcard is never handed another target's
+    ///    binding.
+    ///
+    /// Bounded, allocation-free, and off the ordinary request path: an upstream
+    /// with no wildcard target (or one that mints no tokens at all) returns
+    /// immediately on a precomputed boolean, and the scan that a wildcard
+    /// upstream does pay runs only when a cookie is actually being minted.
+    #[inline]
+    pub fn configured_sticky_identity_target<'a>(
+        &'a self,
+        served_target: &'a UpstreamTarget,
+    ) -> &'a UpstreamTarget {
+        // `*.` on the served host means concretization did NOT apply (the
+        // request authority did not match), so the served target is already the
+        // configured one.
+        if !self.has_wildcard_host_target || served_target.host.starts_with("*.") {
+            return served_target;
+        }
+        let mut wildcard_origin: Option<&'a UpstreamTarget> = None;
+        for configured in &self.targets {
+            if !same_sticky_identity_except_host(configured, served_target) {
+                continue;
+            }
+            if configured.host == served_target.host {
+                return configured.as_ref();
+            }
+            if wildcard_origin.is_none()
+                && configured.host.starts_with("*.")
+                && crate::config::types::wildcard_matches(&configured.host, &served_target.host)
+            {
+                wildcard_origin = Some(configured.as_ref());
+            }
+        }
+        wildcard_origin.unwrap_or(served_target)
     }
 
     /// PASSTHROUGH selection: dial the target whose canonical `(IP, port)`
