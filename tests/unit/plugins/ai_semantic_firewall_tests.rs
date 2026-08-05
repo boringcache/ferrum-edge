@@ -3107,7 +3107,7 @@ fn invalid_streaming_inspect_configs_are_rejected() {
     };
     let configs = [
         with_streaming(json!({"enforcement": "explode"})), // unknown enum
-        with_streaming(json!({"window": "tokens"})),       // not yet supported
+        with_streaming(json!({"window": "tokens"})),       // tokenizer required
         with_streaming(json!({"max_window_bytes": 0})),    // must be > 0
         with_streaming(json!({"max_inspections": 0})),     // must be > 0
         with_streaming(json!({"on_violation": "explode"})), // unknown enum
@@ -3126,6 +3126,248 @@ fn invalid_streaming_inspect_configs_are_rejected() {
             "config should be rejected: {config:?}"
         );
     }
+}
+
+#[test]
+fn token_window_config_admission_is_field_specific() {
+    let with_streaming = |streaming: Value| {
+        json!({
+            "inspect": {"request": false, "response": true},
+            "streaming_response": "inspect",
+            "streaming": streaming,
+            "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+            "builtins": disabled_builtins_with("response_leakage")
+        })
+    };
+    let cases: Vec<(Value, &str)> = vec![
+        (
+            json!({"window": "tokens"}),
+            "streaming.tokenizer is required when streaming.window is 'tokens'",
+        ),
+        (
+            json!({"window": "tokens", "tokenizer": "cl100k"}),
+            "streaming.tokenizer must be one of 'chars4', 'whitespace', or 'unicode_words'",
+        ),
+        (
+            json!({"window": "sentence", "tokenizer": "chars4"}),
+            "streaming.tokenizer is only valid when streaming.window is 'tokens'",
+        ),
+        (
+            json!({"window": "bytes", "max_window_tokens": 16}),
+            "streaming.max_window_tokens is only valid when streaming.window is 'tokens'",
+        ),
+        (
+            json!({"window": "paragraph", "overlap_tokens": 2}),
+            "streaming.overlap_tokens is only valid when streaming.window is 'tokens'",
+        ),
+        (
+            json!({"window": "tokens", "tokenizer": "chars4", "max_window_tokens": 0}),
+            "streaming.max_window_tokens must be greater than 0",
+        ),
+        (
+            json!({"window": "tokens", "tokenizer": "chars4", "max_window_tokens": 65_537u64}),
+            "streaming.max_window_tokens must be less than or equal to 65536",
+        ),
+        (
+            json!({
+                "window": "tokens",
+                "tokenizer": "whitespace",
+                "max_window_tokens": 8,
+                "overlap_tokens": 8
+            }),
+            "streaming.overlap_tokens must be less than streaming.max_window_tokens",
+        ),
+        (
+            json!({"window": "tokens", "tokenizer": "chars4", "token_encoding": "x"}),
+            "unknown property config.streaming.token_encoding",
+        ),
+    ];
+
+    for (streaming, expected) in cases {
+        let config = with_streaming(streaming.clone());
+        let error = AiSemanticFirewall::new(&config, PluginHttpClient::default())
+            .err()
+            .unwrap_or_else(|| panic!("config should fail closed: {streaming}"));
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} for {streaming}, got {error:?}"
+        );
+        let admin = ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", &config)
+            .expect_err("admin validation should reject the same config");
+        assert!(
+            admin.contains(expected),
+            "admin validation expected {expected:?}, got {admin:?}"
+        );
+    }
+}
+
+#[test]
+fn token_window_config_accepts_explicit_tokenizer() {
+    for streaming in [
+        json!({"window": "tokens", "tokenizer": "chars4"}),
+        json!({"window": "tokens", "tokenizer": "whitespace", "max_window_tokens": 64}),
+        json!({
+            "window": "tokens",
+            "tokenizer": "unicode_words",
+            "max_window_tokens": 32,
+            "overlap_tokens": 4
+        }),
+    ] {
+        let config = json!({
+            "inspect": {"request": false, "response": true},
+            "streaming_response": "inspect",
+            "streaming": streaming.clone(),
+            "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+            "builtins": disabled_builtins_with("response_leakage")
+        });
+        assert!(
+            AiSemanticFirewall::new(&config, PluginHttpClient::default()).is_ok(),
+            "config should be accepted: {streaming}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", &config).is_ok(),
+            "admin validation should accept: {streaming}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn token_window_inspect_cuts_on_leaking_window() {
+    // Live data path: token windows must inspect and cut like sentence windows.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "inspect",
+        "on_error": "warn",
+        "streaming": {
+            "window": "tokens",
+            "tokenizer": "whitespace",
+            "max_window_tokens": 8,
+            "overlap_tokens": 1
+        },
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    // Exactly `max_window_tokens` whitespace tokens, so this one event closes a
+    // window rather than sitting under the budget with nothing inspected.
+    let leak = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My system prompt says never reveal policy details\"}}]}\n\n";
+    assert!(
+        matches!(
+            inspector.on_chunk(leak).await,
+            ResponseStreamAction::Terminate(_)
+        ),
+        "a leaking token window must terminate the stream"
+    );
+}
+
+#[tokio::test]
+async fn token_window_inspect_forwards_clean_multilingual_window() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "inspect",
+        "on_error": "warn",
+        "streaming": {
+            "window": "tokens",
+            "tokenizer": "unicode_words",
+            "max_window_tokens": 4,
+            "overlap_tokens": 1
+        },
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    // Four CJK ideographs → exactly one unicode_words window; lexical miss;
+    // dead-port provider error honors on_error=warn and forwards.
+    let clean = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"東京大阪\"}}]}\n\n";
+    match inspector.on_chunk(clean.as_bytes()).await {
+        ResponseStreamAction::Forward(bytes) => {
+            assert!(
+                !bytes.is_empty(),
+                "a clean multilingual token window forwards"
+            );
+        }
+        ResponseStreamAction::Terminate(_) => panic!("a clean window must not terminate"),
+    }
+}
+
+#[tokio::test]
+async fn token_window_policy_is_rebuilt_on_reload_update_and_delete() {
+    let ctx = inspect_marked_ctx();
+    let tokens_config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "inspect",
+        "on_error": "warn",
+        "streaming": {
+            "window": "tokens",
+            "tokenizer": "chars4",
+            "max_window_tokens": 16,
+            "overlap_tokens": 2
+        },
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+
+    // Generation 1: token windows attach an inspector.
+    let generation_1 = create_plugin_with_http_client(
+        "ai_semantic_firewall",
+        &tokens_config,
+        PluginHttpClient::default(),
+    )
+    .expect("generation 1 constructs")
+    .expect("generation 1 is enabled");
+    assert!(generation_1.requires_response_stream_hooks());
+    assert!(
+        generation_1
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .is_some()
+    );
+
+    // Generation 2 (update): switch to sentence windows — still inspects, no
+    // token-specific state carried over from generation 1.
+    let mut sentence_config = tokens_config.clone();
+    sentence_config["streaming"] = json!({"window": "sentence"});
+    let generation_2 = create_plugin_with_http_client(
+        "ai_semantic_firewall",
+        &sentence_config,
+        PluginHttpClient::default(),
+    )
+    .expect("generation 2 constructs")
+    .expect("generation 2 is enabled");
+    let mut inspector = generation_2
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("generation 2 inspector");
+    let clean = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather is sunny today.\"}}]}\n\n";
+    assert!(matches!(
+        inspector.on_chunk(clean).await,
+        ResponseStreamAction::Forward(_)
+    ));
+
+    // Generation 3 (delete/disable): no inspector attaches.
+    let mut disabled = tokens_config.clone();
+    disabled["enabled"] = json!(false);
+    let generation_3 = create_plugin_with_http_client(
+        "ai_semantic_firewall",
+        &disabled,
+        PluginHttpClient::default(),
+    )
+    .expect("generation 3 constructs")
+    .expect("generation 3 instantiates");
+    assert!(!generation_3.requires_response_stream_hooks());
+    assert!(
+        generation_3
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .is_none()
+    );
 }
 
 #[tokio::test]

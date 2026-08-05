@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   elements inherit their field's decision instead of being judged on the
   numeric index, and JSON embedded in a protobuf string is decoded and redacted
   before export.
+- `ai_semantic_firewall` streamed `inspect` mode now accepts
+  `streaming.window: tokens` with an explicitly selected bounded tokenizer
+  (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft
+  `max_window_tokens` / `overlap_tokens` budgets, and deterministic
+  complete-token cuts under the existing `max_window_bytes` memory/CPU cap
+  (issue #3302). Invalid or non-token-window uses of the new fields fail closed
+  with field-specific diagnostics; OpenAPI and `docs/plugins.md` stay in parity.
 - VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
   compile onto a shared precomputed `Proxy.stream_match` carrier and are
