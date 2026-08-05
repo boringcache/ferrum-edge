@@ -10278,6 +10278,34 @@ components:
           description: >-
             Subset backend-connect timeout projected from a mesh
             DestinationRule. Direct admin/file configuration is rejected.
+        h2_upgrade_policy:
+          oneOf:
+            - $ref: "#/components/schemas/H2UpgradePolicy"
+            - type: "null"
+          readOnly: true
+          description: >-
+            Subset plain-HTTP H2 upgrade policy projected from a mesh
+            DestinationRule. Per-port policy has higher precedence; direct
+            admin/file configuration is rejected.
+        max_retries:
+          type: [integer, "null"]
+          format: uint32
+          minimum: 0
+          readOnly: true
+          description: >-
+            Subset cap on an existing per-request retry policy, projected from
+            a mesh DestinationRule. It never enables retries; zero disables an
+            existing policy for the selected destination. Direct admin/file
+            configuration is rejected.
+        http1_max_pending_requests:
+          type: [integer, "null"]
+          format: uint32
+          minimum: 1
+          readOnly: true
+          description: >-
+            Subset concurrent in-flight HTTP/1.1 admission cap projected from
+            a mesh DestinationRule. Admission is isolated by selected subset;
+            direct admin/file configuration is rejected.
         passive_health_check:
           oneOf:
             - $ref: "#/components/schemas/PassiveHealthCheck"

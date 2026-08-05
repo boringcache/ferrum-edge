@@ -6112,6 +6112,9 @@ fn upstream_runtime_serialization_is_covered_by_openapi() {
                     "sni": "backend.example"
                 },
                 "connect_timeout_ms": 750,
+                "h2_upgrade_policy": "DO_NOT_UPGRADE",
+                "max_retries": 2,
+                "http1_max_pending_requests": 7,
                 "passive_health_check": {}
             }
         }],

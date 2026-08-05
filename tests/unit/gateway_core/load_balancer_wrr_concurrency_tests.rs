@@ -1,9 +1,11 @@
 //! Concurrent WRR fairness, recovery, lane isolation, cardinality, and
 //! multi-fingerprint cache regression coverage for issue #2413.
 //!
-//! Throughput against single-lane serialization is gated by the hosted
-//! Criterion microbenchmark + `.github/scripts/verify_wrr_selection_benchmark.py`,
-//! not by wall-clock assertions in this ordinary unit suite.
+//! Throughput against single-lane schedule serialization is gated by the hosted
+//! Criterion microbenchmark + `.github/scripts/verify_wrr_selection_benchmark.py`
+//! (mandatory parallel-speedup floors on 32/129-target fixtures; the skewed
+//! 4-target fixture is a secondary Arc-hotspot / serial-ratio signal), not by
+//! wall-clock assertions in this ordinary unit suite.
 
 use dashmap::DashMap;
 use ferrum_edge::config::types::{
@@ -219,6 +221,9 @@ fn wrr_subset_lanes_are_isolated_under_concurrency() {
                 hash_on: None,
                 tls: None,
                 connect_timeout_ms: None,
+                h2_upgrade_policy: None,
+                max_retries: None,
+                http1_max_pending_requests: None,
                 passive_health_check: None,
             }),
         },
@@ -230,6 +235,9 @@ fn wrr_subset_lanes_are_isolated_under_concurrency() {
                 hash_on: None,
                 tls: None,
                 connect_timeout_ms: None,
+                h2_upgrade_policy: None,
+                max_retries: None,
+                http1_max_pending_requests: None,
                 passive_health_check: None,
             }),
         },
