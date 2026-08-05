@@ -18,7 +18,8 @@
 //!
 //! Mirroring how this repo honestly reinterprets DR `maxRetries` as a
 //! per-request cap (see `docs/mesh.md`), this limiter reframes the knob as a
-//! **max concurrent in-flight HTTP/1.1 requests per `(host, port, subset)`** cap,
+//! **max concurrent in-flight HTTP/1.1 requests per
+//! `(host, DestinationRule policy port, selected subset)`** cap,
 //! measured from dispatch to response-headers. When a destination is already at
 //! its cap, the new request is shed immediately with a 503 ("upstream overflow"
 //! in Envoy terms) instead of being queued unboundedly. This bounds H1
@@ -101,8 +102,8 @@ use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 
 thread_local! {
-    /// Reused per-thread buffer for `(host, port, subset)` counter-key lookups on the
-    /// capped hot path. Mirrors the zero-allocation strategy of
+    /// Reused per-thread buffer for `(host, policy port, selected subset)`
+    /// counter-key lookups on the capped hot path. Mirrors the zero-allocation strategy of
     /// `backend_capabilities` / `pool` / `api_chargeback` so a repeat capped
     /// request to a known destination allocates nothing.
     static PENDING_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(96));
@@ -124,7 +125,7 @@ fn write_pending_key(buf: &mut String, host: &str, port: u16, subset: Option<&st
     }
 }
 
-/// Shared per-destination pending-request counter map.
+/// Shared per-destination in-flight-request counter map.
 ///
 /// Keyed by a flat `host|port|n` or `host|port|s<length>:<subset>` `String` (an
 /// owned key survives DNS-cache refreshes and target rotation without reborrowing from the
@@ -134,13 +135,13 @@ fn write_pending_key(buf: &mut String, host: &str, port: u16, subset: Option<&st
 ///
 /// One instance lives on `ProxyState` and is shared across every reqwest/H1
 /// dispatch for the gateway lifetime, so the cap bounds concurrent in-flight
-/// requests per `(host, port, selected subset name)` across all proxies in the
-/// same admission lane. `None` is distinct from every named subset, preventing a
+/// requests per `(host, policy port, selected subset name)` across all proxies
+/// in the same admission lane. `None` is distinct from every named subset, preventing a
 /// selected subset's cap from leaking to an unmatched destination. The key has
 /// no upstream/Service identity: two Services that dial the same `host:port`
 /// under a conventionally-named subset (e.g. both `v1`) share one lane even when
 /// their caps differ — Envoy scopes this per cluster; Ferrum's pre-existing
-/// `(host, port)` sharing already had that residual, and the subset dimension
+/// `(host, policy port)` sharing already had that residual, and the subset dimension
 /// only isolates distinct names.
 pub struct BackendPendingLimiter {
     inner: Arc<DashMap<String, Arc<BackendPendingCounter>>>,
