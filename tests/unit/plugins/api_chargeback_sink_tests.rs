@@ -8806,7 +8806,11 @@ async fn hardlinked_candidate_never_clobbers_an_existing_quarantine_sibling() {
 
     // A healthy record must still be delivered and removed in the same tick.
     let healthy = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FC2"));
-    fs::write(&healthy, br#"{"event_id":"healthy-after-hostile-hardlink"}"#).unwrap();
+    fs::write(
+        &healthy,
+        br#"{"event_id":"healthy-after-hostile-hardlink"}"#,
+    )
+    .unwrap();
 
     replay_spool_once_for_tests(&spool, &server.uri())
         .await
