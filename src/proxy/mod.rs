@@ -14935,6 +14935,21 @@ where
                                 biased;
                                 _ = cancel_ctb.cancelled() => {
                                     debug!("Client->backend: cancel fired mid-send");
+                                    // Breaking here leaves the loop for good, so the
+                                    // outer cancel branch never runs and this half
+                                    // would drop its sink without the published
+                                    // policy Close — the peer then observes a bare
+                                    // transport reset instead of the defined code and
+                                    // reason. `select!` drops the cancelled `send`
+                                    // future before running this handler, so the sink
+                                    // is free to reborrow; anything that future had
+                                    // already buffered is flushed ahead of the Close
+                                    // by this same bounded write.
+                                    send_bounded_ws_close(
+                                        &mut backend_sink,
+                                        policy_close_ctb.get().cloned(),
+                                    )
+                                    .await;
                                     break;
                                 }
                                 res = backend_sink.send(outgoing) => {
@@ -14973,6 +14988,11 @@ where
                             // delivery logging still records the forwarded Close after a
                             // successful sink accept (exactly once; not double-counted
                             // with policy_close records from plugin rejection).
+                            // O(1) refcount clone of the peer's own frame (the
+                            // reason is `Bytes`-backed and RFC-bounded to 123
+                            // bytes) so the cancel arm below can still deliver a
+                            // Close after `close_msg` is moved into `send`.
+                            let peer_close = close_frame.clone();
                             let close_msg = Message::Close(close_frame);
                             let outgoing_payload_bytes = ws_message_payload_bytes(&close_msg);
                             let delivery =
@@ -14984,6 +15004,17 @@ where
                                 biased;
                                 _ = cancel_ctb.cancelled() => {
                                     debug!("Client->backend: cancel fired during client-close forward");
+                                    // Same hole as the frame-forward arm: this half
+                                    // owns the only write side of `backend_sink`, so
+                                    // giving up here leaves the backend with no Close
+                                    // at all. Prefer the published policy Close (the
+                                    // reason we were cancelled); otherwise relay the
+                                    // peer's own code/reason rather than a bare reset.
+                                    send_bounded_ws_close(
+                                        &mut backend_sink,
+                                        policy_close_ctb.get().cloned().or(peer_close),
+                                    )
+                                    .await;
                                 }
                                 res = backend_sink.send(close_msg) => {
                                     match res {
@@ -15224,6 +15255,19 @@ where
                                 biased;
                                 _ = cancel_btc.cancelled() => {
                                     debug!("Backend->client: cancel fired mid-send");
+                                    // Mirror of the c2b mid-send arm. This is the arm
+                                    // the H2 frontend actually lands on: hyper's
+                                    // upgraded H2 writer flushes through a
+                                    // capacity-1 channel drained by a separate task,
+                                    // so `ws_sink.send()` is routinely still Pending
+                                    // in its flush when the opposite half publishes a
+                                    // policy Close and cancels. Without this write the
+                                    // client sees the transport end with no Close.
+                                    send_bounded_ws_close(
+                                        &mut ws_sink,
+                                        policy_close_btc.get().cloned(),
+                                    )
+                                    .await;
                                     break;
                                 }
                                 res = ws_sink.send(outgoing) => {
@@ -15259,6 +15303,9 @@ where
                             debug!("Backend sent close frame");
                             // Peer Close bypasses mutating hooks; observational delivery
                             // logging records the forwarded Close after sink accept.
+                            // Mirror of c2b: O(1) refcount clone so the cancel arm
+                            // can still deliver a Close after the move.
+                            let peer_close = close_frame.clone();
                             let close_msg = Message::Close(close_frame);
                             let outgoing_payload_bytes = ws_message_payload_bytes(&close_msg);
                             let delivery =
@@ -15268,6 +15315,13 @@ where
                                 biased;
                                 _ = cancel_btc.cancelled() => {
                                     debug!("Backend->client: cancel fired during backend-close forward");
+                                    // Mirror of c2b: policy Close first, else the
+                                    // backend's own code/reason, never a bare reset.
+                                    send_bounded_ws_close(
+                                        &mut ws_sink,
+                                        policy_close_btc.get().cloned().or(peer_close),
+                                    )
+                                    .await;
                                 }
                                 res = ws_sink.send(close_msg) => {
                                     match res {
