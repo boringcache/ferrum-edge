@@ -311,6 +311,16 @@ pub(super) fn collect_backend_lb_policy(
         session: Ok(session),
     };
 
+    // Remember the policy's FULL Service target set. Precedence below is
+    // resolved per Service, so a policy targeting `[a, b]` can win `a` while
+    // losing `b` to an older policy — but the status writer reports Direct
+    // attachment ATOMICALLY (`backend_lb_policy_conflict_losers` marks a policy
+    // Conflicted the moment it loses any one target). `finalize_backend_lb_policies`
+    // uses this set to withdraw such a policy everywhere, so a policy the
+    // operator was told is `Accepted=False` cannot still steer live traffic.
+    acc.gateway_api_backend_session_policy_targets
+        .insert(resource.clone(), service_targets.clone());
+
     for service_name in service_targets {
         let key = (object.metadata.namespace.clone(), service_name);
         let existing = acc
@@ -358,6 +368,55 @@ pub(super) fn collect_backend_lb_policy(
     }
 
     Ok(())
+}
+
+/// Withdraw every backend session policy that lost at least one of its targeted
+/// Services from ALL of the Services it won.
+///
+/// [`collect_backend_lb_policy`] resolves GEP-713 None-merge precedence one
+/// Service at a time, so a policy targeting `[api, cart]` can win `api` while
+/// losing `cart` to an older policy. Ferrum's Direct-attachment status is
+/// deliberately atomic — [`backend_lb_policy_conflict_losers`] marks such a
+/// policy `Accepted=False` / `Conflicted` — so leaving it applied to `api`
+/// would steer live traffic with a policy the operator was told was rejected.
+///
+/// After this pass the Services carrying persistence are exactly those whose
+/// policy reports `Accepted=True`. No cascade is needed: the challenger a
+/// withdrawn policy beat on some Service lost that Service under the same
+/// atomic rule and is itself `Conflicted`, so that Service correctly ends up
+/// with no persistence at all.
+///
+/// Runs once per translation over the collected policy set, never on a request
+/// path.
+pub(super) fn finalize_backend_lb_policies(acc: &mut K8sAccumulator) {
+    if acc.gateway_api_backend_session_policy_targets.is_empty() {
+        return;
+    }
+    // `BTreeSet` so the emitted warnings are deterministic across watch order.
+    let mut withdrawn: BTreeSet<K8sResourceKey> = BTreeSet::new();
+    for (resource, targets) in &acc.gateway_api_backend_session_policy_targets {
+        for service_name in targets {
+            let key = (resource.namespace.clone(), service_name.clone());
+            let winner = acc.gateway_api_backend_session_policies.get(&key);
+            if winner.is_none_or(|policy| policy.resource != *resource) {
+                withdrawn.insert(resource.clone());
+                break;
+            }
+        }
+    }
+    if withdrawn.is_empty() {
+        return;
+    }
+    acc.gateway_api_backend_session_policies
+        .retain(|_, policy| !withdrawn.contains(&policy.resource));
+    for resource in withdrawn {
+        acc.warnings.push(format!(
+            "{} {}/{} lost at least one targeted Service under BackendLB/XBackendTraffic \
+             oldest-wins precedence; its session persistence is withdrawn from every \
+             targeted Service to match the atomic Accepted=False/Conflicted status",
+            resource.kind, resource.namespace, resource.name
+        ));
+    }
 }
 
 fn backend_policy_is_preferred(
@@ -705,6 +764,12 @@ fn scope_cookie_session_to_route(
 /// Must not echo policy identity, Service names, or operator-authored values.
 const BACKEND_LB_POLICY_CONFLICTED_MESSAGE: &str = "Another BackendLBPolicy or XBackendTrafficPolicy already targets one or more of the same Services and merging is not supported";
 
+/// Controller name stamped on every `status.ancestors` entry Ferrum owns.
+const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
+
+/// Gateway API `PolicyStatus.ancestors` upper bound (`+kubebuilder:validation:MaxItems=16`).
+const POLICY_ANCESTOR_MAX_ITEMS: usize = 16;
+
 /// Policies that lose at least one Service target under the same GEP-713 None
 /// merge / oldest-wins precedence used by [`collect_backend_lb_policy`].
 ///
@@ -800,6 +865,11 @@ pub(crate) fn backend_lb_policy_conflict_losers<'a>(
 /// Invalid policies therefore never report Accepted because of a conflict
 /// check. With Ferrum's atomic direct-policy behavior, a multi-target policy
 /// that loses any Service is rejected entirely rather than partially accepted.
+///
+/// The result is reconciled against the object's live `status` through
+/// [`merge_backend_lb_policy_status`], so an unchanged condition keeps its
+/// `lastTransitionTime` (no per-reconcile status churn) and ancestor entries
+/// owned by another implementation are carried through untouched.
 pub(crate) fn backend_lb_policy_status(object: &K8sObject, conflicted: bool) -> Value {
     let (accepted, reason, message) = match validate_backend_lb_policy_for_status(object) {
         Ok(()) if conflicted => (
@@ -828,43 +898,187 @@ pub(crate) fn backend_lb_policy_status(object: &K8sObject, conflicted: bool) -> 
         };
         let kind = string_field(&target, "kind").unwrap_or("Service");
         let group = string_field(&target, "group").unwrap_or("");
-        ancestors.push(json!({
-            "ancestorRef": {
+        ancestors.push(backend_lb_policy_ancestor(
+            object,
+            json!({
                 "group": group,
                 "kind": kind,
                 "name": name,
                 "namespace": object.metadata.namespace,
-            },
-            "controllerName": "ferrum.io/gateway-controller",
-            "conditions": [condition_value(
-                object,
-                "Accepted",
-                accepted,
-                reason,
-                &message,
-            )],
-        }));
+            }),
+            accepted,
+            reason,
+            &message,
+        ));
     }
     if ancestors.is_empty() {
-        ancestors.push(json!({
-            "ancestorRef": {
+        ancestors.push(backend_lb_policy_ancestor(
+            object,
+            json!({
                 "group": "",
                 "kind": "Service",
                 "name": object.metadata.name,
                 "namespace": object.metadata.namespace,
-            },
-            "controllerName": "ferrum.io/gateway-controller",
-            "conditions": [condition_value(
-                object,
-                "Accepted",
-                accepted,
-                reason,
-                &message,
-            )],
-        }));
+            }),
+            accepted,
+            reason,
+            &message,
+        ));
     }
 
-    json!({ "ancestors": ancestors })
+    merge_backend_lb_policy_status(&json!({ "ancestors": ancestors }), Some(&object.status))
+}
+
+/// One Ferrum-owned `status.ancestors` entry, carrying the live
+/// `lastTransitionTime` forward when the condition's value did not change.
+fn backend_lb_policy_ancestor(
+    object: &K8sObject,
+    ancestor_ref: Value,
+    accepted: bool,
+    reason: &str,
+    message: &str,
+) -> Value {
+    let existing = live_ferrum_ancestor_condition(&object.status, &ancestor_ref, "Accepted");
+    let condition = condition_value(object, "Accepted", accepted, reason, message, existing);
+    json!({
+        "ancestorRef": ancestor_ref,
+        "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
+        "conditions": [condition],
+    })
+}
+
+/// Whether an ancestor entry is one Ferrum owns and may rewrite.
+fn is_ferrum_policy_ancestor(ancestor: &Value) -> bool {
+    ancestor.get("controllerName").and_then(Value::as_str) == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+}
+
+/// One `ancestorRef` field, with an absent optional field read as empty so a
+/// server-normalized live entry still matches the desired one.
+fn ancestor_ref_field<'a>(ancestor_ref: &'a Value, field: &str) -> &'a str {
+    ancestor_ref.get(field).and_then(Value::as_str).unwrap_or("")
+}
+
+/// Field-wise `ancestorRef` identity.
+fn policy_ancestor_ref_matches(left: &Value, right: &Value) -> bool {
+    for field in ["group", "kind", "name", "namespace"] {
+        if ancestor_ref_field(left, field) != ancestor_ref_field(right, field) {
+            return false;
+        }
+    }
+    true
+}
+
+fn condition_has_type(condition: &Value, condition_type: &str) -> bool {
+    condition.get("type").and_then(Value::as_str) == Some(condition_type)
+}
+
+/// `lastTransitionTime` for a condition that really did change, in the
+/// `Z`-suffixed RFC 3339 form the Kubernetes API server persists.
+fn condition_transition_now() -> String {
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Live Ferrum-owned condition for one `ancestorRef`, used to preserve
+/// `lastTransitionTime` across reconciles.
+fn live_ferrum_ancestor_condition<'a>(
+    live_status: &'a Value,
+    ancestor_ref: &Value,
+    condition_type: &str,
+) -> Option<&'a Value> {
+    let ancestors = live_status.get("ancestors").and_then(Value::as_array)?;
+    for ancestor in ancestors {
+        if !is_ferrum_policy_ancestor(ancestor) {
+            continue;
+        }
+        let Some(live_ref) = ancestor.get("ancestorRef") else {
+            continue;
+        };
+        if !policy_ancestor_ref_matches(live_ref, ancestor_ref) {
+            continue;
+        }
+        let conditions = ancestor.get("conditions").and_then(Value::as_array);
+        for condition in conditions.into_iter().flatten() {
+            if condition_has_type(condition, condition_type) {
+                return Some(condition);
+            }
+        }
+    }
+    None
+}
+
+/// Reconcile Ferrum's desired policy `status.ancestors` with the live array.
+///
+/// `PolicyStatus.ancestors` is a SHARED, atomic list: GEP-713 lets several
+/// implementations report on one policy and forbids an implementation from
+/// modifying or removing entries it does not own. Ferrum writes policy status
+/// with a forced server-side apply over the whole array, so a foreign entry has
+/// to be carried through the applied document or the API server drops it.
+///
+/// Ferrum-owned entries keep their live position, which — together with the
+/// preserved `lastTransitionTime` — is what makes a steady-state desired status
+/// compare equal to the live one so the planner stops re-patching it.
+///
+/// Idempotent: any non-Ferrum entry already present in `desired` is discarded
+/// before merging, so re-merging an already-merged document cannot duplicate a
+/// foreign ancestor.
+pub(crate) fn merge_backend_lb_policy_status(
+    desired: &Value,
+    live_status: Option<&Value>,
+) -> Value {
+    let mut owned: Vec<Value> = Vec::new();
+    if let Some(ancestors) = desired.get("ancestors").and_then(Value::as_array) {
+        for ancestor in ancestors {
+            if is_ferrum_policy_ancestor(ancestor) {
+                owned.push(ancestor.clone());
+            }
+        }
+    }
+    let live = live_status
+        .and_then(|status| status.get("ancestors"))
+        .and_then(Value::as_array);
+    let Some(live) = live else {
+        return json!({ "ancestors": owned });
+    };
+
+    let mut emitted = vec![false; owned.len()];
+    let mut merged: Vec<Value> = Vec::with_capacity(owned.len() + live.len());
+    // Ferrum's own ancestors always fit (`targetRefs` is capped at 16); foreign
+    // entries are preserved only while the Gateway API `MaxItems=16` budget
+    // allows, because an over-long array would make the whole patch invalid and
+    // Ferrum would then report no status at all.
+    let mut foreign_budget = POLICY_ANCESTOR_MAX_ITEMS.saturating_sub(owned.len());
+    for ancestor in live {
+        if !is_ferrum_policy_ancestor(ancestor) {
+            if foreign_budget > 0 {
+                foreign_budget -= 1;
+                merged.push(ancestor.clone());
+            }
+            continue;
+        }
+        let live_ref = ancestor.get("ancestorRef");
+        // Ferrum-owned slot: keep the live position for an ancestorRef that is
+        // still targeted. A removed targetRef simply drops out.
+        for (index, candidate) in owned.iter().enumerate() {
+            if emitted[index] {
+                continue;
+            }
+            let same_ref = match (candidate.get("ancestorRef"), live_ref) {
+                (Some(want), Some(have)) => policy_ancestor_ref_matches(have, want),
+                _ => false,
+            };
+            if same_ref {
+                merged.push(candidate.clone());
+                emitted[index] = true;
+                break;
+            }
+        }
+    }
+    for (index, candidate) in owned.into_iter().enumerate() {
+        if !emitted[index] {
+            merged.push(candidate);
+        }
+    }
+    json!({ "ancestors": merged })
 }
 
 fn validate_backend_lb_policy_for_status(object: &K8sObject) -> Result<(), String> {
@@ -924,22 +1138,43 @@ fn validate_backend_lb_policy_for_status(object: &K8sObject) -> Result<(), Strin
     Ok(())
 }
 
+/// Build one status condition, reusing `existing`'s `lastTransitionTime` when
+/// the condition's VALUE (status/reason/message) is unchanged.
+///
+/// Kubernetes requires `lastTransitionTime` to advance only on a real
+/// transition. It is also what keeps the status planner quiet: it emits a patch
+/// whenever the desired status differs from the live one, so re-stamping `now()`
+/// on every reconcile would re-patch every policy object forever — an unbounded
+/// API write loop, and a flapping timestamp for operators watching the resource.
+/// The format matches the API server's `Z`-suffixed RFC 3339 form so a
+/// re-emitted unchanged condition compares equal to what was persisted.
 fn condition_value(
     object: &K8sObject,
     condition_type: &str,
     accepted: bool,
     reason: &str,
     message: &str,
+    existing: Option<&Value>,
 ) -> Value {
     let status = if accepted { "True" } else { "False" };
     let observed = object.metadata.generation.unwrap_or(0);
+    let last_transition_time = existing
+        .filter(|condition| {
+            condition.get("status").and_then(Value::as_str) == Some(status)
+                && condition.get("reason").and_then(Value::as_str) == Some(reason)
+                && condition.get("message").and_then(Value::as_str) == Some(message)
+        })
+        .and_then(|condition| condition.get("lastTransitionTime"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(condition_transition_now);
     json!({
         "type": condition_type,
         "status": status,
         "reason": reason,
         "message": message,
         "observedGeneration": observed,
-        "lastTransitionTime": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "lastTransitionTime": last_transition_time,
     })
 }
 
@@ -11997,6 +12232,155 @@ mod tests {
             forward.config.upstreams[0].hash_on, reverse.config.upstreams[0].hash_on,
             "cross-kind policy precedence must not depend on watch order"
         );
+    }
+
+    /// A multi-target policy that loses ONE Service is reported
+    /// `Accepted=False` / `Conflicted` atomically, so translation must not keep
+    /// applying it to the Services it happened to win — otherwise a policy the
+    /// operator was told is rejected still steers live traffic.
+    #[test]
+    fn backend_lb_policy_losing_one_target_is_withdrawn_from_every_service() {
+        let mut older = backend_lb_policy(
+            "older",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "cart"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "older"}
+            }),
+        );
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut newer = backend_lb_policy(
+            "newer",
+            serde_json::json!({
+                "targetRefs": [
+                    {"group": "", "kind": "Service", "name": "api"},
+                    {"group": "", "kind": "Service", "name": "cart"}
+                ],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "newer"}
+            }),
+        );
+        newer.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let losers = super::backend_lb_policy_conflict_losers([&older, &newer], &options());
+        assert!(
+            losers.contains(&K8sResourceKey::from_object(&newer)),
+            "the challenger that lost `cart` must report Conflicted"
+        );
+        assert!(
+            !losers.contains(&K8sResourceKey::from_object(&older)),
+            "the oldest-wins policy stays Accepted"
+        );
+
+        // `api` was only targeted by the Conflicted challenger, so it must get
+        // no persistence at all — status and data plane agree.
+        let api_objects = [older.clone(), newer.clone(), http_route_to_service("api")];
+        let api = translate_k8s_objects(&api_objects, options()).expect("translation");
+        assert!(
+            api.config.upstreams.is_empty(),
+            "a Conflicted policy must not force a session Upstream on the Service it won"
+        );
+        assert!(api.config.proxies[0].upstream_id.is_none());
+
+        // The accepted winner still applies to its own Service.
+        let cart_objects = [older, newer, http_route_to_service("cart")];
+        let cart = translate_k8s_objects(&cart_objects, options()).expect("translation");
+        assert!(
+            cart.config.upstreams[0]
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:older-fe-")),
+            "the oldest-wins policy must still apply to the Service it won"
+        );
+    }
+
+    /// The status planner patches whenever the desired status differs from the
+    /// live one, so a value-unchanged policy status must be byte-identical or
+    /// every policy is re-patched on every reconcile and `lastTransitionTime`
+    /// flaps against the Kubernetes condition contract.
+    #[test]
+    fn backend_lb_policy_status_preserves_unchanged_last_transition_time() {
+        let mut policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "lb-affinity"}
+            }),
+        );
+        let first = super::backend_lb_policy_status(&policy, false);
+        policy.status = first.clone();
+        let second = super::backend_lb_policy_status(&policy, false);
+        assert_eq!(
+            second, first,
+            "an unchanged policy status must not be re-stamped every reconcile"
+        );
+
+        // A real transition still advances the timestamp.
+        let mut stale = first.clone();
+        stale["ancestors"][0]["conditions"][0]["status"] = serde_json::json!("False");
+        stale["ancestors"][0]["conditions"][0]["reason"] = serde_json::json!("Conflicted");
+        stale["ancestors"][0]["conditions"][0]["lastTransitionTime"] =
+            serde_json::json!("2020-01-01T00:00:00Z");
+        policy.status = stale;
+        let transitioned = super::backend_lb_policy_status(&policy, false);
+        let condition = &transitioned["ancestors"][0]["conditions"][0];
+        assert_eq!(condition["reason"], "Accepted");
+        assert_ne!(
+            condition["lastTransitionTime"],
+            serde_json::json!("2020-01-01T00:00:00Z"),
+            "a real transition must advance lastTransitionTime"
+        );
+    }
+
+    /// `status.ancestors` is shared across Gateway API implementations and is
+    /// applied as one atomic array, so Ferrum's forced server-side apply must
+    /// carry foreign ancestor entries through instead of erasing them.
+    #[test]
+    fn backend_lb_policy_status_preserves_foreign_controller_ancestors() {
+        let mut policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "lb-affinity"}
+            }),
+        );
+        policy.status = serde_json::json!({
+            "ancestors": [{
+                "ancestorRef": {
+                    "group": "",
+                    "kind": "Service",
+                    "name": "api",
+                    "namespace": "default"
+                },
+                "controllerName": "example.com/other-controller",
+                "conditions": [{
+                    "type": "Accepted",
+                    "status": "True",
+                    "reason": "Accepted",
+                    "message": "other implementation",
+                    "observedGeneration": 1,
+                    "lastTransitionTime": "2020-01-01T00:00:00Z"
+                }]
+            }]
+        });
+
+        let status = super::backend_lb_policy_status(&policy, false);
+        let ancestors = status["ancestors"].as_array().expect("ancestors array");
+        assert_eq!(ancestors.len(), 2, "got: {status}");
+        let foreign = "example.com/other-controller";
+        let ferrum = "ferrum.io/gateway-controller";
+        assert!(
+            ancestors.iter().any(|entry| entry["controllerName"] == foreign),
+            "a foreign controller's ancestor must survive Ferrum's apply document"
+        );
+        assert!(
+            ancestors.iter().any(|entry| entry["controllerName"] == ferrum),
+            "Ferrum still reports its own ancestor"
+        );
+
+        // Idempotent: the planner merges against the snapshot and the apply path
+        // merges again against the fresh live status.
+        policy.status = status.clone();
+        let again = super::backend_lb_policy_status(&policy, false);
+        assert_eq!(again, status, "re-merging must not duplicate an ancestor");
     }
 
     #[test]

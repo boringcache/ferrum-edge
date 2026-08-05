@@ -12,8 +12,8 @@ mod mesh_config;
 pub(crate) use core::secret_object_is_valid_tls_certificate;
 pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
-    backend_lb_policy_conflict_losers, backend_lb_policy_status, namespace_selector_matches,
-    parse_reference_grant_permissions,
+    backend_lb_policy_conflict_losers, backend_lb_policy_status, merge_backend_lb_policy_status,
+    namespace_selector_matches, parse_reference_grant_permissions,
 };
 // Re-exported for the integration suite's at-cap/over-cap L4 candidate and
 // projection assertions (`tests/integration/mesh_l7_routing_tests.rs`), which
@@ -542,6 +542,13 @@ pub(crate) struct K8sAccumulator {
     /// multiple policies target the same Service (GEP-713 None merge).
     pub(crate) gateway_api_backend_session_policies:
         HashMap<(String, String), gateway_api::GatewayBackendSessionPolicy>,
+    /// Full Service target set of every collected backend session policy, keyed
+    /// by resource identity. Precedence above is resolved per Service, so
+    /// [`gateway_api::finalize_backend_lb_policies`] needs the whole set to
+    /// apply the same ATOMIC rule the status writer reports: a policy that
+    /// loses any one target is withdrawn from every target.
+    pub(crate) gateway_api_backend_session_policy_targets:
+        HashMap<K8sResourceKey, std::collections::BTreeSet<String>>,
 }
 
 impl K8sAccumulator {
@@ -572,6 +579,7 @@ impl K8sAccumulator {
             gateway_api_route_conflicts: Vec::new(),
             gateway_api_materialized_route_parents: HashSet::new(),
             gateway_api_backend_session_policies: HashMap::new(),
+            gateway_api_backend_session_policy_targets: HashMap::new(),
         }
     }
 
@@ -987,6 +995,12 @@ where
             core::collect(&mut acc, object)?;
         }
     }
+
+    // Backend session-policy precedence is resolved per Service while
+    // collecting, but Direct attachment is reported atomically. Withdraw any
+    // policy that lost a target before route translation reads the map, so the
+    // data plane and `status.ancestors` cannot disagree.
+    gateway_api::finalize_backend_lb_policies(&mut acc);
 
     // WorkloadEntry cross-namespace attachment admission depends on the full
     // ReferenceGrant and Service indexes. Collect explicit-service ownership in
