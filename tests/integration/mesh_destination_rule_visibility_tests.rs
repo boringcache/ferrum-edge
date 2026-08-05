@@ -29,22 +29,28 @@
 //!   one by publishing a rule; contested ownership disables the tier instead
 //!   of guessing an owner; and the admission resolver never disagrees with
 //!   `destination_rule_host_matches` in a direction that invents a tier.
+//! * CP/DP agreement on that ownership for a MACHINE-SYNTHESIZED upstream: an
+//!   EgressGateway upstream is stamped with the gateway's own namespace, so the
+//!   materialization tier pass must resolve the external host's owner from the
+//!   ServiceEntry index rather than from the upstream — and must still refuse a
+//!   claimant that does not own it.
 
 use std::collections::HashMap;
 
-use ferrum_edge::config::types::{GatewayConfig, UpstreamTarget};
+use ferrum_edge::config::types::{GatewayConfig, Upstream, UpstreamTarget};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
-    MeshConfig, MeshDestinationRule, MeshLoadBalancer, MeshService, MeshSidecar, MeshSidecarEgress,
-    MeshSimpleLb, MeshTrafficPolicy, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    AppProtocol, MeshConfig, MeshDestinationRule, MeshLoadBalancer, MeshOutlierDetection,
+    MeshService, MeshSidecar, MeshSidecarEgress, MeshSimpleLb, MeshTrafficPolicy,
+    MeshTrafficPolicyTls, MtlsMode, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
     Workload, WorkloadRef, destination_rule_exported_to_namespace,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
-use ferrum_edge::modes::mesh::{MeshRuntimeConfig, prepare_gateway_config_for_mesh};
+use ferrum_edge::modes::mesh::{MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh};
 use serde_json::{Value, json};
 
 use super::mesh_test_support::{default_mesh_runtime, http_proxy, http_upstream};
@@ -1704,5 +1710,167 @@ fn an_upstream_spanning_two_services_resolves_each_host_independently() {
         ferrum_edge::config::types::LoadBalancerAlgorithm::LeastConnections,
         "the service-tier rule for the SECOND host must still apply — its host \
          has no client-tier rule, so nothing outranks it"
+    );
+}
+
+// ── EgressGateway: a SYNTHESIZED upstream carries the owner's policy ─────
+//
+// The upstream namespace is not ownership evidence for a machine-synthesized
+// egress upstream: `build_egress_upstream` stamps the GATEWAY's namespace,
+// which no operator can choose, and an external host pins no namespace in its
+// own syntax either. The declaring ServiceEntry is the ONLY evidence left, so
+// the data-plane tier pass has to read it from the same index slice admission
+// used. Otherwise every rule the control plane admits at the service tier for
+// an external host is refused before materialization and the owner's whole
+// trafficPolicy — TLS origination included — is silently discarded.
+//
+// The operator-authored shape is already covered above
+// (`materialized_external_connect_timeout` deliberately places the upstream in
+// the owning namespace); these cases cover the shape whose namespace is chosen
+// by the materializer.
+
+const EGRESS_GATEWAY_NAMESPACE: &str = "istio-egress";
+const EXTERNAL_HOST_OWNER: &str = "payments";
+
+/// The owner's policy for [`EXTERNAL_HOST`], carrying one knob per projection
+/// path so a PARTIAL application is visible instead of passing: backend TLS
+/// origination, outlier-detection thresholds, and the connect timeout.
+fn external_owner_policy_rule(namespace: &str) -> MeshDestinationRule {
+    let mut dr = rule(namespace, "owner-policy", EXTERNAL_HOST, 2222, &["*"]);
+    dr.traffic_policy = Some(MeshTrafficPolicy {
+        connect_timeout_ms: Some(2222),
+        outlier_detection: Some(MeshOutlierDetection {
+            consecutive_errors: Some(7),
+            interval_seconds: Some(11),
+            base_ejection_seconds: Some(13),
+            max_ejection_percent: Some(42),
+        }),
+        tls: Some(MeshTrafficPolicyTls {
+            mode: MtlsMode::Simple,
+            sni: Some(EXTERNAL_HOST.to_string()),
+            subject_alt_names: vec![EXTERNAL_HOST.to_string()],
+            ..MeshTrafficPolicyTls::default()
+        }),
+        ..MeshTrafficPolicy::default()
+    });
+    dr
+}
+
+/// An EgressGateway mesh: one external `ServiceEntry` declared in
+/// `owner_namespace`, an importing Sidecar in the gateway's own namespace, and
+/// whatever DestinationRules the case under test supplies.
+fn egress_gateway_mesh(owner_namespace: &str, rules: Vec<MeshDestinationRule>) -> MeshConfig {
+    let mut entry = external_service_entry(owner_namespace, "external-api", EXTERNAL_HOST);
+    entry.ports[0].protocol = AppProtocol::Http;
+    MeshConfig {
+        istio_root_namespace: "istio-system".to_string(),
+        service_entries: vec![entry],
+        workloads: vec![workload_in(EGRESS_GATEWAY_NAMESPACE, "egress-gateway")],
+        destination_rules: rules,
+        sidecars: vec![permissive_sidecar(EGRESS_GATEWAY_NAMESPACE)],
+        ..MeshConfig::default()
+    }
+}
+
+/// Materialize an EgressGateway data plane for a subscriber in
+/// [`EGRESS_GATEWAY_NAMESPACE`], end to end through slice narrowing AND
+/// `apply_destination_rules`.
+fn prepare_egress_gateway(mesh: MeshConfig) -> GatewayConfig {
+    let runtime = MeshRuntimeConfig {
+        namespace: EGRESS_GATEWAY_NAMESPACE.to_string(),
+        topology: MeshTopology::EgressGateway,
+        sidecar_enforced: true,
+        ..default_mesh_runtime()
+    };
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds")
+}
+
+/// The materialized egress upstream for [`EXTERNAL_HOST`], plus the effective
+/// connect timeout of the proxy that references it.
+fn egress_upstream_for_external_host(prepared: &GatewayConfig) -> (&Upstream, u64) {
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.targets.iter().any(|t| t.host == EXTERNAL_HOST))
+        .expect("the egress gateway materializes an upstream for the ServiceEntry host");
+    let connect_timeout_ms = prepared
+        .proxies
+        .iter()
+        .find(|p| p.upstream_id.as_deref() == Some(upstream.id.as_str()))
+        .expect("the materialized egress upstream has a referencing proxy")
+        .backend_connect_timeout_ms;
+    (upstream, connect_timeout_ms)
+}
+
+#[test]
+fn a_synthesized_egress_upstream_carries_the_service_entry_owners_traffic_policy() {
+    let owner = vec![external_owner_policy_rule(EXTERNAL_HOST_OWNER)];
+    let prepared = prepare_egress_gateway(egress_gateway_mesh(EXTERNAL_HOST_OWNER, owner));
+    let (upstream, connect_timeout_ms) = egress_upstream_for_external_host(&prepared);
+
+    // The premise of the case: the gateway's namespace is stamped on the
+    // upstream, so it cannot stand in for the ServiceEntry's owner.
+    assert_eq!(
+        upstream.namespace, EGRESS_GATEWAY_NAMESPACE,
+        "a ServiceEntry-derived egress upstream carries the GATEWAY's namespace"
+    );
+    assert_ne!(
+        upstream.namespace, EXTERNAL_HOST_OWNER,
+        "and the operator cannot move it into the owning namespace"
+    );
+
+    assert_eq!(
+        connect_timeout_ms, 2222,
+        "the owner's connectTimeout must reach the egress proxy"
+    );
+    assert_eq!(
+        upstream.backend_tls_sni.as_deref(),
+        Some(EXTERNAL_HOST),
+        "the owner's TLS origination must reach the egress upstream — dropping \
+         it leaves the external connection on whatever posture the upstream \
+         defaults to, which is weaker than what the host's owner configured"
+    );
+    assert_eq!(
+        upstream.backend_tls_san_allow_list,
+        vec![EXTERNAL_HOST.to_string()],
+        "and so must the SAN allow-list that constrains it"
+    );
+
+    let passive = upstream
+        .health_checks
+        .as_ref()
+        .and_then(|checks| checks.passive.as_ref())
+        .expect("the egress upstream carries a passive health check");
+    // The owner's outlierDetection thresholds must reach the egress upstream.
+    assert_eq!(passive.unhealthy_threshold, 7);
+    assert_eq!(passive.unhealthy_window_seconds, 11);
+    assert_eq!(passive.healthy_after_seconds, 13);
+    assert_eq!(passive.max_ejection_percent, Some(42));
+}
+
+/// The guard the repair must not trade away. Reading ownership from the
+/// ServiceEntry index WIDENS the data-plane tier pass, so an unrelated
+/// namespace's rule for the same external host must still be refused — the
+/// index names one owner, and it is not the claimant.
+#[test]
+fn an_unrelated_namespace_rule_never_reaches_the_synthesized_egress_upstream() {
+    let unpoliced = prepare_egress_gateway(egress_gateway_mesh(EXTERNAL_HOST_OWNER, Vec::new()));
+    let (baseline_upstream, baseline_timeout) = egress_upstream_for_external_host(&unpoliced);
+    let baseline_sni = baseline_upstream.backend_tls_sni.clone();
+
+    let claimant = vec![external_owner_policy_rule("evil")];
+    let prepared = prepare_egress_gateway(egress_gateway_mesh(EXTERNAL_HOST_OWNER, claimant));
+    let (upstream, connect_timeout_ms) = egress_upstream_for_external_host(&prepared);
+    assert_eq!(
+        connect_timeout_ms, baseline_timeout,
+        "`evil` is neither the client, the ServiceEntry's owner, nor the root"
+    );
+    assert_eq!(
+        upstream.backend_tls_sni, baseline_sni,
+        "and it must not originate TLS on the owner's behalf either"
     );
 }

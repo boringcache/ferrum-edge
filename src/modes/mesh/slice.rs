@@ -1171,7 +1171,7 @@ impl MeshSlice {
             || !mesh.virtual_service_cors_policies.is_empty()
         {
             (
-                mesh_service_identities(mesh),
+                mesh_service_identities(&mesh.services),
                 visible_service_entry_hosts(mesh, effective_namespace, &effective_labels),
             )
         } else {
@@ -2173,9 +2173,12 @@ fn service_entry_scope_resource(entry: &ServiceEntry) -> MeshEgressScopeResource
     }
 }
 
-fn mesh_service_identities(mesh: &MeshConfig) -> BTreeSet<(String, String)> {
+/// The `(namespace, name)` inventory a two-label policy host is confirmed
+/// against. `pub(crate)` because the data-plane materialization tier pass builds
+/// the same index from its slice's `services` — see [`destination_host_owner`].
+pub(crate) fn mesh_service_identities(services: &[MeshService]) -> BTreeSet<(String, String)> {
     let mut identities = BTreeSet::new();
-    for service in &mesh.services {
+    for service in services {
         let namespace = service
             .namespace
             .trim()
@@ -2215,7 +2218,25 @@ pub(crate) enum ServiceEntryHostOwner {
 }
 
 /// Index the hosts of every ServiceEntry visible to this workload by their
-/// owning (declaring) namespace.
+/// owning (declaring) namespace. Narrowing only; the ownership rules live in
+/// [`index_service_entry_host_owners`].
+fn visible_service_entry_hosts<L: WorkloadLabels + ?Sized>(
+    mesh: &MeshConfig,
+    workload_namespace: &str,
+    workload_labels: &L,
+) -> BTreeMap<String, ServiceEntryHostOwner> {
+    let visible: Vec<&ServiceEntry> = mesh
+        .service_entries
+        .iter()
+        .filter(|entry| {
+            service_entry_applies_to_workload(entry, workload_namespace, workload_labels)
+        })
+        .collect();
+    index_service_entry_host_owners(visible)
+}
+
+/// Index an ALREADY-VISIBLE set of ServiceEntries by the namespace that
+/// declares each host.
 ///
 /// Duplicate declarations WITHIN one namespace are still a single owner —
 /// Istio merges those. Duplicates ACROSS namespaces are
@@ -2223,16 +2244,17 @@ pub(crate) enum ServiceEntryHostOwner {
 /// hand one of two mutually untrusting namespaces a policy tier over the
 /// other's clients, and picking by iteration order would make the winner
 /// depend on resource spelling — the exact defect #2469 exists to remove.
-fn visible_service_entry_hosts<L: WorkloadLabels + ?Sized>(
-    mesh: &MeshConfig,
-    workload_namespace: &str,
-    workload_labels: &L,
+///
+/// Split out from [`visible_service_entry_hosts`] so the data-plane
+/// materialization pass — which consumes `MeshSlice.service_entries`, a set the
+/// control plane already narrowed by `exportTo` — reuses these exact ownership
+/// semantics instead of reimplementing them. CP and DP must agree on who owns
+/// an external host by construction, not by two parallel implementations.
+pub(crate) fn index_service_entry_host_owners<'a>(
+    service_entries: impl IntoIterator<Item = &'a ServiceEntry>,
 ) -> BTreeMap<String, ServiceEntryHostOwner> {
     let mut hosts: BTreeMap<String, ServiceEntryHostOwner> = BTreeMap::new();
-    for entry in &mesh.service_entries {
-        if !service_entry_applies_to_workload(entry, workload_namespace, workload_labels) {
-            continue;
-        }
+    for entry in service_entries {
         let owner = entry
             .namespace
             .trim()
@@ -2266,6 +2288,28 @@ fn visible_service_entry_hosts<L: WorkloadLabels + ?Sized>(
         }
     }
     hosts
+}
+
+/// The namespace that OWNS `host`, per a ServiceEntry-host ownership index —
+/// the LAST-resort arm of [`destination_host_owner`], reached only after
+/// `.svc`-qualified syntax and the service inventory have both declined, so a
+/// ServiceEntry can never claim a Kubernetes host by declaring the same string.
+///
+/// `None` for a host no visible ServiceEntry declares and for a contested one
+/// ([`Ambiguous`](ServiceEntryHostOwner::Ambiguous)): with no single owner the
+/// service tier is REFUSED for that host, never guessed. Host normalization
+/// lives here so every caller keys the index the same way — the index is built
+/// from trimmed, lowercased hosts, while callers hold anything from a rule's
+/// declared host to an upstream target's host.
+fn service_entry_host_owner<'a>(
+    service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
+    host: &str,
+) -> Option<&'a str> {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    match service_entry_hosts.get(&host) {
+        Some(ServiceEntryHostOwner::Owned(namespace)) => Some(namespace.as_str()),
+        Some(ServiceEntryHostOwner::Ambiguous) | None => None,
+    }
 }
 
 fn mesh_service_host_candidates(service: &MeshService, cluster_domain: &str) -> Vec<String> {
@@ -2436,8 +2480,9 @@ where
         admitted.push((**rule).clone());
     }
     let ambiguous_groups = per_group_kept.values().filter(|count| **count > 1).count();
-    let changed = record_destination_rule_ambiguity(scope.client_namespace, ambiguous_groups);
-    if ambiguous_groups > 0 && changed {
+    if ambiguous_groups > 0
+        && record_destination_rule_ambiguity(scope.client_namespace, ambiguous_groups)
+    {
         warn!(
             client_namespace = %scope.client_namespace,
             ambiguous_destinations = ambiguous_groups,
@@ -2448,29 +2493,57 @@ where
     admitted
 }
 
-/// Last reported ambiguous-destination count per client namespace.
+/// Ambiguous-destination counts ALREADY REPORTED for each client namespace, as
+/// a SET of counts per namespace rather than a single last-seen value.
 ///
-/// `admit_destination_rules` runs once per subscriber per config generation,
-/// and one namespace legitimately splitting a host's policy across two
+/// `admit_destination_rules` runs once per SUBSCRIBER (and again per subscriber
+/// for the operator-facing egress-scope snapshot), not once per namespace, and
+/// one namespace legitimately splitting a host's policy across two
 /// DestinationRules is a common Istio pattern — warning unconditionally is
-/// per-reload × per-DP log spam. Bounded by the mesh's namespace count and
-/// touched only on the cold slice-build path, never per request.
-static DESTINATION_RULE_AMBIGUITY_REPORTED: OnceLock<Mutex<HashMap<String, usize>>> =
+/// per-reload × per-DP log spam.
+///
+/// Set semantics, not last-value semantics, is what makes the dedup hold at a
+/// STEADY STATE. Two workloads in one namespace whose Sidecar scopes admit
+/// different rule sets legitimately produce different counts (W1's scope admits
+/// a host with two same-namespace rules, W2's excludes it), so a single
+/// last-seen slot flips 1 → 0 → 1 on every config generation and reports a
+/// "change" that never happened. A count this namespace has already been warned
+/// about is a steady state however many subscribers observe it; a count it has
+/// not is genuinely new and is reported once.
+///
+/// Growth is bounded by the mesh's namespace count times
+/// [`DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE`] and touched only on the
+/// cold slice-build path, never per request.
+static DESTINATION_RULE_AMBIGUITY_REPORTED: OnceLock<Mutex<HashMap<String, HashSet<usize>>>> =
     OnceLock::new();
 
+/// Distinct ambiguous-destination counts retained per namespace. A namespace
+/// churning through more than this many distinct counts keeps reporting (fail
+/// toward visibility — that churn is itself worth surfacing) instead of growing
+/// the map without bound.
+const DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE: usize = 32;
+
 /// Record this namespace's ambiguous-destination count, returning `true` when
-/// it differs from the last recorded one (so the caller reports a CHANGE
-/// rather than a steady state). A poisoned lock reports — fail toward
-/// visibility, never panic on a config-apply path.
+/// that count has NOT been reported for this namespace before (so the caller
+/// reports something new rather than a steady state). A poisoned lock reports —
+/// fail toward visibility, never panic on a config-apply path.
 fn record_destination_rule_ambiguity(client_namespace: &str, ambiguous: usize) -> bool {
     let reported = DESTINATION_RULE_AMBIGUITY_REPORTED.get_or_init(|| Mutex::new(HashMap::new()));
     let Ok(mut reported) = reported.lock() else {
         return true;
     };
-    if reported.get(client_namespace) == Some(&ambiguous) {
+    // Steady state is the common case, so it must not allocate a key.
+    if reported
+        .get(client_namespace)
+        .is_some_and(|counts| counts.contains(&ambiguous))
+    {
         return false;
     }
-    reported.insert(client_namespace.to_string(), ambiguous);
+    let counts = reported.entry(client_namespace.to_string()).or_default();
+    if counts.len() >= DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE {
+        return true;
+    }
+    counts.insert(ambiguous);
     true
 }
 
@@ -2612,55 +2685,122 @@ fn policy_target_service_ref(
         };
     }
 
-    // 2. Structurally-qualified Kubernetes references (`name.ns.svc`,
-    //    `name.ns.svc.<cluster domain>`). The namespace is pinned by the host
-    //    SYNTAX, so no inventory evidence is needed and no ServiceEntry can
-    //    claim ownership of one of these by declaring the same string.
+    // 2-4. Everything else is a CONCRETE destination host, resolved by the
+    //      shared helper the data-plane materialization tier pass also uses so
+    //      the two cannot rank one destination's owners differently.
+    match destination_host_owner(
+        host,
+        cluster_domain,
+        mesh_service_identities,
+        service_entry_hosts,
+    ) {
+        Some(DestinationHostOwner::ClusterService { name, namespace }) => {
+            PolicyTargetRef::ClusterService { name, namespace }
+        }
+        Some(DestinationHostOwner::ExternalHost { namespace }) => {
+            PolicyTargetRef::ExternalHost { namespace }
+        }
+        None => PolicyTargetRef::Unresolved,
+    }
+}
+
+/// Who owns a CONCRETE destination host, and what kind of destination it is.
+pub(crate) enum DestinationHostOwner {
+    /// An in-cluster Kubernetes Service.
+    ClusterService { name: String, namespace: String },
+    /// An external host owned by exactly one visible ServiceEntry.
+    ExternalHost { namespace: String },
+}
+
+impl DestinationHostOwner {
+    /// The owning namespace, whichever kind of destination this is.
+    pub(crate) fn namespace(&self) -> &str {
+        match self {
+            Self::ClusterService { namespace, .. } | Self::ExternalHost { namespace } => namespace,
+        }
+    }
+}
+
+/// Resolve a CONCRETE destination host to its owner, in strict
+/// most-authoritative-evidence-first order. `None` when nothing establishes an
+/// owner, which DISABLES the service tier for that host.
+///
+/// 1. `name.namespace.svc`, `name.namespace.svc.<cluster domain>` — the
+///    namespace is pinned by the host SYNTAX, so no inventory evidence is
+///    needed and no ServiceEntry can claim ownership of one of these by
+///    declaring the same string. A host carrying a DIFFERENT cluster's DNS
+///    domain pins nothing.
+/// 2. the two-label `name.namespace` shorthand, honored ONLY when the service
+///    inventory confirms the pair exists: the shape is INDISTINGUISHABLE from a
+///    two-label external DNS name (`example.com` must not nominate a namespace
+///    `com`), and a cluster Service outranks any ServiceEntry declaring the
+///    same string.
+/// 3. an external host declared by a ServiceEntry the consumer can see.
+///    Contested ownership resolves to `None`, NOT to a guess — refusing narrows
+///    admission, guessing would widen it.
+///
+/// Istio's short-name self-scoping (`reviews` authored in `beta` IS
+/// `beta/reviews`) is deliberately NOT here: it reads the POLICY's own
+/// namespace, so it is a property of how a policy spells its host rather than
+/// of a concrete destination. It lives in [`policy_target_service_ref`] alone.
+///
+/// Shared by DestinationRule admission (control plane) and
+/// `MaterializationTierScope::eligible_tier` (data plane) so neither the
+/// SOURCES of ownership evidence nor their ORDER can drift between the two
+/// (issue #2469). The one input that legitimately differs is
+/// `mesh_service_identities`: the control plane builds it from the full mesh
+/// inventory, the data plane from its slice's already-narrowed `services`. A
+/// service narrowed out of the slice therefore cannot claim step 2 there and
+/// the host falls through to step 3 — the same answer the control plane gives a
+/// consumer that cannot see the service either.
+pub(crate) fn destination_host_owner(
+    host: &str,
+    cluster_domain: &str,
+    mesh_service_identities: &BTreeSet<(String, String)>,
+    service_entry_hosts: &BTreeMap<String, ServiceEntryHostOwner>,
+) -> Option<DestinationHostOwner> {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let cluster_domain = cluster_domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host.is_empty() || host.contains('*') {
+        return None;
+    }
+
     if let Some((name, namespace)) = host
         .strip_suffix(".svc")
         .and_then(split_canonical_service_host)
     {
-        return PolicyTargetRef::ClusterService {
+        return Some(DestinationHostOwner::ClusterService {
             name: name.to_string(),
             namespace: namespace.to_string(),
-        };
+        });
     }
     if !cluster_domain.is_empty()
         && let Some((name, namespace)) = host
             .strip_suffix(&format!(".svc.{cluster_domain}"))
             .and_then(split_canonical_service_host)
     {
-        return PolicyTargetRef::ClusterService {
+        return Some(DestinationHostOwner::ClusterService {
             name: name.to_string(),
             namespace: namespace.to_string(),
-        };
+        });
     }
 
-    // 3. Two-label `name.namespace` shorthand. This shape is syntactically
-    //    INDISTINGUISHABLE from a two-label external DNS name (`example.com`
-    //    would otherwise nominate a namespace `com`), so it is honored only
-    //    when the service inventory confirms the pair exists. A cluster
-    //    Service outranks any ServiceEntry declaring the same string.
-    if let Some((name, namespace)) = split_canonical_service_host(host)
+    if let Some((name, namespace)) = split_canonical_service_host(&host)
         && mesh_service_identity_exists(mesh_service_identities, namespace, name)
     {
-        return PolicyTargetRef::ClusterService {
+        return Some(DestinationHostOwner::ClusterService {
             name: name.to_string(),
             namespace: namespace.to_string(),
-        };
+        });
     }
 
-    // 4. An external host declared by a ServiceEntry this workload can see.
-    //    Ambiguous ownership resolves to `Unresolved`, NOT to a guess: with no
-    //    single owner the service tier is refused for this host and only the
-    //    client and root tiers may write policy for it. Refusing narrows
-    //    admission; guessing would widen it.
-    match service_entry_hosts.get(host) {
-        Some(ServiceEntryHostOwner::Owned(namespace)) => PolicyTargetRef::ExternalHost {
-            namespace: namespace.clone(),
-        },
-        Some(ServiceEntryHostOwner::Ambiguous) | None => PolicyTargetRef::Unresolved,
-    }
+    let declared_owner = service_entry_host_owner(service_entry_hosts, &host)?;
+    Some(DestinationHostOwner::ExternalHost {
+        namespace: declared_owner.to_string(),
+    })
 }
 
 fn mesh_service_identity_exists(
@@ -5487,6 +5627,79 @@ mod tests {
         assert_eq!(slice.destination_rules.len(), 1);
         assert_eq!(slice.destination_rules[0].namespace, "ns");
         assert_eq!(slice.destination_rules[0].name, "in-ns");
+    }
+
+    /// The ambiguity warn-dedup must survive the fact that
+    /// `admit_destination_rules` runs once per SUBSCRIBER, not once per
+    /// namespace.
+    ///
+    /// Two workloads in one namespace whose Sidecar scopes admit different rule
+    /// sets legitimately report different counts, and every config generation
+    /// rebuilds both slices (plus an egress-scope snapshot per subscriber). A
+    /// last-seen-value slot flips 1 → 2 → 1 on every build and calls each flip a
+    /// "change", which is exactly the per-reload × per-DP spam the dedup exists
+    /// to prevent. Set semantics reports each count once and then stays quiet.
+    ///
+    /// This is private, process-global state reachable only from inside the
+    /// module, and the namespaces are unique to this test so a parallel test
+    /// sharing the static cannot perturb it.
+    #[test]
+    fn ambiguity_warn_dedup_is_quiet_when_subscribers_alternate_counts() {
+        let ns = "dedup-alternating-counts-ns";
+        assert!(
+            record_destination_rule_ambiguity(ns, 1),
+            "the first count for a namespace is new"
+        );
+        assert!(
+            record_destination_rule_ambiguity(ns, 2),
+            "a second subscriber's different count is also new"
+        );
+        for generation in 0..4 {
+            assert!(
+                !record_destination_rule_ambiguity(ns, 1),
+                "generation {generation}: this count was already reported"
+            );
+            assert!(
+                !record_destination_rule_ambiguity(ns, 2),
+                "generation {generation}: so was this one"
+            );
+        }
+        assert!(
+            record_destination_rule_ambiguity(ns, 3),
+            "a genuinely new count is still reported"
+        );
+
+        let other = "dedup-alternating-counts-other-ns";
+        assert!(
+            record_destination_rule_ambiguity(other, 1),
+            "counts are tracked per namespace, not globally"
+        );
+    }
+
+    /// Retention per namespace is capped, and a namespace past the cap keeps
+    /// reporting rather than growing the map without bound.
+    #[test]
+    fn ambiguity_warn_dedup_growth_is_bounded_per_namespace() {
+        let ns = "dedup-bounded-growth-ns";
+        for count in 1..=DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE {
+            assert!(
+                record_destination_rule_ambiguity(ns, count),
+                "count {count} is new and is retained"
+            );
+        }
+        let past_cap = DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE + 1;
+        assert!(
+            record_destination_rule_ambiguity(ns, past_cap),
+            "past the cap the dedup fails toward visibility"
+        );
+        assert!(
+            record_destination_rule_ambiguity(ns, past_cap),
+            "and it stays that way rather than retaining the new count"
+        );
+        assert!(
+            !record_destination_rule_ambiguity(ns, 1),
+            "already-retained counts are still deduped"
+        );
     }
 
     fn pa(

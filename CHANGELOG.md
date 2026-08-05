@@ -82,6 +82,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   root namespace keeps the earlier permissive bucketing rather than refusing a
   rule it has no evidence to classify.
 
+- That materialization-time refusal now resolves the matched destination host's
+  owning namespace with the SAME shared helper, in the same precedence order,
+  that slice admission uses — `.svc`-qualified syntax, then an
+  inventory-confirmed two-label `name.namespace`, then the declaring
+  `ServiceEntry` — instead of reading `.svc` syntax alone and otherwise falling
+  back to the namespace of the upstream carrying the host. An external host
+  pins no namespace in its own syntax, and a `ServiceEntry`-derived
+  EgressGateway upstream is stamped with the gateway's own namespace (not the
+  declaring ServiceEntry's, and not an operator choice), so previously the
+  control plane admitted an owner-authored `trafficPolicy` at the service tier
+  and the data plane refused the same rule, silently discarding TLS
+  origination, outlier detection, and the connect timeout on the egress
+  upstream.
+
 - DestinationRule lookup-tier arbitration on the data plane is now per
   destination HOST rather than per upstream, matching Istio's per-host
   resolution. An upstream whose targets span two services previously collapsed

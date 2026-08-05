@@ -63,7 +63,10 @@ use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
 use crate::modes::mesh::dns_proxy::MeshDnsProxy;
 use crate::modes::mesh::runtime::MeshRuntimeState;
-use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use crate::modes::mesh::slice::{
+    DestinationHostOwner, MeshSlice, MeshSliceRequest, ServiceEntryHostOwner,
+    destination_host_owner, index_service_entry_host_owners, mesh_service_identities,
+};
 use crate::modes::startup_security;
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
@@ -7167,6 +7170,30 @@ fn apply_destination_rules(
         );
     }
 
+    // Target-service ownership evidence for the matched destination host, built
+    // once per apply from the SAME indexes the slice builder's admission pass
+    // used so the two halves cannot classify one destination differently.
+    //
+    // The upstream's own namespace is not a substitute. An external host pins no
+    // namespace in its own syntax, and a ServiceEntry-derived EgressGateway
+    // upstream is stamped with the GATEWAY's namespace (`build_egress_upstream`),
+    // which is not an operator choice — so without the declaring ServiceEntry an
+    // owner-authored trafficPolicy the control plane admitted at the service tier
+    // would be refused here and silently dropped.
+    //
+    // The slice's `service_entries` are already `exportTo`-narrowed by the CP;
+    // the filter is re-applied for the same reason the DestinationRule
+    // visibility filter above is — a cross-wired or independently implemented
+    // producer must not be able to vouch for an owner this subscriber may not
+    // even see.
+    let service_identities = mesh_service_identities(&mesh_slice.services);
+    let visible_service_entries: Vec<&ServiceEntry> = mesh_slice
+        .service_entries
+        .iter()
+        .filter(|entry| service_entry_exported_to_namespace(entry, client_namespace))
+        .collect();
+    let service_entry_hosts = index_service_entry_host_owners(visible_service_entries);
+
     // Istio resolves the DestinationRule for a destination HOST, so tier
     // arbitration is per destination host, not per upstream. Arbitrating per
     // upstream conflates independent lookups whenever one upstream's targets
@@ -7182,6 +7209,8 @@ fn apply_destination_rules(
         client_namespace,
         root_namespace: mesh_slice.istio_root_namespace.trim(),
         cluster_domain: runtime.cluster_domain.trim_matches('.'),
+        mesh_service_identities: &service_identities,
+        service_entry_hosts: &service_entry_hosts,
     };
     let winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleLookupTier>>> = config
         .upstreams
@@ -7877,6 +7906,14 @@ struct MaterializationTierScope<'a> {
     /// Cluster DNS domain, used to read a target service namespace out of a
     /// `name.namespace.svc.<domain>` host.
     cluster_domain: &'a str,
+    /// The slice's own `(namespace, name)` service inventory, which confirms a
+    /// two-label `name.namespace` destination host.
+    mesh_service_identities: &'a std::collections::BTreeSet<(String, String)>,
+    /// Which namespace DECLARED each external host this subscriber can see,
+    /// indexed from the slice's own `service_entries`. The only ownership
+    /// evidence an external host has — it pins no namespace syntactically, and
+    /// the upstream carrying it need not live in the owning namespace.
+    service_entry_hosts: &'a std::collections::BTreeMap<String, ServiceEntryHostOwner>,
 }
 
 impl MaterializationTierScope<'_> {
@@ -7887,16 +7924,30 @@ impl MaterializationTierScope<'_> {
     /// specific (smaller) resulting tier wins:
     ///
     /// - the upstream's own `namespace` — authoritative for every materialized
-    ///   mesh upstream (`mesh_outbound_route_upstream` stamps the service's
-    ///   namespace) and for operator-authored upstreams;
-    /// - the namespace pinned by the matched host's own `*.svc[.domain]`
-    ///   syntax, which is what makes a mixed-namespace upstream resolve each
-    ///   destination independently.
+    ///   mesh outbound upstream (`mesh_outbound_route_upstream` stamps the
+    ///   service's namespace) and for operator-authored upstreams;
+    /// - the owner of the MATCHED destination host, resolved by the shared
+    ///   [`destination_host_owner`] — `.svc` syntax, then an
+    ///   inventory-confirmed two-label `name.namespace`, then the declaring
+    ///   ServiceEntry — which is what makes a mixed-namespace upstream resolve
+    ///   each destination independently.
     ///
-    /// Taking the union (rather than replacing one with the other) keeps this
-    /// classification a superset of the pre-#2469 upstream-only one, so the
-    /// refusal below can only ever reject a rule that was ALREADY outside
-    /// every lookup namespace.
+    /// The second is the SAME resolver, in the same precedence ORDER, that
+    /// `admit_destination_rules` used to admit the rule, and that is the point:
+    /// the two halves must agree by construction. Reading the upstream's
+    /// namespace alone does not work for an external host — it pins no
+    /// namespace syntactically, and `build_egress_upstream` stamps every
+    /// ServiceEntry-derived EgressGateway upstream with the GATEWAY's own
+    /// namespace, which the operator cannot choose — so an owner-authored rule
+    /// the control plane admitted at the service tier (TLS origination, outlier
+    /// detection, connect timeout) would otherwise be refused here and silently
+    /// dropped. Keeping the ORDER matters just as much: consulting the
+    /// ServiceEntry index ahead of `.svc` syntax or the service inventory would
+    /// let a carrier-supplied ServiceEntry declaring `reviews.beta[.svc…]`
+    /// transfer ownership of `beta`'s service to its own namespace.
+    ///
+    /// Taking the union of the two rather than replacing one with the other
+    /// keeps this classification a superset of the pre-#2469 upstream-only one.
     ///
     /// Refusal is gated on the slice carrying a root namespace. Without it
     /// `Root` and `Unscoped` are indistinguishable (both fall to the lowest
@@ -7923,10 +7974,16 @@ impl MaterializationTierScope<'_> {
             Some(upstream.namespace.as_str()),
             self.root_namespace,
         );
+        let host_owner = destination_host_owner(
+            matched_host,
+            self.cluster_domain,
+            self.mesh_service_identities,
+            self.service_entry_hosts,
+        );
         let by_host = destination_rule_lookup_tier(
             &dr.namespace,
             self.client_namespace,
-            cluster_service_host_namespace(matched_host, self.cluster_domain),
+            host_owner.as_ref().map(DestinationHostOwner::namespace),
             self.root_namespace,
         );
         let tier = by_upstream.min(by_host);
@@ -7936,31 +7993,6 @@ impl MaterializationTierScope<'_> {
             None
         }
     }
-}
-
-/// The namespace a cluster-service host names, when the host's OWN syntax pins
-/// it (`name.namespace.svc` or `name.namespace.svc.<cluster-domain>`).
-///
-/// Deliberately syntax-only, matching the `.svc`-qualified row of the
-/// target-service ownership table: an external name such as `api.example.com`
-/// must never nominate a namespace, and a host carrying a DIFFERENT cluster's
-/// DNS domain must not nominate a local one.
-fn cluster_service_host_namespace<'a>(host: &'a str, cluster_domain: &str) -> Option<&'a str> {
-    let host = host.trim().trim_end_matches('.');
-    let cluster_domain = cluster_domain.trim().trim_matches('.');
-    let (name, rest) = host.split_once('.')?;
-    if name.is_empty() {
-        return None;
-    }
-    let (namespace, rest) = rest.split_once('.')?;
-    if namespace.is_empty() {
-        return None;
-    }
-    let pinned = rest == "svc"
-        || rest.strip_prefix("svc.").is_some_and(|domain| {
-            !cluster_domain.is_empty() && domain.eq_ignore_ascii_case(cluster_domain)
-        });
-    pinned.then_some(namespace)
 }
 
 /// Every candidate destination host a DestinationRule may match this upstream
