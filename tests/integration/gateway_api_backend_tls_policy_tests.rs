@@ -2282,7 +2282,9 @@ async fn start_h2_first_raw_h1_backend(cert_pem: &str, key_pem: &str) -> ProbeFi
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind backend");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
     let port = listener.local_addr().expect("backend addr").port();
     let observed: ProbeLog = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&observed);
