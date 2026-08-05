@@ -3740,10 +3740,8 @@ fn replaced_dead_letter_source_credit_path_grants_no_capacity() {
     let row = padded_dead_letter_row("dl-replaced-credit", 4096);
     let source_bytes = row.len() as u64;
     let max_bytes = source_bytes + source_bytes / 2;
-    let spool =
-        SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
-    let source =
-        plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FE3", &row);
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FE3", &row);
     let claim = spool
         .hold_replay_claim_for_tests(&source)
         .unwrap()
@@ -3774,13 +3772,8 @@ fn resized_pinned_source_invalidates_dead_letter_credit() {
     let source_row = padded_dead_letter_row("dl-resized-source", 4096);
     let source_bytes = source_row.len() as u64;
     let max_bytes = source_bytes + source_bytes / 2;
-    let spool =
-        SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
-    let source = plant_owned_spool_source(
-        &spool,
-        "01ARZ3NDEKTSV4RRFFQ69G5FE4",
-        &source_row,
-    );
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FE4", &source_row);
     let claim = spool
         .hold_replay_claim_for_tests(&source)
         .unwrap()
@@ -3794,12 +3787,9 @@ fn resized_pinned_source_invalidates_dead_letter_credit() {
         .set_len(1024)
         .unwrap();
     let expanded_rejection = padded_dead_letter_row("dl-resized-rejection", 7000);
-    let error = publish_dead_letter_payload_for_claim_for_tests(
-        &spool,
-        &claim,
-        &expanded_rejection,
-    )
-    .expect_err("a stale source length must not raise the admission ceiling");
+    let error =
+        publish_dead_letter_payload_for_claim_for_tests(&spool, &claim, &expanded_rejection)
+            .expect_err("a stale source length must not raise the admission ceiling");
 
     assert!(
         error.contains("exceeds spool.max_bytes"),
@@ -3818,11 +3808,7 @@ fn source_larger_than_spool_quota_receives_no_dead_letter_credit() {
     let max_bytes = 4096;
     let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
     let oversized = padded_dead_letter_row("dl-over-quota-source", 8192);
-    let source = plant_owned_spool_source(
-        &spool,
-        "01ARZ3NDEKTSV4RRFFQ69G5FE5",
-        &oversized,
-    );
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FE5", &oversized);
 
     let claim = spool
         .hold_replay_claim_for_tests(&source)
@@ -3922,8 +3908,8 @@ fn dropping_a_claim_releases_the_dead_letter_source_credit() {
     let first =
         SpoolManager::for_tests_with_owner(settings.clone(), &test_owner_spec("node-a"), 311)
             .unwrap();
-    let second = SpoolManager::for_tests_with_owner(settings, &test_owner_spec("node-a"), 312)
-        .unwrap();
+    let second =
+        SpoolManager::for_tests_with_owner(settings, &test_owner_spec("node-a"), 312).unwrap();
     let source_a = plant_owned_spool_source(&first, "01ARZ3NDEKTSV4RRFFQ69G5FH1", &row);
     let source_b = plant_owned_spool_source(&first, "01ARZ3NDEKTSV4RRFFQ69G5FH2", &row);
     let source_c = plant_owned_spool_source(&first, "01ARZ3NDEKTSV4RRFFQ69G5FH3", &row);

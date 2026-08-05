@@ -6707,8 +6707,8 @@ impl SpoolSourceCreditReservation {
                 self.path.display()
             ));
         }
-        let record: SpoolSourceCreditWitness<'_> =
-            serde_json::from_slice(&bytes[..filled]).map_err(|error| {
+        let record: SpoolSourceCreditWitness<'_> = serde_json::from_slice(&bytes[..filled])
+            .map_err(|error| {
                 format!(
                     "{PLUGIN_NAME}: invalid spool dead-letter credit record '{}': {error}",
                     self.path.display()
@@ -7029,7 +7029,10 @@ impl SpoolManager {
         ) {
             return 0;
         }
-        if reservation.record_matches(base, pinned_len).unwrap_or(false) {
+        if reservation
+            .record_matches(base, pinned_len)
+            .unwrap_or(false)
+        {
             pinned_len
         } else {
             0
