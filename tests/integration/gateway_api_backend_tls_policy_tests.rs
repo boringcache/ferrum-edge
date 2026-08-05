@@ -803,13 +803,19 @@ fn backend_tls_policy_status_reports_invalid_ca_certificate_ref() {
     let ancestor = &ancestors[0];
 
     let accepted = condition(ancestor, "Accepted");
-    assert_eq!(accepted.get("status").and_then(Value::as_str), Some("False"));
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("False")
+    );
     assert_eq!(
         accepted.get("reason").and_then(Value::as_str),
         Some("Invalid")
     );
     let resolved = condition(ancestor, "ResolvedRefs");
-    assert_eq!(resolved.get("status").and_then(Value::as_str), Some("False"));
+    assert_eq!(
+        resolved.get("status").and_then(Value::as_str),
+        Some("False")
+    );
     assert_eq!(
         resolved.get("reason").and_then(Value::as_str),
         Some("InvalidCACertificateRef"),
@@ -868,7 +874,10 @@ fn backend_tls_policy_status_reports_target_not_found_when_service_is_absent() {
     let ancestors = ferrum_ancestors(&update);
     assert_eq!(ancestors.len(), 1);
     let accepted = condition(&ancestors[0], "Accepted");
-    assert_eq!(accepted.get("status").and_then(Value::as_str), Some("False"));
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("False")
+    );
     assert_eq!(
         accepted.get("reason").and_then(Value::as_str),
         Some("TargetNotFound")

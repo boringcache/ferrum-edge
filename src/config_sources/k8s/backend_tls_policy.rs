@@ -191,7 +191,9 @@ pub(super) fn collect(
     }
 
     let parsed = match object.spec.get("validation") {
-        None => Err(BackendTlsPolicyError::invalid("spec.validation is required")),
+        None => Err(BackendTlsPolicyError::invalid(
+            "spec.validation is required",
+        )),
         Some(validation) => parse_validation(acc, object, validation),
     };
     if let Err(error) = &parsed {
@@ -364,12 +366,10 @@ fn parse_validation(
     object: &K8sObject,
     validation: &Value,
 ) -> Result<BackendTlsPolicyOverlay, BackendTlsPolicyError> {
-    let hostname = string_field(validation, "hostname").ok_or_else(|| {
-        BackendTlsPolicyError::invalid("spec.validation.hostname is required")
-    })?;
-    validate_backend_tls_sni(hostname).map_err(|e| {
-        BackendTlsPolicyError::invalid(format!("spec.validation.hostname: {e}"))
-    })?;
+    let hostname = string_field(validation, "hostname")
+        .ok_or_else(|| BackendTlsPolicyError::invalid("spec.validation.hostname is required"))?;
+    validate_backend_tls_sni(hostname)
+        .map_err(|e| BackendTlsPolicyError::invalid(format!("spec.validation.hostname: {e}")))?;
 
     let well_known = string_field(validation, "wellKnownCACertificates");
     let ca_refs = validation
@@ -530,9 +530,7 @@ fn parse_subject_alt_names(validation: &Value) -> Result<Vec<String>, BackendTls
             }
         };
         validate_backend_tls_san_allow_list_entry(&value).map_err(|e| {
-            BackendTlsPolicyError::invalid(format!(
-                "spec.validation.subjectAltNames[{index}]: {e}"
-            ))
+            BackendTlsPolicyError::invalid(format!("spec.validation.subjectAltNames[{index}]: {e}"))
         })?;
         out.push(value);
     }
@@ -703,8 +701,9 @@ pub(super) fn resolve_backends_tls_policy(
                             "conflicting BackendTLSPolicy overlays across backends including {}",
                             backend_target_label(backend)
                         );
-                        acc.warnings
-                            .push(format!("Gateway API BackendTLSPolicy fails closed: {reason}"));
+                        acc.warnings.push(format!(
+                            "Gateway API BackendTLSPolicy fails closed: {reason}"
+                        ));
                         return BackendTlsPolicyLookup::Fault { reason };
                     }
                 }
@@ -717,8 +716,9 @@ pub(super) fn resolve_backends_tls_policy(
             let reason = format!(
                 "spec.rules[].backendRefs mixes BackendTLSPolicy-covered and uncovered backends ({covered} is covered, {uncovered} is not); Ferrum cannot encode per-backend TLS identity in one upstream"
             );
-            acc.warnings
-                .push(format!("Gateway API BackendTLSPolicy fails closed: {reason}"));
+            acc.warnings.push(format!(
+                "Gateway API BackendTLSPolicy fails closed: {reason}"
+            ));
             BackendTlsPolicyLookup::Fault { reason }
         }
         (Some(overlay), _, _) => BackendTlsPolicyLookup::Apply(overlay),

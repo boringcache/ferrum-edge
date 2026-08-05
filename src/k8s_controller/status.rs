@@ -10,13 +10,12 @@ use tracing::warn;
 use crate::config::types::GatewayConfig;
 use crate::config_sources::k8s::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus,
-    GatewayApiMaterializedRouteParent, GatewayApiRouteConflict,
-    GatewayApiRouteConflictKey, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation,
-    K8sTranslationOptions, gateway_api_route_conflict_keys_with_acc,
-    gateway_api_status_conflict_context, namespace_selector_matches,
-    parse_gateway_listener_allowed_route_namespaces, parse_reference_grant_permissions,
-    secret_object_is_valid_tls_certificate, translate_k8s_objects_collecting_skips,
-    validate_gateway_listener_allowed_routes,
+    GatewayApiMaterializedRouteParent, GatewayApiRouteConflict, GatewayApiRouteConflictKey,
+    K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
+    gateway_api_route_conflict_keys_with_acc, gateway_api_status_conflict_context,
+    namespace_selector_matches, parse_gateway_listener_allowed_route_namespaces,
+    parse_reference_grant_permissions, secret_object_is_valid_tls_certificate,
+    translate_k8s_objects_collecting_skips, validate_gateway_listener_allowed_routes,
 };
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
@@ -2607,11 +2606,12 @@ fn status_candidate_is_eligible(object: &K8sObject, indexes: &GatewayApiStatusIn
         // ancestors on it, so a policy that fell out of scope still gets its
         // stale Ferrum entries reconciled away rather than left behind.
         "BackendTLSPolicy" => {
-            let has_managed_ancestor = policy_target_services(object)
-                .into_iter()
-                .any(|(namespace, name)| {
-                    ancestor_gateways_for_service(indexes, namespace, name).is_some()
-                });
+            let has_managed_ancestor =
+                policy_target_services(object)
+                    .into_iter()
+                    .any(|(namespace, name)| {
+                        ancestor_gateways_for_service(indexes, namespace, name).is_some()
+                    });
             has_managed_ancestor || has_ferrum_status_entry(&object.status, "ancestors")
         }
         _ => false,

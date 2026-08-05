@@ -1792,7 +1792,10 @@ fn load_backend_root_store(
 ) -> Result<rustls::RootCertStore, anyhow::Error> {
     // `system://` resolves to `None` here, pinning the built-in roots and
     // deliberately skipping the cluster-global bundle.
-    if let Some(ca_path) = proxy.resolved_tls.effective_ca_source(global_ca_bundle_path) {
+    if let Some(ca_path) = proxy
+        .resolved_tls
+        .effective_ca_source(global_ca_bundle_path)
+    {
         load_root_store_from_pem(ca_path)
     } else {
         Ok(rustls::RootCertStore::from_iter(

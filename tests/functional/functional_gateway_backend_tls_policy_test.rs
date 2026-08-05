@@ -379,8 +379,8 @@ async fn backend_tls_policy_performs_verified_backend_tls() {
             sans: vec![BACKEND_SNI.to_string()],
         }),
     );
-    let (mut gateway, proxy_http) = start_gateway(&translated_config_yaml(&objects), Vec::new())
-        .await;
+    let (mut gateway, proxy_http) =
+        start_gateway(&translated_config_yaml(&objects), Vec::new()).await;
 
     assert_eq!(
         get_status(proxy_http, "/api/test").await,
@@ -408,8 +408,8 @@ async fn backend_tls_policy_untrusted_backend_ca_fails_closed() {
         &trusted_ca.cert_pem,
         Some(PolicyValidation::ConfigMapCa { sans: Vec::new() }),
     );
-    let (mut gateway, proxy_http) = start_gateway(&translated_config_yaml(&objects), Vec::new())
-        .await;
+    let (mut gateway, proxy_http) =
+        start_gateway(&translated_config_yaml(&objects), Vec::new()).await;
 
     assert_eq!(
         get_status(proxy_http, "/api/test").await,
@@ -436,8 +436,8 @@ async fn backend_tls_policy_hostname_mismatch_fails_closed() {
         &ca.cert_pem,
         Some(PolicyValidation::ConfigMapCa { sans: Vec::new() }),
     );
-    let (mut gateway, proxy_http) = start_gateway(&translated_config_yaml(&objects), Vec::new())
-        .await;
+    let (mut gateway, proxy_http) =
+        start_gateway(&translated_config_yaml(&objects), Vec::new()).await;
 
     assert_eq!(
         get_status(proxy_http, "/api/test").await,
@@ -468,8 +468,8 @@ async fn backend_tls_policy_subject_alt_name_allow_list_is_enforced() {
             sans: vec!["not-presented.example.com".to_string()],
         }),
     );
-    let (mut gateway, proxy_http) = start_gateway(&translated_config_yaml(&objects), Vec::new())
-        .await;
+    let (mut gateway, proxy_http) =
+        start_gateway(&translated_config_yaml(&objects), Vec::new()).await;
 
     assert_eq!(
         get_status(proxy_http, "/api/test").await,
@@ -501,7 +501,11 @@ async fn backend_tls_policy_system_roots_ignore_global_ca_bundle() {
     let global_ca_path = temp.path().join("cluster-ca.pem");
     std::fs::write(&global_ca_path, &cluster_ca.cert_pem).expect("write global CA");
 
-    let objects = k8s_objects(backend_port, &cluster_ca.cert_pem, Some(PolicyValidation::System));
+    let objects = k8s_objects(
+        backend_port,
+        &cluster_ca.cert_pem,
+        Some(PolicyValidation::System),
+    );
     let (mut gateway, proxy_http) = start_gateway(
         &translated_config_yaml(&objects),
         vec![(
