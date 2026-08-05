@@ -25044,8 +25044,10 @@ components:
               default: 5000
               description: >-
                 Per-attempt ClickHouse connect/request timeout. Bounded at ten
-                minutes so the cross-process spool claim lease remains finite
-                and strictly longer than the accepted request/retry budget.
+                minutes so the cross-process spool claim horizon used for
+                stranded-claim diagnostics remains finite and strictly longer
+                than the accepted request/retry budget. The horizon never
+                authorizes descriptor-free claim restoration.
         batch:
           type: object
           additionalProperties: false
