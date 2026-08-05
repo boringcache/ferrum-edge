@@ -1094,6 +1094,7 @@ jobs:
               functional_circuit_breaker_retry_test
               functional_dns_cache_test
               functional_graceful_shutdown_test
+              functional_failover_priority_test
               functional_load_balancer_test
               functional_load_stress_test
               functional_mtls_acl_test

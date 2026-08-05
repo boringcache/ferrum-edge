@@ -105,9 +105,34 @@ pub const AUDIT_LOCAL_FALLBACK_CAPACITY: usize = 4_096;
 pub const AUDIT_LOCAL_FALLBACK_MAX_BYTES: usize = AUDIT_LOCAL_FALLBACK_CAPACITY * 4 * 1024;
 const AUDIT_LOCAL_FALLBACK_FILE_NAME: &str = "admin-audit-fallback.json";
 const AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME: &str = "admin-audit-fallback.lock";
+/// Default on-disk location when `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` is unset.
+///
+/// Kept CWD-relative deliberately: an absolute default such as
+/// `/var/lib/ferrum/...` would break relative deployments and require a
+/// writable system path that many file-mode / container layouts do not have,
+/// while a process-scoped temp dir would discard security records across
+/// restarts. Operators who need an absolute or shared path set
+/// `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` explicitly. Test suites must not share
+/// this default — they pass a per-test directory on `AdminState`.
 const AUDIT_LOCAL_FALLBACK_DEFAULT_DIR: &str = "./ferrum-admin-audit";
+/// Combined bound for in-process + cross-process local-fallback lock waits.
+///
+/// A successful append is a handful of syscalls (typically well under 1 ms
+/// even under sibling-admin contention). 100 ms is orders of magnitude larger
+/// than that critical section, yet small versus typical admin
+/// request/header timeouts (seconds), so ordinary contention resolves without
+/// turning a stuck holder into a hung admin API. Both lock acquisitions share
+/// one deadline so the caller-visible worst case stays this bound, not the
+/// product of two independent waits.
+const LOCAL_FALLBACK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+/// Sleep between non-blocking lock retries. Short enough that a just-released
+/// holder is noticed quickly; long enough to avoid a tight spin.
+const LOCAL_FALLBACK_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
 #[cfg(windows)]
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+/// Win32 `ERROR_SHARING_VIOLATION` — another handle holds exclusive share mode.
+#[cfg(windows)]
+const WIN32_ERROR_SHARING_VIOLATION: i32 = 32;
 
 /// Closed allow-list of backup resource filter names persisted in audit events.
 pub const BACKUP_AUDIT_RESOURCE_NAMES: &[&str] = &[
@@ -3089,15 +3114,19 @@ struct FallbackFileLock {
 /// temp publication with same-directory atomic replace (Unix `rename(2)`;
 /// Windows `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)`), directory sync, and
 /// cross-process exclusion where the platform supports it. In-process and
-/// cross-process locks are acquired without waiting (`try_lock` /
-/// `LOCK_EX|LOCK_NB` on Unix; immediate share denial on Windows): contention
-/// or poisoning fails closed so a credential-bearing admit path cannot hang a
-/// Tokio blocking-pool thread. Never logs event contents.
+/// cross-process locks retry non-blocking acquisition against a shared
+/// [`LOCAL_FALLBACK_LOCK_WAIT`] deadline (`try_lock` / `LOCK_EX|LOCK_NB` on
+/// Unix; exclusive `share_mode(0)` open retries on Windows): ordinary
+/// contention waits briefly, then fails closed so a wedged holder cannot hang
+/// a Tokio blocking-pool thread unboundedly. Callers reach this via
+/// [`admit_security_sensitive_event`]'s `spawn_blocking`, so the bounded
+/// sleep stays off the async worker. Never logs event contents.
 pub fn append_local_fallback_event(dir: &Path, event: &AuditEvent) -> Result<(), anyhow::Error> {
-    let _process_guard = acquire_local_fallback_process_lock()?;
+    let deadline = local_fallback_lock_deadline();
+    let _process_guard = acquire_local_fallback_process_lock(deadline)?;
     prepare_fallback_directory(dir)?;
     let lock_path = dir.join(AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME);
-    let _cross_process = acquire_fallback_file_lock(&lock_path)?;
+    let _cross_process = acquire_fallback_file_lock(&lock_path, deadline)?;
     let path = audit_local_fallback_file(dir);
     reject_symlink_or_non_regular_file(&path, "audit local fallback data file")?;
     let mut events = read_local_fallback_events_unlocked(&path)?;
@@ -3127,32 +3156,57 @@ pub fn append_local_fallback_event(dir: &Path, event: &AuditEvent) -> Result<(),
 
 /// Read all events currently retained in the local fallback store.
 ///
-/// Uses the same non-blocking process and cross-process lock acquisition as
-/// [`append_local_fallback_event`]; contention fails closed immediately.
+/// Uses the same bounded process and cross-process lock acquisition as
+/// [`append_local_fallback_event`]; contention past the shared deadline fails
+/// closed.
 // This public library surface is exercised by integration tests but is unused
 // when the same module is compiled directly into the `ferrum-edge` binary.
 #[allow(dead_code)]
 pub fn list_local_fallback_events(dir: &Path) -> Result<Vec<AuditEvent>, anyhow::Error> {
-    let _process_guard = acquire_local_fallback_process_lock()?;
+    let deadline = local_fallback_lock_deadline();
+    let _process_guard = acquire_local_fallback_process_lock(deadline)?;
     prepare_existing_fallback_directory(dir)?;
     let lock_path = dir.join(AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME);
-    let _cross_process = acquire_fallback_file_lock(&lock_path)?;
+    let _cross_process = acquire_fallback_file_lock(&lock_path, deadline)?;
     let path = audit_local_fallback_file(dir);
     reject_symlink_or_non_regular_file(&path, "audit local fallback data file")?;
     read_local_fallback_events_unlocked(&path)
 }
 
-/// Non-blocking in-process mutex for the local fallback critical section.
+fn local_fallback_lock_deadline() -> std::time::Instant {
+    std::time::Instant::now() + LOCAL_FALLBACK_LOCK_WAIT
+}
+
+fn sleep_until_lock_deadline(deadline: std::time::Instant) -> bool {
+    let now = std::time::Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    let remaining = deadline.saturating_duration_since(now);
+    std::thread::sleep(LOCAL_FALLBACK_LOCK_RETRY.min(remaining));
+    true
+}
+
+/// Bounded in-process mutex for the local fallback critical section.
 ///
-/// Contention and poisoning both return a static, non-sensitive error so
-/// security-sensitive admit never waits indefinitely on another holder.
-fn acquire_local_fallback_process_lock() -> Result<MutexGuard<'static, ()>, anyhow::Error> {
-    match LOCAL_FALLBACK_LOCK.try_lock() {
-        Ok(guard) => Ok(guard),
-        Err(TryLockError::WouldBlock) => {
-            Err(anyhow!("audit local fallback process lock contended"))
+/// Retries `try_lock` until `deadline` so brief sibling contention can clear.
+/// Exhausted deadline and poisoning both return a static, non-sensitive error
+/// so security-sensitive admit never waits indefinitely on another holder.
+fn acquire_local_fallback_process_lock(
+    deadline: std::time::Instant,
+) -> Result<MutexGuard<'static, ()>, anyhow::Error> {
+    loop {
+        match LOCAL_FALLBACK_LOCK.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::WouldBlock) => {
+                if !sleep_until_lock_deadline(deadline) {
+                    return Err(anyhow!("audit local fallback process lock contended"));
+                }
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(anyhow!("audit local fallback lock poisoned"));
+            }
         }
-        Err(TryLockError::Poisoned(_)) => Err(anyhow!("audit local fallback lock poisoned")),
     }
 }
 
@@ -3162,7 +3216,13 @@ fn acquire_local_fallback_process_lock() -> Result<MutexGuard<'static, ()>, anyh
 #[allow(dead_code)]
 pub(crate) fn hold_local_fallback_process_lock_for_test()
 -> Result<MutexGuard<'static, ()>, anyhow::Error> {
-    acquire_local_fallback_process_lock()
+    match LOCAL_FALLBACK_LOCK.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(TryLockError::WouldBlock) => {
+            Err(anyhow!("audit local fallback process lock contended"))
+        }
+        Err(TryLockError::Poisoned(_)) => Err(anyhow!("audit local fallback lock poisoned")),
+    }
 }
 
 fn prepare_fallback_directory(dir: &Path) -> Result<(), anyhow::Error> {
@@ -3227,7 +3287,10 @@ fn reject_symlink_or_non_regular_file(
 }
 
 #[cfg(unix)]
-fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyhow::Error> {
+fn acquire_fallback_file_lock(
+    lock_path: &Path,
+    deadline: std::time::Instant,
+) -> Result<FallbackFileLock, anyhow::Error> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
 
@@ -3252,15 +3315,22 @@ fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyh
     validate_fallback_lock_path_identity(lock_path, &lock_metadata)?;
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
 
-    // SAFETY: `file` owns a valid descriptor for the lifetime of this guard.
-    // `flock` does not access Rust-managed memory. `LOCK_NB` fails immediately
-    // on contention so admit cannot hang a blocking-pool thread.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result != 0 {
+    loop {
+        // SAFETY: `file` owns a valid descriptor for the lifetime of this guard.
+        // `flock` does not access Rust-managed memory. Retry `LOCK_NB` against the
+        // shared deadline rather than blocking `LOCK_EX` unboundedly (or relying
+        // on signal/`alarm` tricks) so the bound stays explicit and portable.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            break;
+        }
         let error = std::io::Error::last_os_error();
         let errno = error.raw_os_error();
         if errno == Some(libc::EWOULDBLOCK) || errno == Some(libc::EAGAIN) {
-            return Err(anyhow!("audit local fallback cross-process lock contended"));
+            if !sleep_until_lock_deadline(deadline) {
+                return Err(anyhow!("audit local fallback cross-process lock contended"));
+            }
+            continue;
         }
         return Err(anyhow!(
             "failed to acquire audit local fallback cross-process lock: {error}"
@@ -3294,22 +3364,38 @@ fn validate_fallback_lock_path_identity(
 }
 
 #[cfg(windows)]
-fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyhow::Error> {
+fn acquire_fallback_file_lock(
+    lock_path: &Path,
+    deadline: std::time::Instant,
+) -> Result<FallbackFileLock, anyhow::Error> {
     use std::os::windows::fs::OpenOptionsExt;
 
     reject_symlink_or_non_regular_file(lock_path, "audit local fallback lock file")?;
     // `share_mode(0)` denies all share access for as long as this handle is
     // held — a std-only cross-process exclusive critical section. Open fails
-    // immediately when another holder already has the file (no wait).
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .share_mode(0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(lock_path)
-        .map_err(|error| anyhow!("failed to open audit local fallback lock: {error}"))?;
+    // immediately on sharing violation; retry against the shared deadline so
+    // the bound matches the Unix `LOCK_NB` loop (no unbounded wait).
+    let file = loop {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(lock_path)
+        {
+            Ok(file) => break file,
+            Err(error) if error.raw_os_error() == Some(WIN32_ERROR_SHARING_VIOLATION) => {
+                if !sleep_until_lock_deadline(deadline) {
+                    return Err(anyhow!("audit local fallback cross-process lock contended"));
+                }
+            }
+            Err(error) => {
+                return Err(anyhow!("failed to open audit local fallback lock: {error}"));
+            }
+        }
+    };
     let lock_metadata = file.metadata()?;
     if !lock_metadata.file_type().is_file() {
         return Err(anyhow!(
@@ -3320,7 +3406,10 @@ fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyh
 }
 
 #[cfg(not(any(unix, windows)))]
-fn acquire_fallback_file_lock(_lock_path: &Path) -> Result<FallbackFileLock, anyhow::Error> {
+fn acquire_fallback_file_lock(
+    _lock_path: &Path,
+    _deadline: std::time::Instant,
+) -> Result<FallbackFileLock, anyhow::Error> {
     Err(anyhow!(
         "audit local fallback cross-process exclusion is unavailable on this platform"
     ))

@@ -78,7 +78,7 @@ fn cp_admin_state(drift: Arc<MeshSliceDriftRegistry>) -> AdminState {
         mode: "cp".to_string(),
         read_only: false,
         admin_audit_enabled: false,
-        admin_audit_fallback_dir: None,
+        admin_audit_fallback_dir: Some(crate::common::isolated_audit_fallback_dir()),
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
