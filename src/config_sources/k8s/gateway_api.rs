@@ -1018,9 +1018,9 @@ fn live_ferrum_ancestor_condition<'a>(
 /// preserved `lastTransitionTime` — is what makes a steady-state desired status
 /// compare equal to the live one so the planner stops re-patching it.
 ///
-/// Idempotent: any non-Ferrum entry already present in `desired` is discarded
-/// before merging, so re-merging an already-merged document cannot duplicate a
-/// foreign ancestor.
+/// Idempotent: when a fresh live status is unavailable, foreign entries already
+/// present in `desired` become the preservation source, so re-merging an
+/// already-merged document neither drops nor duplicates them.
 pub(crate) fn merge_backend_lb_policy_status(
     desired: &Value,
     live_status: Option<&Value>,
@@ -1033,26 +1033,37 @@ pub(crate) fn merge_backend_lb_policy_status(
             }
         }
     }
+    let desired_ancestors = desired.get("ancestors").and_then(Value::as_array);
     let live = live_status
         .and_then(|status| status.get("ancestors"))
-        .and_then(Value::as_array);
-    let Some(live) = live else {
-        return json!({ "ancestors": owned });
-    };
+        .and_then(Value::as_array)
+        .or(desired_ancestors)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
 
     let mut emitted = vec![false; owned.len()];
-    let mut merged: Vec<Value> = Vec::with_capacity(owned.len() + live.len());
-    // Ferrum's own ancestors always fit (`targetRefs` is capped at 16); foreign
-    // entries are preserved only while the Gateway API `MaxItems=16` budget
-    // allows, because an over-long array would make the whole patch invalid and
-    // Ferrum would then report no status at all.
-    let mut foreign_budget = POLICY_ANCESTOR_MAX_ITEMS.saturating_sub(owned.len());
+    let mut merged: Vec<Value> = Vec::with_capacity(POLICY_ANCESTOR_MAX_ITEMS);
+    // Gateway API requires implementations to leave entries owned by other
+    // controllers untouched. If the shared 16-entry list is full, an
+    // implementation MUST NOT add another entry. Reserve capacity for every
+    // valid live foreign ancestor first and spend only what remains on Ferrum's
+    // own desired entries. A persisted CRD-valid list cannot itself exceed 16;
+    // the `take` keeps a malformed synthetic value from producing an invalid
+    // apply document.
+    let foreign_count = live
+        .iter()
+        .filter(|ancestor| !is_ferrum_policy_ancestor(ancestor))
+        .take(POLICY_ANCESTOR_MAX_ITEMS)
+        .count();
+    let mut owned_budget = POLICY_ANCESTOR_MAX_ITEMS.saturating_sub(foreign_count);
     for ancestor in live {
         if !is_ferrum_policy_ancestor(ancestor) {
-            if foreign_budget > 0 {
-                foreign_budget -= 1;
+            if merged.len() < POLICY_ANCESTOR_MAX_ITEMS {
                 merged.push(ancestor.clone());
             }
+            continue;
+        }
+        if owned_budget == 0 {
             continue;
         }
         let live_ref = ancestor.get("ancestorRef");
@@ -1069,13 +1080,15 @@ pub(crate) fn merge_backend_lb_policy_status(
             if same_ref {
                 merged.push(candidate.clone());
                 emitted[index] = true;
+                owned_budget -= 1;
                 break;
             }
         }
     }
     for (index, candidate) in owned.into_iter().enumerate() {
-        if !emitted[index] {
+        if !emitted[index] && owned_budget > 0 {
             merged.push(candidate);
+            owned_budget -= 1;
         }
     }
     json!({ "ancestors": merged })
@@ -12381,6 +12394,50 @@ mod tests {
         policy.status = status.clone();
         let again = super::backend_lb_policy_status(&policy, false);
         assert_eq!(again, status, "re-merging must not duplicate an ancestor");
+    }
+
+    /// Gateway API caps the shared ancestor map at 16 entries and requires an
+    /// implementation not to add entries once it is full. Foreign controller
+    /// ownership therefore wins the capacity budget over Ferrum's desired
+    /// entry; forced SSA must never evict a foreign status just to report ours.
+    #[test]
+    fn backend_lb_policy_status_does_not_evict_a_full_foreign_ancestor_map() {
+        let mut policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "lb-affinity"}
+            }),
+        );
+        let foreign = (0..super::POLICY_ANCESTOR_MAX_ITEMS)
+            .map(|index| {
+                serde_json::json!({
+                    "ancestorRef": {
+                        "group": "",
+                        "kind": "Service",
+                        "name": format!("foreign-{index}"),
+                        "namespace": "default"
+                    },
+                    "controllerName": format!("example.com/controller-{index}"),
+                    "conditions": []
+                })
+            })
+            .collect::<Vec<_>>();
+        policy.status = serde_json::json!({ "ancestors": foreign });
+
+        let status = super::backend_lb_policy_status(&policy, false);
+        let ancestors = status["ancestors"].as_array().expect("ancestors array");
+        assert_eq!(ancestors.len(), super::POLICY_ANCESTOR_MAX_ITEMS);
+        assert!(ancestors.iter().all(|entry| {
+            entry["controllerName"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("example.com/controller-"))
+        }));
+
+        // Applying a planner-produced document without a fresh live snapshot
+        // still preserves its already-carried foreign entries.
+        let again = super::merge_backend_lb_policy_status(&status, None);
+        assert_eq!(again, status);
     }
 
     #[test]
