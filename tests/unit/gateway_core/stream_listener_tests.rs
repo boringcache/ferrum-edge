@@ -172,9 +172,7 @@ where
         let manager = create_manager(config);
         let failures = manager.reconcile().await;
         if failures.is_empty() {
-            let started = manager
-                .wait_until_started(Duration::from_secs(5))
-                .await;
+            let started = manager.wait_until_started(Duration::from_secs(5)).await;
             if started.is_ok() {
                 return (manager, port);
             }
@@ -204,10 +202,9 @@ where
         }
 
         let expected_prefix = format!("Port {port} is already in use on ");
-        let only_released_port_collision =
-            failures.iter().all(|(_, failed_port, message)| {
-                *failed_port == port && message.starts_with(&expected_prefix)
-            });
+        let only_released_port_collision = failures.iter().all(|(_, failed_port, message)| {
+            *failed_port == port && message.starts_with(&expected_prefix)
+        });
         manager.shutdown_all().await;
         assert!(
             only_released_port_collision,
@@ -376,8 +373,7 @@ async fn shared_l4_catchall_is_grouped_and_preserves_declaration_order() {
     let (manager, frontend_port) = start_manager_on_fresh_tcp_port(|frontend_port| {
         let mut catchall = create_stream_proxy("catchall", BackendScheme::Tcp, frontend_port);
         catchall.backend_port = catchall_backend_port;
-        let mut constrained =
-            create_stream_proxy("constrained", BackendScheme::Tcp, frontend_port);
+        let mut constrained = create_stream_proxy("constrained", BackendScheme::Tcp, frontend_port);
         constrained.backend_port = constrained_backend_port;
         constrain_to_loopback(&mut constrained);
         GatewayConfig {
@@ -415,8 +411,7 @@ async fn shared_l4_double_digit_ids_preserve_declaration_order() {
     let match_ten_backend_port = match_ten_backend.local_addr().unwrap().port();
 
     let (manager, frontend_port) = start_manager_on_fresh_tcp_port(|frontend_port| {
-        let mut match_two =
-            create_stream_proxy("route-match-2", BackendScheme::Tcp, frontend_port);
+        let mut match_two = create_stream_proxy("route-match-2", BackendScheme::Tcp, frontend_port);
         match_two.backend_port = match_two_backend_port;
         constrain_to_loopback(&mut match_two);
         let mut match_ten =
@@ -458,8 +453,7 @@ async fn passthrough_same_sni_double_digit_ids_preserve_declaration_order() {
     let match_ten_backend_port = match_ten_backend.local_addr().unwrap().port();
 
     let (manager, frontend_port) = start_manager_on_fresh_tcp_port(|frontend_port| {
-        let mut match_two =
-            create_stream_proxy("route-match-2", BackendScheme::Tcp, frontend_port);
+        let mut match_two = create_stream_proxy("route-match-2", BackendScheme::Tcp, frontend_port);
         match_two.backend_port = match_two_backend_port;
         match_two.passthrough = true;
         match_two.hosts = vec!["secure.example.com".to_string()];
