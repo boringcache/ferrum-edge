@@ -1,9 +1,15 @@
 use bytes::Bytes;
+use ferrum_edge::_test_support::{
+    build_aggregate_sse_reject_for_test, mcp_aggregate_sse_listener_is_staged_for_test,
+    reject_headers_select_event_stream_for_test, take_mcp_aggregate_sse_listener_for_test,
+};
 use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ai_tool_governor::AiToolGovernor,
-    create_plugin, priority,
+    create_plugin, mcp_aggregate_sse::AggregateSseBody, priority,
 };
+use futures_util::StreamExt;
+use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9556,293 +9562,450 @@ async fn validate_tool_results_pinned_validator_survives_catalog_refresh_and_clo
     );
 }
 
-#[tokio::test]
-async fn aggregate_sse_get_attaches_listener_and_multiplexes_ping() {
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &aggregate_config("http://github-mcp.example:8080/mcp"),
-    )
-    .unwrap()
-    .unwrap();
-    let session_id = initialize(&plugin).await;
+/// Build the GET context and headers for an aggregate SSE attach.
+fn sse_get_ctx(
+    session_id: Option<&str>,
+    accept: Option<&str>,
+) -> (
+    ferrum_edge::plugins::RequestContext,
+    HashMap<String, String>,
+) {
+    let mut ctx = create_test_context();
+    ctx.method = "GET".to_string();
+    ctx.path = "/mcp".to_string();
+    let mut headers = HashMap::new();
+    if let Some(accept) = accept {
+        headers.insert("accept".to_string(), accept.to_string());
+    }
+    if let Some(session_id) = session_id {
+        headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    }
+    (ctx, headers)
+}
 
-    let mut get_ctx = create_test_context();
-    get_ctx.method = "GET".to_string();
-    get_ctx.path = "/mcp".to_string();
-    let mut get_headers = HashMap::from([
-        ("accept".to_string(), "text/event-stream".to_string()),
-        ("mcp-session-id".to_string(), session_id.clone()),
-    ]);
-    let get_result = plugin.before_proxy(&mut get_ctx, &mut get_headers).await;
-    match get_result {
-        PluginResult::Reject {
-            status_code,
-            body,
-            headers,
-        } => {
-            assert_eq!(status_code, 200);
-            assert!(body.is_empty());
-            assert_eq!(
-                headers.get("content-type").map(String::as_str),
-                Some("text/event-stream")
-            );
+/// The ordinary well-formed aggregate SSE attach.
+fn sse_get(
+    session_id: &str,
+) -> (
+    ferrum_edge::plugins::RequestContext,
+    HashMap<String, String>,
+) {
+    sse_get_ctx(Some(session_id), Some("text/event-stream"))
+}
+
+fn sse_body(ctx: &mut ferrum_edge::plugins::RequestContext) -> AggregateSseBody {
+    let listener = take_mcp_aggregate_sse_listener_for_test(ctx)
+        .expect("SSE listener staged on the request context");
+    listener.take_body().expect("body claimed exactly once")
+}
+
+async fn sse_drain_until(body: &mut AggregateSseBody, wanted: &[&str], max: usize) -> String {
+    let mut seen = String::new();
+    let window = std::time::Duration::from_secs(2);
+    for _ in 0..max {
+        if wanted.iter().all(|needle| seen.contains(needle)) {
+            break;
         }
-        other => panic!("expected SSE reject, got {other:?}"),
-    }
-    assert_eq!(
-        get_ctx.metadata.get("mcp.route_decision").map(String::as_str),
-        Some("sse_listener")
-    );
-    let mut frames = ferrum_edge::_test_support::take_mcp_aggregate_sse_frames_for_test(&mut get_ctx)
-        .expect("SSE frames staged on context");
-
-    // Concurrent pings on distinct stream identities fan onto the one listener.
-    let session_a = session_id.clone();
-    let session_b = session_id.clone();
-    let p1 = Arc::clone(&plugin);
-    let p2 = Arc::clone(&plugin);
-    let t1 = tokio::spawn(async move {
-        let (mut ctx, mut headers) = mcp_ctx(json!({
-            "jsonrpc": "2.0",
-            "id": "stream-a",
-            "method": "ping",
-            "params": {}
-        }));
-        headers.insert("mcp-session-id".to_string(), session_a);
-        p1.before_proxy(&mut ctx, &mut headers).await
-    });
-    let t2 = tokio::spawn(async move {
-        let (mut ctx, mut headers) = mcp_ctx(json!({
-            "jsonrpc": "2.0",
-            "id": "stream-b",
-            "method": "ping",
-            "params": {}
-        }));
-        headers.insert("mcp-session-id".to_string(), session_b);
-        p2.before_proxy(&mut ctx, &mut headers).await
-    });
-    for handle in [t1, t2] {
-        let result = handle.await.unwrap();
-        let (status, body, _) = reject_raw(result);
-        assert_eq!(status, 202);
-        assert!(body.is_empty());
-    }
-
-    let mut joined = String::new();
-    for _ in 0..6 {
-        let Some(frame) = frames.recv().await else {
+        let Ok(frame) = tokio::time::timeout(window, body.next()).await else {
+            break;
+        };
+        let Some(frame) = frame else {
             break;
         };
         let data = frame.unwrap().into_data().unwrap();
-        joined.push_str(&String::from_utf8_lossy(&data));
-        if joined.contains("stream-a") && joined.contains("stream-b") {
-            break;
-        }
+        seen.push_str(&String::from_utf8_lossy(&data));
     }
-    assert!(
-        joined.contains("stream-a") && joined.contains("stream-b"),
-        "both multiplexed ping results must appear on the SSE listener"
-    );
+    seen
 }
 
-#[tokio::test]
-async fn aggregate_sse_get_rejects_invalid_accept_duplicate_and_unknown_session() {
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &aggregate_config("http://github-mcp.example:8080/mcp"),
-    )
-    .unwrap()
-    .unwrap();
-    let session_id = initialize(&plugin).await;
-
-    let mut ctx = create_test_context();
-    ctx.method = "GET".to_string();
-    ctx.path = "/mcp".to_string();
-    let mut headers = HashMap::from([("mcp-session-id".to_string(), session_id.clone())]);
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    let (status, body, _) = reject_json(result);
-    assert_eq!(status, 400);
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("text/event-stream"));
-    assert_eq!(
-        ctx.metadata.get("mcp.sse.error").map(String::as_str),
-        Some("invalid_accept")
-    );
-
-    let mut ctx = create_test_context();
-    ctx.method = "GET".to_string();
-    ctx.path = "/mcp".to_string();
-    let mut headers = HashMap::from([
-        ("accept".to_string(), "text/event-stream".to_string()),
-        ("mcp-session-id".to_string(), session_id.clone()),
-    ]);
-    let first = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(first, PluginResult::Reject { status_code: 200, .. }));
-    let _frames = ferrum_edge::_test_support::take_mcp_aggregate_sse_frames_for_test(&mut ctx);
-
-    let mut ctx2 = create_test_context();
-    ctx2.method = "GET".to_string();
-    ctx2.path = "/mcp".to_string();
-    let mut headers2 = HashMap::from([
-        ("accept".to_string(), "text/event-stream".to_string()),
-        ("mcp-session-id".to_string(), session_id),
-    ]);
-    let dup = plugin.before_proxy(&mut ctx2, &mut headers2).await;
-    let (status, body, _) = reject_json(dup);
-    assert_eq!(status, 409);
-    assert!(body["error"].as_str().unwrap().contains("already attached"));
-
-    let mut ctx3 = create_test_context();
-    ctx3.method = "GET".to_string();
-    ctx3.path = "/mcp".to_string();
-    let mut headers3 = HashMap::from([
-        ("accept".to_string(), "text/event-stream".to_string()),
-        ("mcp-session-id".to_string(), "missing-session".to_string()),
-    ]);
-    let missing = plugin.before_proxy(&mut ctx3, &mut headers3).await;
-    let (status, _, _) = reject_raw(missing);
-    assert_eq!(status, 404);
-}
-
-#[tokio::test]
-async fn aggregate_sse_cancel_and_disabled_multiplexing_and_reload() {
-    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
-    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
-    let session_id = initialize(&plugin).await;
-
-    let mut get_ctx = create_test_context();
-    get_ctx.method = "GET".to_string();
-    get_ctx.path = "/mcp".to_string();
-    let mut get_headers = HashMap::from([
-        ("accept".to_string(), "text/event-stream".to_string()),
-        ("mcp-session-id".to_string(), session_id.clone()),
-    ]);
-    let _ = plugin.before_proxy(&mut get_ctx, &mut get_headers).await;
-    let mut frames =
-        ferrum_edge::_test_support::take_mcp_aggregate_sse_frames_for_test(&mut get_ctx).unwrap();
-
-    // Open a stream via ping, then cancel it.
-    let (mut ping_ctx, mut ping_headers) = mcp_ctx(json!({
+async fn ping(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    id: Value,
+) -> PluginResult {
+    let (mut ctx, mut headers) = mcp_ctx(json!({
         "jsonrpc": "2.0",
-        "id": "to-cancel",
+        "id": id,
         "method": "ping",
         "params": {}
     }));
-    ping_headers.insert("mcp-session-id".to_string(), session_id.clone());
-    let ping = plugin.before_proxy(&mut ping_ctx, &mut ping_headers).await;
-    assert_eq!(reject_raw(ping).0, 202);
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await
+}
 
-    let (mut cancel_ctx, mut cancel_headers) = mcp_ctx(json!({
+async fn cancel_notification(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    request_id: Value,
+) -> (PluginResult, ferrum_edge::plugins::RequestContext) {
+    let (mut ctx, mut headers) = mcp_ctx(json!({
         "jsonrpc": "2.0",
         "method": "notifications/cancelled",
-        "params": { "requestId": "to-cancel" }
+        "params": { "requestId": request_id }
     }));
-    cancel_headers.insert("mcp-session-id".to_string(), session_id.clone());
-    let cancel = plugin.before_proxy(&mut cancel_ctx, &mut cancel_headers).await;
-    assert_eq!(reject_raw(cancel).0, 202);
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    (result, ctx)
+}
+
+fn mcp_plugin() -> Arc<dyn ferrum_edge::plugins::Plugin> {
+    let config = aggregate_config("http://github-mcp.example:8080/mcp");
+    create_plugin("mcp_gateway", &config).unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn aggregate_sse_get_attaches_listener_and_multiplexes_streams() {
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, response_headers) = reject_raw(result);
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    let content_type = response_headers.get("content-type");
+    assert_eq!(content_type.map(String::as_str), Some("text/event-stream"));
+    // A long-lived event stream never advertises a representation length.
+    assert!(!response_headers.contains_key("content-length"));
+    let decision = ctx.metadata.get("mcp.route_decision");
+    assert_eq!(decision.map(String::as_str), Some("sse_listener"));
+
+    let mut stream = sse_body(&mut ctx);
+
+    // Two request identities of DIFFERENT JSON-RPC types share the one stream.
+    let first = ping(&plugin, &session_id, json!("stream-a")).await;
+    assert_eq!(reject_raw(first).0, 202);
+    let second = ping(&plugin, &session_id, json!(7)).await;
+    assert_eq!(reject_raw(second).0, 202);
+
+    let wanted = ["stream-a", "\"id\":7"];
+    let seen = sse_drain_until(&mut stream, &wanted, 8).await;
+    assert!(seen.contains(": mcp-sse"));
+    assert!(seen.contains("stream-a"), "string identity multiplexed");
+    assert!(seen.contains("\"id\":7"), "number identity multiplexed");
+}
+
+#[tokio::test]
+async fn aggregate_sse_transport_construction_is_streaming_without_length() {
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (_, _, response_headers) = reject_raw(result);
+    // The gateway-authored representation is what the transport adoption gate
+    // checks on both the H1/H2 and the native H3 ladder.
+    assert!(reject_headers_select_event_stream_for_test(&response_headers));
+
+    let listener = take_mcp_aggregate_sse_listener_for_test(&mut ctx).unwrap();
+    let built = build_aggregate_sse_reject_for_test(response_headers, listener);
+    let (parts, mut response_body) = built;
+    assert_eq!(parts.status.as_u16(), 200);
+    // `ClientResponseFraming::Streaming` removes the field rather than
+    // publishing an unverifiable length for bytes not yet written.
+    assert!(!parts.headers.contains_key("content-length"));
+    let content_type = parts.headers.get("content-type");
     assert_eq!(
-        cancel_ctx
-            .metadata
-            .get("mcp.route_decision")
-            .map(String::as_str),
-        Some("sse_cancel")
+        content_type.map(|value| value.as_bytes()),
+        Some(b"text/event-stream".as_slice())
     );
 
-    // Unknown cancel id fails closed.
-    let (mut bad_ctx, mut bad_headers) = mcp_ctx(json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/cancelled",
-        "params": { "requestId": "never-opened" }
-    }));
-    bad_headers.insert("mcp-session-id".to_string(), session_id.clone());
-    let bad = plugin.before_proxy(&mut bad_ctx, &mut bad_headers).await;
-    let (status, body, _) = reject_json(bad);
-    assert_eq!(status, 404);
-    assert!(body["error"].as_str().unwrap().contains("unknown"));
+    // The response body is fed by the broker's retained ring, so an event
+    // published after the response was built still reaches the client.
+    let published = ping(&plugin, &session_id, json!("after-build")).await;
+    assert_eq!(reject_raw(published).0, 202);
+    let window = std::time::Duration::from_secs(2);
+    let mut collected = String::new();
+    for _ in 0..6 {
+        if collected.contains("after-build") {
+            break;
+        }
+        let next = tokio::time::timeout(window, response_body.frame()).await;
+        let Ok(Some(Ok(frame))) = next else {
+            break;
+        };
+        if let Ok(data) = frame.into_data() {
+            collected.push_str(&String::from_utf8_lossy(&data));
+        }
+    }
+    assert!(collected.contains("after-build"));
+}
 
-    // DELETE session tears down the listener (receiver ends).
+#[tokio::test]
+async fn aggregate_sse_replaced_rejection_releases_the_listener_slot() {
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(mcp_aggregate_sse_listener_is_staged_for_test(&ctx));
+
+    // Dropping the request context is what happens when a later plugin
+    // replaces the rejection: the lease must free the single-listener slot
+    // instead of locking the session out.
+    drop(ctx);
+    let (mut retry_ctx, mut retry_headers) = sse_get(&session_id);
+    let retried = plugin.before_proxy(&mut retry_ctx, &mut retry_headers).await;
+    assert_eq!(reject_raw(retried).0, 200);
+}
+
+#[tokio::test]
+async fn aggregate_sse_get_fails_closed_on_accept_session_and_duplicate() {
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = sse_get_ctx(Some(&session_id), None);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 400);
+    assert!(body["error"].as_str().unwrap().contains("text/event-stream"));
+    let reason = ctx.metadata.get("mcp.sse.error").map(String::as_str);
+    assert_eq!(reason, Some("invalid_accept"));
+
+    let (mut ctx, mut headers) = sse_get_ctx(None, Some("text/event-stream"));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_json(result).0, 400);
+    let reason = ctx.metadata.get("mcp.sse.error").map(String::as_str);
+    assert_eq!(reason, Some("missing_session"));
+
+    let (mut ctx, mut headers) = sse_get("no-such-session");
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_raw(result).0, 404);
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    let first = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_raw(first).0, 200);
+    let _stream = sse_body(&mut ctx);
+
+    let (mut dup_ctx, mut dup_headers) = sse_get(&session_id);
+    let duplicate = plugin.before_proxy(&mut dup_ctx, &mut dup_headers).await;
+    let (status, body, _) = reject_json(duplicate);
+    assert_eq!(status, 409);
+    assert!(body["error"].as_str().unwrap().contains("already attached"));
+    let reason = dup_ctx.metadata.get("mcp.sse.error").map(String::as_str);
+    assert_eq!(reason, Some("duplicate_listener"));
+}
+
+#[tokio::test]
+async fn aggregate_sse_last_event_id_diagnostics_never_echo_the_value() {
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    headers.insert("last-event-id".to_string(), "not-a-cursor".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 400);
+    assert!(!body["error"].as_str().unwrap().contains("not-a-cursor"));
+    let reason = ctx.metadata.get("mcp.sse.error").map(String::as_str);
+    assert_eq!(reason, Some("last_event_id_invalid"));
+    let resume = ctx.metadata.get("mcp.sse.resume_requested");
+    assert_eq!(resume.map(String::as_str), Some("true"));
+    // The raw header value never reaches metadata, whole or by length.
+    for value in ctx.metadata.values() {
+        assert!(!value.contains("not-a-cursor"));
+    }
+}
+
+#[tokio::test]
+async fn aggregate_sse_cancel_is_a_side_effect_with_fixed_tokens() {
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut stream = sse_body(&mut ctx);
+
+    let opened = ping(&plugin, &session_id, json!("to-cancel")).await;
+    assert_eq!(reject_raw(opened).0, 202);
+    let seen = sse_drain_until(&mut stream, &["to-cancel"], 4).await;
+    assert!(seen.contains("to-cancel"));
+
+    // A JSON-RPC notification is acknowledged either way; cancelling a
+    // COMPLETED stream records a fixed token instead of changing the outcome.
+    let id = json!("to-cancel");
+    let (result, cancel_ctx) = cancel_notification(&plugin, &session_id, id).await;
+    assert_eq!(reject_raw(result).0, 202);
+    let outcome = cancel_ctx.metadata.get("mcp.sse.cancel");
+    assert_eq!(outcome.map(String::as_str), Some("stream_completed"));
+
+    // An unknown request id is likewise recorded, never fabricated.
+    let id = json!("never-opened");
+    let (result, unknown_ctx) = cancel_notification(&plugin, &session_id, id).await;
+    assert_eq!(reject_raw(result).0, 202);
+    let outcome = unknown_ctx.metadata.get("mcp.sse.cancel");
+    assert_eq!(outcome.map(String::as_str), Some("unknown_stream"));
+    for value in unknown_ctx.metadata.values() {
+        assert!(!value.contains("never-opened"));
+    }
+
+    // An unrepresentable request id is refused as an identity, not coerced.
+    let id = json!({ "not": "representable" });
+    let (result, bad_ctx) = cancel_notification(&plugin, &session_id, id).await;
+    assert_eq!(reject_raw(result).0, 202);
+    let outcome = bad_ctx.metadata.get("mcp.sse.cancel");
+    assert_eq!(outcome.map(String::as_str), Some("stream_id_invalid"));
+}
+
+#[tokio::test]
+async fn aggregate_sse_delete_and_reload_end_the_listener() {
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut stream = sse_body(&mut ctx);
+
     let mut del_ctx = create_test_context();
     del_ctx.method = "DELETE".to_string();
     del_ctx.path = "/mcp".to_string();
-    let mut del_headers = HashMap::from([("mcp-session-id".to_string(), session_id)]);
-    let del = plugin.before_proxy(&mut del_ctx, &mut del_headers).await;
-    assert_eq!(reject_raw(del).0, 200);
-    // After detach, further recv yields None (channel closed) without sleeping.
-    loop {
-        match frames.try_recv() {
-            Ok(_) => continue,
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                // Give the detach a chance to drop the sender by polling once.
-                let closed = frames.recv().await;
-                assert!(closed.is_none());
+    let mut del_headers = HashMap::new();
+    del_headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let deleted = plugin.before_proxy(&mut del_ctx, &mut del_headers).await;
+    assert_eq!(reject_raw(deleted).0, 200);
+
+    // Session DELETE must end the attached body, not leave it hanging.
+    let window = std::time::Duration::from_secs(2);
+    let mut ended = false;
+    for _ in 0..4 {
+        match tokio::time::timeout(window, stream.next()).await {
+            Ok(None) => {
+                ended = true;
                 break;
             }
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            Ok(Some(_)) => continue,
+            Err(_) => break,
         }
     }
+    assert!(ended, "DELETE must end the multiplexed SSE body");
 
-    // Disabled multiplexing preserves 405.
-    config["sessions"] = json!({ "sse_multiplexing": false });
-    let disabled = create_plugin("mcp_gateway", &config).unwrap().unwrap();
-    let mut ctx = create_test_context();
-    ctx.method = "GET".to_string();
-    ctx.path = "/mcp".to_string();
-    let mut headers = HashMap::from([("accept".to_string(), "text/event-stream".to_string())]);
-    let result = disabled.before_proxy(&mut ctx, &mut headers).await;
-    let (status, body, _) = reject_json(result);
-    assert_eq!(status, 405);
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("disabled"));
-
-    // Reload/update: dropping the old plugin instance tears broker state;
-    // a replacement instance starts empty (no cross-generation leakage).
+    // A replacement generation starts empty: a prior session id is unknown.
     drop(plugin);
-    let replacement = create_plugin(
-        "mcp_gateway",
-        &aggregate_config("http://github-mcp.example:8080/mcp"),
-    )
-    .unwrap()
-    .unwrap();
-    let mut ctx = create_test_context();
-    ctx.method = "GET".to_string();
-    ctx.path = "/mcp".to_string();
-    let mut headers = HashMap::from([
-        ("accept".to_string(), "text/event-stream".to_string()),
-        ("mcp-session-id".to_string(), "stale-from-prior-gen".to_string()),
-    ]);
+    let replacement = mcp_plugin();
+    let (mut ctx, mut headers) = sse_get(&session_id);
     let stale = replacement.before_proxy(&mut ctx, &mut headers).await;
     assert_eq!(reject_raw(stale).0, 404);
 }
 
 #[tokio::test]
-async fn transparent_get_still_forwards_when_sse_requested() {
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &transparent_config("http://github-mcp.example:8080/mcp"),
-    )
-    .unwrap()
-    .unwrap();
-    let mut ctx = create_test_context();
-    ctx.method = "GET".to_string();
-    ctx.path = "/mcp".to_string();
-    let mut headers = HashMap::from([("accept".to_string(), "text/event-stream".to_string())]);
+async fn aggregate_sse_disabled_keeps_the_405_and_transparent_forwards() {
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["sessions"] = json!({ "sse_multiplexing": false });
+    let disabled = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let (mut ctx, mut headers) = sse_get_ctx(None, Some("text/event-stream"));
+    let result = disabled.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 405);
+    assert!(body["error"].as_str().unwrap().contains("disabled"));
+
+    // Ordinary JSON responses are preserved when multiplexing is disabled.
+    let session_id = initialize(&disabled).await;
+    let pinged = ping(&disabled, &session_id, json!("plain")).await;
+    let (status, body, _) = reject_json(pinged);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!("plain"));
+
+    let transparent = transparent_config("http://github-mcp.example:8080/mcp");
+    let plugin = create_plugin("mcp_gateway", &transparent).unwrap().unwrap();
+    let (mut ctx, mut headers) = sse_get_ctx(None, Some("text/event-stream"));
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(ctx.route_override_backend_scheme, Some(BackendScheme::Http));
 }
 
 #[tokio::test]
-async fn aggregate_sse_config_bounds_fail_closed() {
+async fn aggregate_sse_without_listener_keeps_the_inline_json_response() {
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+    let pinged = ping(&plugin, &session_id, json!("no-listener")).await;
+    let (status, body, _) = reject_json(pinged);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!("no-listener"));
+}
+
+#[tokio::test]
+async fn aggregate_sse_unrepresentable_id_falls_back_to_inline_json() {
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _stream = sse_body(&mut ctx);
+
+    // An object id is not a representable stream identity. The response is
+    // still delivered — inline, on the POST — never silently dropped.
+    let id = json!({ "not": "representable" });
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "ping",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!({ "not": "representable" }));
+    let reason = ctx.metadata.get("mcp.sse.error").map(String::as_str);
+    assert_eq!(reason, Some("stream_id_invalid"));
+}
+
+#[tokio::test]
+async fn aggregate_sse_retention_overflow_answers_inline_and_keeps_listener() {
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["sessions"] = json!({
+        "sse_max_retained_events": 1,
+        "sse_max_replay_events": 0
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut stream = sse_body(&mut ctx);
+
+    let first = ping(&plugin, &session_id, json!("one")).await;
+    assert_eq!(reject_raw(first).0, 202);
+
+    // The ring is full and nothing has been consumed yet, so the second
+    // response falls back to the POST instead of being dropped.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "two",
+        "method": "ping",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let second = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(second);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!("two"));
+    let reason = ctx.metadata.get("mcp.sse.error").map(String::as_str);
+    assert_eq!(reason, Some("retention_overflow"));
+
+    // The listener is not stranded: it still delivers the first response.
+    let seen = sse_drain_until(&mut stream, &["\"one\""], 4).await;
+    assert!(seen.contains("\"one\""));
+}
+
+#[tokio::test]
+async fn aggregate_sse_config_bounds_fail_closed_without_echoing_values() {
     let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
     config["sessions"] = json!({
         "sse_max_event_bytes": 100,
-        "sse_max_queue_bytes": 50
+        "sse_max_retained_bytes": 50
     });
     let err = create_plugin("mcp_gateway", &config).unwrap_err();
-    assert!(err.contains("sse_max_event_bytes"));
+    assert!(err.contains("sessions.sse_max_event_bytes"));
     assert!(!err.contains("100"));
+
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["sessions"] = json!({ "sse_max_streams_per_session": 0 });
+    let err = create_plugin("mcp_gateway", &config).unwrap_err();
+    assert!(err.contains("sessions.sse_max_streams_per_session"));
+
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["sessions"] = json!({ "sse_keepalive_seconds": 4000 });
+    let err = create_plugin("mcp_gateway", &config).unwrap_err();
+    assert!(err.contains("sessions.sse_keepalive_seconds"));
 }

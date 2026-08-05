@@ -2655,12 +2655,18 @@ pub struct RequestContext {
     /// forged `mcp.*` key can either force or clear the guard, and it never
     /// reaches transaction metadata.
     pub(crate) mcp_batch_forbids_upstream: bool,
-    /// Aggregate-router multiplexed SSE body frames staged by `mcp_gateway`
-    /// for a GET listener. Kept out of public metadata so forgeable keys
-    /// cannot attach or steal a session stream. Consumed exactly once when the
-    /// synthetic reject is turned into a streaming `ProxyBody`.
-    pub(crate) mcp_aggregate_sse_frames:
-        Option<tokio::sync::mpsc::Receiver<Result<http_body::Frame<bytes::Bytes>, crate::proxy::body::BoxError>>>,
+    /// Aggregate-router multiplexed SSE listener staged by `mcp_gateway` for a
+    /// GET attach. Kept out of public `metadata` so a forgeable key cannot
+    /// attach to, or steal, a session's event stream.
+    ///
+    /// This is a Clone-able HANDLE, not the stream itself: the body behind it
+    /// is claimed by a one-shot compare-and-swap
+    /// (`AggregateSseListener::take_body`), so a `RequestContext` clone shares
+    /// the same lease and can never duplicate or divert delivery. If no
+    /// transport ever claims it — because a later plugin replaced the
+    /// rejection — dropping the last handle releases the session's
+    /// single-listener slot instead of stranding it.
+    pub(crate) mcp_aggregate_sse: Option<mcp_aggregate_sse::AggregateSseListener>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -3141,7 +3147,7 @@ impl RequestContext {
             mcp_trusted_tool_name_rewrite: None,
             mcp_validate_tool_result: None,
             mcp_batch_forbids_upstream: false,
-            mcp_aggregate_sse_frames: None,
+            mcp_aggregate_sse: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_instance_scores: HashMap::new(),
@@ -4250,9 +4256,10 @@ impl RequestContext {
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
             mcp_validate_tool_result: self.mcp_validate_tool_result.clone(),
             mcp_batch_forbids_upstream: self.mcp_batch_forbids_upstream,
-            // SSE frame receivers are request-owned and must not be cloned onto
-            // hook context copies; the original request keeps the only handle.
-            mcp_aggregate_sse_frames: None,
+            // A hook-context copy is never a transport, so it has no business
+            // holding the listener lease at all. The real request context keeps
+            // it and is the only place the response builders read it from.
+            mcp_aggregate_sse: None,
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_instance_scores: self.waf_instance_scores.clone(),

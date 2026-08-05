@@ -182,17 +182,51 @@ pub mod _test_support {
         ctx.mcp_trusted_tool_name_rewrite.is_none()
     }
 
-    /// Take the aggregate SSE frame receiver staged by `mcp_gateway` GET attach.
-    /// Production code moves this onto the normalized reject; tests drain it
-    /// directly to exercise the live multiplex path without a full proxy.
-    pub fn take_mcp_aggregate_sse_frames_for_test(
+    /// Take the aggregate SSE listener lease staged by an `mcp_gateway` GET
+    /// attach. Production code adopts it onto the normalized reject; tests take
+    /// it to drive the live multiplex path without a full proxy.
+    pub fn take_mcp_aggregate_sse_listener_for_test(
         ctx: &mut crate::plugins::RequestContext,
-    ) -> Option<
-        tokio::sync::mpsc::Receiver<
-            Result<http_body::Frame<bytes::Bytes>, crate::proxy::body::BoxError>,
-        >,
-    > {
-        ctx.mcp_aggregate_sse_frames.take()
+    ) -> Option<crate::plugins::mcp_aggregate_sse::AggregateSseListener> {
+        ctx.mcp_aggregate_sse.take()
+    }
+
+    /// Whether a request context is still holding an aggregate SSE listener
+    /// lease. Used to prove a replaced rejection released the session slot.
+    pub fn mcp_aggregate_sse_listener_is_staged_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.mcp_aggregate_sse.is_some()
+    }
+
+    /// Build the production H1/H2 wire parts and streaming body for a finalized
+    /// aggregate SSE rejection. Proves the transport construction: the framing
+    /// decision removes `Content-Length` and the body is fed by the broker's
+    /// retained event ring rather than a copy of it.
+    pub fn build_aggregate_sse_reject_for_test(
+        headers: HashMap<String, String>,
+        listener: crate::plugins::mcp_aggregate_sse::AggregateSseListener,
+    ) -> (http::response::Parts, crate::proxy::body::ProxyBody) {
+        let disposition = crate::proxy::headers::RejectBodyDisposition::for_request("GET", 200);
+        let reject = crate::proxy::NormalizedRejectResponse {
+            http_status: StatusCode::OK,
+            headers,
+            body: bytes::Bytes::new(),
+            grpc_status: None,
+            grpc_message: None,
+            failed_websocket_handshake: false,
+            body_disposition: disposition,
+            grpc_trailers: HashMap::new(),
+            aggregate_sse: Some(listener),
+        };
+        crate::proxy::build_response_from_normalized_reject(reject)
+            .into_parts()
+    }
+
+    /// Whether a finalized reject header map still selects the gateway-authored
+    /// `text/event-stream` representation the SSE adoption gate requires.
+    pub fn reject_headers_select_event_stream_for_test(headers: &HashMap<String, String>) -> bool {
+        crate::proxy::response_headers_select_event_stream(headers)
     }
 
     /// Whether a routed `tools/call` pinned a private outputSchema validator.
@@ -5505,7 +5539,7 @@ pub mod _test_support {
                 status.as_u16(),
             ),
             grpc_trailers: HashMap::new(),
-            streaming_frames: None,
+            aggregate_sse: None,
         };
         crate::proxy::build_response_from_normalized_reject(reject)
             .into_parts()
@@ -5769,7 +5803,7 @@ pub mod _test_support {
             failed_websocket_handshake: normalized.failed_websocket_handshake,
             body_disposition: crate::proxy::headers::RejectBodyDisposition::default(),
             grpc_trailers: normalized.grpc_trailers.clone(),
-            streaming_frames: None,
+            aggregate_sse: None,
         };
         crate::proxy::framed_unary_reject_parts(&production).map(|(_, t)| t.clone())
     }

@@ -19259,12 +19259,16 @@ pub(crate) struct NormalizedRejectResponse {
     /// terminate). Ordinary trailers-only rejects leave this empty and keep
     /// terminal metadata in `headers`.
     pub(crate) grpc_trailers: HashMap<String, String>,
-    /// Optional multiplexed SSE frame source staged by `mcp_gateway`. When
-    /// present, [`build_response_from_normalized_reject`] builds a streaming
-    /// body and uses [`ClientResponseFraming::Streaming`] so no
-    /// `Content-Length` is published for the long-lived event stream.
-    pub(crate) streaming_frames:
-        Option<tokio::sync::mpsc::Receiver<Result<http_body::Frame<Bytes>, body::BoxError>>>,
+    /// Multiplexed aggregate MCP SSE listener adopted from the request context.
+    ///
+    /// Only ever set when the final representation is still the gateway's own
+    /// `text/event-stream` response (see
+    /// [`finalize_reject_response_with_after_proxy_hooks_and_commit_policy`]).
+    /// When present, [`build_response_from_normalized_reject`] claims the body
+    /// once and selects [`headers_mod::ClientResponseFraming::Streaming`], so
+    /// no `Content-Length` is published for an event stream whose bytes have
+    /// not been written yet.
+    pub(crate) aggregate_sse: Option<crate::plugins::mcp_aggregate_sse::AggregateSseListener>,
 }
 
 /// Apply route policy to a gateway-generated plain HTTP response and then
@@ -19699,7 +19703,7 @@ pub(crate) fn normalize_reject_response_with_provenance(
             failed_websocket_handshake: false,
             body_disposition: headers_mod::RejectBodyDisposition::default(),
             grpc_trailers: HashMap::new(),
-            streaming_frames: None,
+            aggregate_sse: None,
         };
     }
 
@@ -19809,7 +19813,7 @@ pub(crate) fn normalize_reject_response_with_provenance(
         // `grpc_status`; the disposition is unused on that branch.
         body_disposition: headers_mod::RejectBodyDisposition::default(),
         grpc_trailers: HashMap::new(),
-        streaming_frames: None,
+        aggregate_sse: None,
     }
 }
 
@@ -19895,7 +19899,7 @@ fn build_framed_grpc_unary_reject(
         failed_websocket_handshake: false,
         body_disposition: headers_mod::RejectBodyDisposition::default(),
         grpc_trailers: trailers,
-        streaming_frames: None,
+        aggregate_sse: None,
     }
 }
 
@@ -20033,7 +20037,13 @@ pub(crate) fn build_response_from_normalized_reject(
     let failed_websocket_handshake = reject.failed_websocket_handshake;
     let status = reject.http_status.as_u16();
     let is_framed_unary_reject = framed_unary_reject_parts(&reject).is_some();
-    let has_streaming_frames = reject.streaming_frames.is_some();
+    // Claim the multiplexed SSE body exactly once. The claim is a one-shot
+    // compare-and-swap inside the listener lease, so even if a context clone
+    // still holds a handle it can never produce a second body for this session.
+    let aggregate_sse_body = reject
+        .aggregate_sse
+        .as_ref()
+        .and_then(crate::plugins::mcp_aggregate_sse::AggregateSseListener::take_body);
     let mut headers = reject.headers;
     // A failed WebSocket handshake is still an ordinary HTTP response (RFC 6455
     // §4.2.2), so it keeps its negotiated HTTP version and an authoritative
@@ -20057,7 +20067,7 @@ pub(crate) fn build_response_from_normalized_reject(
     // publish Content-Length for a long-lived event stream.
     let framing = if is_grpc_error {
         headers_mod::ClientResponseFraming::TrailersOnly
-    } else if has_streaming_frames {
+    } else if aggregate_sse_body.is_some() {
         headers_mod::ClientResponseFraming::Streaming
     } else {
         headers_mod::ClientResponseFraming::for_final_reject(
@@ -20070,8 +20080,8 @@ pub(crate) fn build_response_from_normalized_reject(
     let reject_builder = Response::builder().status(reject.http_status);
     let builder = headers_mod::apply_response_headers(reject_builder, &headers);
 
-    let body = if let Some(rx) = reject.streaming_frames {
-        body::inspected_streaming_body(rx)
+    let body = if let Some(sse) = aggregate_sse_body {
+        body::gateway_streaming_body(sse)
     } else if is_framed_unary_reject {
         let trailers = grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
         ProxyBody::buffered_grpc_with_trailers(reject.body, trailers)
@@ -22361,11 +22371,33 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     // reading plugin-controlled headers.
     normalized.body_disposition =
         headers_mod::RejectBodyDisposition::for_request(&ctx.method, status.as_u16());
-    // Aggregate MCP SSE listeners stage their frame source on the request
-    // context; move it onto the normalized reject exactly once so the response
-    // builder can emit a streaming body without Content-Length.
-    normalized.streaming_frames = ctx.mcp_aggregate_sse_frames.take();
+    // Aggregate MCP SSE stages a single-consumer listener lease on the request
+    // context. Adopt it only while the final representation is STILL the
+    // event stream the gateway authored: a later reject-path plugin that
+    // replaced the status or the representation gets an ordinary body, and
+    // dropping the lease here releases the session's single-listener slot so
+    // the client can reattach instead of being locked out.
+    if let Some(listener) = ctx.mcp_aggregate_sse.take()
+        && normalized.http_status == StatusCode::OK
+        && normalized.body.is_empty()
+        && response_headers_select_event_stream(&normalized.headers)
+    {
+        normalized.aggregate_sse = Some(listener);
+    }
     normalized
+}
+
+/// Whether a finalized reject header map still selects a `text/event-stream`
+/// representation. Read as a media-type essence so a charset parameter still
+/// matches and a lookalike type does not.
+pub(crate) fn response_headers_select_event_stream(headers: &HashMap<String, String>) -> bool {
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+    match content_type {
+        Some((_, value)) => crate::plugins::utils::sse::is_text_event_stream_media_type(value),
+        None => false,
+    }
 }
 
 /// Finalize a terminal request-body read failure before any external operation

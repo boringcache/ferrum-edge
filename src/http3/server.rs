@@ -12267,6 +12267,24 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
     // never from the plugin-authored response header map.
     let disposition = RejectBodyDisposition::for_request(&ctx.method, http_status.as_u16());
     let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+    // Aggregate MCP SSE is the one rejection whose body is a long-lived stream
+    // rather than a fixed representation. Take the single-consumer lease here —
+    // this is the funnel every H3 plugin rejection passes through — and adopt it
+    // only while the final representation is still the gateway-authored event
+    // stream and no gateway terminal replaced it. Anything else drops the lease,
+    // which releases the session's single-listener slot so the client can
+    // reattach, and falls through to the ordinary buffered writers.
+    if let Some(listener) = ctx.mcp_aggregate_sse.take() {
+        let representation_intact = matches!(flavor, HttpFlavor::Plain)
+            && grpc_web_response_content_type.is_none()
+            && !terminal_gateway_deadline
+            && http_status == StatusCode::OK
+            && body.is_empty()
+            && crate::proxy::response_headers_select_event_stream(headers);
+        if representation_intact && let Some(sse_body) = listener.take_body() {
+            return send_h3_aggregate_sse_response(stream, headers, sse_body, halt_recv).await;
+        }
+    }
     if terminal_gateway_deadline {
         let mut deadline_headers = headers.clone();
         let mut deadline_body = body;
@@ -12371,6 +12389,61 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
         };
     }
     write.await
+}
+
+/// Write a multiplexed aggregate MCP SSE response over native HTTP/3.
+///
+/// This is the H3 counterpart of the H1/H2 streaming reject body: the same
+/// broker-owned stream, the same `Streaming` framing decision (so no
+/// `Content-Length` is published for bytes not yet written), and the same
+/// ownership contract — dropping the body is what releases the session's single
+/// listener slot, so a client disconnect always permits a reattach.
+///
+/// The stream is bounded by the broker, not by this loop: it ends on session
+/// delete/eviction, on broker retirement (reload / update / delete), at the
+/// configured listener lifetime, or when a QUIC write fails because the peer
+/// went away. Nothing here buffers the stream.
+async fn send_h3_aggregate_sse_response(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    headers: &HashMap<String, String>,
+    mut body: crate::plugins::mcp_aggregate_sse::AggregateSseBody,
+    halt_recv: bool,
+) -> Result<(), anyhow::Error> {
+    use futures_util::StreamExt;
+
+    let mut headers = headers.clone();
+    sanitize_client_response_headers_for_wire(&mut headers, ClientResponseFraming::Streaming);
+    let builder = apply_response_headers(Response::builder().status(StatusCode::OK), &headers);
+    let response = builder
+        .body(())
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 SSE response: {}", e))?;
+    stream.send_response(response).await?;
+    while let Some(frame) = body.next().await {
+        let Ok(frame) = frame else {
+            // The broker never produces a body error; ending the stream is
+            // still preferable to inventing an event for the client.
+            break;
+        };
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if data.is_empty() {
+            continue;
+        }
+        // A failed write on a long-lived stream is an ordinary client
+        // disconnect, not a gateway fault: stop and let the body drop.
+        if stream.send_data(data).await.is_err() {
+            break;
+        }
+    }
+    // Release the listener slot before the QUIC stream teardown so a client
+    // that reconnects immediately is never refused by its own stale lease.
+    drop(body);
+    let _ = stream.finish().await;
+    if halt_recv {
+        crate::http3::stream_util::halt_request_body(stream);
+    }
+    Ok(())
 }
 
 /// Send a trailers-only gRPC error response over H3. The response is

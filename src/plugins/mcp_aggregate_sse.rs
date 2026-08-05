@@ -1,708 +1,1241 @@
 //! Multiplexed aggregate-router SSE session broker for `mcp_gateway`.
 //!
-//! Routes MCP JSON-RPC events onto one downstream `text/event-stream`
-//! connection per live session, keyed by bounded request/stream identity.
-//! Every queue, retained payload, identity, map cardinality, and cleanup
-//! horizon is capped. Identities and payloads are never logged; diagnostics
-//! are field-specific and value-redacted.
+//! One downstream MCP session holds at most one live `text/event-stream`
+//! listener. Every JSON-RPC event published for that session is routed onto
+//! that one listener and identified by a bounded, type-sensitive request/stream
+//! identity, so many concurrent MCP request streams share one connection.
+//!
+//! Design invariants — each one is load bearing:
+//!
+//! * All session state lives behind ONE synchronous [`std::sync::Mutex`] whose
+//!   critical sections never await and never take a second lock. Attach,
+//!   publish, open, cancel, complete, reap and teardown are therefore
+//!   serialized against each other. That is what makes replay-then-live
+//!   ordering deterministic and what makes teardown reliable: there is no
+//!   `try_lock` best-effort path anywhere, so a contended reload, delete or
+//!   disconnect can never leave a listener alive.
+//! * Retained event bytes have exactly ONE budget. Every event is retained
+//!   once, in a single ring that serves both pre-listener staging and
+//!   `Last-Event-ID` replay; delivery clones a `Bytes` handle, never the
+//!   payload.
+//! * An undelivered event is never evicted. When the ring cannot admit one, the
+//!   publish fails closed and the caller answers the POST inline, so a JSON-RPC
+//!   response is never silently dropped.
+//! * Session ids, JSON-RPC ids, `Last-Event-ID` values and event payloads are
+//!   never logged and never reach a diagnostic. Every reason is a fixed,
+//!   low-cardinality token derived from the error variant.
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use http_body::Frame;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, mpsc};
 
-use crate::proxy::body::BoxError;
+/// Frame item produced by [`AggregateSseBody`]. Structurally identical to the
+/// proxy body error type, so the stream can back a `ProxyBody` directly without
+/// naming a crate-private alias in a public signature.
+pub type SseFrameResult = Result<Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>;
 
-/// Default max concurrent request streams retained per downstream session.
+/// Default max concurrent open request streams per downstream session.
 pub const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 64;
-/// Default max queued events waiting for the SSE listener (all streams).
-pub const DEFAULT_MAX_QUEUE_EVENTS: usize = 128;
-/// Default aggregate retained payload budget for queued + replay events.
-pub const DEFAULT_MAX_QUEUE_BYTES: usize = 1024 * 1024;
-/// Default max serialized bytes for one multiplexed SSE event payload.
+/// Default retained-event ring capacity (staging and replay share this ring).
+pub const DEFAULT_MAX_RETAINED_EVENTS: usize = 128;
+/// Default aggregate retained-byte budget for that one ring.
+pub const DEFAULT_MAX_RETAINED_BYTES: usize = 1024 * 1024;
+/// Default max serialized JSON bytes admitted for one SSE event payload.
 pub const DEFAULT_MAX_EVENT_BYTES: usize = 256 * 1024;
-/// Default replay ring capacity (events retained for `Last-Event-ID`).
+/// Default number of already-delivered events kept for `Last-Event-ID`.
 pub const DEFAULT_MAX_REPLAY_EVENTS: usize = 64;
-/// Default max accepted stream-identity UTF-8 bytes (JSON-RPC id string form).
+/// Default max accepted stream-identity bytes (canonical JSON-RPC id form).
 pub const DEFAULT_MAX_STREAM_ID_BYTES: usize = 128;
 /// Default max accepted `Last-Event-ID` header bytes.
 pub const DEFAULT_MAX_LAST_EVENT_ID_BYTES: usize = 64;
-/// Absolute ceilings for operator overrides (fail closed above these).
+/// Default bounded lifetime of one attached listener, after which the client is
+/// expected to resume with `Last-Event-ID`.
+pub const DEFAULT_LISTENER_MAX_LIFETIME_SECONDS: u64 = 300;
+/// Default idle keepalive comment interval.
+pub const DEFAULT_KEEPALIVE_SECONDS: u64 = 15;
+
+/// Absolute ceilings for operator overrides (fail closed outside these).
 pub const MAX_STREAMS_PER_SESSION_CEILING: usize = 4_096;
-pub const MAX_QUEUE_EVENTS_CEILING: usize = 16_384;
-pub const MAX_QUEUE_BYTES_CEILING: usize = 16 * 1024 * 1024;
+pub const MAX_RETAINED_EVENTS_CEILING: usize = 16_384;
+pub const MAX_RETAINED_BYTES_CEILING: usize = 16 * 1024 * 1024;
 pub const MAX_EVENT_BYTES_CEILING: usize = 2 * 1024 * 1024;
 pub const MAX_REPLAY_EVENTS_CEILING: usize = 4_096;
 pub const MAX_STREAM_ID_BYTES_CEILING: usize = 512;
 pub const MAX_LAST_EVENT_ID_BYTES_CEILING: usize = 1_024;
+pub const LISTENER_MIN_LIFETIME_SECONDS: u64 = 5;
+pub const LISTENER_MAX_LIFETIME_SECONDS_CEILING: u64 = 86_400;
+pub const KEEPALIVE_SECONDS_CEILING: u64 = 3_600;
 
-/// Channel capacity for one attached SSE listener (frames awaiting poll).
-const LISTENER_CHANNEL_CAPACITY: usize = 32;
+/// Upper bound on the framing one event adds around its payload:
+/// `id: <20 digits>\nevent: message\ndata: ` plus the terminating blank line.
+const SSE_FRAME_OVERHEAD_BYTES: usize = 64;
+
+/// Opening comment so a client sees an established stream immediately.
+const SSE_GREETING: &[u8] = b": mcp-sse\n\n";
+/// Idle keepalive comment; also how a vanished peer is discovered.
+const SSE_KEEPALIVE: &[u8] = b": keep-alive\n\n";
 
 /// Operator-tunable bounds for the aggregate SSE broker.
 #[derive(Debug, Clone)]
 pub struct AggregateSseBounds {
     pub max_streams_per_session: usize,
-    pub max_queue_events: usize,
-    pub max_queue_bytes: usize,
+    pub max_retained_events: usize,
+    pub max_retained_bytes: usize,
     pub max_event_bytes: usize,
     pub max_replay_events: usize,
     pub max_stream_id_bytes: usize,
     pub max_last_event_id_bytes: usize,
+    pub listener_max_lifetime: Duration,
+    pub keepalive_interval: Duration,
 }
 
 impl Default for AggregateSseBounds {
     fn default() -> Self {
         Self {
             max_streams_per_session: DEFAULT_MAX_STREAMS_PER_SESSION,
-            max_queue_events: DEFAULT_MAX_QUEUE_EVENTS,
-            max_queue_bytes: DEFAULT_MAX_QUEUE_BYTES,
+            max_retained_events: DEFAULT_MAX_RETAINED_EVENTS,
+            max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
             max_event_bytes: DEFAULT_MAX_EVENT_BYTES,
             max_replay_events: DEFAULT_MAX_REPLAY_EVENTS,
             max_stream_id_bytes: DEFAULT_MAX_STREAM_ID_BYTES,
             max_last_event_id_bytes: DEFAULT_MAX_LAST_EVENT_ID_BYTES,
+            listener_max_lifetime: Duration::from_secs(DEFAULT_LISTENER_MAX_LIFETIME_SECONDS),
+            keepalive_interval: Duration::from_secs(DEFAULT_KEEPALIVE_SECONDS),
         }
     }
 }
 
 impl AggregateSseBounds {
-    /// Validate operator bounds; errors name the field and never echo values.
+    /// Validate operator bounds. Diagnostics name the field and never echo the
+    /// configured value.
     pub fn validate(self) -> Result<Self, String> {
         validate_bound(
             self.max_streams_per_session,
             1,
             MAX_STREAMS_PER_SESSION_CEILING,
-            "sessions.sse_max_streams_per_session",
+            "sse_max_streams_per_session",
         )?;
         validate_bound(
-            self.max_queue_events,
+            self.max_retained_events,
             1,
-            MAX_QUEUE_EVENTS_CEILING,
-            "sessions.sse_max_queue_events",
+            MAX_RETAINED_EVENTS_CEILING,
+            "sse_max_retained_events",
         )?;
         validate_bound(
-            self.max_queue_bytes,
+            self.max_retained_bytes,
             1,
-            MAX_QUEUE_BYTES_CEILING,
-            "sessions.sse_max_queue_bytes",
+            MAX_RETAINED_BYTES_CEILING,
+            "sse_max_retained_bytes",
         )?;
         validate_bound(
             self.max_event_bytes,
             1,
             MAX_EVENT_BYTES_CEILING,
-            "sessions.sse_max_event_bytes",
+            "sse_max_event_bytes",
         )?;
         validate_bound(
             self.max_replay_events,
             0,
             MAX_REPLAY_EVENTS_CEILING,
-            "sessions.sse_max_replay_events",
+            "sse_max_replay_events",
         )?;
         validate_bound(
             self.max_stream_id_bytes,
             1,
             MAX_STREAM_ID_BYTES_CEILING,
-            "sessions.sse_max_stream_id_bytes",
+            "sse_max_stream_id_bytes",
         )?;
         validate_bound(
             self.max_last_event_id_bytes,
             1,
             MAX_LAST_EVENT_ID_BYTES_CEILING,
-            "sessions.sse_max_last_event_id_bytes",
+            "sse_max_last_event_id_bytes",
         )?;
-        if self.max_event_bytes > self.max_queue_bytes {
-            return Err(
-                "mcp_gateway: 'sessions.sse_max_event_bytes' must be <= 'sessions.sse_max_queue_bytes'"
-                    .to_string(),
-            );
+        validate_seconds(
+            self.listener_max_lifetime,
+            LISTENER_MIN_LIFETIME_SECONDS,
+            LISTENER_MAX_LIFETIME_SECONDS_CEILING,
+            "sse_listener_max_lifetime_seconds",
+        )?;
+        validate_seconds(
+            self.keepalive_interval,
+            1,
+            KEEPALIVE_SECONDS_CEILING,
+            "sse_keepalive_seconds",
+        )?;
+        // One max-size payload plus the framing the broker adds around it must
+        // fit the single retained-byte budget; otherwise the largest admitted
+        // event could never be staged and every publish would fail closed.
+        let framed_ceiling = self.max_event_bytes.saturating_add(SSE_FRAME_OVERHEAD_BYTES);
+        if framed_ceiling > self.max_retained_bytes {
+            return Err(field_error(
+                "sse_max_event_bytes",
+                "must leave room for SSE framing inside 'sessions.sse_max_retained_bytes'",
+            ));
+        }
+        if self.max_replay_events > self.max_retained_events {
+            return Err(field_error(
+                "sse_max_replay_events",
+                "must not exceed 'sessions.sse_max_retained_events'",
+            ));
+        }
+        if self.keepalive_interval > self.listener_max_lifetime {
+            return Err(field_error(
+                "sse_keepalive_seconds",
+                "must not exceed 'sessions.sse_listener_max_lifetime_seconds'",
+            ));
         }
         Ok(self)
     }
 }
 
+fn field_error(field: &str, detail: &str) -> String {
+    format!("mcp_gateway: 'sessions.{field}' {detail}")
+}
+
 fn validate_bound(value: usize, min: usize, max: usize, field: &str) -> Result<(), String> {
     if value < min || value > max {
-        return Err(format!(
-            "mcp_gateway: '{field}' must be between {min} and {max}"
-        ));
+        return Err(field_error(field, &format!("must be between {min} and {max}")));
     }
     Ok(())
 }
 
-/// Fail-closed broker admission / routing errors (field-specific, value-free).
+fn validate_seconds(value: Duration, min: u64, max: u64, field: &str) -> Result<(), String> {
+    let seconds = value.as_secs();
+    if seconds < min || seconds > max || value.subsec_nanos() != 0 {
+        return Err(field_error(field, &format!("must be between {min} and {max}")));
+    }
+    Ok(())
+}
+
+/// Fail-closed broker admission / routing outcomes. Every variant maps to a
+/// fixed reason and a fixed status; none of them carries request data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateSseError {
     MissingSession,
     UnknownSession,
     StaleSession,
+    BrokerRetired,
     DuplicateListener,
-    ListenerRequired,
     InvalidAccept,
     LastEventIdTooLarge,
     LastEventIdInvalid,
+    LastEventIdTooOld,
+    LastEventIdUnknown,
     StreamIdMissing,
     StreamIdTooLarge,
     StreamIdInvalid,
     DuplicateStream,
     UnknownStream,
-    StaleStream,
+    StreamCompleted,
+    StreamCancelled,
     EventTooLarge,
-    QueueOverflow,
+    RetentionOverflow,
     StreamCardinalityOverflow,
     SessionCardinalityOverflow,
-    Cancelled,
-    GenerationMismatch,
 }
 
 impl AggregateSseError {
+    /// Client-visible reason. Fixed strings only — never a session id, a
+    /// JSON-RPC id, a header value, or an event payload.
     pub fn as_static_reason(self) -> &'static str {
         match self {
-            Self::MissingSession => "sessions.downstream_session_header is required for SSE",
+            Self::MissingSession => "MCP session header is required for aggregate SSE",
             Self::UnknownSession => "MCP session not found",
-            Self::StaleSession => "MCP session is stale for SSE multiplexing",
+            Self::StaleSession => "MCP session is no longer live for SSE multiplexing",
+            Self::BrokerRetired => "MCP SSE broker generation was retired",
             Self::DuplicateListener => "SSE listener already attached for this session",
-            Self::ListenerRequired => "SSE listener is required for multiplexed delivery",
             Self::InvalidAccept => "Accept must include text/event-stream for aggregate SSE",
-            Self::LastEventIdTooLarge => "Last-Event-ID exceeds maximum length",
+            Self::LastEventIdTooLarge => "Last-Event-ID exceeds the maximum length",
             Self::LastEventIdInvalid => "Last-Event-ID is not a valid event cursor",
+            Self::LastEventIdTooOld => "Last-Event-ID is older than the retained event history",
+            Self::LastEventIdUnknown => "Last-Event-ID is ahead of the retained event history",
             Self::StreamIdMissing => "stream identity is required",
-            Self::StreamIdTooLarge => "stream identity exceeds maximum length",
+            Self::StreamIdTooLarge => "stream identity exceeds the maximum length",
             Self::StreamIdInvalid => "stream identity is not a representable JSON-RPC id",
             Self::DuplicateStream => "stream identity is already open on this session",
             Self::UnknownStream => "stream identity is unknown on this session",
-            Self::StaleStream => "stream identity is stale on this session",
-            Self::EventTooLarge => "SSE event payload exceeds maximum length",
-            Self::QueueOverflow => "SSE session queue capacity exceeded",
-            Self::StreamCardinalityOverflow => "SSE stream cardinality exceeded for session",
+            Self::StreamCompleted => "stream identity already completed on this session",
+            Self::StreamCancelled => "stream identity was cancelled by the client",
+            Self::EventTooLarge => "SSE event payload exceeds the maximum length",
+            Self::RetentionOverflow => "SSE session retention capacity exceeded",
+            Self::StreamCardinalityOverflow => "SSE stream cardinality exceeded for this session",
             Self::SessionCardinalityOverflow => "SSE session cardinality exceeded",
-            Self::Cancelled => "SSE stream was cancelled",
-            Self::GenerationMismatch => "SSE broker generation does not match session",
+        }
+    }
+
+    /// Fixed low-cardinality metadata token. Safe in transaction metadata
+    /// because it is derived from the variant, never from request data.
+    pub fn reason_token(self) -> &'static str {
+        match self {
+            Self::MissingSession => "missing_session",
+            Self::UnknownSession => "unknown_session",
+            Self::StaleSession => "stale_session",
+            Self::BrokerRetired => "broker_retired",
+            Self::DuplicateListener => "duplicate_listener",
+            Self::InvalidAccept => "invalid_accept",
+            Self::LastEventIdTooLarge => "last_event_id_too_large",
+            Self::LastEventIdInvalid => "last_event_id_invalid",
+            Self::LastEventIdTooOld => "last_event_id_too_old",
+            Self::LastEventIdUnknown => "last_event_id_unknown",
+            Self::StreamIdMissing => "stream_id_missing",
+            Self::StreamIdTooLarge => "stream_id_too_large",
+            Self::StreamIdInvalid => "stream_id_invalid",
+            Self::DuplicateStream => "duplicate_stream",
+            Self::UnknownStream => "unknown_stream",
+            Self::StreamCompleted => "stream_completed",
+            Self::StreamCancelled => "stream_cancelled",
+            Self::EventTooLarge => "event_too_large",
+            Self::RetentionOverflow => "retention_overflow",
+            Self::StreamCardinalityOverflow => "stream_cardinality_overflow",
+            Self::SessionCardinalityOverflow => "session_cardinality_overflow",
         }
     }
 
     pub fn http_status(self) -> u16 {
         match self {
-            Self::MissingSession | Self::InvalidAccept | Self::LastEventIdTooLarge
-            | Self::LastEventIdInvalid | Self::StreamIdMissing | Self::StreamIdTooLarge
-            | Self::StreamIdInvalid | Self::EventTooLarge => 400,
-            Self::UnknownSession | Self::StaleSession | Self::UnknownStream | Self::StaleStream => {
-                404
-            }
-            Self::DuplicateListener | Self::DuplicateStream => 409,
-            Self::QueueOverflow
+            Self::MissingSession
+            | Self::InvalidAccept
+            | Self::LastEventIdTooLarge
+            | Self::LastEventIdInvalid
+            | Self::LastEventIdUnknown
+            | Self::StreamIdMissing
+            | Self::StreamIdTooLarge
+            | Self::StreamIdInvalid
+            | Self::EventTooLarge => 400,
+            Self::UnknownSession | Self::StaleSession | Self::UnknownStream => 404,
+            Self::DuplicateListener
+            | Self::DuplicateStream
+            | Self::StreamCompleted
+            | Self::StreamCancelled
+            | Self::BrokerRetired => 409,
+            // The retained history this cursor asks for is gone for good, so a
+            // retry cannot recover it. That is a 410, not a 404 "try again".
+            Self::LastEventIdTooOld => 410,
+            Self::RetentionOverflow
             | Self::StreamCardinalityOverflow
             | Self::SessionCardinalityOverflow => 503,
-            Self::ListenerRequired | Self::Cancelled | Self::GenerationMismatch => 409,
         }
     }
 }
 
-/// Canonical, bounded stream identity derived from a JSON-RPC request id.
+/// Canonical, bounded, TYPE-SENSITIVE stream identity from a JSON-RPC id.
+///
+/// JSON-RPC distinguishes the string `"1"` from the number `1`, so the two must
+/// never collapse onto one multiplexed stream. The discriminant participates in
+/// `Eq`/`Hash`, which is what keeps them apart.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct StreamIdentity(String);
+pub enum StreamIdentity {
+    /// JSON-RPC string id, verbatim within the configured byte bound.
+    Text(Arc<str>),
+    /// JSON-RPC numeric id in its canonical serialized form.
+    Number(Arc<str>),
+}
 
 impl StreamIdentity {
-    /// Admit a JSON-RPC id as a stream identity. Objects/arrays/bools/null fail
-    /// closed; strings and numbers are canonicalized without retaining raw
-    /// hostile forms beyond the bound.
+    /// Admit a JSON-RPC id as a stream identity. Objects, arrays, booleans and
+    /// null fail closed, as do over-bound and control-bearing values. A
+    /// rejected value is never retained, echoed, or logged.
     pub fn from_json_rpc_id(id: &Value, max_bytes: usize) -> Result<Self, AggregateSseError> {
-        let canonical = match id {
-            Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
-            Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => {
-                return Err(AggregateSseError::StreamIdInvalid);
+        match id {
+            Value::String(text) => {
+                if text.is_empty() {
+                    return Err(AggregateSseError::StreamIdMissing);
+                }
+                if text.len() > max_bytes {
+                    return Err(AggregateSseError::StreamIdTooLarge);
+                }
+                // Control bytes would let an identity break SSE framing or a
+                // log line if it were ever mirrored outward.
+                if text.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+                    return Err(AggregateSseError::StreamIdInvalid);
+                }
+                Ok(Self::Text(Arc::from(text.as_str())))
             }
-        };
-        if canonical.is_empty() {
-            return Err(AggregateSseError::StreamIdMissing);
+            Value::Number(number) => {
+                let canonical = number.to_string();
+                if canonical.len() > max_bytes {
+                    return Err(AggregateSseError::StreamIdTooLarge);
+                }
+                Ok(Self::Number(Arc::from(canonical.as_str())))
+            }
+            Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => {
+                Err(AggregateSseError::StreamIdInvalid)
+            }
         }
-        if canonical.len() > max_bytes {
-            return Err(AggregateSseError::StreamIdTooLarge);
-        }
-        // Reject control characters so identities stay log/header safe if ever
-        // mirrored into diagnostics (we still never log the value).
-        if canonical.bytes().any(|b| b < 0x20 || b == 0x7f) {
-            return Err(AggregateSseError::StreamIdInvalid);
-        }
-        Ok(Self(canonical))
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// Canonical text form. Internal/equality use only — callers must not log
+    /// it, because it is a verbatim client-controlled JSON-RPC id.
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    pub fn canonical(&self) -> &str {
+        match self {
+            Self::Text(value) | Self::Number(value) => value,
+        }
     }
 }
 
-#[derive(Debug, Clone)]
-struct QueuedEvent {
+/// Lifecycle phase of a request stream on a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamPhase {
+    Open,
+    Completed,
+    Cancelled,
+}
+
+/// One retained event: the pre-framed SSE record plus its assigned id.
+struct RetainedEvent {
     event_id: u64,
-    #[allow(dead_code)] // Retained for per-stream drain/cancel accounting.
-    stream: Option<StreamIdentity>,
-    /// Pre-framed SSE bytes (`id:` / `event:` / `data:` / blank line).
     framed: Bytes,
-    payload_bytes: usize,
 }
 
-struct StreamSlot {
-    #[allow(dead_code)] // Retained for diagnostics/snapshots; identity is the map key.
-    identity: StreamIdentity,
-    cancelled: bool,
-    #[allow(dead_code)] // Retained for idle/stream TTL accounting.
-    opened_at: Instant,
+/// The single attached listener for a session.
+struct ListenerState {
+    epoch: u64,
+    /// Highest event id already handed to this listener.
+    cursor: u64,
+    waker: Option<Waker>,
+    greeted: bool,
 }
 
-struct ListenerSlot {
-    tx: mpsc::Sender<Result<Frame<Bytes>, BoxError>>,
-    attached_generation: u64,
+/// All mutable session state, guarded by one non-async mutex. No method here
+/// awaits, allocates without a bound, or acquires a second lock.
+struct SessionInner {
+    closed: bool,
+    streams: HashMap<StreamIdentity, StreamPhase>,
+    open_streams: usize,
+    /// FIFO of terminal identities. Terminal records exist only to refuse a
+    /// late or duplicate response, so they are bounded like the open set.
+    terminal_order: VecDeque<StreamIdentity>,
+    /// Single retained ring: pre-listener staging AND `Last-Event-ID` replay.
+    history: VecDeque<RetainedEvent>,
+    history_bytes: usize,
+    last_event_id: u64,
+    delivered_through: u64,
+    /// Highest event id dropped from history. A cursor below it cannot resume.
+    evicted_through: u64,
+    listener: Option<ListenerState>,
+    next_listener_epoch: u64,
+    last_activity: Instant,
 }
 
-struct SessionSseState {
-    generation: u64,
-    streams: Mutex<HashMap<StreamIdentity, StreamSlot>>,
-    /// Events waiting because no listener is attached yet (bounded).
-    pending: Mutex<VecDeque<QueuedEvent>>,
-    pending_bytes: AtomicU64,
-    replay: Mutex<VecDeque<QueuedEvent>>,
-    replay_bytes: AtomicU64,
-    next_event_id: AtomicU64,
-    listener: Mutex<Option<ListenerSlot>>,
-    closed: AtomicBool,
-    last_activity: Mutex<Instant>,
-}
-
-impl SessionSseState {
-    fn new(generation: u64) -> Self {
+impl SessionInner {
+    fn new() -> Self {
         Self {
-            generation,
-            streams: Mutex::new(HashMap::new()),
-            pending: Mutex::new(VecDeque::new()),
-            pending_bytes: AtomicU64::new(0),
-            replay: Mutex::new(VecDeque::new()),
-            replay_bytes: AtomicU64::new(0),
-            next_event_id: AtomicU64::new(1),
-            listener: Mutex::new(None),
-            closed: AtomicBool::new(false),
-            last_activity: Mutex::new(Instant::now()),
+            closed: false,
+            streams: HashMap::new(),
+            open_streams: 0,
+            terminal_order: VecDeque::new(),
+            history: VecDeque::new(),
+            history_bytes: 0,
+            last_event_id: 0,
+            delivered_through: 0,
+            evicted_through: 0,
+            listener: None,
+            next_listener_epoch: 1,
+            last_activity: Instant::now(),
         }
     }
 
-    async fn touch(&self) {
-        *self.last_activity.lock().await = Instant::now();
+    fn take_waker(&mut self) -> Option<Waker> {
+        match self.listener.as_mut() {
+            Some(listener) => listener.waker.take(),
+            None => None,
+        }
+    }
+
+    /// Number of leading history entries a consumer has already taken. Only
+    /// those are eviction candidates.
+    fn replayable_prefix(&self, consumed: u64) -> usize {
+        self.history
+            .partition_point(|event| event.event_id <= consumed)
+    }
+
+    /// The watermark below which history is replay-only. With a listener
+    /// attached it is that listener's cursor, so a mid-replay resume cannot
+    /// have events evicted out from under it; with none attached it is the
+    /// last delivery watermark.
+    fn consumed_watermark(&self) -> u64 {
+        match self.listener.as_ref() {
+            Some(listener) => listener.cursor,
+            None => self.delivered_through,
+        }
+    }
+
+    /// Drop retained events from the front. ONLY already-consumed events are
+    /// eligible: an event still owed to a consumer is a JSON-RPC response no
+    /// client has seen, so capacity pressure fails the publish instead of
+    /// losing it.
+    fn trim(&mut self, bounds: &AggregateSseBounds) {
+        let consumed = self.consumed_watermark();
+        let mut replayable = self.replayable_prefix(consumed);
+        while replayable > 0 {
+            let over_replay = replayable > bounds.max_replay_events;
+            let over_events = self.history.len() > bounds.max_retained_events;
+            let over_bytes = self.history_bytes > bounds.max_retained_bytes;
+            if !over_replay && !over_events && !over_bytes {
+                break;
+            }
+            let Some(event) = self.history.pop_front() else {
+                break;
+            };
+            let released = event.framed.len();
+            self.history_bytes = self.history_bytes.saturating_sub(released);
+            self.evicted_through = self.evicted_through.max(event.event_id);
+            replayable -= 1;
+        }
+    }
+
+    /// Admit and retain one event, returning its assigned id. The id is
+    /// committed only after admission succeeds, so a refused publish never
+    /// leaves a hole in the sequence a resuming client could stall on.
+    fn retain_event(
+        &mut self,
+        bounds: &AggregateSseBounds,
+        encoded: &[u8],
+    ) -> Result<u64, AggregateSseError> {
+        self.trim(bounds);
+        let event_id = self.last_event_id.saturating_add(1);
+        let framed = frame_sse_event(event_id, encoded);
+        let projected = self.history_bytes.saturating_add(framed.len());
+        if self.history.len() >= bounds.max_retained_events {
+            return Err(AggregateSseError::RetentionOverflow);
+        }
+        if projected > bounds.max_retained_bytes {
+            return Err(AggregateSseError::RetentionOverflow);
+        }
+        self.history_bytes = projected;
+        self.history.push_back(RetainedEvent { event_id, framed });
+        self.last_event_id = event_id;
+        self.last_activity = Instant::now();
+        Ok(event_id)
+    }
+
+    /// First retained event strictly after `cursor`. History ids ascend, so
+    /// this is a partition point rather than a scan.
+    fn event_after(&self, cursor: u64) -> Option<(u64, Bytes)> {
+        let index = self.replayable_prefix(cursor);
+        self.history
+            .get(index)
+            .map(|event| (event.event_id, event.framed.clone()))
     }
 }
 
-/// Process-local multiplexed SSE broker for one `mcp_gateway` plugin generation.
+/// Per-session broker state. Private on purpose: no public method hands one
+/// out, so the type never appears in a public signature.
+struct SessionState {
+    /// Shared with the owning broker so the delivery side can apply the same
+    /// retention policy the publish side does, without a second lock.
+    bounds: Arc<AggregateSseBounds>,
+    inner: Mutex<SessionInner>,
+}
+
+impl SessionState {
+    fn new(bounds: Arc<AggregateSseBounds>) -> Self {
+        Self {
+            bounds,
+            inner: Mutex::new(SessionInner::new()),
+        }
+    }
+
+    /// Lock the session. Poisoning is recovered rather than propagated: the
+    /// guarded state is plain bookkeeping, and one panicking holder must not be
+    /// able to wedge teardown for every other session.
+    fn lock(&self) -> MutexGuard<'_, SessionInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Close the session and hand back the listener waker, so the caller can
+    /// wake the body AFTER releasing every lock it holds.
+    fn close(&self) -> Option<Waker> {
+        let mut inner = self.lock();
+        inner.closed = true;
+        inner.take_waker()
+    }
+
+    fn close_if_idle(&self, now: Instant, ttl: Duration) -> (bool, Option<Waker>) {
+        let mut inner = self.lock();
+        if now.saturating_duration_since(inner.last_activity) < ttl {
+            return (false, None);
+        }
+        inner.closed = true;
+        let waker = inner.take_waker();
+        (true, waker)
+    }
+
+    /// Release the single listener slot when `epoch` still owns it. Epoch
+    /// matching keeps a stale body's teardown from evicting the listener a
+    /// later reattach installed.
+    fn release_listener(&self, epoch: u64) {
+        let mut inner = self.lock();
+        let owned = match inner.listener.as_ref() {
+            Some(listener) => listener.epoch == epoch,
+            None => false,
+        };
+        if owned {
+            inner.listener = None;
+            inner.last_activity = Instant::now();
+        }
+    }
+
+    fn poll_next_frame(&self, epoch: u64, waker: &Waker) -> NextFrame {
+        let mut inner = self.lock();
+        if inner.closed {
+            return NextFrame::Ended;
+        }
+        let (cursor, greeted) = match inner.listener.as_ref() {
+            Some(listener) if listener.epoch == epoch => (listener.cursor, listener.greeted),
+            _ => return NextFrame::Ended,
+        };
+        if !greeted {
+            if let Some(listener) = inner.listener.as_mut() {
+                listener.greeted = true;
+            }
+            return NextFrame::Frame(Bytes::from_static(SSE_GREETING));
+        }
+        let Some((event_id, framed)) = inner.event_after(cursor) else {
+            if let Some(listener) = inner.listener.as_mut() {
+                listener.waker = Some(waker.clone());
+            }
+            return NextFrame::Idle;
+        };
+        if let Some(listener) = inner.listener.as_mut() {
+            listener.cursor = event_id;
+        }
+        if event_id > inner.delivered_through {
+            inner.delivered_through = event_id;
+        }
+        // Apply the retention policy on DELIVERY as well as on publish, so a
+        // zero-length replay window really does drop a delivered event (and a
+        // later cursor for it fails closed instead of silently resuming).
+        inner.trim(&self.bounds);
+        inner.last_activity = Instant::now();
+        NextFrame::Frame(framed)
+    }
+}
+
+enum NextFrame {
+    Frame(Bytes),
+    Idle,
+    Ended,
+}
+
+/// Monotonic broker-generation source: one ordinal per constructed broker, so a
+/// retired generation stays distinguishable in tests and diagnostics.
+static NEXT_BROKER_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Process-local multiplexed SSE broker for one `mcp_gateway` plugin
+/// generation. Dropping the owning plugin instance drops this broker, which
+/// closes every session and ends every attached body.
 pub struct AggregateSseBroker {
-    generation: AtomicU64,
-    bounds: AggregateSseBounds,
-    /// Max sessions that may hold broker state (aligned with MCP session cap).
+    generation: u64,
+    bounds: Arc<AggregateSseBounds>,
     max_sessions: usize,
-    sessions: DashMap<String, Arc<SessionSseState>>,
+    retired: AtomicBool,
+    /// Reserved slot count. Reservation happens BEFORE insertion, so concurrent
+    /// distinct sessions cannot race past `max_sessions` the way a `len()`
+    /// probe followed by an insert can.
+    reserved_sessions: AtomicUsize,
+    sessions: DashMap<String, Arc<SessionState>>,
 }
 
 impl AggregateSseBroker {
     pub fn new(bounds: AggregateSseBounds, max_sessions: usize, shard_amount: usize) -> Self {
         Self {
-            generation: AtomicU64::new(1),
-            bounds,
+            generation: NEXT_BROKER_GENERATION.fetch_add(1, Ordering::Relaxed),
+            bounds: Arc::new(bounds),
             max_sessions: max_sessions.max(1),
+            retired: AtomicBool::new(false),
+            reserved_sessions: AtomicUsize::new(0),
             sessions: DashMap::with_shard_amount(shard_amount.max(1)),
         }
     }
 
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn bounds(&self) -> &AggregateSseBounds {
         &self.bounds
     }
 
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.generation
     }
 
-    /// Bump the broker generation and drop every session slot. Used on
-    /// reload/update semantics when the owning plugin instance is replaced;
-    /// Drop of the old instance also tears listeners down.
-    pub fn retire_generation(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        let keys: Vec<String> = self.sessions.iter().map(|e| e.key().clone()).collect();
-        for key in keys {
-            if let Some((_, state)) = self.sessions.remove(&key) {
-                state.closed.store(true, Ordering::Release);
-                // Dropping the listener sender ends the SSE body.
-                let _ = state.listener.try_lock().map(|mut guard| guard.take());
-            }
-        }
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
     }
 
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
 
-    /// Ensure a broker session exists for a live downstream MCP session.
-    pub fn ensure_session(&self, session_id: &str) -> Result<Arc<SessionSseState>, AggregateSseError> {
+    /// Retire this generation: refuse every further operation, close every
+    /// session, and wake every attached body so its next poll ends the
+    /// response. Blocking locks throughout — teardown is never best effort.
+    pub fn retire_generation(&self) {
+        self.retired.store(true, Ordering::Release);
+        let mut wakers = Vec::new();
+        self.sessions.retain(|_, state| {
+            if let Some(waker) = state.close() {
+                wakers.push(waker);
+            }
+            false
+        });
+        self.reserved_sessions.store(0, Ordering::Release);
+        wake_all(wakers);
+    }
+
+    /// Admit a broker session for a live downstream MCP session. Idempotent for
+    /// an existing live session, and fails closed rather than silently
+    /// exceeding the cap.
+    pub fn ensure_session(&self, session_id: &str) -> Result<(), AggregateSseError> {
         if session_id.is_empty() {
             return Err(AggregateSseError::MissingSession);
         }
-        if let Some(existing) = self.sessions.get(session_id) {
-            if existing.closed.load(Ordering::Acquire) {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(AggregateSseError::BrokerRetired);
+        }
+        if let Some(state) = self.session_state(session_id) {
+            if state.lock().closed {
                 return Err(AggregateSseError::StaleSession);
             }
-            if existing.generation != self.generation() {
-                return Err(AggregateSseError::GenerationMismatch);
-            }
-            return Ok(Arc::clone(existing.value()));
+            return Ok(());
         }
-        if self.sessions.len() >= self.max_sessions {
-            return Err(AggregateSseError::SessionCardinalityOverflow);
-        }
-        let state = Arc::new(SessionSseState::new(self.generation()));
-        // DashMap entry API avoids TOCTOU growth past the cap under concurrency.
+        self.reserve_session_slot()?;
+        let state = Arc::new(SessionState::new(Arc::clone(&self.bounds)));
         match self.sessions.entry(session_id.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(occupied) => {
-                let existing = occupied.get();
-                if existing.closed.load(Ordering::Acquire) {
+                // Lost the insert race: hand the reservation straight back so
+                // the accounting keeps matching the map exactly.
+                let existing = Arc::clone(occupied.get());
+                drop(occupied);
+                self.release_session_slot();
+                if existing.lock().closed {
                     return Err(AggregateSseError::StaleSession);
                 }
-                if existing.generation != self.generation() {
-                    return Err(AggregateSseError::GenerationMismatch);
-                }
-                Ok(Arc::clone(existing))
+                Ok(())
             }
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                if self.sessions.len() >= self.max_sessions {
-                    return Err(AggregateSseError::SessionCardinalityOverflow);
-                }
-                vacant.insert(Arc::clone(&state));
-                Ok(state)
+                vacant.insert(state);
+                Ok(())
             }
         }
     }
 
-    pub fn get_session(&self, session_id: &str) -> Result<Arc<SessionSseState>, AggregateSseError> {
-        let Some(existing) = self.sessions.get(session_id) else {
-            return Err(AggregateSseError::UnknownSession);
+    /// Tear down broker state for a deleted, evicted, or expired downstream
+    /// session. Synchronous and unconditional: the attached body ends on its
+    /// next poll.
+    pub fn remove_session(&self, session_id: &str) {
+        let Some((_, state)) = self.sessions.remove(session_id) else {
+            return;
         };
-        if existing.closed.load(Ordering::Acquire) {
-            return Err(AggregateSseError::StaleSession);
+        self.release_session_slot();
+        if let Some(waker) = state.close() {
+            waker.wake();
         }
-        if existing.generation != self.generation() {
-            return Err(AggregateSseError::GenerationMismatch);
-        }
-        Ok(Arc::clone(existing.value()))
     }
 
-    /// Tear down broker state for a deleted/expired downstream session.
-    pub async fn remove_session(&self, session_id: &str) {
-        self.detach_session(session_id);
-    }
-
-    /// Synchronous teardown used from session-store eviction paths that cannot
-    /// await. Drops the listener sender so in-flight SSE bodies end promptly.
-    pub fn detach_session(&self, session_id: &str) {
-        if let Some((_, state)) = self.sessions.remove(session_id) {
-            state.closed.store(true, Ordering::Release);
-            if let Ok(mut listener) = state.listener.try_lock() {
-                listener.take();
+    /// Drop broker sessions idle for at least `ttl`, returning how many were
+    /// reclaimed.
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    pub fn reap_idle(&self, ttl: Duration) -> usize {
+        let now = Instant::now();
+        let mut wakers = Vec::new();
+        let mut reaped = 0usize;
+        self.sessions.retain(|_, state| {
+            let (closed, waker) = state.close_if_idle(now, ttl);
+            if !closed {
+                return true;
             }
+            if let Some(waker) = waker {
+                wakers.push(waker);
+            }
+            reaped += 1;
+            false
+        });
+        for _ in 0..reaped {
+            self.release_session_slot();
         }
+        wake_all(wakers);
+        reaped
     }
 
-    /// Open a request stream identity on a session (idempotent fail on duplicate).
-    pub async fn open_stream(
+    /// Attach the one SSE listener for a session.
+    ///
+    /// The cursor decision and the listener install happen inside a single
+    /// critical section that every publish also takes, so replay can never be
+    /// overtaken by a live event: whichever side wins the lock completes
+    /// entirely before the other begins.
+    pub fn attach_listener(
         &self,
         session_id: &str,
-        identity: StreamIdentity,
-    ) -> Result<(), AggregateSseError> {
-        let state = self.get_session(session_id)?;
-        state.touch().await;
-        let mut streams = state.streams.lock().await;
-        if let Some(existing) = streams.get(&identity) {
-            if existing.cancelled {
-                return Err(AggregateSseError::StaleStream);
+        last_event_id: Option<&str>,
+    ) -> Result<AggregateSseListener, AggregateSseError> {
+        let max_leid = self.bounds.max_last_event_id_bytes;
+        let requested = parse_last_event_id(last_event_id, max_leid)?;
+        if self.retired.load(Ordering::Acquire) {
+            return Err(AggregateSseError::BrokerRetired);
+        }
+        let Some(state) = self.session_state(session_id) else {
+            return Err(AggregateSseError::UnknownSession);
+        };
+        let epoch = {
+            let mut inner = state.lock();
+            if inner.closed {
+                return Err(AggregateSseError::StaleSession);
             }
-            return Err(AggregateSseError::DuplicateStream);
-        }
-        if streams.len() >= self.bounds.max_streams_per_session {
-            return Err(AggregateSseError::StreamCardinalityOverflow);
-        }
-        streams.insert(
-            identity.clone(),
-            StreamSlot {
-                identity,
-                cancelled: false,
-                opened_at: Instant::now(),
-            },
-        );
-        Ok(())
+            if inner.listener.is_some() {
+                return Err(AggregateSseError::DuplicateListener);
+            }
+            let cursor = match requested {
+                // No cursor: resume at the delivery watermark. Events staged
+                // while nobody was attached are delivered; events an earlier
+                // listener already received are not, so attach never
+                // duplicates and never fabricates continuity.
+                None => inner.delivered_through,
+                Some(cursor) if cursor > inner.last_event_id => {
+                    return Err(AggregateSseError::LastEventIdUnknown);
+                }
+                Some(cursor) if cursor < inner.evicted_through => {
+                    return Err(AggregateSseError::LastEventIdTooOld);
+                }
+                Some(cursor) => cursor,
+            };
+            let epoch = inner.next_listener_epoch;
+            inner.next_listener_epoch = epoch.saturating_add(1);
+            inner.listener = Some(ListenerState {
+                epoch,
+                cursor,
+                waker: None,
+                greeted: false,
+            });
+            inner.last_activity = Instant::now();
+            epoch
+        };
+        Ok(AggregateSseListener::new(
+            state,
+            epoch,
+            self.bounds.listener_max_lifetime,
+            self.bounds.keepalive_interval,
+        ))
     }
 
-    /// Cancel a stream identity; subsequent publishes for it fail closed.
-    pub async fn cancel_stream(
+    pub fn has_listener(&self, session_id: &str) -> bool {
+        let Some(state) = self.session_state(session_id) else {
+            return false;
+        };
+        let inner = state.lock();
+        !inner.closed && inner.listener.is_some()
+    }
+
+    /// Open a request-stream identity on a session.
+    ///
+    /// [`Self::publish_response`] opens implicitly for a gateway-authored
+    /// reply; this is the explicit entry point for a stream whose response
+    /// arrives later (and can therefore be cancelled in between).
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    pub fn open_stream(
         &self,
         session_id: &str,
         identity: &StreamIdentity,
     ) -> Result<(), AggregateSseError> {
-        let state = self.get_session(session_id)?;
-        state.touch().await;
-        let mut streams = state.streams.lock().await;
-        let Some(slot) = streams.get_mut(identity) else {
-            return Err(AggregateSseError::UnknownStream);
-        };
-        if slot.cancelled {
-            return Err(AggregateSseError::StaleStream);
-        }
-        slot.cancelled = true;
-        Ok(())
-    }
-
-    /// Attach the single SSE listener for a session. Returns the body channel
-    /// receiver and any replay frames for `Last-Event-ID`.
-    pub async fn attach_listener(
-        &self,
-        session_id: &str,
-        last_event_id: Option<&str>,
-    ) -> Result<mpsc::Receiver<Result<Frame<Bytes>, BoxError>>, AggregateSseError> {
-        let resume_after = parse_last_event_id(last_event_id, self.bounds.max_last_event_id_bytes)?;
-        let state = self.ensure_session(session_id)?;
-        if state.closed.load(Ordering::Acquire) {
+        let state = self.live_session(session_id)?;
+        let mut inner = state.lock();
+        if inner.closed {
             return Err(AggregateSseError::StaleSession);
         }
-        state.touch().await;
-
-        let (tx, rx) = mpsc::channel(LISTENER_CHANNEL_CAPACITY);
-        {
-            let mut listener = state.listener.lock().await;
-            if listener.is_some() {
-                return Err(AggregateSseError::DuplicateListener);
-            }
-            *listener = Some(ListenerSlot {
-                tx: tx.clone(),
-                attached_generation: self.generation(),
-            });
-        }
-
-        // Replay ring: events with id > resume_after.
-        if self.bounds.max_replay_events > 0 {
-            let replay = state.replay.lock().await;
-            for event in replay.iter() {
-                if resume_after.is_none_or(|cursor| event.event_id > cursor)
-                    && tx
-                        .try_send(Ok(Frame::data(event.framed.clone())))
-                        .is_err()
-                {
-                    // Listener cannot accept replay under backpressure — fail
-                    // closed rather than silently truncating history.
-                    let mut listener = state.listener.lock().await;
-                    listener.take();
-                    return Err(AggregateSseError::QueueOverflow);
-                }
-            }
-        }
-
-        // Drain pending (pre-listener) queue into the live listener.
-        {
-            let mut pending = state.pending.lock().await;
-            while let Some(event) = pending.pop_front() {
-                state
-                    .pending_bytes
-                    .fetch_sub(event.payload_bytes as u64, Ordering::AcqRel);
-                if resume_after.is_some_and(|cursor| event.event_id <= cursor) {
-                    continue;
-                }
-                if tx
-                    .try_send(Ok(Frame::data(event.framed.clone())))
-                    .is_err()
-                {
-                    let mut listener = state.listener.lock().await;
-                    listener.take();
-                    return Err(AggregateSseError::QueueOverflow);
-                }
-            }
-        }
-
-        // Initial comment frame so clients see an established stream even when
-        // no events are pending (MCP Streamable HTTP GET semantics).
-        let _ = tx.try_send(Ok(Frame::data(Bytes::from_static(b": mcp-sse\n\n"))));
-
-        Ok(rx)
+        inner.last_activity = Instant::now();
+        let max_open = self.bounds.max_streams_per_session;
+        admit_stream_open(&mut inner, identity, max_open)
     }
 
-    /// Detach the SSE listener (client disconnect / explicit cleanup).
-    pub async fn detach_listener(&self, session_id: &str) {
-        if let Ok(state) = self.get_session(session_id) {
-            let mut listener = state.listener.lock().await;
-            listener.take();
-            state.touch().await;
-        }
-    }
-
-    pub async fn has_listener(&self, session_id: &str) -> bool {
-        match self.get_session(session_id) {
-            Ok(state) => state.listener.lock().await.is_some(),
-            Err(_) => false,
-        }
-    }
-
-    /// Publish a JSON-RPC message onto the session's multiplexed SSE stream.
-    pub async fn publish(
+    /// Cancel an open stream. A cancelled identity refuses its own later
+    /// response, which is what makes `notifications/cancelled` meaningful.
+    pub fn cancel_stream(
         &self,
         session_id: &str,
-        stream: Option<&StreamIdentity>,
+        identity: &StreamIdentity,
+    ) -> Result<(), AggregateSseError> {
+        let state = self.live_session(session_id)?;
+        let mut inner = state.lock();
+        if inner.closed {
+            return Err(AggregateSseError::StaleSession);
+        }
+        inner.last_activity = Instant::now();
+        // Bind the phase before the match: a scrutinee temporary would keep the
+        // borrow of `inner` alive across the arms that mutate it.
+        let phase = inner.streams.get(identity).copied();
+        match phase {
+            None => Err(AggregateSseError::UnknownStream),
+            Some(StreamPhase::Completed) => Err(AggregateSseError::StreamCompleted),
+            Some(StreamPhase::Cancelled) => Err(AggregateSseError::StreamCancelled),
+            Some(StreamPhase::Open) => {
+                inner.open_streams = inner.open_streams.saturating_sub(1);
+                let max_open = self.bounds.max_streams_per_session;
+                let terminal = identity.clone();
+                record_terminal(&mut inner, terminal, StreamPhase::Cancelled, max_open);
+                Ok(())
+            }
+        }
+    }
+
+    /// Publish a terminal JSON-RPC response for one request stream and complete
+    /// that stream, releasing its capacity.
+    ///
+    /// Opening (when the identity is not already open), admission, retention
+    /// and completion all happen in ONE critical section, so a concurrent
+    /// cancel or a duplicate response can never interleave, and a late or
+    /// duplicate response is refused instead of misattributed.
+    pub fn publish_response(
+        &self,
+        session_id: &str,
+        identity: &StreamIdentity,
         payload: &Value,
     ) -> Result<u64, AggregateSseError> {
-        let state = self.get_session(session_id)?;
-        if state.closed.load(Ordering::Acquire) {
-            return Err(AggregateSseError::StaleSession);
-        }
-        state.touch().await;
-
-        if let Some(identity) = stream {
-            let streams = state.streams.lock().await;
-            match streams.get(identity) {
-                None => return Err(AggregateSseError::UnknownStream),
-                Some(slot) if slot.cancelled => return Err(AggregateSseError::Cancelled),
-                Some(_) => {}
+        let encoded = encode_event_payload(payload, self.bounds.max_event_bytes)?;
+        let state = self.live_session(session_id)?;
+        let max_open = self.bounds.max_streams_per_session;
+        let (event_id, waker) = {
+            let mut inner = state.lock();
+            if inner.closed {
+                return Err(AggregateSseError::StaleSession);
             }
-        }
-
-        let raw = serde_json::to_vec(payload).map_err(|_| AggregateSseError::EventTooLarge)?;
-        if raw.len() > self.bounds.max_event_bytes {
-            return Err(AggregateSseError::EventTooLarge);
-        }
-        // SSE data lines cannot carry raw newlines without splitting; JSON
-        // serialization is single-line for compact output, but defend anyway.
-        if raw.iter().any(|b| *b == b'\n' || *b == b'\r') {
-            return Err(AggregateSseError::EventTooLarge);
-        }
-
-        let event_id = state.next_event_id.fetch_add(1, Ordering::AcqRel);
-        let framed = frame_sse_event(event_id, &raw);
-        let payload_bytes = raw.len();
-        let queued = QueuedEvent {
-            event_id,
-            stream: stream.cloned(),
-            framed: framed.clone(),
-            payload_bytes,
+            let phase = inner.streams.get(identity).copied();
+            match phase {
+                Some(StreamPhase::Open) => {}
+                Some(StreamPhase::Completed) => return Err(AggregateSseError::StreamCompleted),
+                Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
+                None => admit_stream_open(&mut inner, identity, max_open)?,
+            }
+            let event_id = inner.retain_event(&self.bounds, &encoded)?;
+            inner.open_streams = inner.open_streams.saturating_sub(1);
+            let terminal = identity.clone();
+            record_terminal(&mut inner, terminal, StreamPhase::Completed, max_open);
+            let waker = inner.take_waker();
+            (event_id, waker)
         };
-
-        // Prefer live listener; otherwise retain in the pending queue.
-        let delivered = {
-            let listener = state.listener.lock().await;
-            if let Some(slot) = listener.as_ref() {
-                if slot.attached_generation != self.generation() {
-                    return Err(AggregateSseError::GenerationMismatch);
-                }
-                match slot.tx.try_send(Ok(Frame::data(framed))) {
-                    Ok(()) => true,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        return Err(AggregateSseError::QueueOverflow);
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        // Listener gone mid-send — fall through to pending.
-                        false
-                    }
-                }
-            } else {
-                false
-            }
-        };
-
-        if !delivered {
-            let mut pending = state.pending.lock().await;
-            let current_bytes = state.pending_bytes.load(Ordering::Acquire) as usize;
-            if pending.len() >= self.bounds.max_queue_events
-                || current_bytes.saturating_add(payload_bytes) > self.bounds.max_queue_bytes
-            {
-                return Err(AggregateSseError::QueueOverflow);
-            }
-            pending.push_back(queued.clone());
-            state
-                .pending_bytes
-                .fetch_add(payload_bytes as u64, Ordering::AcqRel);
+        if let Some(waker) = waker {
+            waker.wake();
         }
-
-        // Retain in the replay ring (independent of live delivery).
-        if self.bounds.max_replay_events > 0 {
-            let mut replay = state.replay.lock().await;
-            while replay.len() >= self.bounds.max_replay_events {
-                if let Some(old) = replay.pop_front() {
-                    state
-                        .replay_bytes
-                        .fetch_sub(old.payload_bytes as u64, Ordering::AcqRel);
-                }
-            }
-            while state.replay_bytes.load(Ordering::Acquire) as usize + payload_bytes
-                > self.bounds.max_queue_bytes
-                && !replay.is_empty()
-            {
-                if let Some(old) = replay.pop_front() {
-                    state
-                        .replay_bytes
-                        .fetch_sub(old.payload_bytes as u64, Ordering::AcqRel);
-                } else {
-                    break;
-                }
-            }
-            if state.replay_bytes.load(Ordering::Acquire) as usize + payload_bytes
-                <= self.bounds.max_queue_bytes
-            {
-                replay.push_back(queued);
-                state
-                    .replay_bytes
-                    .fetch_add(payload_bytes as u64, Ordering::AcqRel);
-            }
-        }
-
         Ok(event_id)
     }
 
-    /// Drop idle broker sessions whose activity is older than `ttl`.
-    pub async fn reap_idle(&self, ttl: Duration) {
-        let now = Instant::now();
-        let mut stale = Vec::new();
-        for entry in self.sessions.iter() {
-            let Ok(guard) = entry.value().last_activity.try_lock() else {
-                continue;
-            };
-            if now.duration_since(*guard) >= ttl {
-                stale.push(entry.key().clone());
+    /// Publish a session-scoped event that belongs to no single request stream
+    /// (server-initiated notifications).
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    pub fn publish_notification(
+        &self,
+        session_id: &str,
+        payload: &Value,
+    ) -> Result<u64, AggregateSseError> {
+        let encoded = encode_event_payload(payload, self.bounds.max_event_bytes)?;
+        let state = self.live_session(session_id)?;
+        let (event_id, waker) = {
+            let mut inner = state.lock();
+            if inner.closed {
+                return Err(AggregateSseError::StaleSession);
+            }
+            let event_id = inner.retain_event(&self.bounds, &encoded)?;
+            let waker = inner.take_waker();
+            (event_id, waker)
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        Ok(event_id)
+    }
+
+    fn session_state(&self, session_id: &str) -> Option<Arc<SessionState>> {
+        // Clone the handle and drop the shard guard before any session lock is
+        // taken, so the two locks are never held together in either order.
+        self.sessions
+            .get(session_id)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    fn live_session(&self, session_id: &str) -> Result<Arc<SessionState>, AggregateSseError> {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(AggregateSseError::BrokerRetired);
+        }
+        self.session_state(session_id)
+            .ok_or(AggregateSseError::UnknownSession)
+    }
+
+    fn reserve_session_slot(&self) -> Result<(), AggregateSseError> {
+        let mut current = self.reserved_sessions.load(Ordering::Acquire);
+        loop {
+            if current >= self.max_sessions {
+                return Err(AggregateSseError::SessionCardinalityOverflow);
+            }
+            match self.reserved_sessions.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
             }
         }
-        for key in stale {
-            self.remove_session(&key).await;
+    }
+
+    /// Return one reserved slot, saturating at zero so a retirement that reset
+    /// the counter can never make a late removal underflow it.
+    fn release_session_slot(&self) {
+        let mut current = self.reserved_sessions.load(Ordering::Acquire);
+        while current > 0 {
+            match self.reserved_sessions.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
         }
     }
 }
 
 impl Drop for AggregateSseBroker {
     fn drop(&mut self) {
-        // Closing every listener sender ends in-flight SSE bodies for this
-        // plugin generation so reload/delete cannot leak cross-generation
-        // events onto a new instance.
-        for entry in self.sessions.iter() {
-            entry.value().closed.store(true, Ordering::Release);
-            if let Ok(mut listener) = entry.value().listener.try_lock() {
-                listener.take();
-            }
-        }
-        self.sessions.clear();
+        // Reload / update / delete drops the owning plugin instance, which
+        // drops this broker: every attached body ends on its next poll and no
+        // event can cross generations.
+        self.retire_generation();
     }
 }
 
+/// Admit a new open stream identity under the per-session cardinality bound.
+fn admit_stream_open(
+    inner: &mut SessionInner,
+    identity: &StreamIdentity,
+    max_open: usize,
+) -> Result<(), AggregateSseError> {
+    let phase = inner.streams.get(identity).copied();
+    match phase {
+        Some(StreamPhase::Open) => return Err(AggregateSseError::DuplicateStream),
+        Some(StreamPhase::Completed) => return Err(AggregateSseError::StreamCompleted),
+        Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
+        None => {}
+    }
+    if inner.open_streams >= max_open {
+        return Err(AggregateSseError::StreamCardinalityOverflow);
+    }
+    inner.streams.insert(identity.clone(), StreamPhase::Open);
+    inner.open_streams += 1;
+    Ok(())
+}
+
+/// Record a terminal stream phase, evicting the oldest terminal record once the
+/// terminal set would outgrow the open-stream bound.
+fn record_terminal(
+    inner: &mut SessionInner,
+    identity: StreamIdentity,
+    phase: StreamPhase,
+    max_open: usize,
+) {
+    inner.streams.insert(identity.clone(), phase);
+    inner.terminal_order.push_back(identity);
+    while inner.terminal_order.len() > max_open {
+        let Some(stale) = inner.terminal_order.pop_front() else {
+            break;
+        };
+        let is_terminal = matches!(
+            inner.streams.get(&stale),
+            Some(StreamPhase::Completed | StreamPhase::Cancelled)
+        );
+        if is_terminal {
+            inner.streams.remove(&stale);
+        }
+    }
+}
+
+fn wake_all(wakers: Vec<Waker>) {
+    for waker in wakers {
+        waker.wake();
+    }
+}
+
+/// Single-consumer handle to a session's attached SSE stream.
+///
+/// Cloning this handle (a `RequestContext` clone does) shares one inner lease:
+/// [`AggregateSseListener::take_body`] is a one-shot compare-and-swap, so a
+/// clone can neither duplicate nor steal the stream. Dropping every clone
+/// without taking the body releases the listener slot, so a rejection a later
+/// plugin replaced does not strand the session.
+#[derive(Clone)]
+pub struct AggregateSseListener(Arc<ListenerLease>);
+
+struct ListenerLease {
+    session: Arc<SessionState>,
+    epoch: u64,
+    max_lifetime: Duration,
+    keepalive: Duration,
+    taken: AtomicBool,
+}
+
+impl Drop for ListenerLease {
+    fn drop(&mut self) {
+        if self.taken.load(Ordering::Acquire) {
+            // The body owns the slot now and releases it on its own drop.
+            return;
+        }
+        self.session.release_listener(self.epoch);
+    }
+}
+
+impl fmt::Debug for AggregateSseListener {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Deliberately opaque: never expose a session id or an event cursor.
+        formatter.write_str("AggregateSseListener { .. }")
+    }
+}
+
+impl AggregateSseListener {
+    fn new(
+        session: Arc<SessionState>,
+        epoch: u64,
+        max_lifetime: Duration,
+        keepalive: Duration,
+    ) -> Self {
+        Self(Arc::new(ListenerLease {
+            session,
+            epoch,
+            max_lifetime,
+            keepalive,
+            taken: AtomicBool::new(false),
+        }))
+    }
+
+    /// Take the streaming body exactly once. Every later caller gets `None`,
+    /// which is what makes ownership single-consumer across context clones and
+    /// across the H1/H2 and native H3 response builders alike.
+    pub fn take_body(&self) -> Option<AggregateSseBody> {
+        let lease = &self.0;
+        if lease.taken.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let now = tokio::time::Instant::now();
+        let deadline = now + lease.max_lifetime;
+        let first_wake = now + lease.keepalive.min(lease.max_lifetime);
+        Some(AggregateSseBody {
+            session: Arc::clone(&lease.session),
+            epoch: lease.epoch,
+            deadline,
+            keepalive: lease.keepalive,
+            timer: Box::pin(tokio::time::sleep_until(first_wake)),
+            finished: false,
+        })
+    }
+}
+
+/// The multiplexed SSE response body for one attached listener.
+///
+/// Ending this stream is the ONLY way the listener slot is released on the
+/// delivery side, and it happens in `Drop` through one plain bookkeeping
+/// critical section — no channel, no async lock, no best-effort `try_lock`. A
+/// client transport disconnect therefore always permits a reattach.
+pub struct AggregateSseBody {
+    session: Arc<SessionState>,
+    epoch: u64,
+    deadline: tokio::time::Instant,
+    keepalive: Duration,
+    timer: Pin<Box<tokio::time::Sleep>>,
+    finished: bool,
+}
+
+impl fmt::Debug for AggregateSseBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AggregateSseBody { .. }")
+    }
+}
+
+impl Drop for AggregateSseBody {
+    fn drop(&mut self) {
+        self.session.release_listener(self.epoch);
+    }
+}
+
+impl futures_util::Stream for AggregateSseBody {
+    type Item = SseFrameResult;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        match this.session.poll_next_frame(this.epoch, cx.waker()) {
+            NextFrame::Ended => {
+                this.finished = true;
+                return Poll::Ready(None);
+            }
+            NextFrame::Frame(framed) => return Poll::Ready(Some(Ok(Frame::data(framed)))),
+            NextFrame::Idle => {}
+        }
+        // Idle: the timer is what bounds an otherwise silent stream. It ends
+        // the response at the lifetime deadline — so an orphaned listener is
+        // always reclaimed — and otherwise emits a keepalive comment, which is
+        // how a vanished peer is discovered on a quiet session.
+        if this.timer.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= this.deadline {
+            this.finished = true;
+            return Poll::Ready(None);
+        }
+        let next_wake = this.deadline.min(now + this.keepalive);
+        this.timer.as_mut().reset(next_wake);
+        let keepalive = Bytes::from_static(SSE_KEEPALIVE);
+        Poll::Ready(Some(Ok(Frame::data(keepalive))))
+    }
+}
+
+/// Serialize an event payload under the per-event ceiling. A payload whose
+/// serialization would break SSE line framing is refused rather than escaped,
+/// so the wire representation stays exactly one `data:` line.
+fn encode_event_payload(
+    payload: &Value,
+    max_event_bytes: usize,
+) -> Result<Vec<u8>, AggregateSseError> {
+    let encoded = serde_json::to_vec(payload).map_err(|_| AggregateSseError::EventTooLarge)?;
+    if encoded.len() > max_event_bytes {
+        return Err(AggregateSseError::EventTooLarge);
+    }
+    if encoded.iter().any(|byte| *byte == b'\n' || *byte == b'\r') {
+        return Err(AggregateSseError::EventTooLarge);
+    }
+    Ok(encoded)
+}
+
+/// Parse `Last-Event-ID` into a resume cursor. Bounded, digits only, and never
+/// echoed back to the client or into a log.
 fn parse_last_event_id(
     raw: Option<&str>,
     max_bytes: usize,
 ) -> Result<Option<u64>, AggregateSseError> {
-    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+    let trimmed = raw.map(str::trim).filter(|value| !value.is_empty());
+    let Some(value) = trimmed else {
         return Ok(None);
     };
     if value.len() > max_bytes {
         return Err(AggregateSseError::LastEventIdTooLarge);
     }
-    if !value.bytes().all(|b| b.is_ascii_digit()) {
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(AggregateSseError::LastEventIdInvalid);
     }
     value
@@ -712,8 +1245,7 @@ fn parse_last_event_id(
 }
 
 fn frame_sse_event(event_id: u64, data: &[u8]) -> Bytes {
-    // id / event / data / blank line. event_id is gateway-authored decimal.
-    let mut out = Vec::with_capacity(32 + data.len());
+    let mut out = Vec::with_capacity(SSE_FRAME_OVERHEAD_BYTES + data.len());
     out.extend_from_slice(b"id: ");
     out.extend_from_slice(event_id.to_string().as_bytes());
     out.extend_from_slice(b"\nevent: message\ndata: ");
@@ -722,12 +1254,7 @@ fn frame_sse_event(event_id: u64, data: &[u8]) -> Bytes {
     Bytes::from(out)
 }
 
-/// Returns true when request headers include a usable `text/event-stream` Accept.
-pub fn headers_request_aggregate_sse(headers: &std::collections::HashMap<String, String>) -> bool {
+/// Returns true when request headers carry a usable `text/event-stream` Accept.
+pub fn headers_request_aggregate_sse(headers: &HashMap<String, String>) -> bool {
     crate::plugins::utils::sse::headers_accept_sse(headers)
-}
-
-#[cfg(test)]
-mod inline_smoke {
-    // Intentionally empty: coverage lives in external unit tests per policy.
 }

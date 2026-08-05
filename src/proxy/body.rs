@@ -3353,6 +3353,25 @@ pub(crate) fn inspected_streaming_body(
     ProxyBody::streaming(Box::pin(body))
 }
 
+/// Build a streaming response body from a gateway-owned frame source.
+///
+/// Used by the aggregate MCP SSE multiplexer, whose body IS the session's
+/// retained event ring rather than a channel: there is no intermediate queue to
+/// duplicate events into, and the stream's own `Drop` is what releases the
+/// session's single-listener slot. `content_length` is deliberately `None` —
+/// the reject builder pairs this with `ClientResponseFraming::Streaming`, so no
+/// length is published for bytes that have not been written yet.
+pub(crate) fn gateway_streaming_body<S>(stream: S) -> ProxyBody
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, BoxError>> + Send + Unpin + 'static,
+{
+    let body = DirectStreamBody {
+        inner: stream,
+        content_length: None,
+    };
+    ProxyBody::streaming(Box::pin(body))
+}
+
 /// Drive a streaming-response [`crate::plugins::ResponseStreamInspector`] over a
 /// reqwest backend response, forwarding released bytes to `tx` (which backs an
 /// [`inspected_streaming_body`]).
