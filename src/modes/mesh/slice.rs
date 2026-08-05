@@ -2510,9 +2510,13 @@ where
 /// about is a steady state however many subscribers observe it; a count it has
 /// not is genuinely new and is reported once.
 ///
-/// Growth is bounded by the mesh's namespace count times
-/// [`DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE`] and touched only on the
-/// cold slice-build path, never per request.
+/// Growth is bounded on BOTH axes — at most
+/// [`DESTINATION_RULE_AMBIGUITY_NAMESPACE_BUDGET`] keys, each holding at most
+/// [`DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE`] counts — and touched only
+/// on the cold slice-build path, never per request. The key axis needs its own
+/// budget because the key is the SUBSCRIBER's namespace: a CP serves whichever
+/// namespaces subscribe to it, so a churning or hostile fleet of subscriber
+/// namespaces would otherwise grow this process-global map without limit.
 static DESTINATION_RULE_AMBIGUITY_REPORTED: OnceLock<Mutex<HashMap<String, HashSet<usize>>>> =
     OnceLock::new();
 
@@ -2521,6 +2525,16 @@ static DESTINATION_RULE_AMBIGUITY_REPORTED: OnceLock<Mutex<HashMap<String, HashS
 /// toward visibility — that churn is itself worth surfacing) instead of growing
 /// the map without bound.
 const DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE: usize = 32;
+
+/// Client namespaces retained in [`DESTINATION_RULE_AMBIGUITY_REPORTED`]. Once
+/// this many namespaces have been recorded, a namespace with no entry keeps
+/// reporting instead of taking a new key — the same fail-toward-visibility
+/// direction as the per-namespace budget, so saturation degrades to "warn every
+/// time" rather than to silence. Sized well above any realistic mesh's
+/// subscribing-namespace count so ordinary deployments never leave steady-state
+/// dedup; the whole map is bounded by
+/// `128 * 32` counts plus their namespace keys.
+const DESTINATION_RULE_AMBIGUITY_NAMESPACE_BUDGET: usize = 128;
 
 /// Record this namespace's ambiguous-destination count, returning `true` when
 /// that count has NOT been reported for this namespace before (so the caller
@@ -2531,18 +2545,34 @@ fn record_destination_rule_ambiguity(client_namespace: &str, ambiguous: usize) -
     let Ok(mut reported) = reported.lock() else {
         return true;
     };
+    record_destination_rule_ambiguity_in(&mut reported, client_namespace, ambiguous)
+}
+
+/// Budget-enforcing half of [`record_destination_rule_ambiguity`], split out
+/// from the process-global slot so the bounds are provable against a local map
+/// instead of against unresettable global state.
+fn record_destination_rule_ambiguity_in(
+    reported: &mut HashMap<String, HashSet<usize>>,
+    client_namespace: &str,
+    ambiguous: usize,
+) -> bool {
     // Steady state is the common case, so it must not allocate a key.
-    if reported
-        .get(client_namespace)
-        .is_some_and(|counts| counts.contains(&ambiguous))
-    {
-        return false;
-    }
-    let counts = reported.entry(client_namespace.to_string()).or_default();
-    if counts.len() >= DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE {
+    if let Some(counts) = reported.get(client_namespace) {
+        if counts.contains(&ambiguous) {
+            return false;
+        }
+        if counts.len() >= DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE {
+            return true;
+        }
+    } else if reported.len() >= DESTINATION_RULE_AMBIGUITY_NAMESPACE_BUDGET {
+        // Every key is spoken for and this namespace has none. Report rather
+        // than retain — saturation degrades toward visibility, never silence.
         return true;
     }
-    counts.insert(ambiguous);
+    reported
+        .entry(client_namespace.to_string())
+        .or_default()
+        .insert(ambiguous);
     true
 }
 
@@ -5699,6 +5729,53 @@ mod tests {
             !record_destination_rule_ambiguity(ns, 1),
             "already-retained counts are still deduped"
         );
+    }
+
+    /// The KEY axis is bounded too. The map is keyed by the SUBSCRIBER's
+    /// namespace, so without a global budget a churning or hostile fleet of
+    /// subscriber namespaces grows this process-global map forever.
+    ///
+    /// Asserted against a LOCAL map through the budget-enforcing helper: the
+    /// process-global slot is never reset, so a global-state test could neither
+    /// start from an empty map nor prove a total size.
+    #[test]
+    fn ambiguity_warn_dedup_growth_is_globally_bounded() {
+        let mut reported: HashMap<String, HashSet<usize>> = HashMap::new();
+
+        // Steady-state dedup survives inside the budget.
+        assert!(record_destination_rule_ambiguity_in(&mut reported, "a", 1));
+        assert!(!record_destination_rule_ambiguity_in(&mut reported, "a", 1));
+
+        // Far more distinct namespaces than the budget, each with far more
+        // distinct counts than the per-namespace cap.
+        for ns in 0..(DESTINATION_RULE_AMBIGUITY_NAMESPACE_BUDGET * 8) {
+            let key = format!("ns-{ns}");
+            for count in 0..(DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE * 2) {
+                record_destination_rule_ambiguity_in(&mut reported, &key, count);
+            }
+        }
+
+        assert_eq!(
+            reported.len(),
+            DESTINATION_RULE_AMBIGUITY_NAMESPACE_BUDGET,
+            "the namespace key axis is capped"
+        );
+        assert!(
+            reported
+                .values()
+                .all(|counts| counts.len() <= DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE),
+            "the per-namespace count axis stays capped as well"
+        );
+
+        // Saturated: an unseen namespace takes no key and fails toward
+        // visibility rather than going silent.
+        let before = reported.len();
+        assert!(record_destination_rule_ambiguity_in(&mut reported, "late", 7));
+        assert!(record_destination_rule_ambiguity_in(&mut reported, "late", 7));
+        assert_eq!(reported.len(), before, "and it retains no new key");
+
+        // A namespace admitted before saturation keeps its steady-state dedup.
+        assert!(!record_destination_rule_ambiguity_in(&mut reported, "a", 1));
     }
 
     fn pa(

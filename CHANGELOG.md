@@ -61,6 +61,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace nominate itself as the service tier for an external host it does
   not own and reach the subscriber's materialized upstreams.
 
+  Per-destination lookups do not imply per-destination application: an
+  `Upstream` has one set of slots, and every field a rule projects (load
+  balancer and hash keys, backend TLS, outlier thresholds, connection-pool
+  caps, locality, subsets) is upstream-wide. An upstream whose targets span two
+  destinations that resolve to **different** winning rules is therefore refused
+  before any upstream is mutated — merging them would let `(namespace, name,
+  host)` sort order decide which service's policy governs the other. On a live
+  data plane the slice is rejected and the last good config is retained in
+  full; at startup the config fails to load with an error naming the upstream.
+  Single-destination upstreams, multi-port upstreams, and an upstream whose
+  second destination has no visible rule of its own are unaffected.
+
+  The process-global dedup map that keeps the "multiple DestinationRules target
+  one destination" warning from becoming per-reload × per-DP spam is now
+  bounded on both axes — at most 128 client-namespace keys, each holding at
+  most 32 distinct counts. The key is the subscriber's namespace, so without a
+  key budget a churning or hostile fleet of subscriber namespaces could grow it
+  without limit. Saturation degrades toward visibility (warn every time), never
+  toward silence, and namespaces admitted before saturation keep steady-state
+  dedup.
+
 - `virtual_service_cors_policies[].export_to` is now validated with the same
   fail-closed boundary check `DestinationRule.exportTo` and, like ServiceEntry
   and DestinationRule visibility, is evaluated through the one shared

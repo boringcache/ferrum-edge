@@ -7064,6 +7064,13 @@ fn synthesize_mesh_outbound_cors_plugins(
 /// independently instead of letting one host's winner suppress the only rule
 /// the other host has.
 ///
+/// Independent per-host lookups do NOT imply per-host application: every field
+/// a rule projects lands on the shared `Upstream`. An upstream whose
+/// destinations resolve to DIFFERENT winning rule sets is therefore REFUSED
+/// (fail-closed, before any mutation) rather than merged in sorted order — see
+/// the representability check below. Single-destination upstreams, and
+/// upstreams whose destinations share one winning rule set, are unaffected.
+///
 /// `exportTo` visibility has already been applied at slice construction and is
 /// re-applied below, so only rules this subscriber may see arrive here.
 ///
@@ -7209,32 +7216,81 @@ fn apply_destination_rules(
         mesh_service_identities: &service_identities,
         service_entry_hosts: &service_entry_hosts,
     };
-    let winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleLookupTier>>> = config
-        .upstreams
-        .iter()
-        .map(|upstream| {
-            let hosts = upstream_destination_rule_match_hosts(upstream);
-            let mut winners: Vec<Option<DestinationRuleLookupTier>> =
-                Vec::with_capacity(hosts.len());
-            for host in hosts {
-                let mut winner: Option<DestinationRuleLookupTier> = None;
-                for dr in sorted_destination_rules.iter().copied() {
-                    if !destination_rule_host_matches(&dr.host, &dr.namespace, host) {
-                        continue;
-                    }
-                    let Some(tier) = tier_scope.eligible_tier(dr, upstream, host) else {
-                        continue;
-                    };
-                    winner = Some(match winner {
-                        Some(current) => current.min(tier),
-                        None => tier,
-                    });
+    // The pass ALSO decides representability. An `Upstream` is ONE object: every
+    // field a winning rule projects — load balancer, hash keys, backend TLS,
+    // outlier/passive thresholds, connection-pool caps, locality, subsets — is
+    // upstream-WIDE. Per-host arbitration resolves each destination
+    // independently, but there is no per-host slot to project a winner into, so
+    // when two destinations on one upstream resolve to DIFFERENT winning rule
+    // sets the only representable outcomes are (a) letting the sorted
+    // application order below decide which host's rule overwrites the other's
+    // upstream-wide fields, or (b) refusing. (a) is order-dependent CROSS-SERVICE
+    // policy transfer — `beta`'s rule silently governing traffic to `alpha`'s
+    // service because `beta` sorts later — so this refuses instead, before any
+    // upstream is mutated. See `docs/mesh.md` "An upstream that spans two
+    // destinations".
+    let mut winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleLookupTier>>> =
+        Vec::with_capacity(config.upstreams.len());
+    for upstream in &config.upstreams {
+        let hosts = upstream_destination_rule_match_hosts(upstream);
+        let mut winners: Vec<Option<DestinationRuleLookupTier>> = Vec::with_capacity(hosts.len());
+        // The winning rule SET (indexes into `sorted_destination_rules`, which
+        // is deterministically ordered) for each host that resolved one. Hosts
+        // with NO winner contribute nothing: a destination no visible rule
+        // targets cannot disagree with one that has a rule, and refusing there
+        // would reject the ordinary "upstream carries a static fallback target"
+        // shape that has always inherited the upstream-wide policy.
+        let mut winning_rule_sets: Vec<Vec<usize>> = Vec::new();
+        for host in hosts {
+            let mut winner: Option<DestinationRuleLookupTier> = None;
+            for dr in sorted_destination_rules.iter().copied() {
+                if !destination_rule_host_matches(&dr.host, &dr.namespace, host) {
+                    continue;
                 }
-                winners.push(winner);
+                let Some(tier) = tier_scope.eligible_tier(dr, upstream, host) else {
+                    continue;
+                };
+                winner = Some(match winner {
+                    Some(current) => current.min(tier),
+                    None => tier,
+                });
             }
-            winners
-        })
-        .collect();
+            if let Some(tier) = winner {
+                winning_rule_sets.push(
+                    sorted_destination_rules
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .filter(|&(_, dr)| {
+                            destination_rule_host_matches(&dr.host, &dr.namespace, host)
+                                && tier_scope.eligible_tier(dr, upstream, host) == Some(tier)
+                        })
+                        .map(|(idx, _)| idx)
+                        .collect(),
+                );
+            }
+            winners.push(winner);
+        }
+        let representable = winning_rule_sets
+            .first()
+            .is_none_or(|first| winning_rule_sets.iter().all(|set| set == first));
+        if !representable {
+            let mut distinct = winning_rule_sets;
+            distinct.sort_unstable();
+            distinct.dedup();
+            return Err(anyhow::anyhow!(
+                "DestinationRule policy for upstream={} namespace={} cannot be represented: \
+                 its destinations resolve to {} DIFFERENT winning DestinationRule sets, and \
+                 every field a rule projects is upstream-wide, so applying them would let \
+                 one destination's policy govern the other. Split the upstream so each \
+                 destination has its own, or give the destinations one common winning rule.",
+                upstream.id,
+                upstream.namespace,
+                distinct.len()
+            ));
+        }
+        winning_tier_by_upstream_host.push(winners);
+    }
 
     // Rules that matched a destination but were refused at every one of them
     // for being declared outside Istio's client/service/root lookup

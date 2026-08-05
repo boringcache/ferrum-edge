@@ -1628,26 +1628,18 @@ fn a_wildcard_host_grants_no_service_tier() {
 
 // ── Per-host tier arbitration ────────────────────────────────────────────
 
-/// Istio resolves a DestinationRule PER DESTINATION HOST. An upstream whose
-/// targets span two services carries two independent lookups, so one host's
-/// winning tier must not suppress the only rule the other host has.
+const SPAN_A_HOST: &str = "a.alpha.svc.cluster.local";
+const SPAN_B_HOST: &str = "b.beta.svc.cluster.local";
+
+/// One operator-authored upstream whose targets are `targets`, plus the mesh
+/// inventory both destinations need, viewed as an `alpha` subscriber.
 ///
-/// Arbitrating per UPSTREAM used to compute a single minimum across every
-/// matching rule: the alpha client's own rule for `a.alpha` made `Client` the
-/// upstream-wide winner, and beta's rule — the sole policy for `b.beta`, and
-/// correctly admitted at the service tier — was skipped, silently dropping its
-/// load-balancer setting.
-#[test]
-fn an_upstream_spanning_two_services_resolves_each_host_independently() {
-    let a_host = "a.alpha.svc.cluster.local";
-    let b_host = "b.beta.svc.cluster.local";
-
-    let mut beta_rule = rule("beta", "beta-owner", b_host, 4444, &["*"]);
-    beta_rule.traffic_policy = Some(MeshTrafficPolicy {
-        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
-        ..MeshTrafficPolicy::default()
-    });
-
+/// `name` is cleared so the upstream's own name is not a second match surface —
+/// the cases below are about the TARGET hosts.
+fn spanning_upstream_config(
+    targets: &[(&str, u16)],
+    destination_rules: Vec<MeshDestinationRule>,
+) -> GatewayConfig {
     let mesh = MeshConfig {
         services: vec![service_in("alpha", "a"), service_in("beta", "b")],
         workloads: vec![
@@ -1655,50 +1647,148 @@ fn an_upstream_spanning_two_services_resolves_each_host_independently() {
             workload_in("beta", "b"),
             workload_in("alpha", "web"),
         ],
-        destination_rules: vec![rule("alpha", "client-a", a_host, 1111, &["*"]), beta_rule],
+        destination_rules,
         sidecars: vec![permissive_sidecar("alpha")],
         ..MeshConfig::default()
     };
 
-    let mut upstream = http_upstream("mixed-u", a_host, 8080);
+    let (first_host, first_port) = targets[0];
+    let mut upstream = http_upstream("mixed-u", first_host, first_port);
     upstream.namespace = "alpha".to_string();
     upstream.name = None;
-    upstream.targets.push(UpstreamTarget {
-        host: b_host.to_string(),
-        port: 8080,
-        service_port_policy_key: None,
-        weight: 1,
-        tags: HashMap::new(),
-        locality: None,
-        path: None,
-    });
-    let mut proxy = http_proxy("mixed-p", a_host, 8080);
+    for (host, port) in &targets[1..] {
+        upstream.targets.push(UpstreamTarget {
+            host: (*host).to_string(),
+            port: *port,
+            service_port_policy_key: None,
+            weight: 1,
+            tags: HashMap::new(),
+            locality: None,
+            path: None,
+        });
+    }
+    let mut proxy = http_proxy("mixed-p", first_host, first_port);
     proxy.namespace = "alpha".to_string();
     proxy.upstream_id = Some("mixed-u".to_string());
 
-    let config = GatewayConfig {
+    GatewayConfig {
         proxies: vec![proxy],
         upstreams: vec![upstream],
         mesh: Some(Box::new(mesh)),
         ..GatewayConfig::default()
-    };
-    let runtime = MeshRuntimeConfig {
+    }
+}
+
+fn alpha_subscriber_runtime() -> MeshRuntimeConfig {
+    MeshRuntimeConfig {
         namespace: "alpha".to_string(),
         sidecar_enforced: true,
         ..default_mesh_runtime()
-    };
-    let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+    }
+}
+
+/// Istio resolves a DestinationRule PER DESTINATION HOST, and this pass does
+/// too — but an `Upstream` has only ONE set of slots for the resolved policy.
+/// Load balancer, hash keys, backend TLS, outlier thresholds, connection-pool
+/// caps, locality, and subsets are all upstream-WIDE, so two destinations that
+/// resolve to different winning rules cannot both be represented.
+///
+/// Applying them anyway is cross-service policy transfer decided by sort order:
+/// `beta`'s rule would govern traffic to `alpha`'s service purely because
+/// `beta` sorts later. The apply pass refuses instead, before mutating
+/// anything, and mesh's fail-closed-by-retention contract keeps the last good
+/// config.
+#[test]
+fn an_upstream_spanning_two_services_with_distinct_winners_is_refused() {
+    let mut beta_rule = rule("beta", "beta-owner", SPAN_B_HOST, 4444, &["*"]);
+    beta_rule.traffic_policy = Some(MeshTrafficPolicy {
+        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
+        ..MeshTrafficPolicy::default()
+    });
+
+    let alpha_rule = rule("alpha", "client-a", SPAN_A_HOST, 1111, &["*"]);
+    let config = spanning_upstream_config(
+        &[(SPAN_A_HOST, 8080), (SPAN_B_HOST, 8080)],
+        vec![alpha_rule, beta_rule],
+    );
+
+    let error = prepare_gateway_config_for_mesh(config, &alpha_subscriber_runtime())
+        .expect_err("two destinations with different winning rules cannot share one upstream");
+    let message = error.to_string();
+    assert!(
+        message.contains("mixed-u") && message.contains("cannot be represented"),
+        "the refusal names the unrepresentable upstream: {message}"
+    );
+}
+
+/// The refusal is ORDER-INDEPENDENT. Both rules here set the SAME two
+/// upstream-wide fields, so a merge would have produced a winner chosen by the
+/// `(namespace, name, host)` sort — a different service's policy depending on
+/// nothing but spelling. Neither ordering of the input may produce a config,
+/// and both must fail the same way.
+#[test]
+fn an_upstream_spanning_two_services_has_no_order_dependent_cross_service_winner() {
+    // Both rules set the SAME two upstream-wide fields, so any merge would
+    // have to pick a loser.
+    let mut alpha_rule = rule("alpha", "z-client", SPAN_A_HOST, 1111, &["*"]);
+    alpha_rule.traffic_policy = Some(MeshTrafficPolicy {
+        connect_timeout_ms: Some(1111),
+        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+        ..MeshTrafficPolicy::default()
+    });
+    let mut beta_rule = rule("beta", "a-owner", SPAN_B_HOST, 4444, &["*"]);
+    beta_rule.traffic_policy = Some(MeshTrafficPolicy {
+        connect_timeout_ms: Some(4444),
+        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
+        ..MeshTrafficPolicy::default()
+    });
+
+    let forward_config = spanning_upstream_config(
+        &[(SPAN_A_HOST, 8080), (SPAN_B_HOST, 8080)],
+        vec![alpha_rule.clone(), beta_rule.clone()],
+    );
+    let reversed_config = spanning_upstream_config(
+        &[(SPAN_A_HOST, 8080), (SPAN_B_HOST, 8080)],
+        vec![beta_rule, alpha_rule],
+    );
+
+    let forward = prepare_gateway_config_for_mesh(forward_config, &alpha_subscriber_runtime())
+        .expect_err("conflicting upstream-wide fields are refused");
+    let reversed = prepare_gateway_config_for_mesh(reversed_config, &alpha_subscriber_runtime())
+        .expect_err("and are refused just the same in the other input order");
+
+    assert_eq!(
+        forward.to_string(),
+        reversed.to_string(),
+        "the outcome must not depend on which rule the producer listed first"
+    );
+}
+
+/// Two targets for ONE destination — a multi-port upstream — resolve to the
+/// same winning rule set, so there is nothing to arbitrate and the policy
+/// applies exactly as it does for a single-target upstream.
+#[test]
+fn an_upstream_with_two_ports_for_one_destination_still_applies_its_rule() {
+    let mut client_rule = rule("alpha", "client-a", SPAN_A_HOST, 1111, &["*"]);
+    client_rule.traffic_policy = Some(MeshTrafficPolicy {
+        connect_timeout_ms: Some(1111),
+        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
+        ..MeshTrafficPolicy::default()
+    });
+
+    let config = spanning_upstream_config(
+        &[(SPAN_A_HOST, 8080), (SPAN_A_HOST, 9090)],
+        vec![client_rule],
+    );
+    let prepared = prepare_gateway_config_for_mesh(config, &alpha_subscriber_runtime())
+        .expect("one destination on two ports is representable");
 
     let proxy = prepared
         .proxies
         .iter()
         .find(|p| p.id == "mixed-p")
         .expect("operator proxy survives mesh preparation");
-    assert_eq!(
-        proxy.backend_connect_timeout_ms, 1111,
-        "the client-tier rule still wins outright for its OWN host"
-    );
+    assert_eq!(proxy.backend_connect_timeout_ms, 1111);
 
     let upstream = prepared
         .upstreams
@@ -1708,9 +1798,31 @@ fn an_upstream_spanning_two_services_resolves_each_host_independently() {
     assert_eq!(
         upstream.algorithm,
         ferrum_edge::config::types::LoadBalancerAlgorithm::LeastConnections,
-        "the service-tier rule for the SECOND host must still apply — its host \
-         has no client-tier rule, so nothing outranks it"
+        "the sole winning rule applies to the whole upstream"
     );
+}
+
+/// The boundary, pinned deliberately: a second destination with NO visible rule
+/// of its own does not make the upstream unrepresentable. There is one winning
+/// rule set, and refusing here would reject the ordinary "upstream carries a
+/// static fallback target" shape. That target does inherit the upstream-wide
+/// policy — the documented consequence of upstream-wide slots, not an
+/// order-dependent contest between two services' rules.
+#[test]
+fn an_upstream_whose_second_destination_has_no_rule_still_applies() {
+    let config = spanning_upstream_config(
+        &[(SPAN_A_HOST, 8080), (SPAN_B_HOST, 8080)],
+        vec![rule("alpha", "client-a", SPAN_A_HOST, 1111, &["*"])],
+    );
+    let prepared = prepare_gateway_config_for_mesh(config, &alpha_subscriber_runtime())
+        .expect("a destination with no rule cannot disagree with one that has a rule");
+
+    let proxy = prepared
+        .proxies
+        .iter()
+        .find(|p| p.id == "mixed-p")
+        .expect("operator proxy survives mesh preparation");
+    assert_eq!(proxy.backend_connect_timeout_ms, 1111);
 }
 
 // ── EgressGateway: a SYNTHESIZED upstream carries the owner's policy ─────
