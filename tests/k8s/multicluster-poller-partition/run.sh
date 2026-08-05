@@ -76,6 +76,7 @@ cleanup() {
 trap cleanup EXIT
 
 preflight() {
+  python3 ./tests/k8s/multicluster-poller-partition/verify_signal_reload_guard.py
   for command in docker kind kubectl curl python3 openssl sed; do need "$command"; done
   docker info >/dev/null
   [[ "${FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE:-}" == true ]] || {
@@ -666,16 +667,29 @@ signal_reload() {
   wait_for_projected_withdrawal "projected withdrawn mesh config" 30 "$context"
   # The readiness probe also runs `ferrum-edge health` in this shared process
   # namespace. `pidof ferrum-edge` can therefore return both the daemon and a
-  # transient probe process. Select exactly one executable whose subcommand is
-  # `run`, and discover + signal it in one exec to minimize the PID lifetime gap.
+  # transient probe process. `/proc/<pid>/exe` is ptrace-gated across UIDs, so
+  # the signal sidecar cannot rely on it to identify ferrum-edge (UID 1337).
+  # Parse readable `/proc/<pid>/cmdline` instead: require argv[0] basename
+  # `ferrum-edge` and argv[1] `run`, compare only as data, and discover +
+  # signal exactly one candidate in one exec to minimize the PID lifetime gap.
   kubectl --context "$context" -n "$NS" exec "pod/$pod" -c signal -- sh -eu -c '
     found=""
     for process_dir in /proc/[0-9]*; do
       [ -r "$process_dir/cmdline" ] || continue
-      executable="$(readlink "$process_dir/exe" 2>/dev/null || true)"
-      [ "${executable##*/}" = "ferrum-edge" ] || continue
-      subcommand="$(tr "\000" "\n" < "$process_dir/cmdline" | sed -n "2p")"
-      [ "$subcommand" = "run" ] || continue
+      [ -s "$process_dir/cmdline" ] || continue
+      argv0=""
+      argv1=""
+      pos=0
+      while IFS= read -r -d "" arg || [ -n "$arg" ]; do
+        case "$pos" in
+          0) argv0="$arg" ;;
+          1) argv1="$arg"; break ;;
+        esac
+        pos=$((pos + 1))
+      done < "$process_dir/cmdline"
+      [ -n "$argv0" ] || continue
+      [ "${argv0##*/}" = "ferrum-edge" ] || continue
+      [ "$argv1" = "run" ] || continue
       candidate="${process_dir##*/}"
       if [ -n "$found" ]; then
         echo "multiple ferrum-edge run processes found: $found $candidate" >&2
