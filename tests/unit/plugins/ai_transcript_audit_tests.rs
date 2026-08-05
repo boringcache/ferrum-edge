@@ -10755,7 +10755,8 @@ async fn grpc_backend_effective_method_refutes_enrolled_client_path() {
         "a refuted backend-effective method must discard the provisional candidate"
     );
     assert!(
-        !ctx.metadata.contains_key("ai_transcript_audit.request_hash"),
+        !ctx.metadata
+            .contains_key("ai_transcript_audit.request_hash"),
         "no request hash may survive a refuted enrollment"
     );
 

@@ -120,8 +120,8 @@ fn shared_validation_rejects_unknown_grpc_keys_and_empty_methods() {
 /// their existing fast paths.
 #[test]
 fn grpc_request_body_buffer_gate_is_conservative_before_routing() {
-    use ferrum_edge::HttpFlavor;
     use ferrum_edge::_test_support::set_request_http_flavor_for_test;
+    use ferrum_edge::HttpFlavor;
     use ferrum_edge::plugins::RequestContext;
 
     let grpc_ctx = |path: &str| {

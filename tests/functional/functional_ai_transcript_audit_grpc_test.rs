@@ -288,7 +288,9 @@ async fn spawn_audit_gateway_with_bind_race_retry(
             Err(error) => {
                 let diagnostic = error.to_string();
                 if !gateway_startup_failure_is_bind_race(&diagnostic) {
-                    return Err(format!("gateway startup failed (non-retryable): {diagnostic}").into());
+                    return Err(
+                        format!("gateway startup failed (non-retryable): {diagnostic}").into(),
+                    );
                 }
                 last_bind_race = diagnostic;
                 eprintln!(
