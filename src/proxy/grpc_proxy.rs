@@ -1129,7 +1129,8 @@ impl GrpcPoolManager {
                         pool_config.enable_http_keep_alive,
                         pool_config.tcp_keepalive_seconds,
                     );
-                    self.create_h2c_connection(tcp, pool_config, conn_slot).await
+                    self.create_h2c_connection(tcp, pool_config, conn_slot)
+                        .await
                 }
             })
             .await

@@ -592,7 +592,10 @@ fn removing_the_destination_rule_lifts_the_pooled_cap() {
         .find(|p| p.id == "ws-maxconn")
         .expect("proxy present")
         .clone();
-    assert_eq!(resolve_backend_max_connections(&capped_proxy, 8080), Some(1));
+    assert_eq!(
+        resolve_backend_max_connections(&capped_proxy, 8080),
+        Some(1)
+    );
 
     let uncapped = prepared_config_without_destination_rule();
     let uncapped_proxy = uncapped

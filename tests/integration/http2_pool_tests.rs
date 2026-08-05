@@ -428,7 +428,10 @@ async fn test_http2_pool_backend_timeout() {
             );
         }
         Http2PoolError::MaxConnectionsExceeded { message: msg } => {
-            panic!("Expected BackendTimeout, got MaxConnectionsExceeded: {}", msg);
+            panic!(
+                "Expected BackendTimeout, got MaxConnectionsExceeded: {}",
+                msg
+            );
         }
     }
 }

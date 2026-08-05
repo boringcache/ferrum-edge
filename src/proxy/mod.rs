@@ -33455,9 +33455,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 return retry::BackendResponse {
                     status_code: 503,
                     body: ResponseBody::buffered(
-                        r#"{"error":"Backend connection limit exceeded"}"#
-                            .as_bytes()
-                            .to_vec(),
+                        r#"{"error":"Backend connection limit exceeded"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
                     connection_error: false,
@@ -35859,9 +35857,7 @@ async fn proxy_to_backend(
                     retry::BackendResponse {
                         status_code: 503,
                         body: ResponseBody::buffered(
-                            r#"{"error":"Backend connection limit exceeded"}"#
-                                .as_bytes()
-                                .to_vec(),
+                            r#"{"error":"Backend connection limit exceeded"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
                         connection_error: false,
