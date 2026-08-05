@@ -1936,7 +1936,8 @@ it from the durable record and the live pinned claim rather than from process
 memory. Releasing the credit is closing a descriptor, so a crash, panic, abort,
 or dropped claim frees it immediately with no lease horizon and no leaked
 capacity; a full prepare reconciles a crashed holder's stale record and fails
-closed on a symlinked, non-regular, or hard-linked one. Without this reservation
+closed on a symlinked or non-regular path, and on a hard-linked path on Unix
+(Windows pins a no-delete handle while live). Without this reservation
 a source larger than roughly half `spool.max_bytes` could never complete a
 handoff and permanently head-of-line-blocked its namespace's replay. See
 [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) →

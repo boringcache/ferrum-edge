@@ -6289,7 +6289,7 @@ impl PinnedClaimArtifact {
     }
 
     /// Re-stat the still-open authoritative descriptor and return its current
-    /// length only while it remains a single-link regular file.
+    /// length only while it remains a regular file (and single-link on Unix).
     ///
     /// A source-credit reservation is sized from the descriptor at claim time,
     /// but a same-UID peer can retain another writable descriptor and truncate
@@ -7044,9 +7044,10 @@ impl SpoolManager {
     /// capacity is outstanding to an operator, so clear them. A live peer still
     /// holding the credit reports `WouldBlock` and is left completely untouched.
     ///
-    /// Fail-closed: a symlinked, non-regular, or hard-linked reservation path is
-    /// a substitution of shared coordination state and refuses prepare, exactly
-    /// as the namespace coordination inode does.
+    /// Fail-closed: a symlinked or non-regular reservation path, or a hard-linked
+    /// one on Unix, is a substitution of shared coordination state and refuses
+    /// prepare, exactly as the namespace coordination inode does. Windows pins
+    /// a no-delete handle while a credit is live.
     fn reconcile_source_credit_record_locked(&self) -> Result<(), String> {
         let path = self.source_credit_path();
         self.assert_managed_path(&path)?;
@@ -10838,8 +10839,8 @@ fn open_spool_source_credit_file(path: &Path) -> Result<File, String> {
 }
 
 /// Prove the credit record is a private regular file this namespace owns, that
-/// the pathname and the descriptor name the same node, and that no extra hard
-/// link exists on either view.
+/// the pathname and the descriptor name the same node, and, on Unix, that no
+/// extra hard link exists on either view.
 fn validate_spool_source_credit_file(
     path: &Path,
     file: &File,

@@ -848,11 +848,12 @@ free. Its properties are the contract:
   source above `spool.max_bytes` receives no credit.
 - **Spent only while it is witnessed.** Every admission that uses the credit
   re-reads the durable record through the locked descriptor and re-proves that
-  the credit pathname still names that descriptor, it has no extra hard link,
-  it still names this claim, the reserved length still equals both the original
-  and current pinned-artifact length, and the claim pathname still resolves to
-  that artifact. Anything else yields no credit; the handoff still runs, just
-  under the plain ceiling.
+  the credit pathname still names that descriptor, it has no extra hard link on
+  Unix (Windows keeps the live record on a no-delete handle), it still names this
+  claim, the reserved length still equals both the original and current
+  pinned-artifact length, and the claim pathname still resolves to that artifact.
+  Anything else yields no credit; the handoff still runs, just under the plain
+  ceiling.
 - **Never a credit for ordinary writes.** `write_events` admission is unchanged.
 
 **Peak on-disk bytes.** Owned encoded bytes are bounded by:
@@ -882,10 +883,11 @@ that body grants nothing to anyone, because only the lock holder reads it and
 the next holder truncates and rewrites it before spending. A full prepare
 (startup or storage re-prepare) reconciles the stale body so the durable state an
 operator inspects matches reality, and leaves a live peer's record untouched. A
-symlinked, non-regular, or hard-linked `.spool-dead-letter-credit` path is a
-substitution of shared coordination state and refuses prepare
+symlinked or non-regular `.spool-dead-letter-credit` path, or a hard-linked one
+on Unix, is a substitution of shared coordination state and refuses prepare
 (`spool.available=false`), exactly as the `.spool-quota.lock` inode does. The
-record is not billing data and is excluded from quota and status counts.
+Windows path is pinned with a no-delete handle while a credit is live. The record
+is not billing data and is excluded from quota and status counts.
 
 **Operator implications.** Size `spool.max_bytes` with headroom for one
 source-sized excursion if your filesystem has a hard capacity limit you cannot
