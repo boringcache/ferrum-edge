@@ -1926,8 +1926,10 @@ transient peak <= spool.max_bytes + reserved_source_bytes   (<= 2 x spool.max_by
 The credit is held under an exclusive OS advisory lock on a
 `.spool-dead-letter-credit` record in the namespace root, so a second manager
 instance, plugin generation, or Ferrum process sharing the namespace cannot
-obtain a second one — it admits against the plain ceiling and fails closed
-instead of double-spending capacity the first handoff already promised. **The
+obtain a second one — every spend also re-proves the locked record pathname and
+the source descriptor's current length. Invalidated credit admits against the
+plain ceiling and fails closed instead of double-spending capacity the first
+handoff already promised. **The
 bound therefore does not grow with the number of concurrent handoffs.** Ordinary
 spool writes never carry a credit, and each admission that spends one re-proves
 it from the durable record and the live pinned claim rather than from process

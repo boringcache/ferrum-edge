@@ -3729,6 +3729,113 @@ fn tampered_dead_letter_source_credit_record_grants_no_capacity() {
     assert!(stats.bytes <= max_bytes, "{stats:?}");
 }
 
+/// Holding the old inode's advisory lock is insufficient after its pathname is
+/// replaced: another manager could lock the replacement as a second credit
+/// domain. Every spend must therefore prove the pathname still names the
+/// descriptor that carries this claim's lock.
+#[cfg(unix)]
+#[test]
+fn replaced_dead_letter_source_credit_path_grants_no_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-replaced-credit", 4096);
+    let source_bytes = row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source =
+        plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FE3", &row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("the planted source must be claimable");
+    assert!(claim.holds_source_credit_for_tests());
+
+    let credit_path = spool.source_credit_record_path_for_tests();
+    fs::remove_file(&credit_path).unwrap();
+    fs::write(&credit_path, b"replacement credit domain").unwrap();
+
+    let error = publish_dead_letter_payload_for_claim_for_tests(&spool, &claim, &row)
+        .expect_err("a replaced credit pathname must invalidate the old locked descriptor");
+    assert!(
+        error.contains("cannot fit within spool.max_bytes"),
+        "unexpected quota diagnostic: {error}"
+    );
+    assert!(claim.claim_path_for_tests().exists());
+    assert!(!dead_letter_payload_path(&source).exists());
+    assert!(spool.scan_stats_for_tests().unwrap().bytes <= max_bytes);
+}
+
+/// The credit is the number of bytes terminal source removal will actually
+/// free. If a same-UID writer changes the pinned inode's length after claim
+/// time, the stale original length must grant no capacity.
+#[test]
+fn resized_pinned_source_invalidates_dead_letter_credit() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_row = padded_dead_letter_row("dl-resized-source", 4096);
+    let source_bytes = source_row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(
+        &spool,
+        "01ARZ3NDEKTSV4RRFFQ69G5FE4",
+        &source_row,
+    );
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("the planted source must be claimable");
+    assert!(claim.holds_source_credit_for_tests());
+
+    fs::OpenOptions::new()
+        .write(true)
+        .open(claim.claim_path_for_tests())
+        .unwrap()
+        .set_len(1024)
+        .unwrap();
+    let expanded_rejection = padded_dead_letter_row("dl-resized-rejection", 7000);
+    let error = publish_dead_letter_payload_for_claim_for_tests(
+        &spool,
+        &claim,
+        &expanded_rejection,
+    )
+    .expect_err("a stale source length must not raise the admission ceiling");
+
+    assert!(
+        error.contains("exceeds spool.max_bytes"),
+        "unexpected quota diagnostic: {error}"
+    );
+    assert!(claim.claim_path_for_tests().exists());
+    assert!(!dead_letter_payload_path(&source).exists());
+    assert!(spool.scan_stats_for_tests().unwrap().bytes <= max_bytes);
+}
+
+/// An owner-shaped artifact planted above the configured quota was never
+/// admitted by this sink and cannot enlarge the documented two-times bound.
+#[test]
+fn source_larger_than_spool_quota_receives_no_dead_letter_credit() {
+    let temp = tempfile::tempdir().unwrap();
+    let max_bytes = 4096;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let oversized = padded_dead_letter_row("dl-over-quota-source", 8192);
+    let source = plant_owned_spool_source(
+        &spool,
+        "01ARZ3NDEKTSV4RRFFQ69G5FE5",
+        &oversized,
+    );
+
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("the planted source must remain operator-recoverable");
+
+    assert!(
+        !claim.holds_source_credit_for_tests(),
+        "an over-quota source must not manufacture a larger transient ceiling"
+    );
+    assert_eq!(claim.source_credit_bytes_for_tests(), 0);
+}
+
 /// N managers sharing one namespace cannot jointly spend source-replacement
 /// capacity: exactly one claim holds the namespace-wide credit, and the others
 /// admit against the plain ceiling and fail closed.

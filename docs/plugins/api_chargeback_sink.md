@@ -844,13 +844,15 @@ free. Its properties are the contract:
   handoff already promised.
 - **Taken at claim time, sized from the pinned descriptor.** The reserved byte
   count is the length of the exact authoritative artifact the claim pinned, not
-  whatever the pathname currently names.
+  whatever the pathname currently names. A planted or externally enlarged
+  source above `spool.max_bytes` receives no credit.
 - **Spent only while it is witnessed.** Every admission that uses the credit
   re-reads the durable record through the locked descriptor and re-proves that
-  it still names this claim, that the reserved length still equals the pinned
-  artifact's length, and that the claim pathname still resolves to that
-  artifact. Anything else yields no credit; the handoff still runs, just under
-  the plain ceiling.
+  the credit pathname still names that descriptor, it has no extra hard link,
+  it still names this claim, the reserved length still equals both the original
+  and current pinned-artifact length, and the claim pathname still resolves to
+  that artifact. Anything else yields no credit; the handoff still runs, just
+  under the plain ceiling.
 - **Never a credit for ordinary writes.** `write_events` admission is unchanged.
 
 **Peak on-disk bytes.** Owned encoded bytes are bounded by:
@@ -860,10 +862,11 @@ steady state   <= spool.max_bytes
 transient peak <= spool.max_bytes + reserved_source_bytes
 ```
 
-`reserved_source_bytes` is the length of the one credited source, which can
-never exceed `spool.max_bytes` (a batch larger than the quota is refused at
-write admission), so the absolute worst case is `2 × spool.max_bytes` and the
-realistic case is `spool.max_bytes + your largest spool artifact`. Because at
+`reserved_source_bytes` is the length of the one credited source and is
+explicitly refused when it exceeds `spool.max_bytes` (ordinary sink-written
+batches already obey the same quota), so the absolute worst case is
+`2 × spool.max_bytes` and the realistic case is `spool.max_bytes + your largest
+spool artifact`. Because at
 most one credit exists per namespace at any instant, **this bound does not grow
 with the number of concurrent handoffs, managers, generations, or processes.**
 The excursion lasts only from the first rejected-row append until the

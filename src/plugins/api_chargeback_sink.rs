@@ -6288,6 +6288,34 @@ impl PinnedClaimArtifact {
         self.pinned.as_ref().map(|(_, identity)| identity.len)
     }
 
+    /// Re-stat the still-open authoritative descriptor and return its current
+    /// length only while it remains a single-link regular file.
+    ///
+    /// A source-credit reservation is sized from the descriptor at claim time,
+    /// but a same-UID peer can retain another writable descriptor and truncate
+    /// or extend that inode later. Spending the old size after such a mutation
+    /// could credit bytes the terminal unlink will not actually free, so every
+    /// spend compares the reservation with this live descriptor view.
+    fn current_pinned_len(&self) -> Result<Option<u64>, String> {
+        let Some((file, _)) = self.pinned.as_ref() else {
+            return Ok(None);
+        };
+        let metadata = file.metadata().map_err(|error| {
+            format!("{PLUGIN_NAME}: failed to stat the pinned spool claim descriptor: {error}")
+        })?;
+        if !metadata.file_type().is_file() {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                return Ok(None);
+            }
+        }
+        Ok(Some(metadata.len()))
+    }
+
     /// Prove one `lstat` of the claim pathname names this exact pinned artifact.
     ///
     /// The descriptor is re-`fstat`ed too, and a hard link planted at either end
@@ -6868,7 +6896,11 @@ impl SpoolManager {
         artifact: &PinnedClaimArtifact,
     ) -> Option<SpoolSourceCreditReservation> {
         let reserved_bytes = artifact.pinned_len()?;
-        if reserved_bytes == 0 {
+        // Only artifacts admitted by this namespace's configured quota may
+        // raise that quota. A planted or externally enlarged owned-looking file
+        // must not manufacture an excursion larger than the documented 2x
+        // bound.
+        if reserved_bytes == 0 || reserved_bytes > self.cfg.max_bytes {
             return None;
         }
         let claim_base = claim_path
@@ -6929,6 +6961,14 @@ impl SpoolManager {
         let Some(reservation) = authority.reservation else {
             return 0;
         };
+        // The lock is held on a descriptor, but Unix permits a same-UID peer to
+        // unlink and replace its pathname. Re-prove on every spend that this
+        // descriptor is still the namespace's one coordination inode; otherwise
+        // a replacement path could establish a second independently locked
+        // credit domain.
+        if validate_spool_source_credit_file(&reservation.path, &reservation.file).is_err() {
+            return 0;
+        }
         let Some(base) = claim_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -6944,7 +6984,13 @@ impl SpoolManager {
         let Some(pinned_len) = authority.artifact.pinned_len() else {
             return 0;
         };
-        if pinned_len != reservation.reserved_bytes {
+        let Ok(Some(current_pinned_len)) = authority.artifact.current_pinned_len() else {
+            return 0;
+        };
+        if pinned_len != reservation.reserved_bytes
+            || current_pinned_len != reservation.reserved_bytes
+            || reservation.reserved_bytes > self.cfg.max_bytes
+        {
             return 0;
         }
         if !matches!(
