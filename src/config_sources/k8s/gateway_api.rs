@@ -11704,10 +11704,7 @@ mod tests {
             err.to_string().contains("sessionPersistence.sessionName"),
             "got: {err}"
         );
-        assert!(
-            err.to_string().contains("cookie name"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("cookie name"), "got: {err}");
 
         let status = super::backend_lb_policy_status(&policy);
         let condition = &status["ancestors"][0]["conditions"][0];
@@ -11745,10 +11742,7 @@ mod tests {
             err.to_string().contains("sessionPersistence.sessionName"),
             "got: {err}"
         );
-        assert!(
-            err.to_string().contains("header name"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("header name"), "got: {err}");
 
         let status = super::backend_lb_policy_status(&policy);
         let condition = &status["ancestors"][0]["conditions"][0];
@@ -11790,21 +11784,17 @@ mod tests {
                 }
             }),
         );
-        let cookie = translate_k8s_objects(
-            &[cookie_policy, http_route_to_service("api")],
-            options(),
-        )
-        .expect("valid cookie sessionName should translate");
+        let cookie =
+            translate_k8s_objects(&[cookie_policy, http_route_to_service("api")], options())
+                .expect("valid cookie sessionName should translate");
         assert_eq!(
             cookie.config.upstreams[0].hash_on.as_deref(),
             Some("cookie:lb-affinity")
         );
 
-        let header = translate_k8s_objects(
-            &[header_policy, http_route_to_service("api")],
-            options(),
-        )
-        .expect("valid header sessionName should translate");
+        let header =
+            translate_k8s_objects(&[header_policy, http_route_to_service("api")], options())
+                .expect("valid header sessionName should translate");
         assert_eq!(
             header.config.upstreams[0].hash_on.as_deref(),
             Some("header:X-Session-Affinity")
