@@ -212,8 +212,8 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
         namespaced: true,
     },
     // Successor to BackendLBPolicy on the pinned v1.5.1 experimental channel
-    // (gateway.networking.x-k8s.io). Session persistence is translated; retry
-    // budgets are warned as unsupported.
+    // (gateway.networking.x-k8s.io). Representable cookie session persistence
+    // is translated; unsupported retry budgets reject the whole policy.
     CrdSpec {
         group: "gateway.networking.x-k8s.io",
         version: "v1alpha1",

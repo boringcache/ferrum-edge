@@ -113,7 +113,15 @@ fn backend_lb_policy_cookie_affinity_selects_stable_target_on_lb_path() {
     assert_eq!(result.config.upstreams.len(), 1);
     let upstream = &result.config.upstreams[0];
     assert_eq!(upstream.algorithm, LoadBalancerAlgorithm::ConsistentHashing);
-    assert_eq!(upstream.hash_on.as_deref(), Some("cookie:lb-affinity"));
+    let cookie_name = upstream
+        .hash_on
+        .as_deref()
+        .and_then(|value| value.strip_prefix("cookie:"))
+        .expect("cookie hash strategy");
+    assert!(
+        cookie_name.starts_with("lb-affinity-fe-"),
+        "cookie must be scoped to the route rule: {cookie_name}"
+    );
     assert!(
         upstream
             .hash_on_cookie_config
@@ -130,7 +138,7 @@ fn backend_lb_policy_cookie_affinity_selects_stable_target_on_lb_path() {
     let cache = LoadBalancerCache::new(&result.config);
     assert_eq!(
         cache.get_hash_on_strategy(&upstream.namespace, &upstream.id),
-        HashOnStrategy::Cookie("lb-affinity".to_string())
+        HashOnStrategy::Cookie(cookie_name.to_string())
     );
 
     // `get_balancer` lives on the inner snapshot, so reach it through the

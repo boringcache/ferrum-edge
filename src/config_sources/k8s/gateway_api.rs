@@ -232,14 +232,39 @@ pub(super) fn collect_backend_lb_policy(
             "spec.targetRefs is required and must be a non-empty array",
         ));
     }
+    if target_refs.len() > 16 {
+        return Err(invalid_resource(
+            object,
+            "spec.targetRefs must contain at most 16 entries",
+        ));
+    }
 
-    let mut service_targets = Vec::new();
+    let mut service_targets = BTreeSet::new();
     for (index, target) in target_refs.iter().enumerate() {
+        if !target.is_object() {
+            return Err(invalid_resource(
+                object,
+                format!("spec.targetRefs[{index}] must be an object"),
+            ));
+        }
+        for field in ["group", "kind", "name"] {
+            if target.get(field).is_some_and(|value| !value.is_string()) {
+                return Err(invalid_resource(
+                    object,
+                    format!("spec.targetRefs[{index}].{field} must be a string"),
+                ));
+            }
+        }
         let kind = string_field(target, "kind").unwrap_or("Service");
         let group = string_field(target, "group").unwrap_or("");
-        let name = string_field(target, "name").ok_or_else(|| {
-            invalid_resource(object, format!("spec.targetRefs[{index}].name is required"))
-        })?;
+        let name = string_field(target, "name")
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    format!("spec.targetRefs[{index}].name is required and must not be empty"),
+                )
+            })?;
         if kind != "Service" || !group.is_empty() {
             return Err(invalid_resource(
                 object,
@@ -249,7 +274,12 @@ pub(super) fn collect_backend_lb_policy(
                 ),
             ));
         }
-        service_targets.push(name.to_string());
+        if !service_targets.insert(name.to_string()) {
+            return Err(invalid_resource(
+                object,
+                format!("spec.targetRefs[{index}] duplicates Service {name}"),
+            ));
+        }
     }
 
     if object.spec.get("retryConstraint").is_some() {
@@ -264,28 +294,11 @@ pub(super) fn collect_backend_lb_policy(
         ));
     }
 
-    let session = match object.spec.get("sessionPersistence") {
-        None => None,
-        Some(value) => {
-            let parsed = parse_session_persistence(object, value)?;
-            if string_field(value, "type").unwrap_or("Cookie") == "Cookie"
-                && value
-                    .get("cookieConfig")
-                    .and_then(|cfg| string_field(cfg, "lifetimeType"))
-                    .unwrap_or("Session")
-                    == "Session"
-                && string_field(value, "absoluteTimeout").is_some()
-            {
-                acc.warnings.push(format!(
-                    "{} {}/{} sessionPersistence.absoluteTimeout on Session \
-                     cookies is not gateway-enforced; emitting a browser \
-                     session cookie without Max-Age",
-                    object.kind, object.metadata.namespace, object.metadata.name
-                ));
-            }
-            Some(parsed)
-        }
-    };
+    let session = object
+        .spec
+        .get("sessionPersistence")
+        .map(|value| parse_session_persistence(object, value))
+        .transpose()?;
 
     let resource = K8sResourceKey::from_object(object);
     let record = GatewayBackendSessionPolicy {
@@ -355,17 +368,11 @@ fn backend_policy_is_preferred(
         (Some(c), Some(e)) => match c.cmp(&e) {
             Ordering::Less => true,
             Ordering::Greater => false,
-            Ordering::Equal => {
-                (&candidate.resource.namespace, &candidate.resource.name)
-                    < (&existing.resource.namespace, &existing.resource.name)
-            }
+            Ordering::Equal => candidate.resource.cmp(&existing.resource).is_lt(),
         },
         (Some(_), None) => true,
         (None, Some(_)) => false,
-        (None, None) => {
-            (&candidate.resource.namespace, &candidate.resource.name)
-                < (&existing.resource.namespace, &existing.resource.name)
-        }
+        (None, None) => candidate.resource.cmp(&existing.resource).is_lt(),
     }
 }
 
@@ -406,6 +413,37 @@ fn parse_session_persistence(
     object: &K8sObject,
     value: &Value,
 ) -> Result<GatewaySessionPersistence, K8sTranslateError> {
+    if !value.is_object() {
+        return Err(invalid_resource(
+            object,
+            "sessionPersistence must be an object",
+        ));
+    }
+    for field in ["sessionName", "type", "absoluteTimeout"] {
+        if value.get(field).is_some_and(|field| !field.is_string()) {
+            return Err(invalid_resource(
+                object,
+                format!("sessionPersistence.{field} must be a string"),
+            ));
+        }
+    }
+    if let Some(cookie_config) = value.get("cookieConfig") {
+        if !cookie_config.is_object() {
+            return Err(invalid_resource(
+                object,
+                "sessionPersistence.cookieConfig must be an object",
+            ));
+        }
+        if cookie_config
+            .get("lifetimeType")
+            .is_some_and(|field| !field.is_string())
+        {
+            return Err(invalid_resource(
+                object,
+                "sessionPersistence.cookieConfig.lifetimeType must be a string",
+            ));
+        }
+    }
     if value.get("idleTimeout").is_some() {
         return Err(invalid_resource(
             object,
@@ -446,7 +484,15 @@ fn parse_session_persistence(
             };
             match lifetime {
                 "Session" => {
-                    let _ = absolute_timeout;
+                    if absolute_timeout.is_some() {
+                        return Err(invalid_resource(
+                            object,
+                            "sessionPersistence.absoluteTimeout with \
+                             cookieConfig.lifetimeType Session is not supported; \
+                             Ferrum cannot enforce an absolute lifetime for a \
+                             browser session cookie",
+                        ));
+                    }
                 }
                 "Permanent" => {
                     let Some(raw) = absolute_timeout else {
@@ -497,10 +543,12 @@ fn parse_session_persistence(
                     "sessionPersistence.absoluteTimeout is only supported with type Cookie",
                 ));
             }
-            Ok(GatewaySessionPersistence {
-                hash_on: format!("header:{session_name}"),
-                cookie_config: None,
-            })
+            Err(invalid_resource(
+                object,
+                "sessionPersistence.type Header is not supported; Ferrum does \
+                 not synthesize a response session token and cannot provide \
+                 Gateway API header session-persistence semantics",
+            ))
         }
         _ => Err(invalid_resource(
             object,
@@ -514,6 +562,12 @@ fn parse_gateway_api_duration_secs(
     raw: &str,
     field: &str,
 ) -> Result<u64, K8sTranslateError> {
+    if !is_gateway_api_duration(raw) {
+        return Err(invalid_resource(
+            object,
+            format!("sessionPersistence.{field} '{raw}' is not a valid Gateway API duration"),
+        ));
+    }
     let ms = parse_istio_duration_ms(raw).ok_or_else(|| {
         invalid_resource(
             object,
@@ -540,30 +594,52 @@ fn parse_gateway_api_duration_secs(
     Ok(secs)
 }
 
+/// Gateway API Duration is one to four integer+unit groups, each integer at
+/// most five digits, with units h/m/s/ms. This intentionally rejects the wider
+/// duration grammar accepted by the Istio parser (for example decimals).
+fn is_gateway_api_duration(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut offset = 0;
+    let mut groups = 0;
+    while offset < bytes.len() && groups < 4 {
+        let digits_start = offset;
+        while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+            offset += 1;
+        }
+        let digits = offset - digits_start;
+        if !(1..=5).contains(&digits) {
+            return false;
+        }
+        if bytes
+            .get(offset..)
+            .is_some_and(|remainder| remainder.starts_with(b"ms"))
+        {
+            offset += 2;
+        } else if bytes
+            .get(offset)
+            .is_some_and(|unit| matches!(*unit, b'h' | b'm' | b's'))
+        {
+            offset += 1;
+        } else {
+            return false;
+        }
+        groups += 1;
+    }
+    offset == bytes.len() && groups > 0
+}
+
 fn resolve_rule_session_persistence(
     object: &K8sObject,
     rule: &Value,
+    rule_index: usize,
     backends: &[RouteBackend],
     acc: &mut K8sAccumulator,
 ) -> Result<Option<GatewaySessionPersistence>, K8sTranslateError> {
     if let Some(value) = rule.get("sessionPersistence") {
         let parsed = parse_session_persistence(object, value)?;
-        if let Some(raw) = string_field(value, "absoluteTimeout")
-            && string_field(value, "type").unwrap_or("Cookie") == "Cookie"
-            && value
-                .get("cookieConfig")
-                .and_then(|cfg| string_field(cfg, "lifetimeType"))
-                .unwrap_or("Session")
-                == "Session"
-        {
-            acc.warnings.push(format!(
-                "{} {}/{} sessionPersistence.absoluteTimeout={raw} on Session \
-                 cookies is not gateway-enforced; emitting a browser session \
-                 cookie without Max-Age",
-                object.kind, object.metadata.namespace, object.metadata.name
-            ));
-        }
-        return Ok(Some(parsed));
+        return Ok(Some(scope_cookie_session_to_route(
+            object, rule_index, parsed,
+        )));
     }
 
     let mut service_keys = BTreeSet::new();
@@ -616,7 +692,45 @@ fn resolve_rule_session_persistence(
             }
         }
     }
-    Ok(resolved.map(|(_, session)| session))
+    Ok(resolved
+        .map(|(_, session)| scope_cookie_session_to_route(object, rule_index, session)))
+}
+
+/// A Service-attached policy applies independently to each route rule. Scope
+/// the browser-visible cookie name to the exact route rule so two rules (or two
+/// routes) cannot accidentally consume the same persistent session. Gateway
+/// API marks `sessionName` implementation-specific and permits it to be
+/// reflected rather than requiring an exact wire name.
+fn scope_cookie_session_to_route(
+    object: &K8sObject,
+    rule_index: usize,
+    mut session: GatewaySessionPersistence,
+) -> GatewaySessionPersistence {
+    let Some(session_name) = session
+        .hash_on
+        .strip_prefix("cookie:")
+        .map(str::to_owned)
+    else {
+        return session;
+    };
+    let identity = format!(
+        "{}|{}|{}|{}|{}",
+        object.api_version,
+        object.kind,
+        object.metadata.namespace,
+        object.metadata.name,
+        rule_index
+    );
+    let digest = hex::encode(crate::fips::approved::Sha256::digest(identity.as_bytes()));
+    const ROUTE_SUFFIX_LEN: usize = 16;
+    const ROUTE_MARKER: &str = "-fe-";
+    let max_base_len = 128 - ROUTE_MARKER.len() - ROUTE_SUFFIX_LEN;
+    let base = &session_name[..session_name.len().min(max_base_len)];
+    session.hash_on = format!(
+        "cookie:{base}{ROUTE_MARKER}{}",
+        &digest[..ROUTE_SUFFIX_LEN]
+    );
+    session
 }
 
 /// Build `status.ancestors` for BackendLBPolicy / XBackendTrafficPolicy.
@@ -695,15 +809,36 @@ fn validate_backend_lb_policy_for_status(object: &K8sObject) -> Result<(), Strin
     if target_refs.is_empty() {
         return Err("spec.targetRefs is required and must be a non-empty array".to_string());
     }
+    if target_refs.len() > 16 {
+        return Err("spec.targetRefs must contain at most 16 entries".to_string());
+    }
+    let mut service_targets = BTreeSet::new();
     for (index, target) in target_refs.iter().enumerate() {
+        if !target.is_object() {
+            return Err(format!("spec.targetRefs[{index}] must be an object"));
+        }
+        for field in ["group", "kind", "name"] {
+            if target.get(field).is_some_and(|value| !value.is_string()) {
+                return Err(format!(
+                    "spec.targetRefs[{index}].{field} must be a string"
+                ));
+            }
+        }
         let kind = string_field(target, "kind").unwrap_or("Service");
         let group = string_field(target, "group").unwrap_or("");
-        if string_field(target, "name").is_none() {
-            return Err(format!("spec.targetRefs[{index}].name is required"));
-        }
+        let Some(name) = string_field(target, "name").filter(|name| !name.is_empty()) else {
+            return Err(format!(
+                "spec.targetRefs[{index}].name is required and must not be empty"
+            ));
+        };
         if kind != "Service" || !group.is_empty() {
             return Err(format!(
                 "spec.targetRefs[{index}] must target core group Service"
+            ));
+        }
+        if !service_targets.insert(name) {
+            return Err(format!(
+                "spec.targetRefs[{index}] duplicates Service {name}"
             ));
         }
     }
@@ -3853,8 +3988,13 @@ fn http_route_resources(
             let request_transform = gateway_request_header_modifier_rules(rule);
             let redirect = gateway_request_redirect_value(object, rule, default_redirect_port)?;
             let backend_resolution = route_backends(object, rule, acc)?;
-            let session_persistence =
-                resolve_rule_session_persistence(object, rule, &backend_resolution.backends, acc)?;
+            let session_persistence = resolve_rule_session_persistence(
+                object,
+                rule,
+                rule_index,
+                &backend_resolution.backends,
+                acc,
+            )?;
             let backend_ref_fault = backend_resolution.fault_reason.map(|reason| {
                 backend_ref_fault_value_with_percentage(
                     reason,
@@ -11505,7 +11645,14 @@ mod tests {
             upstream.algorithm,
             crate::config::types::LoadBalancerAlgorithm::ConsistentHashing
         );
-        assert_eq!(upstream.hash_on.as_deref(), Some("cookie:lb-affinity"));
+        assert!(
+            upstream
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:lb-affinity-fe-")),
+            "cookie name must be scoped to the route rule: {:?}",
+            upstream.hash_on
+        );
         let cookie = upstream
             .hash_on_cookie_config
             .as_ref()
@@ -11547,6 +11694,100 @@ mod tests {
     }
 
     #[test]
+    fn session_cookie_absolute_timeout_fails_closed() {
+        let policy = x_backend_traffic_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "bounded-session",
+                    "type": "Cookie",
+                    "absoluteTimeout": "2h",
+                    "cookieConfig": {"lifetimeType": "Session"}
+                }
+            }),
+        );
+        let err = translate_k8s_objects(
+            &[policy.clone(), http_route_to_service("api")],
+            options(),
+        )
+        .expect_err("an unenforced absolute session lifetime must fail closed");
+        assert!(
+            err.to_string().contains("cannot enforce an absolute lifetime"),
+            "got: {err}"
+        );
+
+        let status = super::backend_lb_policy_status(&policy);
+        assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
+    }
+
+    #[test]
+    fn gateway_api_duration_parser_rejects_wider_istio_grammar() {
+        assert!(is_gateway_api_duration("1h2m3s4ms"));
+        assert!(is_gateway_api_duration("0s"));
+        assert!(!is_gateway_api_duration("1.5s"));
+        assert!(!is_gateway_api_duration("123456s"));
+        assert!(!is_gateway_api_duration("1s2s3s4s5s"));
+        assert!(!is_gateway_api_duration(""));
+    }
+
+    #[test]
+    fn malformed_session_persistence_shape_fails_closed() {
+        let policy = x_backend_traffic_policy(
+            "malformed",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": "Cookie"
+            }),
+        );
+        let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
+            .expect_err("a non-object sessionPersistence must fail closed");
+        assert!(err.to_string().contains("must be an object"), "got: {err}");
+        let status = super::backend_lb_policy_status(&policy);
+        assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
+    }
+
+    #[test]
+    fn service_policy_cookie_is_scoped_independently_to_each_route_rule() {
+        let policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "shared-policy-name",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let mut route = http_route_to_service("api");
+        route.spec["rules"] = serde_json::json!([
+            {
+                "matches": [{"path": {"type": "PathPrefix", "value": "/one"}}],
+                "backendRefs": [{"name": "api", "port": 8080}]
+            },
+            {
+                "matches": [{"path": {"type": "PathPrefix", "value": "/two"}}],
+                "backendRefs": [{"name": "api", "port": 8080}]
+            }
+        ]);
+        let result = translate_k8s_objects(&[policy, route], options())
+            .expect("both route rules should receive independent persistence");
+        assert_eq!(result.config.upstreams.len(), 2);
+        let names = result
+            .config
+            .upstreams
+            .iter()
+            .map(|upstream| upstream.hash_on.as_deref().expect("cookie hash key"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), 2, "route rules must not share a cookie name");
+        assert!(
+            names
+                .iter()
+                .all(|name| name.starts_with("cookie:shared-policy-name-fe-"))
+        );
+    }
+
+    #[test]
     fn http_route_rule_session_persistence_overrides_backend_policy() {
         let policy = backend_lb_policy(
             "service-sticky",
@@ -11561,15 +11802,17 @@ mod tests {
         let mut route = http_route_to_service("api");
         route.spec["rules"][0]["sessionPersistence"] = serde_json::json!({
             "sessionName": "from-route",
-            "type": "Header"
+            "type": "Cookie"
         });
         let result = translate_k8s_objects(&[policy, route], options())
             .expect("route-level sessionPersistence should win");
-        assert_eq!(
-            result.config.upstreams[0].hash_on.as_deref(),
-            Some("header:from-route")
+        assert!(
+            result.config.upstreams[0]
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:from-route-fe-"))
         );
-        assert!(result.config.upstreams[0].hash_on_cookie_config.is_none());
+        assert!(result.config.upstreams[0].hash_on_cookie_config.is_some());
     }
 
     #[test]
@@ -11625,6 +11868,78 @@ mod tests {
     }
 
     #[test]
+    fn backend_lb_policy_empty_target_name_fails_closed() {
+        let policy = backend_lb_policy(
+            "empty-target",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": ""}],
+                "sessionPersistence": {"type": "Cookie"}
+            }),
+        );
+        let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
+            .expect_err("an empty target name must fail closed");
+        assert!(err.to_string().contains("must not be empty"), "got: {err}");
+        let status = super::backend_lb_policy_status(&policy);
+        assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
+    }
+
+    #[test]
+    fn backend_lb_policy_target_ref_bound_fails_closed() {
+        let target_refs = (0..17)
+            .map(|index| {
+                serde_json::json!({
+                    "group": "",
+                    "kind": "Service",
+                    "name": format!("api-{index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let policy = backend_lb_policy(
+            "too-many-targets",
+            serde_json::json!({
+                "targetRefs": target_refs,
+                "sessionPersistence": {"type": "Cookie"}
+            }),
+        );
+        let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
+            .expect_err("more than 16 targetRefs must fail closed");
+        assert!(err.to_string().contains("at most 16"), "got: {err}");
+        let status = super::backend_lb_policy_status(&policy);
+        assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
+    }
+
+    #[test]
+    fn same_named_cross_kind_policy_tie_break_is_input_order_independent() {
+        let legacy = backend_lb_policy(
+            "same-name",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "legacy"}
+            }),
+        );
+        let current = x_backend_traffic_policy(
+            "same-name",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "current"}
+            }),
+        );
+        let route = http_route_to_service("api");
+        let forward = translate_k8s_objects(
+            &[legacy.clone(), current.clone(), route.clone()],
+            options(),
+        )
+        .expect("forward policy order");
+        let reverse = translate_k8s_objects(&[current, legacy, route], options())
+            .expect("reverse policy order");
+        assert_eq!(
+            forward.config.upstreams[0].hash_on,
+            reverse.config.upstreams[0].hash_on,
+            "cross-kind policy precedence must not depend on watch order"
+        );
+    }
+
+    #[test]
     fn backend_lb_policy_delete_withdraws_session_persistence() {
         let policy = backend_lb_policy(
             "sticky",
@@ -11639,9 +11954,11 @@ mod tests {
         let route = http_route_to_service("api");
         let with_policy =
             translate_k8s_objects(&[policy, route.clone()], options()).expect("with policy");
-        assert_eq!(
-            with_policy.config.upstreams[0].hash_on.as_deref(),
-            Some("cookie:lb-affinity")
+        assert!(
+            with_policy.config.upstreams[0]
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:lb-affinity-fe-"))
         );
 
         let without_policy = translate_k8s_objects(&[route], options())
@@ -11667,11 +11984,21 @@ mod tests {
         );
         let route = http_route_to_service("api");
         let v1 = translate_k8s_objects(&[policy.clone(), route.clone()], options()).expect("v1");
-        assert_eq!(v1.config.upstreams[0].hash_on.as_deref(), Some("cookie:v1"));
+        assert!(
+            v1.config.upstreams[0]
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:v1-fe-"))
+        );
 
         policy.spec["sessionPersistence"]["sessionName"] = serde_json::json!("v2");
         let v2 = translate_k8s_objects(&[policy, route], options()).expect("v2");
-        assert_eq!(v2.config.upstreams[0].hash_on.as_deref(), Some("cookie:v2"));
+        assert!(
+            v2.config.upstreams[0]
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:v2-fe-"))
+        );
     }
 
     #[test]
@@ -11775,7 +12102,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_lb_policy_accepts_valid_cookie_and_header_session_names() {
+    fn backend_lb_policy_accepts_valid_cookie_and_rejects_header_persistence() {
         let cookie_policy = backend_lb_policy(
             "cookie",
             serde_json::json!({
@@ -11799,18 +12126,24 @@ mod tests {
         let cookie =
             translate_k8s_objects(&[cookie_policy, http_route_to_service("api")], options())
                 .expect("valid cookie sessionName should translate");
-        assert_eq!(
-            cookie.config.upstreams[0].hash_on.as_deref(),
-            Some("cookie:lb-affinity")
+        assert!(
+            cookie.config.upstreams[0]
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:lb-affinity-fe-"))
         );
 
-        let header =
-            translate_k8s_objects(&[header_policy, http_route_to_service("api")], options())
-                .expect("valid header sessionName should translate");
-        assert_eq!(
-            header.config.upstreams[0].hash_on.as_deref(),
-            Some("header:X-Session-Affinity")
+        let err = translate_k8s_objects(
+            &[header_policy.clone(), http_route_to_service("api")],
+            options(),
+        )
+        .expect_err("Header persistence must fail closed until Ferrum emits response tokens");
+        assert!(
+            err.to_string().contains("type Header is not supported"),
+            "got: {err}"
         );
+        let status = super::backend_lb_policy_status(&header_policy);
+        assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
     }
 
     #[test]
@@ -11863,7 +12196,7 @@ mod tests {
                 }
             }),
         );
-        let err = translate_k8s_objects(&[policy.clone()], options())
+        let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
             .expect_err("retryConstraint-only policies must fail closed");
         assert!(err.to_string().contains("retryConstraint"), "got: {err}");
 
