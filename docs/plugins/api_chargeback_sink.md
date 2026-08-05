@@ -529,7 +529,9 @@ Claim disposition:
 - **Unreadable** — the claim is quarantined as `<data-name>.corrupt`.
 - **Descriptor lost / pathname unproven** — the claim remains inert under its
   `.inflight` name, remains counted in owned spool usage, and is reported for
-  operator verification and reconciliation. It is never automatically restored.
+  operator verification and reconciliation. It is never automatically restored,
+  and it authorizes no rejected-payload or rejected-metadata publication: those
+  final renames can replace existing evidence and are destructive mutations too.
 
 In-flight claims count toward `spool.max_bytes` but are **never** eviction
 candidates; when only claimed or foreign-owned files remain, an admission that
@@ -642,8 +644,12 @@ fields are never logged.
   credentials, or charge-record fields. The payload file intentionally contains
   original billing rows and must remain access-controlled. If any payload,
   metadata, quota, or source-removal step fails, the original file remains
-  replayable; while that source remains authoritative, a later attempt removes
-  prior partial metadata/payload siblings under the namespace lock before
+  replayable. The exact pinned claim is revalidated under the namespace lock
+  before opening the handoff, before the payload final rename, before metadata
+  publication, and before source removal. A missing, wrong-type, or substituted
+  claim therefore cannot replace completed evidence merely by colliding with its
+  derived final pathname. While the source remains authoritative, a later attempt
+  removes prior partial metadata/payload siblings under the namespace lock before
   rebuilding them, so recovery does not require quota for two rejected payloads.
   Successfully inserted rows may be retried with their unchanged `event_id`
   idempotency identity.

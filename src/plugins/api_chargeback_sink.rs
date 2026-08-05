@@ -6151,9 +6151,10 @@ fn directory_is_within_canonical_root(canonical_root: &Path, dir: &Path) -> Resu
 /// pathname that merely holds *some* regular file is not the authoritative
 /// artifact this handoff opened, so [`ManagedClaimState::ReplacedRegularFile`]
 /// is kept distinct from [`ManagedClaimState::LiveClaim`]. Missing and
-/// wrong-type claims stay distinct from both so constructive evidence
-/// publication is not gated on the same predicate that protects completed
-/// `.rejected.*` siblings and the terminal claim unlink.
+/// wrong-type claims stay distinct from both so diagnostics can distinguish a
+/// completed handoff from hostile interference. Neither state authorizes a
+/// payload or metadata publication, because the final rename may replace an
+/// existing `.rejected.*` sibling and is therefore destructive too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedClaimState {
     /// The claim pathname still resolves to the exact pinned authoritative
@@ -7279,23 +7280,21 @@ impl SpoolManager {
     /// Classify a managed claim path against the pinned authoritative artifact
     /// before any destructive step.
     ///
-    /// Constructive dead-letter publication (open writer, append, publish
-    /// payload, publish metadata) must keep working when a hostile racer
-    /// replaces the claim; otherwise an attacker suppresses the audit trail by
-    /// planting a file. Destructive cleanup is different for each non-live
-    /// outcome and must not be collapsed:
+    /// Every dead-letter publication can replace a final pathname and is thus a
+    /// destructive mutation, not merely constructive evidence creation.
+    /// Destructive behavior is different for each non-live outcome and must not
+    /// be collapsed:
     /// - [`ManagedClaimState::Missing`]: the handoff already completed. Do not
     ///   unlink durable siblings or the claim pathname, and refuse to open a new
     ///   writer against the stale claim.
     /// - [`ManagedClaimState::NotRegularFile`]: hostile interference at the
-    ///   claim path. Skip every destructive step, but let constructive
-    ///   publication continue.
+    ///   claim path. Skip every mutation.
     /// - [`ManagedClaimState::ReplacedRegularFile`]: same-UID substitution of a
     ///   *different* regular file at the claim pathname — or an extra hard link
     ///   on the pinned inode. Shape is not authority, so this is
-    ///   treated exactly like the wrong-type case: constructive publication
-    ///   continues, everything destructive is refused. Only the pinned artifact
-    ///   can authorize deleting, renaming, or accounting a claim pathname.
+    ///   treated exactly like the wrong-type case: every mutation is refused.
+    ///   Only the pinned artifact can authorize deleting, renaming, publishing,
+    ///   or accounting a claim pathname or its derived siblings.
     ///
     /// The contract for every caller: hold the namespace mutation lock across
     /// this classification and the destructive step it authorizes, and pass the
@@ -8794,18 +8793,13 @@ impl DeadLetterPayloadWriter {
         let (temp_path, final_path) = dead_letter_payload_paths(spool, source_path)?;
         let (_, prior_meta_path) = dead_letter_meta_paths(source_path)?;
         let _guard = spool.lock_spool_mutation()?;
-        // Constructive open keeps namespace containment only. Exact claim
-        // identity gates the destructive prior-sibling cleanup below: a stale
-        // missing claim must not wipe a completed handoff, a planted directory
-        // must not abort evidence reconstruction, and a substituted regular file
-        // is not the authority that authorizes deleting a completed sibling.
-        let claim_state = spool.managed_claim_state(source_path, artifact)?;
-        if claim_state == ManagedClaimState::Missing {
-            return Err(format!(
-                "{PLUGIN_NAME}: managed spool source '{}' no longer exists",
-                source_path.display()
-            ));
-        }
+        // Opening begins a publication transaction whose later rename may
+        // replace a completed sibling. Require the exact pinned claim up front;
+        // a missing, wrong-type, or substituted pathname authorizes no part of
+        // that transaction.
+        spool
+            .require_live_claim(source_path, artifact)
+            .map_err(ClaimMutationError::into_message)?;
         spool.assert_managed_path(&temp_path)?;
         spool.assert_managed_path(&final_path)?;
         spool.assert_managed_path(&prior_meta_path)?;
@@ -8815,16 +8809,9 @@ impl DeadLetterPayloadWriter {
         // handoff artifacts under the namespace lock before rebuilding so
         // recovery never needs quota for two complete rejected payloads and
         // never evicts unrelated active spool data merely to duplicate one.
-        // Only the exact pinned claim authorizes that destructive cleanup;
-        // Missing / NotRegularFile / ReplacedRegularFile iterate an empty set so
-        // the body stays shared with the pre-authorization cleanup path.
-        let authorized_prior_siblings = [(&prior_meta_path, "metadata"), (&final_path, "payload")];
-        let prior_siblings: &[(&PathBuf, &str)] = if claim_state == ManagedClaimState::LiveClaim {
-            &authorized_prior_siblings
-        } else {
-            &authorized_prior_siblings[..0]
-        };
-        for (path, kind) in prior_siblings.iter().copied() {
+        // Only the exact pinned claim reaches this cleanup.
+        let prior_siblings = [(&prior_meta_path, "metadata"), (&final_path, "payload")];
+        for (path, kind) in prior_siblings {
             let removed_len = spool_regular_file_len(path);
             match fs::remove_file(path) {
                 Ok(()) => {
@@ -8877,6 +8864,7 @@ impl DeadLetterPayloadWriter {
     fn append_batch(
         &mut self,
         spool: &SpoolManager,
+        artifact: &PinnedClaimArtifact,
         batch: &StreamingReplayBatch,
         row_indices: &[usize],
     ) -> Result<(), String> {
@@ -8895,6 +8883,12 @@ impl DeadLetterPayloadWriter {
             format!("{PLUGIN_NAME}: dead-letter payload append byte count is not addressable")
         })?;
         let _guard = spool.lock_spool_mutation()?;
+        // Admission may evict other replayable files, and the append mutates
+        // this handoff's temp. Revalidate the exact claim before either action;
+        // a substitution between delivery chunks authorizes neither.
+        spool
+            .require_live_claim(&self.source_path, artifact)
+            .map_err(ClaimMutationError::into_message)?;
         spool.assert_managed_path(&self.temp_path)?;
         spool.assert_managed_path(&self.final_path)?;
         // The live temp and authoritative source already appear in the owned
@@ -8952,11 +8946,15 @@ impl DeadLetterPayloadWriter {
         };
 
         let _guard = spool.lock_spool_mutation()?;
-        // Constructive publish: namespace containment only. Prior-final removal
-        // below is destructive and requires the exact pinned claim.
+        // The final rename can replace an existing payload and is destructive
+        // even when no explicit cleanup runs. Bind the entire publish to the
+        // exact pinned claim, under the namespace lock.
         spool.assert_managed_path(&self.source_path)?;
         spool.assert_managed_path(&self.temp_path)?;
         spool.assert_managed_path(&self.final_path)?;
+        spool
+            .require_live_claim(&self.source_path, artifact)
+            .map_err(ClaimMutationError::into_message)?;
         // Before mutating any prior partial handoff, prove the live temp path
         // still names the descriptor whose completed metadata we captured at
         // fsync. This is a cheap fail-closed boundary; the exact streamed hash
@@ -8981,21 +8979,19 @@ impl DeadLetterPayloadWriter {
         // since the claim was validated: a missing, non-file, or substituted
         // claim must not authorize that unlink (completed handoff, hostile
         // directory plant, planted regular file).
-        if spool.managed_claim_state(&self.source_path, artifact)? == ManagedClaimState::LiveClaim {
-            let replaced_payload_len = spool_regular_file_len(&self.final_path);
-            match fs::remove_file(&self.final_path) {
-                Ok(()) => {
-                    if let Some(len) = replaced_payload_len {
-                        spool.usage.account_sub(1, len);
-                    }
+        let replaced_payload_len = spool_regular_file_len(&self.final_path);
+        match fs::remove_file(&self.final_path) {
+            Ok(()) => {
+                if let Some(len) = replaced_payload_len {
+                    spool.usage.account_sub(1, len);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "{PLUGIN_NAME}: failed to replace prior dead-letter payload '{}': {error}",
-                        self.final_path.display()
-                    ));
-                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: failed to replace prior dead-letter payload '{}': {error}",
+                    self.final_path.display()
+                ));
             }
         }
         // The temp and still-authoritative source are both present in the
@@ -9326,31 +9322,30 @@ fn write_dead_letter_meta(
     let _guard = spool.lock_spool_mutation()?;
     spool.assert_managed_path(&meta_path)?;
     spool.assert_managed_path(&tmp_path)?;
-    // Constructive metadata publication keeps namespace containment only. Prior
-    // meta removal is destructive and requires the exact pinned claim, so a
-    // planted directory cannot suppress the durable record, while neither a
-    // missing claim nor a substituted regular file can authorize unlinking a
-    // completed sibling.
+    // The final metadata rename can replace an existing record and is
+    // destructive even when no explicit cleanup runs. Bind the whole publish
+    // transaction to the exact pinned claim under this namespace lock.
     spool.assert_managed_path(source_path)?;
+    spool
+        .require_live_claim(source_path, artifact)
+        .map_err(ClaimMutationError::into_message)?;
     spool.evict_until_can_admit(bytes.len() as u64)?;
     // Measured after eviction: a reclaim that already deleted this record has
     // accounted for it, so re-measuring here cannot double-subtract. The
     // identity check runs under the same namespace mutation lock as the unlink.
-    if spool.managed_claim_state(source_path, artifact)? == ManagedClaimState::LiveClaim {
-        let replaced_meta_len = spool_regular_file_len(&meta_path);
-        match fs::remove_file(&meta_path) {
-            Ok(()) => {
-                if let Some(len) = replaced_meta_len {
-                    spool.usage.account_sub(1, len);
-                }
+    let replaced_meta_len = spool_regular_file_len(&meta_path);
+    match fs::remove_file(&meta_path) {
+        Ok(()) => {
+            if let Some(len) = replaced_meta_len {
+                spool.usage.account_sub(1, len);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "{PLUGIN_NAME}: failed to replace dead-letter metadata '{}': {error}",
-                    meta_path.display()
-                ));
-            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "{PLUGIN_NAME}: failed to replace dead-letter metadata '{}': {error}",
+                meta_path.display()
+            ));
         }
     }
     let _live = LiveSpoolPathGuard::new(tmp_path.clone());
@@ -10974,9 +10969,9 @@ pub fn publish_dead_letter_payload_for_tests(
 /// optionally planting an accounted prior final between append and publish.
 ///
 /// External tests use this to model same-UID substitution: pin the live claim,
-/// replace the claim pathname with a different regular file, then publish. The
-/// destructive prior-final unlink must refuse the substitute while constructive
-/// publication still succeeds.
+/// replace the claim pathname with a different regular file, then attempt to
+/// publish. Both explicit cleanup and the final replacing rename must refuse the
+/// substitute before the optional prior payload is planted.
 #[doc(hidden)]
 #[allow(dead_code)] // external unit tests only
 pub fn publish_dead_letter_payload_with_identity_for_tests(
@@ -11049,7 +11044,7 @@ fn publish_dead_letter_payload_inner_for_tests(
         _line_reservation: line_reservation,
     };
     let mut writer = DeadLetterPayloadWriter::open(spool, source_path, pinned)?;
-    writer.append_batch(spool, &batch, &[0])?;
+    writer.append_batch(spool, pinned, &batch, &[0])?;
     if let Some(prior) = prior_payload {
         let (_, final_path) = dead_letter_payload_paths(spool, source_path)?;
         fs::write(&final_path, prior).map_err(|error| {
@@ -11067,8 +11062,8 @@ fn publish_dead_letter_payload_inner_for_tests(
 
 /// Publish one production-format dead-letter metadata record for an already
 /// published payload. External tests use this with
-/// [`publish_dead_letter_payload_for_tests`] to exercise constructive metadata
-/// publication when the claim path is no longer a regular file.
+/// [`publish_dead_letter_payload_for_tests`] to prove a non-live claim refuses
+/// metadata publication before any existing sibling can be replaced.
 ///
 /// Callers pass the payload bytes they already published so this probe does not
 /// re-stat or re-read the on-disk file solely to rebuild the metadata record.
@@ -12085,8 +12080,9 @@ async fn replay_spool_once(
                         // whatever now occupies it back to the replayable source
                         // name and queue an unauthoritative artifact for
                         // delivery, so nothing is released, renamed,
-                        // quarantined, unlinked, or accounted. Durable evidence
-                        // that finalization already published stays published.
+                        // quarantined, unlinked, or accounted. Any durable
+                        // evidence completed before authorization was lost stays
+                        // published; no later publication step is allowed.
                         spool
                             .metrics
                             .record_failure(FailureReason::Serialize, error.clone());
@@ -12464,7 +12460,7 @@ fn append_dead_letter_rows(
                 "{PLUGIN_NAME}: dead-letter payload writer was not initialized"
             ))
         })?
-        .append_batch(spool, batch, row_indices)
+        .append_batch(spool, artifact, batch, row_indices)
         .map_err(ReplayStreamError::Retryable)
 }
 
@@ -12476,11 +12472,10 @@ fn append_dead_letter_rows(
 /// means the exact claim is still live and the caller may release it back to a
 /// replayable name; [`ClaimMutationError::Unauthorized`] means the claim
 /// pathname stopped resolving to the opened authoritative artifact, and the
-/// caller must not release, rename, quarantine, unlink, or account it. Durable
-/// evidence that was already published stays published either way: a hostile
-/// replacement must not be able to suppress newly constructed dead-letter
-/// evidence, but publishing that evidence never authorizes destroying the
-/// replacement.
+/// caller must not release, rename, quarantine, unlink, account, or publish for
+/// it. Durable evidence completed before authorization was lost stays
+/// published, but the unproven claim authorizes no later payload or metadata
+/// publication.
 fn finalize_replayed_spool_file(
     spool: &SpoolManager,
     file: &Path,

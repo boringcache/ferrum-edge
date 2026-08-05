@@ -8279,8 +8279,8 @@ async fn claim_substituted_after_the_validated_replay_open_is_never_mutated() {
     // pathname) or at the terminal claim operation, depending on whether this
     // batch crosses a lease second. Both are the same fail-closed decision and
     // both must leave the substitute alone, so the assertions below hold either
-    // way; the deterministic evidence-publication case is covered by
-    // `claim_substituted_before_finalization_still_publishes_but_never_mutates`.
+    // way; the deterministic pre-finalization publication refusal is covered by
+    // `claim_substituted_before_finalization_publishes_nothing_and_never_mutates`.
     assert!(
         error.contains("no longer resolves to the authoritative claimed artifact"),
         "unexpected substituted-claim diagnostic: {error}"
@@ -8337,7 +8337,7 @@ async fn claim_substituted_after_the_validated_replay_open_is_never_mutated() {
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
-async fn claim_substituted_before_finalization_still_publishes_but_never_mutates() {
+async fn claim_substituted_before_finalization_publishes_nothing_and_never_mutates() {
     let server = MockServer::start().await;
     mount_status_sequence(&server, &[400]).await;
     let temp = tempfile::tempdir().unwrap();
@@ -8369,20 +8369,21 @@ async fn claim_substituted_before_finalization_still_publishes_but_never_mutates
         "unexpected terminal-claim diagnostic: {error}"
     );
 
-    // Constructive evidence is NOT suppressed by the substitution: both durable
-    // rejected artifacts are published for the rows this replay actually read
-    // from its own validated descriptor.
+    // Payload and metadata publication both end in a rename that can replace an
+    // existing sibling. They are destructive mutations too, so the substituted
+    // claim authorizes neither one.
     let payload_path = dead_letter_payload_path(&source);
     let meta_path = dead_letter_meta_path(&source);
-    assert_eq!(
-        fs::read(&payload_path).unwrap(),
-        authoritative_bytes,
-        "the rejected payload must hold exactly the rows the validated descriptor produced"
+    assert!(
+        !payload_path.exists(),
+        "a substituted claim must not authorize rejected-payload publication"
     );
-    let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
-    assert_eq!(meta["rejected_rows"], 1);
+    assert!(
+        !meta_path.exists(),
+        "a substituted claim must not authorize rejected-metadata publication"
+    );
 
-    // Publishing that evidence authorizes nothing against the substitute.
+    // Refusing publication also authorizes nothing against the substitute.
     let claim = claim_slot
         .lock()
         .expect("planted claim slot")
@@ -8403,29 +8404,22 @@ async fn claim_substituted_before_finalization_still_publishes_but_never_mutates
     );
     assert_eq!(fs::read(&displaced).unwrap(), authoritative_bytes);
 
-    // Exactly two owned records were added and nothing was accounted out.
-    let payload_len = fs::metadata(&payload_path).unwrap().len();
-    let meta_len = fs::metadata(&meta_path).unwrap().len();
+    // Nothing was published or accounted out.
     let after = spool.cached_stats_for_tests();
     assert_eq!(
-        after.files,
-        before.files.saturating_add(2),
-        "the substituted claim must not be accounted out of the owned inventory"
+        after.files, before.files,
+        "the substituted claim must not change the owned-file accounting"
     );
     assert_eq!(
-        after.bytes,
-        before
-            .bytes
-            .saturating_add(payload_len)
-            .saturating_add(meta_len),
-        "only the newly published evidence may change owned bytes"
+        after.bytes, before.bytes,
+        "the substituted claim must not change the owned-byte accounting"
     );
 }
 
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
-async fn generic_finalize_failure_never_releases_a_substituted_claim() {
+async fn finalize_authorization_precedes_generic_publication_failure() {
     let server = MockServer::start().await;
     mount_status_sequence(&server, &[400]).await;
     let temp = tempfile::tempdir().unwrap();
@@ -8462,12 +8456,8 @@ async fn generic_finalize_failure_never_releases_a_substituted_claim() {
     drop(clear);
 
     assert!(fired.load(Ordering::SeqCst));
-    // The ordinary retryable cause is preserved, and the release it would
-    // normally perform is refused because the pathname is no longer the claim.
-    assert!(
-        error.contains("failed to create spool temp file"),
-        "the generic finalize failure must still be reported: {error}"
-    );
+    // Claim authorization is checked before payload/meta publication can reach
+    // the unrelated occupied metadata-temp path.
     assert!(
         error.contains("no longer resolves to the authoritative claimed artifact"),
         "the refused release must be reported: {error}"
@@ -8480,23 +8470,23 @@ async fn generic_finalize_failure_never_releases_a_substituted_claim() {
     assert_eq!(
         fs::read(&claim).unwrap(),
         PLANTED_CLAIM_SUBSTITUTE,
-        "the generic finalize-error path must not rewrite the substitute"
+        "the finalize path must not rewrite the substitute"
     );
     assert!(
         !source.exists(),
-        "the generic finalize-error release must not rename the substitute into the replayable namespace"
+        "the finalize path must not rename the substitute into the replayable namespace"
     );
     assert!(
         !spool_day_has_quarantine(&day),
-        "the generic finalize-error path must not quarantine the substitute"
+        "the finalize path must not quarantine the substitute"
     );
     assert!(
         !meta_path.exists(),
-        "partial metadata must not be published when its store is blocked"
+        "claim authorization must run before rejected-metadata publication"
     );
     assert!(
-        dead_letter_payload_path(&source).exists(),
-        "a payload published before the metadata failure remains recoverable"
+        !dead_letter_payload_path(&source).exists(),
+        "claim authorization must run before rejected-payload publication"
     );
 }
 
@@ -9282,7 +9272,7 @@ fn stale_dead_letter_claim_cannot_delete_completed_handoff() {
     let error = publish_dead_letter_payload_for_tests(&spool, &stale_claim_path, row)
         .expect_err("stale claim must not reopen dead-letter writer");
     assert!(
-        error.contains("no longer exists"),
+        error.contains("no longer resolves to the authoritative claimed artifact"),
         "unexpected stale-claim diagnostic: {error}"
     );
     assert!(
@@ -9336,10 +9326,10 @@ fn substituted_regular_file_at_claim_cannot_clear_completed_dead_letter_siblings
 
     let error =
         probe_empty_dead_letter_publish_with_identity_for_tests(&spool, &claim_path, &pinned)
-            .expect_err("empty publish must still be refused");
+            .expect_err("a substituted claim must be refused before publication");
     assert!(
-        error.contains("refusing to publish an empty"),
-        "unexpected empty-publish diagnostic: {error}"
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "unexpected claim-authorization diagnostic: {error}"
     );
     assert_eq!(
         fs::read(&payload_path).unwrap(),
@@ -9398,7 +9388,7 @@ fn exact_live_claim_identity_still_clears_prior_dead_letter_siblings() {
 }
 
 #[test]
-fn substituted_regular_file_at_claim_cannot_account_out_prior_dead_letter_artifacts() {
+fn substituted_regular_file_at_claim_cannot_replace_dead_letter_artifacts() {
     let temp = tempfile::tempdir().unwrap();
     let spool = test_spool(&temp);
     let source = spool
@@ -9421,39 +9411,25 @@ fn substituted_regular_file_at_claim_cannot_account_out_prior_dead_letter_artifa
     fs::remove_file(&claim_path).unwrap();
     fs::write(&claim_path, b"planted-not-the-claimed-artifact\n").unwrap();
 
+    let payload_before = fs::read(&payload_path).unwrap();
+    let meta_before = fs::read(&meta_path).unwrap();
+    let stats_before = spool.cached_stats_for_tests();
     let prior_payload = b"prior-rejected-payload-marker-bytes\n";
-    let (republished, accounted_before_publish) =
-        publish_dead_letter_payload_with_identity_for_tests(
-            &spool,
-            &claim_path,
-            &pinned,
-            row,
-            Some(prior_payload),
-        )
-        .expect("substituted claim must not block constructive payload publication");
-    assert_eq!(republished, payload_path);
-    assert_eq!(fs::read(&payload_path).unwrap(), row);
-    let after_payload = spool.cached_stats_for_tests();
-    assert_eq!(
-        after_payload.files,
-        accounted_before_publish.files.saturating_add(1),
-        "a substituted claim must not authorize account_sub of the prior rejected payload"
-    );
-    assert_eq!(
-        after_payload.bytes,
-        accounted_before_publish
-            .bytes
-            .saturating_add(row.len() as u64),
-        "the prior payload's bytes stay charged; only the exact claim may release them"
-    );
-
-    let before_meta = spool.cached_stats_for_tests();
-    let prior_meta_len = fs::metadata(&meta_path).unwrap().len();
+    let payload_error = publish_dead_letter_payload_with_identity_for_tests(
+        &spool,
+        &claim_path,
+        &pinned,
+        row,
+        Some(prior_payload),
+    )
+    .expect_err("a substituted claim must not authorize payload replacement");
     assert!(
-        prior_meta_len > 0,
-        "prior metadata must occupy accounted bytes"
+        payload_error.contains("no longer resolves to the authoritative claimed artifact"),
+        "unexpected payload authorization diagnostic: {payload_error}"
     );
-    write_dead_letter_meta_with_identity_for_tests(
+    assert_eq!(fs::read(&payload_path).unwrap(), payload_before);
+
+    let meta_error = write_dead_letter_meta_with_identity_for_tests(
         &spool,
         &claim_path,
         &pinned,
@@ -9461,21 +9437,13 @@ fn substituted_regular_file_at_claim_cannot_account_out_prior_dead_letter_artifa
         row,
         2,
     )
-    .expect("substituted claim must not block constructive metadata publication");
-    let new_meta_len = fs::metadata(&meta_path).unwrap().len();
-    let after_meta = spool.cached_stats_for_tests();
-    let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
-    assert_eq!(meta["rejected_rows"], 2);
-    assert_eq!(
-        after_meta.files,
-        before_meta.files.saturating_add(1),
-        "a substituted claim must not authorize account_sub of the prior rejected metadata"
+    .expect_err("a substituted claim must not authorize metadata replacement");
+    assert!(
+        meta_error.contains("no longer resolves to the authoritative claimed artifact"),
+        "unexpected metadata authorization diagnostic: {meta_error}"
     );
-    assert_eq!(
-        after_meta.bytes,
-        before_meta.bytes.saturating_add(new_meta_len),
-        "over-counting is deliberate; only the exact claim may release a prior record"
-    );
+    assert_eq!(fs::read(&meta_path).unwrap(), meta_before);
+    assert_eq!(spool.cached_stats_for_tests(), stats_before);
     assert!(
         claim_path.is_file(),
         "refusing destructive cleanup must leave the planted claim file untouched"
@@ -9483,7 +9451,7 @@ fn substituted_regular_file_at_claim_cannot_account_out_prior_dead_letter_artifa
 }
 
 #[test]
-fn directory_at_claim_publishes_evidence_without_clearing_prior_siblings() {
+fn directory_at_claim_cannot_publish_or_clear_dead_letter_siblings() {
     let temp = tempfile::tempdir().unwrap();
     let spool = test_spool(&temp);
     let source = spool
@@ -9513,12 +9481,13 @@ fn directory_at_claim_publishes_evidence_without_clearing_prior_siblings() {
     fs::remove_file(&claim_path).unwrap();
     fs::create_dir(&claim_path).unwrap();
 
-    // Opening must not authorize destructive sibling cleanup.
+    // Opening must reject the entire publication transaction before any
+    // destructive sibling cleanup.
     let empty_error = probe_empty_dead_letter_publish_for_tests(&spool, &claim_path)
-        .expect_err("empty publish must still be refused");
+        .expect_err("a directory claim must be refused before publication");
     assert!(
-        empty_error.contains("refusing to publish an empty"),
-        "unexpected empty-publish diagnostic: {empty_error}"
+        empty_error.contains("no longer resolves to the authoritative claimed artifact"),
+        "unexpected claim-authorization diagnostic: {empty_error}"
     );
     assert_eq!(
         fs::read(&payload_path).unwrap(),
@@ -9531,24 +9500,29 @@ fn directory_at_claim_publishes_evidence_without_clearing_prior_siblings() {
         "directory at claim must not delete a prior rejected metadata sibling"
     );
 
-    // Constructive publication must still succeed for both artifacts.
-    let published = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
-        .expect("directory at claim must not block payload publish");
-    assert_eq!(published, payload_path);
-    assert_eq!(fs::read(&payload_path).unwrap(), row);
+    let payload_error = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect_err("a directory claim must not authorize payload publication");
+    assert!(
+        payload_error.contains("no longer resolves to the authoritative claimed artifact"),
+        "unexpected payload authorization diagnostic: {payload_error}"
+    );
+    assert_eq!(fs::read(&payload_path).unwrap(), prior_payload);
     assert_eq!(
         fs::read(&meta_path).unwrap(),
         prior_meta,
-        "payload publish must leave the prior meta sibling until metadata publish"
+        "refused payload publish must preserve the prior metadata sibling"
     );
 
-    write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
-        .expect("directory at claim must not block metadata publish");
-    let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
-    assert_eq!(meta["rejected_rows"], 1);
+    let meta_error = write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
+        .expect_err("a directory claim must not authorize metadata publication");
+    assert!(
+        meta_error.contains("no longer resolves to the authoritative claimed artifact"),
+        "unexpected metadata authorization diagnostic: {meta_error}"
+    );
+    assert_eq!(fs::read(&meta_path).unwrap(), prior_meta);
     assert!(
         claim_path.is_dir(),
-        "constructive handoff must leave the planted directory claim untouched"
+        "refused handoff must leave the planted directory claim untouched"
     );
 }
 
