@@ -152,6 +152,10 @@ fn h3_native_retry_loop_resolves_effective_proxy_per_attempt() {
         "proxy_to_backend_h3 must receive the per-attempt resolved proxy"
     );
 
+    assert!(
+        loop_src.contains("route_retry_ceiling"),
+        "native-H3 retry must authorize against the original route ceiling"
+    );
     // Rotated attempt: a rotation can cross from the SD fallback into a policy
     // port with its own per-port override (TLS/SNI/connectTimeout), so the
     // loop must RE-resolve after `select_next_retry_target` and before the
@@ -182,13 +186,17 @@ fn h3_native_retry_loop_resolves_effective_proxy_per_attempt() {
 #[test]
 fn h3_frontend_exposes_retry_capped_base_proxy_to_plugins() {
     // H1/H2 parity: `handle_proxy_request_inner` assigns `ctx.matched_proxy`
-    // the retry-capped BASE proxy (right after `cap_proxy_retry_for_target`),
-    // so plugins/logging must not see per-port TLS/timeout overrides baked
-    // into the proxy on the H3 frontend only.
+    // the BASE proxy after the post-selection retry seam (original route
+    // ceiling retained), so plugins/logging must not see per-port TLS/timeout
+    // overrides baked into the proxy on the H3 frontend only.
     let source = include_str!("../../../src/http3/server.rs");
     assert!(
         source.contains("ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));"),
-        "H3 must expose the retry-capped base proxy via ctx.matched_proxy (H1/H2 parity)"
+        "H3 must expose the base proxy via ctx.matched_proxy (H1/H2 parity)"
+    );
+    assert!(
+        source.contains("route_retry_ceiling"),
+        "H3 must retain the original route retry ceiling for DestinationRule maxRetries"
     );
 }
 

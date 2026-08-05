@@ -3495,19 +3495,28 @@ async fn handle_h3_request(
         request_host.as_deref(),
     );
     let upstream_balancer = selection.balancer;
-    // Mirror H1/H2 selected-target policy: cap per-request retries, then build
-    // an effective proxy carrying per-target DestinationRule-derived
-    // connectionPool/TLS overrides for the FIRST selected target. That
-    // effective proxy backs the single-target dispatch decisions below
-    // (retry-dependent buffering, native-H3 capability, streaming dispatch).
-    // Every dispatch loop that can rotate retry targets — the buffered
-    // native-H3 retry loop, the H3->plain and H3->gRPC bridges, and the H3
-    // WebSocket dial loop — re-resolves the effective proxy per attempt from
-    // the capped but UNRESOLVED base proxy, so a later target does not inherit
-    // the first target's port-level TLS/SNI/H1 policy.
+    // Mirror H1/H2 selected-target policy: retain the original route retry
+    // ceiling, then build an effective proxy carrying per-target
+    // DestinationRule-derived connectionPool/TLS overrides for the FIRST
+    // selected target. That effective proxy backs the single-target dispatch
+    // decisions below (retry-dependent buffering, native-H3 capability,
+    // streaming dispatch). Every dispatch loop that can rotate retry targets —
+    // the buffered native-H3 retry loop, the H3->plain and H3->gRPC bridges, and
+    // the H3 WebSocket dial loop — re-resolves the effective proxy per attempt
+    // from the UNRESOLVED base proxy and re-checks
+    // `retry_attempt_allowed_for_target` against the original route ceiling, so
+    // a later target does not inherit the first target's port-level TLS/SNI/H1
+    // policy or get blocked by a permanently lowered initial-port retry cap.
+    let route_retry_ceiling =
+        crate::proxy::route_retry_ceiling(routing_proxy.as_ref()).unwrap_or(0);
     let selected_base_proxy = crate::proxy::cap_proxy_retry_for_target(
         Arc::clone(&routing_proxy),
         upstream_target.as_deref(),
+    );
+    debug_assert_eq!(
+        crate::proxy::route_retry_ceiling(routing_proxy.as_ref()),
+        crate::proxy::route_retry_ceiling(selected_base_proxy.as_ref()),
+        "cap_proxy_retry_for_target must retain the original route retry ceiling"
     );
     let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(
         &selected_base_proxy,
@@ -3517,11 +3526,11 @@ async fn handle_h3_request(
         std::borrow::Cow::Borrowed(_) => Arc::clone(&selected_base_proxy),
         std::borrow::Cow::Owned(owned) => Arc::new(owned),
     };
-    // Plugins/logging see the retry-capped BASE proxy, matching the H1/H2 path
-    // (`handle_proxy_request_inner` assigns `ctx.matched_proxy` right after
-    // `cap_proxy_retry_for_target`). Per-port TLS/timeout overrides are a
+    // Plugins/logging see the BASE proxy with the original route retry ceiling
+    // retained (matching the H1/H2 path). Per-port TLS/timeout overrides are a
     // dispatch-time concern and must not appear baked into the plugin-visible
-    // proxy on H3 only.
+    // proxy on H3 only. DestinationRule maxRetries is enforced per attempt via
+    // retry_attempt_allowed_for_target against `route_retry_ceiling`.
     ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
@@ -6901,10 +6910,12 @@ async fn handle_h3_request(
                 attempt,
             ) {
                 // Re-check the CURRENT target's DestinationRule maxRetries
-                // before authorizing another retry — mixed-port rotation can
-                // leave the proxy-level ceiling looser than the current port.
+                // before authorizing another retry — use the original route
+                // ceiling so a looser rotated candidate may continue up to
+                // min(route, candidate_cap), while a stricter current cap
+                // still fails closed.
                 if !crate::proxy::current_retry_attempt_allowed(
-                    retry_config.max_retries,
+                    route_retry_ceiling,
                     &proxy,
                     current_target.as_deref(),
                     attempt,
@@ -6943,7 +6954,7 @@ async fn handle_h3_request(
                         break;
                     }
                     if !crate::proxy::retry_attempt_allowed_for_target(
-                        retry_config.max_retries,
+                        route_retry_ceiling,
                         &proxy,
                         &next,
                         attempt,

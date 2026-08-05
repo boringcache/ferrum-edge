@@ -665,12 +665,12 @@ pub struct UpstreamPortOverride {
     /// Per-port retry-count cap, mapped from DestinationRule
     /// `connectionPool.http.maxRetries`. Interpreted as an upper bound on the
     /// per-request `Proxy.retry.max_retries` (NOT Envoy's cluster-wide
-    /// outstanding-retry budget — see `docs/mesh.md`). Applied via
-    /// `cap_proxy_retry_for_target` for the initial selected target, then
-    /// re-resolved per retry candidate through `retry_attempt_allowed_for_target`
-    /// when load-balancer rotation can change the policy port: effective
-    /// `max_retries = min(route_ceiling, target_cap)`; never increases retries
-    /// and never synthesizes a retry policy when the proxy has none.
+    /// outstanding-retry budget — see `docs/mesh.md`). The original route
+    /// ceiling is retained on `Proxy.retry`; each attempt/candidate is
+    /// authorized through `retry_attempt_allowed_for_target` as
+    /// `max_retries = min(original_route_ceiling, target_cap)` when
+    /// load-balancer rotation can change the policy port. Never increases
+    /// retries and never synthesizes a retry policy when the proxy has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
     /// Per-port cap on concurrent *pending* (connection-waiting) HTTP/1.1

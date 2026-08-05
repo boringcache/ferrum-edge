@@ -974,9 +974,11 @@ pub(crate) async fn handle_h3_websocket(
                 let ws_egress_denied =
                     matches!(ws_error_class, retry::ErrorClass::DispatchPolicyRejected);
                 let retry_delay = proxy.retry.as_ref().and_then(|retry_config| {
-                    (ws_attempt < retry_config.max_retries
+                    let route_retry_ceiling =
+                        crate::proxy::route_retry_ceiling(&proxy).unwrap_or(0);
+                    (ws_attempt < route_retry_ceiling
                         && crate::proxy::current_retry_attempt_allowed(
-                            retry_config.max_retries,
+                            route_retry_ceiling,
                             &proxy,
                             current_target.as_deref(),
                             ws_attempt,
@@ -992,8 +994,8 @@ pub(crate) async fn handle_h3_websocket(
 
                 if let Some(delay) = retry_delay {
                     // Safety: retry_delay is only Some when proxy.retry is Some.
-                    let route_max_retries =
-                        proxy.retry.as_ref().map(|r| r.max_retries).unwrap_or(0);
+                    let route_retry_ceiling =
+                        crate::proxy::route_retry_ceiling(&proxy).unwrap_or(0);
                     if let Some(permits) = backend_admission_permits.take() {
                         permits.record_backend_outcome(BackendAdmissionOutcome {
                             response_status: 502,
@@ -1046,7 +1048,7 @@ pub(crate) async fn handle_h3_websocket(
                                 "Aborting H3 WebSocket retry because the candidate would change the authorized backend method path"
                             );
                         } else if !crate::proxy::retry_attempt_allowed_for_target(
-                            route_max_retries,
+                            route_retry_ceiling,
                             &proxy,
                             &next,
                             ws_attempt,

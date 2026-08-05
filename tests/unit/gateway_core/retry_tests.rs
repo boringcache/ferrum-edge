@@ -356,6 +356,10 @@ fn http_retry_re_resolves_mesh_transport_before_each_dispatch() {
         .find("current_retry_attempt_allowed(")
         .expect("HTTP retry must re-check DestinationRule maxRetries for the current target");
     assert!(
+        retry_body.contains("route_retry_ceiling"),
+        "HTTP retry must authorize against the original route ceiling"
+    );
+    assert!(
         current_cap_gate < selection,
         "current-target maxRetries must gate retry authorization before rotation"
     );

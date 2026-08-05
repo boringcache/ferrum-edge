@@ -1716,6 +1716,10 @@ where
     } else {
         None
     };
+    // Absolute route ceiling retained on Proxy.retry (never permanently lowered
+    // to the initial target's DestinationRule cap). Retry authorization uses
+    // min(route_retry_ceiling, current_or_candidate_cap).
+    let route_retry_ceiling = crate::proxy::route_retry_ceiling(proxy).unwrap_or(0);
     let should_buffer_response = retry_config.is_some()
         || !crate::proxy::should_stream_response_body(
             proxy,
@@ -1939,7 +1943,7 @@ where
                                     attempt,
                                 )
                                 && crate::proxy::current_retry_attempt_allowed(
-                                    retry_config.max_retries,
+                                    route_retry_ceiling,
                                     proxy,
                                     current_target.as_deref(),
                                     attempt,
@@ -1957,7 +1961,7 @@ where
                                     query_string,
                                     client_ip,
                                     proxy_headers,
-                                    retry_config.max_retries,
+                                    route_retry_ceiling,
                                     attempt,
                                 );
                                 if !matches!(
@@ -2045,7 +2049,7 @@ where
                                     attempt,
                                 )
                                 && crate::proxy::current_retry_attempt_allowed(
-                                    retry_config.max_retries,
+                                    route_retry_ceiling,
                                     proxy,
                                     current_target.as_deref(),
                                     attempt,
@@ -2063,7 +2067,7 @@ where
                                     query_string,
                                     client_ip,
                                     proxy_headers,
-                                    retry_config.max_retries,
+                                    route_retry_ceiling,
                                     attempt,
                                 );
                                 if !matches!(
@@ -4735,6 +4739,7 @@ where
         && let Some(retry_config) = &proxy.retry
         && let (Some(hmap), Some(body_bytes)) = (retry_hmap, retry_body)
     {
+        let route_retry_ceiling = crate::proxy::route_retry_ceiling(proxy).unwrap_or(0);
         let mut attempt = 0u32;
         loop {
             // Pre-wire predicate for the H3→gRPC retry loop, derived from
@@ -4767,9 +4772,9 @@ where
             };
             if !is_connection_error
                 || !retry_config.retry_on_connect_failure
-                || attempt >= retry_config.max_retries
+                || attempt >= route_retry_ceiling
                 || !crate::proxy::current_retry_attempt_allowed(
-                    retry_config.max_retries,
+                    route_retry_ceiling,
                     proxy,
                     current_target.as_deref(),
                     attempt,
@@ -4790,7 +4795,7 @@ where
                 query_string,
                 client_ip,
                 proxy_headers,
-                retry_config.max_retries,
+                route_retry_ceiling,
                 attempt,
             );
             if matches!(

@@ -660,9 +660,9 @@ fn websocket_max_connections_gate_stays_keyed_on_the_policy_port() {
 
 #[test]
 fn websocket_retry_rotation_rechecks_destination_rule_max_retries() {
-    // Mixed-port retry rotation can leave the initial-port ceiling and land on
-    // a stricter (or zero) maxRetries candidate. Both WebSocket bridges must
-    // refuse that candidate through the shared helper before dialing it.
+    // Mixed-port retry rotation must re-check DestinationRule maxRetries against
+    // the original route ceiling: a stricter/zero candidate is refused before
+    // dial, while a looser candidate may continue up to min(route, candidate_cap).
     //
     // H1/H2's existing loop slice ends at `match ws_dial_result` (before the
     // Err-arm retry rotation), so inspect the full authenticated handler there.
@@ -686,6 +686,10 @@ fn websocket_retry_rotation_rechecks_destination_rule_max_retries() {
         assert!(
             body.contains("current_retry_attempt_allowed("),
             "{label} WebSocket retry must re-check DestinationRule maxRetries for the current target"
+        );
+        assert!(
+            body.contains("route_retry_ceiling"),
+            "{label} WebSocket retry must authorize against the original route ceiling"
         );
         let selection = body.find("select_next_retry_target(").unwrap_or_else(|| {
             panic!("{label} WebSocket retry rotation must remain present")

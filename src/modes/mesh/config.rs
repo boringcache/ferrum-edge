@@ -1997,14 +1997,15 @@ pub struct MeshConnectionPoolHttp {
     /// Mapped from `maxRetries`. Interpreted as a per-request retry-count
     /// CAP (an upper bound on `Proxy.retry.max_retries`), NOT Envoy's
     /// cluster-wide outstanding-retry concurrency budget — see the honest
-    /// semantics note in `docs/mesh.md` and `cap_proxy_retry_for_target` /
+    /// semantics note in `docs/mesh.md` and `route_retry_ceiling` /
     /// `retry_attempt_allowed_for_target` in `src/proxy/mod.rs`. When a proxy
-    /// already carries a retry policy the effective `max_retries` becomes
-    /// `min(existing, this)` for the selected target; when no policy exists
-    /// this field does NOT synthesize one (an Istio `maxRetries` is a budget,
-    /// not a retry-policy enabler). Zero explicitly disables an existing retry
-    /// policy for the selected destination. Retry rotation re-resolves the
-    /// candidate's cap before dispatch.
+    /// already carries a retry policy the effective budget for a target is
+    /// `min(original_route_ceiling, this)`; when no policy exists this field
+    /// does NOT synthesize one (an Istio `maxRetries` is a budget, not a
+    /// retry-policy enabler). Zero explicitly disables an existing retry
+    /// policy for the selected destination. The original route ceiling stays
+    /// available across rotation; retry loops re-resolve the candidate's cap
+    /// before dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
     /// Mapped from `http1MaxPendingRequests`. Honestly reinterpreted as the

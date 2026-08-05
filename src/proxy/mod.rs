@@ -11199,6 +11199,11 @@ async fn handle_websocket_request_authenticated(
     ctx.set_websocket_response_boundary(true);
     let mut current_cb_target_key = cb_target_key;
 
+    // Absolute route retry ceiling retained before any DestinationRule target
+    // projection. WebSocket retries authorize each attempt/candidate against
+    // this value, never a permanently lowered initial-port projection.
+    let route_retry_ceiling = route_retry_ceiling(&proxy).unwrap_or(0);
+
     // Build backend URL using upstream target if available
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
         (target.host.as_str(), target.port)
@@ -11613,9 +11618,9 @@ async fn handle_websocket_request_authenticated(
                 // retried under retry_on_connect_failure — that bypasses
                 // retry_on_methods and would also lie in transaction logs.
                 let should_retry_ws = if let Some(retry_config) = &proxy.retry {
-                    ws_attempt < retry_config.max_retries
+                    ws_attempt < route_retry_ceiling
                         && current_retry_attempt_allowed(
-                            retry_config.max_retries,
+                            route_retry_ceiling,
                             &proxy,
                             current_target.as_deref(),
                             ws_attempt,
@@ -11710,7 +11715,7 @@ async fn handle_websocket_request_authenticated(
                                 "Aborting WebSocket retry because the candidate would change the authorized backend method path"
                             );
                         } else if !retry_attempt_allowed_for_target(
-                            retry_config.max_retries,
+                            route_retry_ceiling,
                             &proxy,
                             &next,
                             ws_attempt,
@@ -26109,15 +26114,21 @@ async fn handle_proxy_request_inner(
     let upstream_is_fallback = selection.is_fallback;
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
-    // Apply the DestinationRule `connectionPool.http.maxRetries` per-request
-    // retry-count CAP now that the dispatch target's port is known, before any
-    // retry loop (HTTP / gRPC / WebSocket) reads `proxy.retry`. This sets the
-    // request ceiling from the INITIAL selected target (`min(existing, dr_max)`);
-    // it never enables retries when the proxy has none. Rotating retry loops
-    // must still re-check `retry_attempt_allowed_for_target` when selection can
-    // leave the initial policy port (see that helper). No-op (no Arc clone) in
-    // the common case.
+    // DestinationRule `connectionPool.http.maxRetries` is enforced per attempt
+    // once the dispatch target's port is known. Retain the original route/
+    // `Proxy.retry` ceiling on the proxy (never permanently lower it to the
+    // initial target's cap): rotating retry loops authorize each attempt with
+    // `min(original_route_ceiling, current_or_candidate_cap)` via
+    // `retry_attempt_allowed_for_target`. This call is the post-selection seam
+    // shared with the H3 frontend; it never synthesizes a retry policy.
+    let original_route_retry_ceiling = route_retry_ceiling(&proxy);
     let proxy = cap_proxy_retry_for_target(proxy, upstream_target.as_deref());
+    debug_assert_eq!(
+        original_route_retry_ceiling,
+        route_retry_ceiling(&proxy),
+        "cap_proxy_retry_for_target must retain the original route retry ceiling"
+    );
+    let route_retry_ceiling = original_route_retry_ceiling.unwrap_or(0);
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
@@ -27532,11 +27543,11 @@ async fn handle_proxy_request_inner(
                     }) => true,
                     _ => false,
                 };
-                if grpc_attempt >= retry_config.max_retries
+                if grpc_attempt >= route_retry_ceiling
                     || !is_connection_error
                     || !retry_config.retry_on_connect_failure
                     || !current_retry_attempt_allowed(
-                        retry_config.max_retries,
+                        route_retry_ceiling,
                         &proxy,
                         grpc_current_target.as_deref(),
                         grpc_attempt,
@@ -27577,7 +27588,7 @@ async fn handle_proxy_request_inner(
                         break;
                     }
                     if !retry_attempt_allowed_for_target(
-                        retry_config.max_retries,
+                        route_retry_ceiling,
                         &proxy,
                         &next,
                         grpc_attempt,
@@ -30090,11 +30101,11 @@ async fn handle_proxy_request_inner(
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
             // Re-check the CURRENT target's DestinationRule maxRetries before
-            // authorizing another retry. After a mixed-port rotation the
-            // proxy-level ceiling may still reflect a looser initial port;
-            // a stricter current cap must fail closed.
+            // authorizing another retry. Use the original route ceiling (not a
+            // permanently lowered initial-port projection) so a looser rotated
+            // candidate may continue up to min(route, candidate_cap).
             if !current_retry_attempt_allowed(
-                retry_config.max_retries,
+                route_retry_ceiling,
                 &proxy,
                 current_target.as_deref(),
                 attempt,
@@ -30171,7 +30182,7 @@ async fn handle_proxy_request_inner(
                     break;
                 }
                 if !retry_attempt_allowed_for_target(
-                    retry_config.max_retries,
+                    route_retry_ceiling,
                     &proxy,
                     &next,
                     attempt,
@@ -32663,12 +32674,25 @@ pub(crate) fn resolve_target_retry_max_retries(
         })
 }
 
+/// Absolute route/`Proxy.retry` ceiling. Capture this **before** any
+/// DestinationRule target projection and pass it to every retry-budget helper
+/// so a stricter initial target cannot permanently lower the sequence ceiling
+/// after rotation. Returns `None` when the proxy has no retry policy (DR caps
+/// must not synthesize one).
+#[inline]
+pub(crate) fn route_retry_ceiling(proxy: &Proxy) -> Option<u32> {
+    proxy.retry.as_ref().map(|retry| retry.max_retries)
+}
+
 /// Effective per-request retry ceiling for `target` under the route budget.
 ///
-/// `route_max_retries` is the absolute ceiling (the route/`Proxy.retry` value,
-/// already reduced by any initial-target `cap_proxy_retry_for_target` call). A
-/// DestinationRule cap never raises it. When the target has no DR cap, the
-/// route ceiling is unchanged.
+/// `route_max_retries` is the absolute ceiling — the original route/
+/// `Proxy.retry` value, **never** a value already reduced by an initial-target
+/// DestinationRule projection. Each attempt is authorized by
+/// `min(original_route_ceiling, current_target_cap)`; each candidate is
+/// preflighted by `min(original_route_ceiling, candidate_cap)`. A DestinationRule
+/// cap never raises the route ceiling. When the target has no DR cap, the route
+/// ceiling is unchanged.
 #[inline]
 pub(crate) fn effective_retry_max_retries_for_target(
     route_max_retries: u32,
@@ -32715,8 +32739,7 @@ pub(crate) fn current_retry_attempt_allowed(
     })
 }
 
-/// Cap a proxy's per-request retry count from the DestinationRule
-/// `connectionPool.http.maxRetries` override for the dispatch target's port.
+/// Post-selection seam for DestinationRule `connectionPool.http.maxRetries`.
 ///
 /// **Honest semantics (read this):** Envoy's `connectionPool.http.maxRetries`
 /// is a *cluster-wide outstanding-retry concurrency budget*. Ferrum's retry
@@ -32724,22 +32747,32 @@ pub(crate) fn current_retry_attempt_allowed(
 /// an upper bound on the per-request retry count, NOT Envoy's gauge. See
 /// `docs/mesh.md` "DestinationRule maxRetries semantics".
 ///
+/// **Why this function must not permanently lower `proxy.retry.max_retries`:**
+/// permanently projecting `min(route, initial_target)` onto the proxy makes the
+/// initial port's cap an absolute sequence ceiling. After mixed-port rotation a
+/// looser candidate (up to the original route ceiling) would then be refused by
+/// `should_retry` / `max_retries` comparisons that still read the projected
+/// value. The original route ceiling must remain on `Proxy.retry`; each attempt
+/// is authorized by [`effective_retry_max_retries_for_target`] /
+/// [`retry_attempt_allowed_for_target`] as
+/// `min(original_route_ceiling, current_or_candidate_cap)`.
+///
 /// **Why the SELECTED target's port, not a min across every port:** the cap
 /// must come from the port the request actually dials. Taking the MINIMUM
 /// across every override would let a higher-cap port inherit an unrelated
 /// sibling port's lower cap (port 8080 cap 5 wrongly limited to 1 because
 /// port 9090 has cap 1) — that is what we must NOT do.
 ///
-/// This initial cap sets the request's absolute ceiling from the first selected
-/// target (`min(route, initial_target)`). It does **not** alone govern every
-/// later attempt: when the failed target's policy port has no live
-/// `dispatch_port_overrides` entry, `select_next_retry_target` stays on the
-/// full upstream and may rotate onto a different port whose explicit
-/// `maxRetries` is stricter (including zero). Every rotating retry loop must
-/// therefore re-check [`retry_attempt_allowed_for_target`] for the current
+/// When the failed target's policy port has no live `dispatch_port_overrides`
+/// entry, `select_next_retry_target` stays on the full upstream and may rotate
+/// onto a different port whose explicit `maxRetries` is stricter (including
+/// zero) or looser (up to the original route ceiling). Every rotating retry
+/// loop must re-check [`retry_attempt_allowed_for_target`] for the current
 /// target before authorizing another retry and for each candidate before
 /// dispatch. An explicit per-port override still engages the policy-port retry
-/// lane and pins rotation to that port.
+/// lane and pins rotation to that port. A stricter/zero candidate is never
+/// dispatched; a looser candidate may continue up to its own cap but never
+/// above the original route ceiling.
 ///
 /// A subset cap lives on the route-selected proxy's inherited fallback. The
 /// subset is stable for the request while endpoint rotation may change host or
@@ -32747,21 +32780,16 @@ pub(crate) fn current_retry_attempt_allowed(
 /// unless an explicit per-port cap overlays it.
 ///
 /// Precedence / no-double-retry:
-/// * If the proxy already has a retry policy, the effective `max_retries`
-///   becomes `min(existing, dr_max_retries)` — never *increases* retries.
+/// * If the proxy already has a retry policy, each attempt's effective budget is
+///   `min(original_route_ceiling, target_dr_cap)` — never *increases* retries.
 /// * If the proxy has NO retry policy, DR `maxRetries` alone does NOT enable
 ///   retries (an Istio `maxRetries` is a budget, not a retry-policy enabler),
 ///   so we leave `retry == None`.
 ///
 /// Applied once, in `handle_proxy_request_inner`, right after the dispatch
-/// target (hence its port) is resolved and BEFORE `proxy.retry` is consumed
-/// by the HTTP / gRPC / WebSocket retry loops. Returns the same `Arc` (no
-/// clone) in the common case: no port override, no `maxRetries`, no retry
-/// policy, or the cap is already >= the configured count.
-///
-/// Hot-path discipline: a single map lookup on the already-present, precomputed
-/// `Proxy.dispatch_port_overrides` (no `ArcSwap` load, no allocation unless a
-/// clone is actually needed to reduce the count).
+/// target (hence its port) is resolved and BEFORE retry loops consume
+/// `proxy.retry`. Always returns the same `Arc` (no clone, no mutation): the
+/// original route ceiling stays available for rotation.
 ///
 /// The standalone H3 frontend mirrors this after target selection in
 /// `src/http3/server.rs`, before native-H3 and cross-protocol dispatch read the
@@ -32770,25 +32798,12 @@ pub(crate) fn cap_proxy_retry_for_target(
     proxy: Arc<Proxy>,
     upstream_target: Option<&UpstreamTarget>,
 ) -> Arc<Proxy> {
-    // No retry policy → DR maxRetries does not synthesize one.
-    let Some(existing) = proxy.retry.as_ref() else {
-        return proxy;
-    };
-    let Some(target) = upstream_target else {
-        return proxy;
-    };
-    let Some(cap) = resolve_target_retry_max_retries(&proxy, target) else {
-        return proxy;
-    };
-    if existing.max_retries <= cap {
-        // Cap does not reduce the configured count — nothing to do.
-        return proxy;
-    }
-    let mut owned = (*proxy).clone();
-    if let Some(retry) = owned.retry.as_mut() {
-        retry.max_retries = cap;
-    }
-    Arc::new(owned)
+    // Intentionally retain `proxy.retry` unchanged. DestinationRule caps are
+    // enforced per attempt/candidate through the allocation-free helpers above,
+    // using [`route_retry_ceiling`] as the absolute ceiling. Mutating
+    // `max_retries` here would reintroduce the initial-port absolute-ceiling bug.
+    let _ = upstream_target;
+    proxy
 }
 
 /// Resolve the DestinationRule `connectionPool.tcp.maxConnections` cap for the
@@ -52356,8 +52371,10 @@ mod tests {
     }
 
     #[test]
-    fn cap_proxy_retry_caps_existing_larger_policy() {
-        // Existing retry policy max_retries=5; DR cap=2 → effective 2.
+    fn cap_proxy_retry_retains_original_route_ceiling() {
+        // Existing retry policy max_retries=5; DR cap=2. The post-selection
+        // seam must NOT permanently lower Proxy.retry — helpers project the
+        // per-target effective budget from the original route ceiling.
         let mut inner = (*proxy_with_max_retries_override(Some(2))).clone();
         inner.retry = Some(crate::config::types::RetryConfig {
             max_retries: 5,
@@ -52365,20 +52382,23 @@ mod tests {
         });
         let proxy = Arc::new(inner);
         let target = target_for_test(8080);
-        let capped = cap_proxy_retry_for_target(proxy, Some(&target));
+        let original = route_retry_ceiling(&proxy);
+        let after = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&target));
+        assert_eq!(route_retry_ceiling(&after), original);
+        assert_eq!(after.retry.as_ref().unwrap().max_retries, 5);
+        assert!(Arc::ptr_eq(&proxy, &after), "must return the same Arc");
         assert_eq!(
-            capped.retry.as_ref().unwrap().max_retries,
+            effective_retry_max_retries_for_target(5, &after, &target),
             2,
-            "DR maxRetries must cap an existing larger policy to the DR value"
+            "helpers must still project min(route, target_cap)"
         );
     }
 
     #[test]
-    fn cap_proxy_retry_caps_from_selected_port_not_sibling() {
+    fn cap_proxy_retry_selected_port_not_sibling_via_helpers() {
         // Two port-overrides: port 8080 cap 5, port 9090 cap 1. A request
-        // dispatched to port 8080 must be capped to 5 (its OWN port's cap), NOT
-        // to the sibling port 9090's stricter cap of 1. Sibling ports must not
-        // contribute a global minimum to the initial-target ceiling.
+        // dispatched to port 8080 must use effective cap 5 (its OWN port), NOT
+        // the sibling port 9090's stricter cap of 1.
         let mut inner = (*proxy_with_max_retries_overrides(&[(8080, 5), (9090, 1)])).clone();
         inner.retry = Some(crate::config::types::RetryConfig {
             max_retries: 10,
@@ -52386,17 +52406,19 @@ mod tests {
         });
         let proxy = Arc::new(inner);
         let target = target_for_test(8080);
-        let capped = cap_proxy_retry_for_target(proxy, Some(&target));
+        let after = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&target));
+        assert_eq!(after.retry.as_ref().unwrap().max_retries, 10);
         assert_eq!(
-            capped.retry.as_ref().unwrap().max_retries,
+            effective_retry_max_retries_for_target(10, &after, &target),
             5,
-            "cap must come from the SELECTED port (8080→5), not a sibling port's lower cap (9090→1)"
+            "effective cap must come from the SELECTED port (8080→5), not a sibling"
         );
     }
 
     #[test]
     fn cap_proxy_retry_never_increases_retries() {
-        // Existing max_retries=1; DR cap=4 → stays 1 (min, never increase).
+        // Existing max_retries=1; DR cap=4 → route ceiling stays 1; effective
+        // stays 1 (min, never increase).
         let mut inner = (*proxy_with_max_retries_override(Some(4))).clone();
         inner.retry = Some(crate::config::types::RetryConfig {
             max_retries: 1,
@@ -52409,6 +52431,10 @@ mod tests {
             capped.retry.as_ref().unwrap().max_retries,
             1,
             "DR maxRetries must never increase an existing smaller retry count"
+        );
+        assert_eq!(
+            effective_retry_max_retries_for_target(1, &capped, &target),
+            1
         );
         assert!(
             Arc::ptr_eq(&proxy, &capped),
@@ -52434,6 +52460,7 @@ mod tests {
             capped.retry.is_none(),
             "DR maxRetries must NOT synthesize a retry policy when none exists"
         );
+        assert_eq!(route_retry_ceiling(&capped), None);
         assert!(
             Arc::ptr_eq(&proxy, &capped),
             "no-policy path must return the same Arc (no clone)"
@@ -52845,8 +52872,9 @@ mod tests {
 
     #[test]
     fn cap_proxy_retry_field_merges_partial_per_port_with_sd_fallback() {
-        // codex r1 #1806 finding 3: a per-port entry that sets only an unrelated
-        // field must inherit the SD top-level `maxRetries` cap, not lose it.
+        // A per-port entry that sets only an unrelated field must inherit the
+        // SD top-level `maxRetries` cap through the helpers, while the route
+        // ceiling on Proxy.retry stays intact.
         let mut inner = (*proxy_with_max_retries_override(None)).clone();
         inner.dispatch_port_overrides = Some(HashMap::from([(
             8080u16,
@@ -52866,18 +52894,23 @@ mod tests {
         });
         let proxy = Arc::new(inner);
         let target = target_for_test(8080);
-        let capped = cap_proxy_retry_for_target(proxy, Some(&target));
+        let after = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&target));
+        assert_eq!(after.retry.as_ref().unwrap().max_retries, 5);
         assert_eq!(
-            capped.retry.as_ref().unwrap().max_retries,
-            2,
+            resolve_target_retry_max_retries(&after, &target),
+            Some(2),
             "a partial per-port entry must inherit the SD top-level maxRetries cap"
+        );
+        assert_eq!(
+            effective_retry_max_retries_for_target(5, &after, &target),
+            2
         );
     }
 
     #[test]
     fn cap_proxy_retry_applies_sd_fallback_max_retries() {
-        // SD top-level `maxRetries` fallback caps the per-request retry count on
-        // whatever port the target resolves to (no explicit per-port entry).
+        // SD top-level `maxRetries` fallback caps via helpers without
+        // permanently lowering Proxy.retry.
         let mut inner = (*proxy_with_max_retries_override(None)).clone();
         inner.dispatch_port_overrides = None;
         inner.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
@@ -52890,9 +52923,10 @@ mod tests {
         });
         let proxy = Arc::new(inner);
         let target = target_for_test(9090);
-        let capped = cap_proxy_retry_for_target(proxy, Some(&target));
+        let after = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&target));
+        assert_eq!(after.retry.as_ref().unwrap().max_retries, 5);
         assert_eq!(
-            capped.retry.as_ref().unwrap().max_retries,
+            effective_retry_max_retries_for_target(5, &after, &target),
             2,
             "SD top-level maxRetries fallback must cap an existing larger policy"
         );
@@ -52911,13 +52945,21 @@ mod tests {
             max_retries: 5,
             ..Default::default()
         });
-        let capped = cap_proxy_retry_for_target(Arc::new(inner), Some(&target_for_test(8080)));
+        let proxy = Arc::new(inner);
+        let target = target_for_test(8080);
+        let after = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&target));
 
         assert_eq!(
-            capped.retry.as_ref().map(|retry| retry.max_retries),
-            Some(0),
-            "a selected subset's maxRetries=0 must disable the inherited retry budget"
+            after.retry.as_ref().map(|retry| retry.max_retries),
+            Some(5),
+            "route ceiling must remain available on Proxy.retry"
         );
+        assert_eq!(
+            effective_retry_max_retries_for_target(5, &after, &target),
+            0,
+            "a selected subset's maxRetries=0 must disable retries for that target"
+        );
+        assert!(!retry_attempt_allowed_for_target(5, &after, &target, 0));
     }
 
     #[test]
@@ -52936,11 +52978,12 @@ mod tests {
         let proxy = Arc::new(inner);
 
         for target in [target_for_test(8080), target_for_test(9090)] {
-            let capped = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&target));
+            let after = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&target));
+            assert_eq!(after.retry.as_ref().unwrap().max_retries, 5);
             assert_eq!(
-                capped.retry.as_ref().map(|retry| retry.max_retries),
-                Some(2),
-                "the selected subset cap must be re-resolvable for every target"
+                effective_retry_max_retries_for_target(5, &after, &target),
+                2,
+                "subset fallback cap must be stable across endpoint rotation"
             );
         }
     }
@@ -52948,7 +52991,7 @@ mod tests {
     #[test]
     fn cap_proxy_retry_per_port_wins_over_sd_fallback() {
         // Explicit per-port `maxRetries` (port 8080) wins over the SD fallback
-        // for that port; a different port uses the fallback.
+        // for that port; a different port uses the fallback — via helpers.
         let mut inner = (*proxy_with_max_retries_overrides(&[(8080, 4)])).clone();
         inner.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
             max_retries: Some(1),
@@ -52960,26 +53003,28 @@ mod tests {
         });
         let proxy = Arc::new(inner);
 
-        // Port 8080 → per-port cap 4 wins over the fallback cap 1.
         let target = target_for_test(8080);
         let capped = cap_proxy_retry_for_target(proxy.clone(), Some(&target));
+        assert_eq!(capped.retry.as_ref().unwrap().max_retries, 9);
         assert_eq!(
-            capped.retry.as_ref().unwrap().max_retries,
+            effective_retry_max_retries_for_target(9, &capped, &target),
             4,
             "explicit per-port maxRetries must win over the SD fallback"
         );
 
-        // Port 9090 → no per-port entry → fallback cap 1.
         let other = target_for_test(9090);
         let capped_other = cap_proxy_retry_for_target(proxy, Some(&other));
-        assert_eq!(capped_other.retry.as_ref().unwrap().max_retries, 1);
+        assert_eq!(
+            effective_retry_max_retries_for_target(9, &capped_other, &other),
+            1
+        );
     }
 
     #[test]
     fn retry_attempt_allowed_rejects_stricter_mixed_port_candidate() {
-        // Initial policy port has NO dispatch_port_overrides entry (so retry
-        // selection stays on the full upstream), while the rotated candidate
-        // has maxRetries: 0. The candidate must not be authorized for dispatch.
+        // Uncapped/looser initial -> zero/stricter candidate is refused before
+        // dispatch. Initial policy port has NO dispatch_port_overrides entry
+        // (so retry selection stays on the full upstream).
         let mut inner = (*proxy_with_max_retries_overrides(&[(9090, 0)])).clone();
         inner.retry = Some(crate::config::types::RetryConfig {
             max_retries: 3,
@@ -52989,31 +53034,87 @@ mod tests {
         let initial = target_for_test(8080);
         let candidate = target_for_test(9090);
 
-        let capped = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&initial));
-        assert_eq!(
-            capped.retry.as_ref().map(|r| r.max_retries),
-            Some(3),
-            "an uncapped initial port must keep the route ceiling"
-        );
+        let after = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&initial));
+        let route_ceiling = route_retry_ceiling(&after).unwrap();
+        assert_eq!(route_ceiling, 3);
         assert!(
-            current_retry_attempt_allowed(3, &capped, Some(&initial), 0),
+            current_retry_attempt_allowed(route_ceiling, &after, Some(&initial), 0),
             "the initial uncapped port must still authorize the first retry under the route ceiling"
         );
         assert!(
-            !retry_attempt_allowed_for_target(3, &capped, &candidate, 0),
+            !retry_attempt_allowed_for_target(route_ceiling, &after, &candidate, 0),
             "rotating onto maxRetries: 0 must issue zero requests to that candidate"
         );
         assert_eq!(
-            effective_retry_max_retries_for_target(3, &capped, &candidate),
+            effective_retry_max_retries_for_target(route_ceiling, &after, &candidate),
             0
+        );
+    }
+
+    #[test]
+    fn retry_attempt_allowed_stricter_initial_permits_looser_candidate_up_to_route_ceiling() {
+        // Stricter initial (fallback cap 1) -> looser candidate (per-port cap 5)
+        // with original route ceiling 5: after the first retry is authorized on
+        // the initial target, the looser candidate may continue up to its own
+        // cap but never above the original route ceiling. Permanently lowering
+        // Proxy.retry to the initial cap would wrongly stop the sequence at 1.
+        let mut inner = (*proxy_with_max_retries_overrides(&[(9090, 5)])).clone();
+        inner.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            max_retries: Some(1),
+            ..Default::default()
+        });
+        inner.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 5,
+            ..Default::default()
+        });
+        let proxy = Arc::new(inner);
+        let initial = target_for_test(8080); // no per-port entry → fallback 1
+        let candidate = target_for_test(9090); // explicit per-port 5
+
+        let after = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&initial));
+        let route_ceiling = route_retry_ceiling(&after).unwrap();
+        assert_eq!(
+            route_ceiling, 5,
+            "original route ceiling must survive the initial-target seam"
+        );
+        assert_eq!(
+            effective_retry_max_retries_for_target(route_ceiling, &after, &initial),
+            1
+        );
+        assert!(
+            current_retry_attempt_allowed(route_ceiling, &after, Some(&initial), 0),
+            "stricter initial must still authorize attempt 0 under its own cap"
+        );
+        assert!(
+            !current_retry_attempt_allowed(route_ceiling, &after, Some(&initial), 1),
+            "stricter initial must refuse attempt 1 while still on that target"
+        );
+        assert!(
+            retry_attempt_allowed_for_target(route_ceiling, &after, &candidate, 0),
+            "looser candidate must be dispatchable under the original route ceiling"
+        );
+        assert!(
+            current_retry_attempt_allowed(route_ceiling, &after, Some(&candidate), 1),
+            "after rotation, looser candidate must authorize continuing retries"
+        );
+        assert!(
+            current_retry_attempt_allowed(route_ceiling, &after, Some(&candidate), 4),
+            "looser candidate may use its cap up to the original route ceiling"
+        );
+        assert!(
+            !current_retry_attempt_allowed(route_ceiling, &after, Some(&candidate), 5),
+            "must never raise above the original route ceiling"
+        );
+        assert_eq!(
+            effective_retry_max_retries_for_target(route_ceiling, &after, &candidate),
+            5
         );
     }
 
     #[test]
     fn retry_attempt_allowed_inherits_fallback_through_unrelated_per_port_field() {
         // A per-port entry that sets only connectTimeout must still inherit the
-        // subset/top-level maxRetries for the candidate gate (same field merge
-        // as cap_proxy_retry_for_target).
+        // subset/top-level maxRetries for the candidate gate.
         let mut inner = (*proxy_with_max_retries_override(None)).clone();
         inner.dispatch_port_overrides = Some(HashMap::from([(
             8080u16,
@@ -53047,8 +53148,8 @@ mod tests {
 
     #[test]
     fn retry_attempt_allowed_permits_same_port_retry_within_cap() {
-        // Legitimate same-port / same-subset retry under an explicit per-port
-        // cap must still be authorized while attempt < cap.
+        // Same-port retry under an explicit per-port cap: authorize while
+        // attempt < min(original_route_ceiling, target_cap).
         let mut inner = (*proxy_with_max_retries_overrides(&[(8080, 2)])).clone();
         inner.retry = Some(crate::config::types::RetryConfig {
             max_retries: 5,
@@ -53056,24 +53157,22 @@ mod tests {
         });
         let proxy = Arc::new(inner);
         let target = target_for_test(8080);
-        let capped = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&target));
-        let route_max = capped.retry.as_ref().unwrap().max_retries;
-        assert_eq!(route_max, 2);
+        let after = cap_proxy_retry_for_target(Arc::clone(&proxy), Some(&target));
+        let route_max = route_retry_ceiling(&after).unwrap();
+        assert_eq!(route_max, 5, "original route ceiling must remain on Proxy.retry");
+        assert_eq!(
+            effective_retry_max_retries_for_target(route_max, &after, &target),
+            2
+        );
         assert!(retry_attempt_allowed_for_target(
-            route_max, &capped, &target, 0
+            route_max, &after, &target, 0
         ));
         assert!(retry_attempt_allowed_for_target(
-            route_max, &capped, &target, 1
+            route_max, &after, &target, 1
         ));
         assert!(!retry_attempt_allowed_for_target(
-            route_max, &capped, &target, 2
+            route_max, &after, &target, 2
         ));
-        // A sibling port's stricter cap must not be consulted for this target.
-        assert_eq!(
-            effective_retry_max_retries_for_target(route_max, &capped, &target),
-            2,
-            "must not take a global minimum across unrelated sibling ports"
-        );
     }
 
     #[test]
@@ -53094,8 +53193,8 @@ mod tests {
     #[test]
     fn rotating_retry_families_recheck_target_retry_cap() {
         // Source-level seam: every backend retry family that can rotate targets
-        // must call the shared allocation-free helper rather than trusting only
-        // the initial-port ceiling from cap_proxy_retry_for_target.
+        // must call the shared allocation-free helper with the original route
+        // ceiling rather than a permanently lowered initial-port projection.
         let helper = "retry_attempt_allowed_for_target";
         let proxy_src = include_str!("mod.rs");
         assert!(
@@ -53103,8 +53202,16 @@ mod tests {
             "H1/H2 WebSocket, gRPC, and HTTP retry loops must call {helper}"
         );
         assert!(
+            proxy_src.contains("route_retry_ceiling"),
+            "H1/H2 path must retain the original route retry ceiling"
+        );
+        assert!(
             include_str!("../http3/server.rs").contains(helper),
             "native H3 retry loop must call {helper}"
+        );
+        assert!(
+            include_str!("../http3/server.rs").contains("route_retry_ceiling"),
+            "native H3 path must retain the original route retry ceiling"
         );
         assert!(
             include_str!("../http3/websocket.rs").contains(helper),
@@ -53286,7 +53393,12 @@ mod tests {
         let capped = cap_proxy_retry_for_target(Arc::new(with_retry), Some(&resolved));
         assert_eq!(
             capped.retry.as_ref().map(|r| r.max_retries),
-            Some(5),
+            Some(10),
+            "route ceiling must remain on Proxy.retry after the post-selection seam"
+        );
+        assert_eq!(
+            effective_retry_max_retries_for_target(10, &capped, &resolved),
+            5,
             "named-targetPort SD: maxRetries comes from the service-port policy"
         );
         // The top-level-only field is inherited on the resolved port.
