@@ -11,11 +11,12 @@ use std::path::PathBuf;
 
 /// Allocate a unique local audit fallback directory for one test `AdminState`.
 ///
-/// Uses `TempDir::into_path` so callers need not retain a guard across the
-/// many inline `AdminState { ... }` sites; leftover empty directories under the
-/// system temp root are acceptable for the suite.
+/// Uses `TempDir::keep` so callers need not retain a guard across the many
+/// inline `AdminState { ... }` sites; leftover empty directories under the
+/// system temp root are acceptable for the suite. (`TempDir::into_path` is the
+/// deprecated alias for this and would fail the `-D warnings` lint gate.)
 pub fn isolated_audit_fallback_dir() -> PathBuf {
     tempfile::TempDir::new()
         .expect("create isolated admin audit fallback tempdir")
-        .into_path()
+        .keep()
 }
