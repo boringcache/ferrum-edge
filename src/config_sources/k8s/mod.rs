@@ -4,7 +4,7 @@
 //! supported Istio + Gateway API surface into Ferrum's canonical Layer 2 model.
 //! Unsupported resources fail closed when silent translation would be unsafe.
 
-mod backend_tls_policy;
+pub(crate) mod backend_tls_policy;
 mod core;
 mod gateway_api;
 mod istio;
@@ -362,10 +362,6 @@ pub struct GatewayApiBackendTlsPolicyStatus {
     pub resolved_refs: bool,
     pub resolved_refs_reason: String,
     pub resolved_refs_message: String,
-    /// `(namespace, service name)` Service targets this policy attaches to.
-    /// The status writer derives the policy's `ancestors` from the managed
-    /// Gateways that route to these Services.
-    pub target_services: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -26,10 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to upstream `backend_tls_sni`, optional `subjectAltNames` to
   `backend_tls_san_allow_list`, and ConfigMap/Secret `caCertificateRefs` to the
   upstream CA trust posture with `backend_scheme: https`. Policy
-  `status.ancestors` is written per managed ancestor Gateway with `Accepted` /
-  `ResolvedRefs` conditions using the portable `PolicyConditionReason`
-  vocabulary, preserving third-party controllers' ancestors and stable
-  condition transition times.
+  `status.ancestors` names the targeted Service as Ferrum's single ancestor,
+  with `Accepted` / `ResolvedRefs` conditions using the portable
+  `PolicyConditionReason` vocabulary, preserving third-party controllers'
+  ancestors and stable condition transition times. The ancestor is the Service
+  and not the routing Gateways because nothing on Ferrum's overlay or verdict
+  path takes a Gateway as input, so the verdict cannot vary per Gateway; that
+  also bounds Ferrum's own contribution at one entry, so no number of Gateways
+  can approach the CRD's hard `MaxItems=16` ancestor limit. Ferrum writes policy
+  status only where a managed Gateway *effectively* routes to the targeted
+  Service — a route that materialized on an accepted parentRef, not merely one
+  naming a Gateway. When third-party controllers have filled all 16 ancestor
+  slots, Gateway API forbids adding another entry, so Ferrum publishes none and
+  the same shared predicate makes translation reject the policy: covered
+  backends fail closed with the HTTP 500 fault instead of silently originating
+  backend TLS that no status can report.
 - `wellKnownCACertificates: System` now projects the new first-class
   `system://` backend TLS trust source rather than an unset CA path. `system://`
   pins the built-in system/webpki trust anchors for every HTTP/H2/H3/gRPC

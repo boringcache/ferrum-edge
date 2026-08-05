@@ -749,8 +749,45 @@ fn condition<'a>(ancestor: &'a Value, condition_type: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing {condition_type} condition in {ancestor}"))
 }
 
+/// The one ancestorRef Ferrum ever writes for a `BackendTLSPolicy`.
+fn service_ancestor_ref(name: &str) -> Value {
+    serde_json::json!({
+        "group": "",
+        "kind": "Service",
+        "namespace": "default",
+        "name": name
+    })
+}
+
+/// `n` ancestors owned by other controllers, each with a distinct ancestorRef
+/// so the CRD's list-map key is unique.
+fn third_party_ancestors(n: usize) -> Value {
+    Value::Array(
+        (0..n)
+            .map(|index| {
+                serde_json::json!({
+                    "ancestorRef": {
+                        "group": "gateway.networking.k8s.io",
+                        "kind": "Gateway",
+                        "namespace": "default",
+                        "name": format!("other-{index:02}")
+                    },
+                    "controllerName": "example.com/other-controller",
+                    "conditions": [{
+                        "type": "Accepted",
+                        "status": "True",
+                        "reason": "Accepted",
+                        "message": "another controller's verdict",
+                        "lastTransitionTime": "2020-01-01T00:00:00Z"
+                    }]
+                })
+            })
+            .collect(),
+    )
+}
+
 #[test]
-fn backend_tls_policy_status_reports_accepted_ancestor_gateway() {
+fn backend_tls_policy_status_reports_accepted_service_ancestor() {
     let objects = vec![
         gateway_class(),
         gateway(),
@@ -763,16 +800,15 @@ fn backend_tls_policy_status_reports_accepted_ancestor_gateway() {
     assert_eq!(update.namespace, "default");
 
     let ancestors = ferrum_ancestors(&update);
-    assert_eq!(ancestors.len(), 1, "expected exactly one ancestor Gateway");
+    assert_eq!(
+        ancestors.len(),
+        1,
+        "the targeted Service is Ferrum's only ancestor"
+    );
     let ancestor = &ancestors[0];
     assert_eq!(
         ancestor.get("ancestorRef"),
-        Some(&serde_json::json!({
-            "group": "gateway.networking.k8s.io",
-            "kind": "Gateway",
-            "namespace": "default",
-            "name": "edge"
-        }))
+        Some(&service_ancestor_ref("reviews"))
     );
     let accepted = condition(ancestor, "Accepted");
     assert_eq!(accepted.get("status").and_then(Value::as_str), Some("True"));
@@ -993,8 +1029,13 @@ fn backend_tls_policy_rejects_unrepresentable_or_malformed_optional_shapes() {
     }
 }
 
+/// Seventeen managed Gateways routing to the targeted Service used to derive
+/// seventeen ancestors, be truncated to the CRD's MaxItems=16, and keep
+/// applying the policy through the Gateway that fell off the list. Ferrum's
+/// ancestor is the Service, so the Gateway count is irrelevant: one entry, no
+/// truncation, and the policy stays uniformly in effect.
 #[test]
-fn backend_tls_policy_status_never_exceeds_sixteen_ancestors() {
+fn backend_tls_policy_status_is_one_service_ancestor_regardless_of_gateway_count() {
     let mut objects = vec![gateway_class(), service("reviews", 8080, "http")];
     for index in 0..17 {
         let gateway_name = format!("edge-{index:02}");
@@ -1008,16 +1049,133 @@ fn backend_tls_policy_status_never_exceeds_sixteen_ancestors() {
     }
     objects.push(backend_tls_policy_system("reviews-tls", "reviews"));
 
-    let update = policy_status_update(&objects, "reviews-tls").expect("policy status update");
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    let covered = translated
+        .config
+        .upstreams
+        .iter()
+        .filter(|upstream| upstream.backend_tls_sni.as_deref() == Some("backend.example.com"))
+        .count();
+    assert!(covered > 0, "the policy must materialize backend TLS");
     assert_eq!(
-        update
-            .status
-            .get("ancestors")
-            .and_then(Value::as_array)
-            .expect("ancestors")
-            .len(),
-        16,
-        "Gateway API PolicyStatus has a hard MaxItems=16 contract"
+        covered,
+        translated.config.upstreams.len(),
+        "the policy stays uniformly in effect across every managed Gateway"
+    );
+
+    let update = policy_status_update(&objects, "reviews-tls").expect("policy status update");
+    let all = update
+        .status
+        .get("ancestors")
+        .and_then(Value::as_array)
+        .expect("ancestors");
+    assert_eq!(
+        all.len(),
+        1,
+        "Ferrum contributes one Service ancestor no matter how many Gateways route to it: {all:?}"
+    );
+    assert_eq!(
+        all[0].get("ancestorRef"),
+        Some(&service_ancestor_ref("reviews"))
+    );
+}
+
+/// A live status with fifteen third-party ancestors leaves exactly one free
+/// slot, which Ferrum may use — without disturbing the other controllers'
+/// entries and without exceeding the cap.
+#[test]
+fn backend_tls_policy_status_uses_the_last_free_ancestor_slot() {
+    let mut policy = backend_tls_policy_system("reviews-tls", "reviews");
+    policy.status = serde_json::json!({ "ancestors": third_party_ancestors(15) });
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        service("reviews", 8080, "http"),
+        http_route("reviews-route", "reviews", 8080),
+        policy,
+    ];
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert_eq!(
+        translated
+            .config
+            .upstreams
+            .first()
+            .expect("a representable policy still applies")
+            .backend_tls_sni
+            .as_deref(),
+        Some("backend.example.com")
+    );
+
+    let update = policy_status_update(&objects, "reviews-tls").expect("policy status update");
+    let all = update
+        .status
+        .get("ancestors")
+        .and_then(Value::as_array)
+        .expect("ancestors");
+    assert_eq!(all.len(), 16, "the cap is reached but never exceeded");
+    assert_eq!(
+        all.iter()
+            .filter(|ancestor| {
+                ancestor.get("controllerName").and_then(Value::as_str)
+                    == Some("example.com/other-controller")
+            })
+            .count(),
+        15,
+        "every third-party ancestor is preserved"
+    );
+    let ferrum = ferrum_ancestors(&update);
+    assert_eq!(ferrum.len(), 1);
+    assert_eq!(
+        ferrum[0].get("ancestorRef"),
+        Some(&service_ancestor_ref("reviews"))
+    );
+}
+
+/// A live status already carrying sixteen third-party ancestors leaves Ferrum
+/// no representable slot. Gateway API forbids adding a seventeenth entry, so
+/// Ferrum writes nothing at all — and, because status and data-plane behaviour
+/// must agree, translation rejects the policy so covered backends fail closed
+/// with the HTTP 500 fault rather than silently originating unreportable TLS.
+#[test]
+fn backend_tls_policy_with_full_third_party_ancestors_fails_closed_and_writes_no_status() {
+    let mut policy = backend_tls_policy_system("reviews-tls", "reviews");
+    policy.status = serde_json::json!({ "ancestors": third_party_ancestors(16) });
+    let objects = vec![
+        gateway_class(),
+        gateway(),
+        service("reviews", 8080, "http"),
+        http_route("reviews-route", "reviews", 8080),
+        policy,
+    ];
+
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(
+        translated
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("unimplementable")),
+        "an unrepresentable policy must be diagnosed: {:?}",
+        translated.warnings
+    );
+    assert!(
+        translated.config.upstreams.is_empty(),
+        "an unrepresentable policy must not keep applying backend TLS"
+    );
+    assert!(
+        fault_body_mentions(&translated),
+        "covered backends must fail closed with a 500 fault, never fall back to plaintext"
+    );
+    let status = translated
+        .backend_tls_policy_statuses
+        .first()
+        .expect("policy status projection");
+    assert!(!status.accepted);
+    assert_eq!(status.accepted_reason, "Invalid");
+
+    assert!(
+        policy_status_update(&objects, "reviews-tls").is_none(),
+        "Ferrum must not add a 17th ancestor, and must not disturb the 16 it does not own"
     );
 }
 
@@ -1052,8 +1210,8 @@ fn backend_tls_policy_status_reports_unrepresentable_policy_as_invalid_only() {
 
 #[test]
 fn backend_tls_policy_status_reports_target_not_found_when_service_is_absent() {
-    // The route still names `reviews` (so the managed Gateway is an ancestor),
-    // but no Service object exists, so the policy's targetRef never resolves.
+    // The route still names `reviews` (so a managed Gateway effectively routes
+    // to it), but no Service object exists, so the targetRef never resolves.
     let objects = vec![
         gateway_class(),
         gateway(),
@@ -1078,8 +1236,9 @@ fn backend_tls_policy_status_reports_target_not_found_when_service_is_absent() {
 fn backend_tls_policy_status_preserves_third_party_ancestors_and_transition_times() {
     let mut policy = backend_tls_policy_system("reviews-tls", "reviews");
     policy.metadata.generation = Some(3);
-    // Live status: one third-party ancestor Ferrum must never touch, plus a
-    // stale Ferrum ancestor whose `Accepted` value is about to change and whose
+    // Live status: one third-party ancestor Ferrum must never touch (a Gateway
+    // ancestorRef, which Ferrum itself no longer writes), plus a stale Ferrum
+    // Service ancestor whose `Accepted` value is about to change and whose
     // `ResolvedRefs` value is not.
     policy.status = serde_json::json!({
         "ancestors": [
@@ -1102,10 +1261,10 @@ fn backend_tls_policy_status_preserves_third_party_ancestors_and_transition_time
             },
             {
                 "ancestorRef": {
-                    "group": "gateway.networking.k8s.io",
-                    "kind": "Gateway",
+                    "group": "",
+                    "kind": "Service",
                     "namespace": "default",
-                    "name": "edge"
+                    "name": "reviews"
                 },
                 "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
                 "conditions": [
@@ -1151,7 +1310,7 @@ fn backend_tls_policy_status_preserves_third_party_ancestors_and_transition_time
             })
             .count(),
         1,
-        "a third-party controller's ancestor for the same Gateway must be preserved verbatim: {all:?}"
+        "a third-party controller's ancestor must be preserved verbatim, whatever shape it uses: {all:?}"
     );
 
     let ferrum = ferrum_ancestors(&update);
@@ -1178,8 +1337,8 @@ fn backend_tls_policy_status_preserves_third_party_ancestors_and_transition_time
 
 #[test]
 fn backend_tls_policy_without_managed_ancestor_gets_no_status_update() {
-    // No route reaches the Service, so no managed Gateway is an ancestor and
-    // Ferrum must not claim policy status it cannot be responsible for.
+    // No route reaches the Service, so no managed Gateway carries traffic to it
+    // and Ferrum must not claim policy status it is not responsible for.
     let objects = vec![
         gateway_class(),
         gateway(),

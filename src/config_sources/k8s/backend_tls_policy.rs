@@ -19,7 +19,7 @@
 //!   no policy covers.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -30,8 +30,8 @@ use crate::config::types::{
 use crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE;
 
 use super::{
-    GatewayApiBackendTlsPolicyStatus, K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError,
-    RouteBackend,
+    FERRUM_GATEWAY_CONTROLLER_NAME, GatewayApiBackendTlsPolicyStatus, K8sAccumulator, K8sObject,
+    K8sResourceKey, K8sTranslateError, RouteBackend,
 };
 
 /// Maximum admitted `caCertificateRefs` entries. Bounds hostile input before
@@ -46,6 +46,110 @@ const MAX_SUBJECT_ALT_NAMES: usize = 5;
 const MAX_SUPPORTED_TARGET_REFS: usize = 1;
 /// Structural CRD ceiling; also bounds raw/untrusted translation input.
 const MAX_ADMITTED_TARGET_REFS: usize = 16;
+
+/// Gateway API v1.5.1 `PolicyStatus.ancestors` is a hard MaxItems=16 list-map.
+///
+/// The spec is explicit that when the list is full an implementation MUST NOT
+/// add another entry, MUST consider the policy unimplementable for the
+/// ancestors it cannot represent, and MUST signal that on related resources.
+/// Truncating while still applying the policy is therefore not an option, so
+/// the ceiling lives here — beside translation — and the Gateway API status
+/// writer reads the same constant and the same predicates below. Splitting the
+/// two is exactly how status and data-plane behaviour drift apart.
+pub(crate) const MAX_POLICY_ANCESTORS: usize = 16;
+
+/// Ferrum's desired `status.ancestors` set for one `BackendTLSPolicy`: the core
+/// Services named by `spec.targetRefs`.
+///
+/// The ancestor is the **target Service**, not the managed Gateways that route
+/// to it, and that is a statement about Ferrum's translation rather than a
+/// convenience:
+///
+/// * a policy carries exactly one supported `targetRefs` entry
+///   (`MAX_SUPPORTED_TARGET_REFS`), always a same-namespace core Service;
+/// * the overlay decision (`lookup_for_service` → `resolve_backends_tls_policy`
+///   → `apply_to_upstream`) consumes only the policy record and the rule's
+///   backend Service identities — no Gateway is an input anywhere on that path;
+/// * the `Accepted` / `ResolvedRefs` verdict (`record_status`) is computed
+///   from the parse outcome, target resolution, Service existence, and
+///   snapshot-wide precedence — again with no Gateway input.
+///
+/// So the verdict provably cannot vary per Gateway. A per-Gateway ancestor list
+/// would be N byte-identical copies of one verdict whose length is driven by an
+/// unrelated resource count, which is what made the 16-entry ceiling reachable
+/// (and silently truncated) in the first place. The Service ancestor is exact,
+/// and bounds Ferrum's own contribution at one entry by construction.
+///
+/// This reads the raw spec rather than the translated targets deliberately: a
+/// rejected targetRef (cross-namespace, malformed) must still get a visible
+/// condition on the resource the operator named. It is bounded by
+/// `MAX_ADMITTED_TARGET_REFS` so a hostile spec cannot grow the set.
+pub(crate) fn policy_status_ancestor_services(object: &K8sObject) -> BTreeSet<(String, String)> {
+    object
+        .spec
+        .get("targetRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_ADMITTED_TARGET_REFS)
+        .filter(|target_ref| {
+            let group = target_ref
+                .get("group")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let kind = target_ref
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("Service");
+            group.is_empty() && kind == "Service"
+        })
+        .filter_map(|target_ref| {
+            let name = target_ref
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())?;
+            let namespace = target_ref
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|namespace| !namespace.is_empty())
+                .unwrap_or(object.metadata.namespace.as_str());
+            Some((namespace.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
+/// Remaining `status.ancestors` capacity for Ferrum on a live policy status.
+///
+/// Only *other* controllers' entries consume capacity: Ferrum replaces its own
+/// entries on every write, so counting them would oscillate between reconciles.
+pub(crate) fn policy_status_ancestor_capacity(status: &Value) -> usize {
+    let third_party = status
+        .get("ancestors")
+        .and_then(Value::as_array)
+        .map_or(0, |ancestors| {
+            ancestors
+                .iter()
+                .filter(|ancestor| {
+                    ancestor.get("controllerName").and_then(Value::as_str)
+                        != Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+                })
+                .count()
+        });
+    MAX_POLICY_ANCESTORS.saturating_sub(third_party)
+}
+
+/// Whether Ferrum can publish its **complete** ancestor set inside the cap.
+///
+/// Third-party controllers can legitimately fill the list. When they leave no
+/// room, Gateway API forbids adding an entry, so Ferrum cannot represent this
+/// policy at all — and a policy Ferrum cannot represent must not keep silently
+/// governing backend TLS. Translation consults this and rejects the policy
+/// (fail-closed HTTP 500 on covered backends, never plaintext); the status
+/// writer consults it and publishes no Ferrum ancestor. One predicate, so the
+/// two cannot disagree.
+pub(crate) fn policy_status_ancestors_representable(object: &K8sObject) -> bool {
+    policy_status_ancestor_services(object).len() <= policy_status_ancestor_capacity(&object.status)
+}
 
 /// Resolved BackendTLSPolicy overlay projected onto an Upstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,7 +308,7 @@ pub(super) fn collect(
             object,
             Err(&BackendTlsPolicyError::invalid(message)),
             None,
-            Vec::new(),
+            &[],
             false,
         );
         return Ok(());
@@ -220,7 +324,7 @@ pub(super) fn collect(
             object,
             Err(&BackendTlsPolicyError::invalid(message)),
             None,
-            Vec::new(),
+            &[],
             false,
         );
         return Ok(());
@@ -231,6 +335,17 @@ pub(super) fn collect(
             target_refs
                 .len()
                 .min(MAX_ADMITTED_TARGET_REFS.saturating_add(1))
+        )))
+    } else if !policy_status_ancestors_representable(object) {
+        // Gateway API MUST NOT add an ancestor beyond the 16-entry cap, so a
+        // policy whose ancestors are all spoken for by other controllers is
+        // unimplementable for Ferrum. Applying it anyway would leave the data
+        // plane originating TLS that no status can report. Fail closed here so
+        // covered backends abort with 500 (never plaintext) and the affected
+        // routes carry the visible `InvalidBackendTlsPolicy` fault.
+        Err(BackendTlsPolicyError::invalid(format!(
+            "PolicyStatus.ancestors has no capacity left for Ferrum ({} of {MAX_POLICY_ANCESTORS} entries are owned by other controllers); Gateway API forbids exceeding the ancestor limit, so this BackendTLSPolicy is unimplementable and matching backends fail closed",
+            MAX_POLICY_ANCESTORS.saturating_sub(policy_status_ancestor_capacity(&object.status))
         )))
     } else {
         match object.spec.get("options") {
@@ -334,7 +449,7 @@ pub(super) fn collect(
         object,
         parsed.as_ref().map(|_| ()),
         target_error.as_ref(),
-        target_services,
+        &target_services,
         any_target_resolved,
     );
     Ok(())
@@ -388,7 +503,7 @@ fn record_status(
     object: &K8sObject,
     parsed: Result<(), &BackendTlsPolicyError>,
     target_error: Option<&BackendTlsPolicyError>,
-    target_services: Vec<(String, String)>,
+    target_services: &[(String, String)],
     any_target_resolved: bool,
 ) {
     let targets_exist = target_services
@@ -431,7 +546,6 @@ fn record_status(
                     .unwrap_or_else(|| {
                         "All BackendTLSPolicy references accepted by Ferrum".to_string()
                     }),
-                target_services,
             }
         }
         None if !any_target_resolved => GatewayApiBackendTlsPolicyStatus {
@@ -444,7 +558,6 @@ fn record_status(
             resolved_refs: true,
             resolved_refs_reason: "ResolvedRefs".to_string(),
             resolved_refs_message: "All BackendTLSPolicy references accepted by Ferrum".to_string(),
-            target_services,
         },
         None if !targets_exist => GatewayApiBackendTlsPolicyStatus {
             policy: K8sResourceKey::from_object(object),
@@ -456,7 +569,6 @@ fn record_status(
             resolved_refs: true,
             resolved_refs_reason: "ResolvedRefs".to_string(),
             resolved_refs_message: "All BackendTLSPolicy references accepted by Ferrum".to_string(),
-            target_services,
         },
         None => GatewayApiBackendTlsPolicyStatus {
             policy: K8sResourceKey::from_object(object),
@@ -466,7 +578,6 @@ fn record_status(
             resolved_refs: true,
             resolved_refs_reason: "ResolvedRefs".to_string(),
             resolved_refs_message: "All BackendTLSPolicy references accepted by Ferrum".to_string(),
-            target_services,
         },
     };
     acc.record_backend_tls_policy_status(status);
