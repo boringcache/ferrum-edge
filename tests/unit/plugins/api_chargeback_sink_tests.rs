@@ -4042,7 +4042,8 @@ fn dead_letter_source_credit_record_repairs_insecure_mode() {
 
     let temp = tempfile::tempdir().unwrap();
     let row = padded_dead_letter_row("dl-credit-mode", 512);
-    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a").unwrap();
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a").unwrap();
     let credit_path = spool.source_credit_record_path_for_tests();
     let mut perms = fs::metadata(&credit_path).unwrap().permissions();
     perms.set_mode(0o644);
@@ -4055,12 +4056,19 @@ fn dead_letter_source_credit_record_repairs_insecure_mode() {
         .expect("an insecure but otherwise valid credit record must be repaired and claimable");
     assert!(claim.holds_source_credit_for_tests());
     assert_eq!(
-        probe_dead_letter_source_credit_bytes_for_tests(&spool, claim.claim_path_for_tests(), &claim),
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
         row.len() as u64,
         "a repaired credit record must still spend for its live claim"
     );
     let repaired = fs::metadata(&credit_path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(repaired, 0o600, "claim must restore private credit-record mode");
+    assert_eq!(
+        repaired, 0o600,
+        "claim must restore private credit-record mode"
+    );
 }
 
 /// A directory planted as the credit record is substitution of shared coordination
@@ -4134,7 +4142,10 @@ fn live_dead_letter_source_credit_blocks_reconcile_without_clearing() {
     assert!(claim.holds_source_credit_for_tests());
     let credit_path = holder.source_credit_record_path_for_tests();
     let before = fs::read(&credit_path).unwrap();
-    assert!(!before.is_empty(), "the live holder must publish a durable body");
+    assert!(
+        !before.is_empty(),
+        "the live holder must publish a durable body"
+    );
 
     let peer = SpoolManager::for_tests_with_owner(settings, &test_owner_spec("node-a"), 442)
         .expect("a peer prepare must tolerate a live credit lock without failing");
@@ -4190,7 +4201,11 @@ fn renamed_aside_dead_letter_source_credit_path_grants_no_capacity() {
     fs::write(&credit_path, b"replacement credit domain").unwrap();
 
     assert_eq!(
-        probe_dead_letter_source_credit_bytes_for_tests(&spool, claim.claim_path_for_tests(), &claim),
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
         0,
         "a replaced credit pathname must invalidate the old locked descriptor"
     );
@@ -4234,7 +4249,11 @@ fn hardlinked_replacement_dead_letter_source_credit_path_grants_no_capacity() {
     fs::hard_link(&credit_path, &alias).unwrap();
 
     assert_eq!(
-        probe_dead_letter_source_credit_bytes_for_tests(&spool, claim.claim_path_for_tests(), &claim),
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
         0,
         "a hard-linked replacement credit path must grant no capacity"
     );
@@ -4267,7 +4286,11 @@ fn directory_replacement_dead_letter_source_credit_path_grants_no_capacity() {
     fs::create_dir(&credit_path).unwrap();
 
     assert_eq!(
-        probe_dead_letter_source_credit_bytes_for_tests(&spool, claim.claim_path_for_tests(), &claim),
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
         0,
         "a directory at the credit pathname must grant no capacity"
     );
@@ -4297,7 +4320,11 @@ fn missing_dead_letter_source_credit_path_grants_no_capacity() {
     fs::rename(&credit_path, &aside).unwrap();
 
     assert_eq!(
-        probe_dead_letter_source_credit_bytes_for_tests(&spool, claim.claim_path_for_tests(), &claim),
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
         0,
         "a missing credit pathname must grant no capacity"
     );
@@ -4325,7 +4352,11 @@ fn oversized_dead_letter_source_credit_record_grants_no_capacity() {
     fs::write(spool.source_credit_record_path_for_tests(), &oversized).unwrap();
 
     assert_eq!(
-        probe_dead_letter_source_credit_bytes_for_tests(&spool, claim.claim_path_for_tests(), &claim),
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
         0,
         "an over-bound credit body must grant no capacity"
     );
@@ -4363,7 +4394,11 @@ fn invalid_json_dead_letter_source_credit_record_grants_no_capacity() {
     .unwrap();
 
     assert_eq!(
-        probe_dead_letter_source_credit_bytes_for_tests(&spool, claim.claim_path_for_tests(), &claim),
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
         0,
         "an unparseable credit body must grant no capacity"
     );
@@ -4396,7 +4431,11 @@ fn hardlinked_pinned_source_grants_no_dead_letter_credit() {
     fs::hard_link(claim.claim_path_for_tests(), &alias).unwrap();
 
     assert_eq!(
-        probe_dead_letter_source_credit_bytes_for_tests(&spool, claim.claim_path_for_tests(), &claim),
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
         0,
         "a hard-linked pinned source must not spend source-replacement capacity"
     );
@@ -4414,7 +4453,8 @@ fn hardlinked_pinned_source_grants_no_dead_letter_credit() {
 fn source_credit_bytes_refuse_mismatched_claim_path() {
     let temp = tempfile::tempdir().unwrap();
     let row = padded_dead_letter_row("dl-credit-mismatch-path", 512);
-    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a").unwrap();
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a").unwrap();
     let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FMB", &row);
     let claim = spool
         .hold_replay_claim_for_tests(&source)
@@ -4429,7 +4469,11 @@ fn source_credit_bytes_refuse_mismatched_claim_path() {
         "a reservation must not spend against a different claim pathname"
     );
     assert_eq!(
-        probe_dead_letter_source_credit_bytes_for_tests(&spool, claim.claim_path_for_tests(), &claim),
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
         row.len() as u64,
         "the live claim path must still spend"
     );
@@ -4445,7 +4489,8 @@ fn source_credit_bytes_refuse_non_utf8_claim_path() {
 
     let temp = tempfile::tempdir().unwrap();
     let row = padded_dead_letter_row("dl-credit-non-utf8", 512);
-    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a").unwrap();
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a").unwrap();
     let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FMD", &row);
     let claim = spool
         .hold_replay_claim_for_tests(&source)
@@ -4481,9 +4526,7 @@ fn replaced_pinned_source_grants_no_dead_letter_credit() {
     assert!(claim.holds_source_credit_for_tests());
 
     let claim_path = claim.claim_path_for_tests().to_path_buf();
-    let aside = spool
-        .namespace_root_for_tests()
-        .join("pinned-source.aside");
+    let aside = spool.namespace_root_for_tests().join("pinned-source.aside");
     fs::rename(&claim_path, &aside).unwrap();
     fs::write(&claim_path, padded_dead_letter_row("dl-substitute", 4096)).unwrap();
 
