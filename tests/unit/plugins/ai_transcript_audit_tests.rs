@@ -10455,6 +10455,75 @@ async fn grpc_unenrolled_method_never_stages() {
     );
 }
 
+/// `grpc_method_router` publishes `grpc_full_method` WITHOUT a leading slash
+/// (`parse_grpc_path` strips it and `grpc_method_metadata` rejoins
+/// `service + "/" + method`), while every enrollment key is normalized to
+/// `/package.Service/Method`. Preferring that metadata verbatim would make it
+/// unable to match any enrolled key while still suppressing the `ctx.path`
+/// fallback, so a proxy running both plugins would silently capture nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_full_method_metadata_without_leading_slash_still_enrolls() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    // The client path is deliberately NOT enrolled: only the router-published
+    // method (which is also what reflects a method rewrite) can select capture.
+    let mut ctx = grpc_ctx("/rewritten.Client/Path");
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "a slash-less grpc_full_method must still select the enrolled method"
+    );
+    assert!(plugin.should_buffer_response_body(&ctx));
+
+    let headers = grpc_headers();
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+    let resp = grpc_frame(&hello_response_bytes("ok"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "an enrolled router-rewritten method must stage an audit candidate"
+    );
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &resp)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "enrolled gRPC capture must not be silently disabled, got {records:?}"
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        request_body.contains("/test.Greeter/SayHello"),
+        "the excerpt must report the normalized enrolled method: {request_body}"
+    );
+    assert!(
+        !request_body.contains("agent@example.com"),
+        "captured excerpt leaked an email: {request_body}"
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // gRPC name-based redaction parity with the HTTP JSON contract
 // ══════════════════════════════════════════════════════════════════════
@@ -10824,5 +10893,274 @@ async fn grpc_name_redaction_covers_ancestors_repeats_and_embedded_json() {
     assert!(
         excerpt.contains("summarize the ticket"),
         "a benign string field must still be captured: {excerpt}"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// gRPC walk-budget accounting
+// ══════════════════════════════════════════════════════════════════════
+//
+// Two more hand-encoded `FileDescriptorSet`s, built with the same wire-shape
+// helpers as above:
+//
+// ```proto
+// syntax = "proto3";
+// package wide;
+// message WideRequest { string f0 = 1; /* … */ string f39 = 40; }
+// message NarrowAck { string status = 1; }
+//
+// package deep;
+// message Deep0 { Deep1 next = 1; } /* … */ message Deep39 { string leaf = 1; }
+// ```
+
+/// Comfortably above the walk budget's 32-level depth ceiling, so a leaked
+/// level per miss exhausts it before the last configured path is read.
+const WIDE_REQUEST_FIELD_COUNT: usize = 40;
+
+/// Deeper than the same ceiling, so the walk cannot clear the tree.
+const DEEP_NEST_LEVELS: usize = 40;
+
+fn wide_descriptor_set() -> Vec<u8> {
+    let request_fields: Vec<Vec<u8>> = (0..WIDE_REQUEST_FIELD_COUNT)
+        .map(|index| {
+            pb3_field(
+                &format!("f{index}"),
+                index as u32 + 1,
+                PB3_LABEL_OPTIONAL,
+                PB3_TYPE_STRING,
+            )
+        })
+        .collect();
+    let request = pb3_message("WideRequest", &request_fields);
+    let status = pb3_field("status", 1, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let ack = pb3_message("NarrowAck", &[status]);
+
+    let mut file = pb3_str_field(1, "wide.proto");
+    file.extend(pb3_str_field(2, "wide"));
+    for message in [request, ack] {
+        file.extend(pb3_len_field(4, &message));
+    }
+    file.extend(pb3_str_field(12, "proto3"));
+    pb3_len_field(1, &file)
+}
+
+fn deep_descriptor_set() -> Vec<u8> {
+    let mut messages = Vec::with_capacity(DEEP_NEST_LEVELS);
+    for level in 0..DEEP_NEST_LEVELS - 1 {
+        let next = pb3_message_field(
+            "next",
+            1,
+            PB3_LABEL_OPTIONAL,
+            &format!(".deep.Deep{}", level + 1),
+        );
+        messages.push(pb3_message(&format!("Deep{level}"), &[next]));
+    }
+    let leaf = pb3_field("leaf", 1, PB3_LABEL_OPTIONAL, PB3_TYPE_STRING);
+    let innermost = format!("Deep{}", DEEP_NEST_LEVELS - 1);
+    messages.push(pb3_message(&innermost, &[leaf]));
+
+    let mut file = pb3_str_field(1, "deep.proto");
+    file.extend(pb3_str_field(2, "deep"));
+    for message in &messages {
+        file.extend(pb3_len_field(4, message));
+    }
+    file.extend(pb3_str_field(12, "proto3"));
+    pb3_len_field(1, &file)
+}
+
+fn write_descriptor(name: &str, bytes: Vec<u8>) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(name);
+    std::fs::write(&path, bytes).expect("write pb set");
+    let path = path.to_string_lossy().to_string();
+    (dir, path)
+}
+
+fn wide_request_bytes(descriptor_path: &str, first_value: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(descriptor_path).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("wide.WideRequest").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("f0", Value::String(first_value.to_string()));
+    msg.encode_to_vec()
+}
+
+fn narrow_ack_bytes(descriptor_path: &str, status: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(descriptor_path).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("wide.NarrowAck").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("status", Value::String(status.to_string()));
+    msg.encode_to_vec()
+}
+
+fn deep_message_bytes(descriptor_path: &str, leaf: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(descriptor_path).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let innermost = pool
+        .get_message_by_name(&format!("deep.Deep{}", DEEP_NEST_LEVELS - 1))
+        .expect("innermost descriptor");
+    let mut current = DynamicMessage::new(innermost);
+    current.set_field_by_name("leaf", Value::String(leaf.to_string()));
+    for level in (0..DEEP_NEST_LEVELS - 1).rev() {
+        let descriptor = pool
+            .get_message_by_name(&format!("deep.Deep{level}"))
+            .expect("nested descriptor");
+        let mut outer = DynamicMessage::new(descriptor);
+        outer.set_field_by_name("next", Value::Message(current));
+        current = outer;
+    }
+    current.encode_to_vec()
+}
+
+/// A `text_fields` path only has to resolve against ONE of the method's roots,
+/// so configuring request-only paths is legitimate. Each of those is an
+/// ordinary miss while the RESPONSE is shaped; if a miss leaked a level of the
+/// frame's shared walk budget, the later `status` path would be silently
+/// dropped and the excerpt would export a partial `fields` object with no
+/// omission reason at all.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_request_only_text_fields_do_not_exhaust_the_response_walk_budget() {
+    let (_dir, descriptor_path) = write_descriptor("wide.bin", wide_descriptor_set());
+    let mut text_fields: Vec<String> = (0..WIDE_REQUEST_FIELD_COUNT)
+        .map(|index| format!("f{index}"))
+        .collect();
+    text_fields.push("status".to_string());
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "redaction": { "builtins": ["email"], "hash_redacted_values": false },
+                "grpc": {
+                    "descriptor_path": descriptor_path.as_str(),
+                    "methods": {
+                        "/wide.Sink/Ingest": {
+                            "request_type": "wide.WideRequest",
+                            "response_type": "wide.NarrowAck",
+                            "text_fields": text_fields
+                        }
+                    }
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid wide grpc config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/wide.Sink/Ingest");
+    let headers = grpc_headers();
+    let request = grpc_frame(&wide_request_bytes(&descriptor_path, "summarize"));
+    let response = grpc_frame(&narrow_ack_bytes(&descriptor_path, "walk-budget-intact"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &request)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &response)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "expected one audit record, got {records:?}"
+    );
+    assert_eq!(
+        records[0]
+            .get("response_body_omitted_reason")
+            .and_then(Value::as_str),
+        None,
+        "the response excerpt must not be omitted here: {}",
+        records[0]
+    );
+    let response_body = records[0]
+        .get("response_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        response_body.contains("walk-budget-intact"),
+        "request-only text_fields must not leak walk depth and silently drop a \
+         configured response field: {response_body}"
+    );
+}
+
+/// Exhausting the node/depth ceiling is not a decode failure. Both fail closed,
+/// but the compiled-in omission reason is the operator's only evidence of WHY,
+/// so a scan-ceiling stop must say `grpc_scan_limit`.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_walk_ceiling_omits_with_the_scan_limit_reason() {
+    let (_dir, descriptor_path) = write_descriptor("deep.bin", deep_descriptor_set());
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "redaction": { "builtins": ["email"], "hash_redacted_values": false },
+                "grpc": {
+                    "descriptor_path": descriptor_path.as_str(),
+                    "methods": {
+                        "/deep.Sink/Ingest": {
+                            "request_type": "deep.Deep0",
+                            "response_type": "deep.Deep0"
+                        }
+                    }
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid deep grpc config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/deep.Sink/Ingest");
+    let headers = grpc_headers();
+    let nested = grpc_frame(&deep_message_bytes(&descriptor_path, "leaf value"));
+    // An empty `Deep0` keeps the response side an ordinary shallow capture, so
+    // only the request exercises the walk ceiling.
+    let shallow = grpc_frame(&[]);
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &nested)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &shallow)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "expected one audit record, got {records:?}"
+    );
+    assert_eq!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
+        Some("grpc_scan_limit"),
+        "a walk-ceiling stop is not a decode error: {}",
+        records[0]
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        request_body.is_null(),
+        "an omitted excerpt must export no partial body: {request_body}"
     );
 }

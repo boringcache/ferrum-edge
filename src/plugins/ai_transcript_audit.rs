@@ -2705,9 +2705,24 @@ impl AiTranscriptAudit {
     /// Prefers the finalized `grpc_full_method` published by
     /// `grpc_method_router` (which reflects a method rewrite) and falls back
     /// to the request path.
+    ///
+    /// `grpc_method_router` publishes `package.Service/Method` WITHOUT a leading
+    /// slash, while every enrollment key is normalized to
+    /// `/package.Service/Method`, so the metadata value must be slash-prefixed
+    /// here exactly as `ai_response_guard` and `body_validator` do. Skipping the
+    /// normalization would make the metadata value unable to match any enrolled
+    /// key while still suppressing the `ctx.path` fallback — every enrolled gRPC
+    /// call would silently escape capture whenever `grpc_method_router` is also
+    /// configured. Empty metadata still falls back to the request path.
     fn grpc_method_path(ctx: &RequestContext) -> Cow<'_, str> {
         match ctx.metadata.get("grpc_full_method") {
-            Some(method) if !method.is_empty() => Cow::Borrowed(method.as_str()),
+            Some(method) if method.starts_with('/') => Cow::Borrowed(method.as_str()),
+            Some(method) if !method.is_empty() => {
+                let mut path = String::with_capacity(method.len() + 1);
+                path.push('/');
+                path.push_str(method);
+                Cow::Owned(path)
+            }
             _ => Cow::Borrowed(ctx.path.as_str()),
         }
     }
@@ -2999,7 +3014,13 @@ impl AiTranscriptAudit {
             GrpcBodyDirection::Request => self.limits.max_request_bytes,
             GrpcBodyDirection::Response => self.limits.max_response_bytes,
         };
-        let scan_budget = self.limits.max_redaction_scan_bytes.max(max_bytes);
+        // `limits.max_redaction_scan_bytes` is the operator's ceiling on how
+        // many bytes this plugin is willing to decode and walk, exactly as on
+        // the HTTP path. It is an ADDITIONAL cap on the framed payload, never
+        // raised to the direction's excerpt cap: an operator who lowers it
+        // below `max_request_bytes`/`max_response_bytes` gets an explicit
+        // `grpc_scan_limit` omission rather than a larger scan than configured.
+        let scan_budget = self.limits.max_redaction_scan_bytes;
 
         let frames = match parse_grpc_frames(
             body,
@@ -3027,14 +3048,24 @@ impl AiTranscriptAudit {
                 Err(_) => return ShapedBody::omitted(OMIT_REASON_GRPC_DECODE),
             };
             let mut budget = GrpcWalkBudget::new();
-            if has_unknown_fields(&decoded, &mut budget) {
-                return ShapedBody::omitted(OMIT_REASON_GRPC_DECODE);
+            match has_unknown_fields(&decoded, &mut budget) {
+                Ok(false) => {}
+                Ok(true) => return ShapedBody::omitted(OMIT_REASON_GRPC_DECODE),
+                // The tree was never cleared, so this is a scan-ceiling
+                // omission and not a decode failure.
+                Err(()) => return ShapedBody::omitted(OMIT_REASON_GRPC_SCAN_LIMIT),
             }
             let mut fields = serde_json::Map::new();
             let mut walk_budget = GrpcWalkBudget::new();
             if let Some(paths) = method.text_fields.as_ref() {
                 for path in paths {
-                    if let Some(value) = read_text_field(&decoded, path, &mut walk_budget) {
+                    // A budget exhaustion would drop the remaining configured
+                    // fields, so it omits the whole excerpt with a reason
+                    // rather than exporting a silent partial capture.
+                    let Ok(found) = read_text_field(&decoded, path, &mut walk_budget) else {
+                        return ShapedBody::omitted(OMIT_REASON_GRPC_SCAN_LIMIT);
+                    };
+                    if let Some(value) = found {
                         let sensitive = sensitive_grpc_field_path(path);
                         let key = path.join(".");
                         let exported = self.export_grpc_string(sensitive, &value);
@@ -7344,12 +7375,29 @@ impl GrpcWalkBudget {
         Self { depth: 0, nodes: 0 }
     }
 
+    /// Runs `walk` one nesting level deeper, charging the level's node and
+    /// releasing the depth on EVERY exit path taken by `walk`.
+    ///
+    /// This is the only way to descend: `enter`/`leave` are deliberately not
+    /// exposed separately, because an early `return` between a manual pair
+    /// leaks depth for the rest of the frame's walk and can silently exhaust
+    /// the ceiling (issue #3304 follow-up).
+    fn scoped<T>(&mut self, walk: impl FnOnce(&mut Self) -> T) -> Result<T, ()> {
+        self.enter()?;
+        let result = walk(self);
+        self.leave();
+        Ok(result)
+    }
+
+    /// Charges the level's node BEFORE taking the depth, so a refused `enter`
+    /// never leaves a level behind for a caller that owes no `leave`.
     fn enter(&mut self) -> Result<(), ()> {
         if self.depth >= GRPC_MAX_MESSAGE_DEPTH {
             return Err(());
         }
+        self.charge()?;
         self.depth += 1;
-        self.charge()
+        Ok(())
     }
 
     fn leave(&mut self) {
@@ -7365,40 +7413,53 @@ impl GrpcWalkBudget {
     }
 }
 
-fn has_unknown_fields(message: &DynamicMessage, budget: &mut GrpcWalkBudget) -> bool {
-    if budget.enter().is_err() {
-        return true;
-    }
-    if message.unknown_fields().next().is_some() {
-        return true;
-    }
-    for (_, value) in message.fields() {
-        if value_has_unknown_fields(value, budget) {
-            return true;
+/// `Ok(true)` means the message tree carries unknown fields (so no excerpt may
+/// be exported); `Err(())` means the node/depth ceiling was reached before the
+/// tree could be cleared. Both fail closed, but they carry different omission
+/// reasons, so the caller must not collapse them.
+fn has_unknown_fields(message: &DynamicMessage, budget: &mut GrpcWalkBudget) -> Result<bool, ()> {
+    budget.scoped(|budget| {
+        if message.unknown_fields().next().is_some() {
+            return Ok(true);
         }
-    }
-    for (_, value) in message.extensions() {
-        if value_has_unknown_fields(value, budget) {
-            return true;
+        for (_, value) in message.fields() {
+            if value_has_unknown_fields(value, budget)? {
+                return Ok(true);
+            }
         }
-    }
-    budget.leave();
-    false
+        for (_, value) in message.extensions() {
+            if value_has_unknown_fields(value, budget)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })?
 }
 
-fn value_has_unknown_fields(value: &ProtobufValue, budget: &mut GrpcWalkBudget) -> bool {
-    if budget.charge().is_err() {
-        return true;
-    }
+fn value_has_unknown_fields(
+    value: &ProtobufValue,
+    budget: &mut GrpcWalkBudget,
+) -> Result<bool, ()> {
+    budget.charge()?;
     match value {
         ProtobufValue::Message(message) => has_unknown_fields(message, budget),
-        ProtobufValue::List(items) => items
-            .iter()
-            .any(|item| value_has_unknown_fields(item, budget)),
-        ProtobufValue::Map(entries) => entries
-            .values()
-            .any(|entry| value_has_unknown_fields(entry, budget)),
-        _ => false,
+        ProtobufValue::List(items) => {
+            for item in items {
+                if value_has_unknown_fields(item, budget)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        ProtobufValue::Map(entries) => {
+            for entry in entries.values() {
+                if value_has_unknown_fields(entry, budget)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
     }
 }
 
@@ -7449,23 +7510,23 @@ fn collect_message_strings(
     out: &mut Vec<GrpcCapturedString>,
     budget: &mut GrpcWalkBudget,
 ) -> Result<(), ()> {
-    budget.enter()?;
-    for (field, value) in message.fields() {
-        let name = field.name();
-        let nested = sensitive || sensitive_json_field(name);
-        path.push(name.to_string());
-        collect_string_value(value, path, nested, out, budget)?;
-        path.pop();
-    }
-    for (field, value) in message.extensions() {
-        let name = field.name();
-        let nested = sensitive || sensitive_json_field(name);
-        path.push(name.to_string());
-        collect_string_value(value, path, nested, out, budget)?;
-        path.pop();
-    }
-    budget.leave();
-    Ok(())
+    budget.scoped(|budget| {
+        for (field, value) in message.fields() {
+            let name = field.name();
+            let nested = sensitive || sensitive_json_field(name);
+            path.push(name.to_string());
+            collect_string_value(value, path, nested, out, budget)?;
+            path.pop();
+        }
+        for (field, value) in message.extensions() {
+            let name = field.name();
+            let nested = sensitive || sensitive_json_field(name);
+            path.push(name.to_string());
+            collect_string_value(value, path, nested, out, budget)?;
+            path.pop();
+        }
+        Ok(())
+    })?
 }
 
 fn collect_string_value(
@@ -7516,11 +7577,16 @@ fn collect_string_value(
     Ok(())
 }
 
+/// `Ok(None)` means this direction's message simply does not carry the path —
+/// an ordinary miss for a `text_fields` entry that only resolves against the
+/// other root. `Err(())` means the frame's shared walk budget was exhausted, so
+/// the remaining configured fields cannot be read and the excerpt must carry an
+/// explicit omission reason instead of a silent partial `fields` object.
 fn read_text_field(
     message: &DynamicMessage,
     path: &[String],
     budget: &mut GrpcWalkBudget,
-) -> Option<String> {
+) -> Result<Option<String>, ()> {
     read_text_field_at(message, path, budget)
 }
 
@@ -7528,44 +7594,43 @@ fn read_text_field_at(
     message: &DynamicMessage,
     path: &[String],
     budget: &mut GrpcWalkBudget,
-) -> Option<String> {
-    if budget.enter().is_err() || path.is_empty() {
-        return None;
+) -> Result<Option<String>, ()> {
+    if path.is_empty() {
+        return Ok(None);
     }
-    let field = message.descriptor().get_field_by_name(&path[0])?;
-    if !message.has_field(&field) {
-        budget.leave();
-        return None;
-    }
-    let value = message.get_field(&field);
-    let result = read_text_value(&value, &path[1..], budget);
-    budget.leave();
-    result
+    budget.scoped(|budget| {
+        let Some(field) = message.descriptor().get_field_by_name(&path[0]) else {
+            return Ok(None);
+        };
+        if !message.has_field(&field) {
+            return Ok(None);
+        }
+        let value = message.get_field(&field);
+        read_text_value(&value, &path[1..], budget)
+    })?
 }
 
 fn read_text_value(
     value: &ProtobufValue,
     rest: &[String],
     budget: &mut GrpcWalkBudget,
-) -> Option<String> {
-    if budget.charge().is_err() {
-        return None;
-    }
+) -> Result<Option<String>, ()> {
+    budget.charge()?;
     match value {
-        ProtobufValue::String(text) if rest.is_empty() => Some(text.to_string()),
+        ProtobufValue::String(text) if rest.is_empty() => Ok(Some(text.to_string())),
         ProtobufValue::Message(message) if !rest.is_empty() => {
             read_text_field_at(message, rest, budget)
         }
         ProtobufValue::List(items) => {
             // Prefer the first matching string for a repeated path leaf.
             for item in items {
-                if let Some(found) = read_text_value(item, rest, budget) {
-                    return Some(found);
+                if let Some(found) = read_text_value(item, rest, budget)? {
+                    return Ok(Some(found));
                 }
             }
-            None
+            Ok(None)
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
