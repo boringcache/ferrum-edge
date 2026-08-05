@@ -2759,6 +2759,177 @@ fn mesh_tier3_l4_virtual_service_source_labels_materialize_stream_match() {
     );
 }
 
+fn public_l4_visibility_fixture(
+    export_to: Option<Value>,
+    extra_namespaces: usize,
+) -> (Vec<K8sObject>, K8sTranslationOptions) {
+    let mut spec = serde_json::json!({
+        "hosts": ["db.example.com"],
+        "tcp": [{
+            "match": [{"port": 3306}],
+            "route": [{"destination": {
+                "host": "mysql.default.svc.cluster.local",
+                "port": {"number": 3306}
+            }}]
+        }]
+    });
+    if let Some(export_to) = export_to {
+        spec["exportTo"] = export_to;
+    }
+
+    let mut objects = vec![object("VirtualService", spec)];
+    for index in 0..extra_namespaces {
+        let mut observed = object("ConfigMap", serde_json::json!({}));
+        observed.metadata.name = format!("observed-{index}");
+        observed.metadata.namespace = format!("namespace-{index}");
+        objects.push(observed);
+    }
+
+    // Watch-all so ConfigMaps outside `default` widen `known_namespaces` the
+    // same way a cluster-scoped Kubernetes source does in production.
+    (objects, options().with_source_namespaces(Vec::new()))
+}
+
+#[test]
+fn mesh_l4_virtual_service_public_visibility_caps_projected_proxies() {
+    use ferrum_edge::config_sources::k8s::MAX_PROJECTED_L4_PROXIES;
+
+    for export_to in [
+        None,
+        Some(serde_json::json!([])),
+        Some(serde_json::json!(["*"])),
+    ] {
+        // Boundary: VS namespace (`default`) plus MAX-1 observed namespaces
+        // yields exactly MAX projected proxies and must succeed.
+        let (objects, opts) =
+            public_l4_visibility_fixture(export_to.clone(), MAX_PROJECTED_L4_PROXIES - 1);
+        let translated = translate_k8s_objects(&objects, opts)
+            .expect("public L4 visibility at the projected proxy cap must translate");
+        let projected = translated
+            .config
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.listen_port == Some(3306))
+            .count();
+        assert_eq!(
+            projected, MAX_PROJECTED_L4_PROXIES,
+            "at-cap public projection must materialize exactly {MAX_PROJECTED_L4_PROXIES} proxies"
+        );
+        assert_eq!(
+            translated.config.known_namespaces.len(),
+            MAX_PROJECTED_L4_PROXIES,
+            "fixture must observe exactly {MAX_PROJECTED_L4_PROXIES} namespaces or the cap is vacuous"
+        );
+
+        // Breach: one more observed namespace pushes projection over the cap.
+        let (objects, opts) = public_l4_visibility_fixture(export_to, MAX_PROJECTED_L4_PROXIES);
+        let error = translate_k8s_objects(&objects, opts)
+            .expect_err("public L4 visibility must not exceed the projected proxy cap");
+        let message = format!("{error}");
+        assert!(
+            message.contains("may project at most"),
+            "projection-specific diagnostic required: {error}"
+        );
+        assert!(
+            !message.contains("candidate stream proxies"),
+            "must not report the candidate-cap diagnostic: {error}"
+        );
+    }
+}
+
+/// Per-VS L4 candidate fan-out (`tcp[]`/`tls[]` matches → stream proxies) is
+/// capped independently of the environmental namespace projection product.
+#[test]
+fn mesh_l4_virtual_service_caps_candidate_proxies_before_projection() {
+    use ferrum_edge::config_sources::k8s::{MAX_L4_CANDIDATE_PROXIES, MAX_PROJECTED_L4_PROXIES};
+
+    // Namespace-local export keeps the projection product equal to the
+    // candidate count so this test cannot accidentally trip the product cap.
+    // Both operands are constants, so this is a compile-time assertion; a
+    // plain runtime `assert!` trips `clippy::assertions_on_constants`.
+    const {
+        assert!(
+            MAX_L4_CANDIDATE_PROXIES <= MAX_PROJECTED_L4_PROXIES,
+            "candidate ceiling must fit under the projection backstop for this fixture"
+        );
+    }
+
+    let at_cap_matches: Vec<Value> = (0..MAX_L4_CANDIDATE_PROXIES)
+        .map(|index| {
+            serde_json::json!({
+                "port": 10000 + index
+            })
+        })
+        .collect();
+    let translated = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "exportTo": ["."],
+                "tcp": [{
+                    "match": at_cap_matches,
+                    "route": [{"destination": {
+                        "host": "mysql.default.svc.cluster.local",
+                        "port": {"number": 3306}
+                    }}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("at-cap L4 candidate count must translate");
+    let projected = translated
+        .config
+        .proxies
+        .iter()
+        .filter(|proxy| {
+            proxy.listen_port.is_some_and(|port| {
+                (10000..10000 + MAX_L4_CANDIDATE_PROXIES as u16).contains(&port)
+            })
+        })
+        .count();
+    assert_eq!(
+        projected, MAX_L4_CANDIDATE_PROXIES,
+        "at-cap candidate fan-out must materialize exactly {MAX_L4_CANDIDATE_PROXIES} proxies"
+    );
+
+    let over_cap_matches: Vec<Value> = (0..=MAX_L4_CANDIDATE_PROXIES)
+        .map(|index| {
+            serde_json::json!({
+                "port": 10000 + index
+            })
+        })
+        .collect();
+    let error = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "exportTo": ["."],
+                "tcp": [{
+                    "match": over_cap_matches,
+                    "route": [{"destination": {
+                        "host": "mysql.default.svc.cluster.local",
+                        "port": {"number": 3306}
+                    }}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect_err("L4 candidate fan-out must not exceed the candidate proxy cap");
+    let message = format!("{error}");
+    assert!(
+        message.contains("candidate stream proxies"),
+        "candidate-cap diagnostic required: {error}"
+    );
+    assert!(
+        !message.contains("may project at most"),
+        "must not report the projection-cap diagnostic: {error}"
+    );
+}
+
 #[test]
 fn mesh_l4_virtual_service_top_level_gateways_is_strict() {
     for invalid_gateways in [

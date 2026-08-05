@@ -2413,6 +2413,39 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
     Ok(errors)
 }
 
+/// Load every plugin config currently persisted in `namespace` (paginated).
+///
+/// Backend-TLS-SNI / direct-H2 admission on reverse writes (Upstream / Proxy
+/// `after_validate`) must see the same effective plugins PluginCache would
+/// after a successful DB write (associations, globals, enabled/shadow). Do not
+/// trust a potentially stale GatewayConfig cache, and never silently fall back
+/// to an empty list on DB failure — that would skip request-body-buffering
+/// conflicts.
+async fn load_namespace_plugin_configs(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+) -> Result<Vec<PluginConfig>, AfterValidateError> {
+    let mut plugins = Vec::new();
+    let mut offset = 0_i64;
+    const PAGE_SIZE: i64 = 1_000;
+    loop {
+        let page = db
+            .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        let items_len = page.items.len() as i64;
+        plugins.extend(page.items);
+        if items_len == 0 {
+            break;
+        }
+        offset += items_len;
+        if offset >= page.total {
+            break;
+        }
+    }
+    Ok(plugins)
+}
+
 /// The one redacted plugin-configuration projection.
 ///
 /// Every non-admin read, every management audit record, and every diagnostic

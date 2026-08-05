@@ -510,6 +510,8 @@ enum CrossProtocolRetryTarget {
     Unchanged,
     Selected(Arc<UpstreamTarget>, String, String),
     BackendPathMismatch,
+    /// Candidate's DestinationRule `maxRetries` does not authorize this attempt.
+    RetryBudgetExceeded,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -525,6 +527,8 @@ fn select_next_cross_protocol_retry_target(
     query_string: &str,
     client_ip: &str,
     proxy_headers: &HashMap<String, String>,
+    route_max_retries: u32,
+    attempt: u32,
 ) -> CrossProtocolRetryTarget {
     let (Some(prev_target), Some(hash_key)) = (current_target, lb_hash_key) else {
         return CrossProtocolRetryTarget::Unchanged;
@@ -558,6 +562,18 @@ fn select_next_cross_protocol_retry_target(
             "Aborting cross-protocol retry because the candidate would change the authorized backend method path"
         );
         return CrossProtocolRetryTarget::BackendPathMismatch;
+    }
+
+    // Mixed-port rotation can land on a stricter DestinationRule maxRetries
+    // (including zero). Refuse before any intermediate outcome is charged to
+    // a candidate that will never be dispatched.
+    if !crate::proxy::retry_attempt_allowed_for_target(route_max_retries, proxy, &next, attempt) {
+        warn!(
+            proxy_id = %proxy.id,
+            attempt = attempt,
+            "Aborting cross-protocol retry because the candidate exceeds its DestinationRule maxRetries cap"
+        );
+        return CrossProtocolRetryTarget::RetryBudgetExceeded;
     }
 
     let next_url = crate::proxy::build_backend_url_with_target(
@@ -1205,7 +1221,8 @@ async fn run_plain_attempt_local_policy_or_reject<'a, S>(
     backend_start: Instant,
     current_url: &str,
     effective_host: &str,
-    dispatch_port: u16,
+    dispatch_dial_port: u16,
+    dispatch_policy_port: u16,
     bytes_sent: u64,
     halt_request_body_before_reject: bool,
     ctx: &mut RequestContext,
@@ -1392,15 +1409,26 @@ where
         None
     };
 
-    let pending_cap =
-        crate::proxy::resolve_backend_http1_max_pending_requests(dispatch_proxy, dispatch_port)
-            .filter(|_| {
-                crate::proxy::reqwest_dispatch_is_http1_only(state, dispatch_proxy, current_target)
-            });
-    match state
-        .backend_pending_limit
-        .try_acquire(effective_host, dispatch_port, pending_cap)
-    {
+    // Cap lookup AND lane key use the DR policy port (`dispatch_policy_port`),
+    // never the dial port — same identity `proxy_to_backend` /
+    // `proxy_to_backend_retry` derive via `dispatch_policy_port_for_target`. A
+    // `targetPort`-remapped Service (80 → 8080) otherwise gives the H3 bridge
+    // its own `host|8080|subset` lane while H1/H2 counts in `host|80|subset`,
+    // so a cap of N admits 2N combined, and an explicit
+    // `portLevelSettings[{port: 80}]` cap would be invisible here.
+    let pending_cap = crate::proxy::resolve_backend_http1_max_pending_requests(
+        dispatch_proxy,
+        dispatch_policy_port,
+    )
+    .filter(|_| {
+        crate::proxy::reqwest_dispatch_is_http1_only(state, dispatch_proxy, current_target)
+    });
+    match state.backend_pending_limit.try_acquire_for_subset(
+        effective_host,
+        dispatch_policy_port,
+        dispatch_proxy.upstream_subset.as_deref(),
+        pending_cap,
+    ) {
         Ok(pending_slot) => Ok(Ok(PlainAttemptDispatch {
             pending_slot,
             sni_dial,
@@ -1409,9 +1437,9 @@ where
             warn!(
                 proxy_id = %dispatch_proxy.id,
                 backend_host = %effective_host,
-                backend_port = dispatch_port,
-                pending_requests = limit.current,
-                max_pending_requests = limit.cap,
+                backend_port = dispatch_dial_port,
+                in_flight_requests = limit.current,
+                max_in_flight_requests = limit.cap,
                 "Shedding cross-protocol H3→HTTP request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
             );
             record_backend_outcome_no_conn_end(
@@ -1435,7 +1463,7 @@ where
                 stream,
                 ctx,
                 StatusCode::SERVICE_UNAVAILABLE,
-                r#"{"error":"Upstream pending request queue full"}"#,
+                r#"{"error":"HTTP/1.1 in-flight request limit reached"}"#,
                 None,
                 backend_start,
                 bytes_sent,
@@ -1742,6 +1770,10 @@ where
     } else {
         None
     };
+    // Absolute route ceiling retained on Proxy.retry (never permanently lowered
+    // to the initial target's DestinationRule cap). Retry authorization uses
+    // min(route_retry_ceiling, current_or_candidate_cap).
+    let route_retry_ceiling = crate::proxy::route_retry_ceiling(proxy).unwrap_or(0);
     let should_buffer_response = retry_config.is_some()
         || !crate::proxy::should_stream_response_body(
             proxy,
@@ -1776,10 +1808,18 @@ where
                         .as_deref()
                         .map(|t| t.host.as_str())
                         .unwrap_or(dispatch_proxy.backend_host.as_str());
-                    let dispatch_port = current_target
+                    let dispatch_dial_port = current_target
                         .as_deref()
                         .map(|t| t.port)
                         .unwrap_or(dispatch_proxy.backend_port);
+                    // DR policy identity for this attempt: the declared Service
+                    // port under `targetPort` remapping. Shared with
+                    // `proxy_to_backend`/`proxy_to_backend_retry` so all three
+                    // frontends admit H1 requests in ONE lane per destination.
+                    let dispatch_policy_port = crate::proxy::dispatch_policy_port_for_target(
+                        dispatch_proxy,
+                        current_target.as_deref(),
+                    );
 
                     // Also resolves this attempt's backend-TLS-SNI dial, and
                     // fails closed (502, `gateway-error-reason`) when a
@@ -1800,7 +1840,8 @@ where
                         backend_start,
                         &current_url,
                         effective_host,
-                        dispatch_port,
+                        dispatch_dial_port,
+                        dispatch_policy_port,
                         bytes_sent,
                         false,
                         ctx,
@@ -1973,6 +2014,12 @@ where
                                     &attempt_result,
                                     attempt,
                                 )
+                                && crate::proxy::current_retry_attempt_allowed(
+                                    route_retry_ceiling,
+                                    proxy,
+                                    current_target.as_deref(),
+                                    attempt,
+                                )
                             {
                                 let retry_target = select_next_cross_protocol_retry_target(
                                     state,
@@ -1986,10 +2033,13 @@ where
                                     query_string,
                                     client_ip,
                                     proxy_headers,
+                                    route_retry_ceiling,
+                                    attempt,
                                 );
                                 if !matches!(
                                     &retry_target,
                                     CrossProtocolRetryTarget::BackendPathMismatch
+                                        | CrossProtocolRetryTarget::RetryBudgetExceeded
                                 ) {
                                     record_cross_protocol_backend_admission_outcome(
                                         &mut backend_admission_permits,
@@ -2070,6 +2120,12 @@ where
                                     &attempt_result,
                                     attempt,
                                 )
+                                && crate::proxy::current_retry_attempt_allowed(
+                                    route_retry_ceiling,
+                                    proxy,
+                                    current_target.as_deref(),
+                                    attempt,
+                                )
                             {
                                 let retry_target = select_next_cross_protocol_retry_target(
                                     state,
@@ -2083,10 +2139,13 @@ where
                                     query_string,
                                     client_ip,
                                     proxy_headers,
+                                    route_retry_ceiling,
+                                    attempt,
                                 );
                                 if !matches!(
                                     &retry_target,
                                     CrossProtocolRetryTarget::BackendPathMismatch
+                                        | CrossProtocolRetryTarget::RetryBudgetExceeded
                                 ) {
                                     record_cross_protocol_backend_admission_outcome(
                                         &mut backend_admission_permits,
@@ -2252,10 +2311,17 @@ where
                     .as_deref()
                     .map(|t| t.host.as_str())
                     .unwrap_or(dispatch_proxy.backend_host.as_str());
-                let dispatch_port = current_target
+                let dispatch_dial_port = current_target
                     .as_deref()
                     .map(|t| t.port)
                     .unwrap_or(dispatch_proxy.backend_port);
+                // Same DR policy-port identity the H1/H2 path uses, so the
+                // streaming bridge shares one H1 admission lane per destination
+                // instead of opening a dial-port-keyed second one.
+                let dispatch_policy_port = crate::proxy::dispatch_policy_port_for_target(
+                    dispatch_proxy,
+                    current_target.as_deref(),
+                );
 
                 // Also resolves this attempt's backend-TLS-SNI dial, and fails
                 // closed (502, `gateway-error-reason`) when a requested override
@@ -2277,7 +2343,8 @@ where
                     backend_start,
                     &current_url,
                     effective_host,
-                    dispatch_port,
+                    dispatch_dial_port,
+                    dispatch_policy_port,
                     0,
                     true,
                     ctx,
@@ -4759,6 +4826,7 @@ where
         && let Some(retry_config) = &proxy.retry
         && let (Some(hmap), Some(body_bytes)) = (retry_hmap, retry_body)
     {
+        let route_retry_ceiling = crate::proxy::route_retry_ceiling(proxy).unwrap_or(0);
         let mut attempt = 0u32;
         loop {
             // Pre-wire predicate for the H3→gRPC retry loop, derived from
@@ -4791,7 +4859,13 @@ where
             };
             if !is_connection_error
                 || !retry_config.retry_on_connect_failure
-                || attempt >= retry_config.max_retries
+                || attempt >= route_retry_ceiling
+                || !crate::proxy::current_retry_attempt_allowed(
+                    route_retry_ceiling,
+                    proxy,
+                    current_target.as_deref(),
+                    attempt,
+                )
             {
                 break;
             }
@@ -4808,8 +4882,14 @@ where
                 query_string,
                 client_ip,
                 proxy_headers,
+                route_retry_ceiling,
+                attempt,
             );
-            if matches!(&retry_target, CrossProtocolRetryTarget::BackendPathMismatch) {
+            if matches!(
+                &retry_target,
+                CrossProtocolRetryTarget::BackendPathMismatch
+                    | CrossProtocolRetryTarget::RetryBudgetExceeded
+            ) {
                 break;
             }
 
@@ -9363,7 +9443,9 @@ mod tests {
     /// `connectionPool.http` DR override applies on the bridge. This asserts the
     /// resolution `dispatch_plain` performs at entry: a per-port override wins
     /// for its port; a port with no explicit entry picks up the
-    /// service-discovery top-level fallback.
+    /// service-discovery top-level HTTP fallback. The fallback cannot carry TCP
+    /// `connectTimeout`; that policy is projected onto the upstream/proxy
+    /// posture instead of this derived HTTP-only slot.
     #[test]
     fn h3_plain_bridge_resolves_effective_proxy_for_selected_target() {
         let mut proxy = minimal_proxy();
@@ -9378,7 +9460,8 @@ mod tests {
             },
         )]));
         proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
-            connect_timeout_ms: Some(1_500),
+            http_idle_timeout_ms: Some(2_000),
+            h2_max_concurrent_streams: Some(64),
             ..Default::default()
         });
 
@@ -9396,8 +9479,63 @@ mod tests {
         let effective_sd =
             crate::proxy::resolve_effective_proxy_for_target(&proxy, Some(&sd_target));
         assert_eq!(
-            effective_sd.backend_connect_timeout_ms, 1_500,
-            "the bridge must apply the SD top-level fallback on a runtime-resolved port"
+            effective_sd.backend_connect_timeout_ms, 5_000,
+            "the HTTP-only fallback must not manufacture a TCP connectTimeout"
+        );
+        assert_eq!(effective_sd.pool_idle_timeout_seconds, Some(2));
+        assert_eq!(effective_sd.pool_http2_max_concurrent_streams, Some(64));
+    }
+
+    /// The H3→HTTP bridge's `http1MaxPendingRequests` admission must key by the
+    /// DestinationRule POLICY port, not the dial port. For a `targetPort`-remapped
+    /// Service (declared port 80 → workload port 8080) the dial port is not a
+    /// policy source at all: an explicit `portLevelSettings[{port: 80}]` cap is
+    /// invisible under it, and acquiring in a `host|8080|subset` lane while the
+    /// H1/H2 frontend acquires in `host|80|subset` lets a cap of N admit 2N
+    /// combined.
+    #[test]
+    fn h3_plain_bridge_pending_admission_keys_the_policy_port() {
+        let mut proxy = minimal_proxy();
+        proxy.upstream_id = Some("reviews".to_string());
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            80u16,
+            crate::config::types::ResolvedPortOverride {
+                http1_max_pending_requests: Some(4),
+                ..Default::default()
+            },
+        )]));
+
+        // Declared Service port 80 remapped onto workload port 8080.
+        let mut target = target_for_test(8080);
+        target.service_port_policy_key = Some(80);
+
+        let policy_port = crate::proxy::dispatch_policy_port_for_target(&proxy, Some(&target));
+        assert_eq!(
+            policy_port, 80,
+            "the bridge's admission port must be the declared Service port"
+        );
+        assert_eq!(
+            crate::proxy::resolve_backend_http1_max_pending_requests(&proxy, policy_port),
+            Some(4),
+            "an explicit portLevelSettings cap must be visible to the H3 bridge"
+        );
+        assert_eq!(
+            crate::proxy::resolve_backend_http1_max_pending_requests(&proxy, target.port),
+            None,
+            "fixture guard: the dial port resolves NO cap, so keying by it silently uncaps the bridge"
+        );
+
+        // A target with no remapping keys by its own port, and a direct-backend
+        // proxy with no selected target keys by `backend_port` — same fallbacks
+        // `proxy_to_backend` uses.
+        let plain = target_for_test(8443);
+        assert_eq!(
+            crate::proxy::dispatch_policy_port_for_target(&proxy, Some(&plain)),
+            8443
+        );
+        assert_eq!(
+            crate::proxy::dispatch_policy_port_for_target(&proxy, None),
+            proxy.backend_port
         );
     }
 

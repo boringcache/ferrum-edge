@@ -267,7 +267,7 @@ fn create_test_admin_state(config: &TestConfig) -> AdminState {
         mode: "test".to_string(),
         read_only: false, // Default to read-write for existing tests
         admin_audit_enabled: false,
-        admin_audit_fallback_dir: None,
+        admin_audit_fallback_dir: Some(crate::isolated_audit_fallback_dir()),
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,

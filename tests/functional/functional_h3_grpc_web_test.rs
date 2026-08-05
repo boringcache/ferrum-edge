@@ -631,22 +631,7 @@ async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() 
     assert_grpc_web_error(&unavailable, "14", "application/grpc-web+proto");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let step_errors = backend.step_errors().await;
-    // This asserts the pass-through backend saw no PROTOCOL/translation error —
-    // benign client-disappeared noise is expected and must not fail the test.
-    // A client that goes away DURING the TLS handshake surfaces as a handshake
-    // EOF rather than a post-handshake close, and it is the same benign class:
-    // whether the peer vanishes before or after the handshake completes is a
-    // scheduling detail, not a gRPC-Web translation outcome. Omitting the
-    // handshake shape made this test eject unrelated PRs from the merge queue.
-    assert!(
-        step_errors.iter().all(|error| {
-            error.contains("peer closed connection without sending TLS close_notify")
-                || error.contains("Connection reset by peer")
-                || error.contains("tls handshake eof")
-        }),
-        "unexpected pass-through backend script errors: {step_errors:?}"
-    );
+    backend.assert_no_step_errors().await;
     assert_eq!(backend.accepted_connections(), pass_through_connections);
     assert_eq!(backend.handshakes_completed(), pass_through_connections);
     let negotiated_alpn = backend.last_alpn().await;

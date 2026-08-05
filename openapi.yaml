@@ -10101,6 +10101,17 @@ components:
           description: >-
             Source workload locality in `region/zone/subzone` form, projected
             by mesh slice apply. A direct operator value is rejected.
+        source_labels:
+          type: object
+          readOnly: true
+          additionalProperties:
+            type: string
+          description: >-
+            Source workload labels used for DestinationRule
+            `localityLbSetting.failoverPriority` ranking. Projected by mesh
+            slice apply from authoritative slice workload labels, with
+            unambiguous derived topology enrichment only. A direct operator
+            value is rejected.
         locality_lb_setting:
           oneOf:
             - $ref: "#/components/schemas/UpstreamLocalityLbSetting"
@@ -10299,6 +10310,34 @@ components:
           description: >-
             Subset backend-connect timeout projected from a mesh
             DestinationRule. Direct admin/file configuration is rejected.
+        h2_upgrade_policy:
+          oneOf:
+            - $ref: "#/components/schemas/H2UpgradePolicy"
+            - type: "null"
+          readOnly: true
+          description: >-
+            Subset plain-HTTP H2 upgrade policy projected from a mesh
+            DestinationRule. Per-port policy has higher precedence; direct
+            admin/file configuration is rejected.
+        max_retries:
+          type: [integer, "null"]
+          format: uint32
+          minimum: 0
+          readOnly: true
+          description: >-
+            Subset cap on an existing per-request retry policy, projected from
+            a mesh DestinationRule. It never enables retries; zero disables an
+            existing policy for the selected destination. Direct admin/file
+            configuration is rejected.
+        http1_max_pending_requests:
+          type: [integer, "null"]
+          format: uint32
+          minimum: 1
+          readOnly: true
+          description: >-
+            Subset concurrent in-flight HTTP/1.1 admission cap projected from
+            a mesh DestinationRule. Admission is isolated by selected subset;
+            direct admin/file configuration is rejected.
         passive_health_check:
           oneOf:
             - $ref: "#/components/schemas/PassiveHealthCheck"
@@ -10351,12 +10390,24 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/LocalityDistribute"
-          description: Weighted target-locality distributions.
+          description: Weighted target-locality distributions. Mutually exclusive with failover and failover_priority.
         failover:
           type: array
           items:
             $ref: "#/components/schemas/LocalityFailover"
-          description: Source-region to failover-region mappings.
+          description: Source-region to failover-region mappings. Mutually exclusive with distribute and failover_priority.
+        failover_priority:
+          type: array
+          items:
+            type: string
+          description: |
+            Ordered Istio failoverPriority label keys (`key`) or key/value
+            overrides containing exactly one equals sign (`key=value`). When an
+            applicable upstream, per-port, or per-subset active/passive health
+            policy enables failover, replaces default region/zone/subzone tiers
+            with label-match priority tiers; otherwise remains inert and leaves
+            baseline selection unchanged. An empty source-label map produces no
+            tiers. Mutually exclusive with distribute and failover.
 
     LocalityDistribute:
       type: object
@@ -22049,7 +22100,7 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (3010); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (3010); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP by default; native gRPC capture requires an explicit descriptor-based grpc enrollment block (enrolled methods only). Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
@@ -22384,6 +22435,128 @@ components:
               type: string
               enum: [omit, template, redact, hash, raw]
               description: "How the request path is exported. Applications often embed emails/account-ids/document-names/tokens in path segments, so a privacy mode never exports the literal path by default. omit: no path. template: export the matched route identifier (proxy listen_path, else proxy name; omitted when unavailable) instead of the user-controlled path. redact: literal path with the configured PII redactor applied (requires at least one redaction.builtins/custom_patterns pattern). hash: keyed HMAC-SHA256 hex digest of the literal path (shares redaction.hash_secret; not brute-forceable offline). raw: literal path verbatim. Default is template for metadata_only/redacted_body/hash_only and raw for full_body (the deliberate raw-capture opt-in)."
+
+        grpc:
+          type: object
+          additionalProperties: false
+          required: [descriptor_path, methods]
+          description: >-
+            Native-gRPC capture contract. Present means the plugin also applies
+            to native gRPC, but only enrolled methods are decoded and captured.
+            Because the backend-effective method is not authoritative until
+            after routing, the presence of this block conservatively buffers
+            every native-gRPC request on the proxy; unenrolled responses are
+            not buffered by this plugin. Captured
+            string fields honor the same mode/redaction contract as HTTP
+            excerpts: in redacted_body a value is replaced wholesale when ANY
+            enclosing name matches the sensitive field-name policy — the field
+            itself, any ancestor message field, or the protobuf map key of a
+            map entry (map keys are never exported as labels; each map value is
+            exported under a collision-free ordinal path such as `metadata.0`,
+            and the key still decides redaction) — every element of a repeated
+            field inherits that field's
+            own decision, and JSON embedded inside a protobuf string is decoded
+            and redacted before export. Malformed, truncated, oversized,
+            undecodable, or unknown-field payloads omit the excerpt with a
+            compiled-in reason rather than exporting partial or unredacted
+            bytes. Requires a
+            node-local FileDescriptorSet; Admin/CP admission validates shape
+            only, and mode-aware file-dependency validation resolves the
+            descriptor on data-plane nodes. The enrolled method is the
+            BACKEND-EFFECTIVE one, which is not known until after routing and
+            listen-path stripping, so configuring this block fully buffers the
+            request body of EVERY native gRPC request on the proxy — enrolled
+            or not — and the final request-body hook makes the authoritative
+            enrollment decision. A client-streaming or bidirectional-streaming
+            method on such a proxy therefore gets fully buffered request
+            semantics; max_messages caps how much is captured, not how much is
+            buffered.
+          properties:
+            descriptor_path:
+              type: string
+              minLength: 1
+              pattern: '\S'
+              description: >-
+                Node-local path to a compiled protobuf FileDescriptorSet.
+                Validated shape-only at Admin/CP admission and against the real
+                descriptor by mode-aware file-dependency validation. A readable
+                but invalid descriptor rejects the candidate configuration; an
+                absent or unreadable descriptor retains enrollment and omits
+                body excerpts at request time.
+            methods:
+              type: object
+              minProperties: 1
+              description: >-
+                Map of "/package.Service/Method" to that method's capture
+                contract. Only these methods are captured. Leading/trailing
+                whitespace and one optional leading slash are normalized by the
+                runtime; every dotted service segment and the method identifier
+                must be a protobuf/gRPC identifier. Duplicate normalized forms
+                are rejected at runtime. Each entry must set request_type
+                and/or response_type.
+              propertyNames:
+                pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
+              additionalProperties:
+                type: object
+                additionalProperties: false
+                properties:
+                  request_type:
+                    type: string
+                    minLength: 1
+                    pattern: '\S'
+                    description: Fully-qualified protobuf request message type.
+                  response_type:
+                    type: string
+                    minLength: 1
+                    pattern: '\S'
+                    description: Fully-qualified protobuf response message type.
+                  text_fields:
+                    type: array
+                    minItems: 1
+                    items:
+                      type: string
+                      minLength: 1
+                      pattern: '\S'
+                    description: >-
+                      Dotted field paths restricting which string fields are
+                      exported. Each path must end at a string field and may
+                      not traverse a map field. Repeated fields retain every
+                      selected value under indexed paths such as tags.0 or
+                      messages.2.text. Omit to cover every string field
+                      recursively.
+                anyOf:
+                  - required: [request_type]
+                  - required: [response_type]
+            max_message_bytes:
+              type: integer
+              minimum: 1
+              maximum: 8388608
+              default: 1048576
+              description: >-
+                Per-message ceiling, applied to the declared frame length and
+                enforced while inflating a gzip-compressed frame; inflation
+                stops at the tighter of this ceiling and the remaining
+                redaction-scan budget. Aggregate decoded payload across frames
+                is additionally capped by limits.max_redaction_scan_bytes.
+                Bounded by an immutable deployment maximum of 8388608 (8 MiB),
+                equal to the hard maximum of that aggregate scan ceiling — a
+                larger per-message value could never produce a capture.
+            max_messages:
+              type: integer
+              minimum: 1
+              maximum: 1024
+              default: 64
+              description: >-
+                Maximum number of length-prefixed frames one buffered gRPC
+                request or response may carry; above this the excerpt is
+                omitted rather than partially captured. Bounded by an immutable
+                deployment maximum of 1024 frames: the decoded-byte scan budget
+                bounds decoded payload, not frame count, so legal zero-length
+                frames would otherwise let an operator-configured value drive an
+                effectively unbounded frame vector. Descriptor-tree depth and
+                node ceilings are aggregate across the complete buffered body,
+                rather than resetting for every frame; exhaustion omits the
+                complete excerpt with grpc_scan_limit.
 
     AiSemanticFirewallConfig:
       type: object
@@ -25053,8 +25226,10 @@ components:
               default: 5000
               description: >-
                 Per-attempt ClickHouse connect/request timeout. Bounded at ten
-                minutes so the cross-process spool claim lease remains finite
-                and strictly longer than the accepted request/retry budget.
+                minutes so the cross-process spool claim horizon used for
+                stranded-claim diagnostics remains finite and strictly longer
+                than the accepted request/retry budget. The horizon never
+                authorizes descriptor-free claim restoration.
         batch:
           type: object
           additionalProperties: false

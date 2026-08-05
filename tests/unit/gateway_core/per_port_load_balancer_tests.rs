@@ -97,6 +97,7 @@ fn upstream_with_overrides(
         subsets: None,
         port_overrides,
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
@@ -481,6 +482,9 @@ fn hash_on_only_port_override_preserves_subset_algorithm_with_port_hash_key() {
             hash_on: Some("header:x-subset".to_string()),
             tls: None,
             connect_timeout_ms: None,
+            h2_upgrade_policy: None,
+            max_retries: None,
+            http1_max_pending_requests: None,
             passive_health_check: None,
         }),
     }]);
@@ -624,6 +628,7 @@ fn subset_passive_with_cap(max_ejection_percent: Option<u8>) -> ResolvedSubsetTr
             max_ejection_percent,
             ..PassiveHealthCheck::default()
         }),
+        ..Default::default()
     }
 }
 

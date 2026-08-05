@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
@@ -27,6 +28,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http_body::Body as _;
 
+use ferrum_edge::plugins::prometheus_metrics::{ClientDisconnectKey, MetricsRegistry};
 use ferrum_edge::plugins::{
     Plugin, RequestContext, ResponseStreamAction, ResponseStreamInspector, TransactionSummary,
     create_plugin, create_response_stream_inspector, log_with_mirror_before_buffered_response,
@@ -1010,5 +1012,147 @@ async fn grpc_deadline_body_does_not_restore_stripped_content_length() {
         body.size_hint().exact(),
         None,
         "the deadline wrapper must not let hyper infer the backend Content-Length"
+    );
+}
+
+/// Test plugin that feeds every logged summary into a real `MetricsRegistry`,
+/// mirroring what the `prometheus_metrics` plugin's `log()` hook does. Uses an
+/// owned registry rather than `global_registry()` so concurrent tests cannot
+/// observe each other's counters.
+struct MetricsRecordingPlugin {
+    registry: Arc<MetricsRegistry>,
+    captured: Arc<Mutex<Vec<TransactionSummary>>>,
+}
+
+impl MetricsRecordingPlugin {
+    fn new() -> (
+        Self,
+        Arc<MetricsRegistry>,
+        Arc<Mutex<Vec<TransactionSummary>>>,
+    ) {
+        let registry = Arc::new(MetricsRegistry::new());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                registry: Arc::clone(&registry),
+                captured: Arc::clone(&captured),
+            },
+            registry,
+            captured,
+        )
+    }
+}
+
+#[async_trait]
+impl Plugin for MetricsRecordingPlugin {
+    fn name(&self) -> &str {
+        "metrics-recording"
+    }
+
+    fn priority(&self) -> u16 {
+        9000
+    }
+
+    async fn log(&self, summary: &TransactionSummary) {
+        self.registry.record(summary);
+        self.captured.lock().unwrap().push(summary.clone());
+    }
+}
+
+/// End-to-end: a response body abandoned mid-stream must travel
+/// `ProxyBody` → `DeferredTransactionLogger` → `TransactionSummary` →
+/// `ferrum_client_disconnects_total`.
+///
+/// Every link existed already, but nothing tied the terminal body
+/// classification to the rendered metric, so a break anywhere along the chain
+/// would have surfaced only as a permanently-zero dashboard.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_disconnect_reaches_prometheus_counter() {
+    let (plugin, registry, captured) = MetricsRecordingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let summary = make_summary_with_status(200);
+    let logger = DeferredTransactionLogger::new(summary, plugins, make_ctx());
+
+    // Poll once so the body is "polled but not drained", then drop it. That is
+    // the hyper-cancelled-mid-stream shape the Drop safety net classifies as a
+    // client disconnect.
+    let payload = Bytes::from_static(b"first chunk of a stream the client abandons");
+    let expected_len = payload.len() as u64;
+    let mut body = ProxyBody::full(payload).with_logger(logger);
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    assert!(
+        matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(Some(Ok(_)))
+        ),
+        "the first poll must yield a data frame before the client aborts"
+    );
+    drop(body);
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1);
+    assert!(captures[0].client_disconnected);
+    assert_eq!(captures[0].bytes_received, expected_len);
+    assert_eq!(
+        captures[0].body_error_class,
+        Some(ErrorClass::ClientDisconnect)
+    );
+
+    let key = ClientDisconnectKey {
+        proxy_id: Arc::from("proxy-1"),
+    };
+    assert_eq!(
+        registry
+            .client_disconnect_counter
+            .get(&key)
+            .expect("the abandoned stream must open the disconnect series")
+            .value
+            .load(Ordering::Relaxed),
+        1,
+        "the deferred summary must increment ferrum_client_disconnects_total"
+    );
+    let output = registry.render_uncached();
+    assert!(
+        output.contains("ferrum_client_disconnects_total{proxy_id=\"proxy-1\"} 1"),
+        "the disconnect series must reach the exposition: {output}"
+    );
+}
+
+/// A body drained to completion must leave the disconnect series closed, so a
+/// healthy stream can never inflate the counter.
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_body_does_not_reach_prometheus_counter() {
+    let (plugin, registry, captured) = MetricsRecordingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let summary = make_summary_with_status(200);
+    let logger = DeferredTransactionLogger::new(summary, plugins, make_ctx());
+
+    let mut body = ProxyBody::full(Bytes::from_static(b"fully delivered")).with_logger(logger);
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    loop {
+        match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(_frame))) => continue,
+            Poll::Ready(None) => break,
+            Poll::Ready(Some(Err(e))) => panic!("unexpected body error: {e}"),
+            Poll::Pending => panic!("Full body should never pend"),
+        }
+    }
+    drop(body);
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1);
+    assert!(captures[0].body_completed);
+    assert!(!captures[0].client_disconnected);
+
+    assert!(
+        registry.client_disconnect_counter.is_empty(),
+        "a fully delivered response must not open the disconnect series"
+    );
+    let output = registry.render_uncached();
+    assert!(
+        !output.contains("ferrum_client_disconnects_total"),
+        "an untouched disconnect family must stay out of the exposition: {output}"
     );
 }

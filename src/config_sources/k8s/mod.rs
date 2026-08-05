@@ -15,6 +15,13 @@ pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
     namespace_selector_matches, parse_reference_grant_permissions,
 };
+// Re-exported for the integration suite's at-cap/over-cap L4 candidate and
+// projection assertions (`tests/integration/mesh_l7_routing_tests.rs`), which
+// must observe the same constants the translator enforces rather than
+// duplicated literals. The binary target compiles this module without that
+// suite, so the re-exports are unused there.
+#[allow(unused_imports)]
+pub use istio::{MAX_L4_CANDIDATE_PROXIES, MAX_PROJECTED_L4_PROXIES};
 // Shared with the Istio status writer (`crate::k8s_controller::istio_status`) so
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
 // status writer's deferred-field reporting use one predicate and never diverge.
@@ -3129,6 +3136,7 @@ pub(crate) fn upstream_for_route(
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,

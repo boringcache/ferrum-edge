@@ -6,8 +6,8 @@
 //! - pool_max_requests_per_connection serde
 
 use ferrum_edge::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, PassiveHealthCheck, Proxy, SubsetDefinition,
-    SubsetTrafficPolicy, Upstream, UpstreamTarget,
+    GatewayConfig, H2UpgradePolicy, LoadBalancerAlgorithm, PassiveHealthCheck, Proxy,
+    SubsetDefinition, SubsetTrafficPolicy, Upstream, UpstreamTarget,
 };
 use std::collections::HashMap;
 
@@ -23,6 +23,9 @@ fn subset_definition_round_trip_json() {
             hash_on: Some("header:x-user".into()),
             tls: None,
             connect_timeout_ms: None,
+            h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+            max_retries: Some(2),
+            http1_max_pending_requests: Some(7),
             passive_health_check: None,
         }),
     };
@@ -49,6 +52,13 @@ fn subset_definition_round_trip_json() {
             .as_deref(),
         Some("header:x-user")
     );
+    let policy = deserialized.traffic_policy.as_ref().unwrap();
+    assert_eq!(
+        policy.h2_upgrade_policy,
+        Some(H2UpgradePolicy::DoNotUpgrade)
+    );
+    assert_eq!(policy.max_retries, Some(2));
+    assert_eq!(policy.http1_max_pending_requests, Some(7));
 }
 
 #[test]
@@ -85,6 +95,9 @@ fn subset_traffic_policy_omits_none_fields() {
         hash_on: None,
         tls: None,
         connect_timeout_ms: None,
+        h2_upgrade_policy: None,
+        max_retries: None,
+        http1_max_pending_requests: None,
         passive_health_check: None,
     };
     let json = serde_json::to_string(&policy).unwrap();
@@ -112,6 +125,9 @@ fn subset_traffic_policy_tls_round_trip_json() {
             insecure_skip_verify: false,
         }),
         connect_timeout_ms: None,
+        h2_upgrade_policy: None,
+        max_retries: None,
+        http1_max_pending_requests: None,
         passive_health_check: None,
     };
 
@@ -203,6 +219,7 @@ fn make_upstream(subsets: Option<Vec<SubsetDefinition>>) -> Upstream {
         subsets,
         port_overrides: HashMap::new(),
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
@@ -350,6 +367,9 @@ fn upstream_valid_subsets_pass_validation() {
                 hash_on: None,
                 tls: None,
                 connect_timeout_ms: None,
+                h2_upgrade_policy: None,
+                max_retries: None,
+                http1_max_pending_requests: None,
                 passive_health_check: None,
             }),
         },

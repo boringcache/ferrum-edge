@@ -4691,24 +4691,29 @@ impl RequestContext {
         let dispatch_port_overrides_changed = dispatch_port_overrides_override
             .as_ref()
             .is_some_and(|overrides| *overrides != proxy.dispatch_port_overrides);
-        // Recompute the service-discovery top-level `connectionPool.http`
-        // fallback for the override's destination, exactly mirroring
-        // `dispatch_port_overrides` above: a direct-backend override clears it
-        // (no upstream → no overlay), an upstream-id override recomputes it from
-        // the NEW upstream. Without this, a route from an SD upstream LEAKS its
-        // top-level fallback onto a different destination, and a route TO an SD
-        // upstream LOSES that destination's fallback (see #1806 codex r1).
+        // Recompute the inherited `connectionPool.http` fallback for the
+        // override's destination, exactly mirroring `dispatch_port_overrides`
+        // above: a direct-backend override clears it (no upstream → no overlay),
+        // an upstream-id override recomputes it from the NEW upstream with the
+        // effective selected subset (cleared when the upstream changes). Without
+        // this, a route from an SD upstream LEAKS its top-level/subset fallback
+        // onto a different destination, and a route TO an SD upstream LOSES that
+        // destination's fallback (see #1806 codex r1).
         let dispatch_port_override_fallback_override = if upstream_id_changed {
             if direct_backend_override {
                 Some(None)
             } else {
+                // Runtime clears `upstream_subset` when the override upstream
+                // differs from the proxy default, so admission/runtime both use
+                // top-level-only inheritance for the new destination.
                 Some(
                     self.route_override_upstream_id
                         .as_deref()
                         .and_then(|id| upstreams.and_then(|map| map.get(id)))
                         .and_then(|upstream| {
-                            crate::config::types::dispatch_port_override_fallback_from_upstream(
+                            crate::config::types::dispatch_port_override_fallback_for_selected_subset(
                                 upstream,
+                                None,
                             )
                         }),
                 )
@@ -10210,6 +10215,12 @@ pub(crate) fn validate_plugin_config_with_http_client(
         // files installed on data-plane nodes. Mode-aware dependency
         // validation and runtime construction handle the FileDescriptorSet.
         return ai_response_guard::AiResponseGuard::validate_config(config);
+    }
+    if name == "ai_transcript_audit" {
+        // Shape-only: CP/admin admission must not require gRPC descriptor
+        // files installed on data-plane nodes. Mode-aware dependency
+        // validation and runtime construction handle the FileDescriptorSet.
+        return ai_transcript_audit::AiTranscriptAudit::validate_config(config, http_client);
     }
     if name == "udp_logging" {
         // Shape-only: shared Admin / CP validation must not open node-local
