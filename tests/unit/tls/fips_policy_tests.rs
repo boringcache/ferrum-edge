@@ -381,7 +381,154 @@ fn env_policy_accepts_verified_sql_tls_modes() {
 }
 
 #[test]
-fn env_policy_leaves_unset_sql_db_tls_mode_to_url_or_driver() {
+fn env_policy_rejects_unset_sql_db_tls_mode_without_verifying_url_params() {
+    // Residual gap after #3564: omitting FERRUM_DB_TLS_MODE must not admit an
+    // unauthenticated config-database peer. Absent or weaker URL-owned
+    // parameters are refused for every configured SQL URL.
+    for db_type in ["postgres", "mysql", "POSTGRES", "MYSQL"] {
+        let dialect = if db_type.eq_ignore_ascii_case("postgres") {
+            "postgres"
+        } else {
+            "mysql"
+        };
+        let (plain_url, weak_url, secret_url) = if dialect == "postgres" {
+            (
+                "postgres://db.example/ferrum",
+                "postgres://db.example/ferrum?sslmode=require",
+                "postgres://user:s3cret-pass@db.example/ferrum",
+            )
+        } else {
+            (
+                "mysql://db.example/ferrum",
+                "mysql://db.example/ferrum?ssl-mode=REQUIRED",
+                "mysql://user:s3cret-pass@db.example/ferrum",
+            )
+        };
+
+        for db_url in [plain_url, weak_url, secret_url] {
+            let env_config = EnvConfig {
+                db_type: Some(db_type.to_string()),
+                db_tls_mode: None,
+                db_url: Some(db_url.to_string()),
+                ..EnvConfig::default()
+            };
+            let err = policy::check_env_config_enforced(&env_config)
+                .expect_err("unset mode without verifying URL params is refused");
+            assert!(
+                err.contains("FERRUM_DB_URL"),
+                "diagnostic must name the setting: {err}"
+            );
+            assert!(err.contains("FERRUM_DB_TLS_MODE unset"), "{err}");
+            assert!(
+                !err.contains("s3cret-pass")
+                    && !err.contains("user:")
+                    && !err.contains("db.example"),
+                "database URL must never leak: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn env_policy_accepts_unset_sql_db_tls_mode_with_url_owned_verifying_params() {
+    // docs/database_tls.md documents URL-owned TLS as a supported alternative
+    // to FERRUM_DB_TLS_MODE; verifying URL parameters must keep working under
+    // enforced FIPS when the env var is unset.
+    for (db_type, db_url) in [
+        (
+            "postgres",
+            "postgres://user:s3cret@db.example/ferrum?sslmode=verify-full",
+        ),
+        (
+            "postgres",
+            "postgres://db.example/ferrum?sslmode=verify-ca&sslrootcert=/certs/ca.pem",
+        ),
+        (
+            "mysql",
+            "mysql://user:s3cret@db.example/ferrum?ssl-mode=VERIFY_IDENTITY",
+        ),
+        ("mysql", "mysql://db.example/ferrum?ssl_mode=VERIFY_CA"),
+        (
+            "POSTGRES",
+            "postgres://db.example/ferrum?SSLMode=verify-full",
+        ),
+        (
+            "MYSQL",
+            "mysql://db.example/ferrum?SSL-Mode=VERIFY_IDENTITY",
+        ),
+    ] {
+        let env_config = EnvConfig {
+            db_type: Some(db_type.to_string()),
+            db_tls_mode: None,
+            db_url: Some(db_url.to_string()),
+            ..EnvConfig::default()
+        };
+        policy::check_env_config_enforced(&env_config)
+            .expect("URL-owned verifying TLS is admitted when mode is unset");
+    }
+}
+
+#[test]
+fn env_policy_holds_failover_and_replica_urls_to_the_same_sql_tls_standard() {
+    // A verified primary with an unverified failover or replica still admits
+    // an unauthenticated peer — every configured SQL URL is checked.
+    let verified_primary = "postgres://user:s3cret@primary.example/ferrum?sslmode=verify-full";
+    let weak_failover = "postgres://user:failover-secret@standby.example/ferrum?sslmode=require";
+    let plain_replica = "postgres://user:replica-secret@replica.example/ferrum";
+
+    let failover_only = EnvConfig {
+        db_type: Some("postgres".to_string()),
+        db_tls_mode: None,
+        db_url: Some(verified_primary.to_string()),
+        db_failover_urls: vec![weak_failover.to_string()],
+        ..EnvConfig::default()
+    };
+    let err = policy::check_env_config_enforced(&failover_only)
+        .expect_err("unverified failover is refused");
+    assert!(err.contains("FERRUM_DB_FAILOVER_URLS[#1]"), "{err}");
+    assert!(err.contains("`sslmode`"), "{err}");
+    assert!(
+        !err.contains("failover-secret")
+            && !err.contains("standby.example")
+            && !err.contains(verified_primary),
+        "URL material must never leak: {err}"
+    );
+
+    let replica_only = EnvConfig {
+        db_type: Some("postgres".to_string()),
+        db_tls_mode: None,
+        db_url: Some(verified_primary.to_string()),
+        db_read_replica_url: Some(plain_replica.to_string()),
+        ..EnvConfig::default()
+    };
+    let err = policy::check_env_config_enforced(&replica_only)
+        .expect_err("unverified replica is refused");
+    assert!(err.contains("FERRUM_DB_READ_REPLICA_URL"), "{err}");
+    assert!(
+        !err.contains("replica-secret") && !err.contains("replica.example"),
+        "URL material must never leak: {err}"
+    );
+
+    let all_verified = EnvConfig {
+        db_type: Some("mysql".to_string()),
+        db_tls_mode: None,
+        db_url: Some(
+            "mysql://user:s3cret@primary.example/ferrum?ssl-mode=VERIFY_IDENTITY".to_string(),
+        ),
+        db_failover_urls: vec!["mysql://standby.example/ferrum?ssl-mode=VERIFY_CA".to_string()],
+        db_read_replica_url: Some(
+            "mysql://replica.example/ferrum?ssl_mode=VERIFY_IDENTITY".to_string(),
+        ),
+        ..EnvConfig::default()
+    };
+    policy::check_env_config_enforced(&all_verified)
+        .expect("verified primary, failover, and replica are admitted");
+}
+
+#[test]
+fn env_policy_unset_sql_db_tls_mode_without_urls_has_no_peer_to_refuse() {
+    // With no configured SQL URL there is no peer connection; the gate has
+    // nothing to inspect and must not refuse on db_type alone.
     for db_type in ["postgres", "mysql"] {
         let env_config = EnvConfig {
             db_type: Some(db_type.to_string()),
@@ -389,7 +536,7 @@ fn env_policy_leaves_unset_sql_db_tls_mode_to_url_or_driver() {
             ..EnvConfig::default()
         };
         policy::check_env_config_enforced(&env_config)
-            .expect("unset SQL config-database TLS mode is not refused by this check");
+            .expect("unset mode with no SQL URLs is not refused");
     }
 }
 
@@ -422,6 +569,35 @@ fn env_policy_sql_tls_check_does_not_apply_to_sqlite_or_mongodb() {
             "mongodb refusal must not double-report SQL TLS diagnostics: {err}"
         );
     }
+
+    // Unset mode with a plain SQL-looking URL must still be the MongoDB
+    // config-store refusal alone — never the SQL URL-parameter diagnostic.
+    let mongodb_unset = EnvConfig {
+        db_type: Some("mongodb".to_string()),
+        db_tls_mode: None,
+        db_url: Some("mongodb://user:s3cret@db.example/ferrum".to_string()),
+        ..EnvConfig::default()
+    };
+    let err = policy::check_env_config_enforced(&mongodb_unset)
+        .expect_err("mongodb is refused by its own config-store rule");
+    assert!(err.contains("FERRUM_DB_TYPE=mongodb"), "{err}");
+    assert!(
+        !err.contains("sslmode")
+            && !err.contains("ssl-mode")
+            && !err.contains("FERRUM_DB_TLS_MODE unset"),
+        "mongodb refusal must not double-report SQL URL TLS diagnostics: {err}"
+    );
+    assert!(!err.contains("s3cret"), "database URL leaked: {err}");
+
+    // SQLite has no network TLS; an unset mode with a file URL is unaffected.
+    let sqlite_unset = EnvConfig {
+        db_type: Some("sqlite".to_string()),
+        db_tls_mode: None,
+        db_url: Some("sqlite:///tmp/ferrum.db".to_string()),
+        ..EnvConfig::default()
+    };
+    policy::check_env_config_enforced(&sqlite_unset)
+        .expect("sqlite is outside the SQL network TLS admission check");
 }
 
 #[test]
