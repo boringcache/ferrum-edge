@@ -8,7 +8,7 @@
 
 use ferrum_edge::plugins::mcp_aggregate_sse::{
     AggregateSseBody, AggregateSseBounds, AggregateSseBroker, AggregateSseError as SseError,
-    SseFrameResult, StreamIdentity,
+    AggregateSseStream, SseFrameResult, StreamIdentity,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -47,14 +47,36 @@ fn identity_error(id: Value) -> SseError {
     }
 }
 
+/// One request's whole broker lifecycle: open the identity, then publish its
+/// terminal response. This is the production shape — the request path opens
+/// before its slow work and the response path publishes on the lease.
 fn publish(broker: &AggregateSseBroker, session: &str, id: i64) -> Result<u64, SseError> {
     let payload = json!({"jsonrpc": "2.0", "id": id, "result": {"n": id}});
-    broker.publish_response(session, &number_id(id), &payload)
+    let stream = broker.open_stream(session, &number_id(id))?;
+    stream.publish_encoded(&encode(&payload))
 }
 
 fn publish_text(broker: &AggregateSseBroker, session: &str, id: &str) -> Result<u64, SseError> {
     let payload = json!({"jsonrpc": "2.0", "id": id, "result": {}});
-    broker.publish_response(session, &text_id(id), &payload)
+    let stream = broker.open_stream(session, &text_id(id))?;
+    stream.publish_encoded(&encode(&payload))
+}
+
+/// The exact client-visible bytes a response carries. Production never hands
+/// the broker a `Value`: it publishes the response representation itself.
+fn encode(payload: &Value) -> Vec<u8> {
+    match serde_json::to_vec(payload) {
+        Ok(encoded) => encoded,
+        Err(error) => panic!("payload must serialize: {error}"),
+    }
+}
+
+/// Open and HOLD a stream identity, the way an in-flight request does.
+fn open(broker: &AggregateSseBroker, session: &str, id: &str) -> AggregateSseStream {
+    match broker.open_stream(session, &text_id(id)) {
+        Ok(stream) => stream,
+        Err(error) => panic!("stream must open: {error:?}"),
+    }
 }
 
 fn frame_text(frame: Option<SseFrameResult>) -> String {
@@ -182,22 +204,145 @@ fn completed_stream_releases_capacity_and_refuses_late_duplicates() {
     let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
     broker.ensure_session("sess-cap").unwrap();
 
-    broker.open_stream("sess-cap", &text_id("s1")).unwrap();
-    broker.open_stream("sess-cap", &text_id("s2")).unwrap();
+    let first = open(&broker, "sess-cap", "s1");
+    let _second = open(&broker, "sess-cap", "s2");
     // A third concurrent OPEN stream exceeds the per-session bound.
     let overflow = broker.open_stream("sess-cap", &text_id("s3"));
     assert_eq!(overflow.unwrap_err(), SseError::StreamCardinalityOverflow);
 
     // Completing a stream must return its capacity, or the session would be
     // permanently exhausted after `max_streams_per_session` requests.
-    publish_text(&broker, "sess-cap", "s1").unwrap();
-    broker.open_stream("sess-cap", &text_id("s3")).unwrap();
+    let reply = json!({"jsonrpc": "2.0", "id": "s1", "result": {}});
+    first.publish_encoded(&encode(&reply)).unwrap();
+    let _third = open(&broker, "sess-cap", "s3");
 
     // A late or duplicate response for a completed identity is refused rather
-    // than misattributed onto a fresh stream.
-    let late = publish_text(&broker, "sess-cap", "s1");
+    // than misattributed onto a fresh stream. The lease itself refuses a second
+    // terminal attempt, and re-opening the identity is refused too.
+    let late = first.publish_encoded(&encode(&reply));
     assert_eq!(late.unwrap_err(), SseError::StreamCompleted);
     let reopen = broker.open_stream("sess-cap", &text_id("s1"));
+    assert_eq!(reopen.unwrap_err(), SseError::StreamCompleted);
+}
+
+#[test]
+fn dropping_an_open_lease_releases_capacity_exactly_once() {
+    let tuned = AggregateSseBounds {
+        max_streams_per_session: 2,
+        ..bounds()
+    };
+    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
+    broker.ensure_session("sess-drop-lease").unwrap();
+
+    // A request that ends without ever publishing — a backend error, a policy
+    // replacement, or a client that went away — must return its capacity.
+    let abandoned = open(&broker, "sess-drop-lease", "d1");
+    let held = open(&broker, "sess-drop-lease", "d2");
+    let full = broker.open_stream("sess-drop-lease", &text_id("d3"));
+    assert_eq!(full.unwrap_err(), SseError::StreamCardinalityOverflow);
+    drop(abandoned);
+    let _reused = open(&broker, "sess-drop-lease", "d3");
+
+    // The abandoned identity is terminal, so a late duplicate cannot reopen it.
+    let reopen = broker.open_stream("sess-drop-lease", &text_id("d1"));
+    assert_eq!(reopen.unwrap_err(), SseError::StreamCompleted);
+
+    // Exactly ONE slot comes back per lease: after the second drop a single
+    // fresh identity fits and the next one does not. A double release would
+    // have left room for both.
+    drop(held);
+    let _fourth = open(&broker, "sess-drop-lease", "d4");
+    let overflow = broker.open_stream("sess-drop-lease", &text_id("d5"));
+    assert_eq!(overflow.unwrap_err(), SseError::StreamCardinalityOverflow);
+}
+
+#[test]
+fn cancelled_lease_release_never_republishes_or_double_counts() {
+    let tuned = AggregateSseBounds {
+        max_streams_per_session: 2,
+        ..bounds()
+    };
+    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
+    broker.ensure_session("sess-cancel-drop").unwrap();
+
+    let identity = text_id("c1");
+    let in_flight = open(&broker, "sess-cancel-drop", "c1");
+    let _sibling = open(&broker, "sess-cancel-drop", "c2");
+    broker.cancel_stream("sess-cancel-drop", &identity).unwrap();
+    // The cancel already returned the capacity; dropping the request's lease
+    // must neither return it a second time nor overwrite the cancellation. One
+    // fresh identity fits the slot the cancel freed, and the next does not.
+    drop(in_flight);
+    let _next = open(&broker, "sess-cancel-drop", "c3");
+    let saturated = broker.open_stream("sess-cancel-drop", &text_id("c4"));
+    assert_eq!(saturated.unwrap_err(), SseError::StreamCardinalityOverflow);
+    let still_cancelled = broker.cancel_stream("sess-cancel-drop", &identity);
+    assert_eq!(still_cancelled.unwrap_err(), SseError::StreamCancelled);
+}
+
+#[test]
+fn repeated_retention_overflow_cannot_exhaust_stream_capacity() {
+    // One retained event and no replay window: with nothing consuming the ring,
+    // every publish after the first fails closed.
+    let tuned = AggregateSseBounds {
+        max_streams_per_session: 4,
+        max_retained_events: 1,
+        max_replay_events: 0,
+        ..bounds()
+    };
+    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
+    broker.ensure_session("sess-overflow").unwrap();
+    publish(&broker, "sess-overflow", 0).unwrap();
+
+    // Far more overflowing responses than `max_streams_per_session`. Each one
+    // must be refused for RETENTION, never for cardinality: the refusal
+    // terminalizes its identity, so capacity is returned every time.
+    for id in 1..=12 {
+        let refused = publish(&broker, "sess-overflow", id);
+        assert_eq!(
+            refused.unwrap_err(),
+            SseError::RetentionOverflow,
+            "overflow {id} must not consume stream capacity"
+        );
+    }
+
+    // An inline-completed identity is terminal: a retry of it can never be
+    // published onto the stream later.
+    let retry = broker.open_stream("sess-overflow", &number_id(12));
+    assert_eq!(retry.unwrap_err(), SseError::StreamCompleted);
+
+    // Capacity really is reusable: a full set of fresh identities still opens.
+    let mut held = Vec::new();
+    for id in 100..104 {
+        match broker.open_stream("sess-overflow", &number_id(id)) {
+            Ok(stream) => held.push(stream),
+            Err(error) => panic!("capacity must be reusable after overflow: {error:?}"),
+        }
+    }
+    assert_eq!(held.len(), 4);
+    let beyond = broker.open_stream("sess-overflow", &number_id(104));
+    assert_eq!(beyond.unwrap_err(), SseError::StreamCardinalityOverflow);
+}
+
+#[test]
+fn oversized_event_on_an_open_lease_releases_capacity() {
+    let tuned = AggregateSseBounds {
+        max_streams_per_session: 1,
+        max_event_bytes: 512,
+        ..bounds()
+    };
+    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
+    broker.ensure_session("sess-oversize").unwrap();
+
+    let stream = open(&broker, "sess-oversize", "big");
+    let blob = "y".repeat(4096);
+    let payload = json!({"jsonrpc": "2.0", "id": "big", "result": {"blob": blob}});
+    let refused = stream.publish_encoded(&encode(&payload));
+    assert_eq!(refused.unwrap_err(), SseError::EventTooLarge);
+    // Refused before retention, but still terminal: the identity's capacity is
+    // back and the identity itself cannot be reused.
+    let _next = open(&broker, "sess-oversize", "small");
+    let reopen = broker.open_stream("sess-oversize", &text_id("big"));
     assert_eq!(reopen.unwrap_err(), SseError::StreamCompleted);
 }
 
@@ -209,12 +354,15 @@ fn cancelled_stream_refuses_its_own_response() {
     let unknown = broker.cancel_stream("sess-cancel", &identity);
     assert_eq!(unknown.unwrap_err(), SseError::UnknownStream);
 
-    broker.open_stream("sess-cancel", &identity).unwrap();
+    // Hold the lease the way an in-flight request does, so the cancel lands on
+    // a genuinely OPEN stream and the eventual response is the one refused.
+    let in_flight = open(&broker, "sess-cancel", "c1");
     broker.cancel_stream("sess-cancel", &identity).unwrap();
     let again = broker.cancel_stream("sess-cancel", &identity);
     assert_eq!(again.unwrap_err(), SseError::StreamCancelled);
 
-    let refused = publish_text(&broker, "sess-cancel", "c1");
+    let reply = json!({"jsonrpc": "2.0", "id": "c1", "result": {}});
+    let refused = in_flight.publish_encoded(&encode(&reply));
     assert_eq!(refused.unwrap_err(), SseError::StreamCancelled);
 }
 
@@ -234,6 +382,54 @@ async fn duplicate_listener_is_refused_and_disconnect_permits_reattach() {
     drop(body);
     let reattached = broker.attach_listener("sess-dup", None).unwrap();
     assert!(reattached.take_body().is_some());
+}
+
+#[tokio::test]
+async fn listener_past_its_lifetime_is_superseded_not_refused() {
+    // The in-body timer only advances while the transport polls the body, which
+    // a peer that stopped reading can prevent. Supersession is therefore the
+    // guarantee that the single-listener slot stays usable, and it must not
+    // depend on the stalled body being polled at all.
+    //
+    // Sub-minimum lifetime on purpose: operator ranges are enforced by
+    // `AggregateSseBounds::validate` (covered separately), while the broker
+    // itself must honor whatever bound it was constructed with. A real, short
+    // wall-clock window is required because the supersession deadline is a
+    // `std::time::Instant`, which a paused tokio clock does not move.
+    let tuned = AggregateSseBounds {
+        listener_max_lifetime: Duration::from_millis(60),
+        keepalive_interval: Duration::from_millis(60),
+        ..bounds()
+    };
+    let broker = AggregateSseBroker::new(tuned, 4, 2);
+    broker.ensure_session("sess-stall").unwrap();
+    let stalled = broker.attach_listener("sess-stall", None).unwrap();
+    // Deliberately never polled: this models a transport parked in a write, the
+    // exact case an in-body timer cannot resolve.
+    let mut stalled_body = stalled.take_body().expect("body claimed once");
+
+    // Inside the lifetime the slot is owned, and the gateway routes to it.
+    let duplicate = broker.attach_listener("sess-stall", None);
+    assert_eq!(duplicate.unwrap_err(), SseError::DuplicateListener);
+    assert!(broker.has_listener("sess-stall"));
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Past the lifetime the session stops routing new responses to it, and a
+    // fresh attach takes the slot instead of receiving 409.
+    assert!(!broker.has_listener("sess-stall"));
+    let replacement = broker
+        .attach_listener("sess-stall", None)
+        .expect("expired listener must be superseded");
+    // Hold the replacement body: dropping it would release the slot again.
+    let _replacement_body = replacement.take_body().expect("body claimed once");
+    assert!(broker.has_listener("sess-stall"));
+
+    // The superseded body ends on its next poll and its own release is a no-op,
+    // so it cannot evict the listener that replaced it.
+    assert_ended(&mut stalled_body).await;
+    drop(stalled_body);
+    assert!(broker.has_listener("sess-stall"));
 }
 
 #[tokio::test]
@@ -366,13 +562,17 @@ async fn retention_is_one_budget_and_never_drops_an_undelivered_response() {
     assert_eq!(overflow.unwrap_err(), SseError::RetentionOverflow);
 
     // Draining frees the consumed prefix, so the session recovers instead of
-    // being stranded by one overflow.
+    // being stranded by one overflow. Identity 3 was answered inline and is
+    // therefore terminal for good, so recovery is proven with a fresh id — a
+    // retry of an inline-completed identity must never reach the stream.
     let listener = broker.attach_listener("sess-budget", None).unwrap();
     let mut body = listener.take_body().unwrap();
     let seen = drain_until(&mut body, &["\"n\":2"], 6).await;
     assert!(seen.contains("\"n\":1"));
     assert!(seen.contains("\"n\":2"));
-    publish(&broker, "sess-budget", 3).unwrap();
+    let retried = broker.open_stream("sess-budget", &number_id(3));
+    assert_eq!(retried.unwrap_err(), SseError::StreamCompleted);
+    publish(&broker, "sess-budget", 4).unwrap();
 }
 
 #[test]
@@ -391,10 +591,10 @@ fn byte_budget_bounds_total_retained_bytes() {
     let payload = json!({"jsonrpc": "2.0", "id": 1, "result": {"blob": filler}});
     let one = number_id(1);
     let two = number_id(2);
-    broker
-        .publish_response("sess-bytes", &one, &payload)
-        .unwrap();
-    let overflow = broker.publish_response("sess-bytes", &two, &payload);
+    let first = broker.open_stream("sess-bytes", &one).unwrap();
+    first.publish_encoded(&encode(&payload)).unwrap();
+    let second = broker.open_stream("sess-bytes", &two).unwrap();
+    let overflow = second.publish_encoded(&encode(&payload));
     assert_eq!(overflow.unwrap_err(), SseError::RetentionOverflow);
 }
 
@@ -409,7 +609,8 @@ fn oversized_event_payload_fails_closed() {
     let blob = "y".repeat(4096);
     let payload = json!({"jsonrpc": "2.0", "id": 1, "result": {"blob": blob}});
     let one = number_id(1);
-    let refused = broker.publish_response("sess-big", &one, &payload);
+    let stream = broker.open_stream("sess-big", &one).unwrap();
+    let refused = stream.publish_encoded(&encode(&payload));
     assert_eq!(refused.unwrap_err(), SseError::EventTooLarge);
 }
 

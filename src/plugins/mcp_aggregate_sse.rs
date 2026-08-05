@@ -20,7 +20,16 @@
 //!   payload.
 //! * An undelivered event is never evicted. When the ring cannot admit one, the
 //!   publish fails closed and the caller answers the POST inline, so a JSON-RPC
-//!   response is never silently dropped.
+//!   response is never silently dropped. A refused publish still TERMINALIZES
+//!   its identity inside the same critical section, so the inline answer is
+//!   that identity's one terminal outcome and its stream capacity is returned
+//!   exactly once instead of leaking.
+//! * An open request stream is owned by an RAII lease
+//!   ([`AggregateSseStream`]) held privately on the request context. Every exit
+//!   path — publish, cancellation, inline fallback, backend error, policy
+//!   replacement, transport disconnect, task cancellation — releases the
+//!   identity exactly once through that lease, with no detached task and
+//!   without the lease retaining the broker generation.
 //! * Session ids, JSON-RPC ids, `Last-Event-ID` values and event payloads are
 //!   never logged and never reach a diagnostic. Every reason is a fixed,
 //!   low-cardinality token derived from the error variant.
@@ -413,6 +422,15 @@ struct ListenerState {
     cursor: u64,
     waker: Option<Waker>,
     greeted: bool,
+    /// Absolute end of this listener's bounded lifetime.
+    ///
+    /// The body's own timer ends the stream at this age whenever the transport
+    /// is still polling it. It is ALSO the supersession deadline, which is the
+    /// part that does not depend on polling: past it, a fresh attach takes the
+    /// slot. That is what keeps a listener whose transport stopped polling the
+    /// body — a peer that stopped reading can park an HTTP/1.1 or HTTP/2 write
+    /// indefinitely — from locking its session out of SSE for good.
+    expires_at: Instant,
 }
 
 /// All mutable session state, guarded by one non-async mutex. No method here
@@ -528,6 +546,26 @@ impl SessionInner {
         Ok(event_id)
     }
 
+    /// Move an OPEN identity to a terminal phase and return its capacity.
+    ///
+    /// Idempotent by construction: an unknown or already-terminal identity is
+    /// left alone, so however many release paths run for one request the
+    /// open-stream count is decremented exactly once and a cancellation is
+    /// never overwritten by a later completion.
+    fn terminalize_stream(
+        &mut self,
+        identity: &StreamIdentity,
+        phase: StreamPhase,
+        max_open: usize,
+    ) -> bool {
+        if !matches!(self.streams.get(identity), Some(StreamPhase::Open)) {
+            return false;
+        }
+        self.open_streams = self.open_streams.saturating_sub(1);
+        record_terminal(self, identity.clone(), phase, max_open);
+        true
+    }
+
     /// First retained event strictly after `cursor`. History ids ascend, so
     /// this is a partition point rather than a scan.
     fn event_after(&self, cursor: u64) -> Option<(u64, Bytes)> {
@@ -593,6 +631,65 @@ impl SessionState {
         };
         if owned {
             inner.listener = None;
+            inner.last_activity = Instant::now();
+        }
+    }
+
+    /// Publish the terminal event for an already-open identity.
+    ///
+    /// Admission, retention, completion and waker capture happen in ONE
+    /// critical section, so a concurrent cancel or a duplicate response can
+    /// never interleave. Every outcome is terminal for the identity: a
+    /// successful publish completes it, a cancel refuses it (its capacity was
+    /// already returned by the cancel), and a retention/encoding refusal
+    /// completes it anyway so the caller's inline answer is the identity's one
+    /// terminal outcome and its capacity is returned exactly once.
+    fn publish_terminal(
+        &self,
+        identity: &StreamIdentity,
+        encoded: &[u8],
+    ) -> Result<u64, AggregateSseError> {
+        let max_open = self.bounds.max_streams_per_session;
+        let (outcome, waker) = {
+            let mut inner = self.lock();
+            if inner.closed {
+                return Err(AggregateSseError::StaleSession);
+            }
+            match inner.streams.get(identity).copied() {
+                Some(StreamPhase::Open) => {}
+                Some(StreamPhase::Completed) => return Err(AggregateSseError::StreamCompleted),
+                Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
+                None => return Err(AggregateSseError::UnknownStream),
+            }
+            match inner.retain_event(&self.bounds, encoded) {
+                Ok(event_id) => {
+                    inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
+                    let waker = inner.take_waker();
+                    (Ok(event_id), waker)
+                }
+                Err(error) => {
+                    inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
+                    inner.last_activity = Instant::now();
+                    (Err(error), None)
+                }
+            }
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        outcome
+    }
+
+    /// Release an open identity without publishing anything, because the POST
+    /// answered inline or the request ended before producing a response.
+    fn settle_stream(&self, identity: &StreamIdentity) {
+        let max_open = self.bounds.max_streams_per_session;
+        let mut inner = self.lock();
+        if inner.closed {
+            // Session teardown already discarded every stream record.
+            return;
+        }
+        if inner.terminalize_stream(identity, StreamPhase::Completed, max_open) {
             inner.last_activity = Instant::now();
         }
     }
@@ -787,6 +884,14 @@ impl AggregateSseBroker {
     /// critical section that every publish also takes, so replay can never be
     /// overtaken by a live event: whichever side wins the lock completes
     /// entirely before the other begins.
+    ///
+    /// A listener that is past its configured lifetime is SUPERSEDED rather
+    /// than refused. The listener's own timer only runs while the transport
+    /// polls its body, which a peer that stopped reading can prevent, so
+    /// supersession is what actually guarantees the session's single-listener
+    /// slot is reusable after `sse_listener_max_lifetime_seconds`. The epoch
+    /// bump ends the superseded body on its next poll and makes its own
+    /// release a no-op.
     pub fn attach_listener(
         &self,
         session_id: &str,
@@ -800,13 +905,25 @@ impl AggregateSseBroker {
         let Some(state) = self.session_state(session_id) else {
             return Err(AggregateSseError::UnknownSession);
         };
+        let mut superseded = None;
         let epoch = {
             let mut inner = state.lock();
             if inner.closed {
                 return Err(AggregateSseError::StaleSession);
             }
-            if inner.listener.is_some() {
+            let now = Instant::now();
+            let attached_until = inner.listener.as_ref().map(|listener| listener.expires_at);
+            if let Some(expires_at) = attached_until
+                && now < expires_at
+            {
                 return Err(AggregateSseError::DuplicateListener);
+            }
+            if attached_until.is_some() {
+                // Past its lifetime: supersede it. Wake the old body so it
+                // observes the epoch change and ends itself; a body parked in a
+                // transport write has no waker registered here and simply loses
+                // the slot it can no longer serve.
+                superseded = inner.take_waker();
             }
             let cursor = match requested {
                 // No cursor: resume at the delivery watermark. Events staged
@@ -829,10 +946,16 @@ impl AggregateSseBroker {
                 cursor,
                 waker: None,
                 greeted: false,
+                expires_at: now
+                    .checked_add(self.bounds.listener_max_lifetime)
+                    .unwrap_or(now),
             });
-            inner.last_activity = Instant::now();
+            inner.last_activity = now;
             epoch
         };
+        if let Some(waker) = superseded {
+            waker.wake();
+        }
         Ok(AggregateSseListener::new(
             state,
             epoch,
@@ -841,33 +964,50 @@ impl AggregateSseBroker {
         ))
     }
 
+    /// Whether this session has a listener that can still take delivery.
+    ///
+    /// A listener past its lifetime is deliberately reported as absent: its
+    /// stream is about to end (or has already stopped being polled), so a new
+    /// response belongs on the POST rather than staged behind it.
     pub fn has_listener(&self, session_id: &str) -> bool {
         let Some(state) = self.session_state(session_id) else {
             return false;
         };
         let inner = state.lock();
-        !inner.closed && inner.listener.is_some()
+        if inner.closed {
+            return false;
+        }
+        let now = Instant::now();
+        inner
+            .listener
+            .as_ref()
+            .is_some_and(|listener| now < listener.expires_at)
     }
 
-    /// Open a request-stream identity on a session.
+    /// Open a request-stream identity on a session and lease it.
     ///
-    /// [`Self::publish_response`] opens implicitly for a gateway-authored
-    /// reply; this is the explicit entry point for a stream whose response
-    /// arrives later (and can therefore be cancelled in between).
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    /// This is the ONLY way a stream becomes open. The request path calls it
+    /// before any catalog refresh, upstream initialize, or backend dispatch
+    /// begins, so a concurrent `notifications/cancelled` can mark a genuinely
+    /// in-flight request rather than an unknown one. The returned lease owns
+    /// the identity's capacity: publishing, settling, or simply dropping it
+    /// returns that capacity exactly once.
     pub fn open_stream(
         &self,
         session_id: &str,
         identity: &StreamIdentity,
-    ) -> Result<(), AggregateSseError> {
+    ) -> Result<AggregateSseStream, AggregateSseError> {
         let state = self.live_session(session_id)?;
-        let mut inner = state.lock();
-        if inner.closed {
-            return Err(AggregateSseError::StaleSession);
+        {
+            let mut inner = state.lock();
+            if inner.closed {
+                return Err(AggregateSseError::StaleSession);
+            }
+            inner.last_activity = Instant::now();
+            let max_open = self.bounds.max_streams_per_session;
+            admit_stream_open(&mut inner, identity, max_open)?;
         }
-        inner.last_activity = Instant::now();
-        let max_open = self.bounds.max_streams_per_session;
-        admit_stream_open(&mut inner, identity, max_open)
+        Ok(AggregateSseStream::new(state, identity.clone()))
     }
 
     /// Cancel an open stream. A cancelled identity refuses its own later
@@ -891,79 +1031,14 @@ impl AggregateSseBroker {
             Some(StreamPhase::Completed) => Err(AggregateSseError::StreamCompleted),
             Some(StreamPhase::Cancelled) => Err(AggregateSseError::StreamCancelled),
             Some(StreamPhase::Open) => {
-                inner.open_streams = inner.open_streams.saturating_sub(1);
                 let max_open = self.bounds.max_streams_per_session;
-                let terminal = identity.clone();
-                record_terminal(&mut inner, terminal, StreamPhase::Cancelled, max_open);
+                // Cancellation returns the capacity here; the request's own
+                // lease then finds a terminal phase and releases nothing more,
+                // so one identity is never decremented twice.
+                inner.terminalize_stream(identity, StreamPhase::Cancelled, max_open);
                 Ok(())
             }
         }
-    }
-
-    /// Publish a terminal JSON-RPC response for one request stream and complete
-    /// that stream, releasing its capacity.
-    ///
-    /// Opening (when the identity is not already open), admission, retention
-    /// and completion all happen in ONE critical section, so a concurrent
-    /// cancel or a duplicate response can never interleave, and a late or
-    /// duplicate response is refused instead of misattributed.
-    pub fn publish_response(
-        &self,
-        session_id: &str,
-        identity: &StreamIdentity,
-        payload: &Value,
-    ) -> Result<u64, AggregateSseError> {
-        let encoded = encode_event_payload(payload, self.bounds.max_event_bytes)?;
-        let state = self.live_session(session_id)?;
-        let max_open = self.bounds.max_streams_per_session;
-        let (event_id, waker) = {
-            let mut inner = state.lock();
-            if inner.closed {
-                return Err(AggregateSseError::StaleSession);
-            }
-            let phase = inner.streams.get(identity).copied();
-            match phase {
-                Some(StreamPhase::Open) => {}
-                Some(StreamPhase::Completed) => return Err(AggregateSseError::StreamCompleted),
-                Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
-                None => admit_stream_open(&mut inner, identity, max_open)?,
-            }
-            let event_id = inner.retain_event(&self.bounds, &encoded)?;
-            inner.open_streams = inner.open_streams.saturating_sub(1);
-            let terminal = identity.clone();
-            record_terminal(&mut inner, terminal, StreamPhase::Completed, max_open);
-            let waker = inner.take_waker();
-            (event_id, waker)
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        Ok(event_id)
-    }
-
-    /// Publish a session-scoped event that belongs to no single request stream
-    /// (server-initiated notifications).
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
-    pub fn publish_notification(
-        &self,
-        session_id: &str,
-        payload: &Value,
-    ) -> Result<u64, AggregateSseError> {
-        let encoded = encode_event_payload(payload, self.bounds.max_event_bytes)?;
-        let state = self.live_session(session_id)?;
-        let (event_id, waker) = {
-            let mut inner = state.lock();
-            if inner.closed {
-                return Err(AggregateSseError::StaleSession);
-            }
-            let event_id = inner.retain_event(&self.bounds, &encoded)?;
-            let waker = inner.take_waker();
-            (event_id, waker)
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        Ok(event_id)
     }
 
     fn session_state(&self, session_id: &str) -> Option<Arc<SessionState>> {
@@ -1078,6 +1153,91 @@ fn wake_all(wakers: Vec<Waker>) {
     }
 }
 
+/// RAII lease for ONE open multiplexed request stream.
+///
+/// Held privately on the `RequestContext` for the whole life of the request it
+/// opened, which is what makes cleanup exact-once without a detached task:
+/// publish, inline settlement, and plain drop all funnel into the same
+/// idempotent terminalization, and a context clone shares one lease rather than
+/// minting a second claim on the identity. The lease holds only the session
+/// state it opened on, never the broker, so an in-flight request cannot delay a
+/// generation retirement.
+#[derive(Clone)]
+pub struct AggregateSseStream(Arc<StreamLease>);
+
+struct StreamLease {
+    session: Arc<SessionState>,
+    identity: StreamIdentity,
+    /// One-shot terminal claim. Set BEFORE the session operation runs, because
+    /// every outcome of that operation — published, refused, cancelled — is
+    /// terminal for this identity.
+    settled: AtomicBool,
+}
+
+impl Drop for StreamLease {
+    fn drop(&mut self) {
+        if self.settled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // The request ended without publishing: an inline answer, a backend or
+        // policy replacement, or a client that went away. Return the capacity
+        // and leave a terminal record so a late duplicate is refused.
+        self.session.settle_stream(&self.identity);
+    }
+}
+
+impl fmt::Debug for AggregateSseStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Deliberately opaque: the identity is a verbatim client JSON-RPC id.
+        formatter.write_str("AggregateSseStream { .. }")
+    }
+}
+
+impl AggregateSseStream {
+    fn new(session: Arc<SessionState>, identity: StreamIdentity) -> Self {
+        Self(Arc::new(StreamLease {
+            session,
+            identity,
+            settled: AtomicBool::new(false),
+        }))
+    }
+
+    /// Publish the already-serialized terminal JSON-RPC response for this
+    /// identity, exactly as the inline answer would have carried it.
+    ///
+    /// Bytes, not a `Value`: every producer already holds the exact
+    /// client-visible representation — the gateway-authored response body or
+    /// the buffered upstream body — so the event is the same octets the inline
+    /// answer would have carried, never a re-serialization of them.
+    ///
+    /// `Err(StreamCancelled)` means the client cancelled this request id and
+    /// its result must not be sent; `Err(RetentionOverflow)` / `EventTooLarge`
+    /// mean the caller must answer this POST inline. Either way the identity is
+    /// terminal afterwards and its capacity has been returned exactly once.
+    pub fn publish_encoded(&self, encoded: &[u8]) -> Result<u64, AggregateSseError> {
+        if self.0.settled.swap(true, Ordering::AcqRel) {
+            // A second terminal attempt on one lease is a duplicate response,
+            // never a second event under the same identity.
+            return Err(AggregateSseError::StreamCompleted);
+        }
+        let max_event_bytes = self.0.session.bounds.max_event_bytes;
+        if let Err(error) = validate_event_bytes(encoded, max_event_bytes) {
+            self.0.session.settle_stream(&self.0.identity);
+            return Err(error);
+        }
+        self.0.session.publish_terminal(&self.0.identity, encoded)
+    }
+
+    /// Give up the identity without publishing, because this POST answered
+    /// inline. Idempotent, and never overwrites a cancellation.
+    pub fn settle_inline(&self) {
+        if self.0.settled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.0.session.settle_stream(&self.0.identity);
+    }
+}
+
 /// Single-consumer handle to a session's attached SSE stream.
 ///
 /// Cloning this handle (a `RequestContext` clone does) shares one inner lease:
@@ -1172,6 +1332,18 @@ impl fmt::Debug for AggregateSseBody {
     }
 }
 
+impl AggregateSseBody {
+    /// Absolute end of this stream's bounded lifetime.
+    ///
+    /// The in-body timer only advances while the transport polls this stream.
+    /// Native HTTP/3 writes with an awaited `send_data`, which a peer that stops
+    /// reading can park indefinitely, so that writer enforces this deadline as a
+    /// hard bound around its own send loop instead of relying on the poll.
+    pub fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+}
+
 impl Drop for AggregateSseBody {
     fn drop(&mut self) {
         self.session.release_listener(self.epoch);
@@ -1195,9 +1367,15 @@ impl futures_util::Stream for AggregateSseBody {
             NextFrame::Idle => {}
         }
         // Idle: the timer is what bounds an otherwise silent stream. It ends
-        // the response at the lifetime deadline — so an orphaned listener is
-        // always reclaimed — and otherwise emits a keepalive comment, which is
-        // how a vanished peer is discovered on a quiet session.
+        // the response at the lifetime deadline and otherwise emits a keepalive
+        // comment, which is how a vanished peer is discovered on a quiet
+        // session. It advances only while this body is being polled, so it is
+        // not by itself a reclamation guarantee — a peer that stops reading can
+        // park the transport's write and with it this poll. The unconditional
+        // guarantees are elsewhere: `AggregateSseBroker::attach_listener`
+        // supersedes a listener past `expires_at`, session delete / idle
+        // reaping / generation retirement close the session outright, and the
+        // native H3 writer bounds its send loop by `deadline()`.
         if this.timer.as_mut().poll(cx).is_pending() {
             return Poll::Pending;
         }
@@ -1213,21 +1391,17 @@ impl futures_util::Stream for AggregateSseBody {
     }
 }
 
-/// Serialize an event payload under the per-event ceiling. A payload whose
-/// serialization would break SSE line framing is refused rather than escaped,
-/// so the wire representation stays exactly one `data:` line.
-fn encode_event_payload(
-    payload: &Value,
-    max_event_bytes: usize,
-) -> Result<Vec<u8>, AggregateSseError> {
-    let encoded = serde_json::to_vec(payload).map_err(|_| AggregateSseError::EventTooLarge)?;
+/// Admit already-serialized event bytes under the per-event ceiling. Bytes whose
+/// framing would break SSE line structure are refused rather than escaped, so
+/// the wire representation stays exactly one `data:` line.
+fn validate_event_bytes(encoded: &[u8], max_event_bytes: usize) -> Result<(), AggregateSseError> {
     if encoded.len() > max_event_bytes {
         return Err(AggregateSseError::EventTooLarge);
     }
     if encoded.iter().any(|byte| *byte == b'\n' || *byte == b'\r') {
         return Err(AggregateSseError::EventTooLarge);
     }
-    Ok(encoded)
+    Ok(())
 }
 
 /// Parse `Last-Event-ID` into a resume cursor. Bounded, digits only, and never

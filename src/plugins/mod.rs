@@ -2667,6 +2667,16 @@ pub struct RequestContext {
     /// rejection — dropping the last handle releases the session's
     /// single-listener slot instead of stranding it.
     pub(crate) mcp_aggregate_sse: Option<mcp_aggregate_sse::AggregateSseListener>,
+    /// Lease for the multiplexed request stream this request opened, before any
+    /// catalog refresh or upstream dispatch began. Private for the same reason
+    /// as the listener lease: a forgeable metadata key must not be able to open,
+    /// steal, or terminate another request's stream identity.
+    ///
+    /// Dropping the context is the exact-once release path for every ending a
+    /// request can have — inline answer, backend or body error, policy
+    /// replacement, cancellation, transport disconnect — so no cleanup task is
+    /// ever spawned and no identity can leak its per-session capacity.
+    pub(crate) mcp_sse_stream: Option<mcp_aggregate_sse::AggregateSseStream>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -3148,6 +3158,7 @@ impl RequestContext {
             mcp_validate_tool_result: None,
             mcp_batch_forbids_upstream: false,
             mcp_aggregate_sse: None,
+            mcp_sse_stream: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_instance_scores: HashMap::new(),
@@ -4260,6 +4271,11 @@ impl RequestContext {
             // holding the listener lease at all. The real request context keeps
             // it and is the only place the response builders read it from.
             mcp_aggregate_sse: None,
+            // Likewise for the request-stream lease: this short-lived copy is
+            // discarded after the request-body hooks, and only `metadata`/WAF/AI
+            // state is copied back. Holding a lease here would terminalize the
+            // live request's identity when the copy dropped.
+            mcp_sse_stream: None,
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_instance_scores: self.waf_instance_scores.clone(),

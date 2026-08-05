@@ -12403,6 +12403,13 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
 /// delete/eviction, on broker retirement (reload / update / delete), at the
 /// configured listener lifetime, or when a QUIC write fails because the peer
 /// went away. Nothing here buffers the stream.
+///
+/// The listener lifetime is enforced as a HARD bound around the whole pump
+/// rather than left to the body's own timer. `send_data` awaits QUIC flow
+/// control, so a peer that stops reading can park this task indefinitely — and
+/// a parked task never polls the body, so an in-body deadline alone would never
+/// fire here. Timing out drops the pump (abandoning at most a partial event,
+/// which SSE framing discards) and then releases the listener slot.
 async fn send_h3_aggregate_sse_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     headers: &HashMap<String, String>,
@@ -12418,24 +12425,28 @@ async fn send_h3_aggregate_sse_response(
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 SSE response: {}", e))?;
     stream.send_response(response).await?;
-    while let Some(frame) = body.next().await {
-        let Ok(frame) = frame else {
-            // The broker never produces a body error; ending the stream is
-            // still preferable to inventing an event for the client.
-            break;
-        };
-        let Ok(data) = frame.into_data() else {
-            continue;
-        };
-        if data.is_empty() {
-            continue;
+    let deadline = body.deadline();
+    let pump = async {
+        while let Some(frame) = body.next().await {
+            let Ok(frame) = frame else {
+                // The broker never produces a body error; ending the stream is
+                // still preferable to inventing an event for the client.
+                break;
+            };
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            if data.is_empty() {
+                continue;
+            }
+            // A failed write on a long-lived stream is an ordinary client
+            // disconnect, not a gateway fault: stop and let the body drop.
+            if stream.send_data(data).await.is_err() {
+                break;
+            }
         }
-        // A failed write on a long-lived stream is an ordinary client
-        // disconnect, not a gateway fault: stop and let the body drop.
-        if stream.send_data(data).await.is_err() {
-            break;
-        }
-    }
+    };
+    let _ = tokio::time::timeout_at(deadline, pump).await;
     // Release the listener slot before the QUIC stream teardown so a client
     // that reconnects immediately is never refused by its own stale lease.
     drop(body);

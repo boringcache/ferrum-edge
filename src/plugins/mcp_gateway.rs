@@ -1731,60 +1731,223 @@ impl McpGateway {
         }
     }
 
-    /// Deliver a gateway-authored JSON-RPC response over the session's
-    /// multiplexed SSE stream when one is attached.
+    /// Record how this request's JSON-RPC response was finally delivered:
+    /// `multiplexed` on the event stream, `inline` on the POST, or `suppressed`
+    /// because the client cancelled it. Fixed tokens only.
+    fn note_sse_delivery(ctx: &mut RequestContext, outcome: &str) {
+        Self::note_metadata(ctx, "mcp.sse.delivery", outcome);
+    }
+
+    /// Whether this dispatch may multiplex its terminal JSON-RPC response.
     ///
-    /// Returns `None` when the ordinary inline JSON response must be used
-    /// instead: multiplexing disabled, no listener attached, a JSON-RPC id that
-    /// is not a representable stream identity, or a retention refusal. A
-    /// refusal is therefore never a dropped response — the client still
-    /// receives it, on the POST rather than on the event stream — and the
-    /// listener is never stranded.
-    fn deliver_response_via_sse(
+    /// Notification-form messages produce no JSON-RPC response at all, batch
+    /// members are assembled into one HTTP response array by the batch
+    /// restriction, and `initialize` answers with the session header an event
+    /// stream cannot carry (and has no session to attach to yet). None of those
+    /// may open a stream identity.
+    fn sse_multiplex_eligible(
+        &self,
+        ctx: &RequestContext,
+        envelope: &McpEnvelope,
+        method: &str,
+    ) -> bool {
+        self.sessions.sse_multiplexing
+            && self.mode == McpGatewayMode::AggregateRouter
+            && envelope.message_kind == McpMessageKind::Request
+            && envelope.id.is_some()
+            && !self.batch_forbids_upstream(ctx)
+            && method != "initialize"
+    }
+
+    /// Open the multiplexed request stream for this dispatch, BEFORE the method
+    /// handler runs any catalog refresh, upstream initialize, or backend
+    /// dispatch.
+    ///
+    /// Opening here is what makes cancellation meaningful: a concurrent
+    /// `notifications/cancelled` on another connection finds a genuinely open
+    /// stream while this one is still doing its slow work, and the eventual
+    /// response is then suppressed instead of being published late.
+    ///
+    /// Every refusal falls back to the ordinary inline JSON response. An id
+    /// that is not a representable identity is never coerced into one, so a
+    /// fallback can neither collide with a live stream nor retain state.
+    fn open_sse_stream_for_request(
         &self,
         ctx: &mut RequestContext,
-        session_id: &str,
-        id: Option<&Value>,
-        payload: &Value,
-    ) -> Option<PluginResult> {
-        if !self.sessions.sse_multiplexing {
-            return None;
+        headers: &HashMap<String, String>,
+        envelope: &McpEnvelope,
+        method: &str,
+    ) {
+        if !self.sse_multiplex_eligible(ctx, envelope, method) {
+            return;
         }
-        if !self.sse_broker.has_listener(session_id) {
-            return None;
+        let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
+            return;
+        };
+        if !self.sse_broker.has_listener(&session_id) {
+            return;
         }
-        let id = id?;
+        let Some(id) = envelope.id.as_ref() else {
+            return;
+        };
         let max_id_bytes = self.sessions.sse_bounds.max_stream_id_bytes;
         let identity = match StreamIdentity::from_json_rpc_id(id, max_id_bytes) {
             Ok(identity) => identity,
             Err(error) => {
-                // Not multiplexable, but still answerable: fall back to the
-                // inline JSON response rather than inventing an identity that
-                // could collide with another live stream.
                 Self::note_sse_error(ctx, error);
-                return None;
+                return;
             }
         };
-        let broker = &self.sse_broker;
-        match broker.publish_response(session_id, &identity, payload) {
+        match self.sse_broker.open_stream(&session_id, &identity) {
+            Ok(stream) => {
+                ctx.mcp_sse_stream = Some(stream);
+                Self::note_metadata(ctx, "mcp.sse.stream", "open");
+            }
+            Err(error) => Self::note_sse_error(ctx, error),
+        }
+    }
+
+    /// Whether a gateway-authored dispatch result is the terminal JSON-RPC
+    /// response for the identity this request opened.
+    ///
+    /// Bare status responses (the `404` that asks a client to re-initialize,
+    /// the `202` notification acknowledgement) and any response carrying a
+    /// downstream session header are NOT multiplexable: an event stream cannot
+    /// convey either, so they stay on the POST.
+    fn is_multiplexable_dispatch_response(
+        &self,
+        status_code: u16,
+        body: &str,
+        headers: &HashMap<String, String>,
+    ) -> bool {
+        if status_code != 200 || body.is_empty() {
+            return false;
+        }
+        if header_value(headers, &self.sessions.downstream_session_header).is_some() {
+            return false;
+        }
+        header_value(headers, "content-type").is_some_and(mcp_content_type_is_json)
+    }
+
+    /// Route a gateway-authored terminal response onto the session's one SSE
+    /// listener, or hand it back for the ordinary inline answer.
+    ///
+    /// `PluginResult::Continue` means the request is being routed upstream and
+    /// its response does not exist yet, so the lease stays on the context and
+    /// [`Self::multiplex_upstream_response`] decides it on the response side.
+    fn deliver_dispatch_result_via_sse(
+        &self,
+        ctx: &mut RequestContext,
+        result: PluginResult,
+    ) -> PluginResult {
+        let Some(stream) = ctx.mcp_sse_stream.take() else {
+            return result;
+        };
+        let (status_code, body, headers) = match result {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => (status_code, body, headers),
+            // `Continue` routes this request upstream, so its response does not
+            // exist yet: keep the lease and let the response-side hook own the
+            // terminal decision. Any other shape is likewise returned untouched
+            // with the lease reinstalled, so the context drop still releases the
+            // identity exactly once.
+            other => {
+                ctx.mcp_sse_stream = Some(stream);
+                return other;
+            }
+        };
+        if !self.is_multiplexable_dispatch_response(status_code, &body, &headers) {
+            stream.settle_inline();
+            Self::note_sse_delivery(ctx, "inline");
+            return PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            };
+        }
+        // Publish the EXACT bytes the inline answer would have carried, so the
+        // client receives a byte-identical JSON-RPC response on the stream.
+        match stream.publish_encoded(body.as_bytes()) {
             Ok(_) => {
                 Self::note_route_decision(ctx, "sse_multiplex");
-                Some(empty_response(202))
+                Self::note_sse_delivery(ctx, "multiplexed");
+                empty_response(202)
             }
             Err(AggregateSseError::StreamCancelled) => {
                 // The client cancelled this request id, so MCP says its result
                 // must not be sent. Acknowledge without emitting anything.
                 Self::note_sse_error(ctx, AggregateSseError::StreamCancelled);
                 Self::note_route_decision(ctx, "sse_cancelled");
+                Self::note_sse_delivery(ctx, "suppressed");
+                empty_response(202)
+            }
+            Err(error) => {
+                // A capacity or representation refusal never loses a response:
+                // this POST answers inline, the identity is already terminal so
+                // its capacity is back, and the listener keeps running.
+                Self::note_sse_error(ctx, error);
+                Self::note_sse_delivery(ctx, "inline");
+                PluginResult::Reject {
+                    status_code,
+                    body,
+                    headers,
+                }
+            }
+        }
+    }
+
+    /// Route a routed-upstream JSON-RPC response onto the session's SSE
+    /// listener.
+    ///
+    /// Returns the replacement `202` when the response was delivered on the
+    /// event stream (or deliberately suppressed by a cancellation), and `None`
+    /// when this POST must answer inline. The published event is the exact
+    /// client-visible representation, so anything this phase cannot read as
+    /// bounded identity-encoded JSON answers inline rather than being re-encoded
+    /// or dropped.
+    fn multiplex_upstream_response(
+        ctx: &mut RequestContext,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> Option<PluginResult> {
+        let stream = ctx.mcp_sse_stream.take()?;
+        let inspectable = !body.is_empty()
+            && header_value(response_headers, "content-type").is_none_or(mcp_content_type_is_json)
+            && Self::response_encoding_allows_rewrite(response_headers)
+            && !super::utils::sse::original_response_is_event_stream(ctx, response_headers);
+        if !inspectable {
+            stream.settle_inline();
+            Self::note_sse_delivery(ctx, "inline");
+            return None;
+        }
+        match stream.publish_encoded(body) {
+            Ok(_) => {
+                Self::note_sse_delivery(ctx, "multiplexed");
                 Some(empty_response(202))
             }
-            Err(AggregateSseError::RetentionOverflow) => {
-                // A capacity refusal is recoverable and never loses a response:
-                // this POST answers inline and the listener keeps running.
-                Self::note_sse_error(ctx, AggregateSseError::RetentionOverflow);
+            Err(AggregateSseError::StreamCancelled) => {
+                Self::note_sse_error(ctx, AggregateSseError::StreamCancelled);
+                Self::note_route_decision(ctx, "sse_cancelled");
+                Self::note_sse_delivery(ctx, "suppressed");
+                Some(empty_response(202))
+            }
+            Err(error) => {
+                Self::note_sse_error(ctx, error);
+                Self::note_sse_delivery(ctx, "inline");
                 None
             }
-            Err(error) => Some(Self::sse_error_response(ctx, error)),
+        }
+    }
+
+    /// Release the request's stream identity because this POST is answering
+    /// inline. Idempotent, and a no-op when no stream was opened.
+    fn settle_sse_stream_inline(ctx: &mut RequestContext) {
+        if let Some(stream) = ctx.mcp_sse_stream.take() {
+            stream.settle_inline();
+            Self::note_sse_delivery(ctx, "inline");
         }
     }
 
@@ -4379,6 +4542,30 @@ impl McpGateway {
             self.cancel_sse_stream_for_notification(ctx, headers, envelope);
         }
 
+        // Open the multiplexed stream identity BEFORE the handler runs, so the
+        // whole slow part of the request — catalog refresh, upstream
+        // initialize, backend dispatch — is cancellable, and so every terminal
+        // aggregate response below funnels through one delivery decision
+        // instead of each arm inventing its own.
+        self.open_sse_stream_for_request(ctx, headers, envelope, method);
+        let result = self
+            .dispatch_aggregate_method(ctx, headers, envelope, method, protocol_version)
+            .await;
+        self.deliver_dispatch_result_via_sse(ctx, result)
+    }
+
+    /// Aggregate-router method dispatch. Every arm returns the response as it
+    /// would be answered inline; whether that response is written to the POST or
+    /// multiplexed onto the session's event stream is decided once, by
+    /// [`Self::deliver_dispatch_result_via_sse`].
+    async fn dispatch_aggregate_method(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        envelope: &McpEnvelope,
+        method: &str,
+        protocol_version: Option<String>,
+    ) -> PluginResult {
         match method {
             "initialize" => {
                 // MCP initialize is a negotiation, not a gate: echo a supported
@@ -4457,20 +4644,15 @@ impl McpGateway {
                 if envelope.message_kind == McpMessageKind::Notification {
                     return empty_response(202);
                 }
-                let body = json!({
-                    "jsonrpc": "2.0",
-                    "id": envelope.id.clone().unwrap_or(Value::Null),
-                    "result": {}
-                });
-                let session_id = self.downstream_session_id_from_headers(headers);
-                if let Some(session_id) = session_id {
-                    let id = envelope.id.as_ref();
-                    let delivered = self.deliver_response_via_sse(ctx, &session_id, id, &body);
-                    if let Some(delivered) = delivered {
-                        return delivered;
-                    }
-                }
-                json_response(200, body, None)
+                json_response(
+                    200,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": envelope.id.clone().unwrap_or(Value::Null),
+                        "result": {}
+                    }),
+                    None,
+                )
             }
             "tools/list" => {
                 let session_id = match self
@@ -4719,6 +4901,12 @@ impl Plugin for McpGateway {
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
             && (ctx.mcp_validate_tool_result.is_some()
+                // A routed request that opened a multiplexed stream needs its
+                // complete client-visible representation to publish one SSE
+                // event. If the refinement below declines to buffer it, the
+                // response is streamed inline instead and the lease releases
+                // the identity — the response is never lost either way.
+                || ctx.mcp_sse_stream.is_some()
                 || ctx
                     .metadata
                     .get(METADATA_RESPONSE_REWRITE_KEY)
@@ -5209,7 +5397,50 @@ impl Plugin for McpGateway {
         PluginResult::Continue
     }
 
+    /// Final client-visible buffered response.
+    ///
+    /// Two things happen here, in this order. First the plugin's own fail-closed
+    /// enforcement decides the response; a replacement it authors is answered
+    /// inline on the POST, and the request's stream identity is released rather
+    /// than publishing a gateway error under it. Only a response that survived
+    /// enforcement unchanged is eligible to be multiplexed onto the session's
+    /// event stream, which is the response-side half of the aggregate SSE
+    /// lifecycle for `tools/call`, `prompts/get`, `resources/read`, and every
+    /// passthrough method routed to the primary upstream.
     async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        let enforced =
+            self.enforce_final_response_body(ctx, response_status, response_headers, body);
+        if !matches!(enforced, PluginResult::Continue) {
+            Self::settle_sse_stream_inline(ctx);
+            return enforced;
+        }
+        match Self::multiplex_upstream_response(ctx, response_headers, body) {
+            Some(replacement) => replacement,
+            None => PluginResult::Continue,
+        }
+    }
+
+    fn warmup_hostnames(&self) -> Vec<String> {
+        self.servers
+            .values()
+            .filter(|server| server.enabled)
+            .map(|server| server.target.host.clone())
+            .collect()
+    }
+}
+
+/// Fail-closed response-body enforcement, split out of the trait hook so the
+/// multiplexed SSE delivery decision has exactly one place to read its verdict:
+/// a gateway-authored replacement is answered inline, never published as an
+/// event under the caller's stream identity.
+impl McpGateway {
+    fn enforce_final_response_body(
         &self,
         ctx: &mut RequestContext,
         _response_status: u16,
@@ -5338,14 +5569,6 @@ impl Plugin for McpGateway {
                 )
             }
         }
-    }
-
-    fn warmup_hostnames(&self) -> Vec<String> {
-        self.servers
-            .values()
-            .filter(|server| server.enabled)
-            .map(|server| server.target.host.clone())
-            .collect()
     }
 }
 

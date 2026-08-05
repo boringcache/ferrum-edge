@@ -199,6 +199,21 @@ pub mod _test_support {
         ctx.mcp_aggregate_sse.is_some()
     }
 
+    /// Whether this request is still holding an OPEN multiplexed stream
+    /// identity. Used to prove the request-side open happens before the slow
+    /// aggregate work, and that a terminal delivery released it.
+    pub fn mcp_sse_stream_is_open_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.mcp_sse_stream.is_some()
+    }
+
+    /// Drop just the multiplexed stream lease, modelling a request that ended
+    /// without producing a response — a backend failure, a replaced rejection,
+    /// or a client transport disconnect. The identity must terminalize and its
+    /// per-session capacity must come back exactly once.
+    pub fn drop_mcp_sse_stream_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.mcp_sse_stream = None;
+    }
+
     /// Build the production H1/H2 wire parts and streaming body for a finalized
     /// aggregate SSE rejection. Proves the transport construction: the framing
     /// decision removes `Content-Length` and the body is fed by the broker's
