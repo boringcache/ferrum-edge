@@ -655,6 +655,7 @@ fn test_grpc_kind_is_connect_class_partitions_correctly() {
         K::H2cHandshake,
         K::InvalidServerName,
         K::DispatchCanceled,
+        K::MaxConnections,
     ] {
         assert!(
             kind.is_connect_class(),
@@ -693,6 +694,7 @@ fn test_every_connect_class_kind_classifies_as_pre_wire() {
         K::InvalidServerName,
         K::BackendRequest,
         K::DispatchCanceled,
+        K::MaxConnections,
     ];
     // Compile-time exhaustiveness: if a new variant is added, this match
     // forces an update before tests can compile.
@@ -705,7 +707,8 @@ fn test_every_connect_class_kind_classifies_as_pre_wire() {
             | K::H2cHandshake
             | K::InvalidServerName
             | K::BackendRequest
-            | K::DispatchCanceled => (),
+            | K::DispatchCanceled
+            | K::MaxConnections => (),
         };
         let err = GrpcProxyError::backend_unavailable(kind, format!("{kind:?} test"));
         let class = classify_grpc_proxy_error(&err);
