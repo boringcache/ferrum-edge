@@ -671,14 +671,15 @@ signal_reload() {
   # so select by argv instead. The signal sidecar deliberately runs as the same
   # non-root UID 1337 as the gateway: Linux credential checks otherwise deny
   # both `/proc/<pid>/cmdline` reads and signal delivery across containers.
-  # Parse `/proc/<pid>/cmdline`: require argv[0] basename
+  # procfs reports cmdline pseudo-files with st_size=0 even when reading them
+  # returns argv, so never gate the scan with `test -s`. Parse the file and
+  # require argv[0] basename
   # `ferrum-edge` and argv[1] `run`, compare only as data, and discover +
   # signal exactly one candidate in one exec to minimize the PID lifetime gap.
   kubectl --context "$context" -n "$NS" exec "pod/$pod" -c signal -- sh -eu -c '
     found=""
     for process_dir in /proc/[0-9]*; do
       [ -r "$process_dir/cmdline" ] || continue
-      [ -s "$process_dir/cmdline" ] || continue
       argv0=""
       argv1=""
       pos=0

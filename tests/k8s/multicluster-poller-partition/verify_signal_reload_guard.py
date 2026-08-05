@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Static regression guard for signal_reload process selection in run.sh.
 
-Locks in cmdline-based identity (not pidof or /proc/<pid>/exe), exact argv
-matching, fail-closed uniqueness, and same-exec HUP signaling. Does not execute
-run.sh or any cluster fixture.
+Locks in cmdline-based identity (not pidof or /proc/<pid>/exe), procfs-safe
+reads that do not trust pseudo-file stat sizes, exact argv matching, fail-closed
+uniqueness, and same-exec HUP signaling. Does not execute run.sh or any cluster
+fixture.
 """
 
 from __future__ import annotations
@@ -20,10 +21,12 @@ FORBIDDEN_PATTERNS = (
     re.compile(r"pidof\s+ferrum-edge"),
     re.compile(r"readlink\s+[^\n]*/exe"),
     re.compile(r"/proc/\[0-9\]\*/exe"),
+    re.compile(r'\[\s+-s\s+"\$process_dir/cmdline"\s+\]'),
 )
 
 REQUIRED_INNER_PATTERNS = (
     re.compile(r"for\s+process_dir\s+in\s+/proc/\[0-9\]\*;\s+do"),
+    re.compile(r'\[\s+-r\s+"\$process_dir/cmdline"\s+\]'),
     re.compile(r'done\s*<\s*"\$process_dir/cmdline"'),
     re.compile(r'"\$\{argv0##\*/\}"\s*=\s*"ferrum-edge"'),
     re.compile(r'\[ "\$argv1" = "run" \]'),
@@ -41,7 +44,6 @@ GOOD_INNER = """
     found=""
     for process_dir in /proc/[0-9]*; do
       [ -r "$process_dir/cmdline" ] || continue
-      [ -s "$process_dir/cmdline" ] || continue
       argv0=""
       argv1=""
       pos=0
@@ -129,12 +131,21 @@ def self_test() -> None:
         fail("self-test: pidof must be rejected")
 
     bad_exe = good.replace(
-        '[ -s "$process_dir/cmdline" ] || continue',
+        '[ -r "$process_dir/cmdline" ] || continue',
         'executable="$(readlink "$process_dir/exe")"',
         1,
     )
     if not rejects(bad_exe):
         fail("self-test: /proc exe readlink must be rejected")
+
+    bad_procfs_size_gate = good.replace(
+        '[ -r "$process_dir/cmdline" ] || continue',
+        '[ -r "$process_dir/cmdline" ] || continue\n'
+        '      [ -s "$process_dir/cmdline" ] || continue',
+        1,
+    )
+    if not rejects(bad_procfs_size_gate):
+        fail("self-test: procfs cmdline must not be gated on its zero stat size")
 
     bad_argv = good.replace('[ "$argv1" = "run" ]', '[ "$argv1" = "health" ]', 1)
     if not rejects(bad_argv):
