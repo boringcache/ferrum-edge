@@ -473,9 +473,10 @@ fn local_fallback_fails_closed_on_process_lock_contention() {
     let _holder = ferrum_edge::_test_support::hold_audit_local_fallback_process_lock_for_test()
         .expect("hold process lock");
     let dir = TempDir::new().expect("tempdir");
-    // Mutex is not reentrant: same-thread try_lock while held fails immediately.
+    // Mutex is not reentrant: same-thread try_lock while held keeps failing
+    // until the shared deadline, then fails closed.
     let err = append_local_fallback_event(dir.path(), &sample_backup_event())
-        .expect_err("contended process lock must fail closed");
+        .expect_err("contended process lock must fail closed after wait");
     assert!(
         err.to_string().contains("process lock contended"),
         "unexpected error: {err}"
@@ -488,7 +489,7 @@ fn local_fallback_fails_closed_on_process_lock_contention() {
 fn local_fallback_fails_closed_on_cross_process_lock_contention() {
     use std::os::unix::io::AsRawFd;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     let dir = TempDir::new().expect("tempdir");
     std::fs::create_dir_all(dir.path()).unwrap();
@@ -506,19 +507,25 @@ fn local_fallback_fails_closed_on_cross_process_lock_contention() {
     let event = sample_backup_event();
     let path = dir.path().to_path_buf();
     let (tx, rx) = mpsc::channel();
+    let started = Instant::now();
     std::thread::spawn(move || {
         let result = append_local_fallback_event(&path, &event);
         let _ = tx.send(result);
     });
-    // Generous channel timeout only guards against a hang; the functional
-    // assertion is the admission failure itself.
+    // Channel timeout only guards against a hang; admission must fail after
+    // the bounded wait (100 ms), not immediately and not unboundedly.
     let result = rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("cross-process lock contention must return promptly");
-    let err = result.expect_err("contended flock must fail closed");
+        .expect("cross-process lock contention must return within bound");
+    let elapsed = started.elapsed();
+    let err = result.expect_err("contended flock must fail closed after wait");
     assert!(
         err.to_string().contains("cross-process lock contended"),
         "unexpected error: {err}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(50),
+        "expected a bounded wait before fail-closed, elapsed={elapsed:?}"
     );
     drop(held);
 }
@@ -552,8 +559,8 @@ fn list_local_fallback_fails_closed_on_cross_process_lock_contention() {
     });
     let result = rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("list flock contention must return promptly");
-    let err = result.expect_err("contended flock must fail closed on list");
+        .expect("list flock contention must return within bound");
+    let err = result.expect_err("contended flock must fail closed on list after wait");
     assert!(
         err.to_string().contains("cross-process lock contended"),
         "unexpected error: {err}"
@@ -736,6 +743,60 @@ async fn admit_security_sensitive_event_uses_local_fallback_without_db() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].diff["data_source"], "cached");
     assert_eq!(listed[0].diff["bytes"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+async fn concurrent_security_sensitive_admits_both_succeed() {
+    // Regression for issue #3573: non-blocking lock acquisition turned ordinary
+    // in-process contention into a fail-closed error. Both admits against the
+    // same fallback directory must succeed under a bounded wait.
+    let dir = TempDir::new().expect("tempdir");
+    let first = AuditEvent::new(
+        &admin_actor(),
+        "backup",
+        "gateway_config",
+        "ferrum",
+        "ferrum",
+        backup_success_diff("cached", json!("all"), json!({"proxies": 0}), 2),
+    )
+    .with_outcome(audit::outcome::SUCCESS);
+    let second = AuditEvent::new(
+        &admin_actor(),
+        "backup",
+        "gateway_config",
+        "ferrum",
+        "ferrum",
+        backup_success_diff("cached", json!("all"), json!({"proxies": 1}), 4),
+    )
+    .with_outcome(audit::outcome::SUCCESS);
+
+    let (left, right) = tokio::join!(
+        audit::admit_security_sensitive_event(
+            None,
+            &first,
+            Some(dir.path()),
+        ),
+        audit::admit_security_sensitive_event(
+            None,
+            &second,
+            Some(dir.path()),
+        ),
+    );
+
+    let left_sink = left.expect("first concurrent admit");
+    let right_sink = right.expect("second concurrent admit");
+    assert_eq!(left_sink, AuditAdmitSink::LocalFallback);
+    assert_eq!(right_sink, AuditAdmitSink::LocalFallback);
+
+    let listed = list_local_fallback_events(dir.path()).expect("list");
+    assert_eq!(listed.len(), 2);
+    let ids: std::collections::HashSet<_> = listed
+        .iter()
+        .map(|event| event.id.as_str())
+        .collect();
+    assert!(ids.contains(first.id.as_str()));
+    assert!(ids.contains(second.id.as_str()));
 }
 
 fn hostile_backup_event(outcome: audit::AuditOutcome) -> AuditEvent {
