@@ -459,16 +459,29 @@ Unix parent-directory open or fsync failure is a **write failure**: Ferrum rolls
 the attempt back, performs a second real parent-directory fsync, and returns the
 error before any snapshot baseline commit.
 
-Rollback is ownership-scoped, and ownership is decided by the name being
-published rather than by inspecting the file on disk. It always removes this
-attempt's own attributed temp. It also removes the **final** path when that name
-belongs exclusively to the attempt — the ULID-derived `<ulid>.<owner_tag>.<ext>`
-batch and its `<name>.rejected.meta` dead-letter record, which no other writer
-can publish. It never removes `spool.meta.json`, the one final name every writer
-of a namespace shares: an unlink acts on a path, and a peer's `rename` can
-replace that path between any ownership check and the removal, so no
-stat-then-unlink, content comparison, or timestamp comparison could keep such a
-removal from deleting a peer's newer manifest.
+Rollback is ownership-scoped **and** descriptor-bound. It always removes this
+attempt's own attributed temp, whose name only this attempt can be writing.
+
+For the **final** path it first asks whether the name is one that any other
+legitimate writer of the protocol publishes to. `spool.meta.json` is — it is the
+one final name every writer of a namespace shares — so it is *never* unlinked: a
+peer's newer manifest is an honest publication to that name, and an unlink acts
+on a path, so no check could keep such a removal from deleting it.
+
+The ULID-derived `<ulid>.<owner_tag>.<ext>` batch and its
+`<name>.rejected.meta` dead-letter record are names no other protocol writer
+publishes to, so rollback of a post-rename failure may remove them. That is not
+by itself proof that the pathname still names *this attempt's* file: a same-UID
+actor sharing the volume can atomically rename its own file over any pathname,
+including in the window between this attempt's rename and the parent-directory
+fsync that failed. So the removal is bound to the temp writer descriptor, which
+Ferrum holds open across the rename and the directory fsync: while that
+descriptor lives the kernel cannot recycle its device/inode, so "this entry is
+still the file I published" is provable rather than a stat-then-unlink race. An
+extra hard link on either view fails the same check. If the entry has been
+replaced, it is left byte-for-byte untouched, a warning names the path, and the
+primary durability error is returned on its own. A failure *before* the rename
+publishes nothing at the final path and never considers it at all.
 
 A failed manifest publish therefore leaves the manifest entry in place, and
 Ferrum does **not** treat that as success. The durability error is still
@@ -520,8 +533,10 @@ restoring a descriptor-free pathname.
 Claim disposition:
 
 - **Delivered** — the claim is removed.
-- **Retryable** — the claim is released back to its durable replayable name and
-  the tick stops so ordering is preserved.
+- **Retryable** — an ordinary delivery, I/O, quota, or serialization failure
+  taken while the exact claim is still live: the claim is released back to its
+  durable replayable name through the exact-claim-bound release path, and the
+  tick stops so ordering is preserved.
 - **Permanent / 413 single row** — good siblings are delivered through bounded
   bisection; each minimal rejected row is durably copied byte-for-byte to the
   private dead-letter payload file and described by safe metadata before the
@@ -549,6 +564,15 @@ Claim disposition:
   and the claim is not released, promoted, quarantined, removed, or accounted.
   No further external delivery is attempted for it. The hostile pathname is left
   exactly as found, for operator reconciliation.
+
+  This classification is carried, not flattened. Losing claim authorization while
+  the streaming dead-letter payload writer is being opened or appended to is
+  **not** a retryable storage failure, so it never enters the release path: it is
+  reported as `unauthorized dead-letter payload open` / `… payload append`
+  wrapping the original pathname-scoped refusal, counted in the sink's failure
+  metrics, and returned. Reporting it as retryable would attempt a release that
+  is correctly refused anyway, but would replace the diagnostic that says where
+  authorization was actually lost with the refusal's own.
 
   Recovery driven by the exact pinned claim keeps its deliberate replace, unlink,
   and account-out behavior, because that claim genuinely owns the derived sibling

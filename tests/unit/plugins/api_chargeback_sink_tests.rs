@@ -5556,9 +5556,10 @@ fn rollback_after_rename_never_unlinks_a_shared_final() {
 #[cfg(unix)]
 #[test]
 fn rollback_after_rename_removes_a_unique_final() {
-    // The counterpart to the shared case: a ULID-derived name has exactly one
-    // possible writer, so rollback of a post-rename failure unlinks it and the
-    // "never delete" rule stays scoped to shared names only.
+    // The counterpart to the shared case: a ULID-derived name has no other
+    // legitimate protocol writer, so when the entry at it is still provably this
+    // attempt's own unsynced publication, rollback of a post-rename failure
+    // unlinks it. The "never delete" rule stays scoped to shared names only.
     let temp = tempfile::tempdir().unwrap();
     let final_path = temp.path().join(format!("{}.owner-tag.ndjson", new_ulid()));
     let tmp_path = temp.path().join("unique.write-own.tmp");
@@ -5579,6 +5580,49 @@ fn rollback_after_rename_removes_a_unique_final() {
     assert!(
         !final_path.exists(),
         "an unsynced publication at a uniquely owned name must be rolled back"
+    );
+    assert!(
+        !tmp_path.exists(),
+        "rollback must still remove this attempt's own temp"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_after_rename_preserves_a_peer_replacement_at_a_unique_final() {
+    // `Unique` says only that no other *legitimate protocol writer* publishes to
+    // the generated name. It is not proof that a hostile same-UID actor cannot
+    // atomically replace that pathname — and the window between this attempt's
+    // rename and its failing parent-directory fsync is exactly where such a
+    // replacement lands. Rollback is bound to the writer descriptor this attempt
+    // keeps open across both steps, so the replacement survives byte-for-byte
+    // and only the primary durability error comes back.
+    let temp = tempfile::tempdir().unwrap();
+    let final_path = temp.path().join(format!("{}.owner-tag.ndjson", new_ulid()));
+    let tmp_path = temp.path().join("unique.write-raced.tmp");
+    let mine: &[u8] = b"{\"ok\":true}\n";
+
+    let err = write_private_file_atomically_with_fault_for_tests(
+        &tmp_path,
+        &final_path,
+        mine,
+        SpoolFsFault::PeerRepublishThenDirSync,
+        SpoolFinalOwnership::Unique,
+    )
+    .expect_err("an injected directory-sync fault must fail the write");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    assert!(
+        !err.contains("rollback cleanup also failed"),
+        "leaving a replaced pathname alone is not a cleanup failure: {err}"
+    );
+    let published = fs::read(&final_path).unwrap();
+    assert_eq!(
+        published, PEER_REPUBLISH_MARKER,
+        "rollback must not unlink a replacement that took the unique final pathname"
+    );
+    assert_ne!(
+        published, mine,
+        "the replacement, not this attempt's bytes, must be what survives"
     );
     assert!(
         !tmp_path.exists(),
@@ -8310,6 +8354,22 @@ fn spool_day_has_quarantine(day: &Path) -> bool {
         .any(|entry| entry.file_name().to_string_lossy().ends_with(".corrupt"))
 }
 
+/// Any published or half-published dead-letter artifact left in `day`.
+///
+/// Covers the `.rejected.ndjson` payload, the `.rejected.meta` record, and the
+/// generation-attributed handoff temps of either, whose exact names depend on
+/// the process tag and generation.
+#[cfg(unix)]
+fn spool_day_has_dead_letter_residue(day: &Path) -> bool {
+    fs::read_dir(day)
+        .expect("spool day remains readable")
+        .filter_map(Result::ok)
+        .any(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.contains(".rejected") || name.ends_with(".tmp")
+        })
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
@@ -8561,6 +8621,181 @@ async fn wrong_type_claim_before_finalization_publishes_nothing_and_never_mutate
     assert_eq!(
         after.bytes, before.bytes,
         "a refused wrong-type handoff must not change the owned-byte accounting"
+    );
+}
+
+/// Claim authorization lost *during* streaming dead-letter staging, at the
+/// append stage: the payload writer was already opened while the claim was live,
+/// and a wrong-type replacement then takes the pathname before the rejected rows
+/// are admitted and appended.
+///
+/// That loss is not a transient delivery or storage failure, so it must not be
+/// reported as retryable. A retryable classification sends the tick into the
+/// exact-claim-bound release path, which correctly refuses — but returns the
+/// refusal's own diagnostic in place of the one that says *where* authorization
+/// was lost. The stage-named diagnostic below is what proves no release was
+/// attempted and no result was substituted for it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn wrong_type_claim_during_dead_letter_append_is_unauthorized_not_retryable() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-wrong-type-during-append")])
+        .unwrap();
+    let day = source.parent().unwrap().to_path_buf();
+    let authoritative_bytes = fs::read(&source).unwrap();
+    let before = spool.cached_stats_for_tests();
+    let displaced = outside.path().join("displaced-authoritative-source.ndjson");
+
+    let clear = ClearReplayHookOnDrop;
+    let (fired, claim_slot) = install_claim_directory_substitution_hook(
+        spool.namespace_root_for_tests().to_path_buf(),
+        displaced.clone(),
+        SpoolReplayHookPoint::BeforeDeadLetterPayloadAppend,
+    );
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("a wrong-type claim during dead-letter append must fail the tick");
+    drop(clear);
+
+    assert!(fired.load(Ordering::SeqCst));
+    // The append stage's own diagnostic, not a release refusal standing in for
+    // it. Both messages are produced by the same claim predicate and are
+    // otherwise textually identical, so this prefix is the discriminator.
+    assert!(
+        error.contains("unauthorized dead-letter payload append"),
+        "the append stage's unauthorized diagnostic must be the one returned: {error}"
+    );
+    assert!(
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "the original authorization diagnostic must be preserved verbatim: {error}"
+    );
+
+    // No publication, no eviction, no accounting, and no handoff residue: the
+    // opened temp is removed by its descriptor-bound drop.
+    assert!(
+        !dead_letter_payload_path(&source).exists(),
+        "an unauthorized append must not authorize rejected-payload publication"
+    );
+    assert!(
+        !dead_letter_meta_path(&source).exists(),
+        "an unauthorized append must not authorize rejected-metadata publication"
+    );
+    assert!(
+        !spool_day_has_dead_letter_residue(&day),
+        "an unauthorized append must leave no dead-letter payload, record, or handoff temp"
+    );
+
+    let planted = claim_slot
+        .lock()
+        .expect("planted claim slot")
+        .clone()
+        .expect("the race plants exactly one claim pathname");
+    assert!(
+        planted.is_dir(),
+        "the planted directory must be left exactly where it was planted"
+    );
+    assert!(
+        !source.exists(),
+        "an unauthorized append must never release the pathname back to the replayable name"
+    );
+    assert!(
+        !spool_day_has_quarantine(&day),
+        "an unauthorized append must never quarantine the pathname"
+    );
+    assert_eq!(fs::read(&displaced).unwrap(), authoritative_bytes);
+
+    let after = spool.cached_stats_for_tests();
+    assert_eq!(
+        after.files, before.files,
+        "an unauthorized append must not change the owned-file accounting"
+    );
+    assert_eq!(
+        after.bytes, before.bytes,
+        "an unauthorized append must not change the owned-byte accounting"
+    );
+}
+
+/// The same boundary one stage earlier, with the cheaper substitution: a
+/// same-UID regular file takes the claim pathname before the dead-letter payload
+/// writer is even opened, so not even a handoff temp may be created for it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn substituted_claim_during_dead_letter_open_is_unauthorized_not_retryable() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-substitute-during-open")])
+        .unwrap();
+    let day = source.parent().unwrap().to_path_buf();
+    let authoritative_bytes = fs::read(&source).unwrap();
+    let before = spool.cached_stats_for_tests();
+    let displaced = outside.path().join("displaced-authoritative-source.ndjson");
+
+    let clear = ClearReplayHookOnDrop;
+    let (fired, claim_slot) = install_claim_substitution_hook(
+        spool.namespace_root_for_tests().to_path_buf(),
+        displaced.clone(),
+        SpoolReplayHookPoint::BeforeDeadLetterPayloadOpen,
+    );
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("a substituted claim during dead-letter open must fail the tick");
+    drop(clear);
+
+    assert!(fired.load(Ordering::SeqCst));
+    assert!(
+        error.contains("unauthorized dead-letter payload open"),
+        "the open stage's unauthorized diagnostic must be the one returned: {error}"
+    );
+    assert!(
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "the original authorization diagnostic must be preserved verbatim: {error}"
+    );
+    assert!(
+        !spool_day_has_dead_letter_residue(&day),
+        "an unauthorized open must not create a handoff temp or publish either sibling"
+    );
+
+    let claim = claim_slot
+        .lock()
+        .expect("planted claim slot")
+        .clone()
+        .expect("the race plants exactly one claim pathname");
+    assert_eq!(
+        fs::read(&claim).unwrap(),
+        PLANTED_CLAIM_SUBSTITUTE,
+        "the planted regular file must be byte-identical and never rewritten"
+    );
+    assert!(
+        !source.exists(),
+        "an unauthorized open must never release the substitute back to the replayable name"
+    );
+    assert!(
+        !spool_day_has_quarantine(&day),
+        "an unauthorized open must never quarantine the substitute"
+    );
+    assert_eq!(fs::read(&displaced).unwrap(), authoritative_bytes);
+
+    let after = spool.cached_stats_for_tests();
+    assert_eq!(
+        after.files, before.files,
+        "an unauthorized open must not change the owned-file accounting"
+    );
+    assert_eq!(
+        after.bytes, before.bytes,
+        "an unauthorized open must not change the owned-byte accounting"
     );
 }
 

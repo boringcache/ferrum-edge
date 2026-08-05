@@ -5752,25 +5752,32 @@ pub enum SpoolFsFault {
     PeerRepublishThenDirSync,
 }
 
-/// Whether this write attempt exclusively owns the name it publishes to.
+/// Whether any other *legitimate protocol writer* can publish to the name this
+/// attempt is publishing to.
 ///
-/// Rollback after a failed publish may only unlink a final path when no other
-/// writer can be publishing to that same name, because a path unlink cannot be
-/// made atomic with any proof about which file the name currently resolves to.
-/// Stat-then-unlink, content comparison, and timestamp comparison all lose the
-/// race against an atomic `rename` by a peer between the check and the unlink,
-/// and an in-process lock says nothing about a peer process sharing the volume.
-/// So the distinction is drawn statically, at each call site, instead.
+/// This is a statement about the protocol's own name generation, not a proof
+/// about the filesystem: a same-UID actor sharing the volume can atomically
+/// rename its own file over any pathname, whichever variant applies. So the
+/// variant only decides *whether an unlink is ever considered*; when it is, the
+/// unlink is additionally bound to the still-open writer descriptor
+/// ([`remove_path_if_descriptor_matches`]), which is the capability that proves
+/// which file the pathname currently resolves to. Stat-then-unlink, content
+/// comparison, and timestamp comparison would all lose the race against a peer's
+/// atomic `rename`, and an in-process lock says nothing about a peer process on
+/// a shared volume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpoolFinalOwnership {
-    /// A name no other writer can publish to: the ULID-derived data batch
-    /// `<ulid>.<owner_tag>.<ext>`, and the `<that name>.rejected.meta`
-    /// dead-letter record derived from one. Rollback unlinks such a final,
-    /// because the only entry it can ever destroy is this attempt's own
-    /// unsynced publication.
+    /// A name generated so that no other writer of this protocol publishes to
+    /// it: the ULID-derived data batch `<ulid>.<owner_tag>.<ext>`, and the
+    /// `<that name>.rejected.meta` dead-letter record derived from one. Rollback
+    /// after a post-rename failure unlinks such a final *only* while it still
+    /// resolves to the descriptor this attempt wrote; a hostile replacement is
+    /// left byte-for-byte untouched.
     Unique,
     /// A well-known name every writer of the namespace publishes to — currently
-    /// only `spool.meta.json`. Rollback never unlinks such a final.
+    /// only `spool.meta.json`. Rollback never unlinks such a final, even when it
+    /// is still provably this attempt's: a peer's newer manifest is a legitimate
+    /// publication to that name, so "never unlink" is the only safe rule for it.
     Shared,
 }
 
@@ -7020,8 +7027,10 @@ impl SpoolManager {
         // generation in this process can reconcile the temp mid-write.
         let write_result = {
             let _live = LiveSpoolPathGuard::new(tmp_path.clone());
-            // The final name carries a freshly minted ULID, so no peer can be
-            // publishing to it and a failed publish rolls its own file back.
+            // The final name carries a freshly minted ULID, so no other writer
+            // of this protocol publishes to it. Rollback of a failed publish is
+            // still descriptor-bound, so a hostile same-UID replacement of that
+            // pathname survives instead of being deleted.
             write_private_file_atomically_with_ops(
                 &tmp_path,
                 &final_path,
@@ -8988,26 +8997,38 @@ struct DeadLetterPayloadWriter {
 }
 
 impl DeadLetterPayloadWriter {
+    /// The two-valued outcome is load-bearing for the caller:
+    /// [`ClaimMutationError::Unauthorized`] means the claim pathname stopped
+    /// resolving to the opened authoritative artifact, which is not a transient
+    /// storage failure and must never be answered with a claim release.
     fn open(
         spool: &SpoolManager,
         source_path: &Path,
         artifact: &PinnedClaimArtifact,
-    ) -> Result<Self, String> {
-        let (temp_path, final_path) = dead_letter_payload_paths(spool, source_path)?;
-        let (_, prior_meta_path) = dead_letter_meta_paths(source_path)?;
-        let _guard = spool.lock_spool_mutation()?;
+    ) -> Result<Self, ClaimMutationError> {
+        let (temp_path, final_path) = dead_letter_payload_paths(spool, source_path)
+            .map_err(ClaimMutationError::Retryable)?;
+        let (_, prior_meta_path) = dead_letter_meta_paths(source_path)
+            .map_err(ClaimMutationError::Retryable)?;
+        let _guard = spool
+            .lock_spool_mutation()
+            .map_err(ClaimMutationError::Retryable)?;
         // Opening begins a publication transaction whose later rename may
         // replace a completed sibling, and whose temp already consumes owned
         // quota. Require the exact pinned claim up front; a missing, wrong-type,
         // or substituted pathname authorizes no part of that transaction, so no
         // temp is created, no quota candidate is evicted for it, and no sibling
         // is touched.
+        spool.require_live_claim(source_path, artifact)?;
         spool
-            .require_live_claim(source_path, artifact)
-            .map_err(ClaimMutationError::into_message)?;
-        spool.assert_managed_path(&temp_path)?;
-        spool.assert_managed_path(&final_path)?;
-        spool.assert_managed_path(&prior_meta_path)?;
+            .assert_managed_path(&temp_path)
+            .map_err(ClaimMutationError::Retryable)?;
+        spool
+            .assert_managed_path(&final_path)
+            .map_err(ClaimMutationError::Retryable)?;
+        spool
+            .assert_managed_path(&prior_meta_path)
+            .map_err(ClaimMutationError::Retryable)?;
         // The source claim remains authoritative until payload + metadata are
         // durable and the claim is removed. A previous attempt may therefore
         // have published either sibling before failing. Remove those partial
@@ -9026,10 +9047,10 @@ impl DeadLetterPayloadWriter {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(format!(
+                    return Err(ClaimMutationError::Retryable(format!(
                         "{PLUGIN_NAME}: failed to remove prior partial dead-letter {kind} '{}': {error}",
                         path.display()
-                    ));
+                    )));
                 }
             }
         }
@@ -9049,10 +9070,10 @@ impl DeadLetterPayloadWriter {
             .create_new(true)
             .open(&temp_path);
         let file = file.map_err(|error| {
-            format!(
+            ClaimMutationError::Retryable(format!(
                 "{PLUGIN_NAME}: failed to create dead-letter payload temp '{}': {error}",
                 temp_path.display()
-            )
+            ))
         })?;
         Ok(Self {
             source_path: source_path.to_path_buf(),
@@ -9066,43 +9087,51 @@ impl DeadLetterPayloadWriter {
         })
     }
 
+    /// Same two-valued contract as [`Self::open`]: a claim substituted between
+    /// delivery chunks is [`ClaimMutationError::Unauthorized`], never a
+    /// retryable storage failure.
     fn append_batch(
         &mut self,
         spool: &SpoolManager,
         artifact: &PinnedClaimArtifact,
         batch: &StreamingReplayBatch,
         row_indices: &[usize],
-    ) -> Result<(), String> {
-        let mut incoming_bytes = 0usize;
-        for (offset, row_index) in row_indices.iter().copied().enumerate() {
-            let row = batch.row(row_index)?;
-            let separator_bytes = usize::from(self.rows != 0 || offset != 0);
-            incoming_bytes = incoming_bytes
-                .checked_add(separator_bytes)
-                .and_then(|bytes| bytes.checked_add(row.len()))
-                .ok_or_else(|| {
-                    format!("{PLUGIN_NAME}: dead-letter payload append byte count overflowed")
-                })?;
-        }
-        let incoming_bytes = u64::try_from(incoming_bytes).map_err(|_| {
-            format!("{PLUGIN_NAME}: dead-letter payload append byte count is not addressable")
-        })?;
-        let _guard = spool.lock_spool_mutation()?;
+    ) -> Result<(), ClaimMutationError> {
+        let incoming_bytes = dead_letter_append_byte_bound(self.rows, batch, row_indices)
+            .map_err(ClaimMutationError::Retryable)?;
+        let _guard = spool
+            .lock_spool_mutation()
+            .map_err(ClaimMutationError::Retryable)?;
         // Admission may evict other replayable files, and the append mutates
         // this handoff's temp. Revalidate the exact claim before either action;
         // a substitution between delivery chunks authorizes neither.
+        spool.require_live_claim(&self.source_path, artifact)?;
         spool
-            .require_live_claim(&self.source_path, artifact)
-            .map_err(ClaimMutationError::into_message)?;
-        spool.assert_managed_path(&self.temp_path)?;
-        spool.assert_managed_path(&self.final_path)?;
+            .assert_managed_path(&self.temp_path)
+            .map_err(ClaimMutationError::Retryable)?;
+        spool
+            .assert_managed_path(&self.final_path)
+            .map_err(ClaimMutationError::Retryable)?;
         // The live temp and authoritative source already appear in the owned
         // inventory. Admit each bounded replay-batch append before writing it so
         // a compressed source cannot temporarily expand an uncompressed
         // rejected payload past the documented hard on-disk quota. Batching the
         // admission also prevents an all-poison artifact from causing one full
         // spool walk per hostile row.
-        spool.evict_until_can_admit(incoming_bytes)?;
+        spool
+            .evict_until_can_admit(incoming_bytes)
+            .map_err(ClaimMutationError::Retryable)?;
+        self.write_rows(batch, row_indices)
+            .map_err(ClaimMutationError::Retryable)
+    }
+
+    /// Append the admitted rows to this handoff's temp. Only reached once the
+    /// exact pinned claim has been re-proved under the namespace mutation lock.
+    fn write_rows(
+        &mut self,
+        batch: &StreamingReplayBatch,
+        row_indices: &[usize],
+    ) -> Result<(), String> {
         let file = self.file.as_mut().ok_or_else(|| {
             format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
         })?;
@@ -9289,6 +9318,32 @@ impl Drop for DeadLetterPayloadWriter {
     }
 }
 
+/// Exact on-disk growth an append of `row_indices` would add to a payload that
+/// already holds `existing_rows`, row separators included.
+///
+/// Computed before the namespace mutation lock is taken and before any quota
+/// admission, so an overflow refuses the append without evicting anything.
+fn dead_letter_append_byte_bound(
+    existing_rows: usize,
+    batch: &StreamingReplayBatch,
+    row_indices: &[usize],
+) -> Result<u64, String> {
+    let mut incoming_bytes = 0usize;
+    for (offset, row_index) in row_indices.iter().copied().enumerate() {
+        let row = batch.row(row_index)?;
+        let separator_bytes = usize::from(existing_rows != 0 || offset != 0);
+        incoming_bytes = incoming_bytes
+            .checked_add(separator_bytes)
+            .and_then(|bytes| bytes.checked_add(row.len()))
+            .ok_or_else(|| {
+                format!("{PLUGIN_NAME}: dead-letter payload append byte count overflowed")
+            })?;
+    }
+    u64::try_from(incoming_bytes).map_err(|_| {
+        format!("{PLUGIN_NAME}: dead-letter payload append byte count is not addressable")
+    })
+}
+
 #[derive(Clone, Copy)]
 enum DeadLetterIdentityExpectation {
     Exact(SpoolFileIdentity),
@@ -9454,31 +9509,82 @@ fn verify_dead_letter_payload(
     )
 }
 
-/// Best-effort rollback may unlink only a path that still resolves to the open
-/// writer descriptor. A planted replacement is left untouched for operator
-/// inspection while the authoritative source remains replayable.
-fn remove_dead_letter_path_if_descriptor_matches(path: &Path, file: &File) {
-    let Ok(descriptor_metadata) = file.metadata() else {
-        return;
+/// Outcome of one descriptor-bound rollback unlink.
+enum DescriptorBoundUnlink {
+    /// The pathname resolved to the open descriptor and was unlinked.
+    Removed,
+    /// The pathname is absent, is not a regular file, carries an extra hard
+    /// link, or names a *different* file node than the open descriptor. Nothing
+    /// was touched.
+    NotThisDescriptor,
+    /// The identity proof or the unlink itself could not be completed, so no
+    /// rollback may be claimed. Nothing was unlinked.
+    Failed(String),
+}
+
+/// Unlink `path` only while it still resolves to the exact regular file `file`
+/// has open.
+///
+/// The open descriptor — not a metadata snapshot — is the capability that makes
+/// this sound. While it lives the kernel cannot recycle its device/inode for a
+/// replacement, so a same-UID actor who atomically renames another file over
+/// `path` is always visible here as a different file node rather than winning a
+/// stat-then-unlink race. An extra hard link on either view would survive the
+/// unlink and is refused for the same reason.
+fn remove_path_if_descriptor_matches(path: &Path, file: &File) -> DescriptorBoundUnlink {
+    let descriptor_metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return DescriptorBoundUnlink::Failed(format!(
+                "failed to stat the open writer descriptor for '{}': {error}",
+                path.display()
+            ));
+        }
     };
-    let Ok(path_metadata) = fs::symlink_metadata(path) else {
-        return;
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return DescriptorBoundUnlink::NotThisDescriptor;
+        }
+        Err(error) => {
+            return DescriptorBoundUnlink::Failed(format!(
+                "failed to lstat rollback path '{}': {error}",
+                path.display()
+            ));
+        }
     };
     if !descriptor_metadata.file_type().is_file() || !path_metadata.file_type().is_file() {
-        return;
+        return DescriptorBoundUnlink::NotThisDescriptor;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if descriptor_metadata.nlink() != 1 || path_metadata.nlink() != 1 {
-            return;
+            return DescriptorBoundUnlink::NotThisDescriptor;
         }
     }
     let descriptor_identity = SpoolFileIdentity::from_metadata(&descriptor_metadata);
     let path_identity = SpoolFileIdentity::from_metadata(&path_metadata);
-    if descriptor_identity.same_file_node(&path_identity) {
-        let _ = fs::remove_file(path);
+    if !descriptor_identity.same_file_node(&path_identity) {
+        return DescriptorBoundUnlink::NotThisDescriptor;
     }
+    match fs::remove_file(path) {
+        Ok(()) => DescriptorBoundUnlink::Removed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            DescriptorBoundUnlink::NotThisDescriptor
+        }
+        Err(error) => DescriptorBoundUnlink::Failed(format!(
+            "failed to remove rollback path '{}': {error}",
+            path.display()
+        )),
+    }
+}
+
+/// Best-effort rollback may unlink only a path that still resolves to the open
+/// writer descriptor. A planted replacement is left untouched for operator
+/// inspection while the authoritative source remains replayable.
+fn remove_dead_letter_path_if_descriptor_matches(path: &Path, file: &File) {
+    let _ = remove_path_if_descriptor_matches(path, file);
 }
 
 fn dead_letter_payload_paths(
@@ -9558,8 +9664,9 @@ fn write_dead_letter_meta(
     }
     let _live = LiveSpoolPathGuard::new(tmp_path.clone());
     // `<ulid>.<owner_tag>.<ext>.rejected.meta` inherits the uniqueness of the
-    // ULID-named source artifact it describes, so this final is exclusively this
-    // attempt's and a failed publish rolls it back.
+    // ULID-named source artifact it describes, so no other writer of this
+    // protocol publishes to it and a failed publish rolls back the entry it
+    // published — descriptor-bound, so a hostile replacement is left alone.
     write_private_file_atomically_with_ops(
         &tmp_path,
         &meta_path,
@@ -9762,6 +9869,17 @@ pub enum SpoolReplayHookPoint {
     /// models a same-UID actor replacing the claim pathname after the
     /// authoritative descriptor was validated.
     AfterMatchingReplayOpen,
+    /// This batch produced permanently rejected rows and no dead-letter payload
+    /// writer exists yet; the writer's claim-bound open has not run. A
+    /// substitution staged here models a same-UID actor replacing the claim
+    /// pathname after delivery refused the rows but before any evidence temp
+    /// exists.
+    BeforeDeadLetterPayloadOpen,
+    /// The dead-letter payload writer exists and its claim-bound append of this
+    /// batch's rejected rows has not run. A substitution staged here models the
+    /// same actor racing *between* delivery chunks, after the handoff temp was
+    /// already created.
+    BeforeDeadLetterPayloadAppend,
     /// Streaming finished and its reader was dropped; the dead-letter
     /// finalization that publishes durable evidence and performs the terminal
     /// claim operation has not started.
@@ -11142,7 +11260,8 @@ pub fn probe_empty_dead_letter_publish_with_identity_for_tests(
     source_path: &Path,
     pinned: &PinnedClaimIdentityForTests,
 ) -> Result<(), String> {
-    let writer = DeadLetterPayloadWriter::open(spool, source_path, &pinned.0)?;
+    let writer = DeadLetterPayloadWriter::open(spool, source_path, &pinned.0)
+        .map_err(ClaimMutationError::into_message)?;
     writer.publish(spool, &pinned.0).map(|_| ())
 }
 
@@ -11296,11 +11415,14 @@ pub fn probe_dead_letter_handoff_interference_for_tests(
 ) -> Result<PathBuf, String> {
     let batch = single_row_replay_batch_for_tests(spool, row)?;
     let pinned = PinnedClaimArtifact::pin_path(source_path);
-    let mut writer = DeadLetterPayloadWriter::open(spool, source_path, &pinned)?;
+    let mut writer = DeadLetterPayloadWriter::open(spool, source_path, &pinned)
+        .map_err(ClaimMutationError::into_message)?;
     if stage == DeadLetterHandoffStageForTests::BeforeAppend {
         interfere(source_path);
     }
-    writer.append_batch(spool, &pinned, &batch, &[0])?;
+    writer
+        .append_batch(spool, &pinned, &batch, &[0])
+        .map_err(ClaimMutationError::into_message)?;
     if stage == DeadLetterHandoffStageForTests::BeforePublish {
         interfere(source_path);
     }
@@ -11316,8 +11438,11 @@ fn publish_dead_letter_payload_inner_for_tests(
     prior_payload: Option<&[u8]>,
 ) -> Result<(PathBuf, SpoolStats), String> {
     let batch = single_row_replay_batch_for_tests(spool, row)?;
-    let mut writer = DeadLetterPayloadWriter::open(spool, source_path, pinned)?;
-    writer.append_batch(spool, pinned, &batch, &[0])?;
+    let mut writer = DeadLetterPayloadWriter::open(spool, source_path, pinned)
+        .map_err(ClaimMutationError::into_message)?;
+    writer
+        .append_batch(spool, pinned, &batch, &[0])
+        .map_err(ClaimMutationError::into_message)?;
     if let Some(prior) = prior_payload {
         let (_, final_path) = dead_letter_payload_paths(spool, source_path)?;
         fs::write(&final_path, prior).map_err(|error| {
@@ -11859,7 +11984,15 @@ fn write_private_file_atomically_with_ops(
     ops: SpoolFsOps,
     ownership: SpoolFinalOwnership,
 ) -> Result<(), String> {
-    let result = write_private_file_atomically_inner(tmp_path, final_path, bytes, ops);
+    // The temp writer descriptor stays open across this attempt's rename and
+    // parent-directory fsync, so rollback holds a capability rather than a
+    // snapshot: while it lives the kernel cannot recycle its device/inode, which
+    // is what makes "the final still names the file I published" provable
+    // instead of a stat-then-unlink race. It is released when this function
+    // returns, after every rollback decision below has been taken.
+    let mut progress = AtomicWriteProgress::default();
+    let result =
+        write_private_file_atomically_inner(tmp_path, final_path, bytes, ops, &mut progress);
     let Err(primary_error) = result else {
         return Ok(());
     };
@@ -11887,19 +12020,24 @@ fn write_private_file_atomically_with_ops(
     // `final_path`, unlike the temp, is not always this attempt's to delete.
     //
     // For a [`SpoolFinalOwnership::Unique`] name — a ULID-derived data batch or
-    // its dead-letter metadata — no other writer can publish to that path, so
-    // the only entry an unlink can destroy is this attempt's own unsynced
-    // publication. Roll it back, and report a cleanup failure rather than
-    // claiming a guaranteed rollback.
+    // its dead-letter metadata — no other *legitimate protocol writer* owns the
+    // generated name. That is not proof that the pathname still names this
+    // attempt's file: a same-UID actor sharing the volume can atomically rename
+    // its own file over any pathname, including in the window between this
+    // attempt's rename and the parent-directory fsync that failed above. So the
+    // unlink is bound to the still-open writer descriptor: it removes the entry
+    // only while that entry is provably the exact regular file this attempt
+    // published, and a replacement is left byte-for-byte untouched while the
+    // primary durability error is still returned. A pre-rename failure never
+    // matches either, because the descriptor still names the temp.
     //
     // For a [`SpoolFinalOwnership::Shared`] name — `spool.meta.json`, one
     // well-known path for every writer of the namespace — the unlink is skipped
-    // entirely. There is no way to make "this entry is still the file I renamed"
-    // atomic with the unlink that acts on it: a peer's `rename` can replace the
-    // name between any check and the removal, so stat-then-unlink (by inode or
-    // otherwise), content comparison, and timestamp comparison would all still
-    // permit deleting a peer's newer publication. An in-process lock does not
-    // help either, since peers are separate processes on a shared volume.
+    // entirely, and descriptor binding does not change that. A peer's newer
+    // manifest is a legitimate publication to that shared name, so even a
+    // provably-still-ours entry may not be removed once any peer could have
+    // raced it: the only safe rule for a name with many honest writers is to
+    // never unlink it.
     //
     // Skipping it can leave a manifest whose directory entry was never fsynced,
     // or whose bytes replaced a peer's. That is recoverable: the durability
@@ -11907,14 +12045,27 @@ fn write_private_file_atomically_with_ops(
     // next prepare validates the manifest against this sink's identity and
     // regenerates or fails closed on it. Deleting a peer's publication is not
     // recoverable, so the residual is deliberately pushed to the safe side.
-    if ownership == SpoolFinalOwnership::Unique {
-        match fs::remove_file(final_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => cleanup_errors.push(format!(
-                "failed to remove rollback path '{}': {error}",
-                final_path.display()
-            )),
+    //
+    // A failure before the rename publishes nothing at `final_path`, so that
+    // pathname is out of scope for rollback entirely.
+    if ownership == SpoolFinalOwnership::Unique
+        && progress.renamed
+        && let Some(file) = progress.writer.as_ref()
+    {
+        match remove_path_if_descriptor_matches(final_path, file) {
+            DescriptorBoundUnlink::Removed => {}
+            DescriptorBoundUnlink::NotThisDescriptor => {
+                // A same-UID actor replaced the entry between this attempt's
+                // rename and the durability failure above. The replacement is
+                // not this attempt's to delete, so it is left exactly as found
+                // and the primary durability error is returned on its own.
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    path = %final_path.display(),
+                    "Chargeback sink left a spool publication path untouched during rollback: it no longer names this attempt's file"
+                );
+            }
+            DescriptorBoundUnlink::Failed(error) => cleanup_errors.push(error),
         }
     }
     #[cfg(unix)]
@@ -11944,13 +12095,27 @@ fn write_private_file_atomically_with_ops(
     }
 }
 
+/// What one publish attempt got far enough to own, so rollback can reason about
+/// the final pathname with a capability instead of a guess.
+#[derive(Default)]
+struct AtomicWriteProgress {
+    /// The temp writer descriptor, held open across rename and parent-directory
+    /// fsync on Unix. `None` before it is created, and on platforms where no
+    /// step after the rename can fail.
+    writer: Option<File>,
+    /// Whether this attempt's rename onto the final pathname completed.
+    renamed: bool,
+}
+
 /// Publish `bytes` at `final_path` durably: private temp, write, fsync, rename,
-/// parent-directory fsync. Rollback of a partial sequence is the caller's job.
+/// parent-directory fsync. Rollback of a partial sequence is the caller's job,
+/// and `progress` is what it rolls back with.
 fn write_private_file_atomically_inner(
     tmp_path: &Path,
     final_path: &Path,
     bytes: &[u8],
     ops: SpoolFsOps,
+    progress: &mut AtomicWriteProgress,
 ) -> Result<(), String> {
     if let Some(parent) = tmp_path.parent() {
         ensure_private_dir(parent)?;
@@ -11985,8 +12150,22 @@ fn write_private_file_atomically_inner(
         )
     })?;
     (ops.sync_file)(&file, tmp_path)?;
-    drop(file);
+    // Hand the writer descriptor to the caller's rollback state *before* the
+    // rename, and keep it open across the rename and the parent-directory fsync
+    // below. That open descriptor is the only thing that can later prove which
+    // file `final_path` resolves to, because the kernel cannot recycle its
+    // device/inode while it lives.
+    progress.writer = Some(file);
+    // Windows cannot rename a pathname whose open handle lacks
+    // `FILE_SHARE_DELETE`, and no step after the rename can fail there (the
+    // directory fsync below is Unix-only), so that target releases the
+    // descriptor first and needs no rollback capability.
+    #[cfg(not(unix))]
+    {
+        progress.writer = None;
+    }
     (ops.rename)(tmp_path, final_path)?;
+    progress.renamed = true;
     // Test-only interleaving point: production wires this to a no-op, and the
     // fault-injection suite uses it to republish `final_path` as a peer would
     // before the directory fsync below fails.
@@ -12386,6 +12565,22 @@ async fn replay_spool_once(
                     .map_err(ClaimMutationError::into_message)?;
                 return Err(error);
             }
+            Err(ReplayStreamError::Unauthorized(error)) => {
+                // Dead-letter staging lost claim authorization: the pathname
+                // stopped resolving to the opened authoritative artifact. This
+                // is the explicit no-mutation path — releasing here would rename
+                // whatever now occupies the pathname back into the replayable
+                // namespace, and quarantining or unlinking would destroy it. So
+                // nothing is released, renamed, quarantined, unlinked,
+                // accounted, or published, no further row is delivered for this
+                // artifact, and the stage's own diagnostic is recorded and
+                // returned rather than being replaced by a release refusal.
+                drop(reader);
+                spool
+                    .metrics
+                    .record_failure(FailureReason::Serialize, error.clone());
+                return Err(error);
+            }
             Err(ReplayStreamError::Unreadable(error)) => {
                 drop(reader);
                 spool
@@ -12417,9 +12612,22 @@ async fn replay_spool_once(
     Ok(())
 }
 
+/// Why bounded streaming replay of one claimed artifact stopped.
+///
+/// The split decides what the caller may then do to the claim pathname:
+/// - [`Self::Unreadable`]: the artifact itself is malformed. Quarantine it.
+/// - [`Self::Retryable`]: an ordinary delivery, I/O, quota, or serialization
+///   failure taken while the exact claim is still live. Release the claim back
+///   to its durable replayable name through the exact-claim-bound path.
+/// - [`Self::Unauthorized`]: the claim pathname stopped resolving to the opened
+///   authoritative artifact during dead-letter staging. This is not a transient
+///   failure of anything, so nothing at all may be released, renamed,
+///   quarantined, unlinked, accounted, or published for that pathname — the
+///   diagnostic is recorded and returned as-is.
 enum ReplayStreamError {
     Unreadable(String),
     Retryable(String),
+    Unauthorized(String),
 }
 
 struct ReplayCompletion {
@@ -12714,6 +12922,15 @@ async fn replay_stream_batch(
     Ok(())
 }
 
+/// Stage this batch's permanently rejected rows into the durable dead-letter
+/// payload writer.
+///
+/// Both stages are authorized by the exact pinned claim, so both can fail
+/// *because that authorization was lost* rather than because storage misbehaved.
+/// The two outcomes are kept apart all the way up: collapsing an unauthorized
+/// loss into [`ReplayStreamError::Retryable`] would send the caller into the
+/// claim-release path, where the release is correctly refused but the original
+/// authorization diagnostic is replaced by the refusal's.
 fn append_dead_letter_rows(
     spool: &SpoolManager,
     source: &Path,
@@ -12726,20 +12943,40 @@ fn append_dead_letter_rows(
         return Ok(());
     }
     if payload.is_none() {
-        *payload = Some(
-            DeadLetterPayloadWriter::open(spool, source, artifact)
-                .map_err(ReplayStreamError::Retryable)?,
-        );
+        if let Some(hook) = snapshot_spool_replay_hook_for_tests() {
+            hook(SpoolReplayHookPoint::BeforeDeadLetterPayloadOpen, source);
+        }
+        let writer = DeadLetterPayloadWriter::open(spool, source, artifact)
+            .map_err(|error| dead_letter_stage_error("payload open", error))?;
+        *payload = Some(writer);
     }
-    payload
-        .as_mut()
-        .ok_or_else(|| {
-            ReplayStreamError::Retryable(format!(
-                "{PLUGIN_NAME}: dead-letter payload writer was not initialized"
-            ))
-        })?
+    let Some(writer) = payload.as_mut() else {
+        return Err(ReplayStreamError::Retryable(format!(
+            "{PLUGIN_NAME}: dead-letter payload writer was not initialized"
+        )));
+    };
+    if let Some(hook) = snapshot_spool_replay_hook_for_tests() {
+        hook(SpoolReplayHookPoint::BeforeDeadLetterPayloadAppend, source);
+    }
+    writer
         .append_batch(spool, artifact, batch, row_indices)
-        .map_err(ReplayStreamError::Retryable)
+        .map_err(|error| dead_letter_stage_error("payload append", error))
+}
+
+/// Carry a dead-letter staging failure up without losing its classification.
+///
+/// The unauthorized diagnostic is preserved verbatim and only prefixed with the
+/// stage that observed it, so an operator can tell *where* authorization was
+/// lost. The prefix is a compiled-in literal and the wrapped message is the
+/// pathname-scoped refusal `require_live_claim` already produces; no row bytes,
+/// charge fields, or credentials are involved on this path.
+fn dead_letter_stage_error(stage: &'static str, error: ClaimMutationError) -> ReplayStreamError {
+    match error {
+        ClaimMutationError::Unauthorized(message) => ReplayStreamError::Unauthorized(format!(
+            "{PLUGIN_NAME}: unauthorized dead-letter {stage}: {message}"
+        )),
+        ClaimMutationError::Retryable(message) => ReplayStreamError::Retryable(message),
+    }
 }
 
 /// Complete one replayed artifact: either remove a fully delivered claim, or
