@@ -562,11 +562,20 @@ impl ScriptedH2Backend {
         self.state.step_errors.lock().await.clone()
     }
 
-    /// Panic if any script step returned an error.
+    /// Panic if any script step returned an error other than a known-benign
+    /// client disconnect (see [`is_benign_script_step_error`]).
     pub async fn assert_no_step_errors(&self) {
         let errs = self.step_errors().await;
-        if !errs.is_empty() {
-            panic!("{} script step error(s): {:?}", errs.len(), errs);
+        let unexpected: Vec<_> = errs
+            .iter()
+            .filter(|error| !is_benign_script_step_error(error))
+            .collect();
+        if !unexpected.is_empty() {
+            panic!(
+                "{} script step error(s): {:?}",
+                unexpected.len(),
+                unexpected
+            );
         }
     }
 
@@ -1140,6 +1149,25 @@ fn build_server_config_with_alpn(
         .map_err(|e| io::Error::other(format!("rustls cert: {e}")))?;
     config.alpn_protocols = alpn;
     Ok(config)
+}
+
+/// Substrings for client-disconnect errors scripted TLS/H2 backends may record
+/// when a peer vanishes mid-handshake or without a clean shutdown. Closed
+/// allowlist — do not broaden to swallow genuine protocol or translation errors.
+const BENIGN_SCRIPT_STEP_ERROR_SUBSTRINGS: &[&str] = [
+    // Peer closed TCP during the TLS handshake (pool probe / scheduling noise).
+    "tls handshake eof",
+    // Post-handshake peer close without TLS `close_notify` (same benign class).
+    "peer closed connection without sending TLS close_notify",
+    // Abrupt TCP RST when the client disappeared.
+    "Connection reset by peer",
+];
+
+/// Returns true when `error` matches a known-benign client-disconnect shape.
+pub(crate) fn is_benign_script_step_error(error: &str) -> bool {
+    BENIGN_SCRIPT_STEP_ERROR_SUBSTRINGS
+        .iter()
+        .any(|needle| error.contains(needle))
 }
 
 #[cfg(test)]
