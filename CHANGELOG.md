@@ -24,7 +24,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `a2a_gateway` rewrites unary gRPC Agent Card protobuf payloads (A2A 0.3.x
   wire layout) with the same JSON-RPC endpoint URL policy as HTTP cards,
   clears invalidated signatures, and fails closed on unsupported versions or
-  malformed/compressed frames (issue #3297).
+  malformed/compressed frames (issue #3297). The 0.3.x layout gate is
+  positive: the card must carry an explicit 0.3.x `protocol_version` (field
+  16) on the wire. An absent or empty `protocol_version` fails closed with a
+  trailers-only gRPC `INTERNAL` and `unsupported_agent_card_protobuf_version`
+  regardless of `endpoint.protocol_versions`, because A2A renumbered
+  `AgentCard` for 1.0 (field 3 became `supported_interfaces`, `signatures`
+  moved 17 -> 13, field 14 became `icon_url`, `protocol_version` was removed)
+  and proto3 cannot distinguish an unset field from `""` — guessing would
+  flatten each interface submessage into a bare URL and re-serve the card
+  under its now-invalid original signature. As defense in depth, a rewritable
+  URL field that is not an absolute `http`/`https` URL fails closed with
+  `agent_card_protobuf_url_layout_mismatch`. Operators fronting a non-0.3 A2A
+  backend should set `discovery.rewrite_agent_card_urls: false`; leaving it
+  enabled refuses such cards rather than serving un-rewritten internal URLs.
 - VirtualService `tcp[]` / `tls[]` L4 match predicates `sourceLabels`,
   `sourceSubnets`, `destinationSubnets`, `gateways`, and `sourceNamespace`
   compile onto a shared precomputed `Proxy.stream_match` carrier and are

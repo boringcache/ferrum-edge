@@ -30,6 +30,15 @@ const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 /// A2A 0.3.x `AgentCard` protobuf field numbers used for URL rewriting.
 /// Wire surgery preserves every other field verbatim so skills/security/etc.
 /// survive re-encoding without embedding a full descriptor set.
+///
+/// These numbers are layout-specific, NOT stable across A2A releases. A2A 1.0
+/// renumbered `AgentCard`: field 3 became `repeated AgentInterface
+/// supported_interfaces` (was `string url`), `signatures` moved from 17 to 13,
+/// field 14 became `optional string icon_url` (was `preferred_transport`), and
+/// `protocol_version` was removed outright. Applying the constants below to a
+/// 1.0 card would replace each interface submessage with a bare URL string while
+/// leaving the real signatures untouched, so the rewrite path must first prove
+/// the 0.3 layout — see [`supports_agent_card_protobuf_layout`].
 const AGENT_CARD_PB_URL: u32 = 3;
 const AGENT_CARD_PB_PREFERRED_TRANSPORT: u32 = 14;
 const AGENT_CARD_PB_ADDITIONAL_INTERFACES: u32 = 15;
@@ -1858,6 +1867,10 @@ fn grpc_agent_card_rewrite_failure(diagnostic: &'static str) -> PluginResult {
 /// Validate that a unary gRPC Agent Card body is a supported, rewritable
 /// protobuf shape. Does not allocate a replacement frame; the transform phase
 /// performs the bounded rewrite.
+///
+/// A card that does not carry an explicit A2A 0.3.x `protocol_version` is
+/// rejected with `unsupported_agent_card_protobuf_version` rather than
+/// forwarded — see [`supports_agent_card_protobuf_layout`].
 fn validate_grpc_agent_card_rewrite(
     body: &[u8],
     response_headers: &HashMap<String, String>,
@@ -1881,6 +1894,12 @@ fn validate_grpc_agent_card_rewrite(
 /// URLs changed (signatures cleared), and `Err(diagnostic)` for malformed or
 /// unsupported payloads that must fail closed. Callers frame the message through
 /// a retained-response sink.
+///
+/// "Unsupported" includes any card that does not prove the 0.3 layout: an
+/// absent/empty or non-0.3 `protocol_version` yields
+/// `unsupported_agent_card_protobuf_version`, and a URL field that is not an
+/// absolute http(s) URL yields `agent_card_protobuf_url_layout_mismatch`. The
+/// gateway never rewrites a layout it cannot identify.
 fn rewrite_grpc_agent_card_frame(
     body: &[u8],
     response_headers: &HashMap<String, String>,
@@ -1903,15 +1922,23 @@ fn rewrite_grpc_agent_card_frame(
     Ok(Some(rewritten))
 }
 
+/// Decide whether a decoded card may be rewritten with the 0.3.x field numbers.
+///
+/// The gate is positive: rewriting requires affirmative evidence of the 0.3
+/// layout on the wire. An absent or empty `protocol_version` is NOT evidence.
+/// proto3 cannot distinguish "unset" from `""`, and every non-0.3 layout also
+/// lacks field 16 — A2A 1.0 removed `protocol_version` from `AgentCard`
+/// entirely — so an empty version is exactly the case where the gateway cannot
+/// tell a 0.3 card from a renumbered one. Treating it as 0.3 (which the
+/// operator's `endpoint.protocol_versions` would have permitted) corrupts 1.0
+/// cards, so it fails closed instead, regardless of configuration.
 fn supports_agent_card_protobuf_layout(
     protocol_version: &str,
     configured_versions: &[String],
 ) -> bool {
     let version = protocol_version.trim();
     if version.is_empty() {
-        return configured_versions
-            .iter()
-            .any(|configured| is_a2a_03_family(configured));
+        return false;
     }
     is_a2a_03_family(version)
         && (configured_versions.is_empty()
@@ -1923,6 +1950,35 @@ fn supports_agent_card_protobuf_layout(
 fn is_a2a_03_family(version: &str) -> bool {
     let version = version.trim();
     version == "0.3" || version.starts_with("0.3.")
+}
+
+/// Defense in depth for the URL-bearing fields the rewriter mutates.
+///
+/// In the 0.3 layout `AgentCard.url` (field 3) and `AgentInterface.url`
+/// (field 1) always hold an absolute `http`/`https` URL. UTF-8 validity alone
+/// does not prove that: a serialized `AgentInterface` — which is what field 3
+/// holds in the A2A 1.0 layout — is frequently valid UTF-8, because its tag
+/// bytes (`0x0a`, `0x12`), short length prefixes, and ASCII URL/transport
+/// strings all stay below `0x80`. The scheme check is what actually
+/// distinguishes a URL string from a submessage, so a value that is not an
+/// absolute http(s) URL is treated as a layout mismatch and the rewrite fails
+/// closed rather than guessing.
+fn is_absolute_http_url(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    ["https://", "http://"].iter().any(|scheme| {
+        let scheme = scheme.as_bytes();
+        bytes.len() > scheme.len() && bytes[..scheme.len()].eq_ignore_ascii_case(scheme)
+    })
+}
+
+/// Decode a rewritable URL field, rejecting anything that is not an absolute
+/// http(s) URL. See [`is_absolute_http_url`].
+fn decode_rewritable_url_field(value: &[u8]) -> Result<&str, &'static str> {
+    let current = std::str::from_utf8(value).map_err(|_| "agent_card_protobuf_url_invalid")?;
+    if !is_absolute_http_url(current) {
+        return Err("agent_card_protobuf_url_layout_mismatch");
+    }
+    Ok(current)
 }
 
 fn extract_uncompressed_unary_grpc_message<'a>(
@@ -1992,8 +2048,7 @@ fn rewrite_agent_card_protobuf(
                 Ok(())
             }
             (AGENT_CARD_PB_URL, PROTO_WIRE_LEN) if rewrite_preferred => {
-                let current =
-                    std::str::from_utf8(value).map_err(|_| "agent_card_protobuf_url_invalid")?;
+                let current = decode_rewritable_url_field(value)?;
                 if current != new_url {
                     encode_protobuf_string_field(&mut output, AGENT_CARD_PB_URL, &new_url);
                     changed = true;
@@ -2046,8 +2101,7 @@ fn rewrite_agent_interface_protobuf(
     let mut changed = false;
     for_each_protobuf_field(message, |field, wire, value| {
         if field == AGENT_INTERFACE_PB_URL && wire == PROTO_WIRE_LEN {
-            let current =
-                std::str::from_utf8(value).map_err(|_| "agent_card_protobuf_url_invalid")?;
+            let current = decode_rewritable_url_field(value)?;
             if current != new_url {
                 encode_protobuf_string_field(&mut output, AGENT_INTERFACE_PB_URL, &new_url);
                 changed = true;
