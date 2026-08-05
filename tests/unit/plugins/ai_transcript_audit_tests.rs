@@ -17,10 +17,10 @@ use ferrum_edge::plugins::ai_transcript_audit::{
     AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS, AI_TRANSCRIPT_AUDIT_LIMITS_KEYS,
     AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS, AI_TRANSCRIPT_AUDIT_REDACTION_KEYS,
     AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS, AI_TRANSCRIPT_AUDIT_SINK_KEYS, AiTranscriptAudit,
-    HARD_MAX_CAPTURE_BYTES_AGGREGATE, HARD_MAX_REQUEST_BYTES, HARD_MAX_RESPONSE_BYTES,
-    HARD_MAX_STREAM_CAPTURE_BYTES, MAX_MODEL_BYTES, MAX_TOOL_NAME_BYTES, MAX_TOOL_NAMES,
-    MAX_TOOL_NAMES_AGGREGATE_BYTES, accounted_record_bytes, max_retained_record_bytes,
-    max_serialized_record_bytes, snapshots,
+    HARD_MAX_CAPTURE_BYTES_AGGREGATE, HARD_MAX_GRPC_MAX_MESSAGE_BYTES, HARD_MAX_GRPC_MAX_MESSAGES,
+    HARD_MAX_REQUEST_BYTES, HARD_MAX_RESPONSE_BYTES, HARD_MAX_STREAM_CAPTURE_BYTES,
+    MAX_MODEL_BYTES, MAX_TOOL_NAME_BYTES, MAX_TOOL_NAMES, MAX_TOOL_NAMES_AGGREGATE_BYTES,
+    accounted_record_bytes, max_retained_record_bytes, max_serialized_record_bytes, snapshots,
 };
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
@@ -10088,9 +10088,32 @@ fn grpc_block_extends_supported_protocols_and_buffering() {
         &grpc_headers(),
     ));
 
+    // The request-body gate is CONSERVATIVE for native gRPC: the enrollment
+    // verdict is not decidable before `on_backend_path_resolved`, and answering
+    // `false` here pins the request to the streaming fast path where no final
+    // request-body hook can ever re-decide. Response buffering is decided after
+    // that hook, so it stays enrollment-scoped.
     let other = grpc_ctx("/test.Greeter/Other");
-    assert!(!plugin.should_buffer_request_body(&other));
+    assert!(plugin.should_buffer_request_body(&other));
     assert!(!plugin.should_buffer_response_body(&other));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &other,
+        Some("application/grpc"),
+        200,
+        &grpc_headers(),
+    ));
+
+    // Ordinary HTTP traffic on the same gRPC-enrolled instance keeps the
+    // JSON-POST fast path: a non-JSON POST is still not buffered.
+    let mut http_on_grpc_instance = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat".to_string(),
+    );
+    http_on_grpc_instance
+        .headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    assert!(!plugin.should_buffer_request_body(&http_on_grpc_instance));
 
     let http_only = AiTranscriptAudit::new(
         &config_with_sink("https://audit.example.com/x", json!({})),
@@ -10098,6 +10121,9 @@ fn grpc_block_extends_supported_protocols_and_buffering() {
     )
     .unwrap();
     assert_eq!(http_only.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    // An instance WITHOUT a `grpc` block never pays the conservative gate, even
+    // for a native gRPC request.
+    assert!(!http_only.should_buffer_request_body(&grpc_ctx("/test.Greeter/SayHello")));
 }
 
 #[test]
@@ -10171,6 +10197,69 @@ fn grpc_config_validation_fail_closed() {
         )
         .is_ok()
     );
+}
+
+/// `grpc.max_message_bytes` / `grpc.max_messages` are operator-facing frame
+/// budgets, and the decoded-byte scan budget does NOT bound them: a body of
+/// legal zero-length 5-byte frames consumes no decoded bytes at all, so an
+/// unbounded `max_messages` would let one request drive an equally unbounded
+/// `Vec<GrpcFrame>`. Both carry immutable deployment maxima, accepted exactly
+/// at the bound and refused one above it.
+#[test]
+fn grpc_frame_budgets_are_bounded_by_deployment_maxima() {
+    let descriptor = grpc_descriptor_path();
+    let config = |key: &str, value: usize| {
+        let mut config = json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/x"
+            },
+            "grpc": {
+                "descriptor_path": descriptor,
+                "methods": {
+                    "/test.Greeter/SayHello": {"request_type": "test.HelloRequest"}
+                }
+            }
+        });
+        config["grpc"][key] = json!(value);
+        config
+    };
+
+    for (key, hard_max) in [
+        ("max_message_bytes", HARD_MAX_GRPC_MAX_MESSAGE_BYTES),
+        ("max_messages", HARD_MAX_GRPC_MAX_MESSAGES),
+    ] {
+        let at_bound = config(key, hard_max);
+        assert!(
+            AiTranscriptAudit::new(&at_bound, loopback_http_client()).is_ok(),
+            "'grpc.{key}' must accept exactly {hard_max}"
+        );
+        // Shape-only admission (Admin/CP) must refuse it too, so an
+        // over-budget policy never reaches a data-plane node.
+        assert!(
+            AiTranscriptAudit::validate_config(&at_bound, loopback_http_client()).is_ok(),
+            "shape-only validation must accept exactly {hard_max} for 'grpc.{key}'"
+        );
+
+        let over_bound = config(key, hard_max + 1);
+        let error = AiTranscriptAudit::new(&over_bound, loopback_http_client())
+            .expect_err("above the deployment hard maximum must fail closed");
+        assert!(
+            error.contains(key) && error.contains(&hard_max.to_string()),
+            "the diagnostic must name the field and its ceiling: {error}"
+        );
+        assert!(
+            validate_plugin_config("ai_transcript_audit", &over_bound).is_err(),
+            "shared shape-only validation must refuse 'grpc.{key}' above {hard_max}"
+        );
+    }
+
+    // The ceilings stay tied to the constants they were derived from.
+    assert_eq!(
+        HARD_MAX_GRPC_MAX_MESSAGE_BYTES, 8_388_608,
+        "per-message ceiling must match the 8 MiB aggregate scan ceiling"
+    );
+    assert_eq!(HARD_MAX_GRPC_MAX_MESSAGES, 1_024);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -10526,6 +10615,159 @@ async fn grpc_full_method_metadata_without_leading_slash_still_enrolls() {
     assert!(
         !request_body.contains("agent@example.com"),
         "captured excerpt leaked an email: {request_body}"
+    );
+}
+
+/// Provisional (client-path) method UNENROLLED -> backend-effective method
+/// ENROLLED.
+///
+/// `should_buffer_request_body` and `before_proxy` both run before
+/// `on_backend_path_resolved`, so they only see the client path. A client path
+/// like `/prefix/test.Greeter/SayHello` does not even parse as a gRPC method,
+/// yet listen-path stripping makes the backend-effective method the enrolled
+/// `/test.Greeter/SayHello`. If the buffer gate answered `false` there, the
+/// request would ride the native-gRPC streaming fast path and no final
+/// request-body hook would ever run — a silent, total capture loss.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_backend_effective_method_enrolls_after_unenrolled_client_path() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/prefix/test.Greeter/SayHello");
+    // The provisional publication from `grpc_method_router::on_request_received`
+    // is absent, because the client path does not parse as `/service/method`.
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "a native gRPC request must buffer before the backend-effective method \
+         is known, or it can never be re-decided"
+    );
+
+    let mut headers = grpc_headers();
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    let staged = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(staged, PluginResult::Continue));
+    assert!(
+        !ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .is_some_and(|value| value == "true"),
+        "an unenrolled client-path method must not stage in before_proxy"
+    );
+
+    // `grpc_method_router::on_backend_path_resolved` republishes the
+    // backend-effective method (without a leading slash).
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the backend-effective method enrolls this call, so it must be captured"
+    );
+
+    let resp = grpc_frame(&hello_response_bytes("ok"));
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &resp)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "a backend-effective enrolled method must emit exactly one record, got {records:?}"
+    );
+    let request_body = records[0]
+        .get("request_body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        request_body.contains("/test.Greeter/SayHello"),
+        "the excerpt must report the normalized enrolled method: {request_body}"
+    );
+    assert!(
+        !request_body.contains("agent@example.com"),
+        "captured excerpt leaked an email: {request_body}"
+    );
+}
+
+/// Provisional (client-path) method ENROLLED -> backend-effective method
+/// UNENROLLED.
+///
+/// `before_proxy` legitimately stages against the client path (that view is
+/// authoritative for a pre-routing short circuit), but once the authoritative
+/// backend-effective method refutes enrollment the provisional entry must be
+/// discarded: no record for the refuted method, and the protobuf frames must
+/// never be reinterpreted through the HTTP/JSON capture path.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_backend_effective_method_refutes_enrolled_client_path() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let mut headers = grpc_headers();
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the provisional client-path method is enrolled, so before_proxy stages"
+    );
+
+    // A route override / upstream target path makes the backend-effective
+    // method a different, unenrolled one.
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/Other".to_string(),
+    );
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("false"),
+        "a refuted backend-effective method must discard the provisional candidate"
+    );
+    assert!(
+        !ctx.metadata.contains_key("ai_transcript_audit.request_hash"),
+        "no request hash may survive a refuted enrollment"
+    );
+
+    let resp = grpc_frame(&hello_response_bytes("ok"));
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &resp)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let records = received_records(&server).await;
+    assert!(
+        records.is_empty(),
+        "a method the authoritative view does not enroll must emit no record, got {records:?}"
     );
 }
 

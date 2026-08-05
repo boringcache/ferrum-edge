@@ -24,10 +24,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ai_transcript_audit` native gRPC payload capture via an explicit descriptor-based
   `grpc` enrollment block (issue #3304). Enrolled methods are framed, bounded,
   schema-decoded, and redacted under the same capture `mode` contract as HTTP;
-  unenrolled methods stay undecoded and unbuffered. Malformed, oversized, or
-  undecodable frames omit excerpts with compiled-in reasons rather than
-  exporting partial or unredacted bytes. Name-based redaction matches the HTTP
-  JSON contract exactly: a value is replaced when any enclosing name is
+  unenrolled methods stay undecoded. Enrollment is decided against the
+  BACKEND-EFFECTIVE method, which `grpc_method_router` only republishes in
+  `on_backend_path_resolved` — after the request-body buffering decision and
+  `before_proxy` have already run — so a proxy with a `grpc` block buffers every
+  native gRPC request and the final request-body hook makes the authoritative
+  call. A client path that only becomes enrolled after listen-path stripping is
+  therefore captured instead of escaping onto the streaming fast path, and a
+  provisional enrollment the backend-effective method refutes has its staging
+  entry discarded with no record emitted and no protobuf reinterpreted through
+  the HTTP/JSON capture path. A request that short-circuits before routing never
+  resolves a backend path, so its client-path method stays authoritative for it.
+  `grpc.max_message_bytes` and `grpc.max_messages` carry immutable deployment
+  maxima (8 MiB and 1024 frames) enforced at admission: the decoded-byte scan
+  budget bounds decoded payload, not frame count, so legal zero-length frames
+  would otherwise let an operator-configured frame count drive an unbounded
+  frame vector. Malformed, oversized, or undecodable frames omit excerpts with
+  compiled-in reasons rather than exporting partial or unredacted bytes.
+  Name-based redaction matches the HTTP JSON contract exactly: a value is
+  replaced when any enclosing name is
   sensitive — the field, an ancestor message field, or a protobuf map key
   (never exported as a label; map values use collision-free ordinal paths such
   as `metadata.0`, and the key is consulted only for the redaction decision) —
@@ -41,7 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `before_proxy` reject or synthetic response cannot leave the transaction
   unaudited; that short-circuit capture reads the request `grpc-encoding` from
   a minimal framing witness taken while the authoritative `before_proxy` header
-  map was live, and no other request header is retained or logged.
+  map was live, and no other request header is retained or logged. Framed gRPC
+  bodies never enter the HTTP/JSON capture path, including
+  `application/grpc+json`, which satisfies the JSON media-type test while
+  carrying length-prefixed frames.
 - `ai_semantic_firewall` streamed `inspect` mode now accepts
   `streaming.window: tokens` with an explicitly selected bounded tokenizer
   (`streaming.tokenizer`: `chars4`, `whitespace`, or `unicode_words`), soft

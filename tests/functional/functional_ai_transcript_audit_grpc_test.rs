@@ -685,7 +685,13 @@ async fn grpc_audit_redacts_pii_inside_a_live_decoded_protobuf_string() {
 }
 
 /// Enrollment is the gate: an unenrolled method travelling the same live
-/// native-gRPC path must be forwarded untouched and export no record at all.
+/// native-gRPC path must be forwarded with an unchanged client-visible result
+/// and export no record at all.
+///
+/// A configured `grpc` block does buffer this request — the backend-effective
+/// method is not decidable before routing, so buffering is selected
+/// conservatively and the final request-body hook makes the authoritative call.
+/// What must not change is the transcript: no candidate, no record.
 #[tokio::test]
 #[ignore]
 async fn grpc_audit_never_captures_an_unenrolled_live_method() {

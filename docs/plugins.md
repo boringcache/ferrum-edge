@@ -5279,8 +5279,10 @@ Expiry removes the revoked live slot from the process-global map immediately; it
 | `methods[].request_type` | String | — | Fully-qualified protobuf request message type |
 | `methods[].response_type` | String | — | Fully-qualified protobuf response message type |
 | `methods[].text_fields` | String[] | *(all strings)* | Optional dotted field paths restricting which string fields are exported. Each path must end at a string field and may not traverse a map field. Omit to cover every string field recursively |
-| `max_message_bytes` | Integer | `1048576` | Per-message ceiling, applied to the declared frame length and enforced while inflating gzip |
-| `max_messages` | Integer | `64` | Maximum number of length-prefixed frames one buffered request or response may carry; above this the excerpt is omitted (`grpc_message_limit`) rather than partially captured |
+| `max_message_bytes` | Integer | `1048576` | Per-message ceiling, applied to the declared frame length and enforced while inflating gzip. Immutable deployment maximum: `8388608` (8 MiB) |
+| `max_messages` | Integer | `64` | Maximum number of length-prefixed frames one buffered request or response may carry; above this the excerpt is omitted (`grpc_message_limit`) rather than partially captured. Immutable deployment maximum: `1024` |
+
+Both frame budgets carry immutable ceilings, and a config above either one is **rejected at admission** rather than clamped. `max_message_bytes` stops at 8 MiB because the aggregate decoded-payload budget (`limits.max_redaction_scan_bytes`) tops out there — a larger per-message value could only authorize a bigger single inflate that the aggregate budget then refuses. `max_messages` stops at 1024 because the decoded-byte budget bounds decoded *payload*, not frame *count*: a body of legal zero-length 5-byte frames consumes no decoded-byte budget at all, so an unbounded frame count would let one request under the ordinary gRPC receive limit drive an equally large frame vector and per-frame walk.
 
 Enrolled methods apply the same capture `mode` / redaction contract as HTTP: `redacted_body` runs the configured PII redactor and replaces values under sensitive field names; `full_body` requires `allow_full_body`; `metadata_only` / `hash_only` export hashes without body excerpts.
 
@@ -5295,7 +5297,14 @@ Framed bodies that are malformed, truncated, compressed with an unsupported enco
 
 Enrolled gRPC requests stage **binary-safe**. Native protobuf is routinely not valid UTF-8, so the plugin retains a bounded binary snapshot of the buffered request body (it does not rely on the UTF-8-only body view) and stages the candidate in `before_proxy`. That is what keeps an enrolled call auditable when a later `before_proxy` plugin rejects it or returns a synthetic response before any backend dispatch. On that short-circuit path the request framing (`grpc-encoding`) comes from a minimal witness recorded while the authoritative `before_proxy` header map was live — no other request header is retained, and none is logged. On ordinary dispatch the backend-visible final request body remains the authoritative capture.
 
-> **Enrollment buffers the request body.** An enrolled method's request is fully buffered so its frames can be decoded, which converts a client-streaming or bidirectional-streaming RPC to fully buffered request semantics and changes its latency/interactivity. `max_messages` caps how much is *captured*, not how much is buffered. Enroll unary (and server-streaming) methods unless that trade is acceptable.
+**The enrolled method is the backend-effective one, and it is not known early.** `grpc_method_router` publishes `grpc_full_method` twice: provisionally from the *client* path in `on_request_received`, then authoritatively from the *backend-effective* path in `on_backend_path_resolved` — after routing, `strip_listen_path`, route overrides, and upstream target path assembly. The request-body buffering decision and `before_proxy` both run before that second publication, and a native gRPC request that is not buffered rides the fully-streaming dispatch path where no final request-body hook can ever run. So an instance with a `grpc` block buffers **every** native gRPC request on its proxy, and the authoritative enrollment decision is made in the final request-body hook:
+
+- A client path such as `/prefix/pkg.Service/Method` that only becomes the enrolled `/pkg.Service/Method` after listen-path stripping is staged and captured there, from the exact backend-visible bytes.
+- A client path that *was* enrolled but whose backend-effective method is not has its provisional staging entry discarded: no record is emitted for the refuted method, and the protobuf frames are never reinterpreted through the HTTP/JSON capture path.
+
+A request that short-circuits **before** routing (a `before_proxy` reject or synthetic response) never resolves a backend path at all, so its client-path method is the only — and therefore the authoritative — view it has; that is the method its short-circuit capture uses.
+
+> **Enrollment buffers the request body.** A configured `grpc` block fully buffers the request body of every native gRPC request on the proxy — enrolled or not — so frames can be decoded once the authoritative method is known. That converts a client-streaming or bidirectional-streaming RPC to fully buffered request semantics and changes its latency/interactivity, for every gRPC method the proxy serves. `max_messages` caps how much is *captured*, not how much is buffered. Configure `grpc` on proxies whose gRPC surface is unary (and server-streaming) unless that trade is acceptable.
 
 Native gRPC example:
 

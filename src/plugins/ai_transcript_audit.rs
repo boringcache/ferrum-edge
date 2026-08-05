@@ -37,6 +37,21 @@
 //! without a request hash/excerpt; see the documented limitation in
 //! `docs/plugins.md`.
 //!
+//! Native gRPC enrollment is decided against a method view that is not stable
+//! across the request lifecycle. `grpc_method_router` publishes
+//! `grpc_full_method` provisionally from the CLIENT path in
+//! `on_request_received`, then authoritatively from the backend-effective path
+//! in `on_backend_path_resolved` — after routing, listen-path stripping, route
+//! overrides, and upstream target path assembly. Everything at or before
+//! `before_proxy` (including the request-body buffering decision) therefore sees
+//! only the provisional view. So an instance with a `grpc` block buffers EVERY
+//! native gRPC request, and `on_final_request_body_with_context` makes the
+//! authoritative enrollment decision for ordinary backend-dispatched traffic —
+//! staging late when the backend-effective method turns out to be enrolled, and
+//! discarding the provisional entry when it turns out not to be. A request that
+//! short-circuits before routing never resolves a backend path at all, so its
+//! client-path method is the only, and therefore authoritative, view it has.
+//!
 //! This plugin is **not** a security boundary on its own — it observes and
 //! redacts, it does not enforce. Pair it with `ai_prompt_shield`,
 //! `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in
@@ -127,6 +142,27 @@ const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 1_048_576;
 /// request or response may carry. Streaming RPCs above this omit the excerpt
 /// rather than silently capturing a partial stream.
 const DEFAULT_GRPC_MAX_MESSAGES: usize = 64;
+
+/// Deployment hard maximum for `grpc.max_message_bytes` (8 MiB), equal to
+/// [`HARD_MAX_REDACTION_SCAN_BYTES`].
+///
+/// The aggregate decoded-payload scan budget already refuses any body whose
+/// decoded bytes exceed `limits.max_redaction_scan_bytes`, whose own hard
+/// maximum is 8 MiB. A per-message ceiling above that can therefore never
+/// produce a capture — it can only authorize a larger single gzip inflate
+/// before the aggregate budget refuses the result.
+pub const HARD_MAX_GRPC_MAX_MESSAGE_BYTES: usize = HARD_MAX_REDACTION_SCAN_BYTES;
+
+/// Deployment hard maximum for `grpc.max_messages` (1024 frames), 16x the
+/// default of 64.
+///
+/// The decoded-byte scan budget bounds decoded PAYLOAD, not frame COUNT: a body
+/// of legal zero-length 5-byte frames consumes no decoded-byte budget at all, so
+/// an operator-configured `max_messages` in the millions would let a request
+/// under the ordinary gRPC receive limit drive an equally large
+/// `Vec<GrpcFrame>` and per-frame walk. 1024 frames keeps real server-streaming
+/// captures practical while bounding that vector to a fixed, small allocation.
+pub const HARD_MAX_GRPC_MAX_MESSAGES: usize = 1_024;
 
 /// Recursion depth ceiling for the protobuf message walk.
 const GRPC_MAX_MESSAGE_DEPTH: usize = 32;
@@ -1444,6 +1480,27 @@ enum BodyPhase {
     Final,
 }
 
+/// Which request-capture representation a hook must use for this request.
+///
+/// The distinction that matters is NOT "is this method enrolled" alone: a native
+/// gRPC body is length-prefixed protobuf frames, so it must never be handed to
+/// the HTTP/JSON capture path even when enrollment does not (or no longer)
+/// apply. `application/grpc+json` makes that explicit — it satisfies
+/// `is_json_content_type` while carrying frames on the wire.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RequestCaptureRoute {
+    /// Native gRPC enrolled under the method view available at this hook.
+    /// Frames are parsed and decoded against the configured descriptor.
+    Grpc,
+    /// A native gRPC request on an instance that configured `grpc`, whose
+    /// currently authoritative method is NOT enrolled. Nothing is captured and
+    /// any staging entry left by a provisional (pre-routing) enrollment is
+    /// discarded.
+    GrpcNotEnrolled,
+    /// Ordinary HTTP capture: JSON-document classification and shaping.
+    Http,
+}
+
 /// Expensive request-side capture derived from the FINAL backend-visible body.
 /// Built outside the staging map's shard guard so redaction/hashing never runs
 /// while a `DashMap` shard lock is held.
@@ -2713,9 +2770,23 @@ impl AiTranscriptAudit {
         )
     }
 
+    /// The method view available to the CALLING hook, which is not always the
+    /// backend-effective one.
+    ///
     /// Prefers the finalized `grpc_full_method` published by
     /// `grpc_method_router` (which reflects a method rewrite) and falls back
     /// to the request path.
+    ///
+    /// `grpc_method_router` publishes this key twice: provisionally from the
+    /// CLIENT path in `on_request_received`, then authoritatively from the
+    /// backend-effective path in `on_backend_path_resolved`. Everything before
+    /// backend-path resolution — `should_buffer_request_body`, `before_proxy`,
+    /// and the staging it performs — therefore sees a PROVISIONAL method that
+    /// listen-path stripping, a route override, or an upstream target path can
+    /// still change. Only hooks at or after `on_final_request_body` see the
+    /// authoritative one, and a request that short-circuits before routing never
+    /// resolves a backend path at all, so its client-path view is the only —
+    /// and therefore the authoritative — method it ever has.
     ///
     /// `grpc_method_router` publishes `package.Service/Method` WITHOUT a leading
     /// slash, while every enrollment key is normalized to
@@ -2743,6 +2814,31 @@ impl AiTranscriptAudit {
             return false;
         };
         ctx.is_native_grpc_request() && grpc.enrolls(&Self::grpc_method_path(ctx))
+    }
+
+    /// Whether this instance's `grpc` enrollment OWNS the request
+    /// representation, independent of whether the current method is enrolled.
+    ///
+    /// A native gRPC body is length-prefixed frames. Once this instance has a
+    /// `grpc` block, no gRPC body may be routed through the HTTP/JSON capture
+    /// path — not on a method the authoritative view refutes, and not on
+    /// `application/grpc+json`, which satisfies `is_json_content_type` while
+    /// carrying frames. Instances without a `grpc` block keep the plain HTTP
+    /// behavior on every request.
+    fn grpc_enrollment_owns_request(&self, ctx: &RequestContext) -> bool {
+        self.grpc.is_some() && ctx.is_native_grpc_request()
+    }
+
+    /// Select the request-capture representation for the calling hook, from the
+    /// method view that hook can actually see.
+    fn request_capture_route(&self, ctx: &RequestContext) -> RequestCaptureRoute {
+        if self.grpc_capture_applies(ctx) {
+            RequestCaptureRoute::Grpc
+        } else if self.grpc_enrollment_owns_request(ctx) {
+            RequestCaptureRoute::GrpcNotEnrolled
+        } else {
+            RequestCaptureRoute::Http
+        }
     }
 
     fn response_body_capture_allowed_for(
@@ -4022,8 +4118,15 @@ impl AiTranscriptAudit {
         {
             return false;
         }
-        if self.grpc_capture_applies(ctx) {
-            return true;
+        match self.request_capture_route(ctx) {
+            RequestCaptureRoute::Grpc => return true,
+            // Framed protobuf on a method this instance does not audit. The
+            // JSON-shaped fallback below must not claim it: `application/grpc+json`
+            // satisfies `is_json_content_type`, so without this an unenrolled
+            // gRPC request would pin its response to the buffered path for a
+            // record that will never be built.
+            RequestCaptureRoute::GrpcNotEnrolled => return false,
+            RequestCaptureRoute::Http => {}
         }
         // A `stream: true` request expects an SSE response; do not buffer it —
         // buffering holds the stream until EOF, and under retry the
@@ -4184,15 +4287,43 @@ impl Plugin for AiTranscriptAudit {
     /// instances that actually configure `grpc` enrollment pay the
     /// `Bytes::copy_from_slice`, and only on requests this plugin already asked
     /// to buffer. HTTP-only instances keep the default.
+    ///
+    /// Because `should_buffer_request_body` now selects buffering for every
+    /// native gRPC request on such an instance (enrollment is not decidable that
+    /// early), the snapshot is taken for unenrolled gRPC methods too. It is one
+    /// bounded copy of a body the proxy already buffered for this proxy's plugin
+    /// chain, and it is the price of the fail-safe: the request that turns out
+    /// to be enrolled only after backend-path resolution is indistinguishable
+    /// from one that does not, at the point this flag is read.
     fn needs_request_body_bytes(&self) -> bool {
         self.active && self.grpc.is_some()
     }
 
+    /// Native gRPC selects buffering CONSERVATIVELY, before enrollment is
+    /// decidable.
+    ///
+    /// This predicate is evaluated on the client-path method view: it runs
+    /// before route override, listen-path stripping, and upstream path
+    /// assembly, and therefore before `grpc_method_router` republishes the
+    /// authoritative backend-effective `grpc_full_method` in
+    /// `on_backend_path_resolved`. Answering `false` here is not a deferral —
+    /// it pins the request to the native-gRPC streaming fast path, where no
+    /// final request-body hook ever runs. A client path such as
+    /// `/prefix/pkg.Service/Method` (unparseable, so unenrolled) that becomes
+    /// the enrolled `/pkg.Service/Method` after stripping would then escape
+    /// capture entirely, silently.
+    ///
+    /// So an instance with a `grpc` block buffers every native gRPC request it
+    /// could still be asked to audit, and the authoritative method decides
+    /// capture later, in `on_final_request_body_with_context`. The cost is
+    /// bounded by the gRPC receive limit and is confined to gRPC traffic on a
+    /// gRPC-enrolled instance: HTTP requests here, and every request on an
+    /// instance without a `grpc` block, keep the JSON-POST fast path unchanged.
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         if !self.active {
             return false;
         }
-        if self.grpc_capture_applies(ctx) {
+        if self.grpc_enrollment_owns_request(ctx) {
             return true;
         }
         ctx.method == "POST"
@@ -4208,6 +4339,21 @@ impl Plugin for AiTranscriptAudit {
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if !self.active {
+            return PluginResult::Continue;
+        }
+        // Staging here is deliberately keyed on the PROVISIONAL (client-path)
+        // method, because that is the only view a pre-routing short circuit
+        // will ever have: a `before_proxy` reject or synthetic response never
+        // resolves a backend path, so no more authoritative method exists for
+        // it. `on_final_request_body_with_context` re-decides against the
+        // backend-effective method, in both directions, for every request that
+        // does reach dispatch.
+        //
+        // Framed protobuf this instance's enrollment owns but the current
+        // method view does not select must not fall through to the JSON
+        // candidate path below — `application/grpc+json` would otherwise
+        // satisfy its content-type test.
+        if self.request_capture_route(ctx) == RequestCaptureRoute::GrpcNotEnrolled {
             return PluginResult::Continue;
         }
         if self.grpc_capture_applies(ctx) {
@@ -4278,6 +4424,20 @@ impl Plugin for AiTranscriptAudit {
         self.active
     }
 
+    /// The AUTHORITATIVE gRPC enrollment decision for ordinary backend-dispatched
+    /// traffic.
+    ///
+    /// This hook runs after `on_backend_path_resolved`, so `grpc_full_method` now
+    /// names the backend-effective method. Both transitions are decided here and
+    /// only here:
+    ///
+    /// - provisional unenrolled/invalid -> final enrolled: nothing staged in
+    ///   `before_proxy`, so the candidate is staged and captured now from these
+    ///   exact backend-visible bytes. `should_buffer_request_body` bought the
+    ///   right to be here by buffering every native gRPC request.
+    /// - provisional enrolled -> final unenrolled: the provisional staging entry
+    ///   is discarded and no record is emitted for the refuted method. The
+    ///   protobuf frames are never re-read through the HTTP/JSON capture path.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
@@ -4291,10 +4451,20 @@ impl Plugin for AiTranscriptAudit {
         // `after_proxy` refresh knows this was NOT a `before_proxy` short-circuit.
         ctx.metadata
             .insert(MD_FINAL_REQ_SEEN.to_string(), "true".to_string());
+        let route = self.request_capture_route(ctx);
+        if route == RequestCaptureRoute::GrpcNotEnrolled {
+            // The backend-effective method refuted a provisional enrollment (or
+            // this gRPC method was never enrolled at all). Release whatever
+            // `before_proxy` staged for the client-path method so no record can
+            // ship under it, and never hand framed protobuf to
+            // `stage_candidate`/`capture_staged_request`.
+            self.discard_staged_candidate(ctx);
+            return PluginResult::Continue;
+        }
         // Staged (cheaply) in `before_proxy`: these are the backend-visible
         // bytes, so this is where the transaction's single capture pass runs.
         if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
-            if self.grpc_capture_applies(ctx) {
+            if route == RequestCaptureRoute::Grpc {
                 // Ordinary dispatch: this hook's own `headers` parameter is the
                 // authoritative backend-visible map, so it stays the framing
                 // source and the staged witness is not consulted.
@@ -4312,7 +4482,11 @@ impl Plugin for AiTranscriptAudit {
             // streaming capture off has no later buffered gate).
             return self.request_phase_commit_admission(ctx);
         }
-        if self.grpc_capture_applies(ctx) {
+        if route == RequestCaptureRoute::Grpc {
+            // Either an ordinary enrolled call whose body only became available
+            // here, or a request whose client-path method was unenrolled/invalid
+            // and which the backend-effective method just enrolled. Both stage
+            // and capture from these backend-visible bytes.
             let stage_result = self.stage_grpc_candidate(
                 ctx,
                 body,
@@ -4361,6 +4535,14 @@ impl Plugin for AiTranscriptAudit {
     /// (`MD_FINAL_REQ_SEEN`), so skip there to avoid reverting it from carried
     /// pre-transform metadata; `AuditStaging::captured` is the second, stateful
     /// guard that keeps this to one capture pass per transaction.
+    ///
+    /// The method view read here is whatever the request actually reached: a
+    /// genuine pre-routing short circuit never resolved a backend path, so its
+    /// client-path method is authoritative for it and the candidate
+    /// `before_proxy` staged is exactly the one to capture. A short circuit from
+    /// a DEFERRED `before_proxy` pass, by contrast, already ran
+    /// `on_backend_path_resolved`, so the same read yields the backend-effective
+    /// method and can refute the provisional staging entry.
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -4374,14 +4556,29 @@ impl Plugin for AiTranscriptAudit {
             return PluginResult::Continue;
         }
         if !flag(&ctx.metadata, MD_FINAL_REQ_SEEN) {
-            if self.grpc_capture_applies(ctx) {
-                // No final-body hook ran (before_proxy short-circuit), so there
-                // is no authoritative finalized header map here and the body may
-                // be non-UTF-8 protobuf.
-                self.capture_short_circuit_grpc_request(ctx);
-            } else if let Some(body) = ctx.metadata.remove("request_body") {
-                self.capture_staged_request(ctx, body.as_bytes());
-                ctx.metadata.insert("request_body".to_string(), body);
+            let route = self.request_capture_route(ctx);
+            match route {
+                RequestCaptureRoute::Grpc => {
+                    // No final-body hook ran (before_proxy short-circuit), so
+                    // there is no authoritative finalized header map here and
+                    // the body may be non-UTF-8 protobuf.
+                    self.capture_short_circuit_grpc_request(ctx);
+                }
+                RequestCaptureRoute::GrpcNotEnrolled => {
+                    // A deferred `before_proxy` short circuit after backend-path
+                    // resolution refuted the provisional method. Drop the
+                    // staging entry rather than shipping a record for a method
+                    // this instance does not audit, and never read framed
+                    // protobuf through the HTTP capture path below.
+                    self.discard_staged_candidate(ctx);
+                    return PluginResult::Continue;
+                }
+                RequestCaptureRoute::Http => {
+                    if let Some(body) = ctx.metadata.remove("request_body") {
+                        self.capture_staged_request(ctx, body.as_bytes());
+                        ctx.metadata.insert("request_body".to_string(), body);
+                    }
+                }
             }
         }
         if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY)
@@ -4504,14 +4701,31 @@ impl Plugin for AiTranscriptAudit {
         // second guard that keeps the expensive pass to one per transaction when
         // both this hook and `after_proxy` see the same short-circuit.
         if flag(&ctx.metadata, SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY) {
-            if self.grpc_capture_applies(ctx) {
-                // A synthetic short-circuit never ran the final-body hook, so
-                // there is no finalized request-header map and the body may be
-                // non-UTF-8 protobuf.
-                self.capture_short_circuit_grpc_request(ctx);
-            } else if let Some(body) = ctx.metadata.remove("request_body") {
-                self.capture_staged_request(ctx, body.as_bytes());
-                ctx.metadata.insert("request_body".to_string(), body);
+            let route = self.request_capture_route(ctx);
+            match route {
+                RequestCaptureRoute::Grpc => {
+                    // A synthetic short-circuit never ran the final-body hook,
+                    // so there is no finalized request-header map and the body
+                    // may be non-UTF-8 protobuf.
+                    self.capture_short_circuit_grpc_request(ctx);
+                }
+                RequestCaptureRoute::GrpcNotEnrolled => {
+                    // Same refuted-method contract as `after_proxy`: release the
+                    // provisional staging entry instead of emitting a record for
+                    // a method the authoritative view does not enroll.
+                    // `after_proxy` normally discards first; this keeps the rule
+                    // local to every hook that can reach a short-circuit body.
+                    // The discard removes this instance's entry for
+                    // `record_id`, so no separate cleanup is needed.
+                    self.discard_staged_candidate(ctx);
+                    return PluginResult::Continue;
+                }
+                RequestCaptureRoute::Http => {
+                    if let Some(body) = ctx.metadata.remove("request_body") {
+                        self.capture_staged_request(ctx, body.as_bytes());
+                        ctx.metadata.insert("request_body".to_string(), body);
+                    }
+                }
             }
         }
 
@@ -7857,13 +8071,24 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
         })?
         .to_string();
 
-    let max_message_bytes = cfg_positive_usize(
+    // Both ceilings are immutable deployment maxima: an operator-supplied value
+    // above them is refused at admission rather than silently clamped, so a
+    // config that asks for an unbounded frame vector never becomes a live
+    // policy on any node.
+    let max_message_bytes = cfg_positive_usize_capped(
         grpc,
         "max_message_bytes",
         DEFAULT_GRPC_MAX_MESSAGE_BYTES,
         "grpc",
+        HARD_MAX_GRPC_MAX_MESSAGE_BYTES,
     )?;
-    let max_messages = cfg_positive_usize(grpc, "max_messages", DEFAULT_GRPC_MAX_MESSAGES, "grpc")?;
+    let max_messages = cfg_positive_usize_capped(
+        grpc,
+        "max_messages",
+        DEFAULT_GRPC_MAX_MESSAGES,
+        "grpc",
+        HARD_MAX_GRPC_MAX_MESSAGES,
+    )?;
 
     let Some(method_configs) = grpc.get("methods").and_then(Value::as_object) else {
         return Err(
