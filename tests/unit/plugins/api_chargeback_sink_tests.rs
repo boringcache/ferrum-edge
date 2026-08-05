@@ -8907,13 +8907,130 @@ fn directory_at_claim_publishes_evidence_without_clearing_prior_siblings() {
         "payload publish must leave the prior meta sibling until metadata publish"
     );
 
-    write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, 1)
+    write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
         .expect("directory at claim must not block metadata publish");
     let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
     assert_eq!(meta["rejected_rows"], 1);
     assert!(
         claim_path.is_dir(),
         "constructive handoff must leave the planted directory claim untouched"
+    );
+}
+
+#[test]
+fn dead_letter_open_fails_closed_when_prior_rejected_payload_is_a_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-prior-payload-dir")])
+        .unwrap();
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim should be acquired");
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+    let row = br#"{"event_id":"evt-prior-payload-dir"}"#;
+
+    let payload_path = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect("initial dead-letter payload should publish");
+    // Hostile race: prior final is a directory while the claim remains a
+    // regular file, so authorized cleanup must fail closed on remove_file.
+    fs::remove_file(&payload_path).unwrap();
+    fs::create_dir(&payload_path).unwrap();
+
+    let error = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect_err("directory at prior rejected payload must fail open cleanup");
+    assert!(
+        error.contains("failed to remove prior partial dead-letter payload"),
+        "unexpected prior-payload cleanup diagnostic: {error}"
+    );
+    assert!(
+        claim_path.is_file(),
+        "failed open cleanup must leave the live claim untouched"
+    );
+    assert!(
+        payload_path.is_dir(),
+        "failed open cleanup must leave the planted prior payload directory"
+    );
+}
+
+#[test]
+fn dead_letter_open_fails_closed_when_prior_rejected_meta_is_a_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-prior-meta-dir")])
+        .unwrap();
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim should be acquired");
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+    let row = br#"{"event_id":"evt-prior-meta-dir"}"#;
+
+    let payload_path = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect("initial dead-letter payload should publish");
+    let payload_name = payload_path.file_name().unwrap().to_string_lossy();
+    let base = payload_name
+        .strip_suffix(".rejected.ndjson")
+        .expect("dead-letter payload suffix");
+    let meta_path = payload_path.with_file_name(format!("{base}.rejected.meta"));
+    fs::create_dir(&meta_path).unwrap();
+
+    let error = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect_err("directory at prior rejected meta must fail open cleanup");
+    assert!(
+        error.contains("failed to remove prior partial dead-letter metadata"),
+        "unexpected prior-meta cleanup diagnostic: {error}"
+    );
+    assert!(
+        claim_path.is_file(),
+        "failed open cleanup must leave the live claim untouched"
+    );
+    assert!(
+        meta_path.is_dir(),
+        "failed open cleanup must leave the planted prior meta directory"
+    );
+}
+
+#[test]
+fn dead_letter_meta_publish_fails_closed_when_prior_meta_is_a_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-meta-replace-dir")])
+        .unwrap();
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim should be acquired");
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+    let row = br#"{"event_id":"evt-meta-replace-dir"}"#;
+
+    let payload_path = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
+        .expect("initial dead-letter payload should publish");
+    let payload_name = payload_path.file_name().unwrap().to_string_lossy();
+    let base = payload_name
+        .strip_suffix(".rejected.ndjson")
+        .expect("dead-letter payload suffix");
+    let meta_path = payload_path.with_file_name(format!("{base}.rejected.meta"));
+    // Claim remains a regular file so metadata publish authorizes prior-meta
+    // replacement; a planted directory makes that remove_file fail closed.
+    fs::create_dir(&meta_path).unwrap();
+
+    let error = write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
+        .expect_err("directory at prior meta must fail metadata replace");
+    assert!(
+        error.contains("failed to replace dead-letter metadata"),
+        "unexpected meta-replace diagnostic: {error}"
+    );
+    assert!(
+        claim_path.is_file(),
+        "failed meta replace must leave the live claim untouched"
+    );
+    assert!(
+        meta_path.is_dir(),
+        "failed meta replace must leave the planted prior meta directory"
     );
 }
 

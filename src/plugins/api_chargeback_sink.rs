@@ -8495,23 +8495,31 @@ impl DeadLetterPayloadWriter {
         // handoff artifacts under the namespace lock before rebuilding so
         // recovery never needs quota for two complete rejected payloads and
         // never evicts unrelated active spool data merely to duplicate one.
-        // Only a live regular-file claim authorizes that destructive cleanup.
-        if claim_state == ManagedClaimState::RegularFile {
-            for (path, kind) in [(&prior_meta_path, "metadata"), (&final_path, "payload")] {
-                let removed_len = spool_regular_file_len(path);
-                match fs::remove_file(path) {
-                    Ok(()) => {
-                        if let Some(len) = removed_len {
-                            spool.usage.account_sub(1, len);
-                        }
+        // Only a live regular-file claim authorizes that destructive cleanup;
+        // Missing / NotRegularFile iterate an empty set so the body stays
+        // shared with the pre-authorization cleanup path.
+        let authorized_prior_siblings =
+            [(&prior_meta_path, "metadata"), (&final_path, "payload")];
+        let prior_siblings: &[(&PathBuf, &str)] =
+            if claim_state == ManagedClaimState::RegularFile {
+                &authorized_prior_siblings
+            } else {
+                &authorized_prior_siblings[..0]
+            };
+        for (path, kind) in prior_siblings.iter().copied() {
+            let removed_len = spool_regular_file_len(path);
+            match fs::remove_file(path) {
+                Ok(()) => {
+                    if let Some(len) = removed_len {
+                        spool.usage.account_sub(1, len);
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(format!(
-                            "{PLUGIN_NAME}: failed to remove prior partial dead-letter {kind} '{}': {error}",
-                            path.display()
-                        ));
-                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "{PLUGIN_NAME}: failed to remove prior partial dead-letter {kind} '{}': {error}",
+                        path.display()
+                    ));
                 }
             }
         }
@@ -8649,21 +8657,29 @@ impl DeadLetterPayloadWriter {
         // and could become permanently unrecoverable. A missing or non-file
         // claim must not authorize that unlink (completed handoff vs hostile
         // directory plant).
-        if spool.managed_claim_state(&self.source_path)? == ManagedClaimState::RegularFile {
-            let replaced_payload_len = spool_regular_file_len(&self.final_path);
-            match fs::remove_file(&self.final_path) {
-                Ok(()) => {
-                    if let Some(len) = replaced_payload_len {
-                        spool.usage.account_sub(1, len);
-                    }
+        let clear_prior_final = spool.managed_claim_state(&self.source_path)?
+            == ManagedClaimState::RegularFile;
+        let replaced_payload_len = if clear_prior_final {
+            spool_regular_file_len(&self.final_path)
+        } else {
+            None
+        };
+        match if clear_prior_final {
+            fs::remove_file(&self.final_path)
+        } else {
+            Ok(())
+        } {
+            Ok(()) => {
+                if let Some(len) = replaced_payload_len {
+                    spool.usage.account_sub(1, len);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "{PLUGIN_NAME}: failed to replace prior dead-letter payload '{}': {error}",
-                        self.final_path.display()
-                    ));
-                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: failed to replace prior dead-letter payload '{}': {error}",
+                    self.final_path.display()
+                ));
             }
         }
         // The temp and still-authoritative source are both present in the
@@ -9001,21 +9017,29 @@ fn write_dead_letter_meta(
     spool.evict_until_can_admit(bytes.len() as u64)?;
     // Measured after eviction: a reclaim that already deleted this record has
     // accounted for it, so re-measuring here cannot double-subtract.
-    if spool.managed_claim_state(source_path)? == ManagedClaimState::RegularFile {
-        let replaced_meta_len = spool_regular_file_len(&meta_path);
-        match fs::remove_file(&meta_path) {
-            Ok(()) => {
-                if let Some(len) = replaced_meta_len {
-                    spool.usage.account_sub(1, len);
-                }
+    let clear_prior_meta = spool.managed_claim_state(source_path)?
+        == ManagedClaimState::RegularFile;
+    let replaced_meta_len = if clear_prior_meta {
+        spool_regular_file_len(&meta_path)
+    } else {
+        None
+    };
+    match if clear_prior_meta {
+        fs::remove_file(&meta_path)
+    } else {
+        Ok(())
+    } {
+        Ok(()) => {
+            if let Some(len) = replaced_meta_len {
+                spool.usage.account_sub(1, len);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "{PLUGIN_NAME}: failed to replace dead-letter metadata '{}': {error}",
-                    meta_path.display()
-                ));
-            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "{PLUGIN_NAME}: failed to replace dead-letter metadata '{}': {error}",
+                meta_path.display()
+            ));
         }
     }
     let _live = LiveSpoolPathGuard::new(tmp_path.clone());
@@ -10599,12 +10623,16 @@ pub fn publish_dead_letter_payload_for_tests(
 /// published payload. External tests use this with
 /// [`publish_dead_letter_payload_for_tests`] to exercise constructive metadata
 /// publication when the claim path is no longer a regular file.
+///
+/// Callers pass the payload bytes they already published so this probe does not
+/// re-stat or re-read the on-disk file solely to rebuild the metadata record.
 #[doc(hidden)]
 #[allow(dead_code)] // external unit tests only
 pub fn write_dead_letter_meta_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
     payload_path: &Path,
+    payload: &[u8],
     rejected_rows: usize,
 ) -> Result<PathBuf, String> {
     let payload_file = payload_path
@@ -10614,23 +10642,10 @@ pub fn write_dead_letter_meta_for_tests(
             format!("{PLUGIN_NAME}: dead-letter meta probe has an invalid payload filename")
         })?
         .to_string();
-    let payload_bytes = fs::metadata(payload_path)
-        .map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: dead-letter meta probe failed to stat payload '{}': {error}",
-                payload_path.display()
-            )
-        })?
-        .len();
+    let payload_bytes = payload.len() as u64;
     let payload_sha256 = {
-        let bytes = fs::read(payload_path).map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: dead-letter meta probe failed to read payload '{}': {error}",
-                payload_path.display()
-            )
-        })?;
         let mut hasher = crate::fips::approved::Sha256::new();
-        hasher.update(&bytes);
+        hasher.update(payload);
         hex::encode(hasher.finalize())
     };
     let outcomes = [DeadLetterOutcomeMeta {
