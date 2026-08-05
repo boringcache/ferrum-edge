@@ -133,7 +133,10 @@ fn backend_lb_policy_cookie_affinity_selects_stable_target_on_lb_path() {
         HashOnStrategy::Cookie("lb-affinity".to_string())
     );
 
+    // `get_balancer` lives on the inner snapshot, so reach it through the
+    // `ArcSwap` load the same way the other load-balancer tests do.
     let lb = cache
+        .load()
         .get_balancer(&upstream.namespace, &upstream.id)
         .expect("translated upstream must be in LB cache");
     let first = lb
