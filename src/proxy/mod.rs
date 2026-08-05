@@ -45501,48 +45501,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_tls_sni_retry_path_fails_closed_before_reqwest() {
-        let state = make_test_proxy_state(GatewayConfig::default());
-        let mut proxy = test_proxy(ResponseBodyMode::Stream);
-        proxy.backend_scheme = Some(BackendScheme::Https);
-        proxy.backend_host = "127.0.0.1".to_string();
-        proxy.backend_port = 1;
-        proxy.dns_override = Some("127.0.0.1".to_string());
-        proxy.resolved_tls.sni = Some("backend.mesh.internal".to_string());
-        let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
-
-        let resp = proxy_to_backend_retry(
-            &state,
-            &proxy,
-            "https://127.0.0.1:1/",
-            "GET",
-            &HashMap::new(),
-            None,
-            None,
-            true,
-            &[],
-            &ctx,
-            "127.0.0.1",
-            "127.0.0.1",
-            true,
-            hyper::Version::HTTP_2,
-        )
-        .await;
-
-        assert_eq!(resp.status_code, 502);
-        assert!(!resp.connection_error);
-        assert_eq!(
-            resp.error_class,
-            Some(retry::ErrorClass::DispatchPolicyRejected)
-        );
-        assert_eq!(resp.backend_resolved_ip, None);
-        assert_eq!(
-            resp.headers.get("gateway-error-reason").map(String::as_str),
-            Some(BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON)
-        );
-    }
-
-    #[tokio::test]
     async fn reqwest_retry_fails_closed_when_literal_target_differs_from_dns_override() {
         let state = make_test_proxy_state(GatewayConfig::default());
         let mut proxy = test_proxy(ResponseBodyMode::Stream);

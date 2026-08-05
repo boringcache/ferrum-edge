@@ -1162,8 +1162,10 @@ impl HealthChecker {
                 self.dns_cache.clone(),
                 tls_config,
                 &self.global_tls_ca_bundle_path,
-                &self.global_backend_tls_client_cert_path,
-                &self.global_backend_tls_client_key_path,
+                HealthCheckClientIdentityPaths {
+                    cert: &self.global_backend_tls_client_cert_path,
+                    key: &self.global_backend_tls_client_key_path,
+                },
                 self.global_tls_no_verify,
                 dial_host_pin,
             ),
@@ -2436,6 +2438,15 @@ fn apply_probe_dial_identity(
     }
 }
 
+/// Global client-certificate and private-key paths are one atomic identity.
+/// Bundling them keeps the TLS client builder's argument list below clippy's
+/// complexity threshold and makes it harder for call sites to swap the pair.
+#[derive(Clone, Copy)]
+struct HealthCheckClientIdentityPaths<'a> {
+    cert: &'a Option<String>,
+    key: &'a Option<String>,
+}
+
 /// Build a health check HTTP client with upstream-specific TLS configuration.
 ///
 /// Configures the client with the upstream's CA bundle, client cert/key for mTLS,
@@ -2470,8 +2481,7 @@ fn build_health_check_client_with_tls(
     dns_cache: Option<DnsCache>,
     tls_config: &BackendTlsConfig,
     global_ca_path: &Option<String>,
-    global_cert_path: &Option<String>,
-    global_key_path: &Option<String>,
+    global_identity: HealthCheckClientIdentityPaths<'_>,
     global_no_verify: bool,
     dial_host_pin: Option<&str>,
 ) -> Result<reqwest::Client, HealthCheckClientError> {
@@ -2544,11 +2554,11 @@ fn build_health_check_client_with_tls(
     let cert_path = tls_config
         .client_cert_path
         .as_ref()
-        .or(global_cert_path.as_ref());
+        .or(global_identity.cert.as_ref());
     let key_path = tls_config
         .client_key_path
         .as_ref()
-        .or(global_key_path.as_ref());
+        .or(global_identity.key.as_ref());
     // A configured backend mTLS identity is mandatory for the probe, exactly as
     // it is for proxy traffic: every failure below is fail-closed rather than
     // warn-and-continue, because an anonymous probe measures a different
@@ -3214,8 +3224,10 @@ mod tests {
                 None,
                 &tls_config,
                 &None,
-                &None,
-                &None,
+                HealthCheckClientIdentityPaths {
+                    cert: &None,
+                    key: &None,
+                },
                 false,
                 None,
             )
@@ -3454,8 +3466,10 @@ mod tests {
             None,
             tls_config,
             &None,
-            &None,
-            &None,
+            HealthCheckClientIdentityPaths {
+                cert: &None,
+                key: &None,
+            },
             global_no_verify,
             None,
         )
@@ -3473,8 +3487,10 @@ mod tests {
             None,
             &tls,
             &None,
-            &None,
-            &None,
+            HealthCheckClientIdentityPaths {
+                cert: &None,
+                key: &None,
+            },
             false,
             Some("pod-a.internal"),
         );
