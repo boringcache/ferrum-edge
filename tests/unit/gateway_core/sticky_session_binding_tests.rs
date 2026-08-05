@@ -1319,11 +1319,15 @@ fn every_identity_bearing_field_changes_the_token() {
     differs("absent declared Service port", &no_policy_key);
 
     let mut tag_value = base.clone();
-    tag_value.tags.insert("version".to_string(), "v2".to_string());
+    tag_value
+        .tags
+        .insert("version".to_string(), "v2".to_string());
     differs("subset tag value", &tag_value);
 
     let mut extra_tag = base.clone();
-    extra_tag.tags.insert("canary".to_string(), "on".to_string());
+    extra_tag
+        .tags
+        .insert("canary".to_string(), "on".to_string());
     differs("additional tag", &extra_tag);
 
     let mut locality = base.clone();
@@ -1859,13 +1863,15 @@ fn a_retry_rotation_between_wildcard_backends_reissues_for_the_serving_one() {
         assert_eq!(service_name_of(reissue), "egress-b");
 
         let mut headers: HashMap<String, String> = HashMap::new();
-        assert!(ferrum_edge::_test_support::inject_sticky_affinity_cookie_for_test(
-            &proxy,
-            &snapshot,
-            Some(reissue),
-            true,
-            &mut headers,
-        ));
+        assert!(
+            ferrum_edge::_test_support::inject_sticky_affinity_cookie_for_test(
+                &proxy,
+                &snapshot,
+                Some(reissue),
+                true,
+                &mut headers,
+            )
+        );
         assert_eq!(
             headers.get("set-cookie"),
             Some(&expected_affinity_cookie(&b)),
@@ -1882,7 +1888,8 @@ fn a_retry_rotation_between_wildcard_backends_reissues_for_the_serving_one() {
         )
         .expect("the reissued token must resolve");
         assert_eq!(
-            service_name_of(&bound), "egress-b",
+            service_name_of(&bound),
+            "egress-b",
             "the client must not be sent back to the rotated-away backend"
         );
     }
