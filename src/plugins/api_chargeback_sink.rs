@@ -8498,14 +8498,12 @@ impl DeadLetterPayloadWriter {
         // Only a live regular-file claim authorizes that destructive cleanup;
         // Missing / NotRegularFile iterate an empty set so the body stays
         // shared with the pre-authorization cleanup path.
-        let authorized_prior_siblings =
-            [(&prior_meta_path, "metadata"), (&final_path, "payload")];
-        let prior_siblings: &[(&PathBuf, &str)] =
-            if claim_state == ManagedClaimState::RegularFile {
-                &authorized_prior_siblings
-            } else {
-                &authorized_prior_siblings[..0]
-            };
+        let authorized_prior_siblings = [(&prior_meta_path, "metadata"), (&final_path, "payload")];
+        let prior_siblings: &[(&PathBuf, &str)] = if claim_state == ManagedClaimState::RegularFile {
+            &authorized_prior_siblings
+        } else {
+            &authorized_prior_siblings[..0]
+        };
         for (path, kind) in prior_siblings.iter().copied() {
             let removed_len = spool_regular_file_len(path);
             match fs::remove_file(path) {
