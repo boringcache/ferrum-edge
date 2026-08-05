@@ -2229,7 +2229,7 @@ async fn bodyless_direct_h2_sse_response_is_governed() {
         // failure for this assertion.
         .filter(|error| {
             !error.starts_with("h2 handshake failed: connection error detected: unspecific protocol error detected")
-                && error != "ExpectHeaders: connection closed before any stream arrived"
+                && error.as_str() != "ExpectHeaders: connection closed before any stream arrived"
         })
         .collect();
     assert!(
