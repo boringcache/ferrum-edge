@@ -24,18 +24,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `a2a_gateway` rewrites unary gRPC Agent Card protobuf payloads (A2A 0.3.x
   wire layout) with the same JSON-RPC endpoint URL policy as HTTP cards,
   clears invalidated signatures, and fails closed on unsupported versions or
-  malformed/compressed frames (issue #3297). The 0.3.x layout gate is
-  positive: the card must carry an explicit 0.3.x `protocol_version` (field
-  16) on the wire. An absent or empty `protocol_version` fails closed with a
-  trailers-only gRPC `INTERNAL` and `unsupported_agent_card_protobuf_version`
-  regardless of `endpoint.protocol_versions`, because A2A renumbered
-  `AgentCard` for 1.0 (field 3 became `supported_interfaces`, `signatures`
-  moved 17 -> 13, field 14 became `icon_url`, `protocol_version` was removed)
-  and proto3 cannot distinguish an unset field from `""` — guessing would
-  flatten each interface submessage into a bare URL and re-serve the card
-  under its now-invalid original signature. As defense in depth, a rewritable
+  malformed/compressed frames (issue #3297). The rewritten frame is emitted
+  from its first byte through `BoundedResponseBodySink`: a bounded counting
+  pass supplies the gRPC frame prefix and every `AgentInterface` length
+  prefix, so no complete would-be replacement — and no interface submessage —
+  is ever materialised outside the reserved construction sink
+  (GHSA-pwcm-6rh8-f2gh). Only a proven-successful reply is inspected (HTTP
+  `200` plus a terminal `grpc-status` of exactly `0`, read from the merged
+  header+trailer view), so a non-OK upstream response is forwarded as written
+  instead of being mistaken for a card; refusals are trailers-only gRPC
+  `INTERNAL` under HTTP `200` with an empty body, never a synthetic 5xx or an
+  HTTP body on a native gRPC stream. The 0.3.x layout gate is positive AND
+  exact: the card must carry an explicit `protocol_version` (field 16) whose
+  value equals a configured `endpoint.protocol_versions` entry — that list has
+  no family or wildcard syntax, so `["0.3.0"]` refuses `0.3.99` — and the
+  matched version must belong to the implemented 0.3 family, so an exactly
+  configured `1.0.0` is refused too. An absent or empty `protocol_version`
+  fails closed with `unsupported_agent_card_protobuf_version` regardless of
+  configuration, because A2A renumbered `AgentCard` for 1.0 (field 3 became
+  `supported_interfaces`, `signatures` moved 17 -> 13, field 14 became
+  `icon_url`, `protocol_version` was removed) and proto3 cannot distinguish an
+  unset field from `""` — guessing would flatten each interface submessage
+  into a bare URL and re-serve the card under its now-invalid original
+  signature. Every known 0.3 field is schema-validated before any rewrite, so
+  a wrong wire type or a duplicated singular field can no longer be preserved
+  verbatim beside rewritten siblings, and the protobuf decoder rejects
+  over-long / out-of-range / non-canonical varints, field numbers outside
+  `1..=2^29-1`, and unrepresentable length prefixes. As defense in depth, a
   URL field that is not an absolute `http`/`https` URL fails closed with
-  `agent_card_protobuf_url_layout_mismatch`. Operators fronting a non-0.3 A2A
+  `agent_card_protobuf_url_layout_mismatch`. A card the plugin admitted whose
+  rewrite never reaches the client fails closed with
+  `agent_card_grpc_rewrite_not_applied`. Operators fronting a non-0.3 A2A
   backend should set `discovery.rewrite_agent_card_urls: false`; leaving it
   enabled refuses such cards rather than serving un-rewritten internal URLs.
 - `ai_semantic_firewall` streamed `inspect` mode now accepts

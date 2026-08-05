@@ -2402,9 +2402,24 @@ fn no_declared_producer_builds_a_complete_replacement_before_the_bound() {
                 "ceiling.checked_sub(buffer.len())?",
             ],
         ),
-        // The already-clean producers must stay clean: none of them may
-        // acquire a build-then-copy materialisation.
-        ("a2a_gateway", &["bounded_vec_from"]),
+        (
+            "a2a_gateway",
+            // The gRPC Agent Card rewriter built a complete replacement
+            // `AgentCard` message — and a complete replacement for each
+            // `AgentInterface` submessage inside it — into plain `Vec`s, then
+            // copied the finished message through the sink. Length-prefixed
+            // protobuf is exactly the case the reserve-then-fill / count-then-
+            // emit seam exists for; assembling it first is the build-then-copy
+            // shape, however bounded the final copy is.
+            &[
+                "bounded_vec_from",
+                "fn rewrite_agent_card_protobuf(",
+                "fn rewrite_agent_interface_protobuf(",
+                "Vec::with_capacity(message.len()",
+                "sink.push(&message)",
+                "sink.push(&rewritten)",
+            ],
+        ),
         ("ai_tool_governor", &["bounded_vec_from"]),
         ("compression", &["bounded_vec_from"]),
         ("mcp_gateway", &["bounded_vec_from"]),
@@ -2434,6 +2449,21 @@ fn no_declared_producer_builds_a_complete_replacement_before_the_bound() {
 #[test]
 fn the_repaired_producers_construct_through_the_bound() {
     let required: &[(&str, &[&str])] = &[
+        (
+            "a2a_gateway",
+            // Count-then-emit: the SAME emission code runs into an
+            // allocation-free length counter and then straight into the sink,
+            // so the gRPC frame prefix and every submessage length prefix are
+            // known without ever materialising the message they describe.
+            &[
+                "trait ProtobufEmitter",
+                "struct ProtobufLengthCounter",
+                "impl ProtobufEmitter for crate::proxy::response_buffer_budget::BoundedResponseBodySink",
+                "fn emit_rewritten_agent_card<E: ProtobufEmitter>(",
+                "fn emit_rewritten_agent_interface<E: ProtobufEmitter>(",
+                "fn emit_protobuf_len_header<E: ProtobufEmitter>(",
+            ],
+        ),
         (
             "sse",
             &["fn write_lossy_sse_data(", "SSE_DATA_FIELD_PREFIX"],

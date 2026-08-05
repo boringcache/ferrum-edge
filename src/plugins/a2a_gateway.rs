@@ -15,8 +15,8 @@ use tracing::warn;
 use url::Url;
 
 use super::{
-    HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, ResponseStreamAction,
-    ResponseStreamInspector,
+    A2aGrpcCardRewriteState, HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext,
+    ResponseStreamAction, ResponseStreamInspector,
 };
 
 const DEFAULT_ENDPOINT_PATH: &str = "/a2a";
@@ -750,19 +750,22 @@ impl A2aGateway {
     fn stage_grpc_agent_card_rewrite(
         &self,
         ctx: &mut RequestContext,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         let Some(_public_base) = self.public_base_url(ctx) else {
             return PluginResult::Continue;
         };
-        if body.is_empty() {
-            // Trailers-only upstream failures carry no Agent Card payload.
+        // Only a PROVEN-OK unary reply is a candidate Agent Card. A non-OK
+        // upstream response — including one that streamed its failure in
+        // trailers after a DATA frame — is forwarded as the upstream wrote it,
+        // never re-decoded and never blamed on the rewriter.
+        if !grpc_response_is_proven_ok(response_status, response_headers) {
             return PluginResult::Continue;
         }
-        if let Some(status) = header_value(response_headers, "grpc-status")
-            && status != "0"
-        {
+        if body.is_empty() {
+            // Trailers-only upstream replies carry no Agent Card payload.
             return PluginResult::Continue;
         }
         match validate_grpc_agent_card_rewrite(
@@ -770,7 +773,13 @@ impl A2aGateway {
             response_headers,
             &self.endpoint.protocol_versions,
         ) {
-            Ok(()) => PluginResult::Continue,
+            Ok(()) => {
+                // Claimed. The transform phase owns the outcome from here, and
+                // `on_final_response_body` fails closed if it never reports one,
+                // so an admitted card can never reach the client un-rewritten.
+                ctx.a2a_gateway_grpc_card_rewrite = Some(A2aGrpcCardRewriteState::Staged);
+                PluginResult::Continue
+            }
             Err(diagnostic) => {
                 if self.observability.emit_metadata {
                     ctx.metadata
@@ -1049,7 +1058,7 @@ impl Plugin for A2aGateway {
             }
         }
         if self.should_rewrite_grpc_agent_card(ctx) {
-            return self.stage_grpc_agent_card_rewrite(ctx, response_headers, body);
+            return self.stage_grpc_agent_card_rewrite(ctx, response_status, response_headers, body);
         }
         if !response_headers
             .get("content-type")
@@ -1101,48 +1110,53 @@ impl Plugin for A2aGateway {
         _content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if !self.should_rewrite_grpc_agent_card(ctx) {
+        // Only a card this plugin ADMITTED in `on_response_body` is rewritten.
+        // Reading the staged state rather than re-deriving the decision keeps
+        // the two phases from ever disagreeing about whether the response is a
+        // proven-OK Agent Card — the transform hook is not handed the HTTP
+        // status the admission gate needs.
+        if !matches!(
+            ctx.a2a_gateway_grpc_card_rewrite,
+            Some(A2aGrpcCardRewriteState::Staged)
+        ) {
             return None;
         }
+        // Staging proved this is `Some`; a `None` here would leave the state
+        // `Staged` and fail closed below rather than forward internal URLs.
         let public_base = self.public_base_url(ctx)?;
-        if body.is_empty() {
-            return None;
-        }
-        if let Some(status) = header_value(response_headers, "grpc-status")
-            && status != "0"
-        {
-            return None;
-        }
+        // `0 = unlimited` is folded to the retained-response fallback here; a
+        // raw effective limit of 0 would make the sink refuse every write.
+        let ceiling = ctx.retained_response_body_ceiling();
         match rewrite_grpc_agent_card_frame(
             body,
             response_headers,
             &public_base,
             &self.endpoint.path,
             &self.endpoint.protocol_versions,
+            ceiling,
         ) {
-            Ok(None) => None,
-            Ok(Some(message)) => {
-                // Fold `0 = unlimited` to the retained-response fallback. A raw
-                // effective limit of 0 would make BoundedResponseBodySink refuse
-                // every non-empty write (prospective > ceiling).
-                let ceiling = ctx.retained_response_body_ceiling();
-                let mut sink =
-                    crate::proxy::response_buffer_budget::BoundedResponseBodySink::with_ceiling(
-                        ceiling,
-                    );
-                let Ok(msg_len) = u32::try_from(message.len()) else {
-                    ctx.a2a_gateway_agent_card_rewrite_error =
-                        Some("agent_card_grpc_frame_too_large");
-                    return None;
-                };
-                if !sink.push(&[0]) || !sink.push(&msg_len.to_be_bytes()) || !sink.push(&message) {
-                    ctx.mark_buffered_response_capacity_refusal_pending();
-                    return None;
-                }
-                sink.finish()
+            // No URL differs from the public one: the backend's original,
+            // still-signed frame is forwarded untouched.
+            Ok(None) => {
+                ctx.a2a_gateway_grpc_card_rewrite = Some(A2aGrpcCardRewriteState::Applied);
+                None
             }
-            Err(diagnostic) => {
-                ctx.a2a_gateway_agent_card_rewrite_error = Some(diagnostic);
+            Ok(Some(frame)) => {
+                ctx.a2a_gateway_grpc_card_rewrite = Some(A2aGrpcCardRewriteState::Applied);
+                Some(frame)
+            }
+            Err(AgentCardRewriteRefusal::Capacity) => {
+                // The shared retained-response terminal owns this outcome: it
+                // replaces the body with the health-neutral capacity refusal, so
+                // the un-rewritten card never reaches the client and this plugin
+                // must not additionally publish an `INTERNAL`.
+                ctx.a2a_gateway_grpc_card_rewrite = Some(A2aGrpcCardRewriteState::CapacityRefused);
+                ctx.mark_buffered_response_capacity_refusal_pending();
+                None
+            }
+            Err(AgentCardRewriteRefusal::Diagnostic(diagnostic)) => {
+                ctx.a2a_gateway_grpc_card_rewrite =
+                    Some(A2aGrpcCardRewriteState::Failed(diagnostic));
                 if self.observability.emit_metadata {
                     ctx.metadata
                         .insert("a2a.error".to_string(), diagnostic.to_string());
@@ -1164,16 +1178,45 @@ impl Plugin for A2aGateway {
         remove_header(response_headers, "grpc-encoding");
     }
 
+    /// Fail closed for any admitted gRPC Agent Card whose rewrite did not
+    /// actually reach the client.
+    ///
+    /// Two distinct residuals land here, and both must terminate the call rather
+    /// than let the backend's internal endpoint URLs and now-invalid signatures
+    /// be served:
+    ///
+    /// - `Failed` — the transform phase decoded further and refused.
+    /// - `Staged` — the transform phase never reported at all. That is only
+    ///   reachable if the producer window declined to invoke this plugin, but
+    ///   "the rewrite silently did not run" must not be indistinguishable from
+    ///   "no rewrite was needed", so it is a refusal too.
+    ///
+    /// A response the gateway has already replaced with its own terminal (the
+    /// retained-response capacity refusal, a deadline, an earlier rejection)
+    /// carries no card bytes and is left alone: it is no longer HTTP `200`, and
+    /// re-deciding it here would relabel a health-neutral `503` capacity
+    /// refusal as a gateway `INTERNAL`.
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         _response_headers: &HashMap<String, String>,
         _body: &[u8],
     ) -> PluginResult {
-        let Some(diagnostic) = ctx.a2a_gateway_agent_card_rewrite_error.take() else {
-            return PluginResult::Continue;
+        let diagnostic = match ctx.a2a_gateway_grpc_card_rewrite.take() {
+            None
+            | Some(A2aGrpcCardRewriteState::Applied)
+            | Some(A2aGrpcCardRewriteState::CapacityRefused) => return PluginResult::Continue,
+            Some(A2aGrpcCardRewriteState::Failed(diagnostic)) => diagnostic,
+            Some(A2aGrpcCardRewriteState::Staged) => "agent_card_grpc_rewrite_not_applied",
         };
+        if response_status != 200 {
+            return PluginResult::Continue;
+        }
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("a2a.error".to_string(), diagnostic.to_string());
+        }
         warn!(
             error = diagnostic,
             "Failing closed on gRPC Agent Card rewrite failure after transform"
@@ -1852,9 +1895,26 @@ fn should_rewrite_transport(transport: Option<&str>) -> bool {
     normalized == "jsonrpc"
 }
 
+/// Fail-closed terminal for a unary gRPC Agent Card the gateway admitted but
+/// could not safely rewrite.
+///
+/// The HTTP status is `200`, matching
+/// [`crate::plugins::grpc_deadline_exceeded_plugin_result`] and the rest of the
+/// gateway's gRPC terminals: a gRPC failure rides HTTP 200 plus a `grpc-status`
+/// trailer, and the normalizer collapses this to a Trailers-Only error with an
+/// empty body, so the refused card's bytes never reach the client. An HTTP `500`
+/// here would additionally publish a synthetic 5xx into transaction summaries
+/// and gateway metrics for what is a gateway-side policy refusal, not a backend
+/// fault. (Backend health, the circuit breaker, and adaptive concurrency are
+/// unaffected either way — they record the backend's own dispatch outcome before
+/// any response-body hook runs.)
+///
+/// `diagnostic` is always one of this module's fixed, low-cardinality string
+/// literals. No response byte, header value, or URL is ever reflected into
+/// `grpc-message` or `a2a.error`.
 fn grpc_agent_card_rewrite_failure(diagnostic: &'static str) -> PluginResult {
     PluginResult::Reject {
-        status_code: 500,
+        status_code: 200,
         body: String::new(),
         headers: HashMap::from([
             ("content-type".to_string(), "application/grpc".to_string()),
@@ -1864,68 +1924,266 @@ fn grpc_agent_card_rewrite_failure(diagnostic: &'static str) -> PluginResult {
     }
 }
 
-/// Validate that a unary gRPC Agent Card body is a supported, rewritable
-/// protobuf shape. Does not allocate a replacement frame; the transform phase
-/// performs the bounded rewrite.
+/// Positive proof that a buffered upstream response is a SUCCESSFUL unary gRPC
+/// reply, and therefore a candidate Agent Card at all.
 ///
-/// A card that does not carry an explicit A2A 0.3.x `protocol_version` is
-/// rejected with `unsupported_agent_card_protobuf_version` rather than
-/// forwarded — see [`supports_agent_card_protobuf_layout`].
+/// Two independent facts are required, and neither is inferred:
+///
+/// - HTTP `200`. The gRPC HTTP/2 mapping puts every gRPC outcome under 200, so
+///   any other status is a transport/gateway-level failure whose body is not a
+///   protobuf message.
+/// - A terminal `grpc-status` that is present and exactly `0`. On the buffered
+///   native-gRPC path plugins see a merged header+trailer view
+///   (`grpc_proxy::build_grpc_plugin_header_view`) in which the trailing value
+///   wins for the reserved terminal keys, so an upstream that streamed
+///   `HEADERS(200) + DATA + TRAILERS(grpc-status: 13)` is visible here as the
+///   failure it is. Requiring the field to be PRESENT is the load-bearing half:
+///   an absent terminal status is not an OK response — the client synthesizes
+///   `UNKNOWN` for it — and treating "no status" as success is exactly how a
+///   non-OK upstream reply gets mistaken for an Agent Card and then refused with
+///   a rewrite diagnostic that blames the gateway.
+///
+/// An unproven response is left completely alone: the plugin neither rewrites it
+/// nor fails it closed, so the upstream's own error reaches the client verbatim.
+fn grpc_response_is_proven_ok(
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
+) -> bool {
+    response_status == 200
+        && header_value(response_headers, "grpc-status").is_some_and(|status| status.trim() == "0")
+}
+
+/// A unary gRPC Agent Card frame that passed decode, schema validation, and the
+/// 0.3 layout gate. Borrows the backend's bytes; nothing is copied.
+struct AdmittedAgentCard<'a> {
+    /// The unframed protobuf message (the gRPC 5-byte prefix removed).
+    message: &'a [u8],
+    /// `AgentCard.preferred_transport` (field 14) when the card carries one.
+    preferred_transport: Option<&'a str>,
+}
+
+/// Why a staged gRPC Agent Card rewrite produced no client-visible bytes.
+///
+/// The two arms have different client-visible terminals and must never be
+/// conflated: a capacity refusal belongs to the shared retained-response
+/// terminal (`503` / `RESOURCE_EXHAUSTED`, health-neutral, gateway-local), while
+/// a fault is this plugin's own fail-closed gRPC `INTERNAL`.
+enum AgentCardRewriteRefusal {
+    /// Fixed, low-cardinality diagnostic. Never carries response content.
+    Diagnostic(&'static str),
+    /// The rewrite did not fit the per-response retained ceiling.
+    Capacity,
+}
+
+/// Decode, schema-validate, and version-gate a unary gRPC Agent Card body.
+///
+/// This is the single admission funnel: `on_response_body` calls it to decide
+/// whether to stage a rewrite, and the transform phase calls it again over the
+/// same bytes, so the two phases can never disagree about whether a card is
+/// rewritable. It allocates nothing — every returned string borrows `body`.
+///
+/// A card that does not carry an explicit A2A 0.3.x `protocol_version` naming a
+/// configured version is rejected with
+/// `unsupported_agent_card_protobuf_version` rather than forwarded — see
+/// [`supports_agent_card_protobuf_layout`].
+fn admit_grpc_agent_card_frame<'a>(
+    body: &'a [u8],
+    response_headers: &HashMap<String, String>,
+    configured_versions: &[String],
+) -> Result<AdmittedAgentCard<'a>, &'static str> {
+    let message = extract_uncompressed_unary_grpc_message(body, response_headers)?;
+    // Three ordered questions, because the diagnostic a client sees should name
+    // the FIRST thing that is actually wrong:
+    //
+    //   1. Does this decode as protobuf, and is it Agent-Card shaped at all?
+    //   2. Is its wire layout one this rewriter implements and the operator
+    //      configured? A renumbered A2A 1.0 card answers "no" here, and
+    //      `unsupported_agent_card_protobuf_version` is the accurate, documented
+    //      reason — not a complaint about a field 3 whose 0.3 meaning it never
+    //      claimed to have.
+    //   3. Only then: is the card well formed UNDER that layout?
+    let probe = probe_agent_card_layout(message)?;
+    if !probe.has_identity || !probe.has_endpoint {
+        return Err("agent_card_protobuf_shape_unrecognized");
+    }
+    if let Some(fault) = probe.version_fault {
+        return Err(fault);
+    }
+    let protocol_version = probe.protocol_version.unwrap_or("");
+    if !supports_agent_card_protobuf_layout(protocol_version, configured_versions) {
+        return Err("unsupported_agent_card_protobuf_version");
+    }
+    let schema = validate_agent_card_protobuf(message)?;
+    Ok(AdmittedAgentCard {
+        message,
+        preferred_transport: schema.preferred_transport,
+    })
+}
+
+/// Admission check for `on_response_body`: prove the card is rewritable without
+/// producing a single output byte. The transform phase performs the bounded
+/// rewrite.
 fn validate_grpc_agent_card_rewrite(
     body: &[u8],
     response_headers: &HashMap<String, String>,
     configured_versions: &[String],
 ) -> Result<(), &'static str> {
-    let message = extract_uncompressed_unary_grpc_message(body, response_headers)?;
-    if !looks_like_agent_card_protobuf(message) {
-        return Err("agent_card_protobuf_shape_unrecognized");
-    }
-    let protocol_version =
-        protobuf_string_field(message, AGENT_CARD_PB_PROTOCOL_VERSION)?.unwrap_or("");
-    if !supports_agent_card_protobuf_layout(protocol_version, configured_versions) {
-        return Err("unsupported_agent_card_protobuf_version");
-    }
-    Ok(())
+    admit_grpc_agent_card_frame(body, response_headers, configured_versions).map(|_| ())
 }
 
-/// Rewrite a unary gRPC Agent Card protobuf message for A2A 0.3.x layout.
+/// Rewrite a unary gRPC Agent Card frame straight into a ceiling-aware sink.
 ///
-/// Returns `Ok(None)` when the card needs no mutation, `Ok(Some(message))` when
-/// URLs changed (signatures cleared), and `Err(diagnostic)` for malformed or
-/// unsupported payloads that must fail closed. Callers frame the message through
-/// a retained-response sink.
+/// Returns `Ok(None)` when the card needs no mutation, `Ok(Some(frame))` with
+/// the complete re-framed response, and `Err(..)` for anything that must fail
+/// closed.
 ///
-/// "Unsupported" includes any card that does not prove the 0.3 layout: an
-/// absent/empty or non-0.3 `protocol_version` yields
-/// `unsupported_agent_card_protobuf_version`, and a URL field that is not an
-/// absolute http(s) URL yields `agent_card_protobuf_url_layout_mismatch`. The
-/// gateway never rewrites a layout it cannot identify.
+/// # Why this is two passes and not a builder
+///
+/// The retained-response contract forbids materialising a complete would-be
+/// replacement outside the reserved construction sink (`GHSA-pwcm-6rh8-f2gh`):
+/// a producer that assembles a finished `Vec` and then copies it through a
+/// bounded writer has already made the allocation the aggregate budget exists to
+/// bound. Protobuf makes that awkward, because a length-delimited record — the
+/// gRPC frame's 5-byte prefix, and every rewritten `additional_interfaces`
+/// submessage — declares its payload length BEFORE the payload.
+///
+/// So the same emission code runs twice over the same immutable input. Pass one
+/// writes into [`ProtobufLengthCounter`], which allocates nothing and only
+/// accumulates a byte count; that yields the exact frame length and whether any
+/// URL actually changes. Pass two writes those identical bytes, from the first
+/// byte, into [`BoundedResponseBodySink`], which refuses the write that would
+/// cross the ceiling instead of allocating for it. At no point does a second
+/// copy of the message, or of any interface submessage, exist.
+///
+/// Both passes are single, bounded, allocation-free walks of the input, so the
+/// CPU cost stays linear in the response size with a small constant factor.
+///
+/// "Fail closed" includes any card that does not prove the 0.3 layout: an
+/// absent/empty or non-configured `protocol_version` yields
+/// `unsupported_agent_card_protobuf_version`, a known field with the wrong wire
+/// type or a duplicated singular field yields
+/// `agent_card_protobuf_field_wire_mismatch` / `..._field_duplicated`, and a URL
+/// field that is not an absolute http(s) URL yields
+/// `agent_card_protobuf_url_layout_mismatch`. The gateway never rewrites a
+/// layout it cannot identify.
 fn rewrite_grpc_agent_card_frame(
     body: &[u8],
     response_headers: &HashMap<String, String>,
     public_base: &str,
     endpoint_path: &str,
     configured_versions: &[String],
-) -> Result<Option<Vec<u8>>, &'static str> {
-    let message = extract_uncompressed_unary_grpc_message(body, response_headers)?;
-    if !looks_like_agent_card_protobuf(message) {
-        return Err("agent_card_protobuf_shape_unrecognized");
-    }
-    let protocol_version =
-        protobuf_string_field(message, AGENT_CARD_PB_PROTOCOL_VERSION)?.unwrap_or("");
-    if !supports_agent_card_protobuf_layout(protocol_version, configured_versions) {
-        return Err("unsupported_agent_card_protobuf_version");
-    }
-    let Some(rewritten) = rewrite_agent_card_protobuf(message, public_base, endpoint_path)? else {
+    ceiling: usize,
+) -> Result<Option<Vec<u8>>, AgentCardRewriteRefusal> {
+    let card = admit_grpc_agent_card_frame(body, response_headers, configured_versions)
+        .map_err(AgentCardRewriteRefusal::Diagnostic)?;
+    // The one public URL every rewritten field reuses. Built once per response,
+    // never per field and never per interface.
+    let new_url = format!("{}{}", public_base.trim_end_matches('/'), endpoint_path);
+    // An explicitly-encoded empty `preferred_transport` is proto3's default and
+    // means "unset", which selects the JSON-RPC default just like an absent
+    // field. Only a present, non-empty, non-JSONRPC transport suppresses the
+    // `AgentCard.url` rewrite.
+    let rewrite_preferred =
+        should_rewrite_transport(card.preferred_transport.filter(|value| !value.is_empty()));
+
+    // Pass one: exact encoded length, and whether anything changes at all. A
+    // refused write here can only be the counter's own `usize` overflow, which
+    // means the rewritten card cannot be addressed at all.
+    let mut counter = ProtobufLengthCounter::default();
+    let mut changed = false;
+    emit_rewritten_agent_card(
+        card.message,
+        &new_url,
+        rewrite_preferred,
+        &mut counter,
+        &mut changed,
+    )
+    .map_err(|error| {
+        AgentCardRewriteRefusal::Diagnostic(if error == EMIT_REFUSED {
+            "agent_card_grpc_frame_too_large"
+        } else {
+            error
+        })
+    })?;
+    if !changed {
+        // Nothing to rewrite: the backend's original, still-signed bytes are
+        // forwarded untouched. `output` was never built, so there is nothing to
+        // discard.
         return Ok(None);
+    }
+    let Ok(message_len) = u32::try_from(counter.len) else {
+        return Err(AgentCardRewriteRefusal::Diagnostic(
+            "agent_card_grpc_frame_too_large",
+        ));
     };
-    Ok(Some(rewritten))
+
+    // Pass two: the same bytes, written from the first one into the sink.
+    // `0 = unlimited` was already folded to the retained-response fallback by
+    // `RequestContext::retained_response_body_ceiling`; a raw `0` here would make
+    // every non-empty write refuse.
+    let mut sink =
+        crate::proxy::response_buffer_budget::BoundedResponseBodySink::with_ceiling(ceiling);
+    if !sink.emit(&[0]) || !sink.emit(&message_len.to_be_bytes()) {
+        return Err(AgentCardRewriteRefusal::Capacity);
+    }
+    let mut emitted_changed = false;
+    emit_rewritten_agent_card(
+        card.message,
+        &new_url,
+        rewrite_preferred,
+        &mut sink,
+        &mut emitted_changed,
+    )
+    .map_err(|error| {
+        if error == EMIT_REFUSED {
+            AgentCardRewriteRefusal::Capacity
+        } else {
+            AgentCardRewriteRefusal::Diagnostic(error)
+        }
+    })?;
+    // The two passes run the same code over the same immutable bytes, so they
+    // cannot legitimately disagree. Verifying it anyway keeps a future edit that
+    // makes emission input-dependent from silently shipping a frame whose length
+    // prefix was measured under different decisions.
+    if emitted_changed != changed {
+        return Err(AgentCardRewriteRefusal::Diagnostic(
+            "agent_card_protobuf_rewrite_unstable",
+        ));
+    }
+    match sink.finish() {
+        // Compared by subtracting the 5-byte prefix off the published frame
+        // rather than adding it to the measured length, so the check itself
+        // cannot overflow `usize` on a 32-bit target.
+        Some(frame) if frame.len().checked_sub(5) == Some(counter.len) => Ok(Some(frame)),
+        // A published length that disagrees with the declared prefix would be a
+        // malformed gRPC frame, so it is refused rather than emitted.
+        Some(_) => Err(AgentCardRewriteRefusal::Diagnostic(
+            "agent_card_protobuf_rewrite_unstable",
+        )),
+        None => Err(AgentCardRewriteRefusal::Capacity),
+    }
 }
 
 /// Decide whether a decoded card may be rewritten with the 0.3.x field numbers.
 ///
-/// The gate is positive: rewriting requires affirmative evidence of the 0.3
-/// layout on the wire. An absent or empty `protocol_version` is NOT evidence.
+/// Two independent conditions, both required:
+///
+/// 1. **The wire version is one the operator configured.**
+///    `endpoint.protocol_versions` is documented as a list of exact A2A protocol
+///    version strings — there is no family, range, or wildcard syntax in the
+///    schema (`openapi.yaml`) or in `docs/plugins.md` — so the comparison is
+///    exact after trimming. Configuring `["0.3.0"]` therefore admits `0.3.0` and
+///    refuses `0.3.99`: a version the operator never listed is a backend the
+///    operator never vouched for, and its card layout is not this gateway's to
+///    guess. An empty list admits nothing (config validation already rejects
+///    one, so this is defense in depth rather than a reachable branch).
+/// 2. **That version maps to the wire layout this rewriter implements**, which
+///    is only the A2A 0.3 family. A configured `1.0.0` that a backend echoes
+///    back is an exact match under (1) and still refused here, because the
+///    rewriter's field numbers do not describe it.
+///
+/// The gate is also positive: rewriting requires affirmative evidence of the 0.3
+/// layout ON THE WIRE. An absent or empty `protocol_version` is NOT evidence.
 /// proto3 cannot distinguish "unset" from `""`, and every non-0.3 layout also
 /// lacks field 16 — A2A 1.0 removed `protocol_version` from `AgentCard`
 /// entirely — so an empty version is exactly the case where the gateway cannot
@@ -1941,10 +2199,9 @@ fn supports_agent_card_protobuf_layout(
         return false;
     }
     is_a2a_03_family(version)
-        && (configured_versions.is_empty()
-            || configured_versions
-                .iter()
-                .any(|configured| configured.trim() == version || is_a2a_03_family(configured)))
+        && configured_versions
+            .iter()
+            .any(|configured| configured.trim() == version)
 }
 
 fn is_a2a_03_family(version: &str) -> bool {
@@ -2007,146 +2264,429 @@ fn extract_uncompressed_unary_grpc_message<'a>(
     Ok(&body[5..])
 }
 
-fn looks_like_agent_card_protobuf(message: &[u8]) -> bool {
-    let mut has_identity = false;
-    let mut has_endpoint = false;
-    let Ok(()) = for_each_protobuf_field(message, |field, _wire, value| {
+// ---------------------------------------------------------------------------
+// Bounded protobuf emission
+// ---------------------------------------------------------------------------
+
+/// Maximum protobuf field number, `2^29 - 1`. A tag whose field number exceeds
+/// this is not valid protobuf, so it is refused rather than silently truncated
+/// into a `u32`.
+const PROTO_MAX_FIELD_NUMBER: u32 = (1 << 29) - 1;
+
+/// Sentinel error meaning "the output pass refused a write", as opposed to a
+/// decode or schema fault. It never reaches a client: callers translate it into
+/// the counting pass's `agent_card_grpc_frame_too_large` or the sink pass's
+/// capacity refusal.
+const EMIT_REFUSED: &str = "agent_card_protobuf_emit_refused";
+
+/// One output pass of the bounded protobuf rewriter.
+///
+/// The rewrite runs the SAME emission code against a counter and then against
+/// the response sink; see [`rewrite_grpc_agent_card_frame`] for why that is what
+/// keeps a length-prefixed message off the heap until the ceiling admits it.
+trait ProtobufEmitter {
+    /// Append `bytes`, or refuse. `false` is terminal for the pass.
+    fn emit(&mut self, bytes: &[u8]) -> bool;
+}
+
+/// The allocation-free pass. Accumulates the exact encoded length and nothing
+/// else; a `usize` overflow is refused rather than wrapped into an affordable
+/// length.
+#[derive(Default)]
+struct ProtobufLengthCounter {
+    len: usize,
+}
+
+impl ProtobufEmitter for ProtobufLengthCounter {
+    fn emit(&mut self, bytes: &[u8]) -> bool {
+        match self.len.checked_add(bytes.len()) {
+            Some(len) => {
+                self.len = len;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl ProtobufEmitter for crate::proxy::response_buffer_budget::BoundedResponseBodySink {
+    fn emit(&mut self, bytes: &[u8]) -> bool {
+        self.push(bytes)
+    }
+}
+
+/// Turn a refused write into the sentinel error so it propagates out of a
+/// [`for_each_protobuf_field`] visitor.
+fn emit_or_refuse(emitted: bool) -> Result<(), &'static str> {
+    if emitted {
+        Ok(())
+    } else {
+        Err(EMIT_REFUSED)
+    }
+}
+
+/// Base-128 varint. The scratch array is a fixed 10-byte STACK buffer — the
+/// maximum encoded width of a `u64` — so no heap allocation stands beside the
+/// sink.
+fn emit_varint<E: ProtobufEmitter>(out: &mut E, mut value: u64) -> bool {
+    let mut scratch = [0u8; 10];
+    let mut len = 0;
+    while value >= 0x80 {
+        scratch[len] = (value as u8) | 0x80;
+        len += 1;
+        value >>= 7;
+    }
+    scratch[len] = value as u8;
+    len += 1;
+    out.emit(&scratch[..len])
+}
+
+fn emit_protobuf_key<E: ProtobufEmitter>(out: &mut E, field: u32, wire: u8) -> bool {
+    emit_varint(out, u64::from(field) << 3 | u64::from(wire))
+}
+
+/// A complete length-delimited record whose payload is already in hand.
+fn emit_protobuf_len_field<E: ProtobufEmitter>(out: &mut E, field: u32, value: &[u8]) -> bool {
+    emit_protobuf_key(out, field, PROTO_WIRE_LEN)
+        && emit_varint(out, value.len() as u64)
+        && out.emit(value)
+}
+
+/// The tag and length prefix of a length-delimited record whose payload the
+/// caller writes next. `payload_len` comes from the counting pass, which is what
+/// removes the need to build the submessage first.
+fn emit_protobuf_len_header<E: ProtobufEmitter>(
+    out: &mut E,
+    field: u32,
+    payload_len: usize,
+) -> bool {
+    emit_protobuf_key(out, field, PROTO_WIRE_LEN) && emit_varint(out, payload_len as u64)
+}
+
+/// A field the rewriter does not touch, re-emitted with its original bytes.
+fn emit_protobuf_verbatim_field<E: ProtobufEmitter>(
+    out: &mut E,
+    field: u32,
+    wire: u8,
+    value: &[u8],
+) -> bool {
+    if wire == PROTO_WIRE_LEN {
+        emit_protobuf_len_field(out, field, value)
+    } else {
+        emit_protobuf_key(out, field, wire) && out.emit(value)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schema validation
+// ---------------------------------------------------------------------------
+
+/// What one bounded decode pass can say about a candidate card BEFORE its
+/// layout family is known.
+///
+/// Deliberately layout-agnostic except for `protocol_version`: field presence is
+/// judged by field NUMBER only, exactly as the pre-repair shape check did, so a
+/// renumbered A2A 1.0 card is still recognised as Agent-Card-shaped and refused
+/// with the version diagnostic rather than with a 0.3-specific field complaint.
+struct AgentCardLayoutProbe<'a> {
+    /// `AgentCard.protocol_version` (field 16), when it is a well-formed string.
+    protocol_version: Option<&'a str>,
+    /// A wire-type / duplication / UTF-8 fault on field 16 itself. Held rather
+    /// than raised so the "is this an Agent Card at all" verdict comes first.
+    version_fault: Option<&'static str>,
+    /// A `name` or `description` is present.
+    has_identity: bool,
+    /// A `url` or at least one `additional_interfaces` is present.
+    has_endpoint: bool,
+}
+
+/// One bounded decode pass answering "is this Agent-Card shaped, and what
+/// protocol version does it claim?".
+///
+/// Decode faults (truncation, invalid field number, unsupported wire type,
+/// varint overflow) propagate immediately: nothing about the message can be
+/// trusted once the framing is ambiguous.
+fn probe_agent_card_layout(message: &[u8]) -> Result<AgentCardLayoutProbe<'_>, &'static str> {
+    let mut probe = AgentCardLayoutProbe {
+        protocol_version: None,
+        version_fault: None,
+        has_identity: false,
+        has_endpoint: false,
+    };
+    let mut version_seen = false;
+    for_each_protobuf_field(message, |field, wire, value| {
         match field {
-            AGENT_CARD_PB_NAME | AGENT_CARD_PB_DESCRIPTION => has_identity = true,
-            AGENT_CARD_PB_URL | AGENT_CARD_PB_ADDITIONAL_INTERFACES => has_endpoint = true,
+            AGENT_CARD_PB_NAME | AGENT_CARD_PB_DESCRIPTION => probe.has_identity = true,
+            AGENT_CARD_PB_URL | AGENT_CARD_PB_ADDITIONAL_INTERFACES => probe.has_endpoint = true,
+            AGENT_CARD_PB_PROTOCOL_VERSION => {
+                if version_seen {
+                    probe.version_fault = Some("agent_card_protobuf_field_duplicated");
+                } else if wire != PROTO_WIRE_LEN {
+                    probe.version_fault = Some("agent_card_protobuf_field_wire_mismatch");
+                } else {
+                    match decode_protobuf_string(value) {
+                        Ok(version) => probe.protocol_version = Some(version),
+                        Err(fault) => probe.version_fault = Some(fault),
+                    }
+                }
+                version_seen = true;
+            }
             _ => {}
         }
-        let _ = value;
         Ok(())
-    }) else {
-        return false;
-    };
-    has_identity && has_endpoint
+    })?;
+    Ok(probe)
 }
 
-fn rewrite_agent_card_protobuf(
-    message: &[u8],
-    public_base: &str,
-    endpoint_path: &str,
-) -> Result<Option<Vec<u8>>, &'static str> {
-    let preferred_transport =
-        protobuf_string_field(message, AGENT_CARD_PB_PREFERRED_TRANSPORT)?.unwrap_or("");
-    let rewrite_preferred = should_rewrite_transport(if preferred_transport.is_empty() {
-        None
+/// The known A2A 0.3 `AgentCard` scalars the rewrite decision reads, each proven
+/// to appear at most once and with the wire type the 0.3 schema declares.
+///
+/// `protocol_version` is not carried here: the layout gate already read it from
+/// [`AgentCardLayoutProbe`], and one authoritative reader is what keeps the gate
+/// and the rewriter from disagreeing about which version admitted the card.
+struct AgentCardSchema<'a> {
+    preferred_transport: Option<&'a str>,
+}
+
+/// The known A2A 0.3 `AgentInterface` scalars, under the same proof.
+struct AgentInterfaceSchema<'a> {
+    url: Option<&'a str>,
+    transport: Option<&'a str>,
+}
+
+fn expect_len_wire(wire: u8) -> Result<(), &'static str> {
+    if wire == PROTO_WIRE_LEN {
+        Ok(())
     } else {
-        Some(preferred_transport)
-    });
-    let new_url = format!("{}{}", public_base.trim_end_matches('/'), endpoint_path);
-    let mut output = Vec::with_capacity(message.len());
-    let mut changed = false;
+        Err("agent_card_protobuf_field_wire_mismatch")
+    }
+}
+
+/// Claim a singular field, refusing a second occurrence.
+fn claim_singular_field(seen: &mut bool) -> Result<(), &'static str> {
+    if *seen {
+        return Err("agent_card_protobuf_field_duplicated");
+    }
+    *seen = true;
+    Ok(())
+}
+
+fn decode_protobuf_string(value: &[u8]) -> Result<&str, &'static str> {
+    std::str::from_utf8(value).map_err(|_| "agent_card_protobuf_string_invalid")
+}
+
+/// Prove `message` is a schema-valid A2A 0.3 `AgentCard` before any field is
+/// rewritten.
+///
+/// Validation covers EVERY known field the 0.3 layout gate and the rewriter rely
+/// on, not merely the ones whose values are read. A known field carrying an
+/// unexpected wire type — `url` as a varint, `additional_interfaces` as a fixed32
+/// — would otherwise fall through the rewriter's catch-all arm and be PRESERVED
+/// verbatim while its siblings were rewritten and the signature block was
+/// dropped, publishing a half-rewritten card under no signature at all. A
+/// singular field that appears twice is ambiguous for the same reason: proto3
+/// last-wins semantics would let a backend hide the URL that actually gets
+/// served behind a decoy earlier in the message. Both fail closed.
+///
+/// Unknown fields with any valid wire type are untouched and preserved, so a
+/// newer 0.3.x point release that adds a scalar still round-trips.
+///
+/// The identity/endpoint requirement (a `name` or `description`, plus a `url` or
+/// at least one `additional_interfaces`) is what distinguishes an Agent Card
+/// from an arbitrary protobuf message that happens to decode.
+fn validate_agent_card_protobuf(message: &[u8]) -> Result<AgentCardSchema<'_>, &'static str> {
+    let mut preferred_transport = None;
+    let mut name_seen = false;
+    let mut description_seen = false;
+    let mut url_seen = false;
+    let mut transport_seen = false;
+    let mut version_seen = false;
+    let mut has_endpoint = false;
     for_each_protobuf_field(message, |field, wire, value| {
-        match (field, wire) {
-            (AGENT_CARD_PB_SIGNATURES, _) => {
-                // Omit signatures from the rebuilt card. If no URL actually
-                // changes, the `changed == false` path discards `output` and
-                // the original signed body is preserved.
+        match field {
+            AGENT_CARD_PB_NAME => {
+                claim_singular_field(&mut name_seen)?;
+                expect_len_wire(wire)?;
+            }
+            AGENT_CARD_PB_DESCRIPTION => {
+                claim_singular_field(&mut description_seen)?;
+                expect_len_wire(wire)?;
+            }
+            AGENT_CARD_PB_URL => {
+                claim_singular_field(&mut url_seen)?;
+                expect_len_wire(wire)?;
+                // Validated even when `preferred_transport` means this field is
+                // not rewritten: field 3 holding something that is not an
+                // absolute http(s) URL is evidence the layout is not 0.3 at all,
+                // which disqualifies the whole card, not just this field.
+                decode_rewritable_url_field(value)?;
+                has_endpoint = true;
+            }
+            AGENT_CARD_PB_PREFERRED_TRANSPORT => {
+                claim_singular_field(&mut transport_seen)?;
+                expect_len_wire(wire)?;
+                preferred_transport = Some(decode_protobuf_string(value)?);
+            }
+            AGENT_CARD_PB_ADDITIONAL_INTERFACES => {
+                expect_len_wire(wire)?;
+                validate_agent_interface_protobuf(value)?;
+                has_endpoint = true;
+            }
+            AGENT_CARD_PB_PROTOCOL_VERSION => {
+                claim_singular_field(&mut version_seen)?;
+                expect_len_wire(wire)?;
+                decode_protobuf_string(value)?;
+            }
+            AGENT_CARD_PB_SIGNATURES => expect_len_wire(wire)?,
+            _ => {}
+        }
+        Ok(())
+    })?;
+    if !(name_seen || description_seen) || !has_endpoint {
+        return Err("agent_card_protobuf_shape_unrecognized");
+    }
+    Ok(AgentCardSchema { preferred_transport })
+}
+
+/// The `AgentInterface` counterpart of [`validate_agent_card_protobuf`].
+fn validate_agent_interface_protobuf(
+    message: &[u8],
+) -> Result<AgentInterfaceSchema<'_>, &'static str> {
+    let mut url = None;
+    let mut transport = None;
+    let mut url_seen = false;
+    let mut transport_seen = false;
+    for_each_protobuf_field(message, |field, wire, value| {
+        match field {
+            AGENT_INTERFACE_PB_URL => {
+                claim_singular_field(&mut url_seen)?;
+                expect_len_wire(wire)?;
+                url = Some(decode_rewritable_url_field(value)?);
+            }
+            AGENT_INTERFACE_PB_TRANSPORT => {
+                claim_singular_field(&mut transport_seen)?;
+                expect_len_wire(wire)?;
+                transport = Some(decode_protobuf_string(value)?);
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok(AgentInterfaceSchema { url, transport })
+}
+
+/// Whether this advertised interface is the JSON-RPC endpoint the gateway
+/// fronts, and is not already pointing at the public URL.
+fn agent_interface_needs_rewrite(schema: &AgentInterfaceSchema<'_>, new_url: &str) -> bool {
+    should_rewrite_transport(schema.transport.filter(|value| !value.is_empty()))
+        && schema.url.is_some_and(|url| url != new_url)
+}
+
+// ---------------------------------------------------------------------------
+// Rewrite emission
+// ---------------------------------------------------------------------------
+
+/// Emit the rewritten `AgentCard` body into `out`, recording in `changed`
+/// whether any URL actually differs from the public one.
+///
+/// Runs identically into the counting pass and into the response sink. The card
+/// has already been schema-validated, so the arms below can rely on the wire
+/// types they name instead of re-checking them and falling through on mismatch.
+fn emit_rewritten_agent_card<E: ProtobufEmitter>(
+    message: &[u8],
+    new_url: &str,
+    rewrite_preferred: bool,
+    out: &mut E,
+    changed: &mut bool,
+) -> Result<(), &'static str> {
+    for_each_protobuf_field(message, |field, wire, value| {
+        match field {
+            AGENT_CARD_PB_SIGNATURES => {
+                // Omitted from the rebuilt card: every rewritten field
+                // invalidates the signatures over it. When nothing changes the
+                // caller discards this pass entirely and forwards the backend's
+                // original, still-signed bytes.
                 Ok(())
             }
-            (AGENT_CARD_PB_URL, PROTO_WIRE_LEN) if rewrite_preferred => {
+            AGENT_CARD_PB_URL if rewrite_preferred => {
                 let current = decode_rewritable_url_field(value)?;
-                if current != new_url {
-                    encode_protobuf_string_field(&mut output, AGENT_CARD_PB_URL, &new_url);
-                    changed = true;
+                if current == new_url {
+                    emit_or_refuse(emit_protobuf_len_field(out, field, value))
                 } else {
-                    encode_protobuf_len_field(&mut output, field, value);
+                    *changed = true;
+                    emit_or_refuse(emit_protobuf_len_field(
+                        out,
+                        AGENT_CARD_PB_URL,
+                        new_url.as_bytes(),
+                    ))
                 }
-                Ok(())
             }
-            (AGENT_CARD_PB_ADDITIONAL_INTERFACES, PROTO_WIRE_LEN) => {
-                match rewrite_agent_interface_protobuf(value, public_base, endpoint_path)? {
-                    Some(rewritten) => {
-                        encode_protobuf_len_field(
-                            &mut output,
-                            AGENT_CARD_PB_ADDITIONAL_INTERFACES,
-                            &rewritten,
-                        );
-                        changed = true;
-                    }
-                    None => encode_protobuf_len_field(&mut output, field, value),
+            AGENT_CARD_PB_ADDITIONAL_INTERFACES => {
+                let schema = validate_agent_interface_protobuf(value)?;
+                if !agent_interface_needs_rewrite(&schema, new_url) {
+                    return emit_or_refuse(emit_protobuf_len_field(out, field, value));
                 }
-                Ok(())
+                *changed = true;
+                // The submessage's own length prefix comes from a counting pass
+                // over the same emission code, so the rewritten interface is
+                // never built as a separate `Vec` beside the sink.
+                let mut counter = ProtobufLengthCounter::default();
+                emit_rewritten_agent_interface(value, new_url, &mut counter)?;
+                emit_or_refuse(emit_protobuf_len_header(out, field, counter.len))?;
+                emit_rewritten_agent_interface(value, new_url, out)
             }
-            _ => {
-                encode_protobuf_key_value(&mut output, field, wire, value);
-                Ok(())
-            }
+            _ => emit_or_refuse(emit_protobuf_verbatim_field(out, field, wire, value)),
         }
-    })?;
-    if !changed {
-        return Ok(None);
-    }
-    Ok(Some(output))
+    })
 }
 
-fn rewrite_agent_interface_protobuf(
+/// Emit one rewritten `AgentInterface` submessage body (no length prefix).
+/// Only called for an interface [`agent_interface_needs_rewrite`] selected.
+fn emit_rewritten_agent_interface<E: ProtobufEmitter>(
     message: &[u8],
-    public_base: &str,
-    endpoint_path: &str,
-) -> Result<Option<Vec<u8>>, &'static str> {
-    let transport = protobuf_string_field(message, AGENT_INTERFACE_PB_TRANSPORT)?.unwrap_or("");
-    if !should_rewrite_transport(if transport.is_empty() {
-        None
-    } else {
-        Some(transport)
-    }) {
-        return Ok(None);
-    }
-    let new_url = format!("{}{}", public_base.trim_end_matches('/'), endpoint_path);
-    let mut output = Vec::with_capacity(message.len().saturating_add(new_url.len()));
-    let mut changed = false;
+    new_url: &str,
+    out: &mut E,
+) -> Result<(), &'static str> {
     for_each_protobuf_field(message, |field, wire, value| {
-        if field == AGENT_INTERFACE_PB_URL && wire == PROTO_WIRE_LEN {
-            let current = decode_rewritable_url_field(value)?;
-            if current != new_url {
-                encode_protobuf_string_field(&mut output, AGENT_INTERFACE_PB_URL, &new_url);
-                changed = true;
-            } else {
-                encode_protobuf_len_field(&mut output, field, value);
-            }
+        if field == AGENT_INTERFACE_PB_URL {
+            emit_or_refuse(emit_protobuf_len_field(
+                out,
+                AGENT_INTERFACE_PB_URL,
+                new_url.as_bytes(),
+            ))
         } else {
-            encode_protobuf_key_value(&mut output, field, wire, value);
+            emit_or_refuse(emit_protobuf_verbatim_field(out, field, wire, value))
         }
-        Ok(())
-    })?;
-    Ok(changed.then_some(output))
+    })
 }
 
-fn protobuf_string_field(message: &[u8], target: u32) -> Result<Option<&str>, &'static str> {
-    let mut found = None;
-    for_each_protobuf_field(message, |field, wire, value| {
-        if field == target {
-            if wire != PROTO_WIRE_LEN {
-                return Err("agent_card_protobuf_field_wire_mismatch");
-            }
-            found =
-                Some(std::str::from_utf8(value).map_err(|_| "agent_card_protobuf_string_invalid")?);
-        }
-        Ok(())
-    })?;
-    Ok(found)
-}
+// ---------------------------------------------------------------------------
+// Decoding
+// ---------------------------------------------------------------------------
 
 /// Visit each top-level protobuf field of `message`.
 ///
 /// The visitor receives `&'a [u8]` — the SAME lifetime as `message` — rather
 /// than a higher-ranked `&[u8]`. Every value handed to the visitor is a
 /// subslice of `message` (`split_at` / `&start[..consumed]`), so this is sound,
-/// and it lets a caller such as [`protobuf_string_field`] hoist a borrowed
-/// field value out of the closure instead of copying it.
+/// and it lets a caller such as [`validate_agent_card_protobuf`] hoist a
+/// borrowed field value out of the closure instead of copying it.
+///
+/// Tags are validated before dispatch: a field number of `0` or above
+/// [`PROTO_MAX_FIELD_NUMBER`] is not representable protobuf and is refused
+/// rather than truncated into a `u32`, and the group wire types (`3`/`4`) are
+/// refused outright rather than being resynchronized against.
 fn for_each_protobuf_field<'a>(
     mut message: &'a [u8],
     mut visit: impl FnMut(u32, u8, &'a [u8]) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
     while !message.is_empty() {
         let key = decode_varint(&mut message)?;
-        let field = (key >> 3) as u32;
         let wire = (key & 0x07) as u8;
-        if field == 0 {
+        let Ok(field) = u32::try_from(key >> 3) else {
+            return Err("agent_card_protobuf_field_invalid");
+        };
+        if field == 0 || field > PROTO_MAX_FIELD_NUMBER {
             return Err("agent_card_protobuf_field_invalid");
         }
         let value = match wire {
@@ -2165,7 +2705,13 @@ fn for_each_protobuf_field<'a>(
                 value
             }
             PROTO_WIRE_LEN => {
-                let len = decode_varint(&mut message)? as usize;
+                // Checked, not `as usize`: on a 32-bit target an unchecked cast
+                // truncates a 64-bit length into a small one that then passes
+                // the bounds check below and silently reinterprets the
+                // remainder of the message.
+                let Ok(len) = usize::try_from(decode_varint(&mut message)?) else {
+                    return Err("agent_card_protobuf_length_invalid");
+                };
                 if message.len() < len {
                     return Err("agent_card_protobuf_truncated");
                 }
@@ -2188,6 +2734,19 @@ fn for_each_protobuf_field<'a>(
     Ok(())
 }
 
+/// Strict base-128 varint decode.
+///
+/// Three refusals a permissive decoder gets wrong, all of which let one byte
+/// sequence mean two different things to the gateway and the backend:
+///
+/// - **Overflow.** A ten-byte varint's final byte contributes bits 63..69, so
+///   only `0x00` and `0x01` are representable. A larger final byte is refused
+///   rather than having its high bits truncated by the shift.
+/// - **Over-long encoding.** More than ten bytes never terminates a `u64`.
+/// - **Non-canonical padding.** A continuation chain that ends in a zero
+///   group (`0x81 0x00` for `1`) encodes a value that already fit in fewer
+///   bytes. Every conforming encoder emits the minimal form, so the redundant
+///   form is refused instead of being accepted as an alias.
 fn decode_varint(buf: &mut &[u8]) -> Result<u64, &'static str> {
     let mut result = 0u64;
     for shift in (0..64).step_by(7) {
@@ -2195,42 +2754,20 @@ fn decode_varint(buf: &mut &[u8]) -> Result<u64, &'static str> {
             return Err("agent_card_protobuf_truncated");
         };
         *buf = rest;
+        if shift == 63 && byte > 0x01 {
+            // Bits above 63 have nowhere to go; `<< 63` would drop them.
+            return Err("agent_card_protobuf_varint_overflow");
+        }
         result |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
+            if shift > 0 && byte == 0 {
+                return Err("agent_card_protobuf_varint_noncanonical");
+            }
             return Ok(result);
         }
     }
     Err("agent_card_protobuf_varint_overflow")
 }
-
-fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
-    while value >= 0x80 {
-        out.push((value as u8) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
-fn encode_protobuf_key_value(out: &mut Vec<u8>, field: u32, wire: u8, value: &[u8]) {
-    match wire {
-        PROTO_WIRE_LEN => encode_protobuf_len_field(out, field, value),
-        _ => {
-            encode_varint(u64::from(field) << 3 | u64::from(wire), out);
-            out.extend_from_slice(value);
-        }
-    }
-}
-
-fn encode_protobuf_len_field(out: &mut Vec<u8>, field: u32, value: &[u8]) {
-    encode_varint(u64::from(field) << 3 | u64::from(PROTO_WIRE_LEN), out);
-    encode_varint(value.len() as u64, out);
-    out.extend_from_slice(value);
-}
-
-fn encode_protobuf_string_field(out: &mut Vec<u8>, field: u32, value: &str) {
-    encode_protobuf_len_field(out, field, value.as_bytes());
-}
-
 fn rewrite_url_value(value: &mut Value, public_base: &str, path: &str) -> bool {
     if !value.is_string() {
         return false;

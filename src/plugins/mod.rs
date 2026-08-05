@@ -1992,6 +1992,32 @@ impl BoundedResponseBodyConstruction {
     }
 }
 
+/// Lifecycle of a unary gRPC Agent Card rewrite `a2a_gateway` claimed on the
+/// response path (issue #3297).
+///
+/// The point of a typed state rather than a bare error slot is that "the
+/// transform reported success", "the transform refused", and "the transform
+/// never ran" are three different facts, and only the first may publish the
+/// backend's frame. `on_response_body` admits a card by setting `Staged`; the
+/// transform phase must replace it; `on_final_response_body` refuses anything
+/// still `Staged`.
+///
+/// Kept private to the crate and out of metadata: a plugin-writable marker could
+/// otherwise suppress the fail-closed terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum A2aGrpcCardRewriteState {
+    /// Admitted in `on_response_body`; the transform phase has not reported.
+    Staged,
+    /// The transform phase completed — the frame was rewritten, or provably
+    /// needed no rewrite.
+    Applied,
+    /// The transform phase refused with this fixed diagnostic.
+    Failed(&'static str),
+    /// The rewrite did not fit the per-response retained ceiling. The shared
+    /// capacity terminal owns the client-visible outcome.
+    CapacityRefused,
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -2622,10 +2648,11 @@ pub struct RequestContext {
     pub(crate) a2a_gateway_binding: Option<&'static str>,
     pub(crate) a2a_gateway_is_agent_card: bool,
     pub(crate) a2a_gateway_streaming: bool,
-    /// Fixed diagnostic when unary gRPC Agent Card rewriting fails during the
-    /// transform phase after request-path validation. Consumed by
-    /// `on_final_response_body` to fail closed without reflecting body bytes.
-    pub(crate) a2a_gateway_agent_card_rewrite_error: Option<&'static str>,
+    /// Lifecycle of a unary gRPC Agent Card rewrite `a2a_gateway` admitted in
+    /// `on_response_body`. Consumed by `on_final_response_body`, which fails
+    /// closed unless the transform phase reported a completed outcome — see
+    /// [`A2aGrpcCardRewriteState`].
+    pub(crate) a2a_gateway_grpc_card_rewrite: Option<A2aGrpcCardRewriteState>,
     /// Exact upstream/public resource URI pair used to route an MCP
     /// `resources/read` request. Kept out of public metadata so upstream URI
     /// details cannot enter transaction logs, while the response hook can
@@ -3134,7 +3161,7 @@ impl RequestContext {
             a2a_gateway_binding: None,
             a2a_gateway_is_agent_card: false,
             a2a_gateway_streaming: false,
-            a2a_gateway_agent_card_rewrite_error: None,
+            a2a_gateway_grpc_card_rewrite: None,
             mcp_response_resource_binding: None,
             mcp_trusted_tool_name_rewrite: None,
             mcp_validate_tool_result: None,
@@ -4243,7 +4270,7 @@ impl RequestContext {
             a2a_gateway_binding: self.a2a_gateway_binding,
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
             a2a_gateway_streaming: self.a2a_gateway_streaming,
-            a2a_gateway_agent_card_rewrite_error: None,
+            a2a_gateway_grpc_card_rewrite: None,
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
             mcp_validate_tool_result: self.mcp_validate_tool_result.clone(),
