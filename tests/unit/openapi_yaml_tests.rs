@@ -2734,7 +2734,7 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
         .expect("missing streaming block");
     assert_eq!(streaming["additionalProperties"], false);
     assert_eq!(streaming["properties"]["enabled"]["default"], false);
-    let (default_event_bytes, min_event_bytes, max_event_bytes) =
+    let (default_event_bytes, min_event_bytes, max_event_bytes, max_read_timeout_seconds) =
         ferrum_edge::plugins::ai_federation::test_helpers::streaming_bounds_for_test();
     assert_eq!(
         streaming["properties"]["max_event_bytes"]["default"],
@@ -2748,6 +2748,33 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
         streaming["properties"]["max_event_bytes"]["maximum"],
         max_event_bytes
     );
+    // The streaming-only whole-exchange override is published with the same
+    // bounds the runtime enforces, and `0` (unbounded) is representable.
+    assert_eq!(
+        streaming["properties"]["read_timeout_seconds"]["minimum"],
+        0
+    );
+    assert_eq!(
+        streaming["properties"]["read_timeout_seconds"]["maximum"],
+        max_read_timeout_seconds
+    );
+    // The published streaming key set must equal the runtime allowlist exactly,
+    // so a schema-only key can never be accepted by the spec and rejected at
+    // load (and vice versa).
+    let mut published_streaming_keys: Vec<String> = streaming["properties"]
+        .as_mapping()
+        .expect("streaming properties must be a mapping")
+        .keys()
+        .map(|key| key.as_str().unwrap_or_default().to_string())
+        .collect();
+    published_streaming_keys.sort();
+    let mut runtime_streaming_keys: Vec<String> =
+        ferrum_edge::plugins::ai_federation::test_helpers::streaming_config_keys_for_test()
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect();
+    runtime_streaming_keys.sort();
+    assert_eq!(published_streaming_keys, runtime_streaming_keys);
 
     let valid = json!({
         "providers": [{

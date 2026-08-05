@@ -638,6 +638,124 @@ async fn test_ai_federation_truncated_provider_stream_fails_closed_without_splic
     backend_task.abort();
 }
 
+/// A client that disconnects mid-generation cancels the claimed stream, and the
+/// gateway keeps serving: the next streaming request gets its OWN provider
+/// exchange and completes normally. Live coverage for the cancellation branch of
+/// the streaming lifecycle reservation.
+#[ignore]
+#[tokio::test]
+async fn test_ai_federation_client_disconnect_cancels_without_wedging_the_route() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_hits = Arc::new(AtomicUsize::new(0));
+    let backend_task = tokio::spawn(start_counted_json_server_on(
+        backend_listener,
+        200,
+        r#"{"backend":true}"#,
+        b"POST /",
+        Arc::clone(&backend_hits),
+    ));
+
+    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_port = provider_listener.local_addr().unwrap().port();
+    let provider_hits = Arc::new(AtomicUsize::new(0));
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    // Only the FIRST provider connection waits for the release; every later one
+    // writes head and tail immediately.
+    let provider_task = tokio::spawn(start_sse_provider_on(
+        provider_listener,
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"He\"}}]}\n\n",
+        "data: [DONE]\n\n",
+        Arc::clone(&provider_hits),
+        release_rx,
+    ));
+
+    let gateway = TestGateway::builder()
+        .mode_file(federation_streaming_config(
+            provider_port,
+            backend_port,
+            "/v1/chat/completions",
+        ))
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("start federation cancellation gateway");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .expect("build streaming client");
+    let streaming_request = serde_json::to_vec(&serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": true
+    }))
+    .expect("serialize streaming request");
+
+    let mut response = client
+        .post(gateway.proxy_url("/federation-streaming/chat"))
+        .header("content-type", "application/json")
+        .body(streaming_request.clone())
+        .send()
+        .await
+        .expect("send streaming request");
+    assert_eq!(response.status().as_u16(), 200);
+
+    // Take exactly the first event, then abandon the response: this is a client
+    // disconnect in the middle of a committed generation.
+    let first = response
+        .chunk()
+        .await
+        .expect("read first chunk")
+        .expect("the first event must arrive before the provider completes");
+    let first_text = String::from_utf8_lossy(&first).to_string();
+    assert!(
+        first_text.contains("\"content\":\"He\""),
+        "first client-visible bytes: {first_text}"
+    );
+    assert!(!first_text.contains("[DONE]"), "{first_text}");
+    drop(response);
+    // Let the abandoned provider exchange finish writing into a gone client.
+    release_tx.send(()).expect("release the abandoned stream");
+
+    // The route is not wedged: a fresh stream gets its OWN provider exchange and
+    // completes with exactly one terminal marker.
+    let mut response = client
+        .post(gateway.proxy_url("/federation-streaming/chat"))
+        .header("content-type", "application/json")
+        .body(streaming_request)
+        .send()
+        .await
+        .expect("send follow-up streaming request");
+    assert_eq!(response.status().as_u16(), 200);
+    let mut received = Vec::new();
+    while let Some(chunk) = response.chunk().await.expect("read stream chunk") {
+        received.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8(received).expect("stream is UTF-8");
+    assert!(
+        text.contains("\"content\":\"He\""),
+        "follow-up stream content: {text}"
+    );
+    assert_eq!(
+        text.matches("[DONE]").count(),
+        1,
+        "follow-up stream must complete exactly once: {text}"
+    );
+    assert!(!text.contains("event: error"), "clean follow-up: {text}");
+    assert!(!text.contains("test-key"), "credential leaked: {text}");
+
+    assert_eq!(
+        provider_hits.load(Ordering::Relaxed),
+        2,
+        "the follow-up stream must be its own provider exchange"
+    );
+    assert_eq!(backend_hits.load(Ordering::Relaxed), 0);
+
+    provider_task.abort();
+    backend_task.abort();
+}
+
 // ============================================================================
 // ai_prompt_shield tests
 // ============================================================================

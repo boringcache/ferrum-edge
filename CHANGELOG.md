@@ -28,16 +28,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `google_gemini`, `google_vertex`, `aws_bedrock`, `cohere`, and any AWS
   SigV4 / Google OAuth2 provider fail closed with a field-specific `501` and
   belong to `ai_stream_router`. A claimed stream retains exactly one partial SSE
-  event (`streaming.max_event_bytes`, 4 KiB–1 MiB, default 256 KiB); oversized
-  events, data after the terminal marker, a duplicated terminal marker, a
+  event (`streaming.max_event_bytes`, 4 KiB–1 MiB, default 256 KiB), and the
+  ceiling is enforced on every complete AND partial event before any of its
+  bytes are retained or released, so retained state grows with neither stream
+  length nor transport chunk size. Terminal detection follows the SSE field
+  grammar — an event is terminal only when the CONCATENATION of its `data` lines
+  is exactly `[DONE]`, and `CR`/`LF`/`CRLF` plus their legal mixed blank-line
+  forms are all recognized — so `data: [DONE]\ndata: …` is ordinary data and
+  cannot pass as completion. Oversized events, data after the terminal marker, a
+  duplicated terminal marker, a non-UTF-8 or otherwise undecidable event, a
   truncated stream, a content-coded stream, and a non-`text/event-stream` 2xx
   all fail closed with fixed-cardinality reasons that never echo a provider
-  byte, header, model, or URL. The claim mints the same private provider claim
+  byte, header, model, or URL. A claimed stream is accounted like a buffered
+  call: it holds one non-queuing `max_concurrent_requests` permit and one real
+  `ProviderCircuit` admission (so a half-open circuit still grants exactly one
+  concurrent probe) in a clone-safe reservation that is released exactly once on
+  completion, client disconnect, downstream policy cut, backend error,
+  pre-header cancellation, or a fail-closed final-body rejection; a 2xx is
+  scored a circuit success only after a valid terminal marker. `model_mapping` /
+  `default_model` apply to streams through an owner-scoped request transform
+  that rewrites the provider-visible top-level `model` and re-asserts
+  `stream: true` (a body with duplicate JSON members is deliberately left
+  unrewritten and still fails closed). The committed provider's
+  `connect_timeout_seconds` / `read_timeout_seconds` become the streaming
+  route's dispatch budgets instead of the matched proxy's; on this path
+  `read_timeout_seconds` is a WHOLE-EXCHANGE bound (connect through last body
+  byte), and the new `streaming.read_timeout_seconds` (0–86400, `0` =
+  unbounded) overrides it for streams only. Provider response headers are
+  reduced to the bounded safe allowlist the buffered path already publishes,
+  plus a gateway-authored `Content-Type: text/event-stream` and
+  `Cache-Control: no-cache`; provider cookies, redirects, auth
+  challenges, validators/digests, and unknown metadata never reach the client.
+  The claim mints the same private provider claim
   `ai_stream_router` uses, so `request_mirror`, `serverless_function`,
   `mcp_gateway`, and `mesh_route_dispatch` stand down identically, and
   `enforce_final_backend_header_policy` plus `on_final_request_body_with_context`
-  re-assert the credential, destination, and committed model over the finalized
-  backend-visible request (GHSA-xhp5-hqj8-3mwg).
+  re-assert the credential, destination, committed model, and committed dispatch
+  budgets over the finalized backend-visible request (GHSA-xhp5-hqj8-3mwg).
+- New non-rejecting `origin response-header boundary` plugin phase, run once per
+  response at the top of `run_after_proxy_hooks` (the shared funnel for H1/H2,
+  native gRPC, gRPC-Web, and both H3 paths) before any `after_proxy` hook.
+  A plugin that routed a request to a third-party destination opts in with
+  `enforces_origin_response_header_policy` and bounds what that destination
+  contributed in `enforce_origin_response_header_policy`, without discarding the
+  gateway decorations later hooks add. `ai_federation`'s streaming path is the
+  only owner today.
+- New `RequestContext.route_override_backend_connect_timeout_ms`, the connect
+  counterpart to the existing read-timeout route override, so a plugin that
+  repoints a request at a direct third-party destination can apply that
+  destination's own connect budget instead of silently inheriting the matched
+  proxy's.
 - NodeWaypoint captured TCP observability now exports the bounded-cardinality
   `ferrum_mesh_bpf_accept_to_first_byte_microseconds` histogram for IPv4 and
   IPv6. SOCK_OPS timestamps passive establishment and enrolls the exact accepted
@@ -409,9 +449,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `streaming_enabled`, and `enable_streaming` are still rejected at every scope,
   and a per-provider `streaming` key is rejected with a scope-specific
   diagnostic. Enabling `streaming` makes the plugin declare a backend-boundary
-  header policy plus request header/destination mutation, so such an instance can
+  header policy plus request header/destination mutation AND a request-body
+  transform (the provider-visible `model` rewrite), so such an instance can
   no longer be composed with `request_deduplication` or `response_caching` on the
-  same proxy; instances without the block are unaffected.
+  same proxy; instances without the block are unaffected. The `streaming` block
+  accepts `enabled`, `max_event_bytes`, and `read_timeout_seconds` and rejects
+  every other key.
 - Reqwest backend TLS clients built via `use_preconfigured_tls` /
   `BackendTlsConfigBuilder::build_rustls_for_reqwest` now advertise ALPN
   `[h2, http/1.1]` unless the proxy forces HTTP/1.1 (`h2UpgradePolicy:

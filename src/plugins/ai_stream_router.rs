@@ -215,6 +215,7 @@ use chrono::Utc;
 use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 use url::{Host, Url};
@@ -580,6 +581,30 @@ pub(crate) struct AiStreamRouterClaim {
     /// The exact backend-visible query the dispatch layer may append. Empty
     /// when the committed `path` already carries every pair.
     committed_query: String,
+    /// Exactly the `route_override_backend_connect_timeout_ms` this claim
+    /// committed, so the dispatch policy the credential was approved under is
+    /// part of the destination witness. `None` for a claim that inherits the
+    /// matched proxy's connect budget (every `ai_stream_router` claim).
+    committed_connect_timeout_ms: Option<u64>,
+    /// Exactly the `route_override_backend_read_timeout_ms` this claim
+    /// committed. Same witness role as
+    /// [`Self::committed_connect_timeout_ms`]; `Some(0)` is the explicit
+    /// "no gateway-imposed whole-exchange bound" commitment and is distinct
+    /// from `None`.
+    committed_read_timeout_ms: Option<u64>,
+    /// Opaque, clone-safe lifecycle reservation owned by an EXTERNAL claim
+    /// owner (`ai_federation`'s streaming path today).
+    ///
+    /// It carries capacity and provider-circuit admission that must be released
+    /// exactly once when the request/stream reaches ANY terminal state,
+    /// including cancellation. Cloning the claim (the final-request-body hook
+    /// context) shares the same reservation rather than duplicating it, and the
+    /// reservation's own `Drop` is the cancellation-safe backstop.
+    ///
+    /// `None` for every `ai_stream_router` claim: this plugin reserves no
+    /// external capacity. Deliberately `dyn Any` so the claim type carries no
+    /// knowledge of any particular owner's accounting.
+    lifecycle: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl AiStreamRouterClaim {
@@ -629,6 +654,14 @@ impl AiStreamRouterClaim {
     pub(crate) fn destination_intact(&self, ctx: &RequestContext) -> bool {
         route_override_still_targets(ctx, self)
     }
+
+    /// The opaque lifecycle reservation an external owner attached at claim
+    /// time, if any. Only the owner can make sense of it: it downcasts to its
+    /// own private type after an [`owner`](Self::owner) match.
+    #[inline]
+    pub(crate) fn lifecycle(&self) -> Option<&Arc<dyn std::any::Any + Send + Sync>> {
+        self.lifecycle.as_ref()
+    }
 }
 
 /// The complete set of values another plugin must commit to mint a provider
@@ -651,6 +684,15 @@ pub(crate) struct ExternalProviderClaimParts {
     pub(crate) authority: String,
     pub(crate) resolved_tls: Option<BackendTlsConfig>,
     pub(crate) committed_query: String,
+    /// The exact `route_override_backend_connect_timeout_ms` the owner
+    /// committed for this destination.
+    pub(crate) committed_connect_timeout_ms: Option<u64>,
+    /// The exact `route_override_backend_read_timeout_ms` the owner committed
+    /// for this destination.
+    pub(crate) committed_read_timeout_ms: Option<u64>,
+    /// Opaque, clone-safe lifecycle reservation (capacity + circuit admission)
+    /// whose `Drop` releases anything still unresolved exactly once.
+    pub(crate) lifecycle: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 /// Mint a provider claim owned by a plugin other than `ai_stream_router`.
@@ -680,6 +722,9 @@ pub(crate) fn mint_external_provider_claim(
         authority: parts.authority,
         resolved_tls: parts.resolved_tls,
         committed_query: parts.committed_query,
+        committed_connect_timeout_ms: parts.committed_connect_timeout_ms,
+        committed_read_timeout_ms: parts.committed_read_timeout_ms,
+        lifecycle: parts.lifecycle,
     }
 }
 
@@ -2575,6 +2620,11 @@ fn openai_error_response(
 ///   own client certificate to a third-party connection. `None` (plaintext) is a
 ///   distinct committed state, not "unset".
 ///
+/// The committed dispatch budgets are compared for the same reason: a claim that
+/// pinned a provider's own connect / whole-exchange timeouts must not be
+/// dispatched under a different budget than the one it was approved with, and an
+/// inherited (`None`) commitment must stay inherited.
+///
 /// The claim is a private typed struct, not serialized metadata, so none of
 /// these values can be forged by a plugin that can only write metadata.
 fn route_override_still_targets(ctx: &RequestContext, claim: &AiStreamRouterClaim) -> bool {
@@ -2587,6 +2637,8 @@ fn route_override_still_targets(ctx: &RequestContext, claim: &AiStreamRouterClai
         && ctx.route_override_authority.as_deref() == Some(claim.authority.as_str())
         && ctx.route_override_path.as_deref() == Some(claim.path.as_str())
         && ctx.route_override_resolved_tls == claim.resolved_tls
+        && ctx.route_override_backend_connect_timeout_ms == claim.committed_connect_timeout_ms
+        && ctx.route_override_backend_read_timeout_ms == claim.committed_read_timeout_ms
 }
 
 /// Fail-closed envelope for a broken provider-boundary invariant. Fixed
@@ -2976,6 +3028,13 @@ impl Plugin for AiStreamRouter {
             authority: provider.authority.clone(),
             resolved_tls: committed_tls,
             committed_query,
+            // This plugin never overrides the matched proxy's dispatch budgets,
+            // so the witness pins "inherited" and a later plugin cannot install
+            // one without breaking the destination check.
+            committed_connect_timeout_ms: ctx.route_override_backend_connect_timeout_ms,
+            committed_read_timeout_ms: ctx.route_override_backend_read_timeout_ms,
+            // No external capacity is reserved for an `ai_stream_router` claim.
+            lifecycle: None,
         }));
 
         // --- Metadata (observability + downstream-hook coordination ONLY). ---

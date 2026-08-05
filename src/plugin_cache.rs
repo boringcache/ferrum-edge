@@ -618,11 +618,13 @@ pub(crate) fn validate_plugin_security_composition(
                 ));
             }
             // No separate `enforces_final_backend_header_policy` rule here
-            // (`GHSA-xhp5-hqj8-3mwg`): today's only declarer, `ai_stream_router`,
-            // is already refused by the deferred request-body transformer rule
-            // above, and response caching admits only GET/HEAD with a
-            // transport-proven empty upload — a population no POST JSON claim can
-            // reach. Add one if a body-less plugin ever declares the capability.
+            // (`GHSA-xhp5-hqj8-3mwg`): today's declarers — `ai_stream_router` and
+            // a streaming-enabled `ai_federation` — are already refused by the
+            // deferred request-body transformer rule above (both rewrite the
+            // provider-visible body), and response caching admits only GET/HEAD
+            // with a transport-proven empty upload — a population no POST JSON
+            // claim can reach. Add one if a body-less plugin ever declares the
+            // capability.
         }
 
         for side_effecting_plugin in plugins.iter().filter(|plugin| {
@@ -979,6 +981,18 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn observe_origin_http_response_status(&self, ctx: &mut RequestContext, status: u16) {
         self.inner.observe_origin_http_response_status(ctx, status);
+    }
+    fn enforces_origin_response_header_policy(&self, ctx: &RequestContext) -> bool {
+        self.inner.enforces_origin_response_header_policy(ctx)
+    }
+    fn enforce_origin_response_header_policy(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner
+            .enforce_origin_response_header_policy(ctx, response_status, response_headers);
     }
     fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
         self.inner.owns_deadline_response_header(ctx, name)
