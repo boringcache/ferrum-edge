@@ -21,8 +21,8 @@
 #![allow(clippy::bool_assert_comparison)]
 
 use crate::scaffolding::backends::{
-    H3Step, H3TlsConfig, ScriptedH3Backend, ScriptedTlsBackend, TcpStep, TlsConfig,
-    tls_backend_without_quic_with_ok_response,
+    H2Step, H3Step, H3TlsConfig, MatchHeaders, ScriptedH2Backend, ScriptedH3Backend,
+    ScriptedTlsBackend, TcpStep, TlsConfig, tls_backend_without_quic_with_ok_response,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http3Client;
@@ -283,19 +283,22 @@ async fn h3_capability_downgrade_e2e_when_quic_disappears() {
         .await
         .expect("colocated tcp/udp");
 
-    // TCP+TLS side serves OK responses for both probe and bridge fallback.
-    let _tcp_backend = ScriptedTlsBackend::builder(
-        tcp_listener,
-        TlsConfig::new(cert.clone(), key.clone())
-            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
-    )
-    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
-    .step(TcpStep::Write(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nbridge".to_vec(),
-    ))
-    .step(TcpStep::Drop)
-    .spawn()
-    .expect("spawn tls");
+    // H2/TLS side serves capability probes, reqwest warmup, and the bridge
+    // fallback without closing a connection the gateway may still have pooled.
+    let tcp_backend = ScriptedH2Backend::builder_tls(tcp_listener, &cert, &key)
+        .expect("h2 tls bridge builder")
+        .repeat_script(true)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: bytes::Bytes::from_static(b"bridge"),
+            end_stream: true,
+        })
+        .spawn()
+        .expect("spawn h2 tls bridge backend");
 
     // H3 backend accepts a stream then closes with a non-zero error code,
     // forcing the gateway to mark h3 unsupported on the response path.
@@ -334,7 +337,8 @@ async fn h3_capability_downgrade_e2e_when_quic_disappears() {
         "expected h3=unsupported after downgrade; entry: {post:#?}"
     );
 
-    // Second request: cross-protocol bridge → TLS backend → 200.
+    // Second request: cross-protocol bridge → H2/TLS backend → 200.
+    let bridge_baseline = tcp_backend.received_streams().await.len();
     let second = h3_get(&harness, https_port, "/api/second")
         .await
         .expect("second request must succeed via bridge");
@@ -342,6 +346,14 @@ async fn h3_capability_downgrade_e2e_when_quic_disappears() {
         second.status.as_u16(),
         200,
         "expected 200 from cross-protocol bridge after downgrade; got {second:?}"
+    );
+    let bridge_streams = tcp_backend.received_streams().await;
+    assert!(
+        bridge_streams[bridge_baseline..]
+            .iter()
+            .any(|stream| stream.path == "/second"),
+        "expected the H2/TLS bridge backend to handle /second after downgrade; \
+         baseline={bridge_baseline} streams={bridge_streams:?}"
     );
 }
 

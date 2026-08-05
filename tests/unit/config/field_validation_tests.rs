@@ -1176,6 +1176,9 @@ fn test_upstream_mesh_projected_subset_fields_rejected_by_admin_api() {
             hash_on: None,
             tls: Some(MeshTrafficPolicyTls::default()),
             connect_timeout_ms: Some(1_000),
+            h2_upgrade_policy: Some(ferrum_edge::config::types::H2UpgradePolicy::Upgrade),
+            max_retries: Some(2),
+            http1_max_pending_requests: Some(8),
             passive_health_check: Some(PassiveHealthCheck::default()),
         }),
     }]);
@@ -1183,7 +1186,14 @@ fn test_upstream_mesh_projected_subset_fields_rejected_by_admin_api() {
     let errors = upstream
         .validate_operator_provided_fields()
         .expect_err("mesh-projected subset fields must be rejected on operator writes");
-    for field in ["tls", "connect_timeout_ms", "passive_health_check"] {
+    for field in [
+        "tls",
+        "connect_timeout_ms",
+        "h2_upgrade_policy",
+        "max_retries",
+        "http1_max_pending_requests",
+        "passive_health_check",
+    ] {
         assert!(
             errors.iter().any(|error| {
                 error.contains("subsets[0].traffic_policy")

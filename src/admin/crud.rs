@@ -26,7 +26,7 @@ use crate::config::db_backend::{
 use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_decode_rejection};
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
-    backend_tls_sni_direct_h2_conflict_messages, proxy_with_resolved_port_caps,
+    backend_tls_sni_direct_h2_conflict_messages, proxy_for_sni_direct_h2_admission,
     validate_resource_id,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
@@ -2415,6 +2415,39 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
     Ok(errors)
 }
 
+/// Load every plugin config currently persisted in `namespace` (paginated).
+///
+/// Backend-TLS-SNI / direct-H2 admission on reverse writes (Upstream / Proxy
+/// `after_validate`) must see the same effective plugins PluginCache would
+/// after a successful DB write (associations, globals, enabled/shadow). Do not
+/// trust a potentially stale GatewayConfig cache, and never silently fall back
+/// to an empty list on DB failure — that would skip request-body-buffering
+/// conflicts.
+async fn load_namespace_plugin_configs(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+) -> Result<Vec<PluginConfig>, AfterValidateError> {
+    let mut plugins = Vec::new();
+    let mut offset = 0_i64;
+    const PAGE_SIZE: i64 = 1_000;
+    loop {
+        let page = db
+            .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        let items_len = page.items.len() as i64;
+        plugins.extend(page.items);
+        if items_len == 0 {
+            break;
+        }
+        offset += items_len;
+        if offset >= page.total {
+            break;
+        }
+    }
+    Ok(plugins)
+}
+
 /// The one redacted plugin-configuration projection.
 ///
 /// Every non-admin read, every management audit record, and every diagnostic
@@ -2700,13 +2733,16 @@ impl AdminResource for Upstream {
 
     async fn after_validate(
         db: &dyn DatabaseBackend,
-        state: &AdminState,
+        _state: &AdminState,
         namespace: &str,
         resource: &Self,
         _existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
-        let cached_config = state.cached_gateway_config();
+        // Authoritative plugin view for the reverse-write SNI / direct-H2
+        // gate: load once per Upstream write, not once per proxy. Never fall
+        // back to a stale or empty GatewayConfig cache here.
+        let plugin_configs = load_namespace_plugin_configs(db, namespace).await?;
         let subset_names: HashSet<&str> = resource
             .subsets
             .as_deref()
@@ -2736,31 +2772,19 @@ impl AdminResource for Upstream {
                         ));
                     }
                     // Reverse write order for issue #2954: adding SNI onto an
-                    // upstream that a retry / buffering / http2-disabled proxy
-                    // already targets must fail closed at admission.
-                    let mut admission_proxy = proxy_with_resolved_port_caps(&proxy, resource);
-                    admission_proxy.resolved_tls =
-                        crate::config::types::BackendTlsConfig::from_upstream(resource);
-                    if let Some(subset_name) = proxy.upstream_subset.as_deref()
-                        && let Some(subset_tls) = resource
-                            .resolved_subset_tls
-                            .get(subset_name)
-                            .and_then(|resolved| resolved.tls.clone())
-                    {
-                        admission_proxy.resolved_tls = subset_tls;
-                    }
-                    admission_proxy.dispatch_kind = crate::config::types::DispatchKind::from(
-                        admission_proxy.effective_scheme(),
+                    // upstream that a retry / buffering / http2-disabled /
+                    // DO_NOT_UPGRADE proxy already targets must fail closed at
+                    // admission.
+                    let admission_proxy = proxy_for_sni_direct_h2_admission(
+                        &proxy,
+                        resource,
+                        proxy.upstream_subset.as_deref(),
+                        proxy.retry.clone(),
                     );
-                    let empty_plugins: &[PluginConfig] = &[];
-                    let plugin_configs = cached_config
-                        .as_ref()
-                        .map(|config| config.plugin_configs.as_slice())
-                        .unwrap_or(empty_plugins);
                     errors.extend(backend_tls_sni_direct_h2_conflict_messages(
                         &admission_proxy,
                         Some(resource),
-                        plugin_configs,
+                        &plugin_configs,
                     ));
                 }
             }
@@ -3748,7 +3772,10 @@ impl AdminResource for Proxy {
         existing: Option<&Self>,
         ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
-        let cached_config = state.cached_gateway_config();
+        // Authoritative plugin view for the reverse-write SNI / direct-H2
+        // gate: load once per Proxy write. Never fall back to a stale or
+        // empty GatewayConfig cache here.
+        let plugin_configs = load_namespace_plugin_configs(db, namespace).await?;
         if let Some(upstream_id) = resource.upstream_id.as_deref() {
             // Namespace-predicated lookup: an upstream in another namespace
             // reports as missing (cross-namespace references are equally
@@ -3779,31 +3806,19 @@ impl AdminResource for Proxy {
                         }
                     }
                     // Plain-HTTPS SNI overrides require direct-H2. Reject retry /
-                    // body-buffering / pool_enable_http2=false combinations at
-                    // admission (issue #2954), matching full-config validate.
-                    let mut admission_proxy = proxy_with_resolved_port_caps(resource, &upstream);
-                    admission_proxy.resolved_tls =
-                        crate::config::types::BackendTlsConfig::from_upstream(&upstream);
-                    if let Some(subset_name) = resource.upstream_subset.as_deref()
-                        && let Some(subset_tls) = upstream
-                            .resolved_subset_tls
-                            .get(subset_name)
-                            .and_then(|resolved| resolved.tls.clone())
-                    {
-                        admission_proxy.resolved_tls = subset_tls;
-                    }
-                    admission_proxy.dispatch_kind = crate::config::types::DispatchKind::from(
-                        admission_proxy.effective_scheme(),
+                    // body-buffering / pool_enable_http2=false / DO_NOT_UPGRADE
+                    // combinations at admission (issue #2954), matching full-config
+                    // validate.
+                    let admission_proxy = proxy_for_sni_direct_h2_admission(
+                        resource,
+                        &upstream,
+                        resource.upstream_subset.as_deref(),
+                        resource.retry.clone(),
                     );
-                    let empty_plugins: &[PluginConfig] = &[];
-                    let plugin_configs = cached_config
-                        .as_ref()
-                        .map(|config| config.plugin_configs.as_slice())
-                        .unwrap_or(empty_plugins);
                     let sni_errors = backend_tls_sni_direct_h2_conflict_messages(
                         &admission_proxy,
                         Some(&upstream),
-                        plugin_configs,
+                        &plugin_configs,
                     );
                     if !sni_errors.is_empty() {
                         return Err(AfterValidateError::BadRequest(sni_errors));
