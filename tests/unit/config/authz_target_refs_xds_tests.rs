@@ -297,7 +297,8 @@ fn missing_gateway_class_carrier_refuses_an_enforcing_class_policy() {
     );
 
     let error = MeshAuthz::new(&json!({ "mesh_slice": recovered }))
-        .expect_err("an enforcing class policy without its class stamp must refuse the slice");
+        .err()
+        .expect("an enforcing class policy without its class stamp must refuse the slice");
     assert!(
         error.contains("no authoritative waypoint gateway class"),
         "unexpected refusal: {error}"
