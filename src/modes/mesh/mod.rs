@@ -32728,11 +32728,8 @@ mod tests {
         // The declared 16379 listener therefore remaps to its defaultEndpoint
         // for an authenticated CONNECT naming this pod (mapping semantics are
         // pinned in `tests/unit/config/sidecar_ingress_stream_tests.rs`).
-        let remap = mesh.resolve_sidecar_ingress_connect_relay(
-            "10.244.1.7",
-            16379,
-            Some(expected_pod_ip),
-        );
+        let remap =
+            mesh.resolve_sidecar_ingress_connect_relay("10.244.1.7", 16379, Some(expected_pod_ip));
         assert_eq!(remap, expected_redis_remap());
 
         // Withdrawal clears the back-projection too, so a stale address can
