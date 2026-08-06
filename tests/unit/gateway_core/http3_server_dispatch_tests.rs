@@ -2791,9 +2791,9 @@ fn h3_native_grpc_trailer_wait_stays_in_the_upload_cancellation_domain() {
     assert!(fault_arm.contains("fault.grpc_signal()"));
     assert!(fault_arm.contains("grpc_deadline_can_send_terminal_status("));
     assert!(fault_arm.contains("abort_response_stream(&mut send_half)"));
-    assert!(fault_arm.contains(
-        "body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect)"
-    ));
+    assert!(
+        fault_arm.contains("body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect)")
+    );
     assert!(
         !fault_arm.contains("grpc_trailer_status = Some("),
         "a gateway-authored upload-fault status must not train adaptive concurrency"
