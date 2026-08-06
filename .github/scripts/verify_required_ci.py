@@ -909,40 +909,75 @@ def main() -> int:
         planner_errors.append(
             "jobs.ci-plan must run the integration shard-coverage gate"
         )
-    # Issue #3615: node-agent/ambient chart runtime lint must stay on the
-    # always-on trusted ci-plan path (base-extracted checker + self-test), not a
-    # replaceable PR-only helm step.
-    if "check_node_agent_chart_runtime.py" not in ci_plan_body:
+    # Issue #3615: the node-agent/ambient chart runtime lint must run the checker
+    # extracted from the trusted base, so a pull request cannot replace its own
+    # gate. It lives in its own always-on `chart-runtime-lint` job rather than in
+    # `ci-plan`, because the trusted ARM64 Cross build policy freezes the per-job
+    # digest of every Cross-sensitive `ci.yml` job and `ci-plan` is one of them.
+    # A job with no Cross executable, configuration, ARM64 target, or opaque
+    # inline shell contributes no surface to that contract, so it can be added.
+    # For the same reason it is an independently required branch-protection
+    # check instead of a `test` aggregate input: that aggregate is compared byte
+    # for byte, with only the anchored `fuzz-smoke` wiring admitted.
+    if "check_node_agent_chart_runtime.py" in ci_plan_body:
         planner_errors.append(
-            "jobs.ci-plan must invoke check_node_agent_chart_runtime.py"
+            "jobs.ci-plan must not carry the chart runtime lint; the trusted "
+            "Cross build policy freezes its per-job digest"
         )
-    if "Check node-agent chart runtime mounts" not in ci_yml:
+    chart_runtime_lint_body = extract_job_body(ci_yml, "chart-runtime-lint")
+    if not re.search(r"(?m)^    name: Chart Runtime Lint$", chart_runtime_lint_body):
         planner_errors.append(
-            "jobs.ci-plan must keep the node-agent chart runtime mounts step"
+            "jobs.chart-runtime-lint must keep required check name "
+            "`Chart Runtime Lint`"
         )
-    if 'python3 -I "$checker" --self-test' not in ci_plan_body:
+    if re.search(r"(?m)^    if:", chart_runtime_lint_body) or extract_job_needs(
+        chart_runtime_lint_body
+    ):
         planner_errors.append(
-            "jobs.ci-plan must run the chart runtime lint self-test via "
-            "isolated python3 -I"
+            "jobs.chart-runtime-lint must stay always-on and independent of the "
+            "CI planner"
         )
-    if not re.search(r'(?m)^\s*python3 -I "\$checker"\s*$', ci_plan_body):
+    if "fetch-depth: 0" not in chart_runtime_lint_body:
         planner_errors.append(
-            "jobs.ci-plan must run the chart runtime lint against the checkout"
+            "jobs.chart-runtime-lint must check out full history so the trusted "
+            "base checker is reachable"
         )
-    if 'git show "${base_ref}:${checker}"' not in ci_plan_body:
+    if "check_node_agent_chart_runtime.py" not in chart_runtime_lint_body:
         planner_errors.append(
-            "jobs.ci-plan must extract check_node_agent_chart_runtime.py "
+            "jobs.chart-runtime-lint must invoke check_node_agent_chart_runtime.py"
+        )
+    if "Check node-agent chart runtime mounts" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.chart-runtime-lint must keep the node-agent chart runtime "
+            "mounts step"
+        )
+    if 'python3 -I "$checker" --self-test' not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.chart-runtime-lint must run the chart runtime lint self-test "
+            "via isolated python3 -I"
+        )
+    if not re.search(r'(?m)^\s*python3 -I "\$checker"\s*$', chart_runtime_lint_body):
+        planner_errors.append(
+            "jobs.chart-runtime-lint must run the chart runtime lint against the "
+            "checkout"
+        )
+    if 'git show "${base_ref}:${checker}"' not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.chart-runtime-lint must extract check_node_agent_chart_runtime.py "
             "from the trusted base on pull requests"
         )
-    if 'git show "${MERGE_BASE_SHA}:${checker}"' not in ci_plan_body:
+    if 'git show "${MERGE_BASE_SHA}:${checker}"' not in chart_runtime_lint_body:
         planner_errors.append(
-            "jobs.ci-plan must extract check_node_agent_chart_runtime.py "
+            "jobs.chart-runtime-lint must extract check_node_agent_chart_runtime.py "
             "from the merge-group base"
         )
-    if 'trusted_checker="$RUNNER_TEMP/check-node-agent-chart-runtime.py"' not in ci_plan_body:
+    if (
+        'trusted_checker="$RUNNER_TEMP/check-node-agent-chart-runtime.py"'
+        not in chart_runtime_lint_body
+    ):
         planner_errors.append(
-            "jobs.ci-plan must stage the trusted chart runtime checker under "
-            "RUNNER_TEMP"
+            "jobs.chart-runtime-lint must stage the trusted chart runtime checker "
+            "under RUNNER_TEMP"
         )
     # The scheduling decision above intentionally executes the trusted-base
     # planner on pull requests. Exercise the proposed planner here as data-plane

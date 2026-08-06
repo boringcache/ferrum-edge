@@ -5,9 +5,12 @@
 runtime socket mount or `privileged: true` on the node-agent / ambient
 workloads. This checker is that gate.
 
-Trusted CI extracts this script from the base branch (see `ci-plan` in
-`.github/workflows/ci.yml`) and runs it against the pull request's chart tree,
-so a malicious PR cannot replace the checker while still passing the gate.
+Trusted CI extracts this script from the base branch (see the always-on
+`chart-runtime-lint` job in `.github/workflows/ci.yml`) and runs it against the
+pull request's chart tree, so a malicious PR cannot replace the checker while
+still passing the gate. That job is deliberately separate from `ci-plan`: the
+trusted ARM64 Cross build policy freezes the per-job digest of every
+Cross-sensitive `ci.yml` job, and `ci-plan` is one of them.
 
 The scanner reasons about chart workload/value content after stripping Helm and
 YAML comments, so prose such as the existing RuntimeDefault/containerd seccomp
