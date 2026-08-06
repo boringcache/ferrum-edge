@@ -32038,7 +32038,7 @@ async fn handle_proxy_request_inner(
     // atomic. A deferred task reads it after read_timeout + 5s to emit a
     // supplementary log with accurate backend_total_ms.
     // Default (false): streaming responses pass through with zero tracking overhead.
-    let body = match response_body {
+    let mut body = match response_body {
         ResponseBody::Streaming {
             response,
             reqwest_backend_guard,
