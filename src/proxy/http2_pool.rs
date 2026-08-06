@@ -1458,6 +1458,13 @@ impl From<crate::pool::SharedPoolCreateError> for Http2PoolError {
             SharedPoolCreateKind::NegotiatedHttp1 => Self::BackendSelectedHttp1 {
                 pool_key: err.detail().unwrap_or(err.message()).to_string(),
             },
+            // Coalesced waiters must see the SAME typed over-cap refusal the
+            // creator produced, so `get_sender`'s already-established-shard
+            // fallback and `classify_http2_pool_error`'s pre-wire
+            // `ConnectionPoolError` apply to them identically. Reconstructing it
+            // as `BackendUnavailable` would keep the ErrorClass but lose the
+            // structural signal.
+            SharedPoolCreateKind::MaxConnections => Self::MaxConnectionsExceeded { message },
             SharedPoolCreateKind::Dns
             | SharedPoolCreateKind::Tls
             | SharedPoolCreateKind::ConnectionRefused
@@ -1508,10 +1515,13 @@ impl crate::pool::ShareablePoolCreateError for Http2PoolError {
                 None,
             ),
             // Coalesced waiters must see the same over-cap refusal rather than
-            // each redialing a destination that is already at its ceiling.
+            // each redialing a destination that is already at its ceiling. The
+            // dedicated kind survives the fan-out (the typed source chain does
+            // not), so `From<SharedPoolCreateError>` can rebuild the exact
+            // variant.
             Self::MaxConnectionsExceeded { message } => SharedPoolCreateError::new(
                 message.clone(),
-                SharedPoolCreateKind::Unavailable,
+                SharedPoolCreateKind::MaxConnections,
                 error_class,
                 None,
             ),

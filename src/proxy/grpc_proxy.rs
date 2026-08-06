@@ -1716,6 +1716,13 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
                 message,
             },
             SharedPoolCreateKind::Internal => Self::Internal(message),
+            // Coalesced waiters must see the SAME typed over-cap refusal the
+            // creator produced, so `get_sender`'s already-established-shard
+            // fallback and the pre-wire `ConnectionPoolError` classification
+            // apply to them identically.
+            SharedPoolCreateKind::MaxConnections => {
+                Self::backend_unavailable(GrpcBackendUnavailableKind::MaxConnections, message)
+            }
             // NegotiatedHttp1 is an H2-pool signal; gRPC create never emits it.
             // Fall through to unavailable reconstruction so waiters still fail.
             SharedPoolCreateKind::NegotiatedHttp1
@@ -1782,6 +1789,20 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
             Self::Internal(message) => SharedPoolCreateError::new(
                 message.clone(),
                 SharedPoolCreateKind::Internal,
+                error_class,
+                None,
+            ),
+            // Preserve the over-cap refusal as a STRUCTURAL kind so coalesced
+            // waiters rebuild the same typed variant. Its ErrorClass alone
+            // (`ConnectionPoolError`) is shared with unrelated pool faults and
+            // would collapse to `Unavailable` in the class-driven arm below.
+            Self::BackendUnavailable {
+                kind: GrpcBackendUnavailableKind::MaxConnections,
+                message,
+                ..
+            } => SharedPoolCreateError::new(
+                message.clone(),
+                SharedPoolCreateKind::MaxConnections,
                 error_class,
                 None,
             ),

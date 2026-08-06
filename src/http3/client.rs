@@ -50,6 +50,21 @@ use crate::tls::backend::{
 pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::retry::ErrorClass {
     use crate::retry::ErrorClass;
 
+    // Gateway-side `connectionPool.tcp.maxConnections` refusal. Decided BEFORE
+    // any packet is sent, so it is a pool-side, pre-wire refusal —
+    // `ConnectionPoolError` (`request_reached_wire == false`), matching the
+    // typed direct-H2 (`Http2PoolError::MaxConnectionsExceeded`), gRPC
+    // (`GrpcBackendUnavailableKind::MaxConnections`) and HBONE
+    // (`HbonePoolError::MaxConnectionsExceeded`) classes. Checked FIRST: the
+    // message carries no quinn/io type and the substring fallback below would
+    // otherwise land it in the `RequestError` catch-all, which is treated as
+    // POST-wire (charging backend health for a gateway ceiling) — and this
+    // class is excluded from `is_h3_transport_error_class`, so it never
+    // downgrades the cached H3 capability either.
+    if crate::backend_conn_limit::is_backend_connection_limit_error(err) {
+        return ErrorClass::ConnectionPoolError;
+    }
+
     // Coalesced GenericPool create waiters receive `anyhow` wrapping
     // `SharedPoolCreateError`. Prefer the captured ErrorClass before the
     // quinn/io/substring walk so fan-out preserves creator classification.
@@ -696,8 +711,10 @@ type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes
 /// retry logic — wasted handshake amortization plus an avoidable
 /// fast-fail on the hot path.
 ///
-/// Both fields are `Clone` and the clones share underlying state, so this
-/// struct is `Clone` at the same cost as the original `H3SendRequest`.
+/// Every field is `Clone` and the clones share underlying state (the
+/// `maxConnections` slot is an `Arc`, so cloning shares the ONE reservation
+/// rather than taking another), so this struct is `Clone` at the same cost as
+/// the original `H3SendRequest`.
 #[derive(Clone)]
 struct H3PooledConnection {
     send_request: H3SendRequest,
@@ -1014,6 +1031,18 @@ fn should_reconnect_streaming_body_after_cached_failure(error: &H3PoolError) -> 
 /// error can never replay a body that may already have reached the backend.
 fn incoming_body_for_reconnect<B>(error: &H3PoolError, recovered_body: Option<B>) -> Option<B> {
     recovered_body.filter(|_| should_reconnect_streaming_body_after_cached_failure(error))
+}
+
+/// Whether an H3 pool create failed SPECIFICALLY because the destination is
+/// already at its DestinationRule `connectionPool.tcp.maxConnections` ceiling.
+///
+/// Thin adapter over [`crate::pool::is_max_connections_refusal`] for the
+/// `anyhow` create surface, so the creator's typed chain and a coalesced
+/// waiter's structural kind are recognized by ONE predicate shared with the
+/// capability-probe path.
+fn is_h3_max_connections_refusal(err: &anyhow::Error) -> bool {
+    let err: &(dyn std::error::Error + 'static) = err.as_ref();
+    crate::pool::is_max_connections_refusal(err)
 }
 
 /// Result of a streaming HTTP/3 request — headers received, body still in flight.
@@ -1460,6 +1489,57 @@ impl Http3ConnectionPool {
             .await
     }
 
+    /// Recover from a create the destination's `maxConnections` ceiling refused
+    /// by reusing an already-established connection on another shard index.
+    ///
+    /// `http3_connections_per_backend` (default 4) is a SHARDING knob and can
+    /// legitimately exceed a DestinationRule cap of 1. Without this, requests
+    /// whose round-robin index maps to one of the never-created shards would
+    /// fail forever even though one admitted, healthy, multiplexed QUIC
+    /// connection is sitting in the pool — unlimited H3 streams ride one
+    /// connection, so serving them there is exactly right. This converges the
+    /// destination on `cap` connections and keeps serving, matching the
+    /// already-established-shard fallback direct-H2 and gRPC take.
+    ///
+    /// Deliberately narrow on BOTH axes:
+    ///
+    /// * only a cap refusal takes this path
+    ///   ([`is_h3_max_connections_refusal`]) — an unrelated create failure (DNS,
+    ///   TLS, refused, timeout) still surfaces to the caller unchanged; and
+    /// * only ALREADY-CACHED shards are considered, via `GenericPool::cached`,
+    ///   which returns a connection only when the manager reports it healthy
+    ///   (and evicts it otherwise). Nothing is created and no cap is bypassed.
+    ///
+    /// Replay safety is unchanged: every caller reaches its create only after
+    /// proving every prior attempt was PRE-wire (each cached attempt returns
+    /// immediately on `H3PoolError::request_on_wire`), so the request has not
+    /// been delivered to any backend and may be sent on another connection.
+    /// `key_for_index` is supplied by the caller so the proxy-keyed and
+    /// explicit-target-keyed entry points each stay inside their own key space
+    /// and their own pinned SVID generation.
+    fn reuse_shard_after_max_connections(
+        &self,
+        err: &anyhow::Error,
+        start: usize,
+        conns_per_backend: usize,
+        mut key_for_index: impl FnMut(usize) -> String,
+    ) -> Option<H3PooledConnection> {
+        if !is_h3_max_connections_refusal(err) {
+            return None;
+        }
+        for offset in 1..conns_per_backend {
+            let index = (start + offset) % conns_per_backend;
+            if let Some(pooled) = self.pool.cached(&key_for_index(index)) {
+                debug!(
+                    "HTTP/3 pool: destination at maxConnections; serving on already-established shard {} instead of creating shard {}",
+                    index, start
+                );
+                return Some(pooled);
+            }
+        }
+        None
+    }
+
     /// Pre-establish configured QUIC connections and cache them in the pool.
     ///
     /// Used at startup to warm the connection pool so the first request to each
@@ -1678,10 +1758,25 @@ impl Http3ConnectionPool {
         // genuinely pre-wire.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let pooled = self
+        // A create refused by the destination's `maxConnections` ceiling is not
+        // a dead end: an already-established shard can serve this request by
+        // multiplexing. Only a cap refusal takes that path — see
+        // `reuse_shard_after_max_connections`.
+        let pooled = match self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
-            .map_err(H3PoolError::pre_wire)?;
+        {
+            Ok(pooled) => pooled,
+            Err(err) => match self.reuse_shard_after_max_connections(
+                &err,
+                start,
+                conns_per_backend,
+                |index| self.pool_key_with_generation(proxy, index, svid_generation),
+            ) {
+                Some(pooled) => pooled,
+                None => return Err(H3PoolError::pre_wire(err)),
+            },
+        };
         let mut sr_for_request = pooled.send_request;
 
         Self::do_request(
@@ -1802,7 +1897,11 @@ impl Http3ConnectionPool {
         // failures are therefore genuinely pre-wire.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let pooled = self
+        // A create refused by the destination's `maxConnections` ceiling is not
+        // a dead end: an already-established shard can serve this request by
+        // multiplexing. Only a cap refusal takes that path — see
+        // `reuse_shard_after_max_connections`.
+        let pooled = match self
             .create_or_get_target_sender(
                 key,
                 proxy,
@@ -1812,7 +1911,26 @@ impl Http3ConnectionPool {
                 h3_config,
             )
             .await
-            .map_err(H3PoolError::pre_wire)?;
+        {
+            Ok(pooled) => pooled,
+            Err(err) => match self.reuse_shard_after_max_connections(
+                &err,
+                start,
+                conns_per_backend,
+                |index| {
+                    self.pool_key_for_target_with_generation(
+                        proxy,
+                        target_host,
+                        target_port,
+                        index,
+                        svid_generation,
+                    )
+                },
+            ) {
+                Some(pooled) => pooled,
+                None => return Err(H3PoolError::pre_wire(err)),
+            },
+        };
         let mut sr_for_request = pooled.send_request;
 
         Self::do_request(
@@ -1879,16 +1997,12 @@ impl Http3ConnectionPool {
             port,
         );
         let conn_slot = match conn_admission {
-            Some(admission) => match admission.acquire() {
-                Ok(slot) => Some(slot),
-                Err(limit) => {
-                    return Err(anyhow::anyhow!(
-                        "HTTP/3 pool: {limit} for backend {}:{}",
-                        admission.host(),
-                        admission.policy_port()
-                    ));
-                }
-            },
+            // A cap refusal must stay TYPED through the `anyhow` create surface:
+            // `classify_http3_error` recognizes it as a pre-wire
+            // `ConnectionPoolError`, and `request()` recognizes it structurally
+            // so it can fall back to an already-established shard instead of
+            // failing a destination that is healthy but at its ceiling.
+            Some(admission) => Some(admission.acquire_or_typed_error("HTTP/3 pool")?),
             None => None,
         };
         let candidates = resolve_backend_addrs_cached(
@@ -2003,16 +2117,12 @@ impl Http3ConnectionPool {
             port,
         );
         let conn_slot = match conn_admission {
-            Some(admission) => match admission.acquire() {
-                Ok(slot) => Some(slot),
-                Err(limit) => {
-                    return Err(anyhow::anyhow!(
-                        "HTTP/3 pool: {limit} for backend {}:{}",
-                        admission.host(),
-                        admission.policy_port()
-                    ));
-                }
-            },
+            // A cap refusal must stay TYPED through the `anyhow` create surface:
+            // `classify_http3_error` recognizes it as a pre-wire
+            // `ConnectionPoolError`, and `request()` recognizes it structurally
+            // so it can fall back to an already-established shard instead of
+            // failing a destination that is healthy but at its ceiling.
+            Some(admission) => Some(admission.acquire_or_typed_error("HTTP/3 pool")?),
             None => None,
         };
         let candidates = resolve_backend_addrs_cached(
@@ -2659,10 +2769,25 @@ impl Http3ConnectionPool {
         // `request_on_wire` state needs to be promoted into this attempt.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let pooled = self
+        // A create refused by the destination's `maxConnections` ceiling is not
+        // a dead end: an already-established shard can serve this request by
+        // multiplexing. Only a cap refusal takes that path — see
+        // `reuse_shard_after_max_connections`.
+        let pooled = match self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
-            .map_err(H3PoolError::pre_wire)?;
+        {
+            Ok(pooled) => pooled,
+            Err(err) => match self.reuse_shard_after_max_connections(
+                &err,
+                start,
+                conns_per_backend,
+                |index| self.pool_key_with_current_generation(proxy, index),
+            ) {
+                Some(pooled) => pooled,
+                None => return Err(H3PoolError::pre_wire(err)),
+            },
+        };
         let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming_body(
@@ -2743,10 +2868,25 @@ impl Http3ConnectionPool {
         // needs to be promoted into this attempt.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let pooled = self
+        // A create refused by the destination's `maxConnections` ceiling is not
+        // a dead end: an already-established shard can serve this request by
+        // multiplexing. Only a cap refusal takes that path — see
+        // `reuse_shard_after_max_connections`.
+        let pooled = match self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
-            .map_err(H3PoolError::pre_wire)?;
+        {
+            Ok(pooled) => pooled,
+            Err(err) => match self.reuse_shard_after_max_connections(
+                &err,
+                start,
+                conns_per_backend,
+                |index| self.pool_key_with_current_generation(proxy, index),
+            ) {
+                Some(pooled) => pooled,
+                None => return Err(H3PoolError::pre_wire(err)),
+            },
+        };
         let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming_incoming_body(
@@ -2844,7 +2984,11 @@ impl Http3ConnectionPool {
         // was pre-wire, so replay safety is preserved.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let pooled = self
+        // A create refused by the destination's `maxConnections` ceiling is not
+        // a dead end: an already-established shard can serve this request by
+        // multiplexing. Only a cap refusal takes that path — see
+        // `reuse_shard_after_max_connections`.
+        let pooled = match self
             .create_or_get_target_sender(
                 key,
                 proxy,
@@ -2854,7 +2998,25 @@ impl Http3ConnectionPool {
                 h3_config,
             )
             .await
-            .map_err(H3PoolError::pre_wire)?;
+        {
+            Ok(pooled) => pooled,
+            Err(err) => match self.reuse_shard_after_max_connections(
+                &err,
+                start,
+                conns_per_backend,
+                |index| {
+                    self.pool_key_for_target_with_current_generation(
+                        proxy,
+                        target_host,
+                        target_port,
+                        index,
+                    )
+                },
+            ) {
+                Some(pooled) => pooled,
+                None => return Err(H3PoolError::pre_wire(err)),
+            },
+        };
         let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming_body(
@@ -2940,7 +3102,11 @@ impl Http3ConnectionPool {
         // needs to be promoted into this attempt.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let pooled = self
+        // A create refused by the destination's `maxConnections` ceiling is not
+        // a dead end: an already-established shard can serve this request by
+        // multiplexing. Only a cap refusal takes that path — see
+        // `reuse_shard_after_max_connections`.
+        let pooled = match self
             .create_or_get_target_sender(
                 key,
                 proxy,
@@ -2950,7 +3116,25 @@ impl Http3ConnectionPool {
                 h3_config,
             )
             .await
-            .map_err(H3PoolError::pre_wire)?;
+        {
+            Ok(pooled) => pooled,
+            Err(err) => match self.reuse_shard_after_max_connections(
+                &err,
+                start,
+                conns_per_backend,
+                |index| {
+                    self.pool_key_for_target_with_current_generation(
+                        proxy,
+                        target_host,
+                        target_port,
+                        index,
+                    )
+                },
+            ) {
+                Some(pooled) => pooled,
+                None => return Err(H3PoolError::pre_wire(err)),
+            },
+        };
         let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming_incoming_body(
@@ -3088,10 +3272,25 @@ impl Http3ConnectionPool {
         // genuinely pre-wire.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let pooled = self
+        // A create refused by the destination's `maxConnections` ceiling is not
+        // a dead end: an already-established shard can serve this request by
+        // multiplexing. Only a cap refusal takes that path — see
+        // `reuse_shard_after_max_connections`.
+        let pooled = match self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
-            .map_err(H3PoolError::pre_wire)?;
+        {
+            Ok(pooled) => pooled,
+            Err(err) => match self.reuse_shard_after_max_connections(
+                &err,
+                start,
+                conns_per_backend,
+                |index| self.pool_key_with_generation(proxy, index, svid_generation),
+            ) {
+                Some(pooled) => pooled,
+                None => return Err(H3PoolError::pre_wire(err)),
+            },
+        };
         let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming(
@@ -3198,7 +3397,11 @@ impl Http3ConnectionPool {
         // failures here are genuinely pre-wire.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let pooled = self
+        // A create refused by the destination's `maxConnections` ceiling is not
+        // a dead end: an already-established shard can serve this request by
+        // multiplexing. Only a cap refusal takes that path — see
+        // `reuse_shard_after_max_connections`.
+        let pooled = match self
             .create_or_get_target_sender(
                 key,
                 proxy,
@@ -3208,7 +3411,26 @@ impl Http3ConnectionPool {
                 h3_config,
             )
             .await
-            .map_err(H3PoolError::pre_wire)?;
+        {
+            Ok(pooled) => pooled,
+            Err(err) => match self.reuse_shard_after_max_connections(
+                &err,
+                start,
+                conns_per_backend,
+                |index| {
+                    self.pool_key_for_target_with_generation(
+                        proxy,
+                        target_host,
+                        target_port,
+                        index,
+                        svid_generation,
+                    )
+                },
+            ) {
+                Some(pooled) => pooled,
+                None => return Err(H3PoolError::pre_wire(err)),
+            },
+        };
         let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming(

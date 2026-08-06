@@ -51,6 +51,14 @@ pub enum SharedPoolCreateKind {
     PortExhaustion,
     /// Gateway egress / dispatch policy denied the dial.
     DispatchPolicyRejected,
+    /// The destination is at its DestinationRule
+    /// `connectionPool.tcp.maxConnections` ceiling, so no NEW physical
+    /// connection may be opened. Structural because callers act on it: the
+    /// pooled transports fall back to an already-established shard rather than
+    /// failing a destination that is healthy but full, and the capability probe
+    /// must not read it as evidence the backend lost the protocol. Carries
+    /// `ErrorClass::ConnectionPoolError` (pre-wire).
+    MaxConnections,
     /// Generic backend unreachable / pool acquire failure.
     Unavailable,
     /// Pool-internal / configuration failure.
@@ -152,8 +160,24 @@ impl SharedPoolCreateError {
     /// Capture a broadcastable failure from a setup-phase std error. Uses the
     /// canonical boxed setup classifier rather than substring heuristics so
     /// H3/anyhow GenericPool waiters retain typed shared classification.
+    ///
+    /// A `maxConnections` refusal keeps its dedicated
+    /// [`SharedPoolCreateKind::MaxConnections`] structural kind: the typed
+    /// source chain does not survive the fan-out (waiters get a sanitized,
+    /// cloneable payload), so without the kind a coalesced waiter could not tell
+    /// "this destination is at its ceiling, reuse an existing connection" apart
+    /// from any other pool-side failure.
     pub fn capture(err: &(dyn std::error::Error + Send + Sync + 'static)) -> Self {
         let error_class = crate::retry::classify_boxed_setup_error(err);
+        let plain: &(dyn std::error::Error + 'static) = err;
+        if crate::backend_conn_limit::is_backend_connection_limit_error(plain) {
+            return Self::new(
+                err.to_string(),
+                SharedPoolCreateKind::MaxConnections,
+                error_class,
+                None,
+            );
+        }
         Self::from_classified(err.to_string(), error_class, None)
     }
 
@@ -182,6 +206,34 @@ impl std::fmt::Display for SharedPoolCreateError {
 }
 
 impl std::error::Error for SharedPoolCreateError {}
+
+/// Whether a pool create failed SPECIFICALLY because the destination is already
+/// at its DestinationRule `connectionPool.tcp.maxConnections` ceiling.
+///
+/// Two shapes have to be recognized, because coalescing splits them:
+///
+/// * the creator's own error, which still carries the typed
+///   [`crate::backend_conn_limit::BackendConnectionLimitExceeded`] in its source
+///   chain; and
+/// * a coalesced waiter's error, which carries a sanitized, cloneable
+///   [`SharedPoolCreateError`] with NO typed source chain — there the structural
+///   [`SharedPoolCreateKind::MaxConnections`] is what survives the fan-out.
+///
+/// Deliberately narrower than `ErrorClass::ConnectionPoolError`, which quinn
+/// `CidsExhausted` / `EndpointStopping` and pool-internal faults also carry.
+pub fn is_max_connections_refusal(err: &(dyn std::error::Error + 'static)) -> bool {
+    if crate::backend_conn_limit::is_backend_connection_limit_error(err) {
+        return true;
+    }
+    let mut node = Some(err);
+    while let Some(current) = node {
+        if let Some(shared) = current.downcast_ref::<SharedPoolCreateError>() {
+            return shared.kind() == SharedPoolCreateKind::MaxConnections;
+        }
+        node = current.source();
+    }
+    false
+}
 
 /// Error types that can be broadcast to coalesced create waiters.
 ///

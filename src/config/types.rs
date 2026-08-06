@@ -602,10 +602,21 @@ pub struct UpstreamPortOverride {
     /// slot at the moment a new physical connection is constructed and hands it
     /// to that connection's driver, so the count tracks open sockets — never
     /// request concurrency — and unlimited multiplexed streams still ride one
-    /// admitted connection. reqwest HTTP/1.1 holds the slot for the in-flight
-    /// request (1 request ⇔ 1 H1 socket); reqwest dispatch that may negotiate
-    /// h2 converges on one shared multiplexed socket per destination and is
-    /// deliberately ungated. See `docs/mesh.md` and
+    /// admitted connection.
+    ///
+    /// The reqwest transports (HTTP/1.1 **and** ALPN-negotiated HTTP/2) are
+    /// admitted the same way, inside reqwest's own connector — the one place a
+    /// NEW physical socket is dialed — through the vendored
+    /// `ClientBuilder::connection_admission` hook
+    /// (`docs/upstream-reqwest-patches/003-connection-admission-hook/`). A
+    /// checkout that reuses an idle pooled socket, and an HTTP/2 stream
+    /// multiplexed onto an open connection, never reach the connector and so
+    /// take no slot. The admitted token is owned by the connection object, so
+    /// the slot is released exactly when that socket closes — including while
+    /// reqwest keeps it idle after the request that opened it has finished.
+    /// This is a physical-connection bound on both reqwest protocols; it is NOT
+    /// a request-lifetime slot (which would read zero while sockets stayed open)
+    /// and NOT a stream counter. See `docs/mesh.md` and
     /// `src/backend_conn_limit.rs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<u32>,

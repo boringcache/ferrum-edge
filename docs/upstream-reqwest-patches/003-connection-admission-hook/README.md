@@ -94,6 +94,13 @@ implementation cannot pass them:
   ceiling.
 - `h2_streams_multiplex_without_consuming_extra_slots` — multiplexed streams take
   no additional slot.
-- `a_removed_cap_stops_applying_after_a_config_publication` and
+- `a_removed_cap_stops_applying_once_its_dispatches_drain` and
   `target_port_remap_counts_on_the_policy_port` — Ferrum-side lane lifecycle and
   policy-port identity.
+- `conflicting_reqwest_lanes_resolve_to_the_strictest_in_either_order`,
+  `a_newer_config_generation_replaces_a_retired_reqwest_lane_wholesale`,
+  `a_retired_generation_cannot_weaken_a_live_reqwest_lane`, and
+  `a_reqwest_lane_lives_exactly_as_long_as_its_leases` — the lane a connect
+  attempt is admitted against is deterministic under concurrent, conflicting
+  policy and across a config reload, and the registry drains rather than
+  retaining retired policy.

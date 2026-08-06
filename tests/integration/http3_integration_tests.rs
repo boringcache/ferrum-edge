@@ -1966,3 +1966,302 @@ async fn h3_full_handshake_exposes_peer_identity_before_any_stream_is_accepted()
     client_conn.close(0u32.into(), b"done");
     client.wait_idle().await;
 }
+
+// ===========================================================================
+// DestinationRule `connectionPool.tcp.maxConnections` on the native HTTP/3
+// pool (issue #3290, root review round 3).
+//
+// Two properties, both of which fail before the repair:
+//
+//  1. A cap refusal must stay TYPED through the pool's `anyhow` create surface
+//     so it classifies as a PRE-wire `ConnectionPoolError`. A plain
+//     `anyhow!("...")` message classifies as the `RequestError` catch-all,
+//     which `retry::request_reached_wire` treats as POST-wire.
+//  2. `http3_connections_per_backend` is a sharding knob and can exceed the
+//     cap. When creating the selected shard is refused BY THE CAP, an
+//     already-established healthy shard must serve the request by multiplexing
+//     instead of the request failing. Before the repair, `request()` and
+//     `request_with_target()` only scanned other shards after a CACHED shard
+//     failed pre-wire, so a plain cache miss went straight to a create that
+//     could only ever be refused.
+// ===========================================================================
+
+/// Build a cap-refusal error through the exact production seam the H3 pool
+/// uses, with the destination already saturated.
+fn h3_max_connections_refusal_error() -> anyhow::Error {
+    use ferrum_edge::backend_conn_limit::BackendConnectionLimiter;
+    use ferrum_edge::backend_conn_limit::PooledConnectionAdmission;
+    use ferrum_edge::config::types::ResolvedPortOverride;
+    use std::collections::HashMap;
+
+    let limiter = BackendConnectionLimiter::new();
+    let mut proxy = create_http3_test_proxy();
+    proxy.backend_host = "h3-capped.example".to_string();
+    proxy.backend_port = 443;
+    proxy.dispatch_port_overrides = Some(HashMap::from([(
+        443u16,
+        ResolvedPortOverride {
+            max_connections: Some(1),
+            ..ResolvedPortOverride::default()
+        },
+    )]));
+
+    let admission =
+        PooledConnectionAdmission::resolve(Some(&limiter), &proxy, &proxy.backend_host, 443)
+            .expect("a cap is configured for this destination");
+    let _saturating_slot = admission.acquire().expect("first slot is admitted");
+    admission
+        .acquire_or_typed_error("HTTP/3 pool")
+        .expect_err("the destination is at its ceiling")
+}
+
+#[test]
+fn h3_max_connections_refusal_classifies_pre_wire_and_is_not_capability_evidence() {
+    use ferrum_edge::retry::ErrorClass;
+
+    let err = h3_max_connections_refusal_error();
+    let dyn_err: &(dyn std::error::Error + 'static) = err.as_ref();
+
+    assert!(
+        ferrum_edge::backend_conn_limit::is_backend_connection_limit_error(dyn_err),
+        "the typed refusal must survive `anyhow` wrapping: {err:#}"
+    );
+    assert!(
+        ferrum_edge::pool::is_max_connections_refusal(dyn_err),
+        "the shared predicate the shard-reuse and capability-probe paths use must agree"
+    );
+
+    let class = ferrum_edge::http3::client::classify_http3_error(dyn_err);
+    assert_eq!(
+        class,
+        ErrorClass::ConnectionPoolError,
+        "a cap refusal is a pool-side refusal decided before any packet is sent, \
+         not the `RequestError` catch-all (which is treated as POST-wire)"
+    );
+    assert!(
+        !ferrum_edge::retry::request_reached_wire(class),
+        "no request byte reached the backend, so the class must be pre-wire"
+    );
+}
+
+#[test]
+fn h3_max_connections_refusal_survives_coalesced_waiter_fan_out() {
+    use ferrum_edge::pool::{SharedPoolCreateError, SharedPoolCreateKind};
+    use ferrum_edge::retry::ErrorClass;
+
+    let err = h3_max_connections_refusal_error();
+    // A coalesced waiter never sees the creator's typed source chain — it gets
+    // this sanitized, cloneable payload. The structural kind is what has to
+    // survive so the waiter takes the same shard-reuse path.
+    let shared = SharedPoolCreateError::capture(err.as_ref());
+    assert_eq!(shared.kind(), SharedPoolCreateKind::MaxConnections);
+    assert_eq!(shared.error_class(), ErrorClass::ConnectionPoolError);
+
+    let waiter_error = anyhow::Error::new(shared);
+    let dyn_waiter: &(dyn std::error::Error + 'static) = waiter_error.as_ref();
+    assert!(
+        ferrum_edge::pool::is_max_connections_refusal(dyn_waiter),
+        "a coalesced waiter must be recognized as an over-cap refusal too"
+    );
+    assert_eq!(
+        ferrum_edge::http3::client::classify_http3_error(dyn_waiter),
+        ErrorClass::ConnectionPoolError,
+        "waiters must inherit the creator's pre-wire classification"
+    );
+}
+
+/// Shared fixture: a scripted H3 backend that answers `request_count` requests
+/// on however many QUIC connections the gateway opens, plus a client TLS config
+/// trusting its CA.
+async fn capped_h3_backend(
+    label: &'static str,
+    request_count: usize,
+) -> (
+    crate::scaffolding::backends::ScriptedH3Backend,
+    u16,
+    Arc<rustls::ClientConfig>,
+) {
+    use crate::scaffolding::backends::{H3Step, H3TlsConfig, ScriptedH3Backend};
+    use crate::scaffolding::certs::TestCa;
+    use crate::scaffolding::ports::reserve_udp_port;
+
+    init_crypto_provider();
+
+    let ca = TestCa::new(label).expect("test CA");
+    let (cert, key) = ca.valid().expect("leaf cert");
+
+    let udp = reserve_udp_port().await.expect("reserve udp port");
+    let port = udp.port;
+    let mut builder = ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(&cert, &key));
+    for _ in 0..request_count {
+        builder = builder
+            .step(H3Step::AcceptStream)
+            .step(H3Step::RespondHeadersEndStream(vec![
+                (":status", "200".to_string()),
+                ("content-length", "0".to_string()),
+            ]));
+    }
+    let backend = builder.spawn().expect("spawn scripted H3 backend");
+
+    let provider = rustls::crypto::ring::default_provider();
+    let mut root_store = rustls::RootCertStore::empty();
+    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+        .filter_map(|c| c.ok())
+        .collect();
+    for cert_der in &ca_certs {
+        root_store.add(cert_der.clone()).expect("add CA cert");
+    }
+    let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    client_tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    (backend, port, Arc::new(client_tls))
+}
+
+/// An H3 pool wired to a live `maxConnections` counter, plus a proxy whose
+/// destination ceiling is `cap` while the shard ring is deliberately wider.
+fn capped_h3_pool(
+    cap: u32,
+    port: u16,
+) -> (
+    ferrum_edge::http3::client::Http3ConnectionPool,
+    Arc<ferrum_edge::backend_conn_limit::BackendConnectionLimiter>,
+    Proxy,
+) {
+    use ferrum_edge::backend_conn_limit::BackendConnectionLimiter;
+    use ferrum_edge::config::types::ResolvedPortOverride;
+    use ferrum_edge::dns::DnsConfig;
+    use ferrum_edge::http3::client::Http3ConnectionPool;
+    use std::collections::HashMap;
+
+    let pool = Http3ConnectionPool::new(
+        Arc::new(EnvConfig::default()),
+        DnsCache::new(DnsConfig::default()),
+    );
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    pool.attach_backend_conn_limit(limiter.clone());
+
+    let mut proxy = create_http3_test_proxy();
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = port;
+    proxy.backend_tls_verify_server_cert = true;
+    // The sharding knob deliberately EXCEEDS the cap: this is the configuration
+    // in which the pre-repair implementation fails every request whose
+    // round-robin index maps to a shard that can never be created.
+    proxy.pool_http3_connections_per_backend = Some(4);
+    proxy.dispatch_port_overrides = Some(HashMap::from([(
+        port,
+        ResolvedPortOverride {
+            max_connections: Some(cap),
+            ..ResolvedPortOverride::default()
+        },
+    )]));
+
+    (pool, limiter, proxy)
+}
+
+#[tokio::test]
+async fn h3_pool_request_reuses_an_admitted_shard_when_the_cap_refuses_creation() {
+    const REQUESTS: usize = 4;
+    let (backend, port, client_tls) = capped_h3_backend("h3-cap-req", REQUESTS).await;
+    let (pool, limiter, proxy) = capped_h3_pool(1, port);
+
+    let url = format!("https://127.0.0.1:{port}/");
+    let headers = vec![(
+        http::header::HOST,
+        http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}")).unwrap(),
+    )];
+
+    // Sequential requests walk the round-robin shard ring 0,1,2,3. Only shard 0
+    // can ever be created under `maxConnections: 1`; the other three must be
+    // served by multiplexing onto it.
+    for attempt in 0..REQUESTS {
+        let tls = client_tls.clone();
+        let response = pool
+            .request(
+                &proxy,
+                "GET",
+                &url,
+                &headers,
+                bytes::Bytes::new(),
+                move || Ok(tls),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "request {attempt} must be served on the already-admitted shard, \
+                     not fail because its own shard is over the cap: {e}"
+                )
+            });
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_empty());
+    }
+
+    assert_eq!(
+        backend.accepted_handshakes(),
+        1,
+        "maxConnections: 1 must bound the destination to ONE physical QUIC connection"
+    );
+    assert_eq!(
+        limiter.current("127.0.0.1", port),
+        1,
+        "exactly one slot may be held for the one admitted QUIC connection"
+    );
+
+    drop(backend);
+}
+
+#[tokio::test]
+async fn h3_pool_request_with_target_reuses_an_admitted_shard_when_the_cap_refuses_creation() {
+    const REQUESTS: usize = 4;
+    let (backend, port, client_tls) = capped_h3_backend("h3-cap-tgt", REQUESTS).await;
+    let (pool, limiter, proxy) = capped_h3_pool(1, port);
+
+    let url = format!("https://127.0.0.1:{port}/");
+    let headers = vec![(
+        http::header::HOST,
+        http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}")).unwrap(),
+    )];
+
+    // `request_with_target` keys on the explicit LB target and nests its
+    // alternate-shard scan inside the cached-probe branch, so it can diverge
+    // from `request()` — cover it independently.
+    for attempt in 0..REQUESTS {
+        let tls = client_tls.clone();
+        let response = pool
+            .request_with_target(
+                &proxy,
+                "127.0.0.1",
+                port,
+                "GET",
+                &url,
+                &headers,
+                bytes::Bytes::new(),
+                move || Ok(tls),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "targeted request {attempt} must be served on the already-admitted shard: {e}"
+                )
+            });
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_empty());
+    }
+
+    assert_eq!(
+        backend.accepted_handshakes(),
+        1,
+        "maxConnections: 1 must bound the destination to ONE physical QUIC connection"
+    );
+    assert_eq!(
+        limiter.current("127.0.0.1", port),
+        1,
+        "exactly one slot may be held for the one admitted QUIC connection"
+    );
+
+    drop(backend);
+}

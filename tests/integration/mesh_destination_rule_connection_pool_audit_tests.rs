@@ -240,7 +240,7 @@ async fn sequential_requests_never_exceed_the_cap_while_a_socket_sits_idle() {
     let (backend, accepted, _backend_task) = start_counting_h1_backend(Duration::ZERO).await;
     let (pool, limiter, admission) = admitted_reqwest_pool();
     let proxy = capped_proxy(backend.port(), 1);
-    admission.publish_lane(1, "127.0.0.1", backend.port(), backend.port(), 1);
+    let _lane = admission.lease_lane(1, "127.0.0.1", backend.port(), backend.port(), 1);
 
     let client = pool.get_client(&proxy).await.expect("reqwest client");
     let url = format!("http://{}:{}/audit", backend.ip(), backend.port());
@@ -273,7 +273,7 @@ async fn cap_exhaustion_refuses_the_second_physical_dial() {
         start_counting_h1_backend(Duration::from_millis(300)).await;
     let (pool, limiter, admission) = admitted_reqwest_pool();
     let proxy = capped_proxy(backend.port(), 1);
-    admission.publish_lane(1, "127.0.0.1", backend.port(), backend.port(), 1);
+    let _lane = admission.lease_lane(1, "127.0.0.1", backend.port(), backend.port(), 1);
 
     let client = pool.get_client(&proxy).await.expect("reqwest client");
     let url = format!("http://{}:{}/slow", backend.ip(), backend.port());
@@ -323,7 +323,7 @@ async fn distinct_reqwest_pool_keys_share_one_destination_ceiling() {
     let (backend, accepted, _backend_task) =
         start_counting_h1_backend(Duration::from_millis(300)).await;
     let (pool, _limiter, admission) = admitted_reqwest_pool();
-    admission.publish_lane(1, "127.0.0.1", backend.port(), backend.port(), 1);
+    let _lane = admission.lease_lane(1, "127.0.0.1", backend.port(), backend.port(), 1);
 
     let first_proxy = capped_proxy(backend.port(), 1);
     let mut second_proxy = capped_proxy(backend.port(), 1);
@@ -387,7 +387,7 @@ async fn h2_streams_multiplex_without_consuming_extra_slots() {
     });
 
     let (_pool, limiter, admission) = admitted_reqwest_pool();
-    admission.publish_lane(1, "127.0.0.1", addr.port(), addr.port(), 1);
+    let _lane = admission.lease_lane(1, "127.0.0.1", addr.port(), addr.port(), 1);
     let client = reqwest::Client::builder()
         .http2_prior_knowledge()
         .connection_admission(Arc::clone(&admission) as Arc<dyn reqwest::ConnectionAdmission>)
@@ -421,20 +421,25 @@ async fn h2_streams_multiplex_without_consuming_extra_slots() {
     );
 }
 
-/// A lane published under a config epoch that has since been superseded must
-/// stop applying, so a `maxConnections` an operator REMOVED does not keep
-/// shedding traffic after the reload.
+/// A `maxConnections` an operator REMOVED must stop shedding traffic once the
+/// dispatches that ran under it have drained — the lane exists only while a
+/// capped dispatch holds a lease, so nothing has to be swept and nothing lingers.
 #[tokio::test]
-async fn a_removed_cap_stops_applying_after_a_config_publication() {
+async fn a_removed_cap_stops_applying_once_its_dispatches_drain() {
     let (backend, accepted, _backend_task) =
         start_counting_h1_backend(Duration::from_millis(300)).await;
     let (pool, _limiter, admission) = admitted_reqwest_pool();
     let proxy = capped_proxy(backend.port(), 1);
-    admission.publish_lane(1, "127.0.0.1", backend.port(), backend.port(), 1);
-
-    // Operator removes the cap; the config publish chokepoint invalidates every
-    // published lane and nothing re-publishes this one.
-    admission.advance_config_epoch(2);
+    {
+        let _lane = admission.lease_lane(1, "127.0.0.1", backend.port(), backend.port(), 1);
+        assert!(admission.lane_for("127.0.0.1", backend.port()).is_some());
+    }
+    // The operator removed the cap, so no later dispatch leases this lane.
+    assert_eq!(
+        admission.live_lane_count(),
+        0,
+        "the lane must not outlive the dispatches that were governed by it"
+    );
 
     let client = pool.get_client(&proxy).await.expect("reqwest client");
     let url = format!("http://{}:{}/slow", backend.ip(), backend.port());
@@ -463,7 +468,7 @@ async fn target_port_remap_counts_on_the_policy_port() {
     let proxy = capped_proxy(backend.port(), 2);
 
     // Service port 8080 remapped onto the workload/dial port.
-    admission.publish_lane(1, "127.0.0.1", backend.port(), 8080, 2);
+    let _lane = admission.lease_lane(1, "127.0.0.1", backend.port(), 8080, 2);
 
     let client = pool.get_client(&proxy).await.expect("reqwest client");
     let url = format!("http://{}:{}/audit", backend.ip(), backend.port());
@@ -481,6 +486,121 @@ async fn target_port_remap_counts_on_the_policy_port() {
         0,
         "the dial port must not become a second counter lane"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Lane binding under conflicting policy and across a config reload.
+//
+// `maxConnections` is deliberately NOT reqwest pool-key material, so two
+// logically distinct upstreams (different proxies, subsets, or `targetPort`
+// remaps) can resolve DIFFERENT `(policy port, cap)` for the SAME dial address
+// and share one `reqwest::Client` — one physical socket pool. Which lane a
+// connect attempt is admitted against must therefore be deterministic and
+// fail-closed, never last-writer-wins.
+// ---------------------------------------------------------------------------
+
+fn admission_only() -> Arc<ReqwestConnectionAdmission> {
+    Arc::new(ReqwestConnectionAdmission::new(
+        Arc::new(BackendConnectionLimiter::new()),
+        8,
+    ))
+}
+
+/// Two concurrently in-flight dispatches resolve conflicting policy for one dial
+/// address. The strictest lane must govern regardless of which leased first —
+/// under the previous last-writer-wins publication this assertion fails in one
+/// of the two orders.
+#[test]
+fn conflicting_reqwest_lanes_resolve_to_the_strictest_in_either_order() {
+    for (first, second) in [((8080u16, 4u32), (80u16, 1u32)), ((80, 1), (8080, 4))] {
+        let admission = admission_only();
+        let _a = admission.lease_lane(1, "backend", 9000, first.0, first.1);
+        let _b = admission.lease_lane(1, "backend", 9000, second.0, second.1);
+        let lane = admission
+            .lane_for("backend", 9000)
+            .expect("a lane must be live while both dispatches hold leases");
+        assert_eq!(
+            (lane.policy_port(), lane.cap()),
+            (80, 1),
+            "the strictest live lane must govern regardless of lease order \
+             (leased {first:?} then {second:?})"
+        );
+    }
+}
+
+/// A newer configuration generation replaces the lane wholesale. "Strictest
+/// wins" resolves conflicts WITHIN one generation; it must never pin an operator
+/// to a ceiling they already raised or retired.
+#[test]
+fn a_newer_config_generation_replaces_a_retired_reqwest_lane_wholesale() {
+    let admission = admission_only();
+    let _old = admission.lease_lane(1, "backend", 8080, 8080, 1);
+    let _new = admission.lease_lane(2, "backend", 8080, 8080, 4);
+    let lane = admission.lane_for("backend", 8080).expect("live lane");
+    assert_eq!(
+        lane.cap(),
+        4,
+        "the newest published generation must govern, not the strictest generation"
+    );
+}
+
+/// The publish-to-admit race across a reload: a request pinned to a retired
+/// generation reaches dispatch after the new configuration published. It keeps
+/// the destination governed but must not weaken the live policy back — the
+/// fail-closed direction.
+#[test]
+fn a_retired_generation_cannot_weaken_a_live_reqwest_lane() {
+    let admission = admission_only();
+    let _current = admission.lease_lane(2, "backend", 8080, 8080, 4);
+    let _retired = admission.lease_lane(1, "backend", 8080, 8080, 1);
+    let lane = admission.lane_for("backend", 8080).expect("live lane");
+    assert_eq!(
+        (lane.policy_port(), lane.cap()),
+        (8080, 4),
+        "a request pinned to a retired generation must not replace the live lane"
+    );
+}
+
+/// The lane registry is bounded by in-flight capped dispatches, not by every
+/// host a proxy ever dialed: it drains to empty, so a reload cannot leak retired
+/// policy, and a sibling dispatch keeps the lane alive while it is still needed.
+#[test]
+fn a_reqwest_lane_lives_exactly_as_long_as_its_leases() {
+    let admission = admission_only();
+    assert_eq!(admission.live_lane_count(), 0);
+
+    let first = admission.lease_lane(1, "backend", 8080, 8080, 1);
+    let second = admission.lease_lane(1, "backend", 8080, 8080, 1);
+    assert_eq!(admission.live_lane_count(), 1);
+
+    drop(first);
+    assert!(
+        admission.lane_for("backend", 8080).is_some(),
+        "a sibling in-flight dispatch must keep the lane live"
+    );
+
+    drop(second);
+    assert_eq!(
+        admission.live_lane_count(),
+        0,
+        "the registry must drain rather than retain retired policy"
+    );
+    assert_eq!(admission.lane_for("backend", 8080), None);
+}
+
+/// The lane key normalizes the host the same way on both sides, so the
+/// dispatch-side `UpstreamTarget.host` and the bracketed, URL-normalized
+/// authority reqwest hands the connector land on ONE lane.
+#[test]
+fn reqwest_lane_lookup_normalizes_host_case_and_ipv6_brackets() {
+    let admission = admission_only();
+    let _upper = admission.lease_lane(1, "Backend.Example", 8443, 443, 3);
+    let _v6 = admission.lease_lane(1, "[::1]", 8443, 443, 3);
+
+    let normalized = admission.lane_for("backend.example", 8443);
+    assert_eq!(normalized.map(|lane| lane.cap()), Some(3));
+    let bracketed_v6 = admission.lane_for("::1", 8443);
+    assert_eq!(bracketed_v6.map(|lane| lane.cap()), Some(3));
 }
 
 #[test]

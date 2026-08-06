@@ -737,6 +737,17 @@ fn classify_boxed_with_phase(
     e: &(dyn std::error::Error + Send + Sync + 'static),
     phase_is_connect: bool,
 ) -> ErrorClass {
+    // Gateway-side `connectionPool.tcp.maxConnections` refusal: no socket was
+    // opened and nothing reached the wire, so this is a pool-side, PRE-wire
+    // refusal (`ConnectionPoolError`), matching the typed classes the direct-H2,
+    // gRPC and HBONE pools already return. Checked before the typed/substring
+    // walk because the refusal carries no io/hyper/rustls type and would
+    // otherwise fall through to the `RequestError` catch-all, which
+    // `request_reached_wire` treats as POST-wire.
+    let plain: &(dyn std::error::Error + 'static) = e;
+    if crate::backend_conn_limit::is_backend_connection_limit_error(plain) {
+        return ErrorClass::ConnectionPoolError;
+    }
     if let Some(class) = classify_typed_chain(Some(e), phase_is_connect) {
         return class;
     }

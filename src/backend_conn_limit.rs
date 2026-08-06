@@ -324,6 +324,32 @@ impl<'a> PooledConnectionAdmission<'a> {
             .try_acquire_shared(self.host, self.policy_port, self.cap)
     }
 
+    /// Reserve one slot, mapping a refusal onto an [`anyhow::Error`] whose
+    /// SOURCE CHAIN still carries the typed [`BackendConnectionLimitExceeded`].
+    ///
+    /// For pools whose create surface is `anyhow` (native HTTP/3). A plain
+    /// `anyhow!("...")` would erase the type, leaving only the message —
+    /// [`crate::retry::classify_boxed_setup_error`] would then fall through to
+    /// `ErrorClass::RequestError`, which `retry::request_reached_wire` treats as
+    /// POST-wire. That is exactly wrong for a refusal decided before any packet
+    /// is sent: it would let the dispatch charge backend health and the
+    /// capability probe downgrade a perfectly healthy backend. Keeping the type
+    /// in the chain keeps the refusal a pre-wire `ConnectionPoolError` and lets
+    /// callers recognize it structurally
+    /// ([`is_backend_connection_limit_error`]).
+    pub fn acquire_or_typed_error(
+        &self,
+        transport: &str,
+    ) -> Result<SharedBackendConnectionGuard, anyhow::Error> {
+        self.acquire().map_err(|limit| {
+            let host = self.host;
+            let port = self.policy_port;
+            anyhow::Error::new(limit).context(format!(
+                "{transport}: DestinationRule maxConnections reached for {host}:{port}"
+            ))
+        })
+    }
+
     /// Destination host this lane counts sockets for (diagnostics/logging).
     pub fn host(&self) -> &str {
         self.host
@@ -341,14 +367,106 @@ impl<'a> PooledConnectionAdmission<'a> {
     }
 }
 
-/// One published reqwest admission lane: the DestinationRule policy port and
-/// cap that govern new sockets to a dial `(host, port)`, stamped with the
-/// config epoch that published it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct ReqwestLane {
-    policy_port: u16,
+/// One reqwest admission lane: the DestinationRule policy port and cap that
+/// govern new sockets to a dial `(host, port)`.
+///
+/// `Ord` is `(cap, policy_port)` lexicographic, which is exactly "strictest
+/// first": a lower ceiling wins, and a tie is broken deterministically by port
+/// so two conflicting publications resolve the same way in either arrival
+/// order. See [`ReqwestConnectionAdmission`] for why conflicts resolve to the
+/// strictest lane rather than to the publishing request's own lane.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct ReqwestLane {
     cap: u32,
-    epoch: u64,
+    policy_port: u16,
+}
+
+impl ReqwestLane {
+    /// DestinationRule policy port this lane counts sockets on.
+    pub fn policy_port(&self) -> u16 {
+        self.policy_port
+    }
+
+    /// Configured `connectionPool.tcp.maxConnections` for this lane.
+    pub fn cap(&self) -> u32 {
+        self.cap
+    }
+}
+
+/// Refcounted admission state for one dial `(host, port)`.
+///
+/// Mirrors [`crate::backend_pending_limit`]'s counter: the entry owns its map
+/// key so the RAII lease can evict it under the same `DashMap` shard lock that
+/// admission takes, and lives exactly as long as at least one capped dispatch to
+/// this destination is in flight.
+#[derive(Debug)]
+struct ReqwestDialLaneEntry {
+    key: String,
+    /// Guarded together so a lease can never observe a lane from one
+    /// publication paired with a generation from another. Every mutation runs
+    /// while the caller already holds the `DashMap` shard write lock, so this
+    /// mutex is uncontended by construction; it exists to give `remove_if`'s
+    /// `&V` predicate a legal mutation path (the same role the pending
+    /// limiter's `AtomicU64` plays for its single-field state).
+    state: std::sync::Mutex<ReqwestDialLaneState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReqwestDialLaneState {
+    /// Config generation that published `lane`.
+    generation: u64,
+    lane: ReqwestLane,
+    /// Live [`ReqwestLaneLease`]s. The entry is evicted at zero.
+    leases: u64,
+}
+
+impl ReqwestDialLaneEntry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReqwestDialLaneState> {
+        // A panic can never happen inside the critical section (it is field
+        // assignment on `Copy` scalars), but the production-code rule forbids
+        // `unwrap()`, and recovering the inner value is the correct behavior
+        // even if a future edit did panic: the state stays consistent and
+        // admission keeps enforcing.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Fold one publication into the lane and take a lease.
+    fn acquire(&self, generation: u64, lane: ReqwestLane) {
+        let mut state = self.lock();
+        state.leases += 1;
+        if state.leases == 1 || generation > state.generation {
+            // Freshly created entry, or a NEWER config publication: the new
+            // configuration replaces the old one wholesale, so an operator who
+            // raised (or removed and re-added) a cap sees it take effect
+            // immediately rather than being pinned to the retired ceiling.
+            state.generation = generation;
+            state.lane = lane;
+        } else if generation == state.generation && lane < state.lane {
+            // Same generation, conflicting lanes: strictest wins.
+            state.lane = lane;
+        }
+        // `generation < state.generation` — a request pinned to a retired
+        // configuration reaching dispatch after a reload. It keeps its lease
+        // (so the destination stays governed) but may not weaken the live
+        // policy back to the retired one.
+    }
+
+    /// Release one lease. Returns `true` when the entry is now idle and the
+    /// caller (holding the shard write lock) should evict it.
+    fn release_is_idle(&self) -> bool {
+        let mut state = self.lock();
+        // Straight subtraction, not `saturating_sub`: a double-release or
+        // missing-acquire must panic in tests rather than be masked into a
+        // silently unbounded destination.
+        state.leases -= 1;
+        state.leases == 0
+    }
+
+    fn lane(&self) -> ReqwestLane {
+        self.lock().lane
+    }
 }
 
 thread_local! {
@@ -398,28 +516,43 @@ fn write_lane_key(buf: &mut String, host: &str, dial_port: u16) {
 ///   (TLS material, `rcfg`, forced-H1 ALPN, subset) for the same destination
 ///   still share ONE ceiling.
 ///
-/// # Lane publication
+/// # Binding a lane to the connect attempt
 ///
 /// The connector only knows the dial `(host, port)` from the URI. The cap and
 /// the DestinationRule **policy** port live on the dispatching `Proxy`, so the
-/// dispatch path publishes the lane immediately before handing the request to
-/// reqwest — but only when a cap is actually configured, so an uncapped
-/// destination costs nothing anywhere. Publication is idempotent and
-/// allocation-free on repeat.
+/// dispatch path takes a [`ReqwestLaneLease`] for the destination immediately
+/// before handing the request to reqwest and holds it until `send()` resolves —
+/// the exact window in which that request can cause a dial. Only a destination
+/// with a configured cap ever takes a lease, so an uncapped destination costs
+/// nothing anywhere.
 ///
-/// Lanes are stamped with the request's pinned config generation. The current
-/// generation advances on every config publication (or when the first request
-/// from that publication reaches dispatch). A lane whose epoch is stale is
-/// ignored, so a `maxConnections` an operator **removed** stops being enforced
-/// without needing a withdrawal pass over every host a proxy ever dialed; the
-/// dispatch that re-publishes runs before the dial it will cause, so a cap that
-/// still exists is re-stamped before it is next consulted. Lane replacement is
-/// monotonic by generation: a late in-flight request pinned to an older config
-/// can neither resurrect a removed cap nor overwrite the newer lane.
+/// A lane therefore exists **exactly while some capped dispatch is in flight to
+/// it**. That is what makes reload behavior correct without an epoch registry:
+/// a `maxConnections` an operator removed stops applying as soon as the
+/// requests that were dispatched under it complete (nothing re-leases it), and
+/// nothing has to be swept, so no stale registry can accumulate.
+///
+/// # Why conflicts resolve to the strictest lane, not the publisher's own
+///
+/// Several logical upstreams (different proxies, subsets, or `targetPort`
+/// remaps) can resolve DIFFERENT `(policy port, cap)` for the SAME dial
+/// address. `maxConnections` is deliberately **not** part of the reqwest pool
+/// key — it changes admission, not connection identity — so those upstreams
+/// share one `reqwest::Client` and therefore one physical socket pool. A socket
+/// admitted under the laxer lane is subsequently REUSED by the stricter
+/// upstream, so binding each connect attempt to its own publisher's lane would
+/// not enforce the stricter cap; it would only decide, nondeterministically,
+/// which request paid for the socket. The only sound bound for a shared pool is
+/// the strictest live lane, which is what [`ReqwestLane`]'s `Ord` selects. That
+/// is deterministic (independent of publication order), fail-closed, and
+/// converges on the exact configured cap in the overwhelmingly common
+/// single-lane case.
+///
+/// Across a reload the newest configuration generation replaces the lane
+/// wholesale, and a request pinned to a retired generation may never weaken it.
 pub struct ReqwestConnectionAdmission {
     limiter: SharedBackendConnectionLimiter,
-    lanes: DashMap<String, ReqwestLane>,
-    epoch: AtomicU64,
+    lanes: Arc<DashMap<String, Arc<ReqwestDialLaneEntry>>>,
 }
 
 impl ReqwestConnectionAdmission {
@@ -427,93 +560,123 @@ impl ReqwestConnectionAdmission {
     pub fn new(limiter: SharedBackendConnectionLimiter, shards: usize) -> Self {
         Self {
             limiter,
-            lanes: DashMap::with_shard_amount(shards),
-            // Every RequestEpochStore starts at generation 1.
-            epoch: AtomicU64::new(1),
+            lanes: Arc::new(DashMap::with_shard_amount(shards)),
         }
     }
 
-    /// Advance to an explicitly published configuration generation.
-    ///
-    /// `fetch_max` is deliberate: request dispatch may observe the newly
-    /// published RequestEpoch just before the cold-path mirror runs, while an
-    /// older in-flight request may arrive arbitrarily later. Neither ordering
-    /// is allowed to move admission back to a retired generation.
-    pub fn advance_config_epoch(&self, config_generation: u64) {
-        self.epoch.fetch_max(config_generation, Ordering::AcqRel);
-    }
-
-    /// Publish (or refresh) the lane governing new sockets to
-    /// `(dial_host, dial_port)`.
+    /// Take a lease on the lane governing new sockets to
+    /// `(dial_host, dial_port)`, binding it to this dispatch.
     ///
     /// Call ONLY when a cap is configured for the destination — the uncapped
     /// path must not touch this map. `policy_port` is the DestinationRule
     /// policy port ([`crate::proxy::dispatch_policy_port_for_target`]), which
     /// is what the counter lane is keyed by, so a `targetPort` remap and a raw
     /// TCP/WebSocket session to the same destination share one ceiling.
-    pub fn publish_lane(
+    ///
+    /// `config_generation` is the request's pinned configuration generation; it
+    /// decides reload precedence (see the type docs). The returned lease MUST be
+    /// held across the reqwest `send()` this dispatch performs.
+    #[must_use = "the lane exists only while its lease is held"]
+    pub fn lease_lane(
         &self,
         config_generation: u64,
         dial_host: &str,
         dial_port: u16,
         policy_port: u16,
         cap: u32,
-    ) {
-        // A request from the newly published epoch can reach dispatch before
-        // the compatibility-mirror callback advances the hook. Let that
-        // request close the tiny handoff window itself; an old request cannot
-        // lower the generation.
-        self.advance_config_epoch(config_generation);
-        let lane = ReqwestLane {
-            policy_port,
-            cap,
-            epoch: config_generation,
-        };
-        LANE_KEY_BUF.with(|buf| {
+    ) -> ReqwestLaneLease {
+        let lane = ReqwestLane { cap, policy_port };
+        let entry = LANE_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
             write_lane_key(&mut buf, dial_host, dial_port);
-            // Hit path: an unchanged lane is a borrowed-`&str` read, no write
-            // and no allocation.
-            if let Some(existing) = self.lanes.get(buf.as_str())
-                && *existing == lane
-            {
-                return;
+            // Hit path: a borrowed-`&str` `get` (read-locks only this shard) —
+            // no key allocation for a destination already in flight. The
+            // allocating `entry` path runs only when this is the first capped
+            // dispatch in flight to the destination.
+            if let Some(existing) = self.lanes.get(buf.as_str()) {
+                let entry = Arc::clone(existing.value());
+                // Fold under the SHARD READ LOCK, which is still held by
+                // `existing`: `release` evicts under the shard WRITE lock, so
+                // the entry cannot be evicted between this clone and the
+                // lease increment.
+                entry.acquire(config_generation, lane);
+                return entry;
             }
-            // The allocating entry path is cold (new/changed/stale lane). An
-            // older request must never overwrite a lane already published by
-            // a newer configuration generation.
-            match self.lanes.entry(buf.clone()) {
-                dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                    if entry.get().epoch <= lane.epoch {
-                        entry.insert(lane);
-                    }
-                }
-                dashmap::mapref::entry::Entry::Vacant(entry) => {
-                    entry.insert(lane);
-                }
-            }
+            let occupied = self.lanes.entry(buf.clone()).or_insert_with(|| {
+                Arc::new(ReqwestDialLaneEntry {
+                    key: buf.clone(),
+                    state: std::sync::Mutex::new(ReqwestDialLaneState {
+                        generation: config_generation,
+                        lane,
+                        leases: 0,
+                    }),
+                })
+            });
+            let entry = Arc::clone(occupied.value());
+            // Increment while `occupied` still holds the shard WRITE lock, so a
+            // concurrent lease/release can never evict this entry between its
+            // insertion and its first lease (which would detach the lane from
+            // the map and silently stop enforcing the cap).
+            entry.acquire(config_generation, lane);
+            drop(occupied);
+            entry
         });
+        ReqwestLaneLease {
+            lanes: Arc::clone(&self.lanes),
+            entry,
+        }
     }
 
     /// Resolve the live lane for a dial destination, if any.
-    fn lane_for(&self, host: &str, port: u16) -> Option<ReqwestLane> {
-        let current = self.epoch.load(Ordering::Acquire);
+    ///
+    /// Public so the external suite can assert lane resolution (conflict
+    /// ordering, reload precedence, lease drain) without driving real sockets;
+    /// production reads it only through [`reqwest::ConnectionAdmission::admit`].
+    pub fn lane_for(&self, host: &str, port: u16) -> Option<ReqwestLane> {
         LANE_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
             write_lane_key(&mut buf, host, port);
-            self.lanes
-                .get(buf.as_str())
-                .map(|lane| *lane)
-                .filter(|lane| lane.epoch == current)
+            self.lanes.get(buf.as_str()).map(|entry| entry.lane())
         })
+    }
+
+    /// Number of dial destinations with a live lane. Tests/diagnostics — proves
+    /// the registry drains rather than accumulating retired policy.
+    #[allow(dead_code)]
+    pub fn live_lane_count(&self) -> usize {
+        self.lanes.len()
     }
 
     /// Current open-socket count for a destination lane. Tests/diagnostics.
     #[allow(dead_code)]
     pub fn current(&self, host: &str, policy_port: u16) -> u64 {
         self.limiter.current(host, policy_port)
+    }
+}
+
+/// RAII lease binding one capped reqwest dispatch to its admission lane.
+///
+/// The lane governing a dial destination exists exactly while at least one lease
+/// is held, so the cap is live for precisely the window in which the leasing
+/// request can cause a physical dial. Dropping the last lease evicts the entry
+/// under the same `DashMap` shard write lock that
+/// [`ReqwestConnectionAdmission::lease_lane`] acquires under, so an acquirer can
+/// never resurrect a half-evicted entry and a retired policy can never linger.
+pub struct ReqwestLaneLease {
+    lanes: Arc<DashMap<String, Arc<ReqwestDialLaneEntry>>>,
+    entry: Arc<ReqwestDialLaneEntry>,
+}
+
+impl Drop for ReqwestLaneLease {
+    fn drop(&mut self) {
+        // Decrement and at-zero eviction in ONE shard-locked `remove_if`, the
+        // same mutual exclusion `BackendPendingGuard` relies on: an acquirer
+        // holding the shard lock can never observe the entry "between" the
+        // decrement and the removal.
+        self.lanes
+            .remove_if(self.entry.key.as_str(), |_, entry| entry.release_is_idle());
     }
 }
 
@@ -693,44 +856,6 @@ mod tests {
         assert_eq!(limiter.current("backend-a", 80), 1);
         assert_eq!(limiter.current("backend-b", 80), 1);
         assert_eq!(limiter.current("backend-a", 443), 1);
-    }
-
-    #[test]
-    fn retired_request_cannot_overwrite_newer_reqwest_lane() {
-        let limiter = Arc::new(BackendConnectionLimiter::new());
-        let admission = ReqwestConnectionAdmission::new(limiter, 8);
-
-        admission.publish_lane(1, "backend", 8080, 8080, 1);
-        admission.advance_config_epoch(2);
-        admission.publish_lane(2, "backend", 8080, 8080, 4);
-
-        // A request that pinned generation 1 before reload may reach dispatch
-        // after generation 2. It must not replace generation 2's policy.
-        admission.publish_lane(1, "backend", 8080, 8080, 1);
-
-        assert_eq!(
-            admission.lane_for("backend", 8080),
-            Some(ReqwestLane {
-                policy_port: 8080,
-                cap: 4,
-                epoch: 2,
-            })
-        );
-    }
-
-    #[test]
-    fn retired_request_cannot_resurrect_removed_reqwest_lane() {
-        let limiter = Arc::new(BackendConnectionLimiter::new());
-        let admission = ReqwestConnectionAdmission::new(limiter, 8);
-
-        admission.publish_lane(1, "backend", 8080, 8080, 1);
-        admission.advance_config_epoch(2);
-
-        // Generation 2 removed the cap. No generation-2 lane is published;
-        // an old in-flight generation-1 request remains unable to revive it.
-        admission.publish_lane(1, "backend", 8080, 8080, 1);
-
-        assert_eq!(admission.lane_for("backend", 8080), None);
     }
 
     #[test]

@@ -5760,9 +5760,12 @@ pub struct ProxyState {
     /// vendored `ClientBuilder::connection_admission` hook. Pooled reuse and
     /// multiplexed H2 streams never reach it, and the admitted token is owned
     /// by the connection object, so an idle socket reqwest retains after a
-    /// request still holds its slot. The dispatch path publishes the
-    /// destination lane (dial `(host, port)` -> policy port + cap) just before
-    /// handing the request to reqwest, and only when a cap is configured.
+    /// request still holds its slot. The dispatch path binds the destination
+    /// lane (dial `(host, port)` -> policy port + cap) to its own dispatch with
+    /// an RAII
+    /// [`crate::backend_conn_limit::ReqwestLaneLease`] held across `send()`, and
+    /// only when a cap is configured — so a lane is live exactly while a capped
+    /// request can cause a dial, and a removed cap drains with its requests.
     pub reqwest_conn_admission: Arc<crate::backend_conn_limit::ReqwestConnectionAdmission>,
     /// Per-destination in-flight-request limiter enforcing DestinationRule
     /// `connectionPool.http.http1MaxPendingRequests` on the reqwest/HTTP-1.1
@@ -8162,7 +8165,14 @@ impl ProxyState {
                 // `record.last_probe_error` directly instead — the outer
                 // function merges this into the combined error string.
                 let class = http2_pool::classify_http2_pool_error(&err);
-                let preserve = is_transient_capability_probe_failure(class);
+                // Same reasoning as the H3 probe: a `maxConnections` refusal is
+                // a gateway-side ceiling, not evidence the backend lost H2. This
+                // arm already probes `Unknown`, so preserving is all that is
+                // needed to keep a prior `Supported` from being erased whenever
+                // the refresh happens to run while the cap is saturated.
+                use http2_pool::Http2PoolError;
+                let refused_by_cap = matches!(err, Http2PoolError::MaxConnectionsExceeded { .. });
+                let preserve = refused_by_cap || is_transient_capability_probe_failure(class);
                 record.plain_http.h2_tls =
                     backend_capabilities::merge_protocol_probe_classification(
                         previous_h2_tls,
@@ -8368,10 +8378,25 @@ impl ProxyState {
             },
             Ok(Err(err)) => {
                 let class = crate::http3::client::classify_http3_error(err.as_ref());
-                let preserve = is_transient_capability_probe_failure(class);
+                // A `connectionPool.tcp.maxConnections` refusal is the GATEWAY
+                // declining to open one more socket to a destination that is at
+                // its ceiling — the probe never dialed, so it carries ZERO
+                // evidence about the backend's H3 support. Reading it as
+                // `Unsupported` would durably downgrade a perfectly healthy H3
+                // backend (and route every subsequent request through reqwest)
+                // simply because live traffic had the cap saturated when the
+                // refresh ran. Probe `Unknown` + preserve, so a prior
+                // `Supported` survives and a first probe stays undecided.
+                let refused_by_cap = crate::pool::is_max_connections_refusal(err.as_ref());
+                let probed = if refused_by_cap {
+                    ProtocolSupport::Unknown
+                } else {
+                    ProtocolSupport::Unsupported
+                };
+                let preserve = refused_by_cap || is_transient_capability_probe_failure(class);
                 let h3 = backend_capabilities::merge_protocol_probe_classification(
                     previous_h3,
-                    ProtocolSupport::Unsupported,
+                    probed,
                     preserve,
                 );
                 if preserve && matches!(h3, ProtocolSupport::Supported) {
@@ -9692,13 +9717,13 @@ impl ProxyState {
                 self.router_cache.clear_lookup_caches();
             }
         }
-        // A config publication can REMOVE a destination's
-        // `connectionPool.tcp.maxConnections`. Reqwest admission lanes are
-        // published lazily by the dispatch path, so invalidate them all here;
-        // a cap that still exists is re-published by the next dispatch, before
-        // the dial it causes. See `ReqwestConnectionAdmission`.
-        self.reqwest_conn_admission
-            .advance_config_epoch(published.config_generation);
+        // No withdrawal pass is needed for the reqwest `maxConnections` admission
+        // lanes: a lane exists only while some capped dispatch holds a lease
+        // across its `send()`, so a cap this publication REMOVED stops applying
+        // as soon as the requests dispatched under the old configuration drain,
+        // and the registry drains with them. A cap this publication CHANGED is
+        // replaced wholesale by the first dispatch carrying the newer generation
+        // (see `ReqwestConnectionAdmission`).
         self.plugin_cache
             .store_inner(Arc::clone(&published.plugin_cache));
         self.consumer_index
@@ -33457,21 +33482,22 @@ pub(crate) async fn proxy_to_backend_retry(
         }
     };
 
-    // Republish the `connectionPool.tcp.maxConnections` lane for this retry
+    // Lease the `connectionPool.tcp.maxConnections` lane for this retry
     // attempt's destination. The retry may target a DIFFERENT LB target than the
-    // initial attempt, so the lane for that host must exist before the dial this
-    // attempt can cause. Enforcement itself lives in reqwest's connector (see
-    // `proxy_to_backend`); publication is idempotent and allocation-free on
-    // repeat, and a retry that reuses an idle socket takes no slot at all.
-    if let Some(cap) = resolve_backend_max_connections(proxy, retry_policy_port) {
-        state.reqwest_conn_admission.publish_lane(
-            request_ctx.config_generation,
-            effective_host,
-            retry_dial_port,
-            retry_policy_port,
-            cap,
-        );
-    }
+    // initial attempt, so the lane for that host must be live before the dial
+    // this attempt can cause. Enforcement itself lives in reqwest's connector
+    // (see `proxy_to_backend`); a retry that reuses an idle socket never reaches
+    // the connector and takes no slot at all.
+    let retry_conn_lane_lease =
+        resolve_backend_max_connections(proxy, retry_policy_port).map(|cap| {
+            state.reqwest_conn_admission.lease_lane(
+                request_ctx.config_generation,
+                effective_host,
+                retry_dial_port,
+                retry_policy_port,
+                cap,
+            )
+        });
 
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
@@ -33496,6 +33522,10 @@ pub(crate) async fn proxy_to_backend_retry(
     // the response lifetime. A no-cap / non-HTTP-1.1 retry holds `None` here, so
     // the drop is a no-op.
     drop(retry_pending_slot);
+    // Same join point for this attempt's `maxConnections` lane lease — see
+    // `proxy_to_backend` for why `send()` resolving is the last moment a new
+    // physical dial can be caused.
+    drop(retry_conn_lane_lease);
     match send_result {
         Ok(response) => {
             let status = response.status().as_u16();
@@ -35853,19 +35883,20 @@ async fn proxy_to_backend(
     // The lane is keyed by the DIAL `(host, port)` (what the connector sees in
     // the URI) but COUNTS on the DestinationRule policy port, so a `targetPort`
     // remap, a WebSocket session, and a raw-TCP session to the same destination
-    // all share one ceiling. Publication happens before `send()`, so the lane is
-    // live for any dial this request causes; a `maxConnections` an operator
-    // removed stops applying because a config publication invalidates every
-    // lane epoch and nothing re-publishes it.
-    if let Some(cap) = resolve_backend_max_connections(proxy, pending_policy_port) {
-        state.reqwest_conn_admission.publish_lane(
+    // all share one ceiling. The lease is taken BEFORE `send()` and released
+    // after it resolves — exactly the window in which this request can cause a
+    // dial — so the lane is live for every dial it causes and for no longer. A
+    // `maxConnections` an operator removed stops applying as soon as the
+    // requests dispatched under it drain, with no epoch registry to sweep.
+    let conn_lane_lease = resolve_backend_max_connections(proxy, pending_policy_port).map(|cap| {
+        state.reqwest_conn_admission.lease_lane(
             request_ctx.config_generation,
             effective_host,
             pending_dial_port,
             pending_policy_port,
             cap,
-        );
-    }
+        )
+    });
     backend_admission_permits = match preacquired_backend_admission.take_or_run(
         backend_admission_plugins,
         request_ctx,
@@ -35914,6 +35945,12 @@ async fn proxy_to_backend(
     // point (admission reject); this explicit drop covers the response-handling
     // tail BELOW it. A no-cap / non-HTTP-1.1 dispatch holds `None`, so it no-ops.
     drop(pending_slot);
+    // Same join point for the `maxConnections` lane lease: `send()` resolving is
+    // the last moment this request can cause a NEW physical dial (redirects and
+    // connection establishment all happen inside it; the response body streams
+    // on the socket that is already open). Holding it longer would only keep a
+    // retired policy alive after a reload. RAII covers the early returns above.
+    drop(conn_lane_lease);
     let response = match send_result {
         Ok(response) => {
             // A streaming request body that overran `max_request_body_size_bytes`
