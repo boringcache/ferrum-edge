@@ -107,6 +107,149 @@ pub mod _test_support {
         crate::modes::data_plane::await_dp_listener_handles(listener_handles, shutdown_tx).await
     }
 
+    /// Test-only view of sticky-session `Set-Cookie` construction (#3278).
+    ///
+    /// `namespace` / `upstream_id` are the scope the emitted token is bound to;
+    /// the value must equal
+    /// [`crate::load_balancer::sticky_session_token`] over the same scope and
+    /// target, which is what makes the cookie resolvable back to that exact
+    /// backend by `LoadBalancer::select_sticky`.
+    pub fn build_sticky_cookie_header_for_test(
+        cookie_name: &str,
+        namespace: &str,
+        upstream_id: &str,
+        target: &crate::config::types::UpstreamTarget,
+        config: &crate::config::types::HashOnCookieConfig,
+    ) -> String {
+        crate::proxy::build_sticky_cookie_header(
+            cookie_name,
+            namespace,
+            upstream_id,
+            target,
+            config,
+        )
+    }
+
+    /// Test-only view of the SINGLE sticky-affinity `Set-Cookie` mint site every
+    /// response path shares (#3278).
+    ///
+    /// H1/H2 plain, buffered AND fully-streaming native gRPC, WebSocket
+    /// upgrades, and the HTTP/3 relays all reach the wire through this function,
+    /// so a test here covers the streaming gRPC fast path — which returns before
+    /// the buffered branch ever runs — as well as the append semantics that keep
+    /// a co-present backend `Set-Cookie` intact.
+    pub fn inject_sticky_affinity_cookie_for_test(
+        proxy: &crate::config::types::Proxy,
+        balancers: &crate::load_balancer::LoadBalancerCacheInner,
+        served_target: Option<&crate::config::types::UpstreamTarget>,
+        reissue_needed: bool,
+        response_headers: &mut HashMap<String, String>,
+    ) -> bool {
+        crate::proxy::inject_sticky_affinity_cookie(
+            proxy,
+            balancers,
+            served_target,
+            reissue_needed,
+            response_headers,
+        )
+    }
+
+    /// Test-only view of the sticky-binding lookup used by
+    /// `backend_dispatch::select_upstream_target`'s early return (#3278).
+    ///
+    /// This is the production resolver, so a test through it also covers the
+    /// selected-port precedence guard: a token whose target lives in a per-port
+    /// policy lane that no longer elects this cookie must fail closed to
+    /// ordinary selection instead of being honored. `health: None` keeps the
+    /// test focused on pool/lane scoping; health filtering is covered directly
+    /// through `LoadBalancerCache::select_sticky_from`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_sticky_binding_for_test(
+        proxy: &crate::config::types::Proxy,
+        balancers: &crate::load_balancer::LoadBalancerCacheInner,
+        upstream_id: &str,
+        presented_token: &str,
+        presented_cookie_name: &str,
+        selection_port_scope: Option<u16>,
+        subset_name: Option<&str>,
+    ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
+        crate::proxy::backend_dispatch::resolve_sticky_binding(
+            proxy,
+            balancers,
+            upstream_id,
+            presented_token,
+            presented_cookie_name,
+            selection_port_scope,
+            subset_name,
+            None,
+        )
+    }
+
+    /// Test-only view of the per-request wildcard DIAL concretization every
+    /// H1/H2 and H3 request path applies to the selected target (#3278).
+    ///
+    /// This is the production helper, so a test through it exercises the real
+    /// clone whose `host` is the request authority — the target that is dialed,
+    /// pooled, and resolved, and the one whose identity is deliberately NOT the
+    /// upstream's configured sticky identity.
+    pub fn concretize_wildcard_target_for_request_for_test(
+        target: Option<Arc<crate::config::types::UpstreamTarget>>,
+        request_host: Option<&str>,
+    ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
+        use crate::proxy::backend_dispatch::concretize_wildcard_target_for_request;
+        concretize_wildcard_target_for_request(target, request_host)
+    }
+
+    /// Test adapter for the request-derived retry-target inputs.
+    pub struct RetryTargetRequestForTest<'a> {
+        pub base_hash_key: &'a str,
+        pub client_ip: &'a str,
+        pub proxy_headers: &'a std::collections::HashMap<String, String>,
+        pub request_authority: Option<&'a str>,
+    }
+
+    /// Test-only view of shared retry-target selection (#3278 / PR #3585).
+    ///
+    /// Returns a DIAL target: a concretized previous wildcard is excluded by its
+    /// configured identity, and a selected wildcard is re-concretized with
+    /// `request_authority` (or the helper returns `None` rather than dialing a
+    /// literal `*.example.com`).
+    pub fn select_next_retry_target_for_test(
+        state: &crate::proxy::ProxyState,
+        epoch: &crate::request_epoch::RequestEpoch,
+        proxy: &crate::config::types::Proxy,
+        prev_target: &crate::config::types::UpstreamTarget,
+        request: RetryTargetRequestForTest<'_>,
+    ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
+        crate::proxy::backend_dispatch::select_next_retry_target(
+            state,
+            epoch,
+            proxy,
+            prev_target,
+            crate::proxy::backend_dispatch::RetryTargetRequest {
+                base_hash_key: request.base_hash_key,
+                client_ip: request.client_ip,
+                proxy_headers: request.proxy_headers,
+                request_authority: request.request_authority,
+            },
+        )
+    }
+
+    /// Test-only view of the shared retry-rotation reissue derivation every
+    /// response path uses to decide whether — and for which backend — a
+    /// sticky-session cookie must be minted (#3278).
+    pub fn sticky_cookie_reissue_target_for_test<'a>(
+        selection_needs_set: bool,
+        selected_target: Option<&crate::config::types::UpstreamTarget>,
+        served_target: Option<&'a crate::config::types::UpstreamTarget>,
+    ) -> Option<&'a crate::config::types::UpstreamTarget> {
+        crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
+            selection_needs_set,
+            selected_target,
+            served_target,
+        )
+    }
+
     /// Public mirror of the crate-private TCP SO_REUSEPORT accept-loop peer class.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TcpAcceptLoopClass {

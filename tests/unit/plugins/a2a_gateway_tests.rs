@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use ferrum_edge::plugins::{
-    HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, ResponseStreamAction, create_plugin,
-    create_response_stream_inspector,
+    HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, ResponsePresentationPolicy,
+    ResponseStreamAction, create_plugin, create_response_stream_inspector,
     utils::metadata_redaction::is_sensitive_metadata_key_with_extras,
 };
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
@@ -59,7 +59,7 @@ fn grpc_ctx(rpc: &str, content_type: &str) -> (RequestContext, HashMap<String, S
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
-        format!("/lf.a2a.v1.A2AService/{rpc}"),
+        format!("/a2a.v1.A2AService/{rpc}"),
     );
     ctx.headers
         .insert("content-type".to_string(), content_type.to_string());
@@ -394,7 +394,7 @@ async fn grpc_a2a_method_is_detected_without_request_buffering() {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
-        "/lf.a2a.v1.A2AService/SendStreamingMessage".to_string(),
+        "/a2a.v1.A2AService/SendStreamingMessage".to_string(),
     );
     ctx.headers
         .insert("content-type".to_string(), "application/grpc".to_string());
@@ -1108,6 +1108,2371 @@ async fn grpc_get_agent_card_denied_via_pascalcase_policy_alias() {
     );
 }
 
+fn encode_proto_varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn encode_proto_string(field: u32, value: &str, out: &mut Vec<u8>) {
+    encode_proto_varint(u64::from(field) << 3 | 2, out);
+    encode_proto_varint(value.len() as u64, out);
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn encode_proto_bytes(field: u32, value: &[u8], out: &mut Vec<u8>) {
+    encode_proto_varint(u64::from(field) << 3 | 2, out);
+    encode_proto_varint(value.len() as u64, out);
+    out.extend_from_slice(value);
+}
+
+fn encode_proto_varint_field(field: u32, value: u64, out: &mut Vec<u8>) {
+    encode_proto_varint(u64::from(field) << 3, out);
+    encode_proto_varint(value, out);
+}
+
+fn encode_proto_fixed64_field(field: u32, value: u64, out: &mut Vec<u8>) {
+    encode_proto_varint(u64::from(field) << 3 | 1, out);
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn encode_proto_fixed32_field(field: u32, value: u32, out: &mut Vec<u8>) {
+    encode_proto_varint(u64::from(field) << 3 | 5, out);
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Minimal Agent Card with identity + endpoint fields; optional extras appended.
+fn encode_minimal_agent_card(
+    name: &str,
+    description: &str,
+    url: &str,
+    extras: impl FnOnce(&mut Vec<u8>),
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_proto_string(1, name, &mut out);
+    encode_proto_string(2, description, &mut out);
+    encode_proto_string(3, url, &mut out);
+    extras(&mut out);
+    out
+}
+
+async fn detect_grpc_agent_card(
+    plugin: &std::sync::Arc<dyn ferrum_edge::plugins::Plugin>,
+    rpc: &str,
+) -> RequestContext {
+    let (mut ctx, mut headers) = grpc_ctx(rpc, "application/grpc");
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    ctx
+}
+
+fn assert_grpc_rewrite_reject(result: PluginResult, diagnostic: &str, metadata: Option<&str>) {
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    } = result
+    else {
+        panic!("expected gRPC Agent Card rewrite reject for {diagnostic}");
+    };
+    // A gRPC failure rides HTTP 200 + a `grpc-status` trailer. An HTTP 5xx here
+    // would publish a synthetic backend-shaped fault for a gateway-side policy
+    // refusal; the deadline terminal (`grpc_deadline_exceeded_plugin_result`)
+    // uses the same 200 shape.
+    assert_eq!(status_code, 200);
+    assert!(
+        body.is_empty(),
+        "a gRPC rewrite refusal must be trailers-only, never an HTTP body"
+    );
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("13"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some(diagnostic)
+    );
+    if let Some(metadata) = metadata {
+        assert_eq!(metadata, diagnostic);
+    }
+}
+
+fn encode_agent_interface(url: &str, transport: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_proto_string(1, url, &mut out);
+    encode_proto_string(2, transport, &mut out);
+    out
+}
+
+fn encode_agent_card_signature(protected: &str, signature: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_proto_string(1, protected, &mut out);
+    encode_proto_string(2, signature, &mut out);
+    out
+}
+
+fn encode_a2a_03_agent_card(
+    name: &str,
+    description: &str,
+    url: &str,
+    preferred_transport: &str,
+    interfaces: &[(&str, &str)],
+    protocol_version: &str,
+    with_signature: bool,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_proto_string(1, name, &mut out);
+    encode_proto_string(2, description, &mut out);
+    encode_proto_string(3, url, &mut out);
+    encode_proto_string(14, preferred_transport, &mut out);
+    for (interface_url, transport) in interfaces {
+        encode_proto_bytes(
+            15,
+            &encode_agent_interface(interface_url, transport),
+            &mut out,
+        );
+    }
+    encode_proto_string(16, protocol_version, &mut out);
+    if with_signature {
+        encode_proto_bytes(
+            17,
+            &encode_agent_card_signature("eyJhbGciOiJFUzI1NiJ9", "stale"),
+            &mut out,
+        );
+    }
+    out
+}
+
+/// A2A renumbered `AgentCard` for 1.0: field 3 is
+/// `repeated AgentInterface supported_interfaces` (it was `string url` in
+/// 0.3.x), `signatures` moved from field 17 to field 13, field 14 is
+/// `optional string icon_url` (it was `preferred_transport`), and
+/// `protocol_version` (field 16) was removed from the message entirely.
+///
+/// Every byte of a serialized `AgentInterface` stays below 0x80, so the
+/// submessage on field 3 decodes as valid UTF-8 — `from_utf8` alone cannot
+/// tell this layout apart from a 0.3 card.
+fn encode_a2a_10_agent_card(
+    name: &str,
+    description: &str,
+    interfaces: &[(&str, &str)],
+    icon_url: Option<&str>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_proto_string(1, name, &mut out);
+    encode_proto_string(2, description, &mut out);
+    for (interface_url, protocol_binding) in interfaces {
+        encode_proto_bytes(
+            3,
+            &encode_agent_interface(interface_url, protocol_binding),
+            &mut out,
+        );
+    }
+    encode_proto_bytes(
+        13,
+        &encode_agent_card_signature("eyJhbGciOiJFUzI1NiJ9", "v1-signature"),
+        &mut out,
+    );
+    if let Some(icon_url) = icon_url {
+        encode_proto_string(14, icon_url, &mut out);
+    }
+    out
+}
+
+/// The buffered native-gRPC response view a plugin sees for a SUCCESSFUL unary
+/// reply: `application/grpc` plus the terminal `grpc-status: 0` the proxy merges
+/// out of the backend's TRAILERS frame
+/// (`grpc_proxy::build_grpc_plugin_header_view`). Both are required before
+/// `a2a_gateway` will treat a body as a candidate Agent Card, so a helper keeps
+/// every rewrite test honest about the shape it is actually asserting on.
+fn grpc_ok_response_headers() -> HashMap<String, String> {
+    HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("grpc-status".to_string(), "0".to_string()),
+    ])
+}
+
+fn frame_grpc_message(message: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + message.len());
+    frame.push(0);
+    frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    frame.extend_from_slice(message);
+    frame
+}
+
+fn proto_string_field(message: &[u8], target: u32) -> Option<String> {
+    let mut buf = message;
+    while !buf.is_empty() {
+        let mut key = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = *buf.first()?;
+            buf = &buf[1..];
+            key |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        let field = (key >> 3) as u32;
+        let wire = (key & 0x07) as u8;
+        match wire {
+            0 => {
+                for shift in (0..64).step_by(7) {
+                    let byte = *buf.first()?;
+                    buf = &buf[1..];
+                    if byte & 0x80 == 0 {
+                        let _ = shift;
+                        break;
+                    }
+                }
+            }
+            1 => {
+                if buf.len() < 8 {
+                    return None;
+                }
+                buf = &buf[8..];
+            }
+            2 => {
+                let mut len = 0usize;
+                for shift in (0..64).step_by(7) {
+                    let byte = *buf.first()?;
+                    buf = &buf[1..];
+                    len |= usize::from(byte & 0x7f) << shift;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+                if buf.len() < len {
+                    return None;
+                }
+                let (value, rest) = buf.split_at(len);
+                buf = rest;
+                if field == target {
+                    return std::str::from_utf8(value).ok().map(str::to_owned);
+                }
+            }
+            5 => {
+                if buf.len() < 4 {
+                    return None;
+                }
+                buf = &buf[4..];
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn proto_has_field(message: &[u8], target: u32) -> bool {
+    let mut buf = message;
+    while !buf.is_empty() {
+        let mut key = 0u64;
+        for shift in (0..64).step_by(7) {
+            let Some(&byte) = buf.first() else {
+                return false;
+            };
+            buf = &buf[1..];
+            key |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                let _ = shift;
+                break;
+            }
+        }
+        let field = (key >> 3) as u32;
+        let wire = (key & 0x07) as u8;
+        let len = match wire {
+            0 => {
+                for _ in 0..10 {
+                    let Some(&byte) = buf.first() else {
+                        return false;
+                    };
+                    buf = &buf[1..];
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+                0
+            }
+            1 => 8,
+            2 => {
+                let mut len = 0usize;
+                for shift in (0..64).step_by(7) {
+                    let Some(&byte) = buf.first() else {
+                        return false;
+                    };
+                    buf = &buf[1..];
+                    len |= usize::from(byte & 0x7f) << shift;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+                len
+            }
+            5 => 4,
+            _ => return false,
+        };
+        if wire != 0 {
+            if buf.len() < len {
+                return false;
+            }
+            buf = &buf[len..];
+        }
+        if field == target {
+            return true;
+        }
+    }
+    false
+}
+
+fn proto_repeated_messages(message: &[u8], target: u32) -> Vec<Vec<u8>> {
+    let mut found = Vec::new();
+    let mut buf = message;
+    while !buf.is_empty() {
+        let mut key = 0u64;
+        for shift in (0..64).step_by(7) {
+            let Some(&byte) = buf.first() else {
+                return found;
+            };
+            buf = &buf[1..];
+            key |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        let field = (key >> 3) as u32;
+        let wire = (key & 0x07) as u8;
+        match wire {
+            0 => {
+                for _ in 0..10 {
+                    let Some(&byte) = buf.first() else {
+                        return found;
+                    };
+                    buf = &buf[1..];
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+            }
+            1 => {
+                if buf.len() < 8 {
+                    return found;
+                }
+                buf = &buf[8..];
+            }
+            2 => {
+                let mut len = 0usize;
+                for shift in (0..64).step_by(7) {
+                    let Some(&byte) = buf.first() else {
+                        return found;
+                    };
+                    buf = &buf[1..];
+                    len |= usize::from(byte & 0x7f) << shift;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+                if buf.len() < len {
+                    return found;
+                }
+                let (value, rest) = buf.split_at(len);
+                buf = rest;
+                if field == target {
+                    found.push(value.to_vec());
+                }
+            }
+            5 => {
+                if buf.len() < 4 {
+                    return found;
+                }
+                buf = &buf[4..];
+            }
+            _ => return found,
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn grpc_agent_card_response_rewrites_jsonrpc_urls() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("GetExtendedAgentCard", "application/grpc");
+    headers.insert("grpc-accept-encoding".to_string(), "gzip".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(!headers.contains_key("grpc-accept-encoding"));
+
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/grpc",
+        "GRPC",
+        &[
+            ("https://planner.internal/a2a", "JSONRPC"),
+            ("https://planner.internal/grpc", "GRPC"),
+        ],
+        "0.3.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("rewritten grpc agent card frame");
+    assert_eq!(rewritten[0], 0);
+    let msg_len =
+        u32::from_be_bytes([rewritten[1], rewritten[2], rewritten[3], rewritten[4]]) as usize;
+    assert_eq!(rewritten.len(), 5 + msg_len);
+    let message = &rewritten[5..];
+    assert_eq!(
+        proto_string_field(message, 3).as_deref(),
+        Some("https://planner.internal/grpc")
+    );
+    let interfaces = proto_repeated_messages(message, 15);
+    assert_eq!(interfaces.len(), 2);
+    assert_eq!(
+        proto_string_field(&interfaces[0], 1).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+    assert_eq!(
+        proto_string_field(&interfaces[1], 1).as_deref(),
+        Some("https://planner.internal/grpc")
+    );
+    assert!(!proto_has_field(message, 17));
+    plugin.on_response_body_transformed(&mut ctx, &mut response_headers);
+    assert!(!response_headers.contains_key("content-length"));
+    assert!(!response_headers.contains_key("grpc-encoding"));
+}
+
+#[tokio::test]
+async fn grpc_agent_card_unsupported_version_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("GetAgentCard", "application/grpc");
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        "1.0.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    let PluginResult::Reject {
+        status_code,
+        headers: reject_headers,
+        ..
+    } = result
+    else {
+        panic!("unsupported protobuf version must fail closed");
+    };
+    assert_eq!(status_code, 200);
+    assert_eq!(
+        reject_headers.get("grpc-status").map(String::as_str),
+        Some("13")
+    );
+    assert_eq!(
+        reject_headers.get("grpc-message").map(String::as_str),
+        Some("unsupported_agent_card_protobuf_version")
+    );
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("unsupported_agent_card_protobuf_version")
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_malformed_frame_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("GetExtendedAgentCard", "application/grpc");
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &[0x00, 0x00, 0x00])
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_grpc_frame_malformed",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_without_public_base_is_not_rewritten() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "rewrite_agent_card_urls": true,
+            "trust_forwarded_headers": false
+        }
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("GetExtendedAgentCard", "application/grpc");
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        "0.3.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_preferred_jsonrpc_url_is_rewritten() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("GetExtendedAgentCard", "application/grpc");
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[],
+        "0.3.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("preferred jsonrpc url should rewrite");
+    let message = &rewritten[5..];
+    assert_eq!(
+        proto_string_field(message, 3).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+    assert!(!proto_has_field(message, 17));
+}
+
+#[tokio::test]
+async fn grpc_agent_card_empty_body_is_trailers_only_passthrough() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &[])
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &[],
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_non_ok_status_skips_rewrite() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        "0.3.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("grpc-status".to_string(), "14".to_string()),
+    ]);
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "non-OK grpc-status must not rewrite an Agent Card frame"
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_compressed_frame_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    let mut compressed = frame_grpc_message(b"not-a-card");
+    compressed[0] = 1; // gRPC compression flag
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &compressed)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_grpc_encoding_unsupported",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_grpc_encoding_header_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        "0.3.0",
+        false,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("grpc-status".to_string(), "0".to_string()),
+        ("grpc-encoding".to_string(), "gzip".to_string()),
+    ]);
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_grpc_encoding_unsupported",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_length_prefix_mismatch_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    // Claims 10 payload bytes but only carries 3.
+    let body = vec![0, 0, 0, 0, 10, 1, 2, 3];
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_grpc_frame_malformed",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_unrecognized_protobuf_shape_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    // Valid unary frame, but missing Agent Card identity/endpoint fields.
+    let mut message = Vec::new();
+    encode_proto_string(99, "not-an-agent-card", &mut message);
+    let body = frame_grpc_message(&message);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_shape_unrecognized",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_truncated_protobuf_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    // Length-delimited field claiming more bytes than remain.
+    let message = vec![0x0a, 0x05, 0x61, 0x62]; // field 1, len 5, only 2 bytes
+    let body = frame_grpc_message(&message);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_truncated",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_invalid_field_number_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    // Protobuf key with field number 0 is illegal.
+    let message = vec![0x02, 0x01, 0x61]; // field 0, wire LEN, one byte
+    let body = frame_grpc_message(&message);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_field_invalid",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_unsupported_wire_type_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    // Wire type 3 (start-group) is unsupported.
+    let message = vec![0x0b]; // field 1, wire 3
+    let body = frame_grpc_message(&message);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_wire_type_unsupported",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_protocol_version_wire_mismatch_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    let card = encode_minimal_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        |out| {
+            encode_proto_string(14, "JSONRPC", out);
+            // Field 16 must be LEN-wire string; force a varint mismatch.
+            encode_proto_varint_field(16, 1, out);
+        },
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_field_wire_mismatch",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_missing_protocol_version_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    // Omit field 16. This card really is A2A 0.3.x shaped, but proto3 cannot
+    // distinguish an unset protocol_version from "", and A2A 1.0 dropped the
+    // field entirely, so the wire carries no evidence of the layout. The gate
+    // is positive: without proof, the card fails closed instead of being
+    // rewritten with 0.3 field numbers that may not apply.
+    let card = encode_minimal_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        |out| {
+            encode_proto_string(14, "JSONRPC", out);
+        },
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "unsupported_agent_card_protobuf_version",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "an unprovable layout must never produce a rewritten frame"
+    );
+}
+
+/// Assert that a v1.0-shaped card is refused, and report the exact corruption
+/// if the rewriter ever accepts one again.
+async fn assert_a2a_10_card_fails_closed(icon_url: Option<&str>) {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let card = encode_a2a_10_agent_card(
+        "planner",
+        "planning agent",
+        &[
+            ("https://planner.internal/a2a", "JSONRPC"),
+            ("https://planner.internal/grpc", "GRPC"),
+        ],
+        icon_url,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "unsupported_agent_card_protobuf_version",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await;
+    if let Some(rewritten) = rewritten {
+        // Applying 0.3 field numbers here flattens each AgentInterface
+        // submessage on field 3 into a bare URL string and leaves the real
+        // field-13 signatures in place: a mutated card under a stale signature.
+        let message = &rewritten[5..];
+        panic!(
+            "A2A 1.0 card was rewritten: field 3 as string = {:?}, field 13 present = {}",
+            proto_string_field(message, 3),
+            proto_has_field(message, 13)
+        );
+    }
+}
+
+#[tokio::test]
+async fn grpc_a2a_10_agent_card_fails_closed_instead_of_being_corrupted() {
+    assert_a2a_10_card_fails_closed(None).await;
+}
+
+#[tokio::test]
+async fn grpc_a2a_10_agent_card_outcome_is_independent_of_icon_url() {
+    // Field 14 is `preferred_transport` in 0.3 but `icon_url` in 1.0. The
+    // outcome must not hinge on whether that unrelated optional field happens
+    // to be set, so this takes exactly the same path as the fixture without it.
+    assert_a2a_10_card_fails_closed(Some("https://cdn.example.com/planner.png")).await;
+}
+
+// ── gRPC service identity ↔ Agent Card schema ────────────────────────────────
+//
+// A gRPC service NAME and an `AgentCard` wire LAYOUT are two different facts.
+// A2A 0.3 publishes `package a2a.v1` (service `a2a.v1.A2AService`) with
+// `AgentCard` fields 1..17; A2A 1.0 publishes `package lf.a2a.v1` with a
+// renumbered card. This gateway implements the 0.3 layout, so the 0.3 identity
+// is what it defaults to, and the 1.0 identity may never reach the 0.3 decoder
+// no matter what the bytes look like.
+
+/// Build a detected gRPC Agent Card context on an arbitrary service.
+async fn detect_grpc_card_on_service(
+    plugin: &std::sync::Arc<dyn ferrum_edge::plugins::Plugin>,
+    service: &str,
+    rpc: &str,
+) -> (RequestContext, bool) {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        format!("/{service}/{rpc}"),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let detected = ctx.metadata.get("a2a.binding").map(String::as_str) == Some("grpc");
+    (ctx, detected)
+}
+
+fn a2a_03_card_fixture() -> Vec<u8> {
+    encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        "0.3.0",
+        true,
+    )
+}
+
+/// The default `endpoint.grpc_services` is the canonical A2A 0.3 identity, and
+/// it is the one that actually gets rewritten. Before this pairing was made
+/// explicit, the default named A2A 1.0's service while the rewriter implemented
+/// 0.3's payload, so genuine canonical 0.3 traffic was missed by defaults.
+#[tokio::test]
+async fn grpc_default_service_is_the_canonical_a2a_03_identity() {
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (mut ctx, detected) =
+        detect_grpc_card_on_service(&plugin, "a2a.v1.A2AService", "GetAgentCard").await;
+    assert!(detected, "a2a.v1.A2AService must be detected by default");
+
+    let body = frame_grpc_message(&a2a_03_card_fixture());
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("canonical 0.3 card must be rewritten");
+    assert_eq!(
+        proto_string_field(&rewritten[5..], 3).as_deref(),
+        Some("https://gateway.example.com/a2a"),
+    );
+}
+
+/// A2A 1.0's service is not enabled by default, so 1.0 traffic is not silently
+/// pulled into a 0.3 gateway's card path at all.
+#[tokio::test]
+async fn grpc_a2a_10_service_is_not_detected_by_default() {
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (ctx, detected) =
+        detect_grpc_card_on_service(&plugin, "lf.a2a.v1.A2AService", "GetAgentCard").await;
+    assert!(
+        !detected,
+        "lf.a2a.v1.A2AService is A2A 1.0 and must not be a 0.3 gateway's default"
+    );
+    assert!(!plugin.should_buffer_response_body(&ctx));
+}
+
+/// **The load-bearing regression.** Even when an operator explicitly configures
+/// the A2A 1.0 service, a reply on it can never be decoded or rewritten with 0.3
+/// field numbers — not even one whose bytes happen to be 0.3-shaped and carry a
+/// configured `protocol_version`. The decoder follows the declared service
+/// schema, never the bytes.
+#[tokio::test]
+async fn grpc_a2a_10_service_never_decodes_a_0_3_shaped_card() {
+    let plugin = plugin(json!({
+        "endpoint": {"grpc_services": ["lf.a2a.v1.A2AService"]},
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (mut ctx, detected) =
+        detect_grpc_card_on_service(&plugin, "lf.a2a.v1.A2AService", "GetAgentCard").await;
+    assert!(detected, "a configured 1.0 service is still detected");
+
+    let body = frame_grpc_message(&a2a_03_card_fixture());
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_grpc_schema_unsupported",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await;
+    assert!(
+        rewritten.is_none(),
+        "a 1.0 service's reply must never be re-encoded with 0.3 field numbers"
+    );
+}
+
+/// A genuine 1.0 card on the 1.0 service is refused for the SCHEMA reason, not
+/// with a complaint about a `protocol_version` the 1.0 layout does not even
+/// carry. The disposition a client sees has to name what is actually wrong.
+#[tokio::test]
+async fn grpc_a2a_10_service_refuses_with_a_schema_disposition() {
+    let plugin = plugin(json!({
+        "endpoint": {"grpc_services": ["lf.a2a.v1.A2AService"]},
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (mut ctx, _) =
+        detect_grpc_card_on_service(&plugin, "lf.a2a.v1.A2AService", "GetExtendedAgentCard").await;
+    let body = frame_grpc_message(&encode_a2a_10_agent_card(
+        "planner",
+        "planning agent",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        None,
+    ));
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_grpc_schema_unsupported",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// A custom service name has no published Agent Card layout, so an undeclared
+/// one is detected and policed but never decoded. Serving the card un-rewritten
+/// would publish the backend's internal URLs, so it fails closed.
+#[tokio::test]
+async fn grpc_undeclared_custom_service_refuses_card_rewrite() {
+    let plugin = plugin(json!({
+        "endpoint": {"grpc_services": ["acme.agents.v1.AgentService"]},
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (mut ctx, detected) =
+        detect_grpc_card_on_service(&plugin, "acme.agents.v1.AgentService", "GetAgentCard").await;
+    assert!(detected, "a custom service is still detected and policed");
+
+    let body = frame_grpc_message(&a2a_03_card_fixture());
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_grpc_schema_undeclared",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// The documented custom-deployment path: declare the published layout the
+/// service actually serves, and rewriting works exactly as on the canonical
+/// identity.
+#[tokio::test]
+async fn grpc_custom_service_declaring_a2a_03_is_rewritten() {
+    let plugin = plugin(json!({
+        "endpoint": {"grpc_services": [
+            {"service": "acme.agents.v1.AgentService", "card_schema": "a2a-0.3"}
+        ]},
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (mut ctx, _) =
+        detect_grpc_card_on_service(&plugin, "acme.agents.v1.AgentService", "GetAgentCard").await;
+    let body = frame_grpc_message(&a2a_03_card_fixture());
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("a declared 0.3 custom service must be rewritten");
+    assert_eq!(
+        proto_string_field(&rewritten[5..], 3).as_deref(),
+        Some("https://gateway.example.com/a2a"),
+    );
+}
+
+/// The documented escape for fronting a service this gateway cannot rewrite:
+/// withdraw rewriting and the card passes through untouched instead of being
+/// refused.
+#[tokio::test]
+async fn grpc_unrewritable_service_passes_through_with_rewriting_withdrawn() {
+    let cases = [
+        ("lf.a2a.v1.A2AService", json!(["lf.a2a.v1.A2AService"])),
+        ("acme.v1.Agents", json!(["acme.v1.Agents"])),
+        (
+            "acme.v1.Agents",
+            json!([{"service": "acme.v1.Agents", "card_schema": "none"}]),
+        ),
+    ];
+    for (service, services) in cases {
+        let plugin = plugin(json!({
+            "endpoint": {"grpc_services": services},
+            "discovery": {
+                "public_base_url": "https://gateway.example.com",
+                "rewrite_agent_card_urls": false
+            }
+        }));
+        let (mut ctx, _) = detect_grpc_card_on_service(&plugin, service, "GetAgentCard").await;
+        let body = frame_grpc_message(&a2a_03_card_fixture());
+        let mut response_headers = grpc_ok_response_headers();
+        let staged = plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await;
+        assert!(
+            matches!(staged, PluginResult::Continue),
+            "{service}: withdrawing the rewrite must stop the refusal too"
+        );
+        let rewritten = plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await;
+        assert!(
+            rewritten.is_none(),
+            "{service}: nothing may be rewritten with the rewrite withdrawn"
+        );
+    }
+}
+
+/// Restating a published service's own layout is a no-op; contradicting it is a
+/// configuration error, because the layout belongs to the protocol rather than
+/// to the deployment.
+#[test]
+fn grpc_service_card_schema_declarations_are_validated() {
+    let accepted = [
+        json!([{"service": "a2a.v1.A2AService", "card_schema": "a2a-0.3"}]),
+        json!([{"service": "lf.a2a.v1.A2AService", "card_schema": "a2a-1.0"}]),
+        json!([{"service": "acme.v1.Agents", "card_schema": "a2a-1.0"}]),
+        json!([{"service": "acme.v1.Agents", "card_schema": "none"}]),
+        json!([{"service": "acme.v1.Agents"}]),
+        json!(["a2a.v1.A2AService", {"service": "acme.v1.Agents"}]),
+    ];
+    for services in accepted {
+        let config = json!({"endpoint": {"grpc_services": services}});
+        assert!(
+            create_plugin("a2a_gateway", &config).is_ok(),
+            "{services} must be accepted"
+        );
+    }
+
+    let rejected = [
+        (
+            json!([{"service": "a2a.v1.A2AService", "card_schema": "a2a-1.0"}]),
+            "published A2A service",
+        ),
+        (
+            json!([{"service": "lf.a2a.v1.A2AService", "card_schema": "a2a-0.3"}]),
+            "published A2A service",
+        ),
+        (
+            json!([{"service": "a2a.v1.A2AService", "card_schema": "none"}]),
+            "published A2A service",
+        ),
+        (
+            json!([{"service": "acme.v1.Agents", "card_schema": "a2a-2.0"}]),
+            "card_schema",
+        ),
+        (json!([{"card_schema": "a2a-0.3"}]), "require 'service'"),
+        (json!([42]), "service name string"),
+    ];
+    for (services, expected) in rejected {
+        let config = json!({"endpoint": {"grpc_services": services}});
+        let error = match create_plugin("a2a_gateway", &config) {
+            Ok(_) => panic!("{services} must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains(expected),
+            "{services}: expected an error naming {expected:?}, got {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn grpc_agent_card_submessage_on_url_field_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    // A card that claims 0.3.0 but carries a 1.0-shaped serialized
+    // AgentInterface on field 3. The submessage is valid UTF-8, so only the
+    // absolute-http(s)-URL guard separates it from a real 0.3 `url` string.
+    let mut card = Vec::new();
+    encode_proto_string(1, "planner", &mut card);
+    encode_proto_string(2, "planning agent", &mut card);
+    encode_proto_bytes(
+        3,
+        &encode_agent_interface("https://planner.internal/a2a", "JSONRPC"),
+        &mut card,
+    );
+    encode_proto_string(14, "JSONRPC", &mut card);
+    encode_proto_string(16, "0.3.0", &mut card);
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    // Admission schema-validates every known field the 0.3 layout gate relies
+    // on, so the field-3 mismatch is caught before a rewrite is ever staged.
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_url_layout_mismatch",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "a submessage on the url field must not be rewritten in place"
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_non_absolute_interface_url_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    // preferred_transport GRPC leaves field 3 alone; the JSONRPC interface is
+    // the only rewrite target, and its url is not an absolute http(s) URL.
+    let mut card = Vec::new();
+    encode_proto_string(1, "planner", &mut card);
+    encode_proto_string(2, "planning agent", &mut card);
+    encode_proto_string(3, "https://planner.internal/grpc", &mut card);
+    encode_proto_string(14, "GRPC", &mut card);
+    encode_proto_bytes(
+        15,
+        &encode_agent_interface("planner.internal/a2a", "JSONRPC"),
+        &mut card,
+    );
+    encode_proto_string(16, "0.3.0", &mut card);
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_url_layout_mismatch",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_grpc_only_urls_need_no_mutation() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/grpc",
+        "GRPC",
+        &[("https://planner.internal/grpc", "GRPC")],
+        "0.3.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "GRPC-only cards must leave the upstream frame untouched"
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_preserves_matching_jsonrpc_url_when_interface_changes() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    // Preferred URL already public; only the additional interface needs rewrite.
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://gateway.example.com/a2a",
+        "JSONRPC",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        "0.3.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("interface rewrite should still produce a frame");
+    let message = &rewritten[5..];
+    assert_eq!(
+        proto_string_field(message, 3).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+    let interfaces = proto_repeated_messages(message, 15);
+    assert_eq!(interfaces.len(), 1);
+    assert_eq!(
+        proto_string_field(&interfaces[0], 1).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+    assert!(!proto_has_field(message, 17));
+}
+
+#[tokio::test]
+async fn grpc_agent_card_preserves_matching_interface_url_when_card_url_changes() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[("https://gateway.example.com/a2a", "JSONRPC")],
+        "0.3.0",
+        false,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("card url rewrite should still produce a frame");
+    let message = &rewritten[5..];
+    assert_eq!(
+        proto_string_field(message, 3).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+    let interfaces = proto_repeated_messages(message, 15);
+    assert_eq!(
+        proto_string_field(&interfaces[0], 1).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_empty_preferred_transport_rewrites_url() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let card = encode_minimal_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        |out| {
+            // No preferred_transport field => treat as rewritable.
+            encode_proto_bytes(
+                15,
+                &encode_agent_interface("https://planner.internal/a2a", ""),
+                out,
+            );
+            encode_proto_string(16, "0.3.0", out);
+        },
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("empty preferred transport should rewrite");
+    let message = &rewritten[5..];
+    assert_eq!(
+        proto_string_field(message, 3).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+    let interfaces = proto_repeated_messages(message, 15);
+    assert_eq!(
+        proto_string_field(&interfaces[0], 1).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_rewrite_preserves_unknown_scalar_wire_types() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let card = encode_minimal_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        |out| {
+            encode_proto_string(14, "JSONRPC", out);
+            encode_proto_string(16, "0.3.0", out);
+            // Unknown fields across varint / 64-bit / 32-bit wires must round-trip.
+            encode_proto_varint_field(50, 42, out);
+            encode_proto_fixed64_field(51, 0x1122_3344_5566_7788, out);
+            encode_proto_fixed32_field(52, 0xaabb_ccdd, out);
+        },
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("scalar unknown fields must not block rewrite");
+    let message = &rewritten[5..];
+    assert_eq!(
+        proto_string_field(message, 3).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+    assert!(proto_has_field(message, 50));
+    assert!(proto_has_field(message, 51));
+    assert!(proto_has_field(message, 52));
+}
+
+#[tokio::test]
+async fn grpc_agent_card_unlimited_response_ceiling_still_rewrites() {
+    use ferrum_edge::_test_support::take_buffered_response_capacity_refusal_pending_for_test;
+
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    // 0 means unlimited on the effective limit; the rewriter must fold via
+    // retained_response_body_ceiling or BoundedResponseBodySink refuses writes.
+    ctx.max_response_body_size_bytes = 0;
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        "0.3.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("unlimited effective limit must still permit Agent Card rewrite");
+    assert_eq!(
+        proto_string_field(&rewritten[5..], 3).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+    assert!(
+        !take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "successful unlimited-ceiling rewrite must not mark capacity refusal"
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_tight_response_ceiling_refuses_rewrite() {
+    use ferrum_edge::_test_support::take_buffered_response_capacity_refusal_pending_for_test;
+
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        "0.3.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    // Far below any rewritten frame size.
+    ctx.max_response_body_size_bytes = 8;
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "over-ceiling Agent Card rewrite must return None"
+    );
+    assert!(
+        take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "over-ceiling rewrite must mark the pending capacity refusal"
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_transform_failure_rejects_on_final_body() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        "0.3.0",
+        false,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    // Staging validated an uncompressed card; transform later sees compression.
+    response_headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("agent_card_grpc_encoding_unsupported")
+    );
+    let final_result = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(final_result, "agent_card_grpc_encoding_unsupported", None);
+}
+
+#[tokio::test]
+async fn grpc_agent_card_truncated_fixed64_field_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    let mut message = encode_minimal_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        |_| {},
+    );
+    // 64-bit wire value truncated to 3 bytes.
+    encode_proto_varint(u64::from(51u32) << 3 | 1, &mut message);
+    message.extend_from_slice(&[1, 2, 3]);
+    let body = frame_grpc_message(&message);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_truncated",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_truncated_fixed32_field_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    let mut message = encode_minimal_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        |_| {},
+    );
+    encode_proto_varint(u64::from(52u32) << 3 | 5, &mut message);
+    message.extend_from_slice(&[1, 2]); // need 4
+    let body = frame_grpc_message(&message);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_truncated",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_varint_overflow_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    // Ten continuation bytes overflow the varint decoder.
+    let message = vec![0xff; 10];
+    let body = frame_grpc_message(&message);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_varint_overflow",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_truncated_varint_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    // Continuation bit set with no following byte.
+    let message = vec![0x80];
+    let body = frame_grpc_message(&message);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_truncated",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_identity_grpc_encoding_is_accepted() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[],
+        "0.3.0",
+        false,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("grpc-status".to_string(), "0".to_string()),
+        ("grpc-encoding".to_string(), "identity".to_string()),
+    ]);
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("identity grpc-encoding must still rewrite");
+    assert_eq!(
+        proto_string_field(&rewritten[5..], 3).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_transform_sees_late_shape_and_version_failures() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let valid = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[],
+        "0.3.0",
+        false,
+    );
+    let valid_body = frame_grpc_message(&valid);
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &valid_body)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut unrecognized = Vec::new();
+    encode_proto_string(99, "not-a-card", &mut unrecognized);
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &frame_grpc_message(&unrecognized),
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("agent_card_protobuf_shape_unrecognized")
+    );
+    // Consume the pending transform diagnostic, then re-admit the valid card so
+    // the version case is isolated: `on_final_response_body` clears the staged
+    // state, and the transform phase only acts on a card it admitted.
+    let _ = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, &valid_body)
+        .await;
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &valid_body)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let unsupported = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[],
+        "1.0.0",
+        false,
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &frame_grpc_message(&unsupported),
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("unsupported_agent_card_protobuf_version")
+    );
+    let final_result = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, &valid_body)
+        .await;
+    assert_grpc_rewrite_reject(
+        final_result,
+        "unsupported_agent_card_protobuf_version",
+        None,
+    );
+}
+
+/// Build the standard rewritable 0.3 card at an arbitrary wire version.
+fn versioned_agent_card_body(protocol_version: &str) -> Vec<u8> {
+    frame_grpc_message(&encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[],
+        protocol_version,
+        false,
+    ))
+}
+
+/// Drive admission for one `endpoint.protocol_versions` list against one wire
+/// `protocol_version`, returning the `on_response_body` outcome.
+async fn admit_versioned_card(configured: &[&str], wire_version: &str) -> PluginResult {
+    let plugin = plugin(json!({
+        "endpoint": { "protocol_versions": configured },
+        "discovery": { "public_base_url": "https://gateway.example.com" }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let body = versioned_agent_card_body(wire_version);
+    let mut response_headers = grpc_ok_response_headers();
+    plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await
+}
+
+/// `endpoint.protocol_versions` is a list of EXACT version strings — the schema
+/// documents no family, range, or wildcard syntax — so listing `0.3.0` must not
+/// silently vouch for every other `0.3.x` a backend cares to claim.
+#[tokio::test]
+async fn grpc_agent_card_version_gate_requires_an_exact_configured_version() {
+    assert!(matches!(
+        admit_versioned_card(&["0.3.0"], "0.3.0").await,
+        PluginResult::Continue
+    ));
+    assert_grpc_rewrite_reject(
+        admit_versioned_card(&["0.3.0"], "0.3.99").await,
+        "unsupported_agent_card_protobuf_version",
+        None,
+    );
+    // Configuring the other version is what admits it.
+    assert!(matches!(
+        admit_versioned_card(&["0.3.0", "0.3.99"], "0.3.99").await,
+        PluginResult::Continue
+    ));
+    // Trailing/leading whitespace in configuration is normalized, not a
+    // different version.
+    assert!(matches!(
+        admit_versioned_card(&[" 0.3.0 "], "0.3.0").await,
+        PluginResult::Continue
+    ));
+}
+
+/// The exact-match rule is necessary but not sufficient: the selected version
+/// must ALSO map to the 0.3 wire layout this rewriter implements. An operator
+/// who configures a 1.0 backend cannot thereby authorize 0.3 field surgery on
+/// it.
+#[tokio::test]
+async fn grpc_agent_card_version_gate_requires_the_implemented_wire_layout() {
+    assert_grpc_rewrite_reject(
+        admit_versioned_card(&["1.0.0"], "1.0.0").await,
+        "unsupported_agent_card_protobuf_version",
+        None,
+    );
+    assert_grpc_rewrite_reject(
+        admit_versioned_card(&["0.2.9"], "0.2.9").await,
+        "unsupported_agent_card_protobuf_version",
+        None,
+    );
+    // `0.30.0` starts with the characters `0.3` but is not the 0.3 family.
+    assert_grpc_rewrite_reject(
+        admit_versioned_card(&["0.30.0"], "0.30.0").await,
+        "unsupported_agent_card_protobuf_version",
+        None,
+    );
+}
+
+/// A non-OK upstream gRPC reply is not an Agent Card, even when it decodes.
+/// Both halves of the proof are required, and a missing one is passthrough — not
+/// a rewrite, and not a gateway-authored failure that would blame the rewriter
+/// for the backend's own outcome.
+#[tokio::test]
+async fn grpc_agent_card_requires_positive_proof_of_a_successful_reply() {
+    let plugin = plugin(json!({
+        "discovery": { "public_base_url": "https://gateway.example.com" }
+    }));
+    let body = versioned_agent_card_body("0.3.0");
+
+    // No terminal grpc-status at all: not a proven-OK reply.
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let mut headers = HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "an unproven reply must be forwarded, not rewritten"
+    );
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // grpc-status arriving in the merged trailer view as a failure.
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let mut headers = grpc_ok_response_headers();
+    headers.insert("grpc-status".to_string(), "13".to_string());
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(!ctx.metadata.contains_key("a2a.error"));
+
+    // A non-200 HTTP status is a transport-level failure, not a card.
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let mut headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 502, &mut headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(!ctx.metadata.contains_key("a2a.error"));
+}
+
+/// A card this plugin ADMITTED whose transform phase never reported an outcome
+/// must not be served. "The rewrite silently did not run" and "no rewrite was
+/// needed" must not be indistinguishable.
+#[tokio::test]
+async fn grpc_agent_card_admitted_but_never_transformed_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": { "public_base_url": "https://gateway.example.com" }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let body = versioned_agent_card_body("0.3.0");
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    // Transform phase deliberately skipped.
+    let final_result = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(
+        final_result,
+        "agent_card_grpc_rewrite_not_applied",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// A retained-ceiling refusal is owned by the shared capacity terminal. This
+/// plugin must not additionally publish an `INTERNAL` over it, which would
+/// relabel a health-neutral gateway capacity `503` as a gateway defect.
+#[tokio::test]
+async fn grpc_agent_card_capacity_refusal_does_not_also_publish_internal() {
+    use ferrum_edge::_test_support::take_buffered_response_capacity_refusal_pending_for_test;
+
+    let plugin = plugin(json!({
+        "discovery": { "public_base_url": "https://gateway.example.com" }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let body = versioned_agent_card_body("0.3.0");
+    ctx.max_response_body_size_bytes = 8;
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none()
+    );
+    assert!(take_buffered_response_capacity_refusal_pending_for_test(
+        &mut ctx
+    ));
+    // The proxy has by now installed the shared capacity terminal (503).
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut ctx, 503, &response_headers, &[])
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+/// Drive admission over a hand-built message and return the outcome.
+async fn admit_raw_card_message(message: Vec<u8>) -> (RequestContext, PluginResult) {
+    let plugin = plugin(json!({
+        "discovery": { "public_base_url": "https://gateway.example.com" }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let body = frame_grpc_message(&message);
+    let mut response_headers = grpc_ok_response_headers();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    (ctx, result)
+}
+
+/// A known field carrying an unexpected wire type used to fall through the
+/// rewriter's catch-all and be PRESERVED verbatim while its siblings were
+/// rewritten and the signature block was dropped — a half-rewritten card served
+/// under no signature at all.
+#[tokio::test]
+async fn grpc_agent_card_known_field_with_wrong_wire_type_fails_closed() {
+    let mut card = Vec::new();
+    encode_proto_string(1, "planner", &mut card);
+    encode_proto_string(2, "planning agent", &mut card);
+    // Field 3 (`url`) declared as a varint rather than a length-delimited
+    // string. `has_endpoint` is satisfied by field number, so the card is still
+    // Agent-Card shaped and reaches schema validation.
+    encode_proto_varint_field(3, 7, &mut card);
+    encode_proto_string(14, "JSONRPC", &mut card);
+    encode_proto_string(16, "0.3.0", &mut card);
+    let (ctx, result) = admit_raw_card_message(card).await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_field_wire_mismatch",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// `additional_interfaces` submessages are schema-validated too, so a wrong wire
+/// type inside one cannot ride along.
+#[tokio::test]
+async fn grpc_agent_card_interface_field_with_wrong_wire_type_fails_closed() {
+    let mut interface = Vec::new();
+    encode_proto_varint_field(1, 7, &mut interface); // url as a varint
+    encode_proto_string(2, "JSONRPC", &mut interface);
+    let mut card = Vec::new();
+    encode_proto_string(1, "planner", &mut card);
+    encode_proto_string(2, "planning agent", &mut card);
+    encode_proto_string(3, "https://planner.internal/grpc", &mut card);
+    encode_proto_string(14, "GRPC", &mut card);
+    encode_proto_bytes(15, &interface, &mut card);
+    encode_proto_string(16, "0.3.0", &mut card);
+    let (ctx, result) = admit_raw_card_message(card).await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_field_wire_mismatch",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// proto3 last-wins would let a backend hide the URL that actually gets served
+/// behind a decoy earlier in the message, so a duplicated singular field is
+/// ambiguous and fails closed.
+#[tokio::test]
+async fn grpc_agent_card_duplicated_singular_field_fails_closed() {
+    let mut card = Vec::new();
+    encode_proto_string(1, "planner", &mut card);
+    encode_proto_string(2, "planning agent", &mut card);
+    encode_proto_string(3, "https://decoy.internal/a2a", &mut card);
+    encode_proto_string(3, "https://planner.internal/a2a", &mut card);
+    encode_proto_string(14, "JSONRPC", &mut card);
+    encode_proto_string(16, "0.3.0", &mut card);
+    let (ctx, result) = admit_raw_card_message(card).await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_field_duplicated",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// A duplicated `protocol_version` is ambiguous about which version admitted the
+/// card, so it is refused before the layout gate can pick one.
+#[tokio::test]
+async fn grpc_agent_card_duplicated_protocol_version_fails_closed() {
+    let mut card = Vec::new();
+    encode_proto_string(1, "planner", &mut card);
+    encode_proto_string(2, "planning agent", &mut card);
+    encode_proto_string(3, "https://planner.internal/a2a", &mut card);
+    encode_proto_string(14, "JSONRPC", &mut card);
+    encode_proto_string(16, "1.0.0", &mut card);
+    encode_proto_string(16, "0.3.0", &mut card);
+    let (ctx, result) = admit_raw_card_message(card).await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_field_duplicated",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// A ten-byte varint's final byte contributes bits 63..69, so only `0x00` and
+/// `0x01` are representable. A permissive decoder truncates the rest with the
+/// shift and reads a DIFFERENT tag than any conforming parser would.
+#[tokio::test]
+async fn grpc_agent_card_ten_byte_varint_overflow_fails_closed() {
+    let mut message = vec![0x80u8; 9];
+    message.push(0x02); // final group > 1
+    let (ctx, result) = admit_raw_card_message(message).await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_varint_overflow",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// A continuation chain ending in a zero group encodes a value that already fit
+/// in fewer bytes. Every conforming encoder emits the minimal form, so the
+/// redundant one is refused rather than accepted as an alias for the same tag.
+#[tokio::test]
+async fn grpc_agent_card_noncanonical_varint_fails_closed() {
+    // `0x8a 0x00` is a non-minimal encoding of the field-1 LEN tag `0x0a`.
+    let message = vec![0x8a, 0x00, 0x01, 0x61];
+    let (ctx, result) = admit_raw_card_message(message).await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_varint_noncanonical",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// The protobuf maximum field number is `2^29 - 1`. A larger key is not a valid
+/// tag; casting it to `u32` truncates it into one that IS valid, which is how a
+/// hostile message gets a field to mean two things at once.
+#[tokio::test]
+async fn grpc_agent_card_out_of_range_field_number_fails_closed() {
+    let mut message = Vec::new();
+    // Field number 2^29, wire LEN.
+    encode_proto_varint((1u64 << 29) << 3 | 2, &mut message);
+    encode_proto_varint(1, &mut message);
+    message.push(b'a');
+    let (ctx, result) = admit_raw_card_message(message).await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_field_invalid",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
 #[tokio::test]
 async fn grpc_web_content_type_is_not_detected_as_native_grpc() {
     let plugin = plugin(json!({}));
@@ -1570,7 +3935,7 @@ fn invalid_a2a_gateway_configs_are_rejected() {
             "protocol versions cannot be empty",
         ),
         (
-            json!({"endpoint": {"grpc_services": ["lf.a2a.v1.A2AService", "lf.a2a.v1.A2AService"]}}),
+            json!({"endpoint": {"grpc_services": ["a2a.v1.A2AService", "a2a.v1.A2AService"]}}),
             "duplicate endpoint.grpc_services",
             "duplicate gRPC services should reject",
         ),
@@ -1615,6 +3980,825 @@ fn invalid_a2a_gateway_configs_are_rejected() {
         assert!(
             err.contains(expected),
             "{label}: expected {expected:?} in {err:?}"
+        );
+    }
+}
+
+const A2A_GATEWAY_SOURCE: &str = include_str!("../../../src/plugins/a2a_gateway.rs");
+
+/// Every fixed gRPC Agent Card diagnostic string literal the plugin source
+/// carries.
+///
+/// Scanned from the opening quote of each known prefix rather than by splitting
+/// on `"`, so an escaped quote elsewhere in the file cannot desynchronize the
+/// parity and silently shrink the set this test compares against.
+fn agent_card_diagnostic_literals(source: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    for prefix in [
+        "\"agent_card_protobuf_",
+        "\"agent_card_grpc_",
+        "\"unsupported_agent_card_",
+    ] {
+        let mut rest = source;
+        while let Some(index) = rest.find(prefix) {
+            let tail = &rest[index + 1..];
+            let end = tail
+                .find('"')
+                .expect("a string literal must have a closing quote");
+            found.push(&tail[..end]);
+            rest = &tail[end..];
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// The gRPC Agent Card diagnostic enumeration in `docs/plugins.md` is a
+/// *complete* list of client-visible codes, not a sample.
+///
+/// It is published as an operator-facing contract, so an omission is worse than
+/// no list at all: an operator who cannot find an observed `a2a.error` in the
+/// table concludes their gateway produced something undocumented. This pins both
+/// directions — every client-visible diagnostic in the source is in the table,
+/// and every diagnostic in the table exists in the source.
+#[test]
+fn grpc_agent_card_diagnostics_are_completely_documented() {
+    const GUIDE: &str = include_str!("../../../docs/plugins.md");
+    // Internal sentinel for "the output pass refused a write". Callers translate
+    // it into `agent_card_grpc_frame_too_large` or the shared capacity terminal,
+    // so it must never be documented as a client-visible diagnostic.
+    const INTERNAL_ONLY: &str = "agent_card_protobuf_emit_refused";
+
+    let section = GUIDE
+        .split("### `a2a_gateway`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("a2a_gateway docs section");
+    let literals = agent_card_diagnostic_literals(A2A_GATEWAY_SOURCE);
+    assert!(
+        literals.len() > 1,
+        "diagnostic extraction found {} literals — the scan is broken",
+        literals.len()
+    );
+
+    let mut documented = 0usize;
+    for diagnostic in &literals {
+        if *diagnostic == INTERNAL_ONLY {
+            assert!(
+                !section.contains(diagnostic),
+                "{INTERNAL_ONLY} never reaches a client and must not be documented as a diagnostic"
+            );
+            continue;
+        }
+        assert!(
+            section.contains(&format!("| `{diagnostic}` |")),
+            "docs/plugins.md must list the client-visible diagnostic {diagnostic} \
+             in the a2a_gateway gRPC Agent Card table"
+        );
+        documented += 1;
+    }
+    assert!(
+        documented > 0,
+        "no client-visible diagnostics were checked against the guide"
+    );
+
+    // Reverse direction, restricted to the diagnostic table's own rows so an
+    // unrelated parameter table in this section cannot be misread as one.
+    const STAGES: [&str; 6] = [
+        "Service schema",
+        "Framing",
+        "Version/layout",
+        "Schema",
+        "Decoding",
+        "Emission",
+    ];
+    for line in section.lines() {
+        let Some(row) = line.strip_prefix("| ") else {
+            continue;
+        };
+        let mut columns = row.split('|');
+        let stage = columns.next().unwrap_or_default().trim();
+        if !STAGES.contains(&stage) {
+            continue;
+        }
+        let Some(name) = columns.next() else {
+            continue;
+        };
+        let name = name.trim().trim_matches('`');
+        assert!(
+            literals.contains(&name),
+            "docs/plugins.md documents {name}, which the plugin source cannot produce"
+        );
+    }
+}
+
+/// The OpenAPI `endpoint.grpc_services` description must describe what the gRPC
+/// binding actually does. It used to say the payloads are never decoded, which
+/// stopped being true when unary Agent Card decode/rewrite landed.
+#[test]
+fn openapi_grpc_services_describes_agent_card_decoding() {
+    const SPEC: &str = include_str!("../../../openapi.yaml");
+
+    assert!(
+        !SPEC.contains("without decoding protobuf payloads"),
+        "openapi.yaml must not claim the A2A gRPC binding never decodes protobuf payloads"
+    );
+    let scoped = "The one decoded payload is the unary Agent Card reply \
+                  (GetAgentCard / GetExtendedAgentCard)";
+    assert!(
+        SPEC.contains(scoped),
+        "openapi.yaml endpoint.grpc_services must scope protobuf decoding \
+         to unary Agent Card replies"
+    );
+}
+
+/// The published `endpoint.grpc_services` default must be the gRPC service
+/// identity whose Agent Card layout this plugin actually implements.
+///
+/// The whole point of the repair is that a service NAME and a card LAYOUT are
+/// separate facts: the spec previously advertised A2A 1.0's
+/// `lf.a2a.v1.A2AService` as the default of a gateway that decodes A2A 0.3
+/// cards, so an operator reading the spec was told the wrong pairing. Pinning it
+/// here keeps the documented default, the runtime default, and the implemented
+/// wire layout from drifting apart again.
+#[test]
+fn openapi_grpc_services_default_is_the_canonical_a2a_03_service() {
+    const SPEC: &str = include_str!("../../../openapi.yaml");
+
+    // The schema body is every line indented deeper than the 4-space key line,
+    // so the section ends at the next sibling schema key rather than at the
+    // first nested mapping (which a naive prefix split would truncate on).
+    let mut section = String::new();
+    let mut inside = false;
+    for line in SPEC.lines() {
+        if line == "    A2aGatewayConfig:" {
+            inside = true;
+            continue;
+        }
+        if inside {
+            let is_sibling_key =
+                line.starts_with("    ") && !line.starts_with("     ") && !line.trim().is_empty();
+            if is_sibling_key {
+                break;
+            }
+            section.push_str(line);
+            section.push('\n');
+        }
+    }
+    assert!(inside, "A2aGatewayConfig schema section not found");
+    let section = section.as_str();
+    assert!(
+        section.contains(r#"default: ["a2a.v1.A2AService"]"#),
+        "endpoint.grpc_services must default to the canonical A2A 0.3 service"
+    );
+    assert!(
+        !section.contains(r#"default: ["lf.a2a.v1.A2AService"]"#),
+        "A2A 1.0's service must not be the default of a 0.3 Agent Card rewriter"
+    );
+    assert!(
+        section.contains(r#"default: ["0.3.0"]"#),
+        "the default protocol version must stay the one a2a.v1.A2AService carries"
+    );
+    for enumerated in ["a2a-0.3", "a2a-1.0", "none"] {
+        assert!(
+            section.contains(enumerated),
+            "the card_schema enumeration must publish {enumerated}"
+        );
+    }
+    for diagnostic in [
+        "agent_card_grpc_schema_unsupported",
+        "agent_card_grpc_schema_undeclared",
+    ] {
+        assert!(
+            section.contains(diagnostic),
+            "openapi.yaml must document the fail-closed disposition {diagnostic}"
+        );
+    }
+}
+
+/// The runtime default and the published default are the same service, proven
+/// through detection rather than by reading a constant.
+#[tokio::test]
+async fn default_grpc_service_detection_matches_the_published_default() {
+    let plugin = plugin(json!({}));
+    for (service, expected) in [
+        ("a2a.v1.A2AService", true),
+        ("lf.a2a.v1.A2AService", false),
+        ("acme.agents.v1.AgentService", false),
+    ] {
+        let (_, detected) = detect_grpc_card_on_service(&plugin, service, "GetTask").await;
+        assert_eq!(
+            detected, expected,
+            "{service}: default gRPC service detection disagrees with openapi.yaml"
+        );
+    }
+}
+
+// ── Replay presentation provenance (issue #3297 root review) ────────────────
+//
+// `transform_response_body_with_context` is a client-facing presentation
+// transform, and `request_deduplication` deliberately skips such transforms
+// when it replays a finalized representation. Without enrollment here, a
+// retained Agent Card could be replayed under a public base, endpoint path,
+// admitted protocol version, or rewrite switch that has since changed.
+
+fn presentation_policy(config: Value) -> ResponsePresentationPolicy {
+    plugin(config)
+        .response_presentation_policy()
+        .expect("a2a_gateway must always enroll in replay presentation provenance")
+}
+
+fn static_presentation_digest(config: Value) -> [u8; 32] {
+    match presentation_policy(config) {
+        ResponsePresentationPolicy::Static(digest) => digest,
+        ResponsePresentationPolicy::Dynamic => {
+            panic!("expected a provable static presentation policy")
+        }
+    }
+}
+
+fn configured_base_config() -> Value {
+    json!({
+        "endpoint": {
+            "path": "/a2a",
+            "agent_card_path": "/.well-known/agent-card.json",
+            "protocol_versions": ["0.3.0"]
+        },
+        "discovery": {
+            "rewrite_agent_card_urls": true,
+            "public_base_url": "https://agents.example.com"
+        }
+    })
+}
+
+/// A digest that depended on map iteration order, or on which process computed
+/// it, could not prove anything about a representation persisted to Redis and
+/// read back by a different gateway.
+#[test]
+fn a2a_static_presentation_digest_is_stable_for_equivalent_configs() {
+    let one_order = r#"{"discovery":{"public_base_url":"https://a.example.com",
+        "rewrite_agent_card_urls":true},"endpoint":{"path":"/a2a"}}"#;
+    let other_order = r#"{"endpoint":{"path":"/a2a"},"discovery":{
+        "rewrite_agent_card_urls":true,"public_base_url":"https://a.example.com"}}"#;
+    let one: Value = serde_json::from_str(one_order).expect("fixture must parse");
+    let other: Value = serde_json::from_str(other_order).expect("fixture must parse");
+
+    assert_eq!(
+        static_presentation_digest(one.clone()),
+        static_presentation_digest(other),
+        "equivalent configuration must digest identically regardless of key order"
+    );
+    assert_eq!(
+        static_presentation_digest(one.clone()),
+        static_presentation_digest(one),
+        "two instances of one configuration must digest identically"
+    );
+}
+
+/// Every knob that shapes a client-visible Agent Card must move the digest, or
+/// a representation retained under the old value would keep replaying.
+#[test]
+fn a2a_static_presentation_digest_moves_when_card_shaping_config_changes() {
+    let mut changed_public_base = configured_base_config();
+    changed_public_base["discovery"]["public_base_url"] = json!("https://other.example.com");
+
+    let mut changed_endpoint_path = configured_base_config();
+    changed_endpoint_path["endpoint"]["path"] = json!("/agents");
+
+    let mut changed_card_path = configured_base_config();
+    changed_card_path["endpoint"]["agent_card_path"] = json!("/.well-known/agent.json");
+
+    let mut changed_versions = configured_base_config();
+    changed_versions["endpoint"]["protocol_versions"] = json!(["0.3.0", "0.3.1"]);
+
+    let mut rewrite_disabled = configured_base_config();
+    rewrite_disabled["discovery"]["rewrite_agent_card_urls"] = json!(false);
+
+    let mut plugin_disabled = configured_base_config();
+    plugin_disabled["enabled"] = json!(false);
+
+    let labels = [
+        "base",
+        "public base",
+        "endpoint path",
+        "agent card path",
+        "admitted protocol versions",
+        "rewrite switch",
+        "enabled switch",
+    ];
+    let digests = [
+        static_presentation_digest(configured_base_config()),
+        static_presentation_digest(changed_public_base),
+        static_presentation_digest(changed_endpoint_path),
+        static_presentation_digest(changed_card_path),
+        static_presentation_digest(changed_versions),
+        static_presentation_digest(rewrite_disabled),
+        static_presentation_digest(plugin_disabled),
+    ];
+
+    for (index, digest) in digests.iter().enumerate() {
+        for (other_index, other) in digests.iter().enumerate() {
+            if index == other_index {
+                continue;
+            }
+            assert_ne!(
+                digest, other,
+                "the {} and {} configurations must not share replay provenance",
+                labels[index], labels[other_index]
+            );
+        }
+    }
+}
+
+/// The forwarded-derived public base is not static configuration: absent an
+/// `X-Forwarded-Proto`, the scheme comes from whether the connection carried a
+/// TLS SNI hostname, which no replay fingerprint binds.
+#[test]
+fn a2a_request_derived_public_base_reports_dynamic_presentation_policy() {
+    let config = json!({"discovery": {"trust_forwarded_headers": true}});
+    assert_eq!(
+        presentation_policy(config),
+        ResponsePresentationPolicy::Dynamic,
+        "a forwarded/SNI-derived public base cannot be described by a static digest"
+    );
+}
+
+/// A configured public base is the provable mode and must keep composing with
+/// deduplication, even when forwarded headers are also trusted — the configured
+/// value wins inside `public_base_url`.
+#[test]
+fn a2a_configured_public_base_stays_static_even_with_forwarded_trust() {
+    let mut trusting = configured_base_config();
+    trusting["discovery"]["trust_forwarded_headers"] = json!(true);
+
+    assert_ne!(
+        static_presentation_digest(trusting),
+        static_presentation_digest(configured_base_config()),
+        "the accepted configuration differs, so the digest must differ too"
+    );
+}
+
+/// Enrollment is unconditional. An instance that rewrites nothing still binds a
+/// stored representation to "nothing was rewritten", so turning the rewrite back
+/// on cannot be skipped by a retained replay.
+#[test]
+fn a2a_inert_instances_still_enroll_a_static_presentation_policy() {
+    let internally_disabled = json!({
+        "enabled": false,
+        "discovery": {"trust_forwarded_headers": true}
+    });
+    let rewriting_disabled = json!({
+        "discovery": {"rewrite_agent_card_urls": false, "trust_forwarded_headers": true}
+    });
+
+    for config in [internally_disabled, rewriting_disabled, json!({})] {
+        assert!(
+            matches!(
+                presentation_policy(config.clone()),
+                ResponsePresentationPolicy::Static(_)
+            ),
+            "an inert a2a_gateway ({config}) applies no request-derived rewrite \
+             and must stay provable"
+        );
+    }
+}
+
+// ── Absolute-URL proof (issue #3297 root review) ────────────────────────────
+
+/// A `http://` / `https://` prefix is not a URL. Each of these begins with one
+/// and is still not an absolute http(s) URL with a real host and no embedded
+/// credentials, so the rewriter must treat it as a layout mismatch rather than
+/// mutating around it.
+#[tokio::test]
+async fn grpc_agent_card_absolute_looking_urls_fail_closed() {
+    let over_length = format!("https://planner.internal/{}", "a".repeat(5000));
+    let cases = [
+        // No authority at all — not an explicit canonical spelling.
+        "https://",
+        "https:///",
+        "https://:8080/a2a",
+        "http:///a2a",
+        "https:////planner.internal/a2a",
+        "http://\\planner.internal/a2a",
+        "https:\\planner.internal/a2a",
+        "https://user:pass@planner.internal/a2a",
+        "http://token@planner.internal/a2a",
+        "http://[::1/a2a",
+        "https://plan ner.internal/a2a",
+        // Begins with neither scheme, so it is not absolute.
+        "//planner.internal/a2a",
+        // An absolute URL, but not an http-family one.
+        "file:///a2a",
+        over_length.as_str(),
+    ];
+
+    for url in cases {
+        let card = encode_minimal_agent_card("planner", "planning agent", url, |out| {
+            encode_proto_string(14, "JSONRPC", out);
+            encode_proto_string(16, "0.3.0", out);
+        });
+        let (ctx, result) = admit_raw_card_message(card).await;
+        assert_grpc_rewrite_reject(
+            result,
+            "agent_card_protobuf_url_layout_mismatch",
+            ctx.metadata.get("a2a.error").map(String::as_str),
+        );
+    }
+}
+
+/// Ambiguous absolute-URL spellings whose authority exists only after parser
+/// recovery must fail closed at the Agent Card boundary.
+#[tokio::test]
+async fn grpc_agent_card_ambiguous_absolute_url_spellings_fail_closed() {
+    let cases = [
+        "http:///a2a",
+        "https:////planner.internal/a2a",
+        "http://\\planner.internal/a2a",
+        "https:\\planner.internal/a2a",
+    ];
+
+    for url in cases {
+        let card = encode_minimal_agent_card("planner", "planning agent", url, |out| {
+            encode_proto_string(14, "JSONRPC", out);
+            encode_proto_string(16, "0.3.0", out);
+        });
+        let (ctx, result) = admit_raw_card_message(card).await;
+        assert_grpc_rewrite_reject(
+            result,
+            "agent_card_protobuf_url_layout_mismatch",
+            ctx.metadata.get("a2a.error").map(String::as_str),
+        );
+    }
+}
+
+/// Ordinary absolute URLs with an explicit authority remain admitted.
+#[tokio::test]
+async fn grpc_agent_card_preserves_explicit_absolute_url_bytes() {
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    let card = encode_minimal_agent_card(
+        "planner",
+        "planning agent",
+        "http://planner.internal/a2a",
+        |out| {
+            encode_proto_string(14, "GRPC", out);
+            encode_proto_bytes(
+                15,
+                &encode_agent_interface("https://planner.internal/a2a", "JSONRPC"),
+                out,
+            );
+            encode_proto_string(16, "0.3.0", out);
+        },
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    let staged = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert!(
+        matches!(staged, PluginResult::Continue),
+        "an explicit-authority http URL must be admitted"
+    );
+    assert_eq!(ctx.metadata.get("a2a.error"), None);
+
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("the JSONRPC interface still needs rewriting");
+    let message = &rewritten[5..];
+    assert_eq!(
+        proto_string_field(message, 3).as_deref(),
+        Some("http://planner.internal/a2a"),
+        "a preserved URL must be the backend's own bytes, never a normalized form"
+    );
+    assert_eq!(
+        proto_string_field(&proto_repeated_messages(message, 15)[0], 1).as_deref(),
+        Some("https://gateway.example.com/a2a"),
+    );
+}
+
+/// The same proof applies inside every advertised interface, which is where a
+/// serialized submessage most plausibly masquerades as a URL string.
+#[tokio::test]
+async fn grpc_agent_card_absolute_looking_interface_url_fails_closed() {
+    let interface = encode_agent_interface("https://user:pass@planner.internal/grpc", "GRPC");
+    let mut card = Vec::new();
+    encode_proto_string(1, "planner", &mut card);
+    encode_proto_string(2, "planning agent", &mut card);
+    encode_proto_string(3, "https://planner.internal/a2a", &mut card);
+    encode_proto_string(14, "JSONRPC", &mut card);
+    encode_proto_bytes(15, &interface, &mut card);
+    encode_proto_string(16, "0.3.0", &mut card);
+    let (ctx, result) = admit_raw_card_message(card).await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_url_layout_mismatch",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// An interface with no URL is not a usable endpoint: nothing would rewrite it,
+/// yet it would be preserved verbatim inside a card published as rewritten with
+/// its signatures removed — and it would be the only evidence the card
+/// advertised an endpoint at all.
+#[tokio::test]
+async fn grpc_agent_card_interface_without_url_fails_closed() {
+    let mut interface = Vec::new();
+    encode_proto_string(2, "JSONRPC", &mut interface);
+    let mut card = Vec::new();
+    encode_proto_string(1, "planner", &mut card);
+    encode_proto_string(2, "planning agent", &mut card);
+    encode_proto_bytes(15, &interface, &mut card);
+    encode_proto_string(16, "0.3.0", &mut card);
+    let (ctx, result) = admit_raw_card_message(card).await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_interface_url_missing",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+// ── Complete A2A 0.3 field-table validation (issue #3297 root review) ───────
+
+/// Base card carrying every known 0.3 top-level field, so the validation table
+/// is exercised as a whole rather than field by field.
+fn encode_complete_a2a_03_agent_card(url: &str, extras: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut card = Vec::new();
+    encode_proto_string(1, "planner", &mut card);
+    encode_proto_string(2, "planning agent", &mut card);
+    encode_proto_string(3, url, &mut card);
+    // Opaque submessages the rewriter preserves without decoding.
+    encode_proto_bytes(4, b"\x0a\x07acme.io", &mut card);
+    encode_proto_string(5, "1.4.2", &mut card);
+    encode_proto_string(6, "https://docs.example.com/planner", &mut card);
+    encode_proto_bytes(7, b"\x08\x01", &mut card);
+    encode_proto_bytes(8, b"\x0a\x05oauth", &mut card);
+    encode_proto_bytes(9, b"\x0a\x03key", &mut card);
+    encode_proto_string(10, "text/plain", &mut card);
+    encode_proto_string(10, "application/json", &mut card);
+    encode_proto_string(11, "application/json", &mut card);
+    encode_proto_bytes(12, b"\x0a\x04plan", &mut card);
+    encode_proto_varint_field(13, 1, &mut card);
+    encode_proto_string(14, "JSONRPC", &mut card);
+    encode_proto_bytes(
+        15,
+        &encode_agent_interface("https://planner.internal/grpc", "GRPC"),
+        &mut card,
+    );
+    encode_proto_string(16, "0.3.0", &mut card);
+    extras(&mut card);
+    card
+}
+
+/// The complete card round-trips: the JSON-RPC endpoint is rewritten, every
+/// opaque submessage and repeated string is preserved, and only the signature
+/// block is dropped.
+#[tokio::test]
+async fn grpc_agent_card_complete_0_3_card_preserves_every_untouched_field() {
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    let card = encode_complete_a2a_03_agent_card("https://planner.internal/a2a", |out| {
+        let signature = encode_agent_card_signature("eyJhbGciOiJFUzI1NiJ9", "stale");
+        encode_proto_bytes(17, &signature, out);
+    });
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("a complete 0.3 card must rewrite");
+    let message = &rewritten[5..];
+
+    assert_eq!(
+        proto_string_field(message, 3).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+    for preserved in [4u32, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] {
+        assert!(
+            proto_has_field(message, preserved),
+            "field {preserved} must be preserved verbatim"
+        );
+    }
+    assert!(
+        !proto_has_field(message, 17),
+        "signatures must be dropped once a URL mutation is published"
+    );
+    let interfaces = proto_repeated_messages(message, 15);
+    assert_eq!(interfaces.len(), 1);
+    assert_eq!(
+        proto_string_field(&interfaces[0], 1).as_deref(),
+        Some("https://planner.internal/grpc"),
+        "a non-JSONRPC interface must be preserved verbatim"
+    );
+}
+
+/// Every known top-level field must carry the wire type the 0.3 schema
+/// declares. Before this, a known field with an unexpected wire type fell
+/// through the rewriter's catch-all and was preserved beside rewritten siblings
+/// after the signature block was dropped.
+#[tokio::test]
+async fn grpc_agent_card_known_fields_with_wrong_wire_types_fail_closed() {
+    // Every length-delimited known field, declared as a varint instead.
+    for field in [4u32, 5, 6, 7, 8, 9, 10, 11, 12] {
+        let card = encode_minimal_agent_card(
+            "planner",
+            "planning agent",
+            "https://planner.internal/a2a",
+            |out| {
+                encode_proto_varint_field(field, 7, out);
+                encode_proto_string(14, "JSONRPC", out);
+                encode_proto_string(16, "0.3.0", out);
+            },
+        );
+        let (ctx, result) = admit_raw_card_message(card).await;
+        assert_grpc_rewrite_reject(
+            result,
+            "agent_card_protobuf_field_wire_mismatch",
+            ctx.metadata.get("a2a.error").map(String::as_str),
+        );
+    }
+
+    // The one varint field, declared as a length-delimited string instead.
+    let card = encode_minimal_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        |out| {
+            encode_proto_string(13, "true", out);
+            encode_proto_string(14, "JSONRPC", out);
+            encode_proto_string(16, "0.3.0", out);
+        },
+    );
+    let (ctx, result) = admit_raw_card_message(card).await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_field_wire_mismatch",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// proto3 last-wins would make a duplicated singular field ambiguous, so each
+/// of them is claimed exactly once.
+#[tokio::test]
+async fn grpc_agent_card_duplicated_singular_fields_fail_closed() {
+    for field in [4u32, 5, 6, 7] {
+        let card = encode_minimal_agent_card(
+            "planner",
+            "planning agent",
+            "https://planner.internal/a2a",
+            |out| {
+                encode_proto_bytes(field, b"\x0a\x01a", out);
+                encode_proto_bytes(field, b"\x0a\x01b", out);
+                encode_proto_string(14, "JSONRPC", out);
+                encode_proto_string(16, "0.3.0", out);
+            },
+        );
+        let (ctx, result) = admit_raw_card_message(card).await;
+        assert_grpc_rewrite_reject(
+            result,
+            "agent_card_protobuf_field_duplicated",
+            ctx.metadata.get("a2a.error").map(String::as_str),
+        );
+    }
+
+    let card = encode_minimal_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        |out| {
+            encode_proto_varint_field(13, 1, out);
+            encode_proto_varint_field(13, 0, out);
+            encode_proto_string(14, "JSONRPC", out);
+            encode_proto_string(16, "0.3.0", out);
+        },
+    );
+    let (ctx, result) = admit_raw_card_message(card).await;
+    assert_grpc_rewrite_reject(
+        result,
+        "agent_card_protobuf_field_duplicated",
+        ctx.metadata.get("a2a.error").map(String::as_str),
+    );
+}
+
+/// The genuinely repeated fields must still be allowed to repeat.
+#[tokio::test]
+async fn grpc_agent_card_repeated_fields_may_repeat() {
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    let card = encode_minimal_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        |out| {
+            encode_proto_bytes(8, b"\x0a\x05oauth", out);
+            encode_proto_bytes(8, b"\x0a\x04mtls", out);
+            encode_proto_bytes(9, b"\x0a\x03key", out);
+            encode_proto_bytes(9, b"\x0a\x03alt", out);
+            encode_proto_string(10, "text/plain", out);
+            encode_proto_string(10, "application/json", out);
+            encode_proto_string(11, "text/plain", out);
+            encode_proto_string(11, "application/json", out);
+            encode_proto_bytes(12, b"\x0a\x04plan", out);
+            encode_proto_bytes(12, b"\x0a\x04cook", out);
+            encode_proto_string(14, "JSONRPC", out);
+            encode_proto_string(16, "0.3.0", out);
+        },
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("repeated 0.3 fields must not block the rewrite");
+    let message = &rewritten[5..];
+    for repeated in [8u32, 9, 10, 11, 12] {
+        assert_eq!(
+            proto_repeated_messages(message, repeated).len(),
+            2,
+            "both {repeated} entries must be preserved"
+        );
+    }
+}
+
+/// A protobuf `bool` a conforming encoder never emits is refused rather than
+/// preserved verbatim beside rewritten siblings.
+#[tokio::test]
+async fn grpc_agent_card_non_boolean_extended_card_flag_fails_closed() {
+    for raw in [2u64, 255] {
+        let card = encode_minimal_agent_card(
+            "planner",
+            "planning agent",
+            "https://planner.internal/a2a",
+            |out| {
+                encode_proto_varint_field(13, raw, out);
+                encode_proto_string(14, "JSONRPC", out);
+                encode_proto_string(16, "0.3.0", out);
+            },
+        );
+        let (ctx, result) = admit_raw_card_message(card).await;
+        assert_grpc_rewrite_reject(
+            result,
+            "agent_card_protobuf_bool_invalid",
+            ctx.metadata.get("a2a.error").map(String::as_str),
+        );
+    }
+}
+
+/// Known strings that get copied into the rebuilt card must be valid UTF-8, so
+/// a value the gateway cannot even represent is never republished as though it
+/// had been inspected.
+#[tokio::test]
+async fn grpc_agent_card_non_utf8_known_strings_fail_closed() {
+    for field in [1u32, 2, 5, 6, 10, 11, 14] {
+        let mut card = Vec::new();
+        if field != 1 {
+            encode_proto_string(1, "planner", &mut card);
+        }
+        encode_proto_string(3, "https://planner.internal/a2a", &mut card);
+        encode_proto_bytes(field, &[0xff, 0xfe], &mut card);
+        if field != 14 {
+            encode_proto_string(14, "JSONRPC", &mut card);
+        }
+        encode_proto_string(16, "0.3.0", &mut card);
+        let (ctx, result) = admit_raw_card_message(card).await;
+        assert_grpc_rewrite_reject(
+            result,
+            "agent_card_protobuf_string_invalid",
+            ctx.metadata.get("a2a.error").map(String::as_str),
         );
     }
 }
