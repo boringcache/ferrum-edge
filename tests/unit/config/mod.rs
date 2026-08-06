@@ -38,6 +38,7 @@ mod plugin_migration_split_tests;
 mod plugin_migration_tests;
 mod pool_config_tests;
 mod separate_listeners_tests;
+mod sidecar_ingress_stream_tests;
 mod sql_dialect_tests;
 mod stream_proxy_config_tests;
 mod workload_entry_cross_namespace_tests;

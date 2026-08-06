@@ -29,7 +29,10 @@ pub(crate) use istio::cors_policy_translatable;
 // HTTP-family classification used by resolution and by deferred-field reporting
 // is one predicate, so an HTTPS (→ Unknown → HTTP-family) listener is never
 // modeled by resolution yet reported as a deferred non-HTTP listener.
-pub(crate) use istio::sidecar_ingress_protocol_is_http_family;
+pub(crate) use istio::{
+    sidecar_ingress_protocol_is_http_family, sidecar_ingress_protocol_is_modeled,
+    sidecar_ingress_protocol_is_stream_family,
+};
 // Shared with the Istio status writer the same way: the ServiceEntry UDP-port
 // classification used by translation/materialization (a `protocol: UDP` port is
 // classified `AppProtocol::Udp` and its egress materialization is deferred/inert

@@ -6819,11 +6819,11 @@ mod tests {
         );
     }
 
-    /// Codex round-4 P2: the DECLARED HTTP-family port count counts DISTINCT
-    /// HTTP-family listener ports (resolvable or not) and EXCLUDES non-HTTP-family
-    /// entries (deferred raw-TCP, never an HTTP route) and duplicate ports. This
-    /// pins the exact boundary so the router's fail-closed ambiguity is neither
-    /// over- nor under-counted.
+    /// Declared HTTP-family port count counts DISTINCT HTTP-family listener
+    /// ports (resolvable or not) and EXCLUDES stream-family entries (they use
+    /// the raw-TCP inbound table, not HTTP sibling ambiguity) and duplicate
+    /// ports. Pins the exact boundary so the router's fail-closed ambiguity is
+    /// neither over- nor under-counted.
     #[test]
     fn sidecar_ingress_declared_count_excludes_non_http_and_dedups_ports() {
         let spiffe = "spiffe://cluster.local/ns/alpha/sa/reviews";
@@ -6867,8 +6867,8 @@ mod tests {
                 bind: None,
                 default_endpoint: "127.0.0.1:5001".to_string(),
             },
-            // Non-HTTP-family (raw TCP) → deferred, NOT counted as a declared
-            // HTTP-family port.
+            // Stream-family (raw TCP) → resolves into local_ingress_listeners but
+            // is NOT counted as a declared HTTP-family port (#3260).
             MeshSidecarIngress {
                 port: 9000,
                 protocol: AppProtocol::Tcp,
@@ -6901,11 +6901,23 @@ mod tests {
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
 
-        // Resolved: only the routable HTTP listener on 8080.
+        // Resolved: routable HTTP on 8080 + routable TCP on 9000.
         assert_eq!(
             slice.local_ingress_listeners.len(),
-            1,
-            "only the routable HTTP listener resolves"
+            2,
+            "routable HTTP and TCP listeners resolve"
+        );
+        assert!(
+            slice
+                .local_ingress_listeners
+                .iter()
+                .any(|l| l.port == 8080 && l.is_http_family())
+        );
+        assert!(
+            slice
+                .local_ingress_listeners
+                .iter()
+                .any(|l| l.port == 9000 && l.is_stream_family())
         );
         // Declared HTTP-family ports: {8080, 8443} = 2. The duplicate 8080, the
         // raw-TCP 9000, and the zero-port entry are excluded.

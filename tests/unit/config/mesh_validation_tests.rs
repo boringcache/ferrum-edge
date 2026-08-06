@@ -1935,6 +1935,7 @@ fn ingress_resolved_listener_endpoint_revalidation() {
         port: 8443,
         endpoint_host: "127.0.0.1".to_string(),
         endpoint_port: 8080,
+        protocol: AppProtocol::Http,
         owner_namespace: "default".to_string(),
         owner_service: "reviews".to_string(),
     };
@@ -1987,14 +1988,55 @@ fn ingress_resolve_rejects_unix_socket_endpoint() {
 }
 
 #[test]
-fn ingress_resolve_rejects_non_http_protocol() {
+fn ingress_resolve_accepts_stream_protocols() {
+    // Issue #3260: recognized stream-family protocols resolve to a routable
+    // listener (raw-TCP inbound relay), not NonHttpProtocol.
+    for protocol in [
+        AppProtocol::Tcp,
+        AppProtocol::Tls,
+        AppProtocol::Mongo,
+        AppProtocol::Redis,
+        AppProtocol::Mysql,
+        AppProtocol::Postgres,
+    ] {
+        let resolved = ingress_entry(6379, protocol, "127.0.0.1:6380")
+            .resolve()
+            .unwrap_or_else(|_| panic!("{protocol:?} ingress must resolve"));
+        assert_eq!(resolved.port, 6379);
+        assert_eq!(resolved.endpoint_host, "127.0.0.1");
+        assert_eq!(resolved.endpoint_port, 6380);
+        assert_eq!(resolved.protocol, protocol);
+        assert!(resolved.is_stream_family());
+        assert!(!resolved.is_http_family());
+    }
+}
+
+#[test]
+fn ingress_resolve_rejects_unrecognized_or_udp_protocol() {
     assert_eq!(
-        ingress_entry(8443, AppProtocol::Tcp, "127.0.0.1:8080").resolve(),
+        ingress_entry(8443, AppProtocol::Unknown, "127.0.0.1:8080").resolve(),
         Err(IngressListenerUnsupported::NonHttpProtocol)
     );
     assert_eq!(
-        ingress_entry(8443, AppProtocol::Mongo, "127.0.0.1:8080").resolve(),
+        ingress_entry(8443, AppProtocol::Udp, "127.0.0.1:8080").resolve(),
         Err(IngressListenerUnsupported::NonHttpProtocol)
+    );
+}
+
+#[test]
+fn ingress_resolved_listener_rejects_unknown_protocol_on_revalidation() {
+    use ferrum_edge::modes::mesh::config::ResolvedIngressListener;
+    let hostile = ResolvedIngressListener {
+        port: 8443,
+        endpoint_host: "127.0.0.1".to_string(),
+        endpoint_port: 8080,
+        protocol: AppProtocol::Unknown,
+        owner_namespace: "default".to_string(),
+        owner_service: "reviews".to_string(),
+    };
+    assert!(
+        !hostile.endpoint_is_valid(),
+        "a carried Unknown protocol must fail re-validation"
     );
 }
 

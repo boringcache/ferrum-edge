@@ -1434,14 +1434,24 @@ Istio's `Sidecar` resource has an `ingress[]` block letting a workload declare c
 
 ### Materialization model
 
-Each modeled ingress entry becomes one inbound loopback route:
+Each modeled ingress entry becomes one inbound forward path on the shared
+`:15006` capture listener:
 
-- **hosts** — the union of the local workload's own service FQDN variants (`{name}`, `{name}.{ns}`, `{name}.{ns}.svc`, `{name}.{ns}.svc.{cluster_domain}`). Istio only configures ingress "if and only if the workload is associated with a service"; when no local service resolves (e.g. EndpointSlice lag), the listener is dropped fail-closed (no host-less catch-all route).
+- **HTTP-family** (`http`/`http2`/`grpc`/`https`) — one host-routed loopback
+  route (same sibling machinery as the default service-port inbound routes).
+- **Stream-family** (`tcp`/`tls`/database protocols; issue #3260) — one
+  raw-TCP inbound relay in `local_inbound_tcp_routes`, keyed by the declared
+  listener port and forwarding to `defaultEndpoint`. PeerAuthentication and
+  AuthorizationPolicy still apply on the capture listener / L4 stream chain;
+  authz uses the declared listener port (not the backend port).
+
+Shared fields for both lanes:
+
+- **hosts** (HTTP only) — the union of the local workload's own service FQDN variants (`{name}`, `{name}.{ns}`, `{name}.{ns}.svc`, `{name}.{ns}.svc.{cluster_domain}`). Istio only configures ingress "if and only if the workload is associated with a service"; when no local service resolves (e.g. EndpointSlice lag), the listener is dropped fail-closed (no host-less catch-all route).
 - **backend** — the entry's `defaultEndpoint`, resolved to a loopback `host:port` (see supported forms below).
-- **listen path** — `/` (the route is selected by host, then disambiguated by port).
-- **port disambiguation** — on Ferrum's shared `:15006` inbound listener, the captured original destination (the port the client dialed) **and** a peer sidecar's request authority are matched against the **declared listener port** (not the `defaultEndpoint` port, which is the separate forward target). This reuses `select_mesh_inbound_port_route`: multiple ingress listeners on one workload are siblings disambiguated by listener port, and a request that addresses no declared listener port fails closed with `502` rather than being routed to an arbitrary backend.
-
-- **authorization port** — `mesh_authz` authorizes an ingress listener on its **declared listener port** (e.g. `8443`), not the `defaultEndpoint` backend port (e.g. `8080`). An `AuthorizationPolicy` `to.operation.ports` / `when: destination.port` rule scoped to the listener port therefore matches; authorizing on the backend port would let an ALLOW miss and — worse — a port-scoped **DENY fail open**. (Service-port default inbound routes keep authorizing on the container/backend port, matching Istio inbound authz.) The listener port is stamped onto the request at port selection and read by authz; if it is somehow unavailable for an ingress route, authz fails closed (it never falls back to the backend port).
+- **listen path** (HTTP only) — `/` (the route is selected by host, then disambiguated by port).
+- **port disambiguation** — on Ferrum's shared `:15006` inbound listener, the captured original destination (the port the client dialed) **and** (HTTP) a peer sidecar's request authority are matched against the **declared listener port** (not the `defaultEndpoint` port, which is the separate forward target). HTTP reuses `select_mesh_inbound_port_route`; stream reuses the `mesh_tcp_inbound` orig-dst table. A request that addresses no declared listener port fails closed rather than being routed to an arbitrary backend.
+- **authorization port** — `mesh_authz` authorizes an ingress listener on its **declared listener port** (e.g. `8443`), not the `defaultEndpoint` backend port (e.g. `8080`). An `AuthorizationPolicy` `to.operation.ports` / `when: destination.port` rule scoped to the listener port therefore matches; authorizing on the backend port would let an ALLOW miss and — worse — a port-scoped **DENY fail open**. (Service-port default inbound routes keep authorizing on the container/backend port, matching Istio inbound authz.)
 
 ### Precedence vs. the default inbound listeners (fail-closed)
 
@@ -1462,15 +1472,17 @@ The resolved listeners that ride the slice are **re-validated before dialing**: 
 | Recognized HTTP-family `port.protocol` (`http`/`http2`/`grpc`/`grpc-web`/`https`) | Modeled — `https` is a TLS-terminated HTTP-family listener and is materialized. |
 | `unix:///path/to/socket` | **Deferred** — Ferrum's backend model is `host:port` only; not representable. |
 | Arbitrary off-box IP (`10.0.0.5:PORT`) | **Deferred** — Istio forbids arbitrary IPs; Ferrum's loopback-only model will not dial off-box. |
-| Non-HTTP-family `port.protocol` (`tcp`/`tls`/`mongo`/…) | **Deferred** — raw-TCP inbound has no Host/route and is not modeled here. |
-| Missing or **unrecognized** `port.protocol` (e.g. a `HTPS` typo) | **Deferred** — a custom inbound listener routes only *recognized* HTTP-family protocols; a missing protocol (Istio defaults an unset port to TCP) or a mistyped string is **not** guessed as HTTP and is reported as a deferred non-HTTP listener, so it is never exposed on the HTTP request path. (The service-port default path keeps the `unknown → HTTP` convention for auto-discovered ports; this stricter rule applies only to explicitly declared `ingress[]` listeners. On the native source a mistyped `protocol` fails deserialization outright.) |
+| Non-HTTP-family `port.protocol` (`tcp`/`tls`/`mongo`/…) with a supported loopback `defaultEndpoint` | **Modeled** (issue #3260) — materializes a raw-TCP inbound relay keyed by the declared listener port, forwarding to `defaultEndpoint`. Authz uses the listener port. |
+| Missing `port.protocol` (K8s) | **Modeled as TCP** — Istio defaults an unset port protocol to TCP; Ferrum stream-models it the same way (never guesses HTTP). |
+| Unrecognized `port.protocol` (e.g. a `HTPS` typo) | **Deferred** — never guessed as HTTP or as a live TCP listener. (On the native source a mistyped `protocol` fails deserialization outright.) |
+| `Udp` `port.protocol` | **Deferred** — not a REDIRECT-captured TCP stream lane. |
 | Omitted / empty `defaultEndpoint` | **Deferred** — Istio allows omitting it (the native model also accepts an omitted field, defaulting to empty); with no forward target there is nothing to route. |
 
 The status writer reports the count of modeled listeners as `status.ferrum.translation.ingress_modeled` and lists deferral reasons in `deferred_fields`. The HTTP-family classification is shared by translation/resolution and the status writer (one predicate), so a modeled listener is never falsely reported as a deferred non-HTTP listener (and vice-versa). A listener `port` of `0` is a hard validation error (rejected), not a deferral.
 
 ### `bind` and `captureMode` limitations
 
-- **`bind`** — Ferrum's capture model funnels all inbound through the shared `:15006` listener (matched by captured original destination = the dialed listener port), so a custom `bind` address does **not** open a separate OS listener; it is preserved on the parsed model for observability. Unix-socket `bind` values are invalid (Istio rejects them too).
+- **`bind`** — Ferrum's capture model funnels all inbound through the shared `:15006` listener (matched by captured original destination = the dialed listener port), so a custom `bind` address does **not** open a separate OS listener; it is preserved on the parsed model for observability. Unix-socket `bind` values are invalid (Istio rejects them too). **Issue #3266** tracks dedicated bind-address socket materialization separately; stream-ingress modeling (#3260) intentionally keeps this capture-listener contract and does not absorb custom-bind behavior.
 - **`captureMode`** — Ferrum assumes `IPTABLES`/`DEFAULT` capture (the sidecar redirect model). `captureMode: NONE` (the app handles capture itself) is not separately honored; the listener-port disambiguation relies on the captured original destination or the request authority port being present.
 
 ### xDS / file / native parity

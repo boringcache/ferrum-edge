@@ -44,9 +44,9 @@ use std::collections::BTreeMap;
 
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
-    MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshService, MeshTelemetryResource,
-    MeshVirtualServiceCorsPolicy, MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication,
-    ResolvedIngressListener, ServiceEntry, TrustBundleSet, Workload,
+    AppProtocol, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshService,
+    MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MultiClusterConfig, OutboundTrafficPolicy,
+    PeerAuthentication, ResolvedIngressListener, ServiceEntry, TrustBundleSet, Workload,
 };
 use crate::modes::mesh::revision::MeshConfigRevision;
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
@@ -872,6 +872,7 @@ mod tests {
                 port: 8443,
                 endpoint_host: "127.0.0.1".to_string(),
                 endpoint_port: 8080,
+                protocol: AppProtocol::Http,
                 owner_namespace: "default".to_string(),
                 owner_service: "reviews".to_string(),
             }]),

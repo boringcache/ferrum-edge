@@ -10261,6 +10261,11 @@ fn tcp_round_trip_from_netns(
 /// capture a client in a fresh pod netns, `SO_ORIGINAL_DST` selects the strict
 /// VIP:port route, and a real Sidecar source opens the mesh-mTLS CONNECT tunnel
 /// to gateway B's destination relay and TCP echo.
+///
+/// Issue #3260 stream Sidecar `ingress[]` listeners install into the same
+/// `mesh_tcp_inbound` / `handle_mesh_tcp_inbound` table keyed by declared
+/// listener port (see unit materialization + authz coverage); this live lane
+/// exercises the shared relay datapath those ingress relays reuse.
 #[cfg(target_os = "linux")]
 #[ignore = "requires root + netns/veth + iptables REDIRECT"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
