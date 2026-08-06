@@ -4500,11 +4500,8 @@ fn l4_route_proxies(
         if allowed_parent_refs.is_empty() {
             continue;
         }
-        let materialized_parent_refs = route_materialized_parent_ref_keys_for_namespace(
-            object,
-            acc,
-            Some(config_namespace),
-        );
+        let materialized_parent_refs =
+            route_materialized_parent_ref_keys_for_namespace(object, acc, Some(config_namespace));
         let materialized_listener_ports =
             l4_route_listener_ports_for_namespace(object, acc, Some(config_namespace));
         let route_namespace_suffix = (config_namespaces.len() > 1)

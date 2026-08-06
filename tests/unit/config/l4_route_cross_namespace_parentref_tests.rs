@@ -350,7 +350,7 @@ fn l4_route_withdraws_when_allowed_routes_tighten_on_reload() {
         "tightened AllowedRoutes must withdraw the prior L4 proxy"
     );
     assert!(
-        skipped.iter().any(|error| {
+        skipped.values().any(|error| {
             error
                 .to_string()
                 .contains("not permitted by the target Gateway listener")
