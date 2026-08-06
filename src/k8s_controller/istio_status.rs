@@ -20,8 +20,10 @@
 //!   route blocks are translated to stream proxies (port / SNI-passthrough);
 //!   HTTP `mirror`/`rewrite`/`redirect`/`corsPolicy` are translated. L4 match
 //!   predicates (source identity/labels, CIDRs, and gateways) compile onto the
-//!   stream matcher; malformed predicates and weighted splitting are rejected
-//!   fail-closed (`Invalid`).
+//!   stream matcher; weighted multi-destination splits materialize an
+//!   upstream-backed stream proxy, while malformed predicates,
+//!   `destination.subset`, and invalid weights are rejected fail-closed
+//!   (`Invalid`).
 //! - `ServiceEntry` — status reports the resolved `resolution`/`location`
 //!   and host/endpoint/port counts.
 //! - `RequestAuthentication` — status reports the resolved scope and the
@@ -934,10 +936,12 @@ fn accepted_status(
 /// (incl. `mirror` / `rewrite` / `redirect` / `corsPolicy`) and `spec.tcp` /
 /// `spec.tls` L4 route blocks (translated to stream proxies: port / SNI
 /// passthrough) with supported L4 match predicates compiled onto
-/// `Proxy.stream_match`. Malformed predicates, weighted splitting, and any
-/// other `K8sTranslateError` (bad backend, etc.) surface through the `Invalid`
-/// arm. `corsPolicy` is deferred only for a policy combination Ferrum cannot
-/// represent faithfully (a malformed/unknown origin matcher, an over-budget
+/// `Proxy.stream_match` and weighted multi-destination splits materializing an
+/// upstream-backed stream proxy. Malformed predicates, `destination.subset`,
+/// invalid weights, and any other `K8sTranslateError` (bad backend, etc.)
+/// surface through the `Invalid` arm. `corsPolicy` is deferred only for a
+/// policy combination Ferrum cannot represent faithfully (a
+/// malformed/unknown origin matcher, an over-budget
 /// matcher list or value, an un-compilable/over-complex regex, an unparseable
 /// `maxAge`, or credentialed exact `*`); exact/prefix/regex origin matchers are
 /// otherwise translated.
@@ -1006,15 +1010,19 @@ fn virtual_service_status(
 /// VirtualService HTTP-route fields the translator parses past but never
 /// projects. `tcp` / `tls` route arrays are not listed here: they are
 /// translated to stream proxies (L4 match predicates compile onto
-/// `stream_match`; weighted splitting surfaces via the `Invalid` arm, not as
-/// deferred). `corsPolicy` is translated to a `cors` plugin when the complete
-/// source combination is representable; otherwise it is deferred.
+/// `stream_match`; weighted multi-destination splits materialize an
+/// upstream-backed stream proxy, and a rejected L4 route surfaces via the
+/// `Invalid` arm, not as deferred). `corsPolicy` is translated to a `cors`
+/// plugin when the complete source combination is representable; otherwise it
+/// is deferred.
 fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     let mut deferred: Vec<&'static str> = Vec::new();
     // `spec.tcp[]` / `spec.tls[]` are NOT listed as deferred: the translator
     // materializes them as stream proxies (including L4 match predicates on
-    // `Proxy.stream_match`). Weighted splitting and malformed predicates surface
-    // via the `Invalid` arm of `virtual_service_status`. `mirror` /
+    // `Proxy.stream_match`, and weighted multi-destination splits onto an
+    // upstream-backed stream proxy). Malformed predicates, `destination.subset`,
+    // and invalid weights surface via the `Invalid` arm of
+    // `virtual_service_status`. `mirror` /
     // `mirrorPercentage` / `redirect` / `rewrite` are translated, and
     // `corsPolicy` is translated to a proxy-scoped `cors` plugin when its
     // origins are representable — `allowOrigins[]` `exact`/`prefix`/`regex`
