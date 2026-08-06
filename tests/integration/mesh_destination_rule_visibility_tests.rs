@@ -1080,6 +1080,7 @@ fn sidecar_admitting(namespace: &str, hosts: &[&str]) -> MeshSidecar {
         }],
         ingress_declared: false,
         ingress: Vec::new(),
+        outbound_traffic_policy: None,
     }
 }
 
