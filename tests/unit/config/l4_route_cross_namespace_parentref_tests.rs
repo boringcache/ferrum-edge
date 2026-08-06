@@ -161,7 +161,15 @@ fn tls_route_cross_namespace_parent_ref_materializes_when_allowed() {
     let proxy = &result.config.proxies[0];
     assert_eq!(proxy.namespace, "infra");
     assert_eq!(proxy.listen_port, Some(15443));
-    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcps));
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
+    assert!(
+        proxy.passthrough,
+        "TLSRoute must preserve encrypted bytes for SNI passthrough"
+    );
+    assert!(
+        !proxy.frontend_tls,
+        "TLSRoute passthrough must not terminate frontend TLS"
+    );
     assert_eq!(proxy.hosts, vec!["db.example.com".to_string()]);
 }
 
