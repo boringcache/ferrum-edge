@@ -67,7 +67,7 @@ use crate::config::types::{
     BackendTlsConfig, BackoffStrategy, MAX_BACKEND_HOST_LENGTH,
     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, RetryConfig,
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
-    validate_backend_tls_sni,
+    validate_backend_tls_sni, validate_system_trust_roots_verify_pairing,
 };
 use crate::plugins::fault_injection::{
     CLIENT_GONE_STATUS, FaultDelayDisposition, ROUTE_FAULT_INJECTED_METADATA_KEY,
@@ -650,6 +650,31 @@ fn normalize_and_validate_backend_tls(
             "mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.client_cert_path \
              and client_key_path must be set together"
         ));
+    }
+
+    // `system://` means "verify against the platform roots"; pairing it with the
+    // verification opt-out is the same contradiction Proxy and Upstream
+    // admission reject, and this route-local override is the third surface that
+    // constructs a `BackendTlsConfig`. Without the check here the documented
+    // invariant (`docs/backend_mtls.md`) would silently resolve in favour of not
+    // verifying at all on exactly this path. The shared predicate is reused
+    // rather than restated so the two cannot drift; the cheap field test in
+    // front of it keeps the diagnostic strings off the ordinary path.
+    if tls.server_ca_cert_path.is_some() && !tls.verify_server_cert {
+        let ca_field = format!(
+            "mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.server_ca_cert_path"
+        );
+        let verify_field = format!(
+            "mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.verify_server_cert"
+        );
+        if let Some(error) = validate_system_trust_roots_verify_pairing(
+            &ca_field,
+            &verify_field,
+            tls.server_ca_cert_path.as_deref(),
+            tls.verify_server_cert,
+        ) {
+            return Err(error);
+        }
     }
 
     if let Some(sni) = tls.sni.as_mut() {

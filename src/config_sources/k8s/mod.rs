@@ -4,6 +4,7 @@
 //! supported Istio + Gateway API surface into Ferrum's canonical Layer 2 model.
 //! Unsupported resources fail closed when silent translation would be unsafe.
 
+pub(crate) mod backend_tls_policy;
 mod core;
 mod gateway_api;
 mod istio;
@@ -40,6 +41,12 @@ pub(crate) use istio::cors_policy_translatable;
 // is one predicate, so an HTTPS (→ Unknown → HTTP-family) listener is never
 // modeled by resolution yet reported as a deferred non-HTTP listener.
 pub(crate) use istio::sidecar_ingress_protocol_is_http_family;
+// Shared with the Istio status writer the same way (issue #3262): the Sidecar
+// `outboundTrafficPolicy` classification that decides the ENFORCED workload-scoped
+// policy is the same one that produces the reported `deferred_fields` reason, so a
+// fail-closed REGISTRY_ONLY degradation is never enforced without being reported
+// (nor reported without being enforced).
+pub(crate) use istio::{SidecarOutboundPolicy, classify_sidecar_outbound_traffic_policy};
 // Shared with the Istio status writer the same way: the ServiceEntry UDP-port
 // classification used by translation/materialization (a `protocol: UDP` port is
 // classified `AppProtocol::Udp` and its egress materialization is deferred/inert
@@ -136,6 +143,14 @@ pub struct K8sTranslationOptions {
     /// inbound behavior (dry-run / default-off). Default false (matches the env
     /// default and the slice builder). Egress narrowing has its OWN, looser gate
     /// (`enforced || dry_run`) and is not affected by this.
+    ///
+    /// The SAME effective gate governs `Sidecar.outboundTrafficPolicy`
+    /// application (issue #3262) — the slice builder resolves the workload-scoped
+    /// policy under the identical `sidecar_enforced && !sidecar_dry_run`
+    /// predicate — so the status writer reports the translated mode as APPLIED
+    /// only when this is true. It is deliberately one flag, not two: both are
+    /// "the applicable Sidecar changes data-plane behavior beyond narrowing what
+    /// the slice contains".
     pub mesh_sidecar_ingress_enforced: bool,
     /// Whether this Kubernetes source is an authoritative owner of mesh state
     /// (issue #2452).
@@ -355,6 +370,133 @@ pub struct K8sTranslation {
     /// route attached to one programmed parent and one fail-closed parent does
     /// not report both parents as Programmed.
     pub materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
+    /// Per-`BackendTLSPolicy` translation outcome, projected for the Gateway
+    /// API status writer. Computed during translation (the only place the
+    /// ConfigMap/Secret CA index exists) so status planning never retranslates.
+    pub backend_tls_policy_statuses: Vec<GatewayApiBackendTlsPolicyStatus>,
+}
+
+/// Translation outcome for one Gateway API `BackendTLSPolicy`, in the shape the
+/// status writer publishes on `status.ancestors[].conditions`.
+///
+/// Reasons come from the Gateway API `PolicyConditionReason` vocabulary so the
+/// values are portable: `Accepted` / `Conflicted` / `Invalid` /
+/// `NoValidCACertificate` / `TargetNotFound` on `Accepted`, and `ResolvedRefs`
+/// / `InvalidCACertificateRef` / `InvalidKind` / `RefNotPermitted` on
+/// `ResolvedRefs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayApiBackendTlsPolicyStatus {
+    pub policy: K8sResourceKey,
+    pub accepted: bool,
+    pub accepted_reason: String,
+    pub accepted_message: String,
+    pub resolved_refs: bool,
+    pub resolved_refs_reason: String,
+    pub resolved_refs_message: String,
+}
+
+/// Ceiling on the per-Service port metadata retained for BackendTLSPolicy.
+///
+/// Kubernetes places no hard limit on `Service.spec.ports`, and this index is
+/// built from untrusted cluster input, so the retained view is bounded. A
+/// Service that exceeds the cap is marked [`ServicePortIndex::truncated`] and
+/// every BackendTLSPolicy targeting it is rejected: an incomplete port view
+/// cannot prove a target port *is* TCP, and guessing would be the exact
+/// failure this index exists to prevent.
+pub(crate) const MAX_INDEXED_SERVICE_PORTS: usize = 64;
+
+/// Transport of one `Service.spec.ports[]` entry.
+///
+/// Modeled as an explicit transport rather than a `udp: bool` predicate.
+/// Gateway API `BackendTLSPolicy` governs **TCP** traffic, so the question a
+/// policy has to answer is "is this port TCP?", not "is this port UDP?" — and
+/// those two differ for `SCTP` and for any `protocol` value Ferrum does not
+/// recognize. Collapsing them onto `!udp` made an SCTP port (and a typo'd or
+/// future protocol) silently *eligible* for backend TLS, which is the one
+/// answer the transport check exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServicePortTransport {
+    /// `protocol: TCP`, or the field omitted (Kubernetes defaults it to TCP).
+    Tcp,
+    Udp,
+    Sctp,
+    /// A `protocol` value that is present but is not one of the three
+    /// Kubernetes core protocols. Never TCP-eligible: an unrecognized transport
+    /// cannot be *proven* to be TCP, so it fails closed.
+    Unrecognized,
+}
+
+impl ServicePortTransport {
+    /// Classify `Service.spec.ports[].protocol`.
+    ///
+    /// `None` is [`Self::Tcp`]: the field is optional and Kubernetes defaults it
+    /// to TCP. Comparison is ASCII-case-insensitive so a non-canonical spelling
+    /// cannot slip a non-TCP port past the check by failing an exact match —
+    /// and, unlike the previous `!udp` model, an unmatched spelling lands on
+    /// [`Self::Unrecognized`] rather than on TCP.
+    pub(crate) fn from_protocol_field(protocol: Option<&str>) -> Self {
+        match protocol {
+            None => Self::Tcp,
+            Some(value) if value.eq_ignore_ascii_case("TCP") => Self::Tcp,
+            Some(value) if value.eq_ignore_ascii_case("UDP") => Self::Udp,
+            Some(value) if value.eq_ignore_ascii_case("SCTP") => Self::Sctp,
+            Some(_) => Self::Unrecognized,
+        }
+    }
+
+    /// Whether a `BackendTLSPolicy` may govern a port with this transport.
+    pub(crate) fn is_tcp(self) -> bool {
+        matches!(self, Self::Tcp)
+    }
+
+    /// Operator-facing transport name for a policy status message.
+    ///
+    /// A fixed, bounded set — deliberately never the raw `protocol` string,
+    /// which is untrusted cluster input and would otherwise be echoed verbatim
+    /// onto a `status.ancestors[].conditions[].message` surface.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Tcp => "TCP",
+            Self::Udp => "UDP",
+            Self::Sctp => "SCTP",
+            Self::Unrecognized => "not a recognized Kubernetes protocol",
+        }
+    }
+}
+
+/// One `Service.spec.ports[]` entry, reduced to what BackendTLSPolicy needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexedServicePort {
+    pub port: u16,
+    /// `spec.ports[].name` — what a policy `targetRefs[].sectionName` names.
+    pub name: Option<String>,
+    /// Classified `spec.ports[].protocol`.
+    pub transport: ServicePortTransport,
+}
+
+/// Bounded, deterministic port view of one collected `Service`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ServicePortIndex {
+    /// Ports ordered by `(port, name)` so translation outcomes never depend on
+    /// the order Kubernetes happened to serialize `spec.ports`.
+    pub ports: Vec<IndexedServicePort>,
+    /// The Service declared more than [`MAX_INDEXED_SERVICE_PORTS`] ports, so
+    /// `ports` is an incomplete view and no transport conclusion is sound.
+    pub truncated: bool,
+}
+
+impl ServicePortIndex {
+    /// The indexed entry for a numeric Service port.
+    pub(crate) fn port(&self, port: u16) -> Option<&IndexedServicePort> {
+        self.ports.iter().find(|entry| entry.port == port)
+    }
+
+    /// The indexed entry a `sectionName` names (`spec.ports[].name`).
+    pub(crate) fn named(&self, section_name: &str) -> Option<&IndexedServicePort> {
+        self.ports
+            .iter()
+            .find(|entry| entry.name.as_deref() == Some(section_name))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,6 +667,15 @@ pub(crate) struct K8sAccumulator {
     /// directly — no per-lookup `.to_string()` allocations.
     service_port_names: HashMap<String, HashMap<String, HashMap<String, u16>>>,
     service_ports: HashMap<String, HashMap<String, HashSet<u16>>>,
+    /// Bounded per-Service port metadata (`namespace → service → ports`) that
+    /// retains the L4 transport of `spec.ports[].protocol`.
+    ///
+    /// Deliberately a third index rather than a change to the two above: those
+    /// are consumed by unrelated translation (VirtualService port-name
+    /// resolution, backendRef port existence) whose shape and behaviour must
+    /// not shift. Gateway API `BackendTLSPolicy` is the only consumer here, and
+    /// it needs the transport — TLS must never be originated to a UDP port.
+    service_port_specs: HashMap<String, HashMap<String, ServicePortIndex>>,
     pub(crate) mesh_config_registry: mesh_config::MeshConfigProviderRegistry,
     core: core::CoreState,
     explicit_workload_services: HashSet<K8sServiceKey>,
@@ -550,6 +701,10 @@ pub(crate) struct K8sAccumulator {
     /// sibling into `Conflicted=True`.
     gateway_api_route_conflicts: Vec<GatewayApiRouteConflict>,
     gateway_api_materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
+    /// Gateway API `BackendTLSPolicy` index keyed by target Service identity.
+    backend_tls_policies: backend_tls_policy::BackendTlsPolicyIndex,
+    /// Per-policy status projections recorded as policies are collected.
+    backend_tls_policy_statuses: Vec<GatewayApiBackendTlsPolicyStatus>,
     /// Effective session persistence from `BackendLBPolicy` /
     /// `XBackendTrafficPolicy`, keyed by `(namespace, service_name)`.
     /// Oldest creationTimestamp (then full resource identity) wins when
@@ -581,6 +736,7 @@ impl K8sAccumulator {
             known_namespaces: HashSet::new(),
             service_port_names: HashMap::new(),
             service_ports: HashMap::new(),
+            service_port_specs: HashMap::new(),
             mesh_config_registry: mesh_config::MeshConfigProviderRegistry::default(),
             core: core::CoreState::default(),
             explicit_workload_services: HashSet::new(),
@@ -593,9 +749,18 @@ impl K8sAccumulator {
             namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
             gateway_api_materialized_route_parents: HashSet::new(),
+            backend_tls_policies: backend_tls_policy::BackendTlsPolicyIndex::default(),
+            backend_tls_policy_statuses: Vec::new(),
             gateway_api_backend_session_policies: HashMap::new(),
             gateway_api_backend_session_policy_targets: HashMap::new(),
         }
+    }
+
+    pub(crate) fn record_backend_tls_policy_status(
+        &mut self,
+        status: GatewayApiBackendTlsPolicyStatus,
+    ) {
+        self.backend_tls_policy_statuses.push(status);
     }
 
     /// Resolve a Service port name to its `port` value. Returns `None` when
@@ -627,6 +792,23 @@ impl K8sAccumulator {
             .is_some_and(|ports| ports.contains(&port))
     }
 
+    /// Bounded port metadata for a collected `Service`, including each port's
+    /// L4 transport. `None` means the Service was never collected (external
+    /// host, foreign namespace, absent object) — which is distinct from a
+    /// collected Service that declares no ports.
+    ///
+    /// Used by Gateway API `BackendTLSPolicy` to resolve `sectionName` to a
+    /// real port and to refuse originating TLS to a UDP port.
+    pub(crate) fn service_port_index(
+        &self,
+        namespace: &str,
+        service: &str,
+    ) -> Option<&ServicePortIndex> {
+        self.service_port_specs
+            .get(namespace)
+            .and_then(|by_service| by_service.get(service))
+    }
+
     pub(crate) fn has_observed_services(&self) -> bool {
         !self.service_port_names.is_empty()
     }
@@ -647,6 +829,14 @@ impl K8sAccumulator {
 
     pub(crate) fn secret_tls_material_digest(&self, namespace: &str, name: &str) -> Option<&str> {
         core::secret_tls_material_digest(self, namespace, name)
+    }
+
+    pub(crate) fn secret_ca_bundle_digest(&self, namespace: &str, name: &str) -> Option<&str> {
+        core::secret_ca_bundle_digest(self, namespace, name)
+    }
+
+    pub(crate) fn configmap_ca_bundle_pem(&self, namespace: &str, name: &str) -> Option<&str> {
+        core::configmap_ca_bundle_pem(self, namespace, name)
     }
 
     fn observe_namespace(&mut self, namespace: &str) {
@@ -807,6 +997,24 @@ impl K8sAccumulator {
     }
 
     fn finish(mut self) -> K8sTranslation {
+        // BackendTLSPolicy precedence depends on the complete snapshot. Mark
+        // losers only after every policy has been indexed so status is stable
+        // under input reordering and matches runtime lookup's winner.
+        let conflicted_policies = self
+            .backend_tls_policies
+            .conflicted_policy_ids(&self.service_port_specs);
+        for status in &mut self.backend_tls_policy_statuses {
+            if status.accepted
+                && conflicted_policies
+                    .contains(&(status.policy.namespace.clone(), status.policy.name.clone()))
+            {
+                status.accepted = false;
+                status.accepted_reason = "Conflicted".to_string();
+                status.accepted_message = "An older or more specific BackendTLSPolicy takes \
+                    precedence for every Service section this policy could govern"
+                    .to_string();
+            }
+        }
         gateway_api::finalize_dispatch_plugin_precedence(&mut self.config.plugin_configs);
         debug_assert!(
             !gateway_api::dispatch_rule_internal_metadata_present(&self.config.plugin_configs),
@@ -858,6 +1066,7 @@ impl K8sAccumulator {
             warnings: self.warnings,
             route_conflicts: self.gateway_api_route_conflicts,
             materialized_route_parents: self.gateway_api_materialized_route_parents,
+            backend_tls_policy_statuses: self.backend_tls_policy_statuses,
         }
     }
 }
@@ -1003,6 +1212,13 @@ where
             }
         } else if object.kind == "Secret" {
             core::collect(&mut acc, object)?;
+        } else if object.kind == "ConfigMap"
+            && !mesh_config::is_istio_mesh_config_map(&acc.options, object)
+        {
+            // Gateway API BackendTLSPolicy caCertificateRefs commonly point at
+            // ConfigMaps. Collect CA bundles here; the istio root ConfigMap is
+            // handled by the mesh_config branch below.
+            core::collect(&mut acc, object)?;
         } else if mesh_config::is_istio_mesh_config_map(&acc.options, object) {
             mesh_config::collect(&mut acc, object)?;
         } else if acc.options.pod_discovery_enabled && object.kind == "ServiceEntry" {
@@ -1010,6 +1226,19 @@ where
         } else if acc.options.pod_discovery_enabled && core::is_core_resource_kind(&object.kind) {
             core::collect(&mut acc, object)?;
         }
+    }
+
+    // BackendTLSPolicy validation resolves ConfigMap/Secret CA refs, so it
+    // runs after the core material index above rather than interleaved with it.
+    for object in &included_objects {
+        if object.kind != "BackendTLSPolicy" {
+            continue;
+        }
+        if !includes_object_namespace(&acc.options, object) {
+            continue;
+        }
+        observe_object_namespace(&mut acc, object);
+        backend_tls_policy::collect(&mut acc, object)?;
     }
 
     // Backend session-policy precedence is resolved per Service while
@@ -1306,6 +1535,8 @@ pub(crate) fn collect_service(
         .unwrap_or(&[]);
     let mut port_names: HashMap<String, u16> = HashMap::new();
     let mut port_numbers: HashSet<u16> = HashSet::new();
+    let mut port_specs: Vec<IndexedServicePort> = Vec::new();
+    let mut port_specs_truncated = false;
     for port_entry in ports {
         let Some(raw) = port_entry.get("port").and_then(Value::as_u64) else {
             continue;
@@ -1315,7 +1546,25 @@ pub(crate) fn collect_service(
         if let Some(name) = string_field(port_entry, "name") {
             port_names.insert(name.to_string(), port);
         }
+        if port_specs.len() < MAX_INDEXED_SERVICE_PORTS {
+            port_specs.push(IndexedServicePort {
+                port,
+                name: string_field(port_entry, "name").map(ToOwned::to_owned),
+                transport: ServicePortTransport::from_protocol_field(string_field(
+                    port_entry, "protocol",
+                )),
+            });
+        } else {
+            port_specs_truncated = true;
+        }
     }
+    // Deterministic order: the same Service must produce the same policy
+    // verdict no matter how the API server serialized `spec.ports`.
+    port_specs.sort_by(|left, right| {
+        left.port
+            .cmp(&right.port)
+            .then_with(|| left.name.cmp(&right.name))
+    });
     acc.service_port_names
         .entry(object.metadata.namespace.clone())
         .or_default()
@@ -1324,6 +1573,16 @@ pub(crate) fn collect_service(
         .entry(object.metadata.namespace.clone())
         .or_default()
         .insert(object.metadata.name.clone(), port_numbers);
+    acc.service_port_specs
+        .entry(object.metadata.namespace.clone())
+        .or_default()
+        .insert(
+            object.metadata.name.clone(),
+            ServicePortIndex {
+                ports: port_specs,
+                truncated: port_specs_truncated,
+            },
+        );
 
     // GAMMA Waypoint binding: a Service with the `istio.io/use-waypoint`
     // annotation routes through the named waypoint. We append the binding

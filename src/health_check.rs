@@ -88,6 +88,46 @@ fn grpc_probe_urls(
     )
 }
 
+/// Authority a probe must present to the backend: the REAL target, never the
+/// TLS server name. Mirrors what a plain `format_probe_url` client would put in
+/// `Host` / `:authority`, including the default-port elision reqwest performs.
+fn probe_authority(scheme: &str, host: &str, port: u16) -> String {
+    let rendered = if !host.starts_with('[') && host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let default_port = match scheme {
+        "https" => 443,
+        _ => 80,
+    };
+    if port == default_port {
+        rendered
+    } else {
+        format!("{rendered}:{port}")
+    }
+}
+
+/// Effective backend TLS server name for a probe.
+///
+/// A backend covered by `backend_tls_sni` (Gateway API `BackendTLSPolicy`
+/// `validation.hostname`, an Istio DestinationRule TLS overlay, or the upstream
+/// field directly) presents a certificate valid for THAT name, not for the
+/// target host the gateway dials. A probe that verifies against the target host
+/// therefore marks a perfectly healthy backend unhealthy — request traffic
+/// succeeds while the probe fails. Use the same identity request traffic uses.
+///
+/// Returns the bracket-stripped form: rustls/tonic want a bare DNS name, and
+/// `validate_backend_tls_sni` already guarantees an override is a hostname and
+/// never an IP literal.
+fn probe_tls_server_name<'a>(tls_config: &'a BackendTlsConfig, host: &'a str) -> &'a str {
+    let name = tls_config.sni.as_deref().unwrap_or(host);
+    match name.strip_prefix('[').and_then(|i| i.strip_suffix(']')) {
+        Some(bare) => bare,
+        None => name,
+    }
+}
+
 fn load_probe_tls_material(
     source_value: &str,
     kind: MaterialKind,
@@ -369,7 +409,8 @@ impl HealthChecker {
     /// rebuilt by [`set_global_tls_config`] before traffic flows.
     pub fn with_pool_config(pool_config: &PoolConfig, dns_cache: DnsCache) -> Self {
         let client = accept_health_check_client(
-            build_health_check_client(pool_config, Some(dns_cache.clone()), false),
+            build_health_check_client(pool_config, Some(dns_cache.clone()), false)
+                .map_err(HealthCheckClientError::from),
             "default health-check HTTP client",
         );
         Self {
@@ -414,7 +455,8 @@ impl HealthChecker {
         // through the no-TLS-config path honour the operator opt-in.
         if tls_no_verify {
             self.default_http_client = accept_health_check_client(
-                build_health_check_client(&self.pool_config, self.dns_cache.clone(), tls_no_verify),
+                build_health_check_client(&self.pool_config, self.dns_cache.clone(), tls_no_verify)
+                    .map_err(HealthCheckClientError::from),
                 "default health-check HTTP client (tls_no_verify rebuild)",
             );
         }
@@ -423,7 +465,8 @@ impl HealthChecker {
     /// Create a health checker without DNS cache (for tests).
     fn without_dns_cache(pool_config: &PoolConfig) -> Self {
         let client = accept_health_check_client(
-            build_health_check_client(pool_config, None, false),
+            build_health_check_client(pool_config, None, false)
+                .map_err(HealthCheckClientError::from),
             "default health-check HTTP client",
         );
         Self {
@@ -553,9 +596,28 @@ impl HealthChecker {
                 if let Some(active) = &hc_config.active {
                     // Build a per-upstream HTTP client with the upstream's TLS config
                     let tls_config = BackendTlsConfig::from_upstream(upstream);
-                    let upstream_client =
-                        self.build_upstream_health_client(&tls_config, active.use_tls);
+                    // A `backend_tls_sni` HTTPS probe puts the overridden server
+                    // name in the probe URL, so its client must pin the dial to
+                    // ONE target and is therefore built per target below. Every
+                    // other probe keeps the shared per-upstream client.
+                    let probe_pins_dial_host = active.use_tls
+                        && tls_config.sni.is_some()
+                        && matches!(active.probe_type, HealthProbeType::Http);
+                    let upstream_client = if probe_pins_dial_host {
+                        None
+                    } else {
+                        self.build_upstream_health_client(&tls_config, active.use_tls, None)
+                    };
                     for target in &upstream.targets {
+                        let target_client = if probe_pins_dial_host {
+                            self.build_upstream_health_client(
+                                &tls_config,
+                                active.use_tls,
+                                Some(target.host.as_str()),
+                            )
+                        } else {
+                            upstream_client.clone()
+                        };
                         let start = ActiveCheckStartParams {
                             target,
                             upstream_namespace: &upstream.namespace,
@@ -566,7 +628,7 @@ impl HealthChecker {
                         let handle = self.start_active_check(
                             start,
                             active,
-                            upstream_client.as_ref(),
+                            target_client.as_ref(),
                             &tls_config,
                         );
                         new_aborts.push(handle.abort_handle());
@@ -1071,10 +1133,16 @@ impl HealthChecker {
     /// Returns `None` when client construction fails closed; HTTP probes then
     /// report unhealthy without dialing (TCP/UDP/gRPC probes do not need this
     /// client).
+    ///
+    /// `dial_host_pin` is `Some(target_host)` only for a `backend_tls_sni`
+    /// HTTPS probe, which is therefore built per TARGET rather than per upstream
+    /// (the pin names the one target this client may dial). See
+    /// [`build_health_check_client_with_tls`].
     fn build_upstream_health_client(
         &self,
         tls_config: &BackendTlsConfig,
         use_tls: bool,
+        dial_host_pin: Option<&str>,
     ) -> Option<Arc<reqwest::Client>> {
         let has_tls_config = tls_config.client_cert_path.is_some()
             || tls_config.client_key_path.is_some()
@@ -1094,9 +1162,12 @@ impl HealthChecker {
                 self.dns_cache.clone(),
                 tls_config,
                 &self.global_tls_ca_bundle_path,
-                &self.global_backend_tls_client_cert_path,
-                &self.global_backend_tls_client_key_path,
+                HealthCheckClientIdentityPaths {
+                    cert: &self.global_backend_tls_client_cert_path,
+                    key: &self.global_backend_tls_client_key_path,
+                },
                 self.global_tls_no_verify,
+                dial_host_pin,
             ),
             "upstream TLS health-check HTTP client",
         )
@@ -1139,7 +1210,37 @@ impl HealthChecker {
         let healthy_status_codes = config.healthy_status_codes.clone();
         let client = upstream_client.cloned();
         let scheme = if config.use_tls { "https" } else { "http" };
-        let url = format_probe_url(scheme, &host, port, &config.http_path);
+        // A backend covered by `backend_tls_sni` presents a certificate for the
+        // OVERRIDE, not for the target host, so the probe must offer the same
+        // server name request traffic does or it reports a healthy backend as
+        // unhealthy. reqwest derives the server name from the URL host and has
+        // no per-request hook, so the override goes in the probe URL's authority
+        // — exactly as on the proxy path
+        // (`crate::proxy::backend_tls_sni_reqwest_dial`) — while the client
+        // built for this target pins its resolver to the real target host, so
+        // the override is never resolved and the socket cannot leave that
+        // target's egress-screened candidate set. That client is also restricted
+        // to HTTP/1.1 (`build_health_check_client_with_tls`), which is what makes
+        // the explicit `Host` below authoritative: over HTTP/2 the authority
+        // would be rebuilt from the URI, i.e. from the server name.
+        let probe_server_name = if config.use_tls {
+            tls_config.sni.as_deref()
+        } else {
+            None
+        };
+        let url = format_probe_url(
+            scheme,
+            probe_server_name.unwrap_or(host.as_str()),
+            port,
+            &config.http_path,
+        );
+        // ...and the backend must still see its OWN authority, never the server
+        // name. Sent explicitly because hyper-util only derives `Host` from the
+        // URL when the request carries none, and PRESERVED because the SNI probe
+        // client speaks HTTP/1.1 only — `Host` is a header there, not a value the
+        // transport recomputes from the URI. Absent (and byte-identical to
+        // today's probe) whenever no override is configured.
+        let host_header = probe_server_name.map(|_| probe_authority(scheme, &host, port));
         let udp_payload = config
             .udp_probe_payload
             .as_deref()
@@ -1224,7 +1325,14 @@ impl HealthChecker {
                             // it and were screened by `egress_denied` above.
                             match client.as_ref() {
                                 Some(client) => {
-                                    http_probe(client, &url, timeout, &healthy_status_codes).await
+                                    http_probe(
+                                        client,
+                                        &url,
+                                        host_header.as_deref(),
+                                        timeout,
+                                        &healthy_status_codes,
+                                    )
+                                    .await
                                 }
                                 None => {
                                     warn!(
@@ -1530,13 +1638,22 @@ fn sanitized_http_probe_failure(error: &reqwest::Error) -> &'static str {
 }
 
 /// HTTP health probe — sends a GET request and checks the status code.
+///
+/// `host_header` is set only when the URL authority is a backend TLS server-name
+/// override, so the backend still receives its own authority rather than the
+/// server name.
 async fn http_probe(
     client: &reqwest::Client,
     url: &str,
+    host_header: Option<&str>,
     timeout: Duration,
     healthy_status_codes: &[u16],
 ) -> ProbeOutcome {
-    match client.get(url).timeout(timeout).send().await {
+    let mut request = client.get(url).timeout(timeout);
+    if let Some(host_header) = host_header {
+        request = request.header(reqwest::header::HOST, host_header);
+    }
+    match request.send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
             let healthy = if healthy_status_codes.is_empty() {
@@ -1778,7 +1895,9 @@ async fn grpc_probe(
         }
     };
 
-    let skip_verify = use_tls && (!tls_config.verify_server_cert || global_no_verify);
+    let skip_verify = use_tls
+        && (!tls_config.verify_server_cert
+            || (global_no_verify && tls_config.allows_global_no_verify()));
 
     // When skip_verify is true, tonic's ClientTlsConfig doesn't support disabling
     // cert verification. Build a rustls ClientConfig directly with NoVerifier
@@ -1816,56 +1935,81 @@ async fn grpc_probe(
             }
         }
     } else if use_tls {
-        // SNI / cert hostname stays the original `host` even though we dial the
-        // pre-screened IP via `dial_addr`, so backend cert validation is unchanged.
+        // SNI / cert hostname is the EFFECTIVE backend TLS identity — the
+        // configured `backend_tls_sni` override when present, else the original
+        // `host` — even though we dial the pre-screened IP via `dial_addr`. The
+        // `origin`/authority above deliberately keeps the real target so the
+        // backend still sees its own `:authority`, exactly as for proxy traffic.
         // rustls/tonic want a BARE SNI host, not a URI-bracketed IPv6 literal
-        // (`[fd00::1]`), so strip brackets here — the `origin`/authority above
-        // keeps the bracketed form because a URI authority requires it.
-        let sni_host = host
-            .strip_prefix('[')
-            .and_then(|h| h.strip_suffix(']'))
-            .unwrap_or(host);
+        // (`[fd00::1]`), which `probe_tls_server_name` strips.
+        let sni_host = probe_tls_server_name(tls_config, host);
         let mut tonic_tls = tonic::transport::ClientTlsConfig::new().domain_name(sni_host);
 
-        // Load CA certs (upstream → global → system roots)
-        if let Some(ca_path) = tls_config.server_ca_cert_path.as_deref().or(global_ca_path) {
+        // Load CA certs (upstream → global → system roots). `system://` resolves
+        // to `None` here so the probe pins the built-in roots and deliberately
+        // skips the cluster-global bundle.
+        if let Some(ca_path) = tls_config.effective_ca_source(global_ca_path) {
             match load_probe_tls_material(ca_path, MaterialKind::CaBundle, "gRPC health probe CA") {
                 Ok(pem) => {
                     let cert = tonic::transport::Certificate::from_pem(pem);
                     tonic_tls = tonic_tls.ca_certificate(cert);
                 }
                 Err(e) => {
-                    debug!("gRPC health probe: failed to load CA: {}", e);
+                    // The configured CA is the sole trust anchor. Proceeding
+                    // without it leaves tonic on its default roots, so a
+                    // publicly-trusted certificate would pass a probe for a
+                    // backend pinned to a private CA. Fail the probe instead.
+                    return ProbeOutcome::failure(format!(
+                        "gRPC health probe: configured backend CA is the sole trust anchor but could not be loaded ({e})"
+                    ));
                 }
             }
         } else {
             tonic_tls = tonic_tls.with_enabled_roots();
         }
 
-        // Load mTLS client identity
+        // Load mTLS client identity. Fail-closed, matching the no-verify gRPC
+        // branch (`build_grpc_probe_channel_no_verify`) and the HTTP probe: a
+        // configured identity that cannot be loaded must fail the probe rather
+        // than silently downgrade it to an anonymous handshake the backend
+        // answers differently than it answers proxy traffic. Errors carry the
+        // loader's source identifier and failure class, never key material.
         let cert_path = tls_config.client_cert_path.as_deref().or(global_cert_path);
         let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
-        if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-            match (
-                load_probe_tls_material(
+        match (cert_path, key_path) {
+            (Some(cert_path), Some(key_path)) => {
+                let pair = load_probe_tls_material(
                     cert_path,
                     MaterialKind::Cert,
                     "gRPC health probe client cert",
-                ),
-                load_probe_tls_material(
-                    key_path,
-                    MaterialKind::Key,
-                    "gRPC health probe client key",
-                ),
-            ) {
-                (Ok(cert_pem), Ok(key_pem)) => {
-                    let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
-                    tonic_tls = tonic_tls.identity(identity);
-                }
-                (Err(e), _) | (_, Err(e)) => {
-                    debug!("gRPC health probe: failed to load client cert/key: {}", e);
+                )
+                .and_then(|cert_pem| {
+                    load_probe_tls_material(
+                        key_path,
+                        MaterialKind::Key,
+                        "gRPC health probe client key",
+                    )
+                    .map(|key_pem| (cert_pem, key_pem))
+                });
+                match pair {
+                    Ok((cert_pem, key_pem)) => {
+                        let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+                        tonic_tls = tonic_tls.identity(identity);
+                    }
+                    Err(e) => {
+                        return ProbeOutcome::failure(format!(
+                            "gRPC health probe: configured backend mTLS client identity could not be loaded ({e})"
+                        ));
+                    }
                 }
             }
+            (Some(_), None) | (None, Some(_)) => {
+                return ProbeOutcome::failure(
+                    "gRPC health probe: backend mTLS client certificate and private key must be configured together"
+                        .to_string(),
+                );
+            }
+            (None, None) => {}
         }
 
         let endpoint = match endpoint.tls_config(tonic_tls) {
@@ -1977,7 +2121,7 @@ async fn build_grpc_probe_channel_no_verify(
     use tokio_rustls::TlsConnector;
 
     // Build root cert store (still needed for mTLS client auth builder)
-    let ca_path = tls_config.server_ca_cert_path.as_deref().or(global_ca_path);
+    let ca_path = tls_config.effective_ca_source(global_ca_path);
     let root_store = if let Some(ca_path) = ca_path {
         load_probe_tls_root_store(ca_path, "gRPC health probe CA").map_err(std::io::Error::other)?
     } else {
@@ -2025,7 +2169,11 @@ async fn build_grpc_probe_channel_no_verify(
     client_config.alpn_protocols = vec![b"h2".to_vec()];
 
     let tls_connector = TlsConnector::from(Arc::new(client_config));
-    let host_owned = host.to_string();
+    // Same effective backend TLS identity the verifying branch uses: the
+    // configured `backend_tls_sni` override when present, else the target host.
+    // Only the server NAME changes — the socket still goes to the pre-screened
+    // address in `uri`, and tonic's `origin` still carries the real authority.
+    let host_owned = probe_tls_server_name(tls_config, host).to_string();
 
     let connector = tower::service_fn(move |uri: http::Uri| {
         let tls_connector = tls_connector.clone();
@@ -2036,6 +2184,8 @@ async fn build_grpc_probe_channel_no_verify(
                 uri.port_u16().unwrap_or(443),
             );
             let tcp = tokio::net::TcpStream::connect(&addr).await?;
+            // Fail closed on an unusable server name rather than handshaking
+            // with whatever rustls would otherwise infer.
             let server_name = ServerName::try_from(host)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
             let tls = tls_connector.connect(server_name, tcp).await?;
@@ -2099,6 +2249,84 @@ fn build_health_check_client(
     }
 }
 
+/// Why a health-check HTTP client could not be produced.
+///
+/// Split from a bare `reqwest::Error` because the two failures are not the same
+/// event: a builder failure is degraded-but-neutral, while an unusable
+/// exclusive CA is a *trust policy* failure that must never be downgraded into
+/// "build something that verifies against different roots".
+#[derive(Debug)]
+enum HealthCheckClientError {
+    /// `reqwest` refused to build the client.
+    Build(reqwest::Error),
+    /// A configured exclusive backend CA could not be loaded or parsed.
+    ///
+    /// Ferrum's documented CA exclusivity (`docs/backend_mtls.md`) makes a
+    /// configured CA the *sole* trust anchor. Continuing without it would build
+    /// a probe client that trusts the public webpki roots instead, so a backend
+    /// presenting any publicly-trusted certificate would pass health checks for
+    /// an upstream pinned to a private CA — the probe would then keep marking a
+    /// target healthy that proxy traffic correctly refuses.
+    ///
+    /// Reachable through Gateway API `BackendTLSPolicy`: a `caCertificateRefs`
+    /// Secret projects a `k8s://…#ca.crt` source whose load happens here, not
+    /// at translation time, and can fail afterwards (Secret deleted, RBAC
+    /// revoked, API server unavailable).
+    ExclusiveTrustUnavailable(String),
+    /// A configured backend mTLS client identity could not be loaded or parsed.
+    ///
+    /// A health probe must authenticate to the backend exactly as proxy traffic
+    /// does. Continuing without the configured certificate/key produces an
+    /// *anonymous* probe: a backend enforcing client authentication rejects it
+    /// (so the probe reports a failure the operator cannot explain from the
+    /// backend's perspective), and a backend that merely *prefers* client certs
+    /// answers the anonymous probe successfully while refusing real proxy
+    /// traffic — marking a target healthy that no request can actually use.
+    ///
+    /// A half-configured pair (cert without key, or key without cert) is the
+    /// same fault: it is an operator error that must surface, never an implicit
+    /// "authenticate anonymously".
+    ClientIdentityUnavailable(String),
+    /// A `backend_tls_sni` probe was requested but the dial cannot be pinned to
+    /// the real target, because this checker has no DNS cache wired.
+    ///
+    /// The probe URL's host is the overridden TLS server name, so without the
+    /// pin reqwest would resolve THAT name and dial wherever it points —
+    /// off the egress-screened candidate set for the target being probed.
+    DialPinUnavailable,
+}
+
+impl std::fmt::Display for HealthCheckClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Build(error) => write!(f, "{error}"),
+            // `details` carries a source identifier and loader message, never
+            // material: `MaterialError` reports `display_source_id`, so no PEM
+            // or secret bytes reach this string.
+            Self::ExclusiveTrustUnavailable(details) => write!(
+                f,
+                "configured backend CA is the sole trust anchor but could not be used ({details})"
+            ),
+            // Same disclosure contract as above: `details` names the source
+            // identifier and failure class, never key or certificate material.
+            Self::ClientIdentityUnavailable(details) => write!(
+                f,
+                "configured backend mTLS client identity could not be used ({details})"
+            ),
+            Self::DialPinUnavailable => write!(
+                f,
+                "backend TLS server-name override requires a DNS cache to pin the probe dial to the real target"
+            ),
+        }
+    }
+}
+
+impl From<reqwest::Error> for HealthCheckClientError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Build(error)
+    }
+}
+
 /// Build a minimal `reqwest::Client` that still uses the gateway's DNS cache.
 ///
 /// Used as a fallback when a fully-configured builder fails (e.g., due to
@@ -2159,7 +2387,7 @@ fn build_dns_cached_fallback_client(
 
 /// Accept a built health-check client or log and return `None` so probes fail closed.
 fn accept_health_check_client(
-    result: Result<reqwest::Client, reqwest::Error>,
+    result: Result<reqwest::Client, HealthCheckClientError>,
     context: &str,
 ) -> Option<Arc<reqwest::Client>> {
     match result {
@@ -2173,20 +2401,92 @@ fn accept_health_check_client(
     }
 }
 
+/// Install the probe's dial identity on a health-check client builder: the DNS
+/// resolver, and — for a `backend_tls_sni` probe — the HTTP/1.1-only
+/// restriction that keeps its explicit `Host` header authoritative.
+///
+/// Both halves are one decision. A pinned probe's URL host is the overridden TLS
+/// server name, so:
+///
+/// * the resolver must answer every name by resolving the REAL target, or
+///   reqwest would resolve the override and dial wherever it points; and
+/// * ALPN must exclude `h2`, or HTTP/2 would rebuild `:authority` from that same
+///   URL and show the backend the override instead of the target being probed.
+///
+/// Split out of [`build_health_check_client_with_tls`] so the pairing can be
+/// asserted on a `ClientBuilder` (whose `Debug` reports `http1_only`) rather
+/// than only observed on the wire.
+fn apply_probe_dial_identity(
+    builder: reqwest::ClientBuilder,
+    dns_cache: Option<DnsCache>,
+    dial_host_pin: Option<&str>,
+) -> Result<reqwest::ClientBuilder, HealthCheckClientError> {
+    match (dns_cache, dial_host_pin) {
+        (Some(dns_cache), Some(pin)) => {
+            let resolver = DnsCacheResolver::with_hostname_pin(dns_cache, pin);
+            Ok(builder.dns_resolver(Arc::new(resolver)).http1_only())
+        }
+        (Some(dns_cache), None) => {
+            let resolver = DnsCacheResolver::new(dns_cache);
+            Ok(builder.dns_resolver(Arc::new(resolver)))
+        }
+        // A server-name override with no DNS cache to pin would let reqwest's
+        // own resolver look up the SNI hostname and dial wherever it points.
+        // That is the escape this must never allow, so fail closed instead.
+        (None, Some(_)) => Err(HealthCheckClientError::DialPinUnavailable),
+        (None, None) => Ok(builder),
+    }
+}
+
+/// Global client-certificate and private-key paths are one atomic identity.
+/// Bundling them keeps the TLS client builder's argument list below clippy's
+/// complexity threshold and makes it harder for call sites to swap the pair.
+#[derive(Clone, Copy)]
+struct HealthCheckClientIdentityPaths<'a> {
+    cert: &'a Option<String>,
+    key: &'a Option<String>,
+}
+
 /// Build a health check HTTP client with upstream-specific TLS configuration.
 ///
 /// Configures the client with the upstream's CA bundle, client cert/key for mTLS,
 /// and verify settings — so health probes authenticate the same way proxy traffic does.
+///
+/// `dial_host_pin` is set only for a `backend_tls_sni` probe, whose URL host is
+/// the overridden TLS server name (reqwest derives the rustls server name from
+/// the URL and exposes no per-request hook — the same constraint the proxy path
+/// documents on `crate::proxy::backend_tls_sni_reqwest_dial`). The pin makes the
+/// resolver answer every name by resolving the REAL target instead, so the
+/// server name is never itself resolved and the socket cannot leave the
+/// egress-screened candidate set for that target.
+///
+/// A pinned client is additionally restricted to **HTTP/1.1**, for the same
+/// reason the proxy's SNI dial is. The probe carries the real target authority
+/// in an explicit `Host` header, which hyper-util preserves on HTTP/1.1 — but
+/// HTTP/2 derives `:authority` from the URI, i.e. from the server name, so an
+/// h2-negotiated probe would present the OVERRIDE as its authority and measure
+/// a request the backend never receives from proxy traffic. `http1_only()` is
+/// load-bearing here rather than a hint: this builder does not use
+/// `use_preconfigured_tls`, so reqwest itself derives the client's ALPN from
+/// the version preference and advertises `http/1.1` alone (see
+/// `vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/client.rs`), which means
+/// an h2-capable backend cannot select h2 on this connection. Probes without an
+/// override keep the default h2-capable client: their URL already names the real
+/// target, so there is no authority to lose.
+///
+/// The resolver + ALPN half of that contract lives in
+/// [`apply_probe_dial_identity`] so it can be asserted directly.
 fn build_health_check_client_with_tls(
     pool_config: &PoolConfig,
     dns_cache: Option<DnsCache>,
     tls_config: &BackendTlsConfig,
     global_ca_path: &Option<String>,
-    global_cert_path: &Option<String>,
-    global_key_path: &Option<String>,
+    global_identity: HealthCheckClientIdentityPaths<'_>,
     global_no_verify: bool,
-) -> Result<reqwest::Client, reqwest::Error> {
-    let skip_verify = !tls_config.verify_server_cert || global_no_verify;
+    dial_host_pin: Option<&str>,
+) -> Result<reqwest::Client, HealthCheckClientError> {
+    let skip_verify = !tls_config.verify_server_cert
+        || (global_no_verify && tls_config.allows_global_no_verify());
 
     let mut builder = reqwest::Client::builder()
         .no_proxy()
@@ -2197,30 +2497,56 @@ fn build_health_check_client_with_tls(
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(skip_verify);
 
-    if let Some(dns_cache) = dns_cache.clone() {
-        let resolver = DnsCacheResolver::new(dns_cache);
-        builder = builder.dns_resolver(Arc::new(resolver));
-    }
+    builder = apply_probe_dial_identity(builder, dns_cache.clone(), dial_host_pin)?;
 
-    // Load CA bundle (upstream → global → system roots)
-    let ca_path = tls_config
-        .server_ca_cert_path
-        .as_ref()
-        .or(global_ca_path.as_ref());
+    // Load CA bundle (upstream → global → system roots). `system://` resolves to
+    // `None` here so the probe pins the built-in roots and deliberately skips
+    // the cluster-global bundle.
+    let ca_path = tls_config.effective_ca_source(global_ca_path.as_deref());
     if let Some(ca_path) = ca_path {
-        if let Ok(ca_data) =
-            load_probe_tls_material(ca_path, MaterialKind::CaBundle, "Health check CA")
-        {
-            if let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_data) {
+        // A configured CA is EXCLUSIVE: it replaces the trust store rather than
+        // adding to it. So there is no "continue without it" outcome here — a
+        // client built after a failed load would verify against the public
+        // webpki roots, which is a different (and weaker) trust policy than the
+        // one configured. Fail closed instead and let the probe report
+        // unhealthy.
+        //
+        // This holds even when `skip_verify` is set. Explicitly configured
+        // material that cannot be loaded or parsed is a *configuration* fault,
+        // and the repository's atomic TLS-material invariant says such a fault
+        // must surface rather than be absorbed. Reading it as "no-verify makes
+        // the CA moot" conflated two independent operator statements — "do not
+        // verify the peer" and "here is the trust anchor" — and let a deleted
+        // Secret, revoked RBAC, or corrupt `ca.crt` pass silently on exactly the
+        // deployments least able to detect it. `skip_verify` still governs
+        // *verification*; it does not license ignoring named material.
+        //
+        // `from_pem_bundle` accepts multi-certificate bundles; a root plus
+        // intermediates is the ordinary shape of a Kubernetes `ca.crt`.
+        let ca_bundle = load_probe_tls_material(ca_path, MaterialKind::CaBundle, "Health check CA")
+            .and_then(|ca_data| {
+                reqwest::Certificate::from_pem_bundle(&ca_data)
+                    .map_err(|e| format!("Health check CA: failed to parse CA bundle: {e}"))
+            })
+            .and_then(|certs| {
+                // An empty trust store would reject every handshake anyway;
+                // reporting it here keeps the cause legible.
+                if certs.is_empty() {
+                    Err("Health check CA: bundle contains no certificates".to_string())
+                } else {
+                    Ok(certs)
+                }
+            });
+        match ca_bundle {
+            Ok(ca_certs) => {
                 // reqwest 0.13: `tls_certs_only` replaces the trust store entirely,
                 // matching the project's "CA exclusivity" rule (no webpki mixing
                 // when a custom CA is provided).
-                builder = builder.tls_certs_only([ca_cert]);
-            } else {
-                tracing::warn!("Health check: failed to parse CA cert, using system roots");
+                builder = builder.tls_certs_only(ca_certs);
             }
-        } else {
-            tracing::warn!("Health check: failed to load CA cert, using system roots");
+            Err(details) => {
+                return Err(HealthCheckClientError::ExclusiveTrustUnavailable(details));
+            }
         }
     }
 
@@ -2228,40 +2554,75 @@ fn build_health_check_client_with_tls(
     let cert_path = tls_config
         .client_cert_path
         .as_ref()
-        .or(global_cert_path.as_ref());
+        .or(global_identity.cert.as_ref());
     let key_path = tls_config
         .client_key_path
         .as_ref()
-        .or(global_key_path.as_ref());
-    if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        match (
-            load_probe_tls_material(cert_path, MaterialKind::Cert, "Health check client cert"),
-            load_probe_tls_material(key_path, MaterialKind::Key, "Health check client key"),
-        ) {
-            (Ok(cert_data), Ok(key_data)) => {
-                let mut combined = cert_data;
-                combined.extend_from_slice(b"\n");
-                combined.extend_from_slice(&key_data);
-                match reqwest::Identity::from_pem(&combined) {
-                    Ok(identity) => {
-                        builder = builder.identity(identity);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Health check: failed to parse client identity: {}", e);
-                    }
+        .or(global_identity.key.as_ref());
+    // A configured backend mTLS identity is mandatory for the probe, exactly as
+    // it is for proxy traffic: every failure below is fail-closed rather than
+    // warn-and-continue, because an anonymous probe measures a different
+    // handshake than the one real requests perform. None of these arms
+    // interpolate certificate or key bytes — `load_probe_tls_material` reports
+    // through `MaterialError`, which carries `display_source_id` and a failure
+    // class only, and `reqwest::Identity::from_pem` errors describe the parse
+    // failure, not the input.
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let material =
+                load_probe_tls_material(cert_path, MaterialKind::Cert, "Health check client cert")
+                    .and_then(|cert_data| {
+                        load_probe_tls_material(
+                            key_path,
+                            MaterialKind::Key,
+                            "Health check client key",
+                        )
+                        .map(|key_data| (cert_data, key_data))
+                    })
+                    .and_then(|(cert_data, key_data)| {
+                        let mut combined = cert_data;
+                        combined.extend_from_slice(b"\n");
+                        combined.extend_from_slice(&key_data);
+                        reqwest::Identity::from_pem(&combined).map_err(|e| {
+                            format!(
+                                "Health check client identity: failed to parse cert/key pair: {e}"
+                            )
+                        })
+                    });
+            match material {
+                Ok(identity) => {
+                    builder = builder.identity(identity);
+                }
+                Err(details) => {
+                    return Err(HealthCheckClientError::ClientIdentityUnavailable(details));
                 }
             }
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::warn!("Health check: failed to load client cert/key: {}", e);
-            }
         }
+        // A half-configured pair cannot authenticate. Silently skipping it built
+        // an anonymous probe for an upstream the operator explicitly gave an
+        // identity to, so report the misconfiguration instead.
+        (Some(_), None) => {
+            return Err(HealthCheckClientError::ClientIdentityUnavailable(
+                "a backend mTLS client certificate is configured without a matching private key"
+                    .to_string(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(HealthCheckClientError::ClientIdentityUnavailable(
+                "a backend mTLS private key is configured without a matching client certificate"
+                    .to_string(),
+            ));
+        }
+        (None, None) => {}
     }
 
     if pool_config.enable_http_keep_alive {
         builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
     }
 
-    if pool_config.enable_http2 {
+    // An SNI-override probe is HTTP/1.1-only by construction (see above), so the
+    // HTTP/2 keepalive settings have nothing to govern on it.
+    if pool_config.enable_http2 && dial_host_pin.is_none() {
         builder = builder
             .http2_keep_alive_interval(Duration::from_secs(
                 pool_config.http2_keep_alive_interval_seconds,
@@ -2271,16 +2632,35 @@ fn build_health_check_client_with_tls(
             ));
     }
 
+    // The minimal fallback carries neither a trust store nor a client identity,
+    // so it verifies against the default roots and connects anonymously. That is
+    // only acceptable when this upstream named no exclusive CA and no client
+    // identity in the first place; otherwise it is the same downgrade the arms
+    // above refuse, just later. `skip_verify` is deliberately NOT an escape here
+    // either — see the CA block for why disabling verification does not license
+    // discarding explicitly configured material.
+    //
+    // A `dial_host_pin` disqualifies the fallback outright, whatever material was
+    // named: the minimal client carries neither the hostname pin nor the H1-only
+    // restriction, so it would resolve the SNI hostname from the probe URL and
+    // dial wherever THAT points — the exact escape `DialPinUnavailable` exists to
+    // refuse. Fail closed instead and let the probe report unhealthy.
+    let has_explicit_material =
+        ca_path.is_some() || cert_path.is_some() || key_path.is_some() || dial_host_pin.is_some();
     match builder.build() {
         Ok(client) => Ok(client),
-        Err(e) => {
+        Err(e) if !has_explicit_material => {
             tracing::error!(
                 "Failed to build TLS health check HTTP client: {}. \
                  Falling back to a minimal DNS-cached client (TLS-specific settings will not apply).",
                 e
             );
             build_dns_cached_fallback_client(dns_cache, "TLS health check")
+                .map_err(HealthCheckClientError::from)
         }
+        Err(e) => Err(HealthCheckClientError::ExclusiveTrustUnavailable(format!(
+            "TLS health check client could not be built with the configured backend TLS material: {e}"
+        ))),
     }
 }
 
@@ -2481,6 +2861,19 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Bare probe builder for tests that exercise `apply_probe_dial_identity`
+    /// directly.
+    ///
+    /// The policy-governed builder guard in
+    /// `tests/unit/plugins/plugin_http_client_tests.rs` reads this file as
+    /// source text, so every `reqwest::Client::builder()` chain in it — test
+    /// chains included — must carry the ambient-proxy opt-out the production
+    /// constructors install. Constructing it here keeps that true in one place
+    /// instead of relying on each call site to remember.
+    fn probe_test_builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder().no_proxy()
+    }
+
     struct ProxyEnvGuard {
         saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
@@ -2618,6 +3011,76 @@ mod tests {
         let (endpoint, origin) = grpc_probe_urls("https", "backend.internal", "192.0.2.25", 8443);
         assert_eq!(endpoint, "https://192.0.2.25:8443");
         assert_eq!(origin, "https://backend.internal:8443");
+    }
+
+    // -----------------------------------------------------------------------
+    // Probes use the EFFECTIVE backend TLS server-name identity.
+    //
+    // `probe_tls_server_name` / `probe_authority` are private, so these stay
+    // inline. The dial itself is covered by the candidate/authority tests above
+    // and the pinned-client fail-closed test below.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn probe_server_name_follows_the_configured_backend_tls_sni() {
+        let mut tls = BackendTlsConfig::default_verify();
+        let target_only = probe_tls_server_name(&tls, "pod-a.internal");
+        assert_eq!(
+            target_only, "pod-a.internal",
+            "without an override the probe keeps verifying the target host"
+        );
+
+        tls.sni = Some("backend.example.com".to_string());
+        let overridden = probe_tls_server_name(&tls, "pod-a.internal");
+        assert_eq!(
+            overridden, "backend.example.com",
+            "a covered backend serves a certificate for the override name"
+        );
+        // Every target of the upstream resolves to the same server name — a
+        // per-upstream identity, not a per-target one.
+        let other_target = probe_tls_server_name(&tls, "pod-b.internal");
+        assert_eq!(other_target, "backend.example.com");
+    }
+
+    #[test]
+    fn probe_server_name_strips_ipv6_brackets_for_rustls() {
+        // rustls/tonic want a bare name. An override is validated to be a DNS
+        // hostname, so this only ever applies to the target-host fallback.
+        let tls = BackendTlsConfig::default_verify();
+        let bare = probe_tls_server_name(&tls, "[fd00::1]");
+        assert_eq!(bare, "fd00::1");
+    }
+
+    #[test]
+    fn probe_authority_names_the_real_target_not_the_server_name() {
+        // What the backend must see in `Host` when the URL authority carries
+        // the TLS server name instead.
+        let explicit = probe_authority("https", "pod-a.internal", 8443);
+        assert_eq!(explicit, "pod-a.internal:8443");
+        // Default ports are elided, matching what reqwest would have derived.
+        let https_default = probe_authority("https", "pod-a.internal", 443);
+        assert_eq!(https_default, "pod-a.internal");
+        let http_default = probe_authority("http", "pod-a.internal", 80);
+        assert_eq!(http_default, "pod-a.internal");
+        // IPv6 targets stay bracketed: a URI authority requires it.
+        let v6 = probe_authority("https", "fd00::1", 8443);
+        assert_eq!(v6, "[fd00::1]:8443");
+        let v6_bracketed = probe_authority("https", "[fd00::1]", 8443);
+        assert_eq!(v6_bracketed, "[fd00::1]:8443");
+    }
+
+    #[test]
+    fn sni_probe_url_carries_the_server_name_and_keeps_the_probe_path() {
+        // The pairing dispatch performs: URL authority = server name (so
+        // reqwest presents it as SNI and verifies against it), `Host` = the
+        // real target.
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.sni = Some("backend.example.com".to_string());
+        let server_name = probe_tls_server_name(&tls, "pod-a.internal");
+        let url = format_probe_url("https", server_name, 8443, "/healthz");
+        assert_eq!(url, "https://backend.example.com:8443/healthz");
+        let authority = probe_authority("https", "pod-a.internal", 8443);
+        assert_eq!(authority, "pod-a.internal:8443");
     }
 
     #[tokio::test]
@@ -2774,9 +3237,12 @@ mod tests {
                 None,
                 &tls_config,
                 &None,
-                &None,
-                &None,
+                HealthCheckClientIdentityPaths {
+                    cert: &None,
+                    key: &None,
+                },
                 false,
+                None,
             )
             .expect("TLS health-check client should build")
         };
@@ -2826,7 +3292,7 @@ mod tests {
         let url = format_probe_url("http", "::1", port, "/health");
 
         assert!(
-            http_probe(&client, &url, Duration::from_secs(2), &[200])
+            http_probe(&client, &url, None, Duration::from_secs(2), &[200])
                 .await
                 .success
         );
@@ -2986,6 +3452,230 @@ mod tests {
         assert!(
             accept_health_check_client(Ok(client), "test").is_some(),
             "successful builds must remain available to HTTP probes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Explicit backend TLS material is mandatory for HTTP probes.
+    //
+    // `build_health_check_client_with_tls` is private, so these stay inline.
+    // A path under a fresh temp dir that was never created is guaranteed
+    // unloadable without depending on ambient filesystem state.
+    // -----------------------------------------------------------------------
+
+    fn unloadable_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("ferrum-health-probe-absent-{name}"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn tls_client_result(
+        tls_config: &BackendTlsConfig,
+        global_no_verify: bool,
+    ) -> Result<reqwest::Client, HealthCheckClientError> {
+        build_health_check_client_with_tls(
+            &PoolConfig::default(),
+            None,
+            tls_config,
+            &None,
+            HealthCheckClientIdentityPaths {
+                cert: &None,
+                key: &None,
+            },
+            global_no_verify,
+            None,
+        )
+    }
+
+    /// A server-name override with no DNS cache to pin the dial must fail
+    /// closed: reqwest would otherwise resolve the SNI hostname from the probe
+    /// URL and dial wherever it points, off the target's screened candidates.
+    #[test]
+    fn probe_client_fails_closed_when_the_dial_cannot_be_pinned() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.sni = Some("backend.example.com".to_string());
+        let built = build_health_check_client_with_tls(
+            &PoolConfig::default(),
+            None,
+            &tls,
+            &None,
+            HealthCheckClientIdentityPaths {
+                cert: &None,
+                key: &None,
+            },
+            false,
+            Some("pod-a.internal"),
+        );
+        let pin_missing = matches!(built, Err(HealthCheckClientError::DialPinUnavailable));
+        assert!(
+            pin_missing,
+            "an unpinnable SNI probe must not build a client that resolves the server name"
+        );
+    }
+
+    /// A pinned (SNI-override) probe client must be HTTP/1.1-only.
+    ///
+    /// The probe puts the server name in the URL authority and the REAL target
+    /// in an explicit `Host` header. HTTP/2 rebuilds `:authority` from the URI,
+    /// so an h2-negotiated probe would present the override instead — measuring
+    /// a request proxy traffic never makes. `ClientBuilder`'s `Debug` reports
+    /// `http1_only` exactly when the version preference is HTTP/1, which is the
+    /// same field that restricts the client's advertised ALPN to `http/1.1`.
+    /// The wire-level counterpart (an h2-advertising backend that only speaks
+    /// raw H1) lives in
+    /// `tests/integration/gateway_api_backend_tls_policy_tests.rs`.
+    #[test]
+    fn sni_probe_dial_identity_is_restricted_to_http1() {
+        let dns_cache = DnsCache::new(DnsConfig::default());
+
+        let pinned = apply_probe_dial_identity(
+            probe_test_builder(),
+            Some(dns_cache.clone()),
+            Some("pod-a.internal"),
+        )
+        .expect("pinned SNI probe builder");
+        assert!(
+            format!("{pinned:?}").contains("http1_only"),
+            "an SNI-override probe must not be able to negotiate h2: {pinned:?}"
+        );
+
+        // A probe without an override keeps the ordinary h2-capable client: its
+        // URL already names the real target, so there is no authority to lose.
+        let unpinned = apply_probe_dial_identity(probe_test_builder(), Some(dns_cache), None)
+            .expect("ordinary probe builder");
+        assert!(
+            !format!("{unpinned:?}").contains("http1_only"),
+            "a probe without a server-name override must not be narrowed to H1: {unpinned:?}"
+        );
+
+        // And the pin itself stays mandatory: no cache, no client.
+        let unpinnable =
+            apply_probe_dial_identity(probe_test_builder(), None, Some("pod-a.internal"));
+        assert!(
+            matches!(unpinnable, Err(HealthCheckClientError::DialPinUnavailable)),
+            "an unpinnable SNI probe must not build a builder at all"
+        );
+    }
+
+    #[test]
+    fn probe_client_fails_closed_when_configured_ca_cannot_be_loaded() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.server_ca_cert_path = Some(unloadable_path("ca"));
+        assert!(
+            matches!(
+                tls_client_result(&tls, false),
+                Err(HealthCheckClientError::ExclusiveTrustUnavailable(_))
+            ),
+            "an unloadable exclusive CA must not fall back to the default roots"
+        );
+    }
+
+    #[test]
+    fn probe_client_fails_closed_on_unloadable_ca_even_without_verification() {
+        // The defect this pins: `verify_server_cert: false` used to downgrade an
+        // unloadable CA to a warning and build a client on the default roots.
+        // Explicitly named material that cannot be loaded is a configuration
+        // fault in both verification modes.
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.server_ca_cert_path = Some(unloadable_path("ca-noverify"));
+        tls.verify_server_cert = false;
+        assert!(
+            matches!(
+                tls_client_result(&tls, false),
+                Err(HealthCheckClientError::ExclusiveTrustUnavailable(_))
+            ),
+            "per-upstream no-verify must not absorb an unloadable configured CA"
+        );
+
+        // Same through the global `FERRUM_TLS_NO_VERIFY` opt-in.
+        let mut global = BackendTlsConfig::default_verify();
+        global.server_ca_cert_path = Some(unloadable_path("ca-global-noverify"));
+        assert!(
+            matches!(
+                tls_client_result(&global, true),
+                Err(HealthCheckClientError::ExclusiveTrustUnavailable(_))
+            ),
+            "global no-verify must not absorb an unloadable configured CA"
+        );
+    }
+
+    #[test]
+    fn probe_client_fails_closed_when_configured_identity_cannot_be_loaded() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.client_cert_path = Some(unloadable_path("cert"));
+        tls.client_key_path = Some(unloadable_path("key"));
+        assert!(
+            matches!(
+                tls_client_result(&tls, false),
+                Err(HealthCheckClientError::ClientIdentityUnavailable(_))
+            ),
+            "an unloadable client identity must not produce an anonymous probe"
+        );
+    }
+
+    #[test]
+    fn probe_client_fails_closed_on_unloadable_identity_even_without_verification() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.client_cert_path = Some(unloadable_path("cert-noverify"));
+        tls.client_key_path = Some(unloadable_path("key-noverify"));
+        tls.verify_server_cert = false;
+        assert!(
+            matches!(
+                tls_client_result(&tls, false),
+                Err(HealthCheckClientError::ClientIdentityUnavailable(_))
+            ),
+            "no-verify governs server verification, not whether the probe authenticates"
+        );
+    }
+
+    #[test]
+    fn probe_client_fails_closed_on_half_configured_identity() {
+        let mut cert_only = BackendTlsConfig::default_verify();
+        cert_only.client_cert_path = Some(unloadable_path("cert-only"));
+        assert!(
+            matches!(
+                tls_client_result(&cert_only, false),
+                Err(HealthCheckClientError::ClientIdentityUnavailable(_))
+            ),
+            "a client certificate without a key must fail rather than be ignored"
+        );
+
+        let mut key_only = BackendTlsConfig::default_verify();
+        key_only.client_key_path = Some(unloadable_path("key-only"));
+        assert!(
+            matches!(
+                tls_client_result(&key_only, false),
+                Err(HealthCheckClientError::ClientIdentityUnavailable(_))
+            ),
+            "a private key without a certificate must fail rather than be ignored"
+        );
+    }
+
+    #[test]
+    fn probe_client_error_text_names_no_material() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.client_cert_path = Some(unloadable_path("cert-redaction"));
+        tls.client_key_path = Some(unloadable_path("key-redaction"));
+        let rendered = tls_client_result(&tls, false)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        for marker in ["BEGIN CERTIFICATE", "BEGIN PRIVATE KEY", "BEGIN RSA"] {
+            assert!(
+                !rendered.contains(marker),
+                "probe TLS diagnostics must never carry credential material: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_client_builds_when_no_backend_tls_material_is_configured() {
+        // The ordinary case must stay unaffected: no CA, no identity, so there is
+        // nothing explicit to fail closed on.
+        assert!(
+            tls_client_result(&BackendTlsConfig::default_verify(), false).is_ok(),
+            "an upstream with no configured backend TLS material still gets a probe client"
         );
     }
 
