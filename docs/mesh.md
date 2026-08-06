@@ -1504,6 +1504,28 @@ The CONNECT remap is deliberately narrow and fails closed before any dial:
   relay. With no declared `ingress` block, ordinary Ambient/Waypoint relay
   behavior is unchanged.
 
+#### Live datapath coverage
+
+Two `#[ignore]`d functional tests in `tests/functional/functional_mesh_mode_test.rs`
+drive the shipped `ferrum-edge` binary over this lane (data-plane CI shard):
+
+- `functional_mesh_sidecar_ingress_stream_connect_relays_declared_listener_port`
+  — a Sidecar consuming a slice with one already-resolved stream
+  `local_ingress_listeners` entry. A real SVID-mTLS bare HTTP/2 CONNECT naming
+  `127.0.0.1:<declared listener port>` is relayed to the listener's
+  `defaultEndpoint`, proven by that backend's reply tag rather than the decoy
+  bound on the declared port itself. A CONNECT naming a declared workload port
+  the `ingress[]` block omits is refused, even though a live backend is
+  listening there and the ordinary open-relay guard would have admitted it.
+- `functional_mesh_sidecar_ingress_stream_reload_withdraws_declared_listener`
+  — the same datapath under `FERRUM_MESH_CONFIG_PROTOCOL=file` with
+  `FERRUM_MESH_SIDECAR_ENFORCED=true`, so the data plane runs the real
+  `Sidecar.ingress[]` resolution and SIGHUP is a deterministic in-test config
+  refresh. An `AuthorizationPolicy` DENY scoped to the **declared listener
+  port** rejects the CONNECT with 403 (authorizing on the `defaultEndpoint`
+  backend port would let it fail open), and a reload that declares a different
+  listener fails the withdrawn port closed while the new one serves.
+
 ### Precedence vs. the default inbound listeners (fail-closed)
 
 Per Istio, when `ingress` is **declared** it **replaces** the workload's default per-service-port inbound listeners. Ferrum mirrors this and **fails closed on the declared signal, not on what resolved**: if the applicable `Sidecar` declares an `ingress` block, the inbound materializer emits routes **only** from the resolved `ingress[]` listeners and skips the service-port default `:15006` → `127.0.0.1:targetPort` materialization for that workload — **even if every entry was unsupported and nothing resolved**. An all-unsupported `ingress[]` therefore yields **no inbound routes** for the workload rather than silently exposing the default service-port routes the operator explicitly replaced (exposing them would be a fail-open regression).
