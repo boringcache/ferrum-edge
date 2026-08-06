@@ -3521,9 +3521,7 @@ async fn h3_native_grpc_bidi_server_responds_before_client_half_close() {
             (":status", "200".to_string()),
             ("content-type", "application/grpc".to_string()),
         ]))
-        .step(H3Step::RespondData(bytes::Bytes::from(
-            reply_frame.clone(),
-        )))
+        .step(H3Step::RespondData(bytes::Bytes::from(reply_frame.clone())))
         .step(H3Step::RespondTrailers(vec![
             ("grpc-status", "0".to_string()),
             ("grpc-message", "OK".to_string()),
@@ -3597,11 +3595,9 @@ async fn h3_native_grpc_bidi_server_responds_before_client_half_close() {
     let received = h3_backend.received_requests().await;
     let logs = harness.captured_combined().unwrap_or_default();
     assert!(
-        received
-            .iter()
-            .any(|r| r.method == "POST"
-                && r.path.ends_with("/echo.Echo/Bidi")
-                && r.body == grpc_frame(b"bidi-hello")),
+        received.iter().any(|r| r.method == "POST"
+            && r.path.ends_with("/echo.Echo/Bidi")
+            && r.body == grpc_frame(b"bidi-hello")),
         "the H3-only backend must have received the pre-half-close request \
          message; recorded: {received:#?}\n--- logs ---\n{logs}"
     );

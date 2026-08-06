@@ -1075,11 +1075,12 @@ fn build_h3_backend_request_preserving_te(
 /// native-H3 stream.
 ///
 /// Deliberately UNBOUNDED: the full-duplex caller owns one absolute deadline
-/// (the client `grpc-timeout`, else `backend_read_timeout_ms`) covering connect
-/// + header wait, and races this future against it so a single expiry can be
-/// attributed to the correct phase. Errors keep the pool's classification
-/// (`recv_response_err`), including the graceful-remote-close signal that must
-/// not be read as an H3 capability failure.
+/// (the client `grpc-timeout`, else `backend_read_timeout_ms`) covering the
+/// backend connect and the header wait together, and races this future against
+/// it so a single expiry can be attributed to the correct phase. Errors keep
+/// the pool's classification (`recv_response_err`), including the
+/// graceful-remote-close signal that must not be read as an H3 capability
+/// failure.
 pub async fn recv_h3_backend_response_head(
     recv: &mut H3BackendRecvStream,
 ) -> H3PoolResult<H3BackendResponseHead> {
@@ -2449,7 +2450,10 @@ impl Http3ConnectionPool {
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    debug!("HTTP/3 bidi open: cached connection failed, evicting: {}", e);
+                    debug!(
+                        "HTTP/3 bidi open: cached connection failed, evicting: {}",
+                        e
+                    );
                     self.pool.invalidate(&key);
                     // Opening is pre-wire by construction, so the gate below can
                     // only reject a mislabeled error. Keep it anyway: a request

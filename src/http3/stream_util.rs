@@ -160,6 +160,44 @@ where
     stream.stop_sending(Code::H3_NO_ERROR);
 }
 
+/// Ownership state of a frontend request-receive half at the moment the task
+/// that was reading it stops.
+///
+/// A long-lived request-upload pump can leave its loop from several places, and
+/// only some of them leave the receive half idle. `h3-quinn` parks its
+/// `quinn::RecvStream` inside a `ReusableBoxFuture` while `poll_data` /
+/// `poll_trailers` is `Pending`, leaving its own `Option` as `None`;
+/// [`halt_request_body`] then unwraps that `None` and aborts the process under
+/// `panic = "abort"`. Tracking the state explicitly — rather than reasoning
+/// about which `break` a given exit came from — is what keeps the graceful
+/// `STOP_SENDING` on the paths that provably own an idle receive half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum H3RequestRecvState {
+    /// No receive future is outstanding; `STOP_SENDING` is safe.
+    Idle,
+    /// A `recv_data` / `recv_trailers` future was dropped while `Pending`, so
+    /// the inner `quinn::RecvStream` is parked and must be released by `Drop`.
+    ParkedMidPoll,
+}
+
+/// [`halt_request_body`], but only when the receive half is provably idle.
+///
+/// The `ParkedMidPoll` case is not a silent no-op with a lost signal: dropping
+/// the `RequestStream` still issues `STOP_SENDING` from
+/// `quinn::RecvStream::drop`, it just carries code `0` instead of
+/// `H3_NO_ERROR`. That is strictly better than a process abort.
+#[inline]
+pub(crate) fn halt_request_body_if_idle<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    state: H3RequestRecvState,
+) where
+    S: RecvStream,
+{
+    if state == H3RequestRecvState::Idle {
+        halt_request_body(stream);
+    }
+}
+
 /// Abort the response send half for a gateway-originated streaming failure.
 ///
 /// Use this when we have already sent response headers but cannot complete the

@@ -53,8 +53,7 @@ use crate::proxy::headers::{
     preserved_response_content_length, reconcile_backend_trailers_with_response_policy,
     reconcile_streaming_backend_trailers, remove_content_length_header,
     sanitize_backend_request_trailers, sanitize_client_response_headers_for_wire,
-    strip_client_response_hop_by_hop_headers,
-    strip_response_hop_by_hop_trailers,
+    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
@@ -9613,6 +9612,45 @@ pub(crate) async fn h3_grpc_terminating_upload_fault(
     }
 }
 
+/// Why [`run_h3_grpc_upload_pump`] stopped forwarding the request direction.
+///
+/// The pump can leave its loop from six places and the correct teardown differs
+/// per exit, so the exit is a value rather than a pair of booleans: every
+/// assignment is read by the retirement block, and the two questions it has to
+/// answer — "may the backend still be FINished?" and "is the frontend receive
+/// half safe to halt gracefully?" — are answered from the same state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum H3UploadPumpExit {
+    /// The client half-closed cleanly. Trailing metadata (if any) and the
+    /// backend FIN still have to be written.
+    ClientEof,
+    /// A latched fault (client abort, oversize) or a backend that stopped
+    /// accepting request DATA ended the upload. The receive half is idle.
+    Halted,
+    /// The relay retired the pump while no frontend receive future was
+    /// outstanding (parked on a backend write / FIN).
+    Cancelled,
+    /// The relay retired the pump while a frontend `recv_data` /
+    /// `recv_trailers` future was `Pending`.
+    CancelledMidRecv,
+}
+
+impl H3UploadPumpExit {
+    /// The RPC is over: never write anything further to the backend.
+    fn is_cancelled(self) -> bool {
+        matches!(self, Self::Cancelled | Self::CancelledMidRecv)
+    }
+
+    /// Whether the frontend receive half may still be halted gracefully.
+    fn recv_state(self) -> crate::http3::stream_util::H3RequestRecvState {
+        use crate::http3::stream_util::H3RequestRecvState;
+        match self {
+            Self::CancelledMidRecv => H3RequestRecvState::ParkedMidPoll,
+            _ => H3RequestRecvState::Idle,
+        }
+    }
+}
+
 /// Forward the client's gRPC request direction to a native-H3 backend,
 /// concurrently with the response relay.
 ///
@@ -9633,32 +9671,22 @@ async fn run_h3_grpc_upload_pump(
     shutdown: Arc<tokio::sync::Notify>,
 ) {
     let mut total_sent: usize = 0;
-    let mut client_eof = false;
-    let mut cancelled = false;
-    // h3-quinn parks the `quinn::RecvStream` inside a `ReusableBoxFuture` while
-    // `poll_data` is `Pending`, leaving its own `Option` as `None`. Calling
-    // `stop_sending` in that state unwraps a `None` and aborts the process under
-    // `panic = "abort"`, so a receive cancelled mid-poll must skip the graceful
-    // halt and let `Drop` issue STOP_SENDING instead.
-    let mut cancelled_mid_recv = false;
-
-    loop {
+    // Every `break` carries the exit reason, so there is no initial value that
+    // teardown could read by accident. `Cancelled*` records whether a frontend
+    // receive future was outstanding when the relay retired us: h3-quinn parks
+    // the `quinn::RecvStream` inside a `ReusableBoxFuture` while `poll_data` is
+    // `Pending`, leaving its own `Option` as `None`, and `stop_sending` in that
+    // state unwraps the `None` and aborts the process under `panic = "abort"`.
+    let mut exit = 'pump: loop {
         let mut chunk = tokio::select! {
             biased;
-            _ = shutdown.notified() => {
-                cancelled = true;
-                cancelled_mid_recv = true;
-                break;
-            }
+            _ = shutdown.notified() => break 'pump H3UploadPumpExit::CancelledMidRecv,
             result = frontend_recv.recv_data() => match result {
                 Ok(Some(chunk)) => chunk,
-                Ok(None) => {
-                    client_eof = true;
-                    break;
-                }
+                Ok(None) => break 'pump H3UploadPumpExit::ClientEof,
                 Err(_error) => {
                     upload.publish_fault(H3GrpcUploadFault::ClientAbort);
-                    break;
+                    break 'pump H3UploadPumpExit::Halted;
                 }
             },
         };
@@ -9667,7 +9695,7 @@ async fn run_h3_grpc_upload_pump(
             total_sent += len;
             if total_sent > max_request_body_size {
                 upload.publish_fault(H3GrpcUploadFault::Oversize);
-                break;
+                break 'pump H3UploadPumpExit::Halted;
             }
         }
         if len == 0 {
@@ -9678,20 +9706,18 @@ async fn run_h3_grpc_upload_pump(
         let data = chunk.copy_to_bytes(len);
         let sent = tokio::select! {
             biased;
-            _ = shutdown.notified() => {
-                cancelled = true;
-                break;
-            }
+            // Parked on the BACKEND write, so the frontend receive half is idle.
+            _ = shutdown.notified() => break 'pump H3UploadPumpExit::Cancelled,
             result = backend_send.send_data(data) => result,
         };
         if sent.is_err() {
             upload.publish_fault(H3GrpcUploadFault::BackendUploadHalted);
-            break;
+            break 'pump H3UploadPumpExit::Halted;
         }
         upload.add_bytes(len as u64);
-    }
+    };
 
-    if client_eof && upload.fault().is_none() {
+    if exit == H3UploadPumpExit::ClientEof && upload.fault().is_none() {
         // Client request trailers (trailing metadata) are read AFTER the initial
         // headers were stripped/sanitized, so a hostile client can smuggle
         // hop-by-hop fields or reserved gateway metadata here. Apply the same
@@ -9703,8 +9729,7 @@ async fn run_h3_grpc_upload_pump(
         let trailers = tokio::select! {
             biased;
             _ = shutdown.notified() => {
-                cancelled = true;
-                cancelled_mid_recv = true;
+                exit = H3UploadPumpExit::CancelledMidRecv;
                 None
             }
             result = frontend_recv.recv_trailers() => Some(result),
@@ -9715,8 +9740,9 @@ async fn run_h3_grpc_upload_pump(
                 if !trailers.is_empty() {
                     let sent = tokio::select! {
                         biased;
+                        // Parked on the BACKEND write; the receive half is idle.
                         _ = shutdown.notified() => {
-                            cancelled = true;
+                            exit = H3UploadPumpExit::Cancelled;
                             None
                         }
                         result = backend_send.send_trailers(trailers) => Some(result),
@@ -9732,20 +9758,19 @@ async fn run_h3_grpc_upload_pump(
             }
             None => {}
         }
-        if !cancelled && upload.fault().is_none() {
+        if !exit.is_cancelled() && upload.fault().is_none() {
             let finished = tokio::select! {
                 biased;
+                // Parked on the BACKEND FIN; the receive half is idle.
                 _ = shutdown.notified() => {
-                    cancelled = true;
+                    exit = H3UploadPumpExit::Cancelled;
                     None
                 }
                 result = backend_send.finish() => Some(result),
             };
             match finished {
                 Some(Ok(())) => upload.mark_complete(),
-                Some(Err(_error)) => {
-                    upload.publish_fault(H3GrpcUploadFault::BackendUploadHalted)
-                }
+                Some(Err(_error)) => upload.publish_fault(H3GrpcUploadFault::BackendUploadHalted),
                 None => {}
             }
         }
@@ -9759,10 +9784,9 @@ async fn run_h3_grpc_upload_pump(
         backend_send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
     }
     // STOP_SENDING(H3_NO_ERROR) on an IDLE receive half: a bare drop surfaces as
-    // RESET_STREAM(0x0) and makes clients log a spurious "Remote reset".
-    if !cancelled_mid_recv {
-        crate::http3::stream_util::halt_request_body(&mut frontend_recv);
-    }
+    // RESET_STREAM(0x0) and makes clients log a spurious "Remote reset". The
+    // exit state is the single source of truth for whether the half is idle.
+    crate::http3::stream_util::halt_request_body_if_idle(&mut frontend_recv, exit.recv_state());
 }
 
 /// Immutable per-request context for the native-H3 gRPC dispatch phases.
@@ -10258,9 +10282,11 @@ async fn dispatch_grpc_native_h3(
                     state
                         .backend_capabilities
                         .mark_h3_unsupported(proxy, upstream_target);
-                    Err(crate::http3::client::H3PoolError::pre_wire(anyhow::anyhow!(
-                        "gRPC backend connect/dispatch timed out before the request reached the wire"
-                    )))
+                    Err(crate::http3::client::H3PoolError::pre_wire(
+                        anyhow::anyhow!(
+                            "gRPC backend connect/dispatch timed out before the request reached the wire"
+                        ),
+                    ))
                 }
             }
         },
@@ -10326,9 +10352,11 @@ async fn dispatch_grpc_native_h3(
                 // a valid zero-message / trailers-only client-streaming RPC
                 // forwards no body bytes at all.
                 if upload.is_complete() {
-                    Err(crate::http3::client::H3PoolError::read_timeout(anyhow::anyhow!(
-                        "gRPC backend dispatch timed out before response headers (grpc-timeout / backend_read_timeout)"
-                    )))
+                    Err(crate::http3::client::H3PoolError::read_timeout(
+                        anyhow::anyhow!(
+                            "gRPC backend dispatch timed out before response headers (grpc-timeout / backend_read_timeout)"
+                        ),
+                    ))
                 } else {
                     Err(crate::http3::client::H3PoolError::read_timeout(
                         anyhow::anyhow!("client request upload stalled past the dispatch deadline"),
@@ -11160,7 +11188,9 @@ async fn dispatch_grpc_native_h3(
                                     body_error_class =
                                         Some(crate::retry::ErrorClass::ClientDisconnect);
                                 } else {
-                                    crate::http3::stream_util::abort_response_stream(&mut send_half);
+                                    crate::http3::stream_util::abort_response_stream(
+                                        &mut send_half,
+                                    );
                                     client_disconnected = true;
                                     body_error_class =
                                         Some(crate::retry::ErrorClass::ClientDisconnect);

@@ -6053,12 +6053,24 @@ pub(crate) async fn dispatch_grpc_streaming(
     let pump_shutdown = Arc::new(tokio::sync::Notify::new());
     let pump_shutdown_signal = Arc::clone(&pump_shutdown);
     let pump = tokio::spawn(async move {
+        use crate::http3::stream_util::H3RequestRecvState;
+
         let mut cancelled_before_eof = false;
+        // Whether the frontend receive half is still safe to halt gracefully.
+        // Shutdown can cancel this pump while a frontend `recv_data` /
+        // `recv_trailers` future is `Pending`, and h3-quinn parks its
+        // `quinn::RecvStream` inside a `ReusableBoxFuture` in that state,
+        // leaving its own `Option` as `None`. `halt_request_body`'s
+        // `stop_sending` would unwrap that `None` — a process abort under
+        // `panic = "abort"`. Cancellation on a channel send leaves the receive
+        // half idle and must keep the graceful STOP_SENDING(H3_NO_ERROR).
+        let mut recv_state = H3RequestRecvState::Idle;
         loop {
             tokio::select! {
                 biased;
                 _ = pump_shutdown_signal.notified() => {
                     cancelled_before_eof = true;
+                    recv_state = H3RequestRecvState::ParkedMidPoll;
                     break;
                 },
                 recv = recv_half.recv_data() => {
@@ -6101,6 +6113,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                                 biased;
                                 _ = pump_shutdown_signal.notified() => {
                                     cancelled_before_eof = true;
+                                    recv_state = H3RequestRecvState::ParkedMidPoll;
                                     break;
                                 },
                                 result = recv_half.recv_trailers() => result,
@@ -6160,7 +6173,9 @@ pub(crate) async fn dispatch_grpc_streaming(
         }
         // STOP_SENDING(H3_NO_ERROR): a bare recv-half drop surfaces as
         // RESET_STREAM(0x0) and makes clients log a spurious "Remote reset".
-        crate::http3::stream_util::halt_request_body(&mut recv_half);
+        // Skipped when shutdown cancelled a frontend receive mid-poll — see
+        // `recv_state` above; `Drop` still issues STOP_SENDING there.
+        crate::http3::stream_util::halt_request_body_if_idle(&mut recv_half, recv_state);
     });
     let mut pump_shutdown_guard = H3RequestPumpShutdownGuard::new(
         Arc::clone(&pump_shutdown),
