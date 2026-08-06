@@ -706,6 +706,35 @@ fn oversized_event_payload_fails_closed() {
     assert_eq!(refused.unwrap_err(), SseError::EventTooLarge);
 }
 
+/// An upstream JSON body terminated by a newline is a routine shape, and SSE
+/// line folding cannot carry it without reshaping the exact octets the inline
+/// answer would have used. It must be refused under its OWN fixed reason rather
+/// than being reported as an oversized payload, and — like every other refusal —
+/// it must still terminalize the identity so the capacity comes back once.
+#[test]
+fn unframable_event_payload_fails_closed_with_its_own_reason() {
+    let broker = broker();
+    broker.ensure_session("sess-frame").unwrap();
+    let one = number_id(1);
+    let stream = broker.open_stream("sess-frame", &one).unwrap();
+
+    let mut encoded = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    encoded.push(b'\n');
+    assert!(
+        encoded.len() <= bounds().max_event_bytes,
+        "the refusal under test must be framing, not size"
+    );
+    let refused = stream.publish_encoded(&encoded);
+    assert_eq!(refused.unwrap_err(), SseError::EventFramingInvalid);
+    assert_eq!(
+        SseError::EventFramingInvalid.reason_token(),
+        "event_framing_invalid"
+    );
+
+    let reopen = broker.open_stream("sess-frame", &number_id(1));
+    assert_eq!(reopen.unwrap_err(), SseError::StreamCompleted);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_cardinality_is_race_free_under_concurrent_distinct_sessions() {
     let broker = Arc::new(AggregateSseBroker::new(bounds(), 4, 8));
@@ -930,6 +959,7 @@ fn every_error_reason_is_a_fixed_low_cardinality_token() {
         SseError::StreamCancelled,
         SseError::ResponseEnvelopeInvalid,
         SseError::EventTooLarge,
+        SseError::EventFramingInvalid,
         SseError::RetentionOverflow,
         SseError::StreamCardinalityOverflow,
         SseError::SessionCardinalityOverflow,

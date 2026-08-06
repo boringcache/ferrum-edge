@@ -259,6 +259,7 @@ pub enum AggregateSseError {
     StreamCancelled,
     ResponseEnvelopeInvalid,
     EventTooLarge,
+    EventFramingInvalid,
     RetentionOverflow,
     StreamCardinalityOverflow,
     SessionCardinalityOverflow,
@@ -290,6 +291,7 @@ impl AggregateSseError {
                 "JSON-RPC response envelope is invalid for the open stream"
             }
             Self::EventTooLarge => "SSE event payload exceeds the maximum length",
+            Self::EventFramingInvalid => "SSE event payload cannot be framed as one event record",
             Self::RetentionOverflow => "SSE session retention capacity exceeded",
             Self::StreamCardinalityOverflow => "SSE stream cardinality exceeded for this session",
             Self::SessionCardinalityOverflow => "SSE session cardinality exceeded",
@@ -319,6 +321,7 @@ impl AggregateSseError {
             Self::StreamCancelled => "stream_cancelled",
             Self::ResponseEnvelopeInvalid => "response_envelope_invalid",
             Self::EventTooLarge => "event_too_large",
+            Self::EventFramingInvalid => "event_framing_invalid",
             Self::RetentionOverflow => "retention_overflow",
             Self::StreamCardinalityOverflow => "stream_cardinality_overflow",
             Self::SessionCardinalityOverflow => "session_cardinality_overflow",
@@ -336,7 +339,8 @@ impl AggregateSseError {
             | Self::StreamIdTooLarge
             | Self::StreamIdInvalid
             | Self::ResponseEnvelopeInvalid
-            | Self::EventTooLarge => 400,
+            | Self::EventTooLarge
+            | Self::EventFramingInvalid => 400,
             Self::UnknownSession | Self::StaleSession | Self::UnknownStream => 404,
             Self::DuplicateListener
             | Self::DuplicateStream
@@ -1278,9 +1282,10 @@ impl AggregateSseStream {
     /// answer would have carried, never a re-serialization of them.
     ///
     /// `Err(StreamCancelled)` means the client cancelled this request id and
-    /// its result must not be sent; `Err(RetentionOverflow)` / `EventTooLarge`
-    /// mean the caller must answer this POST inline. Either way the identity is
-    /// terminal afterwards and its capacity has been returned exactly once.
+    /// its result must not be sent; `Err(RetentionOverflow)` / `EventTooLarge` /
+    /// `EventFramingInvalid` mean the caller must answer this POST inline.
+    /// Either way the identity is terminal afterwards and its capacity has been
+    /// returned exactly once.
     pub fn publish_encoded(&self, encoded: &[u8]) -> Result<u64, AggregateSseError> {
         if self.0.settled.swap(true, Ordering::AcqRel) {
             // A second terminal attempt on one lease is a duplicate response,
@@ -1483,12 +1488,19 @@ impl futures_util::Stream for AggregateSseBody {
 /// Admit already-serialized event bytes under the per-event ceiling. Bytes whose
 /// framing would break SSE line structure are refused rather than escaped, so
 /// the wire representation stays exactly one `data:` line.
+///
+/// The two refusals are DISTINCT reasons. A CR/LF-bearing payload — an upstream
+/// JSON body terminated by a newline is the common one — is not oversized: SSE
+/// line folding would silently reshape those bytes, and this multiplexer only
+/// ever publishes the exact octets the inline answer would have carried. Fixed
+/// diagnostics must describe the refusal that actually happened, so it gets its
+/// own low-cardinality token instead of being reported as `event_too_large`.
 fn validate_event_bytes(encoded: &[u8], max_event_bytes: usize) -> Result<(), AggregateSseError> {
     if encoded.len() > max_event_bytes {
         return Err(AggregateSseError::EventTooLarge);
     }
     if encoded.iter().any(|byte| *byte == b'\n' || *byte == b'\r') {
-        return Err(AggregateSseError::EventTooLarge);
+        return Err(AggregateSseError::EventFramingInvalid);
     }
     Ok(())
 }
