@@ -750,6 +750,7 @@ jobs:
               integration::ai_transcript_audit_grpc_reload_tests
               integration::api_chargeback_sink_tests
               integration::gateway_allowed_routes_selector_tests
+              integration::gateway_api_backend_tls_policy_tests
               integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_istio_status_tests
               integration::k8s_controller_shutdown_tests
@@ -1063,6 +1064,7 @@ jobs:
               functional_backend_lb_session_persistence_test
               functional_credential_rotation_test
               functional_file_mode_test
+              functional_gateway_backend_tls_policy_test
               functional_host_only_routing_test
               functional_migrate_mode_test
               functional_protocol_validation_test

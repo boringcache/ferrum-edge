@@ -1609,6 +1609,31 @@ pub struct MeshSidecar {
     /// explicit empty `ingress: []`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingress: Vec<MeshSidecarIngress>,
+    /// Istio `spec.outboundTrafficPolicy.mode` — the workload-scoped override of
+    /// the mesh-wide [`MeshConfig::outbound_traffic_policy`] (issue #3262).
+    ///
+    /// `None` = the Sidecar OMITTED `outboundTrafficPolicy`, so the workload
+    /// inherits the mesh-wide policy (slice `outbound_traffic_policy`, else
+    /// `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`). `Some(_)` REPLACES it for every
+    /// workload this Sidecar applies to — Istio resolves exactly ONE Sidecar per
+    /// workload, so there is no inheritance chain here (unlike `egress`, whose
+    /// omitted-means-inherit walk is a separate, egress-only concern).
+    ///
+    /// On the K8s path, a present object with omitted/null `mode` uses Istio's
+    /// documented `ALLOW_ANY` default. A PRESENT `outboundTrafficPolicy` block
+    /// Ferrum cannot represent exactly — an unrecognized/non-string `mode`, a
+    /// non-object block, or an `egressProxy` Ferrum cannot route through —
+    /// resolves fail-closed to [`OutboundTrafficPolicy::RegistryOnly`] and is
+    /// surfaced in the resource's `deferred_fields` status. The Sidecar itself
+    /// is never REJECTED over this field: dropping it would also drop its egress
+    /// narrowing and thereby WIDEN both the slice's service view and the derived
+    /// outbound registry.
+    ///
+    /// Applied only under `FERRUM_MESH_SIDECAR_ENFORCED && !…_DRY_RUN` (the same
+    /// effective gate as `ingress[]` materialization) — see
+    /// `MeshSlice::sidecar_outbound_traffic_policy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
 }
 
 /// A single ingress listener entry under a [`MeshSidecar`] (`spec.ingress[]`).
@@ -2877,8 +2902,14 @@ pub struct MeshWaypointServiceRef {
     pub name: String,
 }
 
-/// Istio mesh-wide outbound traffic policy. Mirrors
-/// `MeshConfig.outboundTrafficPolicy.mode` in the upstream API.
+/// Istio outbound traffic policy. Mirrors the upstream `OutboundTrafficPolicy`
+/// message, which Istio uses at TWO scopes: mesh-wide
+/// (`MeshConfig.outboundTrafficPolicy.mode`, carried on
+/// [`MeshConfig::outbound_traffic_policy`]) and workload-scoped
+/// (`Sidecar.outboundTrafficPolicy.mode`, carried on
+/// [`MeshSidecar::outbound_traffic_policy`]). The workload-scoped value wins for
+/// the workloads its Sidecar selects; the effective value is resolved once per
+/// slice apply by `MeshSlice::effective_outbound_traffic_policy`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutboundTrafficPolicy {
@@ -4346,6 +4377,24 @@ fn validate_mesh_traffic_policy_tls(
     tls: &MeshTrafficPolicyTls,
     errors: &mut Vec<String>,
 ) {
+    if let Some(ca_certificates) = tls.ca_certificates.as_deref()
+        && let Err(error) = crate::config::types::validate_tls_material_source_field(
+            &format!("{context}.ca_certificates"),
+            ca_certificates,
+            crate::tls::source::MaterialKind::CaBundle,
+        )
+    {
+        errors.push(error);
+    }
+    if let Some(error) = crate::config::types::validate_system_trust_roots_skip_verify_pairing(
+        &format!("{context}.ca_certificates"),
+        &format!("{context}.insecure_skip_verify"),
+        tls.ca_certificates.as_deref(),
+        tls.insecure_skip_verify,
+    ) {
+        errors.push(error);
+    }
+
     match tls.mode {
         MtlsMode::Strict | MtlsMode::Permissive => errors.push(format!(
             "{context}.mode: {mode:?} is invalid for DestinationRule client TLS",

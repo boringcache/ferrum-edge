@@ -52,9 +52,8 @@ pub struct TransactionLogSchema {
 type CompiledSchemaEntry = (String, Arc<Value>, Arc<SummarySchema>);
 
 impl TransactionLogSchema {
-    /// Shape-only validation for admin/CP admission and the buffering screen.
-    /// Compiles every schema entry without staging anything in the process-global
-    /// registry.
+    /// Shape-only validation for admin/CP admission. Compiles every schema entry
+    /// without staging anything in the process-global registry.
     pub(crate) fn validate_config(config: &Value) -> Result<(), String> {
         Self::validate_and_compile_entries(config)?;
         Ok(())
