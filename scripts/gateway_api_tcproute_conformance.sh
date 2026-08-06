@@ -257,7 +257,7 @@ spec:
           - kind: TCPRoute
         namespaces:
           from: Same
-    - name: tcp-parent-cross
+    - name: tcp-parent-xns
       port: ${TCP_BLACKBOX_PORT_PARENT_CROSS}
       protocol: TCP
       allowedRoutes:
@@ -347,7 +347,7 @@ spec:
   parentRefs:
     - name: ferrum-blackbox-tcp
       namespace: ${DP_GATEWAY_NAMESPACE}
-      sectionName: tcp-parent-cross
+      sectionName: tcp-parent-xns
   rules:
     - backendRefs:
         - name: blackbox-tcp-cross
@@ -474,7 +474,7 @@ run_tcp_blackbox_tests() {
   wait_for_tcproute_parent_condition blackbox-tcp-parent-cross Accepted True "$BACKEND_NAMESPACE" | tee -a "$report"
   wait_for_tcproute_parent_condition blackbox-tcp-parent-cross ResolvedRefs True "$BACKEND_NAMESPACE" | tee -a "$report"
   wait_for_tcproute_parent_condition blackbox-tcp-parent-cross Programmed True "$BACKEND_NAMESPACE" | tee -a "$report"
-  wait_for_gateway_listener_attached_routes ferrum-blackbox-tcp tcp-parent-cross 1 | tee -a "$report"
+  wait_for_gateway_listener_attached_routes ferrum-blackbox-tcp tcp-parent-xns 1 | tee -a "$report"
   wait_for_tcp_echo "$TCP_BLACKBOX_PORT_PARENT_CROSS" "blackbox-tcp-cross" "parent-cross-ping" | tee -a "$report"
   echo "TCPRoute cross-namespace parentRef with AllowedRoutes=All served echo on :${TCP_BLACKBOX_PORT_PARENT_CROSS}" >> "$report"
 
@@ -520,7 +520,7 @@ spec:
           - kind: TCPRoute
         namespaces:
           from: Same
-    - name: tcp-parent-cross
+    - name: tcp-parent-xns
       port: ${TCP_BLACKBOX_PORT_PARENT_CROSS}
       protocol: TCP
       allowedRoutes:
@@ -586,7 +586,7 @@ spec:
           - kind: TCPRoute
         namespaces:
           from: Same
-    - name: tcp-parent-cross
+    - name: tcp-parent-xns
       port: ${TCP_BLACKBOX_PORT_PARENT_CROSS}
       protocol: TCP
       allowedRoutes:

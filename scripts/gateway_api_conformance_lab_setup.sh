@@ -204,7 +204,7 @@ spec:
               containerPort: ${TCP_BLACKBOX_PORT_FAIL}
             - name: tcp-delete
               containerPort: ${TCP_BLACKBOX_PORT_DELETE}
-            - name: tcp-parent-cross
+            - name: tcp-parent-xns
               containerPort: ${TCP_BLACKBOX_PORT_PARENT_CROSS}
           env:
             - name: FERRUM_MODE
@@ -282,7 +282,7 @@ spec:
       port: ${TCP_BLACKBOX_PORT_DELETE}
       targetPort: ${TCP_BLACKBOX_PORT_DELETE}
       nodePort: ${TCP_BLACKBOX_NODEPORT_DELETE}
-    - name: tcp-parent-cross
+    - name: tcp-parent-xns
       port: ${TCP_BLACKBOX_PORT_PARENT_CROSS}
       targetPort: ${TCP_BLACKBOX_PORT_PARENT_CROSS}
       nodePort: ${TCP_BLACKBOX_NODEPORT_PARENT_CROSS}
