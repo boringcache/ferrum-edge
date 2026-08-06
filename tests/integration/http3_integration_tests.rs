@@ -2106,7 +2106,11 @@ async fn capped_h3_backend(
     // that teardown races the client's last recv_response and fails request N-1
     // even though the headers were already sent. Same pattern as the trailered
     // H3 fixtures in functional_scripted_backend_h3_tests.
-    builder = builder.step(H3Step::StallFor(std::time::Duration::from_secs(1)));
+    // The backend handle aborts this task at test teardown, so use a long
+    // bounded hold instead of a scheduler-sensitive grace period. The test
+    // never waits 60 seconds; the hold exists only to make the client/test,
+    // rather than an end-of-script timer, own connection teardown.
+    builder = builder.step(H3Step::StallFor(std::time::Duration::from_secs(60)));
     let backend = builder.spawn().expect("spawn scripted H3 backend");
 
     let provider = rustls::crypto::ring::default_provider();
