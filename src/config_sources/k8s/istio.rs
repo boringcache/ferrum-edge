@@ -2842,10 +2842,6 @@ fn l4_route_backends(
             &format!("VirtualService {kind}[].route[{route_index}].weight"),
             0,
         )?;
-        if weight == 0 && !preserve_single_destination {
-            skipped_zero += 1;
-            continue;
-        }
         let dest = route.get("destination").ok_or_else(|| {
             invalid_resource(
                 object,
@@ -2877,6 +2873,14 @@ fn l4_route_backends(
                 ),
             )
         })?;
+        // Zero weight disables selection, not admission. Validate the complete
+        // destination first so an ignored leg cannot hide an unsupported
+        // subset, a missing port, or another malformed destination in an
+        // otherwise-active split.
+        if weight == 0 && !preserve_single_destination {
+            skipped_zero += 1;
+            continue;
+        }
         // A short Istio destination is resolved relative to the VirtualService's
         // namespace, not the namespace of a sidecar/gateway that consumes an
         // exported route. Qualify recognized Kubernetes service forms before L4

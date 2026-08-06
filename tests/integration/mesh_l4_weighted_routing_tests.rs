@@ -254,6 +254,28 @@ fn virtual_service_tcp_weighted_split_skips_zero_weight_and_fails_closed_on_inva
         format!("{subset:?}").contains("destination.subset is not supported"),
         "{subset:?}"
     );
+
+    let zero_weight_subset = translate_k8s_objects(
+        &[vs(
+            "db-zero-weight-subset",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "match": [{"port": 3306}],
+                    "route": [
+                        {"destination": {"host": "a.default.svc.cluster.local", "port": {"number": 3306}, "subset": "v1"}, "weight": 0},
+                        {"destination": {"host": "b.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 100}
+                    ]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect_err("a zero-weight leg must not bypass destination validation");
+    assert!(
+        format!("{zero_weight_subset:?}").contains("destination.subset is not supported"),
+        "{zero_weight_subset:?}"
+    );
 }
 
 #[test]
