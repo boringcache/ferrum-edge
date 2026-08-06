@@ -1140,7 +1140,29 @@ fn h3_native_and_cross_protocol_cancel_writers_use_post_deadline_grace() {
     assert!(error_writer.contains("if !halt_recv"));
     assert!(error_writer.contains("await_post_deadline_terminal_response_write("));
     assert!(error_writer.contains("abort_response_stream(stream)"));
-    assert!(!error_writer.contains("halt_request_body(stream)"));
+    assert_eq!(
+        error_writer.matches("halt_request_body(stream)").count(),
+        1,
+        "the halt_recv=false branch must halt the request direction after the bounded write settles"
+    );
+    let grace_start = error_writer
+        .find("if !halt_recv {")
+        .expect("native H3 error writer halt_recv=false branch");
+    let grace_arm = &error_writer[grace_start..];
+    let grace_write = grace_arm
+        .find("await_post_deadline_terminal_response_write(")
+        .expect("native H3 error writer must use post-deadline grace");
+    let halt_after_grace = grace_arm
+        .find("halt_request_body(stream)")
+        .expect("native H3 error writer must halt after grace settles");
+    assert!(
+        grace_write < halt_after_grace,
+        "STOP_SENDING must follow the bounded terminal write, not precede response settlement"
+    );
+    assert!(
+        !grace_arm[..halt_after_grace].contains("halt_request_body(stream)"),
+        "halt_request_body must not run until await_post_deadline_terminal_response_write returns"
+    );
 
     let cross = include_str!("../../../src/http3/cross_protocol.rs");
     let final_reject = cross
@@ -1173,7 +1195,25 @@ fn h3_native_and_cross_protocol_cancel_writers_use_post_deadline_grace() {
         .expect("bounded timed-out bridge arm");
     assert!(timed_out.contains("await_post_deadline_terminal_response_write("));
     assert!(timed_out.contains("abort_response_stream(stream)"));
-    assert!(!timed_out.contains("halt_request_body(stream)"));
+    assert_eq!(
+        timed_out.matches("halt_request_body(stream)").count(),
+        1,
+        "timed-out bridge arm must halt the request direction after the bounded write settles"
+    );
+    let grace_write = timed_out
+        .find("await_post_deadline_terminal_response_write(")
+        .expect("timed-out bridge arm must use post-deadline grace");
+    let halt_after_grace = timed_out
+        .find("halt_request_body(stream)")
+        .expect("timed-out bridge arm must halt after grace settles");
+    assert!(
+        grace_write < halt_after_grace,
+        "cross-protocol timed-out STOP_SENDING must follow the bounded terminal write"
+    );
+    assert!(
+        !timed_out[..halt_after_grace].contains("halt_request_body(stream)"),
+        "halt_request_body must not run until await_post_deadline_terminal_response_write returns"
+    );
 }
 
 #[test]
