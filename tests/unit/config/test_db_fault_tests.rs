@@ -4,10 +4,9 @@
 //! (ordinary `PoolClosed` connectivity failure) and clears cleanly — without
 //! mutating live SQLite/WAL/SHM files.
 
-use crate::unit::env_lock::ENV_LOCK;
+use crate::unit::env_lock::{ENV_LOCK, EnvGuard};
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::test_db_fault::{self, CONTROL_ENV};
-use std::time::Duration;
 
 #[tokio::test]
 async fn fault_control_trips_pool_to_closed_and_restores() {
@@ -69,7 +68,6 @@ async fn fault_control_trips_pool_to_closed_and_restores() {
 
     // Restore.
     std::fs::remove_file(&control).expect("clear control");
-    tokio::time::sleep(Duration::from_millis(1)).await;
     assert!(
         test_db_fault::tripped_fault_pool().is_none(),
         "cleared control file must un-trip"
@@ -84,15 +82,10 @@ async fn fault_control_trips_pool_to_closed_and_restores() {
 
 #[tokio::test]
 async fn arm_from_env_requires_control_path() {
-    let _guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let env = EnvGuard::new(&[CONTROL_ENV]);
 
     test_db_fault::disarm_for_tests();
-    // SAFETY: ENV_LOCK is held for the whole test.
-    unsafe {
-        std::env::remove_var(CONTROL_ENV);
-    }
+    env.unset(CONTROL_ENV);
     test_db_fault::arm_from_env().await;
     assert!(
         !test_db_fault::is_armed(),
