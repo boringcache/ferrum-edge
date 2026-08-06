@@ -1518,8 +1518,12 @@ fn route_conflict_message(conflict: &GatewayApiRouteConflict) -> String {
         );
     }
     if conflict.loser.kind == "UDPRoute" {
+        // UDPRoute same-listener arbitration suppresses traffic ownership only:
+        // the loser stays Accepted (attached) under the upstream multiple-route
+        // attachment contract, while Programmed/Conflicted carry non-effective
+        // ownership. Do not phrase this as an Accepted rejection.
         return format!(
-            "Ferrum rejected this UDPRoute on parent={} because another UDPRoute already owns the same UDP listener ({}); winner is {}/{}",
+            "Ferrum did not program this UDPRoute on parent={} because another UDPRoute already owns effective traffic on the same UDP listener ({}); winner is {}/{}",
             conflict.key.parent_ref,
             conflict.key.listen_path,
             conflict.winner.namespace,
@@ -1700,6 +1704,15 @@ fn route_status(
             && parent_route_keys
                 .iter()
                 .all(|key| parent_conflict_keys.contains(key));
+        // Gateway API UDPRoute multiple-route attachment: two otherwise-valid
+        // UDPRoutes on one listener both report Accepted=True; only the oldest
+        // is effective/Programmed. Do not use same-kind UDP conflict to flip
+        // Accepted false (HTTP/GRPC cross-kind and same-path acceptance stay
+        // on the conflict-rejects path below).
+        let conflict_rejects_acceptance =
+            all_parent_matches_conflicted && object.kind != "UDPRoute";
+        let udp_fully_shadowed =
+            object.kind == "UDPRoute" && all_parent_matches_conflicted;
         let conflict_message = parent_conflicts
             .first()
             .map(|conflict| route_conflict_message(conflict));
@@ -1714,11 +1727,11 @@ fn route_status(
             && !not_allowed_by_listener
             && !route_parent_ref_has_matching_listener(object, parent_ref, indexes);
         let accepted_for_parent = accepted
-            && !all_parent_matches_conflicted
+            && !conflict_rejects_acceptance
             && !not_allowed_by_listener
             && !no_matching_parent
             && !no_matching_listener_hostname;
-        let accepted_reason = if all_parent_matches_conflicted {
+        let accepted_reason = if conflict_rejects_acceptance {
             "Conflicted"
         } else if not_allowed_by_listener {
             "NotAllowedByListeners"
@@ -1726,10 +1739,15 @@ fn route_status(
             "NoMatchingParent"
         } else if no_matching_listener_hostname {
             "NoMatchingListenerHostname"
+        } else if udp_fully_shadowed {
+            // Attachment is accepted; empty materialization here means the
+            // newer route lost traffic ownership, not that the route had no
+            // rules — keep reason Accepted (not NoRules/Conflicted).
+            "Accepted"
         } else {
             accepted_reason
         };
-        let accepted_message = if all_parent_matches_conflicted {
+        let accepted_message = if conflict_rejects_acceptance {
             conflict_message.as_deref().unwrap_or(&message)
         } else if not_allowed_by_listener {
             "Ferrum rejected this route attachment because it is not permitted by the target Gateway listener"
@@ -1737,6 +1755,8 @@ fn route_status(
             "Ferrum rejected this route attachment because no matching parent listener was found"
         } else if no_matching_listener_hostname {
             "Ferrum rejected this route attachment because no matching listener hostname was found"
+        } else if udp_fully_shadowed {
+            "Ferrum accepted this route attachment"
         } else {
             &message
         };

@@ -199,6 +199,23 @@ fn route_condition_reason(
     route_condition_field(updates, name, condition, "reason")
 }
 
+fn gateway_listener_attached_routes(
+    updates: &[GatewayApiStatusUpdate],
+    gateway_name: &str,
+    listener_name: &str,
+) -> Option<u64> {
+    let update = updates
+        .iter()
+        .find(|update| update.kind == "Gateway" && update.name == gateway_name)?;
+    update
+        .status
+        .get("listeners")?
+        .as_array()?
+        .iter()
+        .find(|listener| listener.get("name").and_then(Value::as_str) == Some(listener_name))
+        .and_then(|listener| listener.get("attachedRoutes").and_then(Value::as_u64))
+}
+
 #[test]
 fn udp_route_materializes_udp_stream_proxy_on_listener_port() {
     let route = udp_route("dns", attached_rule("edge", "dns", "coredns", 5353));
@@ -1273,13 +1290,39 @@ fn udp_routes_on_the_same_listener_arbitrate_oldest_wins() {
     );
 
     let updates = plan_gateway_api_status_updates(&objects, options(), &result.route_conflicts);
+    // Official Gateway API UDPRoute multiple-route attachment: both routes
+    // report Accepted=True; only the oldest is Programmed/effective. Listener
+    // attachedRoutes counts every accepted attached route, including the
+    // non-effective newer one — not materialized-only.
+    assert_eq!(
+        route_condition(&updates, "dns-old", "Accepted").as_deref(),
+        Some("True")
+    );
+    assert_eq!(
+        route_condition_reason(&updates, "dns-old", "Accepted").as_deref(),
+        Some("Accepted")
+    );
     assert_eq!(
         route_condition(&updates, "dns-old", "Programmed").as_deref(),
         Some("True")
     );
     assert_eq!(
+        route_condition(&updates, "dns-old", "Conflicted").as_deref(),
+        Some("False")
+    );
+    assert_eq!(
+        route_condition(&updates, "dns-new", "Accepted").as_deref(),
+        Some("True"),
+        "fully shadowed newer UDPRoute must stay Accepted=True"
+    );
+    assert_eq!(
         route_condition_reason(&updates, "dns-new", "Accepted").as_deref(),
-        Some("Conflicted")
+        Some("Accepted"),
+        "conflict must not flip Accepted reason to Conflicted"
+    );
+    assert_eq!(
+        route_condition(&updates, "dns-new", "Programmed").as_deref(),
+        Some("False")
     );
     assert_eq!(
         route_condition_reason(&updates, "dns-new", "Programmed").as_deref(),
@@ -1288,6 +1331,11 @@ fn udp_routes_on_the_same_listener_arbitrate_oldest_wins() {
     assert_eq!(
         route_condition(&updates, "dns-new", "Conflicted").as_deref(),
         Some("True")
+    );
+    assert_eq!(
+        gateway_listener_attached_routes(&updates, "edge", "dns"),
+        Some(2),
+        "attachedRoutes must count accepted attached UDPRoutes including the non-effective newer route"
     );
 }
 
@@ -1480,6 +1528,43 @@ fn udp_route_partial_listener_conflict_keeps_the_non_colliding_listener() {
             .any(|conflict| conflict.loser.name == "both" && conflict.winner.name == "dns-only"),
         "{:?}",
         result.route_conflicts
+    );
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &result.route_conflicts);
+    // Partial loss on one concrete listener: the multi-listener route stays
+    // Accepted and Programmed (retains metrics), with supplementary Conflicted.
+    assert_eq!(
+        route_condition(&updates, "both", "Accepted").as_deref(),
+        Some("True")
+    );
+    assert_eq!(
+        route_condition_reason(&updates, "both", "Accepted").as_deref(),
+        Some("Accepted")
+    );
+    assert_eq!(
+        route_condition(&updates, "both", "Programmed").as_deref(),
+        Some("True")
+    );
+    assert_eq!(
+        route_condition(&updates, "both", "Conflicted").as_deref(),
+        Some("True")
+    );
+    assert_eq!(
+        route_condition(&updates, "dns-only", "Accepted").as_deref(),
+        Some("True")
+    );
+    assert_eq!(
+        route_condition(&updates, "dns-only", "Programmed").as_deref(),
+        Some("True")
+    );
+    assert_eq!(
+        gateway_listener_attached_routes(&updates, "edge", "dns"),
+        Some(2),
+        "dns listener attachedRoutes includes both the exclusive winner and the partially conflicted multi-listener route"
+    );
+    assert_eq!(
+        gateway_listener_attached_routes(&updates, "edge", "metrics"),
+        Some(1)
     );
 }
 

@@ -2375,8 +2375,12 @@ struct UdpRouteConflictEntry {
 /// that attach to the same listener cannot both receive traffic. Gateway API
 /// picks the oldest `metadata.creationTimestamp`, then `{namespace}/{name}`.
 /// Ferrum materializes that decision fail-closed: the loser emits neither a
-/// stream proxy nor a generated upstream for the conflicted listener, and
-/// status reports `Conflicted` rather than `Programmed`.
+/// stream proxy nor a generated upstream for the conflicted listener.
+/// Status distinguishes attachment from traffic ownership: both otherwise-valid
+/// routes report `Accepted=True`; the non-effective newer route reports
+/// `Programmed=False` with conflict evidence (and Ferrum's `Conflicted=True`
+/// extension). A multi-listener route that loses on only some listeners keeps
+/// `Accepted=True` / `Programmed=True` while still surfacing partial conflict.
 ///
 /// Arbitration is scoped to resolved [`GatewayApiListenerKey`] identity, not
 /// the literal parentRef selector string, so a wildcard reference and a

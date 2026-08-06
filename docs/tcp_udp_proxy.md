@@ -472,7 +472,12 @@ Route admission is strict and fail closed (required `spec.rules` and
 at most one *supported* rule per `UDPRoute`, same-listener UDPRoute ownership
 by oldest `creationTimestamp` then `{namespace}/{name}`, and no listener at all
 for a declared Gateway parent that matches nothing or lost every claimed
-listener). A multi-rule `UDPRoute` is valid under the upstream CRD but has no
+listener). Same-listener ownership suppresses **effective traffic** only: both
+otherwise-valid `UDPRoute`s stay `Accepted=True` (attached), the oldest alone
+is `Programmed`/effective, the shadowed newer route reports
+`Programmed=False` with conflict evidence, and listener `attachedRoutes`
+counts every accepted attached route — including a non-effective newer one. A
+multi-rule `UDPRoute` is valid under the upstream CRD but has no
 representable aggregate here, so it is refused as `Accepted=False` /
 `UnsupportedValue` on `spec.rules` rather than resolved by listener bind order.
 Missing/empty/non-array `rules` or `backendRefs` reject as `Invalid`.
