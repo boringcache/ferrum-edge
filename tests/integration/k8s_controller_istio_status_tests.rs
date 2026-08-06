@@ -966,16 +966,11 @@ fn sidecar_omitted_mode_reports_the_istio_allow_any_default_without_deferral() {
         "sc-default-mode",
         json!({ "outboundTrafficPolicy": {} }),
     );
-    let updates = plan_istio_status_updates(
-        &[obj],
-        options().with_mesh_sidecar_ingress_enforced(true),
-    );
+    let updates =
+        plan_istio_status_updates(&[obj], options().with_mesh_sidecar_ingress_enforced(true));
     let translation = sidecar_translation(&updates, "sc-default-mode");
     assert_eq!(translation["outbound_traffic_policy"], json!("ALLOW_ANY"));
-    assert_eq!(
-        translation["outbound_traffic_policy_enforced"],
-        json!(true)
-    );
+    assert_eq!(translation["outbound_traffic_policy_enforced"], json!(true));
     assert_eq!(translation["deferred_fields"], json!([]));
 }
 
