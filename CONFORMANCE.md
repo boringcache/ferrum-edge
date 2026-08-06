@@ -49,9 +49,8 @@ citations):
 - **Artifacts.** A `gateway-api-conformance-<version>` bundle
   (`conformance-results/`, 90-day retention). The **run-local `CONFORMANCE.md`**
   inside that bundle is generated per run by
-  `scripts/gateway_api_data_plane_conformance.sh` (with GRPCRoute/TCPRoute ports
-  and resources appended by `scripts/gateway_api_grpcroute_conformance.sh` and
-  `scripts/gateway_api_tcproute_conformance.sh`) and is a
+  `scripts/gateway_api_data_plane_conformance.sh` (with TCPRoute ports and
+  resources appended by `scripts/gateway_api_tcproute_conformance.sh`) and is a
   different file from this repo-root page.
 
 # Istio + xDS Conformance Suite

@@ -11,10 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Gateway API live `GATEWAY-GRPC` conformance: CI advertises
   `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`, runs the upstream
-  `GATEWAY-HTTP,GATEWAY-GRPC` profiles against a live Ferrum listener, and
-  adds Ferrum black-box GRPCRoute status / ReferenceGrant / fail-closed /
-  update / delete / Unimplemented coverage via
-  `scripts/gateway_api_grpcroute_conformance.sh` (issue #3272).
+  `GATEWAY-HTTP,GATEWAY-GRPC` profiles against a live Ferrum listener, with
+  exact-method, header, listener-hostname, weighted-backend, and core status
+  coverage owned by the pinned upstream suite (issue #3272).
 
 - NodeWaypoint captured TCP observability now exports the bounded-cardinality
   `ferrum_mesh_bpf_accept_to_first_byte_microseconds` histogram for IPv4 and

@@ -85,7 +85,7 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | Selectorless/headless Services | Yes | With pod discovery enabled, backends resolve ready EndpointSlice addresses directly; a named Service `targetPort` resolves against EndpointSlice port names, but the `backendRef.port` itself is numeric-only — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Backend failure | Yes | Traffic to unavailable generated backends must return an error response rather than falling through |
 | Route update and deletion | Yes | Reconciliation regenerates live proxy/upstream/plugin config; deletion removes the route from live config |
-| `GRPCRoute` | Yes, via upstream `GATEWAY-GRPC` | Watched and translated — see [GRPCRoute predicate translation](#grpcroute-predicate-translation). CI advertises `GRPCRoute` and runs the upstream `GATEWAY-GRPC` core suite (exact method, header, listener hostname, weight) against a live Ferrum listener, plus Ferrum black-box status/ReferenceGrant/fail-closed/update/delete/Unimplemented coverage in `scripts/gateway_api_grpcroute_conformance.sh`. Extended `GRPCRouteNamedRouteRule` is **not** claimed. Native gRPC route misses and `reject_unmatched` refusals map HTTP 404 → gRPC `UNIMPLEMENTED` (official HTTP↔gRPC table / Gateway API `GRPCExactMethodMatching`). |
+| `GRPCRoute` | Yes, via upstream `GATEWAY-GRPC` | Watched and translated — see [GRPCRoute predicate translation](#grpcroute-predicate-translation). CI advertises `GRPCRoute` and runs the pinned upstream `GATEWAY-GRPC` core suite (exact method, header, listener hostname, weight, and core status) against a live Ferrum listener. Extended `GRPCRouteNamedRouteRule` is **not** claimed. Native gRPC route misses and `reject_unmatched` refusals map HTTP 404 → gRPC `UNIMPLEMENTED` (official HTTP↔gRPC table / Gateway API `GRPCExactMethodMatching`). |
 | `TCPRoute` | Yes, via Ferrum black-box live checks (not upstream `GATEWAY-TCP`) | Lab installs the pinned `v1.5.1` experimental-channel CRD bundle (one coherent channel that includes `TCPRoute`). Live kind traffic proves parent/listener attachment, same-namespace and ReferenceGrant cross-namespace backend resolution, tagged TCP echo forwarding, empty/missing/unpermitted backend fail-closed behavior, parent status (`Accepted`/`ResolvedRefs`/`Programmed`), live backendRef updates, and deletion withdrawal. Upstream profiles/features remain `GATEWAY-HTTP,GATEWAY-GRPC` / `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`; `GATEWAY-TCP` is **not** claimed on this pin (the profile/tests land in later Gateway API releases). |
 | `TLSRoute` | Not claimed | Watched/translated for L4 experiments, but not advertised as a supported Gateway API conformance profile |
 | `UDPRoute`, `BackendTLSPolicy`, `ListenerSet`, `BackendLBPolicy` | No | Not claimed as effective Gateway API conformance features |
@@ -311,13 +311,14 @@ The standalone `gateway-api-conformance.yml` workflow is the single owner that d
 
 - Ferrum control plane/controller with Gateway API watches enabled.
 - A routable Ferrum data-plane deployment and NodePort Service mapped to host ports 80 and 443 (HTTP/HTTPS) plus dedicated TCPRoute stream ports `9001`–`9004` in kind.
-- HTTP echo backend namespaces, gRPC echo-basic fixtures for live `GRPCRoute` checks, plus tagged TCP echo fixtures for live `TCPRoute` checks.
+- HTTP echo backend namespaces, the upstream suite's gRPC echo-basic fixtures,
+  plus tagged TCP echo fixtures for live `TCPRoute` checks.
 - `GatewayClass`, `Gateway`, `HTTPRoute`, `GRPCRoute`, `TCPRoute`, and `ReferenceGrant` resources for direct black-box checks.
 - The upstream Gateway API conformance suite pinned by `GATEWAY_API_VERSION`, defaulting to `v1.5.1`, running the complete `GATEWAY-HTTP` and `GATEWAY-GRPC` profiles with explicit supported features `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`. TCPRoute remains gated by Ferrum black-box evidence (not by advertising an upstream `GATEWAY-TCP` profile on this pin).
 
-Direct black-box checks cover hostname, path, method, headers, weighted backend selection, zero-weight-only HTTP 500 behavior, cross-namespace references, invalid references, backend failure, TLS, route updates, and route deletion for HTTP; GRPCRoute parent status, exact method + header matching, ReferenceGrant backends, trailers-only Unimplemented for unmatched methods, fail-closed empty/missing/unpermitted backends, update, and deletion; plus TCPRoute parent/listener attachment, ReferenceGrant backend resolution, tagged echo traffic, fail-closed empty/missing/unpermitted backends, status, update, and deletion. Diagnostics and the upstream conformance report are uploaded from `conformance-results/` as retained CI artifacts.
+Direct black-box checks cover hostname, path, method, headers, weighted backend selection, zero-weight-only HTTP 500 behavior, cross-namespace references, invalid references, backend failure, TLS, route updates, and route deletion for HTTP; plus TCPRoute parent/listener attachment, ReferenceGrant backend resolution, tagged echo traffic, fail-closed empty/missing/unpermitted backends, status, update, and deletion. The pinned upstream suite owns live GRPCRoute conformance evidence. Diagnostics and the upstream conformance report are uploaded from `conformance-results/` as retained CI artifacts.
 
-Lab bootstrap uses `scripts/gateway_api_conformance_lab_setup.sh` (kind ports, experimental CRDs, TCP listener Service ports). HTTP upstream and HTTP black-box phases stay in `scripts/gateway_api_data_plane_conformance.sh`; GRPCRoute black-box and supplemental diagnostics run via `scripts/gateway_api_grpcroute_conformance.sh`; TCPRoute black-box and supplemental diagnostics run via `scripts/gateway_api_tcproute_conformance.sh`.
+Lab bootstrap uses `scripts/gateway_api_conformance_lab_setup.sh` (kind ports, experimental CRDs, TCP listener Service ports). HTTP/GRPC upstream and HTTP black-box phases stay in `scripts/gateway_api_data_plane_conformance.sh`; TCPRoute black-box and supplemental diagnostics run via `scripts/gateway_api_tcproute_conformance.sh`.
 
 The standalone Gateway API conformance workflow triggers on every PR, but a lightweight `changes` job gates the heavy lab job internally: it runs the conformance suite only when the PR diff touches routing, Kubernetes translation/status, CP/DP sync, data-plane startup, plugins, charts, the conformance script, or related CI files, and otherwise skips it. Artifacts are retained for 90 days so the standard upstream report can be reproduced from the workflow inputs and preserved as release evidence.
 
@@ -389,15 +390,14 @@ themselves assert condition **status**, not custom reason strings.
 Each run uploads a `gateway-api-conformance-<version>` bundle from
 `conformance-results/` (90-day retention), produced by
 `scripts/gateway_api_data_plane_conformance.sh diagnostics` (plus
-`scripts/gateway_api_grpcroute_conformance.sh diagnostics` and
-`scripts/gateway_api_tcproute_conformance.sh diagnostics` for GRPCRoute/TCPRoute
-log snapshots and the extended `gateway-api-resources.yaml`):
+`scripts/gateway_api_tcproute_conformance.sh diagnostics` for TCPRoute log
+snapshots and the extended `gateway-api-resources.yaml`):
 
 | File | What it is |
 | --- | --- |
 | `gateway-api-conformance-test.json` | Streaming `go test -json` events for every upstream conformance test. |
 | `gateway-api-conformance-report.yaml` | Upstream `conformance.gateway.networking.k8s.io` report; `profiles[].coreTests` has pass/fail per test. |
-| `gateway-api-blackbox.md` | Results of the direct black-box traffic checks (HTTP host/method/header/modifier/cross-namespace/redirect/weighted/invalid-500/zero-weight-500/no-endpoints/update/delete/TLS, GRPCRoute status/exact-method/header/ReferenceGrant/Unimplemented/fail-closed/update/delete, plus TCPRoute attachment/status/echo/ReferenceGrant/fail-closed/update/delete). |
+| `gateway-api-blackbox.md` | Results of the direct black-box traffic checks (HTTP host/method/header/modifier/cross-namespace/redirect/weighted/invalid-500/zero-weight-500/no-endpoints/update/delete/TLS, plus TCPRoute attachment/status/echo/ReferenceGrant/fail-closed/update/delete). GRPCRoute results are recorded in the upstream conformance report. |
 | `gateway-api-resources.yaml` | `kubectl get gatewayclasses,gateways,httproutes,grpcroutes,tcproutes,referencegrants -A -o yaml` snapshot. |
 | `kubernetes-workloads.txt`, `namespaces.txt`, `ferrum-*-deployment.txt`, `ferrum-pods.txt`, `ferrum-events.txt` | Cluster/workload diagnostics. |
 | `ferrum-control-plane.log`, `ferrum-control-plane-previous.log`, `ferrum-data-plane.log`, `blackbox-*.log` | Container logs. |

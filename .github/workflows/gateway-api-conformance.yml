@@ -180,11 +180,6 @@ jobs:
       - name: Install Kubernetes tools
         uses: ./.github/actions/setup-kubernetes-tools
 
-      - name: Install grpcurl
-        # Go's module checksum database authenticates the pinned release source;
-        # keep executable acquisition in the visible workflow trust boundary.
-        run: go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.3
-
       - name: Package Ferrum image
         uses: ./.github/actions/package-ferrum-runtime-image
         with:
@@ -206,20 +201,13 @@ jobs:
         run: bash scripts/gateway_api_data_plane_conformance.sh upstream
 
       - name: Run Ferrum Gateway API black-box checks
-        # HTTPRoute black-box coverage. Dedicated steps below own live GRPCRoute
-        # and TCPRoute evidence; upstream profiles are GATEWAY-HTTP,GATEWAY-GRPC.
+        # HTTPRoute black-box coverage. The upstream suite owns live GRPCRoute
+        # evidence; the dedicated step below owns live TCPRoute evidence.
         env:
           GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
           GATEWAY_API_PROFILE: ${{ steps.inputs.outputs.conformance_profile }}
           GATEWAY_API_SUPPORTED_FEATURES: ${{ steps.inputs.outputs.supported_features }}
         run: bash scripts/gateway_api_data_plane_conformance.sh blackbox
-
-      - name: Run Ferrum Gateway API GRPCRoute black-box checks
-        # Ferrum-specific status/ReferenceGrant/fail-closed/update/delete coverage
-        # supplementing the upstream GATEWAY-GRPC core suite.
-        env:
-          GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
-        run: bash scripts/gateway_api_grpcroute_conformance.sh blackbox
 
       - name: Run Ferrum Gateway API TCPRoute black-box checks
         # Ferrum-specific echo/status/update/delete coverage; this does not claim
@@ -235,12 +223,6 @@ jobs:
           GATEWAY_API_PROFILE: ${{ steps.inputs.outputs.conformance_profile }}
           GATEWAY_API_SUPPORTED_FEATURES: ${{ steps.inputs.outputs.supported_features }}
         run: bash scripts/gateway_api_data_plane_conformance.sh diagnostics
-
-      - name: Collect GRPCRoute diagnostics
-        if: always()
-        env:
-          GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
-        run: bash scripts/gateway_api_grpcroute_conformance.sh diagnostics
 
       - name: Collect TCPRoute diagnostics
         if: always()
