@@ -5,6 +5,11 @@
 //! from length-prefixed framing observed on the live body adapters — not from
 //! manually seeded summaries.
 //!
+//! Also covers translated gRPC-Web: the counters must describe the NATIVE gRPC
+//! representation exchanged with the backend, so a text-mode client whose wire
+//! body is base64 (and whose response is re-armoured on the way out) still
+//! reports the true message counts rather than zero.
+//!
 //! ```bash
 //! cargo build --bin ferrum-edge && \
 //!   cargo test --test functional_tests grpc_message_metrics -- --ignored --nocapture
@@ -15,6 +20,8 @@ use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http3Client;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::Request;
@@ -184,6 +191,161 @@ async fn h2_grpc_message_metrics_are_nonzero_and_exact() {
         .expect("response message series missing");
     assert_eq!(req, 2, "H2 gRPC request messages:\n{metrics}");
     assert_eq!(resp, 2, "H2 gRPC response messages:\n{metrics}");
+}
+
+/// Proxy config for a browser gRPC-Web client in front of a native gRPC
+/// backend: the `grpc_web` plugin owns request decode / response re-framing.
+fn grpc_web_metrics_config(backend_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "grpc-web-msg-metrics",
+            "listen_path": "/grpc",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "plugins": [{"plugin_config_id": "grpc-web"}],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "grpc-web",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "grpc-web-msg-metrics",
+                "enabled": true,
+                "config": {},
+            },
+            {
+                "id": "prom",
+                "plugin_name": "prometheus_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": { "render_cache_ttl_seconds": 0 }
+            },
+            {
+                "id": "workload-metrics",
+                "plugin_name": "workload_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {
+                    "namespace": "default",
+                    "workload_spiffe_id": "spiffe://cluster.local/ns/default/sa/frontend",
+                    "labels": { "app": "frontend" }
+                }
+            }
+        ],
+    });
+    serde_yaml::to_string(&config).expect("yaml")
+}
+
+async fn send_h2_grpc_web(
+    gateway_addr: &str,
+    path: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    use http_body_util::BodyExt;
+
+    let addr: SocketAddr = gateway_addr.parse()?;
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", content_type)
+        .body(Full::new(Bytes::from(body)))?;
+    let response = sender.send_request(req).await?;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    Ok(response.into_body().collect().await?.to_bytes())
+}
+
+/// Two-message gRPC-Web request/response over the real H1/H2 translation path.
+///
+/// Binary mode is the parity control (client wire == native framing); text mode
+/// is the regression: its wire body is base64, so counting the client-visible
+/// representation reports zero messages in both directions.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_web_message_metrics_count_native_frames_not_client_wire() {
+    const REQUEST_SERIES: &str = "ferrum_mesh_request_messages_total{";
+    const RESPONSE_SERIES: &str = "ferrum_mesh_response_messages_total{";
+
+    for (label, content_type, text_mode) in [
+        ("binary", "application/grpc-web+proto", false),
+        ("text", "application/grpc-web-text+proto", true),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind backend");
+        let backend_port = listener.local_addr().unwrap().port();
+        let _backend = ScriptedGrpcBackend::builder_plain(listener)
+            .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+            .step(GrpcStep::SendInitialHeaders)
+            .step(GrpcStep::RespondMessage(Bytes::from_static(b"a")))
+            .step(GrpcStep::RespondMessage(Bytes::from_static(b"b")))
+            .step(GrpcStep::RespondStatus {
+                code: 0,
+                message: "",
+            })
+            .spawn()
+            .expect("spawn backend");
+
+        let gateway = GatewayHarness::builder()
+            .file_config(grpc_web_metrics_config(backend_port))
+            .env("FERRUM_ACCEPT_THREADS", "1")
+            .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+            .spawn()
+            .await
+            .expect("spawn gateway");
+
+        let mut native = grpc_frame(b"one");
+        native.extend_from_slice(&grpc_frame(b"two"));
+        let wire = if text_mode {
+            BASE64.encode(&native).into_bytes()
+        } else {
+            native
+        };
+
+        let proxy_host = gateway
+            .proxy_base_url()
+            .trim_start_matches("http://")
+            .to_string();
+        let path = "/grpc/my.Echo/Echo";
+        let client_body = send_h2_grpc_web(&proxy_host, path, content_type, wire)
+            .await
+            .unwrap_or_else(|e| panic!("{label} gRPC-Web request: {e}"));
+
+        if text_mode {
+            // The client-visible response is base64-armoured, so scanning it as
+            // gRPC framing is exactly the mistake this test guards against.
+            assert!(
+                BASE64.decode(&client_body[..]).is_ok(),
+                "{label}: response body must be base64 text mode"
+            );
+        }
+
+        let metrics = wait_for_message_metrics(&gateway, 2, 2).await;
+        let requests = metric_line_value(&metrics, REQUEST_SERIES);
+        let responses = metric_line_value(&metrics, RESPONSE_SERIES);
+        assert_eq!(
+            requests,
+            Some(2),
+            "{label} gRPC-Web request messages must count the decoded native body:\n{metrics}"
+        );
+        assert_eq!(
+            responses,
+            Some(2),
+            "{label} gRPC-Web response messages must count the backend frames:\n{metrics}"
+        );
+    }
 }
 
 #[ignore]

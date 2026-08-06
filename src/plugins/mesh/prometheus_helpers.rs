@@ -1742,9 +1742,40 @@ pub fn metadata_observes_grpc_messages(metadata: &HashMap<String, String>) -> bo
 
 /// Record a complete buffered gRPC body with store/fetch_max semantics so
 /// retry/replay of the same bytes cannot inflate the counter.
+///
+/// `body` must already be the NATIVE length-prefixed gRPC representation. The
+/// client-visible gRPC-Web representation is not: text mode base64-armours the
+/// whole body, and both modes may carry a `0x80`-flagged terminal trailer frame
+/// that is metadata rather than a message. See
+/// [`record_native_grpc_message_count`] for the guarded entry point every
+/// dispatch ladder uses.
 pub fn record_complete_grpc_message_count(counter: &AtomicU64, body: &[u8]) {
     let count = count_grpc_length_prefixed_messages(body);
     counter.fetch_max(count, Ordering::Release);
+}
+
+/// Guarded recorder for a complete, protocol-native gRPC body.
+///
+/// Ordering contract, enforced by the call sites rather than by this function:
+///
+/// * REQUEST bodies are counted from the BACKEND-VISIBLE bytes, i.e. after
+///   `apply_request_body_plugins_with_context` has run, because that is where
+///   the `grpc_web` plugin base64-decodes text mode and splits off the terminal
+///   gRPC-Web trailer frame.
+/// * RESPONSE bodies are counted from the BACKEND-PRODUCED bytes, i.e. before
+///   any gRPC-Web re-encoding appends a trailer frame or base64-armours the
+///   stream.
+///
+/// Both directions therefore describe the native gRPC representation exchanged
+/// with the backend, and `fetch_max` keeps retried/replayed buffers idempotent.
+pub fn record_native_grpc_message_count(
+    metadata: &HashMap<String, String>,
+    counter: &AtomicU64,
+    body: &[u8],
+) {
+    if metadata_observes_grpc_messages(metadata) {
+        record_complete_grpc_message_count(counter, body);
+    }
 }
 
 pub fn mesh_label_fragment(key: &MeshRequestKey, le: Option<&str>) -> String {

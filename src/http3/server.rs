@@ -2428,13 +2428,10 @@ async fn handle_h3_request(
         );
         ctx.bytes_sent_observed
             .fetch_max(body_data.len() as u64, std::sync::atomic::Ordering::Release);
-        if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata)
-        {
-            crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
-                &ctx.grpc_request_messages_observed,
-                &body_data,
-            );
-        }
+        // No gRPC message accounting here: this early prebuffer is the CLIENT
+        // representation, which for gRPC-Web is base64 text and/or carries a
+        // terminal trailer frame. The dispatch ladders below count the
+        // backend-visible body once the request-body transforms have run.
         Some(body_data)
     } else {
         None
@@ -2637,14 +2634,9 @@ async fn handle_h3_request(
             );
             ctx.bytes_sent_observed
                 .fetch_max(body_data.len() as u64, std::sync::atomic::Ordering::Release);
-            if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                &ctx.metadata,
-            ) {
-                crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
-                    &ctx.grpc_request_messages_observed,
-                    body_data,
-                );
-            }
+            // Client representation again (see the authenticate-phase prebuffer
+            // above): gRPC message accounting happens on the backend-visible
+            // body at dispatch, never on undecoded gRPC-Web bytes.
         }
     }
 
@@ -3867,13 +3859,6 @@ async fn handle_h3_request(
         prepared_raw_request_body_bytes = Some(raw_request_body_bytes);
         ctx.bytes_sent_observed
             .fetch_max(raw_request_body_bytes, std::sync::atomic::Ordering::Release);
-        if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata)
-        {
-            crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
-                &ctx.grpc_request_messages_observed,
-                &body_data,
-            );
-        }
 
         let mut hook_headers = proxy_headers.clone();
         hook_headers
@@ -3889,6 +3874,14 @@ async fn handle_h3_request(
             body_data,
         )
         .await;
+        // `bytes_sent` above is the raw client-wire length; gRPC messages come
+        // from the transformed, backend-visible body so translated gRPC-Web
+        // requests count native frames instead of base64 / trailer framing.
+        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+            &ctx.metadata,
+            &ctx.grpc_request_messages_observed,
+            &transformed,
+        );
         let final_body_result = crate::proxy::run_final_request_body_hooks(
             &plugins,
             Some(&mut ctx),
@@ -4377,13 +4370,6 @@ async fn handle_h3_request(
         prepared_raw_request_body_bytes = Some(raw_request_body_bytes);
         ctx.bytes_sent_observed
             .fetch_max(raw_request_body_bytes, std::sync::atomic::Ordering::Release);
-        if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata)
-        {
-            crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
-                &ctx.grpc_request_messages_observed,
-                &body_data,
-            );
-        }
 
         let mut hook_headers = proxy_headers.clone();
         hook_headers
@@ -4398,6 +4384,13 @@ async fn handle_h3_request(
             body_data,
         )
         .await;
+        // Same contract as the terminal-hook ladder above: count the
+        // backend-visible native representation, not the client wire bytes.
+        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+            &ctx.metadata,
+            &ctx.grpc_request_messages_observed,
+            &transformed,
+        );
         match crate::proxy::run_final_request_body_hooks(
             &plugins,
             Some(&mut ctx),

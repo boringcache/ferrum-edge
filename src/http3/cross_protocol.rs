@@ -4636,12 +4636,17 @@ where
     } else {
         body.len() as u64
     };
-    if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata) {
-        crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
-            &ctx.grpc_request_messages_observed,
-            &body,
-        );
-    }
+    // `body` is already the backend-visible native representation: a prebuffered
+    // body went through `apply_request_body_plugins_with_context` in
+    // `cross_protocol::run` (that is where gRPC-Web text base64 is decoded and
+    // the terminal trailer frame is split off), and the non-prebuffered arm is
+    // reachable only when no body-transforming plugin is configured. `bytes_sent`
+    // above stays the raw client-wire length.
+    crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+        &ctx.metadata,
+        &ctx.grpc_request_messages_observed,
+        &body,
+    );
 
     // Build the backend-facing header map (X-Forwarded-*, Via, Forwarded,
     // Early-Data) via the shared helper so the buffered and streaming H3 gRPC
