@@ -1058,6 +1058,7 @@ jobs:
               functional_admin_observability_test
               functional_admin_operations_test
               functional_auth_acl_test
+              functional_backend_lb_session_persistence_test
               functional_credential_rotation_test
               functional_file_mode_test
               functional_host_only_routing_test
