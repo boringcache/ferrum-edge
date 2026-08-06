@@ -35575,15 +35575,16 @@ async fn proxy_to_backend(
                         Arc::clone(&body_size_exceeded),
                         Arc::clone(ctx_bytes_sent_observed),
                     );
-                    let limited = if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                        &request_ctx.metadata,
-                    ) {
-                        limited.with_grpc_message_counter(Arc::clone(
-                            &request_ctx.grpc_request_messages_observed,
-                        ))
-                    } else {
-                        limited
-                    };
+                    let limited =
+                        if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                            &request_ctx.metadata,
+                        ) {
+                            limited.with_grpc_message_counter(Arc::clone(
+                                &request_ctx.grpc_request_messages_observed,
+                            ))
+                        } else {
+                            limited
+                        };
                     req_builder = req_builder.body(limited.into_reqwest_body());
                 } else {
                     // No size limit — stream body directly. Wrap in
@@ -35595,15 +35596,16 @@ async fn proxy_to_backend(
                         incoming,
                         Arc::clone(ctx_bytes_sent_observed),
                     );
-                    let counting = if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                        &request_ctx.metadata,
-                    ) {
-                        counting.with_grpc_message_counter(Arc::clone(
-                            &request_ctx.grpc_request_messages_observed,
-                        ))
-                    } else {
-                        counting
-                    };
+                    let counting =
+                        if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                            &request_ctx.metadata,
+                        ) {
+                            counting.with_grpc_message_counter(Arc::clone(
+                                &request_ctx.grpc_request_messages_observed,
+                            ))
+                        } else {
+                            counting
+                        };
                     req_builder = req_builder.body(counting.into_reqwest_body());
                 }
             }

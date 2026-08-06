@@ -2262,8 +2262,7 @@ impl Http3ConnectionPool {
                 continue;
             }
             let data = chunk.copy_to_bytes(len);
-            if let (Some(messages), Some(scanner)) =
-                (grpc_messages.as_ref(), grpc_scanner.as_mut())
+            if let (Some(messages), Some(scanner)) = (grpc_messages.as_ref(), grpc_scanner.as_mut())
             {
                 scanner.push(&data, messages);
             }
@@ -2466,8 +2465,7 @@ impl Http3ConnectionPool {
                 continue;
             }
             let data = chunk.copy_to_bytes(len);
-            if let (Some(messages), Some(scanner)) =
-                (grpc_messages.as_ref(), grpc_scanner.as_mut())
+            if let (Some(messages), Some(scanner)) = (grpc_messages.as_ref(), grpc_scanner.as_mut())
             {
                 scanner.push(&data, messages);
             }

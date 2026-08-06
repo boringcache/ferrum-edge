@@ -5279,10 +5279,11 @@ async fn handle_h3_request(
         // satisfy the shared signature.
         let request_stream_opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let request_upload_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let grpc_request_messages = crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-            &ctx.metadata,
-        )
-        .then(|| Arc::clone(&ctx.grpc_request_messages_observed));
+        let grpc_request_messages =
+            crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                &ctx.metadata,
+            )
+            .then(|| Arc::clone(&ctx.grpc_request_messages_observed));
 
         let streaming_resp = if let Some(target) = upstream_target.as_deref() {
             state
