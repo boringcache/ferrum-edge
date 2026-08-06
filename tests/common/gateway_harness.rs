@@ -54,6 +54,15 @@
 //!   ready child is proof that the child, not a squatter, owns the proxy port.
 //!   The child holds that socket for its whole lifetime, so the proof stays
 //!   valid while it runs.
+//! - That ownership claim requires an **exclusive** proxy bind. Production
+//!   defaults `FERRUM_ACCEPT_THREADS` to `available_parallelism()`, which
+//!   enables `SO_REUSEPORT` whenever the value is greater than one. Two
+//!   parallel harness children can then bind the same ephemeral proxy port
+//!   after the classic bind-drop-rebind race, keep distinct admin ports (so
+//!   identity still succeeds), and leave client traffic load-balanced onto a
+//!   foreign gateway that returns 404 for this test's routes. The harness
+//!   therefore pins `FERRUM_ACCEPT_THREADS=1` unless the caller overrides it,
+//!   so a colliding bind fails closed and the spawn retry picks a fresh port.
 //!
 //! The spawn wait also polls `Child::try_wait`, so a child that dies after a
 //! partial bind fails fast instead of letting the retry loop burn the full
@@ -1143,6 +1152,7 @@ const SCRUB_DEFAULTS: &[&str] = &[
     "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP",
     "FERRUM_LOG_LEVEL",
     "FERRUM_POOL_WARMUP_ENABLED",
+    "FERRUM_ACCEPT_THREADS",
     "FERRUM_BASIC_AUTH_HMAC_SECRET",
     "FERRUM_NAMESPACE",
     "FERRUM_DB_TYPE",
