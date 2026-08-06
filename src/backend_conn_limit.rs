@@ -407,12 +407,15 @@ fn write_lane_key(buf: &mut String, host: &str, dial_port: u16) {
 /// destination costs nothing anywhere. Publication is idempotent and
 /// allocation-free on repeat.
 ///
-/// Lanes are stamped with a config epoch that [`Self::bump_config_epoch`]
-/// advances on every config publication. A lane whose epoch is stale is
+/// Lanes are stamped with the request's pinned config generation. The current
+/// generation advances on every config publication (or when the first request
+/// from that publication reaches dispatch). A lane whose epoch is stale is
 /// ignored, so a `maxConnections` an operator **removed** stops being enforced
 /// without needing a withdrawal pass over every host a proxy ever dialed; the
 /// dispatch that re-publishes runs before the dial it will cause, so a cap that
-/// still exists is re-stamped before it is next consulted.
+/// still exists is re-stamped before it is next consulted. Lane replacement is
+/// monotonic by generation: a late in-flight request pinned to an older config
+/// can neither resurrect a removed cap nor overwrite the newer lane.
 pub struct ReqwestConnectionAdmission {
     limiter: SharedBackendConnectionLimiter,
     lanes: DashMap<String, ReqwestLane>,
@@ -425,14 +428,19 @@ impl ReqwestConnectionAdmission {
         Self {
             limiter,
             lanes: DashMap::with_shard_amount(shards),
-            epoch: AtomicU64::new(0),
+            // Every RequestEpochStore starts at generation 1.
+            epoch: AtomicU64::new(1),
         }
     }
 
-    /// Invalidate every published lane. Called from the single config-publish
-    /// chokepoint so a removed cap cannot outlive its configuration.
-    pub fn bump_config_epoch(&self) {
-        self.epoch.fetch_add(1, Ordering::Release);
+    /// Advance to an explicitly published configuration generation.
+    ///
+    /// `fetch_max` is deliberate: request dispatch may observe the newly
+    /// published RequestEpoch just before the cold-path mirror runs, while an
+    /// older in-flight request may arrive arbitrarily later. Neither ordering
+    /// is allowed to move admission back to a retired generation.
+    pub fn advance_config_epoch(&self, config_generation: u64) {
+        self.epoch.fetch_max(config_generation, Ordering::AcqRel);
     }
 
     /// Publish (or refresh) the lane governing new sockets to
@@ -443,11 +451,23 @@ impl ReqwestConnectionAdmission {
     /// policy port ([`crate::proxy::dispatch_policy_port_for_target`]), which
     /// is what the counter lane is keyed by, so a `targetPort` remap and a raw
     /// TCP/WebSocket session to the same destination share one ceiling.
-    pub fn publish_lane(&self, dial_host: &str, dial_port: u16, policy_port: u16, cap: u32) {
+    pub fn publish_lane(
+        &self,
+        config_generation: u64,
+        dial_host: &str,
+        dial_port: u16,
+        policy_port: u16,
+        cap: u32,
+    ) {
+        // A request from the newly published epoch can reach dispatch before
+        // the compatibility-mirror callback advances the hook. Let that
+        // request close the tiny handoff window itself; an old request cannot
+        // lower the generation.
+        self.advance_config_epoch(config_generation);
         let lane = ReqwestLane {
             policy_port,
             cap,
-            epoch: self.epoch.load(Ordering::Acquire),
+            epoch: config_generation,
         };
         LANE_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
@@ -460,7 +480,19 @@ impl ReqwestConnectionAdmission {
             {
                 return;
             }
-            self.lanes.insert(buf.clone(), lane);
+            // The allocating entry path is cold (new/changed/stale lane). An
+            // older request must never overwrite a lane already published by
+            // a newer configuration generation.
+            match self.lanes.entry(buf.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                    if entry.get().epoch <= lane.epoch {
+                        entry.insert(lane);
+                    }
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    entry.insert(lane);
+                }
+            }
         });
     }
 
@@ -661,6 +693,44 @@ mod tests {
         assert_eq!(limiter.current("backend-a", 80), 1);
         assert_eq!(limiter.current("backend-b", 80), 1);
         assert_eq!(limiter.current("backend-a", 443), 1);
+    }
+
+    #[test]
+    fn retired_request_cannot_overwrite_newer_reqwest_lane() {
+        let limiter = Arc::new(BackendConnectionLimiter::new());
+        let admission = ReqwestConnectionAdmission::new(limiter, 8);
+
+        admission.publish_lane(1, "backend", 8080, 8080, 1);
+        admission.advance_config_epoch(2);
+        admission.publish_lane(2, "backend", 8080, 8080, 4);
+
+        // A request that pinned generation 1 before reload may reach dispatch
+        // after generation 2. It must not replace generation 2's policy.
+        admission.publish_lane(1, "backend", 8080, 8080, 1);
+
+        assert_eq!(
+            admission.lane_for("backend", 8080),
+            Some(ReqwestLane {
+                policy_port: 8080,
+                cap: 4,
+                epoch: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn retired_request_cannot_resurrect_removed_reqwest_lane() {
+        let limiter = Arc::new(BackendConnectionLimiter::new());
+        let admission = ReqwestConnectionAdmission::new(limiter, 8);
+
+        admission.publish_lane(1, "backend", 8080, 8080, 1);
+        admission.advance_config_epoch(2);
+
+        // Generation 2 removed the cap. No generation-2 lane is published;
+        // an old in-flight generation-1 request remains unable to revive it.
+        admission.publish_lane(1, "backend", 8080, 8080, 1);
+
+        assert_eq!(admission.lane_for("backend", 8080), None);
     }
 
     #[test]

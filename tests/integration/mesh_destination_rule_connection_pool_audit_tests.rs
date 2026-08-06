@@ -240,7 +240,7 @@ async fn sequential_requests_never_exceed_the_cap_while_a_socket_sits_idle() {
     let (backend, accepted, _backend_task) = start_counting_h1_backend(Duration::ZERO).await;
     let (pool, limiter, admission) = admitted_reqwest_pool();
     let proxy = capped_proxy(backend.port(), 1);
-    admission.publish_lane("127.0.0.1", backend.port(), backend.port(), 1);
+    admission.publish_lane(1, "127.0.0.1", backend.port(), backend.port(), 1);
 
     let client = pool.get_client(&proxy).await.expect("reqwest client");
     let url = format!("http://{}:{}/audit", backend.ip(), backend.port());
@@ -273,7 +273,7 @@ async fn cap_exhaustion_refuses_the_second_physical_dial() {
         start_counting_h1_backend(Duration::from_millis(300)).await;
     let (pool, limiter, admission) = admitted_reqwest_pool();
     let proxy = capped_proxy(backend.port(), 1);
-    admission.publish_lane("127.0.0.1", backend.port(), backend.port(), 1);
+    admission.publish_lane(1, "127.0.0.1", backend.port(), backend.port(), 1);
 
     let client = pool.get_client(&proxy).await.expect("reqwest client");
     let url = format!("http://{}:{}/slow", backend.ip(), backend.port());
@@ -323,7 +323,7 @@ async fn distinct_reqwest_pool_keys_share_one_destination_ceiling() {
     let (backend, accepted, _backend_task) =
         start_counting_h1_backend(Duration::from_millis(300)).await;
     let (pool, _limiter, admission) = admitted_reqwest_pool();
-    admission.publish_lane("127.0.0.1", backend.port(), backend.port(), 1);
+    admission.publish_lane(1, "127.0.0.1", backend.port(), backend.port(), 1);
 
     let first_proxy = capped_proxy(backend.port(), 1);
     let mut second_proxy = capped_proxy(backend.port(), 1);
@@ -387,7 +387,7 @@ async fn h2_streams_multiplex_without_consuming_extra_slots() {
     });
 
     let (_pool, limiter, admission) = admitted_reqwest_pool();
-    admission.publish_lane("127.0.0.1", addr.port(), addr.port(), 1);
+    admission.publish_lane(1, "127.0.0.1", addr.port(), addr.port(), 1);
     let client = reqwest::Client::builder()
         .http2_prior_knowledge()
         .connection_admission(Arc::clone(&admission) as Arc<dyn reqwest::ConnectionAdmission>)
@@ -430,11 +430,11 @@ async fn a_removed_cap_stops_applying_after_a_config_publication() {
         start_counting_h1_backend(Duration::from_millis(300)).await;
     let (pool, _limiter, admission) = admitted_reqwest_pool();
     let proxy = capped_proxy(backend.port(), 1);
-    admission.publish_lane("127.0.0.1", backend.port(), backend.port(), 1);
+    admission.publish_lane(1, "127.0.0.1", backend.port(), backend.port(), 1);
 
     // Operator removes the cap; the config publish chokepoint invalidates every
     // published lane and nothing re-publishes this one.
-    admission.bump_config_epoch();
+    admission.advance_config_epoch(2);
 
     let client = pool.get_client(&proxy).await.expect("reqwest client");
     let url = format!("http://{}:{}/slow", backend.ip(), backend.port());
@@ -463,7 +463,7 @@ async fn target_port_remap_counts_on_the_policy_port() {
     let proxy = capped_proxy(backend.port(), 2);
 
     // Service port 8080 remapped onto the workload/dial port.
-    admission.publish_lane("127.0.0.1", backend.port(), 8080, 2);
+    admission.publish_lane(1, "127.0.0.1", backend.port(), 8080, 2);
 
     let client = pool.get_client(&proxy).await.expect("reqwest client");
     let url = format!("http://{}:{}/audit", backend.ip(), backend.port());

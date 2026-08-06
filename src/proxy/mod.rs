@@ -9698,7 +9698,8 @@ impl ProxyState {
         // published lazily by the dispatch path, so invalidate them all here;
         // a cap that still exists is re-published by the next dispatch, before
         // the dial it causes. See `ReqwestConnectionAdmission`.
-        self.reqwest_conn_admission.bump_config_epoch();
+        self.reqwest_conn_admission
+            .advance_config_epoch(published.config_generation);
         self.plugin_cache
             .store_inner(Arc::clone(&published.plugin_cache));
         self.consumer_index
@@ -23989,6 +23990,7 @@ async fn handle_proxy_request_inner(
 
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
+    ctx.config_generation = epoch.config_generation;
 
     // Direct Pod-IP HTTP mesh egress is selected by captured original
     // destination before Host routing. The client-controlled Host header cannot
@@ -33464,6 +33466,7 @@ pub(crate) async fn proxy_to_backend_retry(
     // repeat, and a retry that reuses an idle socket takes no slot at all.
     if let Some(cap) = resolve_backend_max_connections(proxy, retry_policy_port) {
         state.reqwest_conn_admission.publish_lane(
+            request_ctx.config_generation,
             effective_host,
             retry_dial_port,
             retry_policy_port,
@@ -35857,6 +35860,7 @@ async fn proxy_to_backend(
     // lane epoch and nothing re-publishes it.
     if let Some(cap) = resolve_backend_max_connections(proxy, pending_policy_port) {
         state.reqwest_conn_admission.publish_lane(
+            request_ctx.config_generation,
             effective_host,
             pending_dial_port,
             pending_policy_port,

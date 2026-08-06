@@ -1792,6 +1792,7 @@ async fn handle_h3_request(
 
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
+    ctx.config_generation = epoch.config_generation;
 
     // Route: host + longest prefix match via router cache
     let route_match = state.router_cache.find_proxy_in_snapshot(
