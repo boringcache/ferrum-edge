@@ -1129,11 +1129,6 @@ async fn build_env(
     // Tests don't need the 5s warmup stall; pool warmup failures are
     // non-fatal but noisy in test logs.
     env.insert("FERRUM_POOL_WARMUP_ENABLED".into(), "false".into());
-    // Keep the proxy bind exclusive so issue #3428's admin-identity ⇒ proxy
-    // ownership proof cannot be broken by SO_REUSEPORT sharing under the
-    // production auto accept-thread default. Callers that intentionally test
-    // multi-accept can still `.env("FERRUM_ACCEPT_THREADS", N)`.
-    env.insert("FERRUM_ACCEPT_THREADS".into(), "1".into());
     if coverage_profiles_enabled() {
         env.insert("FERRUM_SHUTDOWN_DRAIN_SECONDS".into(), "0".into());
     }
