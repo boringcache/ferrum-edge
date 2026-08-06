@@ -511,10 +511,16 @@ async fn read_h3_trailers_with_timeout(
     }
 }
 
-async fn recv_h3_response_with_timeout(
-    stream: &mut H3RequestStream,
+/// Generic over the receive half so it serves both the whole bidirectional
+/// request stream (the drain-then-read streaming paths) and the `split()` recv
+/// half used by the full-duplex native-H3 gRPC bridge.
+async fn recv_h3_response_with_timeout<S>(
+    stream: &mut h3::client::RequestStream<S, bytes::Bytes>,
     backend_read_timeout_ms: u64,
-) -> H3PoolResult<http::Response<()>> {
+) -> H3PoolResult<http::Response<()>>
+where
+    S: h3::quic::RecvStream,
+{
     let recv = stream.recv_response();
     let result = if backend_read_timeout_ms > 0 {
         match tokio::time::timeout(Duration::from_millis(backend_read_timeout_ms), recv).await {
@@ -1000,6 +1006,88 @@ pub struct H3StreamingResponse {
     pub status: u16,
     pub headers: HashMap<String, String>,
     pub recv_stream: H3RequestStream,
+}
+
+/// Send half of a `split()` native-H3 backend request stream.
+pub type H3BackendSendStream =
+    h3::client::RequestStream<h3_quinn::SendStream<bytes::Bytes>, bytes::Bytes>;
+
+/// Receive half of a `split()` native-H3 backend request stream.
+pub type H3BackendRecvStream = h3::client::RequestStream<h3_quinn::RecvStream, bytes::Bytes>;
+
+/// A native-H3 backend request stream whose HEADERS are on the wire but whose
+/// request body has NOT been written yet, already split into independently
+/// drivable halves.
+///
+/// This is the transport primitive for full-duplex gRPC over a native H3
+/// backend: one task owns [`Self::send`] and forwards client request DATA /
+/// trailers while another owns [`Self::recv`] and relays the backend response —
+/// so the backend may answer before the client half-closes. The
+/// drain-then-read `request_streaming_body` family cannot express that, because
+/// it FINishes the backend send side before it reads response headers.
+///
+/// Opening is PRE-WIRE up to and including `send_request`; no frontend body
+/// byte is consumed here, so a cached-connection failure is always safe to
+/// retry on a fresh connection.
+pub struct H3BidiBackendStream {
+    pub send: H3BackendSendStream,
+    pub recv: H3BackendRecvStream,
+}
+
+/// Response prelude read off the receive half of an [`H3BidiBackendStream`].
+pub struct H3BackendResponseHead {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+}
+
+/// Build the backend request head for a native-H3 streaming dispatch,
+/// preserving the single legal `te: trailers` value.
+///
+/// `te` is hop-by-hop (RFC 9110 §7.6.1) and is stripped from every other
+/// backend request, but HTTP/3 permits exactly the value `trailers`
+/// (RFC 9114 §4.2) and strict gRPC backends require it. The gRPC dispatch paths
+/// author that header themselves AFTER `build_h3_backend_headers` has removed
+/// any client-supplied `te`, so the value forwarded here is always the
+/// gateway's own. Shared by the drain-then-read streaming path and the
+/// full-duplex opener so the two cannot drift.
+fn build_h3_backend_request_preserving_te(
+    method: http::Method,
+    path_and_query: &str,
+    headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+) -> H3PoolResult<Request<()>> {
+    let mut req_builder = Request::builder().method(method).uri(path_and_query);
+    for (name, value) in headers {
+        match name.as_str() {
+            "te" if value.as_bytes().eq_ignore_ascii_case(b"trailers") => {
+                req_builder = req_builder.header(name, value);
+            }
+            // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
+            n if is_backend_request_strip_header(n) => continue,
+            _ => {
+                req_builder = req_builder.header(name, value);
+            }
+        }
+    }
+    req_builder.body(()).map_err(H3PoolError::pre_wire)
+}
+
+/// Await the backend response HEADERS on the receive half of a split
+/// native-H3 stream.
+///
+/// Deliberately UNBOUNDED: the full-duplex caller owns one absolute deadline
+/// (the client `grpc-timeout`, else `backend_read_timeout_ms`) covering connect
+/// + header wait, and races this future against it so a single expiry can be
+/// attributed to the correct phase. Errors keep the pool's classification
+/// (`recv_response_err`), including the graceful-remote-close signal that must
+/// not be read as an H3 capability failure.
+pub async fn recv_h3_backend_response_head(
+    recv: &mut H3BackendRecvStream,
+) -> H3PoolResult<H3BackendResponseHead> {
+    let response = recv.recv_response().await.map_err(recv_response_err)?;
+    Ok(H3BackendResponseHead {
+        status: response.status().as_u16(),
+        headers: collect_h3_response_headers(response.headers()),
+    })
 }
 
 /// HTTP/3 connection pool for proxying requests to HTTP/3 backends.
@@ -2197,27 +2285,7 @@ impl Http3ConnectionPool {
             H3PoolError::pre_wire(anyhow::anyhow!("Invalid HTTP method: {}", method))
         })?;
 
-        let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
-        for (name, value) in headers {
-            match name.as_str() {
-                // `te: trailers` is the single hop-by-hop exception that MUST reach
-                // the backend: HTTP/3 permits only that one value (RFC 9114 §4.2) and
-                // strict gRPC backends require it. The native-H3 gRPC dispatch authors
-                // this header explicitly (after `build_h3_backend_headers` has already
-                // stripped any client-supplied `te`), so forward `te: trailers` as-is
-                // instead of dropping it with the generic hop-by-hop strip below.
-                "te" if value.as_bytes().eq_ignore_ascii_case(b"trailers") => {
-                    req_builder = req_builder.header(name, value);
-                }
-                // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
-                n if is_backend_request_strip_header(n) => continue,
-                _ => {
-                    req_builder = req_builder.header(name, value);
-                }
-            }
-        }
-
-        let req = req_builder.body(()).map_err(H3PoolError::pre_wire)?;
+        let req = build_h3_backend_request_preserving_te(req_method, path_and_query, headers)?;
         let mut backend_stream = send_request
             .send_request(req)
             .await
@@ -2321,6 +2389,149 @@ impl Http3ConnectionPool {
             headers: response_headers,
             recv_stream: backend_stream,
         })
+    }
+
+    /// Open a native-H3 backend request stream for FULL-DUPLEX use: send the
+    /// request HEADERS, then hand back independently drivable send/recv halves
+    /// without writing (or even polling) any request body.
+    ///
+    /// Everything this does is pre-wire up to `send_request`; the caller has not
+    /// yet consumed a single frontend body byte when it fails, so a cached
+    /// connection can always be replaced. Once it returns `Ok`, the request
+    /// HEADERS are committed to the backend and nothing may be replayed.
+    async fn do_open_bidi_backend_stream(
+        send_request: &mut H3SendRequest,
+        proxy: &Proxy,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+    ) -> H3PoolResult<H3BidiBackendStream> {
+        let uri: http::Uri = backend_url
+            .parse()
+            .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
+
+        let _host = uri.host().unwrap_or(&proxy.backend_host);
+        let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+
+        let req_method: http::Method = method.parse().map_err(|_| {
+            H3PoolError::pre_wire(anyhow::anyhow!("Invalid HTTP method: {}", method))
+        })?;
+
+        let req = build_h3_backend_request_preserving_te(req_method, path_and_query, headers)?;
+        let stream = send_request
+            .send_request(req)
+            .await
+            .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
+        let (send, recv) = stream.split();
+        Ok(H3BidiBackendStream { send, recv })
+    }
+
+    /// Pooled entry point for [`Self::do_open_bidi_backend_stream`].
+    pub async fn open_bidi_backend_stream(
+        &self,
+        proxy: &Proxy,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
+    ) -> H3PoolResult<H3BidiBackendStream> {
+        let conns_per_backend = proxy
+            .pool_http3_connections_per_backend
+            .unwrap_or(self.connections_per_backend)
+            .max(1);
+        let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
+        let key = self.pool_key_with_current_generation(proxy, start);
+
+        if let Some(pooled) = self.pool.cached(&key) {
+            let mut sr = pooled.send_request;
+            match Self::do_open_bidi_backend_stream(&mut sr, proxy, method, backend_url, headers)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    debug!("HTTP/3 bidi open: cached connection failed, evicting: {}", e);
+                    self.pool.invalidate(&key);
+                    // Opening is pre-wire by construction, so the gate below can
+                    // only reject a mislabeled error. Keep it anyway: a request
+                    // that somehow reached the wire must never be reopened on a
+                    // second connection.
+                    if !should_reconnect_streaming_body_after_cached_failure(&e) {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
+        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
+        let pooled = self
+            .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
+            .await
+            .map_err(H3PoolError::pre_wire)?;
+        let mut sr_for_request = pooled.send_request;
+        Self::do_open_bidi_backend_stream(&mut sr_for_request, proxy, method, backend_url, headers)
+            .await
+    }
+
+    /// [`Self::open_bidi_backend_stream`] against an explicit LB-selected target.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_bidi_backend_stream_with_target(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        target_port: u16,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
+    ) -> H3PoolResult<H3BidiBackendStream> {
+        let conns_per_backend = proxy
+            .pool_http3_connections_per_backend
+            .unwrap_or(self.connections_per_backend)
+            .max(1);
+        let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
+        let key = self.pool_key_for_target_with_current_generation(
+            proxy,
+            target_host,
+            target_port,
+            start,
+        );
+
+        if let Some(pooled) = self.pool.cached(&key) {
+            let mut sr = pooled.send_request;
+            match Self::do_open_bidi_backend_stream(&mut sr, proxy, method, backend_url, headers)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    debug!(
+                        "HTTP/3 bidi open: cached connection to {}:{} failed, evicting: {}",
+                        target_host, target_port, e
+                    );
+                    self.pool.invalidate(&key);
+                    if !should_reconnect_streaming_body_after_cached_failure(&e) {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
+        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
+        let pooled = self
+            .create_or_get_target_sender(
+                key,
+                proxy,
+                target_host,
+                target_port,
+                tls_config,
+                h3_config,
+            )
+            .await
+            .map_err(H3PoolError::pre_wire)?;
+        let mut sr_for_request = pooled.send_request;
+        Self::do_open_bidi_backend_stream(&mut sr_for_request, proxy, method, backend_url, headers)
+            .await
     }
 
     /// Execute an HTTP/3 request, streaming the request body from a hyper

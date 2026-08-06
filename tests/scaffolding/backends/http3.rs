@@ -38,7 +38,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use quinn::Endpoint;
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, private_key};
@@ -80,6 +80,13 @@ pub enum H3Step {
     /// stream. This is the HTTP/3 equivalent of a header-borne gRPC
     /// Trailers-Only response and mirrors `H2Step::RespondHeadersEndStream`.
     RespondHeadersEndStream(Vec<(&'static str, String)>),
+    /// Read ONE request DATA chunk from the current stream and append it to
+    /// this connection's recorded request body, WITHOUT waiting for request
+    /// EOF. Used by bidirectional-streaming tests: a following `RespondHeaders`
+    /// then provably answers a request message the client sent while its
+    /// request stream is still open. Fails the script if the client half-closes
+    /// (or resets) before sending any DATA.
+    ReadRequestData,
     /// Send a chunk of response body.
     RespondData(Bytes),
     /// Send an H3 trailers (HEADERS) frame with the given `(name, value)`
@@ -379,6 +386,10 @@ pub struct H3RecordedRequest {
     pub path: String,
     pub authority: Option<String>,
     pub headers: Vec<(String, String)>,
+    /// Request DATA the script explicitly read via [`H3Step::ReadRequestData`].
+    /// Empty unless the script asked for it — the scripted backend otherwise
+    /// never consumes the request body.
+    pub body: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -594,6 +605,26 @@ async fn run_h3_script(
                     }
                 }
             }
+            H3Step::ReadRequestData => {
+                let stream = response_stream
+                    .as_mut()
+                    .ok_or_else(|| "ReadRequestData without an accepted stream".to_string())?;
+                let chunk = stream
+                    .recv_data()
+                    .await
+                    .map_err(|e| format!("recv_data: {e}"))?
+                    .ok_or_else(|| {
+                        "ReadRequestData: request stream ended before any DATA arrived".to_string()
+                    })?;
+                let mut chunk = chunk;
+                let mut bytes = Vec::with_capacity(chunk.remaining());
+                while chunk.has_remaining() {
+                    let take = chunk.chunk().to_vec();
+                    bytes.extend_from_slice(&take);
+                    chunk.advance(take.len());
+                }
+                record_request_body(&state, &bytes).await;
+            }
             H3Step::RespondData(bytes) => {
                 let stream = response_stream
                     .as_mut()
@@ -735,8 +766,16 @@ async fn record_request(state: &Arc<H3BackendState>, req: &http::Request<()>) {
         path: req.uri().path().to_string(),
         authority: req.uri().authority().map(|a| a.to_string()),
         headers,
+        body: Vec::new(),
     };
     state.requests.lock().await.push(recorded);
+}
+
+/// Append one request DATA chunk to the most recently recorded request.
+async fn record_request_body(state: &Arc<H3BackendState>, chunk: &[u8]) {
+    if let Some(last) = state.requests.lock().await.last_mut() {
+        last.body.extend_from_slice(chunk);
+    }
 }
 
 #[cfg(test)]

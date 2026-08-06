@@ -5175,6 +5175,100 @@ pub mod _test_support {
         crate::proxy::strip_content_length_for_streaming_grpc_deadline(response_headers, deadline);
     }
 
+    /// Terminal request-upload faults the full-duplex native-H3 gRPC relay can
+    /// observe (issue #3283). Mirrors `http3::server::H3GrpcUploadFault` so unit
+    /// tests can pin the signalling / RPC-termination contract without widening
+    /// the runtime API.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum H3GrpcUploadFaultKind {
+        ClientAbort,
+        MalformedTrailers,
+        Oversize,
+        BackendUploadHalted,
+    }
+
+    fn h3_grpc_upload_fault_for_test(
+        kind: H3GrpcUploadFaultKind,
+    ) -> crate::http3::server::H3GrpcUploadFault {
+        match kind {
+            H3GrpcUploadFaultKind::ClientAbort => {
+                crate::http3::server::H3GrpcUploadFault::ClientAbort
+            }
+            H3GrpcUploadFaultKind::MalformedTrailers => {
+                crate::http3::server::H3GrpcUploadFault::MalformedTrailers
+            }
+            H3GrpcUploadFaultKind::Oversize => crate::http3::server::H3GrpcUploadFault::Oversize,
+            H3GrpcUploadFaultKind::BackendUploadHalted => {
+                crate::http3::server::H3GrpcUploadFault::BackendUploadHalted
+            }
+        }
+    }
+
+    /// Client-visible `(grpc-status, grpc-message)` for a terminating native-H3
+    /// gRPC request-upload fault.
+    pub fn h3_grpc_upload_fault_signal_for_test(
+        kind: H3GrpcUploadFaultKind,
+    ) -> (u32, &'static str) {
+        h3_grpc_upload_fault_for_test(kind).grpc_signal()
+    }
+
+    /// Whether observing this upload fault must END the RPC. A backend that
+    /// stops accepting request DATA after it has everything it needs must NOT.
+    pub fn h3_grpc_upload_fault_terminates_rpc_for_test(kind: H3GrpcUploadFaultKind) -> bool {
+        h3_grpc_upload_fault_for_test(kind).terminates_rpc()
+    }
+
+    /// Return true when publishing `kind` on the shared upload state wakes the
+    /// response relay's terminating-fault wait, and false when the wait stays
+    /// parked (a non-terminating fault). Times out rather than hanging.
+    pub async fn h3_grpc_upload_fault_wakes_relay_for_test(
+        kind: H3GrpcUploadFaultKind,
+        publish_before_wait: bool,
+    ) -> bool {
+        let state = std::sync::Arc::new(crate::http3::server::H3GrpcUploadState::new());
+        let fault = h3_grpc_upload_fault_for_test(kind);
+        if publish_before_wait {
+            state.publish_fault(fault);
+        } else {
+            let publisher = std::sync::Arc::clone(&state);
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                publisher.publish_fault(fault);
+            });
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            crate::http3::server::h3_grpc_terminating_upload_fault(&state),
+        )
+        .await
+        .is_ok()
+    }
+
+    /// The first fault latches: a later one never rewrites the RPC's outcome.
+    pub fn h3_grpc_upload_fault_latches_first_for_test(
+        first: H3GrpcUploadFaultKind,
+        second: H3GrpcUploadFaultKind,
+    ) -> H3GrpcUploadFaultKind {
+        let state = crate::http3::server::H3GrpcUploadState::new();
+        state.publish_fault(h3_grpc_upload_fault_for_test(first));
+        state.publish_fault(h3_grpc_upload_fault_for_test(second));
+        match state.fault() {
+            Some(crate::http3::server::H3GrpcUploadFault::ClientAbort) => {
+                H3GrpcUploadFaultKind::ClientAbort
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::MalformedTrailers) => {
+                H3GrpcUploadFaultKind::MalformedTrailers
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::Oversize) => {
+                H3GrpcUploadFaultKind::Oversize
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::BackendUploadHalted) => {
+                H3GrpcUploadFaultKind::BackendUploadHalted
+            }
+            None => unreachable!("a published fault must latch"),
+        }
+    }
+
     /// Return true when an indefinitely stalled downstream H3 write is
     /// cancelled by the supplied absolute deadline.
     pub async fn stalled_h3_response_write_expires_for_test(
