@@ -172,6 +172,19 @@ pub(super) fn translate(
             }
             Ok(true)
         }
+        // UDPRoute shares the L4 materialization path with TCPRoute/TLSRoute:
+        // the route carries no request-level predicate, so the Gateway listener
+        // port is the entire match and the backendRef is the datagram peer.
+        // The stream scheme is what makes the materialized proxy a UDP
+        // listener/relay rather than a TCP one; datagram semantics (no
+        // connection state, per-session idle expiry, amplification limits) are
+        // preserved by the existing UDP data path.
+        "UDPRoute" => {
+            for proxy in l4_route_proxies(object, acc, BackendScheme::Udp)? {
+                acc.upsert_proxy(proxy, SourceKind::GatewayApi);
+            }
+            Ok(true)
+        }
         "ReferenceGrant" => Ok(true),
         _ => Ok(false),
     }
@@ -4490,6 +4503,7 @@ fn l4_route_proxies(
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
     ensure_route_parent_refs_allowed(object, acc)?;
     ensure_l4_parent_refs_are_same_namespace(object)?;
+    let hosts = l4_route_hosts(object, scheme)?;
     let materialized_parent_refs = route_materialized_parent_ref_keys_for_namespace(
         object,
         acc,
@@ -4513,18 +4527,16 @@ fn l4_route_proxies(
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
         let backend_namespace =
             checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
-        let raw_backend_port =
-            backend_ref
-                .get("port")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    invalid_resource(object, "TCPRoute/TLSRoute backendRefs[].port is required")
-                })?;
-        let backend_port = port_from_u64(
-            object,
-            raw_backend_port,
-            "TCPRoute/TLSRoute backendRefs[].port",
-        )?;
+        // Field-specific diagnostics name the route's own kind: an operator
+        // reading a UDPRoute condition must not be told about TCPRoute/TLSRoute.
+        let backend_port_field = format!("{} backendRefs[].port", object.kind);
+        let Some(raw_backend_port) = backend_ref.get("port").and_then(Value::as_u64) else {
+            return Err(invalid_resource(
+                object,
+                format!("{backend_port_field} is required"),
+            ));
+        };
+        let backend_port = port_from_u64(object, raw_backend_port, &backend_port_field)?;
 
         let listen_ports = if materialized_listener_ports.is_empty() {
             vec![backend_port]
@@ -4545,7 +4557,7 @@ fn l4_route_proxies(
                     &suffix,
                 ),
                 namespace: object.metadata.namespace.clone(),
-                hosts: string_array(&object.spec, "hostnames"),
+                hosts: hosts.clone(),
                 listen_path: None,
                 strip_listen_path: false,
                 preserve_host_header: false,
@@ -4571,6 +4583,31 @@ fn l4_route_proxies(
     Ok(proxies)
 }
 
+/// Route-level hostnames an L4 route may carry.
+///
+/// `TLSRoute.spec.hostnames` selects by SNI, so it materializes onto the
+/// stream proxy. Gateway API defines **no** `hostnames` field on `UDPRoute`:
+/// a datagram carries no name to match on, so a hostname would be silently
+/// inert on the data path. Reject it fail closed with a field-specific
+/// diagnostic rather than accepting a selector Ferrum can never honor.
+/// `TCPRoute` keeps its historical behavior untouched.
+fn l4_route_hosts(
+    object: &K8sObject,
+    scheme: BackendScheme,
+) -> Result<Vec<String>, K8sTranslateError> {
+    let hosts = string_array(&object.spec, "hostnames");
+    if scheme.is_udp() && !hosts.is_empty() {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} spec.hostnames is not a Gateway API UDPRoute field and cannot be matched on a datagram listener",
+                object.kind
+            ),
+        ));
+    }
+    Ok(hosts)
+}
+
 fn ensure_l4_parent_refs_are_same_namespace(object: &K8sObject) -> Result<(), K8sTranslateError> {
     let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
         return Ok(());
@@ -4584,7 +4621,10 @@ fn ensure_l4_parent_refs_are_same_namespace(object: &K8sObject) -> Result<(), K8
             if parent_namespace != object.metadata.namespace {
                 return Err(invalid_resource(
                     object,
-                    "TCPRoute/TLSRoute cross-namespace parentRefs are not supported by Ferrum yet",
+                    format!(
+                        "{} cross-namespace parentRefs are not supported by Ferrum yet",
+                        object.kind
+                    ),
                 ));
             }
         }
@@ -4720,6 +4760,7 @@ fn listener_route_kinds_for_protocol(protocol: Option<&str>) -> Vec<&'static str
         "GRPC" | "GRPCS" => vec!["GRPCRoute"],
         "TCP" => vec!["TCPRoute"],
         "TLS" => vec!["TLSRoute"],
+        "UDP" => vec!["UDPRoute"],
         _ => Vec::new(),
     }
 }
@@ -10291,10 +10332,7 @@ mod tests {
         )
         .expect_err("invalid L4 backend port must fail closed");
 
-        assert!(
-            err.to_string()
-                .contains("TCPRoute/TLSRoute backendRefs[].port")
-        );
+        assert!(err.to_string().contains("TCPRoute backendRefs[].port"));
         assert!(err.to_string().contains("70000"));
     }
 

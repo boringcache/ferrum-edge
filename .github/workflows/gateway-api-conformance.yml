@@ -216,6 +216,14 @@ jobs:
           GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
         run: bash scripts/gateway_api_tcproute_conformance.sh blackbox
 
+      - name: Run Ferrum Gateway API UDPRoute black-box checks
+        # Ferrum-specific datagram echo/status/update/delete coverage; this does
+        # not claim an upstream GATEWAY-UDP profile on the pinned Gateway API
+        # version.
+        env:
+          GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
+        run: bash scripts/gateway_api_udproute_conformance.sh blackbox
+
       - name: Collect diagnostics
         if: always()
         env:
@@ -227,6 +235,10 @@ jobs:
       - name: Collect TCPRoute diagnostics
         if: always()
         run: bash scripts/gateway_api_tcproute_conformance.sh diagnostics
+
+      - name: Collect UDPRoute diagnostics
+        if: always()
+        run: bash scripts/gateway_api_udproute_conformance.sh diagnostics
 
       - name: Upload conformance artifacts
         if: always()

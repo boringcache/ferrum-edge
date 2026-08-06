@@ -438,6 +438,23 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 - **Response amplification guard**: When `udp_max_response_amplification_factor` is set, each backend datagram is limited to the latest client request payload size multiplied by the factor. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance.
 - **Reply-source selection (`FERRUM_UDP_PKTINFO_ENABLED=auto`, Linux)**: On wildcard / multi-homed binds, `IP_PKTINFO` / `IPV6_PKTINFO` captures the per-datagram local destination address (and interface index) on recv and reuses it as the reply source on send. This saves one kernel routing lookup per `sendmsg` flush (combined with `UDP_SEGMENT`/GSO in a single cmsg buffer) and ensures replies exit the same interface the client targeted — important for NAT-sensitive middleboxes, anycast, and scoped IPv6 (link-local `fe80::/10`, where the ifindex is required to disambiguate the source zone). The captured address is stored per-session via `OnceLock` on the first datagram that exposes pktinfo; subsequent datagrams reuse it lock-free. When pktinfo is active, the recv loop uses `readable() + recvmmsg` instead of `recv_from`, so the first datagram of each wakeup also surfaces cmsg — one-shot UDP flows (e.g. DNS) get the correct reply source even when the drain loop never fires.
 
+## Kubernetes Gateway API (`TCPRoute` / `UDPRoute`)
+
+Stream proxies can also be produced by the Kubernetes controller instead of
+being written by hand. A Gateway API `TCPRoute` attached to a `protocol: TCP`
+listener and a `UDPRoute` attached to a `protocol: UDP` listener each
+materialize one stream proxy per rule on the Gateway listener port, with the
+rule's `backendRefs` entry as the backend (`<service>.<namespace>.svc.<cluster
+domain>:<port>`). Everything on this page — session management, idle timeout,
+the amplification guard, stream plugins, metrics — applies unchanged to those
+generated proxies; the route only decides the listen port and backend.
+
+Route admission is strict and fail closed (required numeric `backendRefs[].port`,
+core `Service` backends only, `ReferenceGrant` for cross-namespace backends, no
+cross-namespace `parentRefs`). See
+[gateway_api_conformance.md](gateway_api_conformance.md) for the full field
+table and the live black-box coverage.
+
 ## Compatible Plugins
 
 Each plugin declares which protocols it supports via `supported_protocols()`. Only plugins that declare `Tcp` or `Udp` support are invoked for stream connections — the gateway automatically skips HTTP-specific plugins (auth, CORS, body transformer, request/response transformer, etc.).

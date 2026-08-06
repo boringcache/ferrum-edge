@@ -16,8 +16,10 @@ controlPlane:
   rbac:
     create: true
     # Grants get/list/watch (+ status patch) for GatewayClass/Gateway/HTTPRoute/
-    # GRPCRoute/TCPRoute/TLSRoute/ReferenceGrant. TCPRoute live data-plane
-    # conformance is gated by scripts/gateway_api_tcproute_conformance.sh.
+    # GRPCRoute/TCPRoute/TLSRoute/UDPRoute/ReferenceGrant. TCPRoute and UDPRoute
+    # live data-plane conformance are gated by
+    # scripts/gateway_api_tcproute_conformance.sh and
+    # scripts/gateway_api_udproute_conformance.sh.
     gatewayApi: true
     istio: true
     meshConfig: true

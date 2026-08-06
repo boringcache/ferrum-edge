@@ -277,11 +277,14 @@ streamPorts:
     service: true
 ```
 
-Gateway API `TCPRoute` listeners materialize Ferrum stream proxies on the
-Gateway listener port itself. Chart installs that terminate north-south TCP
-must publish matching `streamPorts` (with `service: true` when the Service
-should expose them). The Gateway API conformance lab exercises this path with
-dedicated NodePorts; see [`docs/gateway_api_conformance.md`](../../docs/gateway_api_conformance.md).
+Gateway API `TCPRoute` and `UDPRoute` listeners materialize Ferrum stream
+proxies on the Gateway listener port itself — a `UDPRoute` on a `protocol: UDP`
+listener becomes a UDP datagram relay, a `TCPRoute` on a `protocol: TCP`
+listener a TCP stream relay. Chart installs that terminate north-south TCP or
+UDP must publish matching `streamPorts` with the matching `protocol` (and
+`service: true` when the Service should expose them). The Gateway API
+conformance lab exercises both paths with dedicated NodePorts; see
+[`docs/gateway_api_conformance.md`](../../docs/gateway_api_conformance.md).
 
 ## TLS material
 

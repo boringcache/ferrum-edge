@@ -210,7 +210,10 @@ async fn patch_route_status_with_retry(
 }
 
 fn route_status_kind(kind: &str) -> bool {
-    matches!(kind, "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute")
+    matches!(
+        kind,
+        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" | "UDPRoute"
+    )
 }
 
 fn kube_error_is_conflict(error: &kube::Error) -> bool {
@@ -456,7 +459,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
                 "ReferenceGrant" => {
                     reference_grant_permissions.ingest(object);
                 }
-                "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => {
+                "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" | "UDPRoute" => {
                     let mut seen_parents = HashSet::new();
                     for parent_ref in route_parent_refs_borrowed(object) {
                         let Some((namespace, name)) = parent_ref_gateway_target(object, parent_ref)
@@ -692,7 +695,7 @@ fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_
             ctx.translation_result,
             ctx.status_context,
         ),
-        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => route_status(
+        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" | "UDPRoute" => route_status(
             object,
             ctx.indexes,
             ctx.translation_result,
@@ -1291,6 +1294,7 @@ fn listener_protocol_route_kinds(protocol: &str) -> Vec<&'static str> {
         "GRPC" | "GRPCS" => vec!["GRPCRoute"],
         "TCP" => vec!["TCPRoute"],
         "TLS" => vec!["TLSRoute"],
+        "UDP" => vec!["UDPRoute"],
         _ => Vec::new(),
     }
 }
@@ -2195,7 +2199,7 @@ fn status_candidate_is_eligible(object: &K8sObject, indexes: &GatewayApiStatusIn
             object.metadata.namespace.as_str(),
             object.metadata.name.as_str(),
         )),
-        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => {
+        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" | "UDPRoute" => {
             // Borrowed predicate only — do not deep-clone parentRefs before the
             // fair work budget selects the expensive status window (#2397).
             route_has_managed_parent_ref_indexed(object, indexes)
@@ -2656,7 +2660,13 @@ fn error_is_parent_ref_no_matching(error: &K8sTranslateError) -> bool {
 fn is_status_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "GatewayClass" | "Gateway" | "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
+        "GatewayClass"
+            | "Gateway"
+            | "HTTPRoute"
+            | "GRPCRoute"
+            | "TCPRoute"
+            | "TLSRoute"
+            | "UDPRoute"
     )
 }
 
@@ -2669,6 +2679,7 @@ fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResourc
         ("GRPCRoute", "v1") => "grpcroutes",
         ("TCPRoute", "v1alpha2") => "tcproutes",
         ("TLSRoute", "v1alpha2") => "tlsroutes",
+        ("UDPRoute", "v1alpha2") => "udproutes",
         _ => return None,
     };
 

@@ -16,6 +16,7 @@ rules:
       - grpcroutes
       - tlsroutes
       - tcproutes
+      - udproutes
       - referencegrants
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
@@ -36,6 +37,7 @@ rules:
       - grpcroutes/status
       - tlsroutes/status
       - tcproutes/status
+      - udproutes/status
     # The status writer reads live status before merge-patching so it can
     # preserve non-Ferrum conditions. Newer kube-rs SSA paths may fall
     # back to `update status` after a 409 conflict, and the Gateway API
