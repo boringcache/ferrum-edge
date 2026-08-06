@@ -719,6 +719,10 @@ impl SessionState {
     /// already returned by the cancel), and a retention/encoding refusal
     /// completes it anyway so the caller's inline answer is the identity's one
     /// terminal outcome and its capacity is returned exactly once.
+    // Kept as the direct-publication primitive for library consumers and the
+    // external broker contract suite. The ferrum-edge binary's private module
+    // copy uses the later two-phase reservation path exclusively.
+    #[allow(dead_code)]
     fn publish_terminal(
         &self,
         identity: &StreamIdentity,
@@ -1410,6 +1414,9 @@ impl AggregateSseStream {
     /// `EventFramingInvalid` mean the caller must answer this POST inline.
     /// Either way the identity is terminal afterwards and its capacity has been
     /// returned exactly once.
+    // Public library primitive exercised by the external broker contract suite;
+    // the ferrum-edge binary itself publishes governed responses in two phases.
+    #[allow(dead_code)]
     pub fn publish_encoded(&self, encoded: &[u8]) -> Result<u64, AggregateSseError> {
         if self.0.settled.swap(true, Ordering::AcqRel) {
             // A second terminal attempt on one lease is a duplicate response,

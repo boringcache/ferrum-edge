@@ -10254,7 +10254,7 @@ async fn aggregate_sse_multiplexes_a_synthetic_list_and_a_routed_call_on_one_lis
         mcp_sse_stream_is_open_for_test(&list_ctx),
         "the lease must stay open for the final client-visible phase"
     );
-    assert!(list_ctx.metadata.get("mcp.sse.delivery").is_none());
+    assert!(!list_ctx.metadata.contains_key("mcp.sse.delivery"));
 
     let listed = final_body_and_commit(
         &plugin,
@@ -10352,7 +10352,7 @@ async fn aggregate_sse_gateway_authored_error_is_staged_not_published_by_before_
         "the stream lease must remain open for the final lifecycle"
     );
     assert!(
-        ctx.metadata.get("mcp.sse.delivery").is_none(),
+        !ctx.metadata.contains_key("mcp.sse.delivery"),
         "no delivery outcome may be recorded before the final phase"
     );
     // Nothing reached the listener: the greeting is still the only frame.
@@ -10373,7 +10373,7 @@ async fn aggregate_sse_gateway_authored_error_is_staged_not_published_by_before_
     assert_eq!(status, 202);
     assert!(delivered_body.is_empty());
     assert!(mcp_sse_publication_is_pending_for_test(&ctx));
-    assert!(ctx.metadata.get("mcp.sse.delivery").is_none());
+    assert!(!ctx.metadata.contains_key("mcp.sse.delivery"));
     plugin
         .on_response_committed(&mut ctx, status, &HashMap::new(), delivered_body.as_bytes())
         .await;
@@ -10406,7 +10406,7 @@ async fn aggregate_sse_late_response_replacement_aborts_reserved_event() {
     assert_eq!(selected_status, 202);
     assert!(selected_body.is_empty());
     assert!(mcp_sse_publication_is_pending_for_test(&ctx));
-    assert!(ctx.metadata.get("mcp.sse.delivery").is_none());
+    assert!(!ctx.metadata.contains_key("mcp.sse.delivery"));
 
     // Model the synthetic lifecycle's deliberately-late response/header policy
     // replacing the selected acknowledgement. The committed hook observes the
