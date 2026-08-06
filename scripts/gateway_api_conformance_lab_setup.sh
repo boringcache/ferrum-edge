@@ -6,8 +6,8 @@ RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/conformance-results}"
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-ferrum-gwapi}"
 FERRUM_IMAGE="${FERRUM_IMAGE:-ferrum-edge:gateway-api-conformance}"
 GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.5.1}"
-GATEWAY_API_PROFILE="${GATEWAY_API_PROFILE:-GATEWAY-HTTP}"
-GATEWAY_API_SUPPORTED_FEATURES="${GATEWAY_API_SUPPORTED_FEATURES:-Gateway,ReferenceGrant,HTTPRoute}"
+GATEWAY_API_PROFILE="${GATEWAY_API_PROFILE:-GATEWAY-HTTP,GATEWAY-GRPC}"
+GATEWAY_API_SUPPORTED_FEATURES="${GATEWAY_API_SUPPORTED_FEATURES:-Gateway,ReferenceGrant,HTTPRoute,GRPCRoute}"
 GATEWAY_API_SKIP_TESTS="${GATEWAY_API_SKIP_TESTS:-}"
 GATEWAY_API_STATUS_ADDRESS="${GATEWAY_API_STATUS_ADDRESS:-127.0.0.1}"
 
@@ -102,8 +102,9 @@ install_gateway_api_crds() {
   # Install the experimental-channel bundle (includes standard resources plus
   # TCPRoute/TLSRoute). Mixing standard-install with a standalone experimental
   # L4 CRD fails upstream init with "multiple gateway API CRDs channels detected".
-  # Profile/features stay GATEWAY-HTTP / Gateway,ReferenceGrant,HTTPRoute;
-  # TCPRoute/TLSRoute coverage remains Ferrum black-box only.
+  # Profile/features stay GATEWAY-HTTP,GATEWAY-GRPC /
+  # Gateway,ReferenceGrant,HTTPRoute,GRPCRoute; TCPRoute/TLSRoute coverage
+  # remains Ferrum black-box only.
   kubectl apply --server-side=true \
     -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml"
   for crd in \
