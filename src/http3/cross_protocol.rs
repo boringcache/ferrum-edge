@@ -251,6 +251,9 @@ where
     pub response_committed_plugins: &'a [Arc<dyn Plugin>],
     pub requires_response_stream_hooks: bool,
     pub sticky_cookie_needed: bool,
+    /// Validated inbound routing host already used for initial wildcard
+    /// concretization. Retries must reuse this exact authority.
+    pub request_authority: Option<&'a str>,
     /// Config-time response-trailer governance, precomputed per reload. Used by
     /// the STREAMING gRPC relay, whose terminal metadata crosses the
     /// response-header policy boundary after the initial HEADERS frame is
@@ -527,6 +530,7 @@ fn select_next_cross_protocol_retry_target(
     query_string: &str,
     client_ip: &str,
     proxy_headers: &HashMap<String, String>,
+    request_authority: Option<&str>,
     route_max_retries: u32,
     attempt: u32,
 ) -> CrossProtocolRetryTarget {
@@ -542,9 +546,12 @@ fn select_next_cross_protocol_retry_target(
         epoch,
         proxy,
         prev_target,
-        hash_key,
-        client_ip,
-        proxy_headers,
+        crate::proxy::backend_dispatch::RetryTargetRequest {
+            base_hash_key: hash_key,
+            client_ip,
+            proxy_headers,
+            request_authority,
+        },
     ) else {
         return CrossProtocolRetryTarget::Unchanged;
     };
@@ -667,6 +674,7 @@ where
         response_committed_plugins,
         requires_response_stream_hooks,
         sticky_cookie_needed,
+        request_authority,
         response_trailer_governance,
     } = request;
     let backend_start = Instant::now();
@@ -778,6 +786,7 @@ where
                 response_committed_plugins,
                 requires_response_stream_hooks,
                 sticky_cookie_needed,
+                request_authority,
             )
             .await
         }
@@ -813,6 +822,7 @@ where
                 requires_response_body_buffering,
                 response_committed_plugins,
                 sticky_cookie_needed,
+                request_authority,
                 response_trailer_governance,
             )
             .await
@@ -1636,6 +1646,7 @@ async fn dispatch_plain<S>(
     response_committed_plugins: &[Arc<dyn Plugin>],
     requires_response_stream_hooks: bool,
     sticky_cookie_needed: bool,
+    request_authority: Option<&str>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -1956,6 +1967,7 @@ where
                                     query_string,
                                     client_ip,
                                     proxy_headers,
+                                    request_authority,
                                     route_retry_ceiling,
                                     attempt,
                                 );
@@ -2062,6 +2074,7 @@ where
                                     query_string,
                                     client_ip,
                                     proxy_headers,
+                                    request_authority,
                                     route_retry_ceiling,
                                     attempt,
                                 );
@@ -2851,12 +2864,23 @@ where
     // buffered branch below hands this response to `response_committed` hooks
     // under `grpc_web_deadline_at`; a deadline rebuild there keeps gateway-owned
     // headers only, and an unrecorded cookie would be dropped.
+    //
+    // The binding decision is re-derived against `current_target`, the target
+    // that actually produced this response: the retry loop above rotates it, and
+    // every rotated candidate this bridge refuses to dial writes its refusal
+    // straight to the stream and never reaches here. An honored cookie that
+    // retry moved away from is reissued for the final backend.
+    let sticky_reissue_target = crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
+        sticky_cookie_needed,
+        upstream_target,
+        current_target.as_deref(),
+    );
     crate::http3::server::inject_sticky_cookie_with_deadline_provenance(
         ctx,
         epoch,
         proxy,
-        current_target.as_deref(),
-        sticky_cookie_needed,
+        sticky_reissue_target,
+        sticky_reissue_target.is_some(),
         &mut response_headers,
     );
 
@@ -4410,6 +4434,7 @@ async fn dispatch_grpc<S>(
     requires_response_body_buffering: bool,
     response_committed_plugins: &[Arc<dyn Plugin>],
     sticky_cookie_needed: bool,
+    request_authority: Option<&str>,
     response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
@@ -4792,6 +4817,7 @@ where
                 query_string,
                 client_ip,
                 proxy_headers,
+                request_authority,
                 route_retry_ceiling,
                 attempt,
             );
@@ -4943,6 +4969,20 @@ where
 
     let final_backend_resolved_ip =
         resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
+
+    // Re-derive the sticky-affinity binding decision against the target that
+    // actually produced this response: the retry loop above rotates
+    // `current_target`, and every rotated candidate this bridge refuses to dial
+    // (mesh-transport screen, backend-path mismatch) returns before reaching
+    // here, so `current_target` is the served backend. Without this an honored
+    // cookie would survive a rotation and steer the next request straight back
+    // to the endpoint that just failed.
+    let sticky_cookie_needed = crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
+        sticky_cookie_needed,
+        upstream_target,
+        current_target.as_deref(),
+    )
+    .is_some();
 
     match result {
         Ok(GrpcResponseKind::Buffered(resp)) => {

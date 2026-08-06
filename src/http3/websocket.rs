@@ -600,6 +600,9 @@ pub(crate) async fn handle_h3_websocket(
     // logs record what the client sent, not the backend-rewritten path in
     // `ctx.path`.
     original_request_path: String,
+    // Validated inbound routing host already used for initial wildcard
+    // concretization. Retries must reuse this exact authority.
+    request_host: Option<String>,
 ) -> Result<(), anyhow::Error> {
     // Defense in depth: dispatcher already checked this. If the flag
     // got toggled mid-flight, return 501 rather than half-bridging.
@@ -733,6 +736,10 @@ pub(crate) async fn handle_h3_websocket(
         &plugins,
     );
     let mut current_backend_url = backend_url;
+    // The target selection bound this request to, retained across the retry
+    // loop's rotations so the successful upgrade response can tell "the honored
+    // affinity cookie still names the serving backend" from "retry moved us".
+    let sticky_selected_target = upstream_target.clone();
     let mut current_target = upstream_target;
     let mut current_cb_target_key = cb_target_key;
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
@@ -1029,9 +1036,12 @@ pub(crate) async fn handle_h3_websocket(
                             &epoch,
                             &proxy,
                             prev_target,
-                            hash_key,
-                            &ctx.client_ip,
-                            &proxy_headers,
+                            crate::proxy::backend_dispatch::RetryTargetRequest {
+                                base_hash_key: hash_key,
+                                client_ip: &ctx.client_ip,
+                                proxy_headers: &proxy_headers,
+                                request_authority: request_host.as_deref(),
+                            },
                         )
                     {
                         if !crate::proxy::retry_target_preserves_backend_path(
@@ -1248,30 +1258,25 @@ pub(crate) async fn handle_h3_websocket(
     // Sticky session cookie on the WS upgrade response, mirroring the
     // H1/H2 path. Gateway affinity is injected after operator response
     // policy so the selected-target cookie cannot be removed or replaced.
-    if sticky_cookie_needed
-        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
+    //
+    // This response is only built after a successful upgrade, so the retry
+    // loop's final `current_target` is the backend that actually served the
+    // handshake. Re-derive the binding against it so a rotation reissues.
     {
-        let strategy = crate::proxy::backend_dispatch::hash_on_strategy_for_selected_target(
+        let ws_sticky_target = crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
+            sticky_cookie_needed,
+            sticky_selected_target.as_deref(),
+            current_target.as_deref(),
+        );
+        // The upgrade response goes straight on the wire, so this is the
+        // non-provenance variant of the one shared mint site.
+        crate::proxy::inject_sticky_affinity_cookie(
             &proxy,
             &epoch.load_balancer,
-            upstream_id,
-            target,
+            ws_sticky_target,
+            ws_sticky_target.is_some(),
+            &mut response_headers,
         );
-        if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = crate::load_balancer::LoadBalancerCache::get_upstream_from(
-                &epoch.load_balancer,
-                &proxy.namespace,
-                upstream_id,
-            );
-            let default_cc = crate::config::types::HashOnCookieConfig::default();
-            let cookie_config = upstream
-                .as_ref()
-                .and_then(|u| u.hash_on_cookie_config.as_ref())
-                .unwrap_or(&default_cc);
-            let cookie_val =
-                crate::proxy::build_sticky_cookie_header(cookie_name, target, cookie_config);
-            crate::proxy::headers::append_set_cookie_header(&mut response_headers, cookie_val);
-        }
     }
     let mut response_builder = crate::proxy::headers::apply_response_headers(
         Response::builder().status(StatusCode::OK),

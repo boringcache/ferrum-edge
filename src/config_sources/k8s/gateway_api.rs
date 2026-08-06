@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::config::types::{BackendScheme, FrontendTlsNamespaceSource, MAX_TARGET_WEIGHT};
 use crate::modes::mesh::config::{
@@ -14,16 +14,18 @@ use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerPolicy,
     GatewayApiListenerValidationError, GatewayApiNamespaceSelector,
     GatewayApiNamespaceSelectorExpression, GatewayApiNamespaceSelectorOperator,
-    GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sAccumulator, K8sObject, K8sResourceKey,
-    K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
-    RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
-    invalid_resource, mesh_route_dispatch_plugin_from_rules, namespaced_resource_key,
-    optional_port_field, optional_target_weight_field, port_from_u64, proxy_for_route, resource_id,
-    route_backends_require_node_waypoint_authz, route_request_transformer_plugin_for_proxy,
-    service_dns_name, string_array, string_field, upstream_for_route,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewaySessionPersistence, K8sAccumulator,
+    K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslationOptions,
+    MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
+    attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
+    mesh_route_dispatch_plugin_from_rules, namespaced_resource_key, optional_port_field,
+    optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
+    resource_id, route_backends_require_node_waypoint_authz,
+    route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
+    upstream_for_route_with_session,
 };
 use crate::config::db_backend::NamespacedResourceId;
-use crate::config::types::{PluginConfig, Proxy};
+use crate::config::types::{HashOnCookieConfig, PluginConfig, Proxy};
 
 // Use an absolute DNS name (trailing dot) so resolvers must query this exact
 // label and cannot append search domains from resolv.conf.
@@ -167,14 +169,1068 @@ pub(super) fn translate(
             Ok(true)
         }
         "TLSRoute" => {
-            for proxy in l4_route_proxies(object, acc, BackendScheme::Tcps)? {
+            // Gateway API TLSRoute is SNI-matched TLS passthrough on TLS
+            // listeners (typically `tls.mode: Passthrough`): peek ClientHello
+            // SNI against route hostnames and forward encrypted bytes with no
+            // termination — same stream+SNI machinery as VirtualService tls[]
+            // and east-west passthrough. BackendScheme::Tcp + passthrough is
+            // required; Tcps without passthrough would terminate or originate
+            // TLS and ignore hostname SNI selection.
+            for mut proxy in l4_route_proxies(object, acc, BackendScheme::Tcp)? {
+                proxy.passthrough = true;
                 acc.upsert_proxy(proxy, SourceKind::GatewayApi);
             }
             Ok(true)
         }
         "ReferenceGrant" => Ok(true),
+        // Collected in the pre-pass; acknowledged here so the main translate
+        // loop does not warn about an "unsupported" kind.
+        "BackendLBPolicy" | "XBackendTrafficPolicy" => Ok(true),
         _ => Ok(false),
     }
+}
+
+/// Default session token name when `sessionPersistence.sessionName` is omitted
+/// (Gateway API marks the field implementation-specific).
+const DEFAULT_SESSION_NAME: &str = "ferrum-session";
+
+/// Accepted/rejected BackendLB / XBackendTraffic policy attachment for a Service.
+#[derive(Debug, Clone)]
+pub(crate) struct GatewayBackendSessionPolicy {
+    pub resource: K8sResourceKey,
+    pub creation_timestamp: Option<DateTime<Utc>>,
+    /// `Ok(None)` = policy accepted but carries no `sessionPersistence`.
+    /// `Err` = field-specific rejection reason.
+    pub session: Result<Option<GatewaySessionPersistence>, String>,
+}
+
+fn backend_lb_policy_kinds(kind: &str) -> bool {
+    matches!(kind, "BackendLBPolicy" | "XBackendTrafficPolicy")
+}
+
+/// Collect `BackendLBPolicy` / `XBackendTrafficPolicy` into the accumulator.
+///
+/// Gateway API removed `BackendLBPolicy` from the experimental channel in
+/// v1.3+ (replaced by `XBackendTrafficPolicy` on `gateway.networking.x-k8s.io`).
+/// Ferrum watches and translates both shapes so operators on older CRDs and on
+/// the pinned v1.5.1 experimental channel get the same session-persistence
+/// semantics. `retryConstraint` is not representable today and rejects the
+/// entire policy fail-closed (no sessionPersistence projection either).
+pub(super) fn collect_backend_lb_policy(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+) -> Result<(), K8sTranslateError> {
+    if !backend_lb_policy_kinds(&object.kind) {
+        return Ok(());
+    }
+
+    let target_refs = object
+        .spec
+        .get("targetRefs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                "spec.targetRefs is required and must be a non-empty array",
+            )
+        })?;
+    if target_refs.is_empty() {
+        return Err(invalid_resource(
+            object,
+            "spec.targetRefs is required and must be a non-empty array",
+        ));
+    }
+    if target_refs.len() > 16 {
+        return Err(invalid_resource(
+            object,
+            "spec.targetRefs must contain at most 16 entries",
+        ));
+    }
+
+    let mut service_targets = BTreeSet::new();
+    for (index, target) in target_refs.iter().enumerate() {
+        if !target.is_object() {
+            return Err(invalid_resource(
+                object,
+                format!("spec.targetRefs[{index}] must be an object"),
+            ));
+        }
+        for field in ["group", "kind", "name"] {
+            if target.get(field).is_some_and(|value| !value.is_string()) {
+                return Err(invalid_resource(
+                    object,
+                    format!("spec.targetRefs[{index}].{field} must be a string"),
+                ));
+            }
+        }
+        let kind = string_field(target, "kind").unwrap_or("Service");
+        let group = string_field(target, "group").unwrap_or("");
+        let name = string_field(target, "name")
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    format!("spec.targetRefs[{index}].name is required and must not be empty"),
+                )
+            })?;
+        if kind != "Service" || !group.is_empty() {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "spec.targetRefs[{index}] must target core group Service; \
+                     other backend kinds are not supported"
+                ),
+            ));
+        }
+        if !service_targets.insert(name.to_string()) {
+            return Err(invalid_resource(
+                object,
+                format!("spec.targetRefs[{index}] duplicates an earlier Service targetRef"),
+            ));
+        }
+    }
+
+    validate_backend_lb_policy_status_capacity(object, service_targets.len())
+        .map_err(|message| invalid_resource(object, message))?;
+
+    if object.spec.get("retryConstraint").is_some() {
+        // Unrepresentable retry budgets must not fail open: rejecting the
+        // whole policy also withholds sessionPersistence rather than applying
+        // sticky affinity while ignoring the budget constraint.
+        return Err(invalid_resource(
+            object,
+            "spec.retryConstraint is not supported; Ferrum does not enforce \
+             retry budgets and rejects the entire backend traffic policy \
+             fail-closed (sessionPersistence is not applied)",
+        ));
+    }
+
+    let session = object
+        .spec
+        .get("sessionPersistence")
+        .map(|value| parse_session_persistence(object, value))
+        .transpose()?;
+
+    let resource = K8sResourceKey::from_object(object);
+    let record = GatewayBackendSessionPolicy {
+        resource: resource.clone(),
+        creation_timestamp: object
+            .metadata
+            .creation_timestamp
+            .as_deref()
+            .and_then(parse_k8s_timestamp),
+        session: Ok(session),
+    };
+
+    // Remember the policy's FULL Service target set. Precedence below is
+    // resolved per Service, so a policy targeting `[a, b]` can win `a` while
+    // losing `b` to an older policy — but the status writer reports Direct
+    // attachment ATOMICALLY (`backend_lb_policy_conflict_losers` marks a policy
+    // Conflicted the moment it loses any one target). `finalize_backend_lb_policies`
+    // uses this set to withdraw such a policy everywhere, so a policy the
+    // operator was told is `Accepted=False` cannot still steer live traffic.
+    acc.gateway_api_backend_session_policy_targets
+        .insert(resource.clone(), service_targets.clone());
+
+    for service_name in service_targets {
+        let key = (object.metadata.namespace.clone(), service_name);
+        let existing = acc
+            .gateway_api_backend_session_policies
+            .get(&key)
+            .map(|policy| {
+                (
+                    backend_policy_is_preferred(&record, policy),
+                    policy.resource.clone(),
+                )
+            });
+        match existing {
+            None => {
+                acc.gateway_api_backend_session_policies
+                    .insert(key, record.clone());
+            }
+            Some((true, old)) => {
+                acc.warnings.push(format!(
+                    "{} {}/{} replaces older backend session policy {}/{} \
+                     for Service {}/{}",
+                    object.kind,
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    old.namespace,
+                    old.name,
+                    key.0,
+                    key.1
+                ));
+                acc.gateway_api_backend_session_policies
+                    .insert(key, record.clone());
+            }
+            Some((false, old)) => {
+                acc.warnings.push(format!(
+                    "{} {}/{} ignored for Service {}/{}; older policy {}/{} wins",
+                    object.kind,
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    key.0,
+                    key.1,
+                    old.namespace,
+                    old.name
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Withdraw every backend session policy that lost at least one of its targeted
+/// Services from ALL of the Services it won.
+///
+/// [`collect_backend_lb_policy`] resolves GEP-713 None-merge precedence one
+/// Service at a time, so a policy targeting `[api, cart]` can win `api` while
+/// losing `cart` to an older policy. Ferrum's Direct-attachment status is
+/// deliberately atomic — [`backend_lb_policy_conflict_losers`] marks such a
+/// policy `Accepted=False` / `Conflicted` — so leaving it applied to `api`
+/// would steer live traffic with a policy the operator was told was rejected.
+///
+/// After this pass the Services carrying persistence are exactly those whose
+/// policy reports `Accepted=True`. No cascade is needed: the challenger a
+/// withdrawn policy beat on some Service lost that Service under the same
+/// atomic rule and is itself `Conflicted`, so that Service correctly ends up
+/// with no persistence at all.
+///
+/// Runs once per translation over the collected policy set, never on a request
+/// path.
+pub(super) fn finalize_backend_lb_policies(acc: &mut K8sAccumulator) {
+    if acc.gateway_api_backend_session_policy_targets.is_empty() {
+        return;
+    }
+    // `BTreeSet` so the emitted warnings are deterministic across watch order.
+    let mut withdrawn: BTreeSet<K8sResourceKey> = BTreeSet::new();
+    for (resource, targets) in &acc.gateway_api_backend_session_policy_targets {
+        for service_name in targets {
+            let key = (resource.namespace.clone(), service_name.clone());
+            let winner = acc.gateway_api_backend_session_policies.get(&key);
+            if winner.is_none_or(|policy| policy.resource != *resource) {
+                withdrawn.insert(resource.clone());
+                break;
+            }
+        }
+    }
+    if withdrawn.is_empty() {
+        return;
+    }
+    acc.gateway_api_backend_session_policies
+        .retain(|_, policy| !withdrawn.contains(&policy.resource));
+    for resource in withdrawn {
+        acc.warnings.push(format!(
+            "{} {}/{} lost at least one targeted Service under BackendLB/XBackendTraffic \
+             oldest-wins precedence; its session persistence is withdrawn from every \
+             targeted Service to match the atomic Accepted=False/Conflicted status",
+            resource.kind, resource.namespace, resource.name
+        ));
+    }
+}
+
+fn backend_policy_is_preferred(
+    candidate: &GatewayBackendSessionPolicy,
+    existing: &GatewayBackendSessionPolicy,
+) -> bool {
+    match (candidate.creation_timestamp, existing.creation_timestamp) {
+        (Some(c), Some(e)) => match c.cmp(&e) {
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => candidate.resource.cmp(&existing.resource).is_lt(),
+        },
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => candidate.resource.cmp(&existing.resource).is_lt(),
+    }
+}
+
+fn is_valid_session_cookie_name(name: &str) -> bool {
+    crate::config::types::is_valid_http_token(name)
+}
+
+fn is_valid_session_header_name(name: &str) -> bool {
+    crate::config::types::is_valid_http_token(name)
+}
+
+fn parse_session_persistence(
+    object: &K8sObject,
+    value: &Value,
+) -> Result<GatewaySessionPersistence, K8sTranslateError> {
+    if !value.is_object() {
+        return Err(invalid_resource(
+            object,
+            "sessionPersistence must be an object",
+        ));
+    }
+    for field in ["sessionName", "type", "absoluteTimeout"] {
+        if value.get(field).is_some_and(|field| !field.is_string()) {
+            return Err(invalid_resource(
+                object,
+                format!("sessionPersistence.{field} must be a string"),
+            ));
+        }
+    }
+    if let Some(cookie_config) = value.get("cookieConfig") {
+        if !cookie_config.is_object() {
+            return Err(invalid_resource(
+                object,
+                "sessionPersistence.cookieConfig must be an object",
+            ));
+        }
+        if cookie_config
+            .get("lifetimeType")
+            .is_some_and(|field| !field.is_string())
+        {
+            return Err(invalid_resource(
+                object,
+                "sessionPersistence.cookieConfig.lifetimeType must be a string",
+            ));
+        }
+    }
+    if value.get("idleTimeout").is_some() {
+        return Err(invalid_resource(
+            object,
+            "sessionPersistence.idleTimeout is not supported; Ferrum sticky \
+             sessions do not track idle expiry",
+        ));
+    }
+
+    let persistence_type = string_field(value, "type").unwrap_or("Cookie");
+    let session_name = string_field(value, "sessionName")
+        .map(str::to_string)
+        .unwrap_or_else(|| DEFAULT_SESSION_NAME.to_string());
+    if session_name.is_empty() || session_name.len() > 128 {
+        return Err(invalid_resource(
+            object,
+            "sessionPersistence.sessionName must be 1..=128 characters",
+        ));
+    }
+
+    match persistence_type {
+        "Cookie" => {
+            if !is_valid_session_cookie_name(&session_name) {
+                return Err(invalid_resource(
+                    object,
+                    "sessionPersistence.sessionName must be a valid HTTP cookie name \
+                     (ASCII token characters only; control bytes and separators \
+                     such as space, tab, CR, LF, ;, and = are rejected)",
+                ));
+            }
+            let lifetime = value
+                .get("cookieConfig")
+                .and_then(|cfg| string_field(cfg, "lifetimeType"))
+                .unwrap_or("Session");
+            let absolute_timeout = string_field(value, "absoluteTimeout");
+            let mut cookie_config = HashOnCookieConfig {
+                session_cookie: lifetime == "Session",
+                ..HashOnCookieConfig::default()
+            };
+            match lifetime {
+                "Session" => {
+                    if absolute_timeout.is_some() {
+                        return Err(invalid_resource(
+                            object,
+                            "sessionPersistence.absoluteTimeout with \
+                             cookieConfig.lifetimeType Session is not supported; \
+                             Ferrum cannot enforce an absolute lifetime for a \
+                             browser session cookie",
+                        ));
+                    }
+                }
+                "Permanent" => {
+                    let Some(raw) = absolute_timeout else {
+                        return Err(invalid_resource(
+                            object,
+                            "sessionPersistence.absoluteTimeout is required when \
+                             cookieConfig.lifetimeType is Permanent",
+                        ));
+                    };
+                    cookie_config.session_cookie = false;
+                    cookie_config.ttl_seconds =
+                        parse_gateway_api_duration_secs(object, raw, "absoluteTimeout")?;
+                }
+                _ => {
+                    return Err(invalid_resource(
+                        object,
+                        "sessionPersistence.cookieConfig.lifetimeType must be \
+                         Session or Permanent"
+                            .to_string(),
+                    ));
+                }
+            }
+            Ok(GatewaySessionPersistence {
+                hash_on: format!("cookie:{session_name}"),
+                cookie_config: Some(cookie_config),
+            })
+        }
+        "Header" => {
+            if !is_valid_session_header_name(&session_name) {
+                return Err(invalid_resource(
+                    object,
+                    "sessionPersistence.sessionName must be a valid HTTP header name \
+                     (ASCII token characters only; control bytes and separators \
+                     such as space, tab, CR, LF, and : are rejected)",
+                ));
+            }
+            if value.get("cookieConfig").is_some() {
+                return Err(invalid_resource(
+                    object,
+                    "sessionPersistence.cookieConfig can only be set with type Cookie",
+                ));
+            }
+            if string_field(value, "absoluteTimeout").is_some() {
+                // AbsoluteTimeout without a cookie has no Set-Cookie surface;
+                // refuse rather than silently ignore.
+                return Err(invalid_resource(
+                    object,
+                    "sessionPersistence.absoluteTimeout is only supported with type Cookie",
+                ));
+            }
+            Err(invalid_resource(
+                object,
+                "sessionPersistence.type Header is not supported; Ferrum does \
+                 not synthesize a response session token and cannot provide \
+                 Gateway API header session-persistence semantics",
+            ))
+        }
+        _ => Err(invalid_resource(
+            object,
+            "sessionPersistence.type must be Cookie or Header".to_string(),
+        )),
+    }
+}
+
+fn parse_gateway_api_duration_secs(
+    object: &K8sObject,
+    raw: &str,
+    field: &str,
+) -> Result<u64, K8sTranslateError> {
+    // Diagnostics name the field and system cap only — never echo the operator
+    // duration string (which may carry hostile/control content into status).
+    if !is_gateway_api_duration(raw) {
+        return Err(invalid_resource(
+            object,
+            format!("sessionPersistence.{field} is not a valid Gateway API duration"),
+        ));
+    }
+    let ms = parse_istio_duration_ms(raw).ok_or_else(|| {
+        invalid_resource(
+            object,
+            format!("sessionPersistence.{field} is not a valid Gateway API duration"),
+        )
+    })?;
+    if ms == 0 {
+        return Err(invalid_resource(
+            object,
+            format!("sessionPersistence.{field} must be greater than 0s"),
+        ));
+    }
+    let secs = ms.div_ceil(1000);
+    if secs > crate::config::types::MAX_TIMEOUT_SECONDS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "sessionPersistence.{field} exceeds the sticky-cookie ttl cap of {}s",
+                crate::config::types::MAX_TIMEOUT_SECONDS
+            ),
+        ));
+    }
+    Ok(secs)
+}
+
+/// Gateway API Duration is one to four integer+unit groups, each integer at
+/// most five digits, with units h/m/s/ms. This intentionally rejects the wider
+/// duration grammar accepted by the Istio parser (for example decimals).
+fn is_gateway_api_duration(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut offset = 0;
+    let mut groups = 0;
+    while offset < bytes.len() && groups < 4 {
+        let digits_start = offset;
+        while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+            offset += 1;
+        }
+        let digits = offset - digits_start;
+        if !(1..=5).contains(&digits) {
+            return false;
+        }
+        if bytes
+            .get(offset..)
+            .is_some_and(|remainder| remainder.starts_with(b"ms"))
+        {
+            offset += 2;
+        } else if bytes
+            .get(offset)
+            .is_some_and(|unit| matches!(*unit, b'h' | b'm' | b's'))
+        {
+            offset += 1;
+        } else {
+            return false;
+        }
+        groups += 1;
+    }
+    offset == bytes.len() && groups > 0
+}
+
+fn resolve_rule_session_persistence(
+    object: &K8sObject,
+    rule: &Value,
+    rule_index: usize,
+    backends: &[RouteBackend],
+    acc: &mut K8sAccumulator,
+) -> Result<Option<GatewaySessionPersistence>, K8sTranslateError> {
+    if let Some(value) = rule.get("sessionPersistence") {
+        let parsed = parse_session_persistence(object, value)?;
+        return Ok(Some(scope_cookie_session_to_route(
+            object, rule_index, parsed,
+        )));
+    }
+
+    let mut service_keys = BTreeSet::new();
+    for backend in backends {
+        let (Some(ns), Some(name)) = (
+            backend.service_namespace.as_deref(),
+            backend.service_name.as_deref(),
+        ) else {
+            continue;
+        };
+        service_keys.insert((ns.to_string(), name.to_string()));
+    }
+    if service_keys.is_empty() {
+        return Ok(None);
+    }
+
+    let mut resolved: Option<((String, String), GatewaySessionPersistence)> = None;
+    for key in &service_keys {
+        let Some(policy) = acc.gateway_api_backend_session_policies.get(key) else {
+            continue;
+        };
+        match &policy.session {
+            Ok(Some(session)) => {
+                if let Some((ref prior_key, ref existing)) = resolved {
+                    if existing != session {
+                        return Err(invalid_resource(
+                            object,
+                            format!(
+                                "backendRefs target Services with conflicting \
+                                 BackendLB/XBackendTraffic sessionPersistence \
+                                 (Service {}/{} vs Service {}/{})",
+                                prior_key.0, prior_key.1, key.0, key.1
+                            ),
+                        ));
+                    }
+                } else {
+                    resolved = Some((key.clone(), session.clone()));
+                }
+            }
+            Ok(None) => {}
+            Err(message) => {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "backend Service {}/{} has rejected session policy \
+                         {}/{}: {message}",
+                        key.0, key.1, policy.resource.namespace, policy.resource.name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(resolved.map(|(_, session)| scope_cookie_session_to_route(object, rule_index, session)))
+}
+
+/// A Service-attached policy applies independently to each route rule. Scope
+/// the browser-visible cookie name to the exact route rule so two rules (or two
+/// routes) cannot accidentally consume the same persistent session. Gateway
+/// API marks `sessionName` implementation-specific and permits it to be
+/// reflected rather than requiring an exact wire name.
+fn scope_cookie_session_to_route(
+    object: &K8sObject,
+    rule_index: usize,
+    mut session: GatewaySessionPersistence,
+) -> GatewaySessionPersistence {
+    let Some(session_name) = session.hash_on.strip_prefix("cookie:").map(str::to_owned) else {
+        return session;
+    };
+    let identity = format!(
+        "{}|{}|{}|{}|{}",
+        object.api_version,
+        object.kind,
+        object.metadata.namespace,
+        object.metadata.name,
+        rule_index
+    );
+    let digest = hex::encode(crate::fips::approved::Sha256::digest(identity.as_bytes()));
+    const ROUTE_SUFFIX_LEN: usize = 16;
+    const ROUTE_MARKER: &str = "-fe-";
+    let max_base_len = 128 - ROUTE_MARKER.len() - ROUTE_SUFFIX_LEN;
+    let base = &session_name[..session_name.len().min(max_base_len)];
+    session.hash_on = format!("cookie:{base}{ROUTE_MARKER}{}", &digest[..ROUTE_SUFFIX_LEN]);
+    session
+}
+
+/// Fixed Accepted=False / Conflicted message for GEP-713 None-merge losers.
+/// Must not echo policy identity, Service names, or operator-authored values.
+const BACKEND_LB_POLICY_CONFLICTED_MESSAGE: &str = "Another BackendLBPolicy or XBackendTrafficPolicy already targets one or more of the same Services and merging is not supported";
+
+/// Controller name stamped on every `status.ancestors` entry Ferrum owns.
+const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
+
+/// Gateway API `PolicyStatus.ancestors` upper bound (`+kubebuilder:validation:MaxItems=16`).
+const POLICY_ANCESTOR_MAX_ITEMS: usize = 16;
+
+/// Ensure Ferrum can represent every direct-policy attachment without
+/// overwriting another controller's entry in the shared, 16-item ancestor map.
+/// A policy whose complete status cannot be represented is unimplementable and
+/// must not steer traffic.
+fn validate_backend_lb_policy_status_capacity(
+    object: &K8sObject,
+    desired_ancestor_count: usize,
+) -> Result<(), String> {
+    let foreign_count = object
+        .status
+        .get("ancestors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|ancestor| !is_ferrum_policy_ancestor(ancestor))
+        .count();
+    let available = POLICY_ANCESTOR_MAX_ITEMS.saturating_sub(foreign_count);
+    if desired_ancestor_count > available {
+        return Err(format!(
+            "status.ancestors has capacity for {available} Ferrum entries after preserving \
+             {foreign_count} entries owned by other controllers, but this policy requires \
+             {desired_ancestor_count}; the policy is not applied"
+        ));
+    }
+    Ok(())
+}
+
+/// Policies that lose at least one Service target under the same GEP-713 None
+/// merge / oldest-wins precedence used by [`collect_backend_lb_policy`].
+///
+/// Only syntactically valid, in-scope `BackendLBPolicy` / `XBackendTrafficPolicy`
+/// objects participate. Invalid policies are excluded so they cannot occupy a
+/// Service slot or convert a field-level rejection into Accepted/Conflicted.
+/// Participant processing is sorted by full resource identity so watch/input
+/// order cannot change winners.
+pub(crate) fn backend_lb_policy_conflict_losers<'a>(
+    objects: impl IntoIterator<Item = &'a K8sObject>,
+    options: &K8sTranslationOptions,
+) -> HashSet<K8sResourceKey> {
+    let mut participants: Vec<(GatewayBackendSessionPolicy, BTreeSet<String>)> = Vec::new();
+
+    for object in objects
+        .into_iter()
+        .filter(|object| super::includes_object_namespace(options, object))
+        .filter(|object| backend_lb_policy_kinds(&object.kind))
+    {
+        // Validation first: invalid objects never participate in conflict.
+        if validate_backend_lb_policy_for_status(object).is_err() {
+            continue;
+        }
+        let targets = object
+            .spec
+            .get("targetRefs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|target| {
+                string_field(target, "name")
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            })
+            .collect::<BTreeSet<_>>();
+        participants.push((
+            GatewayBackendSessionPolicy {
+                resource: K8sResourceKey::from_object(object),
+                creation_timestamp: object
+                    .metadata
+                    .creation_timestamp
+                    .as_deref()
+                    .and_then(parse_k8s_timestamp),
+                session: Ok(None),
+            },
+            targets,
+        ));
+    }
+
+    participants.sort_by(|left, right| left.0.resource.cmp(&right.0.resource));
+
+    let mut winners: BTreeMap<(String, String), GatewayBackendSessionPolicy> = BTreeMap::new();
+    for (record, targets) in &participants {
+        for service_name in targets {
+            let key = (record.resource.namespace.clone(), service_name.clone());
+            match winners.get(&key) {
+                None => {
+                    winners.insert(key, record.clone());
+                }
+                Some(existing) if backend_policy_is_preferred(record, existing) => {
+                    winners.insert(key, record.clone());
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    let mut losers = HashSet::new();
+    for (record, targets) in &participants {
+        for service_name in targets {
+            let key = (record.resource.namespace.clone(), service_name.clone());
+            let Some(winner) = winners.get(&key) else {
+                continue;
+            };
+            if winner.resource != record.resource {
+                losers.insert(record.resource.clone());
+                break;
+            }
+        }
+    }
+    losers
+}
+
+/// Build `status.ancestors` for BackendLBPolicy / XBackendTrafficPolicy.
+///
+/// Ancestor is the targeted Service (Direct policy attachment). Status
+/// evaluation order is deterministic:
+/// 1. Field validation / unsupported values → `Accepted=False` /
+///    `UnsupportedValue` (including unsupported `retryConstraint`)
+/// 2. GEP-713 None-merge conflicts → `Accepted=False` / `Conflicted` when
+///    `conflicted` is true because this policy lost at least one Service target
+///
+/// Invalid policies therefore never report Accepted because of a conflict
+/// check. With Ferrum's atomic direct-policy behavior, a multi-target policy
+/// that loses any Service is rejected entirely rather than partially accepted.
+///
+/// The result is reconciled against the object's live `status` through
+/// [`merge_backend_lb_policy_status`], so an unchanged condition keeps its
+/// `lastTransitionTime` (no per-reconcile status churn) and ancestor entries
+/// owned by another implementation are carried through untouched.
+pub(crate) fn backend_lb_policy_status(object: &K8sObject, conflicted: bool) -> Value {
+    let (accepted, reason, message) = match validate_backend_lb_policy_for_status(object) {
+        Ok(()) if conflicted => (
+            false,
+            "Conflicted",
+            BACKEND_LB_POLICY_CONFLICTED_MESSAGE.to_string(),
+        ),
+        Ok(()) => (
+            true,
+            "Accepted",
+            "Ferrum accepted this backend traffic policy".to_string(),
+        ),
+        Err(message) => (false, "UnsupportedValue", message),
+    };
+
+    let target_refs = object
+        .spec
+        .get("targetRefs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut ancestors = Vec::new();
+    for target in target_refs {
+        let Some(name) = string_field(&target, "name") else {
+            continue;
+        };
+        let kind = string_field(&target, "kind").unwrap_or("Service");
+        let group = string_field(&target, "group").unwrap_or("");
+        ancestors.push(backend_lb_policy_ancestor(
+            object,
+            json!({
+                "group": group,
+                "kind": kind,
+                "name": name,
+                "namespace": object.metadata.namespace,
+            }),
+            accepted,
+            reason,
+            &message,
+        ));
+    }
+    if ancestors.is_empty() {
+        ancestors.push(backend_lb_policy_ancestor(
+            object,
+            json!({
+                "group": "",
+                "kind": "Service",
+                "name": object.metadata.name,
+                "namespace": object.metadata.namespace,
+            }),
+            accepted,
+            reason,
+            &message,
+        ));
+    }
+
+    merge_backend_lb_policy_status(&json!({ "ancestors": ancestors }), Some(&object.status))
+}
+
+/// One Ferrum-owned `status.ancestors` entry, carrying the live
+/// `lastTransitionTime` forward when the condition's value did not change.
+fn backend_lb_policy_ancestor(
+    object: &K8sObject,
+    ancestor_ref: Value,
+    accepted: bool,
+    reason: &str,
+    message: &str,
+) -> Value {
+    let existing = live_ferrum_ancestor_condition(&object.status, &ancestor_ref, "Accepted");
+    let condition = condition_value(object, "Accepted", accepted, reason, message, existing);
+    json!({
+        "ancestorRef": ancestor_ref,
+        "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
+        "conditions": [condition],
+    })
+}
+
+/// Whether an ancestor entry is one Ferrum owns and may rewrite.
+fn is_ferrum_policy_ancestor(ancestor: &Value) -> bool {
+    ancestor.get("controllerName").and_then(Value::as_str) == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+}
+
+/// One `ancestorRef` field, with an absent optional field read as empty so a
+/// server-normalized live entry still matches the desired one.
+fn ancestor_ref_field<'a>(ancestor_ref: &'a Value, field: &str) -> &'a str {
+    ancestor_ref
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+/// Field-wise `ancestorRef` identity.
+fn policy_ancestor_ref_matches(left: &Value, right: &Value) -> bool {
+    for field in ["group", "kind", "name", "namespace"] {
+        if ancestor_ref_field(left, field) != ancestor_ref_field(right, field) {
+            return false;
+        }
+    }
+    true
+}
+
+fn condition_has_type(condition: &Value, condition_type: &str) -> bool {
+    condition.get("type").and_then(Value::as_str) == Some(condition_type)
+}
+
+/// `lastTransitionTime` for a condition that really did change, in the
+/// `Z`-suffixed RFC 3339 form the Kubernetes API server persists.
+fn condition_transition_now() -> String {
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Live Ferrum-owned condition for one `ancestorRef`, used to preserve
+/// `lastTransitionTime` across reconciles.
+fn live_ferrum_ancestor_condition<'a>(
+    live_status: &'a Value,
+    ancestor_ref: &Value,
+    condition_type: &str,
+) -> Option<&'a Value> {
+    let ancestors = live_status.get("ancestors").and_then(Value::as_array)?;
+    for ancestor in ancestors {
+        if !is_ferrum_policy_ancestor(ancestor) {
+            continue;
+        }
+        let Some(live_ref) = ancestor.get("ancestorRef") else {
+            continue;
+        };
+        if !policy_ancestor_ref_matches(live_ref, ancestor_ref) {
+            continue;
+        }
+        let conditions = ancestor.get("conditions").and_then(Value::as_array);
+        for condition in conditions.into_iter().flatten() {
+            if condition_has_type(condition, condition_type) {
+                return Some(condition);
+            }
+        }
+    }
+    None
+}
+
+/// Reconcile Ferrum's desired policy `status.ancestors` with the live array.
+///
+/// `PolicyStatus.ancestors` is a SHARED, atomic list: GEP-713 lets several
+/// implementations report on one policy and forbids an implementation from
+/// modifying or removing entries it does not own. Ferrum writes policy status
+/// with a forced server-side apply over the whole array, so a foreign entry has
+/// to be carried through the applied document or the API server drops it.
+///
+/// Ferrum-owned entries keep their live position, which — together with the
+/// preserved `lastTransitionTime` — is what makes a steady-state desired status
+/// compare equal to the live one so the planner stops re-patching it.
+///
+/// Idempotent: when a fresh live status is unavailable, foreign entries already
+/// present in `desired` become the preservation source, so re-merging an
+/// already-merged document neither drops nor duplicates them.
+pub(crate) fn merge_backend_lb_policy_status(
+    desired: &Value,
+    live_status: Option<&Value>,
+) -> Value {
+    let mut owned: Vec<Value> = Vec::new();
+    if let Some(ancestors) = desired.get("ancestors").and_then(Value::as_array) {
+        for ancestor in ancestors {
+            if is_ferrum_policy_ancestor(ancestor) {
+                owned.push(ancestor.clone());
+            }
+        }
+    }
+    let desired_ancestors = desired.get("ancestors").and_then(Value::as_array);
+    let live = live_status
+        .and_then(|status| status.get("ancestors"))
+        .and_then(Value::as_array)
+        .or(desired_ancestors)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+
+    let mut emitted = vec![false; owned.len()];
+    let mut merged: Vec<Value> = Vec::with_capacity(POLICY_ANCESTOR_MAX_ITEMS);
+    // Gateway API requires implementations to leave entries owned by other
+    // controllers untouched. If the shared 16-entry list is full, an
+    // implementation MUST NOT add another entry. Reserve capacity for every
+    // valid live foreign ancestor first and spend only what remains on Ferrum's
+    // own desired entries. A persisted CRD-valid list cannot itself exceed 16;
+    // the `take` keeps a malformed synthetic value from producing an invalid
+    // apply document.
+    let foreign_count = live
+        .iter()
+        .filter(|ancestor| !is_ferrum_policy_ancestor(ancestor))
+        .take(POLICY_ANCESTOR_MAX_ITEMS)
+        .count();
+    let mut owned_budget = POLICY_ANCESTOR_MAX_ITEMS.saturating_sub(foreign_count);
+    for ancestor in live {
+        if !is_ferrum_policy_ancestor(ancestor) {
+            if merged.len() < POLICY_ANCESTOR_MAX_ITEMS {
+                merged.push(ancestor.clone());
+            }
+            continue;
+        }
+        if owned_budget == 0 {
+            continue;
+        }
+        let live_ref = ancestor.get("ancestorRef");
+        // Ferrum-owned slot: keep the live position for an ancestorRef that is
+        // still targeted. A removed targetRef simply drops out.
+        for (index, candidate) in owned.iter().enumerate() {
+            if emitted[index] {
+                continue;
+            }
+            let same_ref = match (candidate.get("ancestorRef"), live_ref) {
+                (Some(want), Some(have)) => policy_ancestor_ref_matches(have, want),
+                _ => false,
+            };
+            if same_ref {
+                merged.push(candidate.clone());
+                emitted[index] = true;
+                owned_budget -= 1;
+                break;
+            }
+        }
+    }
+    for (index, candidate) in owned.into_iter().enumerate() {
+        if !emitted[index] && owned_budget > 0 {
+            merged.push(candidate);
+            owned_budget -= 1;
+        }
+    }
+    json!({ "ancestors": merged })
+}
+
+fn validate_backend_lb_policy_for_status(object: &K8sObject) -> Result<(), String> {
+    let target_refs = object
+        .spec
+        .get("targetRefs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "spec.targetRefs is required and must be a non-empty array".to_string())?;
+    if target_refs.is_empty() {
+        return Err("spec.targetRefs is required and must be a non-empty array".to_string());
+    }
+    if target_refs.len() > 16 {
+        return Err("spec.targetRefs must contain at most 16 entries".to_string());
+    }
+    let mut service_targets = BTreeSet::new();
+    for (index, target) in target_refs.iter().enumerate() {
+        if !target.is_object() {
+            return Err(format!("spec.targetRefs[{index}] must be an object"));
+        }
+        for field in ["group", "kind", "name"] {
+            if target.get(field).is_some_and(|value| !value.is_string()) {
+                return Err(format!("spec.targetRefs[{index}].{field} must be a string"));
+            }
+        }
+        let kind = string_field(target, "kind").unwrap_or("Service");
+        let group = string_field(target, "group").unwrap_or("");
+        let Some(name) = string_field(target, "name").filter(|name| !name.is_empty()) else {
+            return Err(format!(
+                "spec.targetRefs[{index}].name is required and must not be empty"
+            ));
+        };
+        if kind != "Service" || !group.is_empty() {
+            return Err(format!(
+                "spec.targetRefs[{index}] must target core group Service"
+            ));
+        }
+        if !service_targets.insert(name) {
+            return Err(format!(
+                "spec.targetRefs[{index}] duplicates an earlier Service targetRef"
+            ));
+        }
+    }
+    validate_backend_lb_policy_status_capacity(object, service_targets.len())?;
+    if object.spec.get("retryConstraint").is_some() {
+        return Err(
+            "spec.retryConstraint is not supported; Ferrum does not enforce \
+             retry budgets and rejects the entire backend traffic policy \
+             fail-closed (sessionPersistence is not applied)"
+                .to_string(),
+        );
+    }
+    if let Some(value) = object.spec.get("sessionPersistence") {
+        parse_session_persistence(object, value).map_err(|err| match err {
+            K8sTranslateError::InvalidResource { message, .. } => message,
+            other => other.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+/// Build one status condition, reusing `existing`'s `lastTransitionTime` when
+/// the condition's VALUE (status/reason/message) is unchanged.
+///
+/// Kubernetes requires `lastTransitionTime` to advance only on a real
+/// transition. It is also what keeps the status planner quiet: it emits a patch
+/// whenever the desired status differs from the live one, so re-stamping `now()`
+/// on every reconcile would re-patch every policy object forever — an unbounded
+/// API write loop, and a flapping timestamp for operators watching the resource.
+/// The format matches the API server's `Z`-suffixed RFC 3339 form so a
+/// re-emitted unchanged condition compares equal to what was persisted.
+fn condition_value(
+    object: &K8sObject,
+    condition_type: &str,
+    accepted: bool,
+    reason: &str,
+    message: &str,
+    existing: Option<&Value>,
+) -> Value {
+    let status = if accepted { "True" } else { "False" };
+    let observed = object.metadata.generation.unwrap_or(0);
+    let last_transition_time = existing
+        .filter(|condition| {
+            condition.get("status").and_then(Value::as_str) == Some(status)
+                && condition.get("reason").and_then(Value::as_str) == Some(reason)
+                && condition.get("message").and_then(Value::as_str) == Some(message)
+        })
+        .and_then(|condition| condition.get("lastTransitionTime"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(condition_transition_now);
+    json!({
+        "type": condition_type,
+        "status": status,
+        "reason": reason,
+        "message": message,
+        "observedGeneration": observed,
+        "lastTransitionTime": last_transition_time,
+    })
 }
 
 /// Borrowed, validated ReferenceGrant from×to permission cell.
@@ -328,7 +1384,7 @@ pub(super) fn collect_gateway_listener_policy(
     };
     for listener in listeners {
         let listener_name = string_field(listener, "name").unwrap_or("listener");
-        let requires_frontend_tls = listener_is_terminating_tls(listener);
+        let requires_frontend_tls = listener_requires_frontend_tls(listener);
         let (namespaces, validation_error) = match allowed_route_namespaces(listener) {
             Ok(namespaces) => (namespaces, None),
             Err(error) => {
@@ -339,8 +1395,15 @@ pub(super) fn collect_gateway_listener_policy(
                 (GatewayApiAllowedRoutesNamespaces::Invalid, Some(error))
             }
         };
-        let materializable =
-            validation_error.is_none() && listener_is_materializable(acc, object, listener);
+        if !listener_protocol_mode_is_supported(listener) {
+            acc.warnings.push(format!(
+                "Gateway API Gateway {}/{} listener {} rejected: spec.listeners[].tls.mode must be Passthrough for protocol TLS",
+                object.metadata.namespace, object.metadata.name, listener_name
+            ));
+        }
+        let materializable = validation_error.is_none()
+            && listener_protocol_mode_is_supported(listener)
+            && listener_is_materializable(acc, object, listener);
         let policy = GatewayApiListenerPolicy {
             namespaces,
             validation_error,
@@ -364,7 +1427,10 @@ pub(super) fn collect_gateway_listener_policy(
 }
 
 fn listener_is_materializable(acc: &K8sAccumulator, object: &K8sObject, listener: &Value) -> bool {
-    if !listener_is_terminating_tls(listener) {
+    if !listener_protocol_mode_is_supported(listener) {
+        return false;
+    }
+    if !listener_requires_frontend_tls(listener) {
         return true;
     }
     let Some(sources) = listener_frontend_tls_sources(acc, object, listener) else {
@@ -482,7 +1548,7 @@ fn disable_gateway_frontend_tls_route_materialization(
         .into_iter()
         .flatten()
     {
-        if !listener_is_terminating_tls(listener) {
+        if !listener_requires_frontend_tls(listener) {
             continue;
         }
         let listener_name = string_field(listener, "name").unwrap_or("listener");
@@ -511,7 +1577,7 @@ fn gateway_frontend_tls_sources(
     let mut saw_invalid_ref = false;
     for listener in listeners
         .iter()
-        .filter(|listener| listener_is_terminating_tls(listener))
+        .filter(|listener| listener_requires_frontend_tls(listener))
     {
         saw_terminating_tls = true;
         let Some(listener_sources) = listener_frontend_tls_sources(acc, object, listener) else {
@@ -555,6 +1621,26 @@ fn listener_is_terminating_tls(listener: &Value) -> bool {
     string_field(tls, "mode")
         .unwrap_or("Terminate")
         .eq_ignore_ascii_case("Terminate")
+}
+
+fn listener_is_tls_protocol(listener: &Value) -> bool {
+    string_field(listener, "protocol").is_some_and(|protocol| protocol.eq_ignore_ascii_case("TLS"))
+}
+
+/// Ferrum implements the Gateway API TLSRoute core behavior: encrypted SNI
+/// passthrough. The separate TLSRouteModeTerminate feature is not advertised
+/// and must not be materialized as passthrough or poison the HTTPS certificate
+/// slot until its decrypt-and-forward semantics are implemented end to end.
+fn listener_protocol_mode_is_supported(listener: &Value) -> bool {
+    !listener_is_tls_protocol(listener)
+        || listener
+            .get("tls")
+            .and_then(|tls| string_field(tls, "mode"))
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("Passthrough"))
+}
+
+fn listener_requires_frontend_tls(listener: &Value) -> bool {
+    listener_is_terminating_tls(listener) && !listener_is_tls_protocol(listener)
 }
 
 fn listener_frontend_tls_sources(
@@ -2643,7 +3729,16 @@ fn mesh_services_from_gateway(
             {
                 return Ok(());
             }
-            if listener_is_terminating_tls(listener)
+            if !listener_protocol_mode_is_supported(listener) {
+                acc.warnings.push(format!(
+                    "Gateway API Gateway {}/{} listener {} uses unsupported protocol TLS with a non-Passthrough mode and will not be exposed",
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    listener_name
+                ));
+                return Ok(());
+            }
+            if listener_requires_frontend_tls(listener)
                 && (!namespace_tls_ready || !listener_is_materializable(acc, object, listener))
             {
                 acc.warnings.push(format!(
@@ -3287,6 +4382,13 @@ fn http_route_resources(
             let request_transform = gateway_request_header_modifier_rules(rule);
             let redirect = gateway_request_redirect_value(object, rule, default_redirect_port)?;
             let backend_resolution = route_backends(object, rule, acc)?;
+            let session_persistence = resolve_rule_session_persistence(
+                object,
+                rule,
+                rule_index,
+                &backend_resolution.backends,
+                acc,
+            )?;
             let backend_ref_fault = backend_resolution.fault_reason.map(|reason| {
                 backend_ref_fault_value_with_percentage(
                     reason,
@@ -3316,7 +4418,7 @@ fn http_route_resources(
                     None,
                     false,
                 )
-            } else if backend_resolution.backends.len() == 1 {
+            } else if backend_resolution.backends.len() == 1 && session_persistence.is_none() {
                 let Some(backend) = backend_resolution.backends.into_iter().next() else {
                     continue;
                 };
@@ -3344,10 +4446,11 @@ fn http_route_resources(
                     &object.metadata.name,
                     &route_suffix,
                 );
-                let upstream = upstream_for_route(
+                let upstream = upstream_for_route_with_session(
                     upstream_id.clone(),
                     config_namespace.clone(),
                     backend_resolution.backends,
+                    session_persistence.as_ref(),
                 );
                 (
                     String::new(),
@@ -4497,6 +5600,17 @@ fn l4_route_proxies(
     );
     let materialized_listener_ports =
         l4_route_listener_ports_for_namespace(object, acc, Some(&object.metadata.namespace));
+    let has_gateway_parent_ref = object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .is_some_and(|parent_refs| parent_refs.iter().any(parent_ref_is_gateway));
+    if has_gateway_parent_ref && materialized_listener_ports.is_empty() {
+        // A parented L4 route has no standalone/default listener semantics.
+        // Falling back to backend_port here would expose traffic after its
+        // named Gateway listener was rejected or left unmaterialized.
+        return Ok(Vec::new());
+    }
     let mut proxies = Vec::new();
     for (rule_index, rule) in object
         .spec
@@ -4725,6 +5839,9 @@ fn listener_route_kinds_for_protocol(protocol: Option<&str>) -> Vec<&'static str
 }
 
 fn listener_allowed_route_kinds(listener: &Value) -> HashSet<String> {
+    if !listener_protocol_mode_is_supported(listener) {
+        return HashSet::new();
+    }
     let protocol_kinds = listener_route_kinds_for_protocol(string_field(listener, "protocol"));
     if protocol_kinds.is_empty() {
         return HashSet::new();
@@ -10240,6 +11357,107 @@ mod tests {
     }
 
     #[test]
+    fn tls_route_materializes_sni_passthrough_on_gateway_tls_listener_port() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Passthrough"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TLSRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "tls"}],
+                "hostnames": ["db.example.com"],
+                "rules": [{
+                    "backendRefs": [{"name": "db", "port": 5432}]
+                }]
+            }),
+        );
+
+        let result =
+            translate_k8s_objects(&[gateway, route], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        let proxy = &result.config.proxies[0];
+        assert_eq!(proxy.listen_port, Some(15443));
+        assert_eq!(proxy.backend_port, 5432);
+        assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
+        assert!(
+            proxy.passthrough,
+            "TLSRoute must be SNI passthrough (encrypted bytes, no termination)"
+        );
+        assert_eq!(proxy.hosts, vec!["db.example.com".to_string()]);
+        assert!(
+            !proxy.frontend_tls,
+            "passthrough and frontend_tls are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn tls_route_rejects_terminate_listener_without_backend_port_fallback() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls-terminate",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Terminate"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TLSRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "tls-terminate"}],
+                "hostnames": ["db.example.com"],
+                "rules": [{
+                    "backendRefs": [{"name": "db", "port": 5432}]
+                }]
+            }),
+        );
+
+        let error = translate_k8s_objects(&[gateway, route], options())
+            .expect_err("TLSRouteModeTerminate must fail closed until implemented");
+
+        assert!(error.to_string().contains("not permitted"));
+        assert!(error.to_string().contains("Gateway listener"));
+    }
+
+    #[test]
+    fn parented_l4_route_without_materialized_listener_never_uses_backend_port() {
+        let result = translate_k8s_objects(
+            &[object(
+                "TLSRoute",
+                serde_json::json!({
+                    "parentRefs": [{"name": "missing-gateway"}],
+                    "hostnames": ["db.example.com"],
+                    "rules": [{
+                        "backendRefs": [{"name": "db", "port": 5432}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("unknown parent is represented as an unmaterialized route");
+
+        assert!(
+            result.config.proxies.is_empty(),
+            "a parented route must not expose the backend port as a listener"
+        );
+    }
+
+    #[test]
     fn rejects_gateway_api_ports_outside_kubernetes_range() {
         let err = translate_k8s_objects(
             &[object(
@@ -10883,6 +12101,1101 @@ mod tests {
                 .iter()
                 .map(|host| host.to_string())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    fn backend_lb_policy(name: &str, spec: Value) -> K8sObject {
+        let mut policy = object("BackendLBPolicy", spec);
+        policy.api_version = "gateway.networking.k8s.io/v1alpha2".to_string();
+        policy.metadata.name = name.to_string();
+        policy
+    }
+
+    fn x_backend_traffic_policy(name: &str, spec: Value) -> K8sObject {
+        let mut policy = object("XBackendTrafficPolicy", spec);
+        policy.api_version = "gateway.networking.x-k8s.io/v1alpha1".to_string();
+        policy.metadata.name = name.to_string();
+        policy
+    }
+
+    fn http_route_to_service(service: &str) -> K8sObject {
+        object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": service, "port": 8080}]
+                }]
+            }),
+        )
+    }
+
+    #[test]
+    fn backend_lb_policy_cookie_session_forces_consistent_hash_upstream() {
+        let policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "lb-affinity",
+                    "type": "Cookie",
+                    "cookieConfig": {"lifetimeType": "Session"}
+                }
+            }),
+        );
+        let route = http_route_to_service("api");
+        let result = translate_k8s_objects(&[policy, route], options())
+            .expect("BackendLBPolicy cookie session should translate");
+
+        assert_eq!(result.config.upstreams.len(), 1);
+        let upstream = &result.config.upstreams[0];
+        assert_eq!(
+            upstream.algorithm,
+            crate::config::types::LoadBalancerAlgorithm::ConsistentHashing
+        );
+        assert!(
+            upstream
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:lb-affinity-fe-")),
+            "cookie name must be scoped to the route rule: {:?}",
+            upstream.hash_on
+        );
+        let cookie = upstream
+            .hash_on_cookie_config
+            .as_ref()
+            .expect("cookie config");
+        assert!(
+            cookie.session_cookie,
+            "Session lifetimeType must omit Max-Age"
+        );
+        assert_eq!(
+            result.config.proxies[0].upstream_id.as_deref(),
+            Some(upstream.id.as_str()),
+            "single-backend sticky routes must materialize an Upstream so \
+             Set-Cookie injection runs on the live LB path"
+        );
+    }
+
+    #[test]
+    fn x_backend_traffic_policy_permanent_cookie_sets_max_age() {
+        let policy = x_backend_traffic_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "perm",
+                    "type": "Cookie",
+                    "absoluteTimeout": "2h",
+                    "cookieConfig": {"lifetimeType": "Permanent"}
+                }
+            }),
+        );
+        let result = translate_k8s_objects(&[policy, http_route_to_service("api")], options())
+            .expect("XBackendTrafficPolicy permanent cookie should translate");
+        let cookie = result.config.upstreams[0]
+            .hash_on_cookie_config
+            .as_ref()
+            .expect("cookie config");
+        assert!(!cookie.session_cookie);
+        assert_eq!(cookie.ttl_seconds, 7200);
+    }
+
+    #[test]
+    fn session_cookie_absolute_timeout_fails_closed() {
+        let policy = x_backend_traffic_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "bounded-session",
+                    "type": "Cookie",
+                    "absoluteTimeout": "2h",
+                    "cookieConfig": {"lifetimeType": "Session"}
+                }
+            }),
+        );
+        let err = translate_k8s_objects(&[policy.clone(), http_route_to_service("api")], options())
+            .expect_err("an unenforced absolute session lifetime must fail closed");
+        assert!(
+            err.to_string()
+                .contains("cannot enforce an absolute lifetime"),
+            "got: {err}"
+        );
+
+        let status = super::backend_lb_policy_status(&policy, false);
+        assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
+    }
+
+    #[test]
+    fn gateway_api_duration_parser_rejects_wider_istio_grammar() {
+        assert!(is_gateway_api_duration("1h2m3s4ms"));
+        assert!(is_gateway_api_duration("0s"));
+        assert!(!is_gateway_api_duration("1.5s"));
+        assert!(!is_gateway_api_duration("123456s"));
+        assert!(!is_gateway_api_duration("1s2s3s4s5s"));
+        assert!(!is_gateway_api_duration(""));
+    }
+
+    #[test]
+    fn malformed_session_persistence_shape_fails_closed() {
+        let policy = x_backend_traffic_policy(
+            "malformed",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": "Cookie"
+            }),
+        );
+        let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
+            .expect_err("a non-object sessionPersistence must fail closed");
+        assert!(err.to_string().contains("must be an object"), "got: {err}");
+        let status = super::backend_lb_policy_status(&policy, false);
+        assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
+    }
+
+    #[test]
+    fn service_policy_cookie_is_scoped_independently_to_each_route_rule() {
+        let policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "shared-policy-name",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let mut route = http_route_to_service("api");
+        route.spec["rules"] = serde_json::json!([
+            {
+                "matches": [{"path": {"type": "PathPrefix", "value": "/one"}}],
+                "backendRefs": [{"name": "api", "port": 8080}]
+            },
+            {
+                "matches": [{"path": {"type": "PathPrefix", "value": "/two"}}],
+                "backendRefs": [{"name": "api", "port": 8080}]
+            }
+        ]);
+        let result = translate_k8s_objects(&[policy, route], options())
+            .expect("both route rules should receive independent persistence");
+        assert_eq!(result.config.upstreams.len(), 2);
+        let names = result
+            .config
+            .upstreams
+            .iter()
+            .map(|upstream| upstream.hash_on.as_deref().expect("cookie hash key"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), 2, "route rules must not share a cookie name");
+        assert!(
+            names
+                .iter()
+                .all(|name| name.starts_with("cookie:shared-policy-name-fe-"))
+        );
+    }
+
+    #[test]
+    fn http_route_rule_session_persistence_overrides_backend_policy() {
+        let policy = backend_lb_policy(
+            "service-sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "from-policy",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let mut route = http_route_to_service("api");
+        route.spec["rules"][0]["sessionPersistence"] = serde_json::json!({
+            "sessionName": "from-route",
+            "type": "Cookie"
+        });
+        let result = translate_k8s_objects(&[policy, route], options())
+            .expect("route-level sessionPersistence should win");
+        assert!(
+            result.config.upstreams[0]
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:from-route-fe-"))
+        );
+        assert!(result.config.upstreams[0].hash_on_cookie_config.is_some());
+    }
+
+    #[test]
+    fn backend_lb_policy_idle_timeout_fails_closed() {
+        let policy = backend_lb_policy(
+            "idle",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "type": "Cookie",
+                    "idleTimeout": "30s"
+                }
+            }),
+        );
+        let err =
+            translate_k8s_objects(&[policy], options()).expect_err("idleTimeout must fail closed");
+        assert!(err.to_string().contains("idleTimeout"), "got: {err}");
+    }
+
+    #[test]
+    fn backend_lb_policy_permanent_without_absolute_timeout_fails_closed() {
+        let policy = backend_lb_policy(
+            "perm",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "type": "Cookie",
+                    "cookieConfig": {"lifetimeType": "Permanent"}
+                }
+            }),
+        );
+        let err = translate_k8s_objects(&[policy], options())
+            .expect_err("Permanent without absoluteTimeout must fail");
+        assert!(err.to_string().contains("absoluteTimeout"), "got: {err}");
+    }
+
+    #[test]
+    fn backend_lb_policy_unsupported_target_kind_fails_closed() {
+        let policy = backend_lb_policy(
+            "bad-target",
+            serde_json::json!({
+                "targetRefs": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "name": "gw"
+                }],
+                "sessionPersistence": {"type": "Cookie"}
+            }),
+        );
+        let err = translate_k8s_objects(&[policy], options())
+            .expect_err("non-Service targetRef must fail closed");
+        assert!(err.to_string().contains("Service"), "got: {err}");
+    }
+
+    #[test]
+    fn backend_lb_policy_empty_target_name_fails_closed() {
+        let policy = backend_lb_policy(
+            "empty-target",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": ""}],
+                "sessionPersistence": {"type": "Cookie"}
+            }),
+        );
+        let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
+            .expect_err("an empty target name must fail closed");
+        assert!(err.to_string().contains("must not be empty"), "got: {err}");
+        let status = super::backend_lb_policy_status(&policy, false);
+        assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
+    }
+
+    #[test]
+    fn backend_lb_policy_target_ref_bound_fails_closed() {
+        let target_refs = (0..17)
+            .map(|index| {
+                serde_json::json!({
+                    "group": "",
+                    "kind": "Service",
+                    "name": format!("api-{index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let policy = backend_lb_policy(
+            "too-many-targets",
+            serde_json::json!({
+                "targetRefs": target_refs,
+                "sessionPersistence": {"type": "Cookie"}
+            }),
+        );
+        let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
+            .expect_err("more than 16 targetRefs must fail closed");
+        assert!(err.to_string().contains("at most 16"), "got: {err}");
+        let status = super::backend_lb_policy_status(&policy, false);
+        assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
+    }
+
+    #[test]
+    fn same_named_cross_kind_policy_tie_break_is_input_order_independent() {
+        let legacy = backend_lb_policy(
+            "same-name",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "legacy"}
+            }),
+        );
+        let current = x_backend_traffic_policy(
+            "same-name",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "current"}
+            }),
+        );
+        let route = http_route_to_service("api");
+        let forward =
+            translate_k8s_objects(&[legacy.clone(), current.clone(), route.clone()], options())
+                .expect("forward policy order");
+        let reverse = translate_k8s_objects(&[current, legacy, route], options())
+            .expect("reverse policy order");
+        assert_eq!(
+            forward.config.upstreams[0].hash_on, reverse.config.upstreams[0].hash_on,
+            "cross-kind policy precedence must not depend on watch order"
+        );
+    }
+
+    /// A multi-target policy that loses ONE Service is reported
+    /// `Accepted=False` / `Conflicted` atomically, so translation must not keep
+    /// applying it to the Services it happened to win — otherwise a policy the
+    /// operator was told is rejected still steers live traffic.
+    #[test]
+    fn backend_lb_policy_losing_one_target_is_withdrawn_from_every_service() {
+        let mut older = backend_lb_policy(
+            "older",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "cart"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "older"}
+            }),
+        );
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut newer = backend_lb_policy(
+            "newer",
+            serde_json::json!({
+                "targetRefs": [
+                    {"group": "", "kind": "Service", "name": "api"},
+                    {"group": "", "kind": "Service", "name": "cart"}
+                ],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "newer"}
+            }),
+        );
+        newer.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let losers = super::backend_lb_policy_conflict_losers([&older, &newer], &options());
+        assert!(
+            losers.contains(&K8sResourceKey::from_object(&newer)),
+            "the challenger that lost `cart` must report Conflicted"
+        );
+        assert!(
+            !losers.contains(&K8sResourceKey::from_object(&older)),
+            "the oldest-wins policy stays Accepted"
+        );
+
+        // `api` was only targeted by the Conflicted challenger, so it must get
+        // no persistence at all — status and data plane agree.
+        let api_objects = [older.clone(), newer.clone(), http_route_to_service("api")];
+        let api = translate_k8s_objects(&api_objects, options()).expect("translation");
+        assert!(
+            api.config.upstreams.is_empty(),
+            "a Conflicted policy must not force a session Upstream on the Service it won"
+        );
+        assert!(api.config.proxies[0].upstream_id.is_none());
+
+        // The accepted winner still applies to its own Service.
+        let cart_objects = [older, newer, http_route_to_service("cart")];
+        let cart = translate_k8s_objects(&cart_objects, options()).expect("translation");
+        assert!(
+            cart.config.upstreams[0]
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:older-fe-")),
+            "the oldest-wins policy must still apply to the Service it won"
+        );
+    }
+
+    /// The status planner patches whenever the desired status differs from the
+    /// live one, so a value-unchanged policy status must be byte-identical or
+    /// every policy is re-patched on every reconcile and `lastTransitionTime`
+    /// flaps against the Kubernetes condition contract.
+    #[test]
+    fn backend_lb_policy_status_preserves_unchanged_last_transition_time() {
+        let mut policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "lb-affinity"}
+            }),
+        );
+        let first = super::backend_lb_policy_status(&policy, false);
+        policy.status = first.clone();
+        let second = super::backend_lb_policy_status(&policy, false);
+        assert_eq!(
+            second, first,
+            "an unchanged policy status must not be re-stamped every reconcile"
+        );
+
+        // A real transition still advances the timestamp.
+        let mut stale = first.clone();
+        stale["ancestors"][0]["conditions"][0]["status"] = serde_json::json!("False");
+        stale["ancestors"][0]["conditions"][0]["reason"] = serde_json::json!("Conflicted");
+        stale["ancestors"][0]["conditions"][0]["lastTransitionTime"] =
+            serde_json::json!("2020-01-01T00:00:00Z");
+        policy.status = stale;
+        let transitioned = super::backend_lb_policy_status(&policy, false);
+        let condition = &transitioned["ancestors"][0]["conditions"][0];
+        assert_eq!(condition["reason"], "Accepted");
+        assert_ne!(
+            condition["lastTransitionTime"],
+            serde_json::json!("2020-01-01T00:00:00Z"),
+            "a real transition must advance lastTransitionTime"
+        );
+    }
+
+    /// `status.ancestors` is shared across Gateway API implementations and is
+    /// applied as one atomic array, so Ferrum's forced server-side apply must
+    /// carry foreign ancestor entries through instead of erasing them.
+    #[test]
+    fn backend_lb_policy_status_preserves_foreign_controller_ancestors() {
+        let mut policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "lb-affinity"}
+            }),
+        );
+        policy.status = serde_json::json!({
+            "ancestors": [{
+                "ancestorRef": {
+                    "group": "",
+                    "kind": "Service",
+                    "name": "api",
+                    "namespace": "default"
+                },
+                "controllerName": "example.com/other-controller",
+                "conditions": [{
+                    "type": "Accepted",
+                    "status": "True",
+                    "reason": "Accepted",
+                    "message": "other implementation",
+                    "observedGeneration": 1,
+                    "lastTransitionTime": "2020-01-01T00:00:00Z"
+                }]
+            }]
+        });
+
+        let status = super::backend_lb_policy_status(&policy, false);
+        let ancestors = status["ancestors"].as_array().expect("ancestors array");
+        assert_eq!(ancestors.len(), 2, "got: {status}");
+        let foreign = "example.com/other-controller";
+        let ferrum = "ferrum.io/gateway-controller";
+        assert!(
+            ancestors
+                .iter()
+                .any(|entry| entry["controllerName"] == foreign),
+            "a foreign controller's ancestor must survive Ferrum's apply document"
+        );
+        assert!(
+            ancestors
+                .iter()
+                .any(|entry| entry["controllerName"] == ferrum),
+            "Ferrum still reports its own ancestor"
+        );
+
+        // Idempotent: the planner merges against the snapshot and the apply path
+        // merges again against the fresh live status.
+        policy.status = status.clone();
+        let again = super::backend_lb_policy_status(&policy, false);
+        assert_eq!(again, status, "re-merging must not duplicate an ancestor");
+    }
+
+    /// Gateway API caps the shared ancestor map at 16 entries and requires an
+    /// implementation not to add entries once it is full. Foreign controller
+    /// ownership therefore wins the capacity budget over Ferrum's desired
+    /// entry; forced SSA must never evict a foreign status just to report ours.
+    #[test]
+    fn backend_lb_policy_status_does_not_evict_a_full_foreign_ancestor_map() {
+        let mut policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "lb-affinity"}
+            }),
+        );
+        let foreign = (0..super::POLICY_ANCESTOR_MAX_ITEMS)
+            .map(|index| {
+                serde_json::json!({
+                    "ancestorRef": {
+                        "group": "",
+                        "kind": "Service",
+                        "name": format!("foreign-{index}"),
+                        "namespace": "default"
+                    },
+                    "controllerName": format!("example.com/controller-{index}"),
+                    "conditions": []
+                })
+            })
+            .collect::<Vec<_>>();
+        policy.status = serde_json::json!({ "ancestors": foreign });
+
+        let status = super::backend_lb_policy_status(&policy, false);
+        let ancestors = status["ancestors"].as_array().expect("ancestors array");
+        assert_eq!(ancestors.len(), super::POLICY_ANCESTOR_MAX_ITEMS);
+        assert!(ancestors.iter().all(|entry| {
+            entry["controllerName"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("example.com/controller-"))
+        }));
+
+        let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
+            .expect_err("a policy with no status capacity must not steer traffic");
+        assert!(
+            err.to_string()
+                .contains("status.ancestors has capacity for 0 Ferrum entries")
+                && err.to_string().contains("policy is not applied"),
+            "got: {err}"
+        );
+
+        // Applying a planner-produced document without a fresh live snapshot
+        // still preserves its already-carried foreign entries.
+        let again = super::merge_backend_lb_policy_status(&status, None);
+        assert_eq!(again, status);
+    }
+
+    #[test]
+    fn backend_lb_policy_delete_withdraws_session_persistence() {
+        let policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "lb-affinity",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let route = http_route_to_service("api");
+        let with_policy =
+            translate_k8s_objects(&[policy, route.clone()], options()).expect("with policy");
+        assert!(
+            with_policy.config.upstreams[0]
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:lb-affinity-fe-"))
+        );
+
+        let without_policy = translate_k8s_objects(&[route], options())
+            .expect("policy deletion withdraws sticky config");
+        assert!(
+            without_policy.config.upstreams.is_empty(),
+            "without session persistence a single backend stays direct"
+        );
+        assert!(without_policy.config.proxies[0].upstream_id.is_none());
+    }
+
+    #[test]
+    fn backend_lb_policy_update_changes_session_name() {
+        let mut policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "v1",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let route = http_route_to_service("api");
+        let v1 = translate_k8s_objects(&[policy.clone(), route.clone()], options()).expect("v1");
+        assert!(
+            v1.config.upstreams[0]
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:v1-fe-"))
+        );
+
+        policy.spec["sessionPersistence"]["sessionName"] = serde_json::json!("v2");
+        let v2 = translate_k8s_objects(&[policy, route], options()).expect("v2");
+        assert!(
+            v2.config.upstreams[0]
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:v2-fe-"))
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_status_rejects_idle_timeout() {
+        let policy = backend_lb_policy(
+            "idle",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "type": "Cookie",
+                    "idleTimeout": "10s"
+                }
+            }),
+        );
+        let status = super::backend_lb_policy_status(&policy, false);
+        let condition = &status["ancestors"][0]["conditions"][0];
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "UnsupportedValue");
+        assert!(
+            condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("idleTimeout")
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_rejects_cookie_session_name_with_newline_injection() {
+        let policy = backend_lb_policy(
+            "inject",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "lb-affinity\nevilmalicious=1",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let err = translate_k8s_objects(&[policy.clone(), http_route_to_service("api")], options())
+            .expect_err("newline in cookie sessionName must fail closed");
+        assert!(
+            err.to_string().contains("sessionPersistence.sessionName"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("cookie name"), "got: {err}");
+
+        let status = super::backend_lb_policy_status(&policy, false);
+        let condition = &status["ancestors"][0]["conditions"][0];
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "UnsupportedValue");
+        assert!(
+            condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("sessionPersistence.sessionName")
+        );
+        assert!(
+            condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("cookie name")
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_rejects_header_session_name_with_invalid_characters() {
+        let policy = backend_lb_policy(
+            "bad-header",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "x-session name",
+                    "type": "Header"
+                }
+            }),
+        );
+        let err = translate_k8s_objects(&[policy.clone(), http_route_to_service("api")], options())
+            .expect_err("space in header sessionName must fail closed");
+        assert!(
+            err.to_string().contains("sessionPersistence.sessionName"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("header name"), "got: {err}");
+
+        let status = super::backend_lb_policy_status(&policy, false);
+        let condition = &status["ancestors"][0]["conditions"][0];
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "UnsupportedValue");
+        assert!(
+            condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("sessionPersistence.sessionName")
+        );
+        assert!(
+            condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("header name")
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_accepts_valid_cookie_and_rejects_header_persistence() {
+        let cookie_policy = backend_lb_policy(
+            "cookie",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "lb-affinity",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let header_policy = backend_lb_policy(
+            "header",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "X-Session-Affinity",
+                    "type": "Header"
+                }
+            }),
+        );
+        let cookie =
+            translate_k8s_objects(&[cookie_policy, http_route_to_service("api")], options())
+                .expect("valid cookie sessionName should translate");
+        assert!(
+            cookie.config.upstreams[0]
+                .hash_on
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cookie:lb-affinity-fe-"))
+        );
+
+        let err = translate_k8s_objects(
+            &[header_policy.clone(), http_route_to_service("api")],
+            options(),
+        )
+        .expect_err("Header persistence must fail closed until Ferrum emits response tokens");
+        assert!(
+            err.to_string().contains("type Header is not supported"),
+            "got: {err}"
+        );
+        let status = super::backend_lb_policy_status(&header_policy, false);
+        assert_eq!(status["ancestors"][0]["conditions"][0]["status"], "False");
+    }
+
+    #[test]
+    fn x_backend_traffic_policy_retry_constraint_rejects_entire_policy() {
+        let policy = x_backend_traffic_policy(
+            "budget",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "retryConstraint": {
+                    "budget": {"percent": 20, "interval": "10s"}
+                },
+                "sessionPersistence": {
+                    "sessionName": "with-budget",
+                    "type": "Cookie"
+                }
+            }),
+        );
+        let err = translate_k8s_objects(&[policy.clone(), http_route_to_service("api")], options())
+            .expect_err("retryConstraint must reject the entire policy fail-closed");
+        assert!(err.to_string().contains("retryConstraint"), "got: {err}");
+        assert!(
+            err.to_string()
+                .contains("sessionPersistence is not applied"),
+            "rejection must withhold sessionPersistence, got: {err}"
+        );
+
+        let status = super::backend_lb_policy_status(&policy, false);
+        let condition = &status["ancestors"][0]["conditions"][0];
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "UnsupportedValue");
+        let message = condition["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("retryConstraint"),
+            "status message must name the field, got: {message}"
+        );
+        assert!(
+            message.contains("sessionPersistence is not applied"),
+            "status must document that sticky affinity is withheld, got: {message}"
+        );
+    }
+
+    #[test]
+    fn x_backend_traffic_policy_retry_constraint_only_still_rejects() {
+        let policy = x_backend_traffic_policy(
+            "budget-only",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "retryConstraint": {
+                    "budget": {"percent": 10, "interval": "5s"}
+                }
+            }),
+        );
+        let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
+            .expect_err("retryConstraint-only policies must fail closed");
+        assert!(err.to_string().contains("retryConstraint"), "got: {err}");
+
+        let status = super::backend_lb_policy_status(&policy, false);
+        let condition = &status["ancestors"][0]["conditions"][0];
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "UnsupportedValue");
+    }
+
+    fn accepted_condition(status: &Value) -> &Value {
+        &status["ancestors"][0]["conditions"][0]
+    }
+
+    #[test]
+    fn backend_lb_policy_status_older_wins_marks_challenger_conflicted() {
+        let mut older = backend_lb_policy(
+            "older",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "older"}
+            }),
+        );
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut newer = backend_lb_policy(
+            "newer",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "newer"}
+            }),
+        );
+        newer.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let losers =
+            super::backend_lb_policy_conflict_losers(&[older.clone(), newer.clone()], &options());
+        assert!(!losers.contains(&K8sResourceKey::from_object(&older)));
+        assert!(losers.contains(&K8sResourceKey::from_object(&newer)));
+
+        let winner_status = super::backend_lb_policy_status(&older, false);
+        let winner = accepted_condition(&winner_status);
+        assert_eq!(winner["status"], "True");
+        assert_eq!(winner["reason"], "Accepted");
+
+        let loser_status = super::backend_lb_policy_status(&newer, true);
+        let loser = accepted_condition(&loser_status);
+        assert_eq!(loser["status"], "False");
+        assert_eq!(loser["reason"], "Conflicted");
+        assert_eq!(
+            loser["message"].as_str(),
+            Some(super::BACKEND_LB_POLICY_CONFLICTED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_status_same_timestamp_cross_kind_uses_full_identity() {
+        let stamp = "2026-01-01T00:00:00Z";
+        let mut legacy = backend_lb_policy(
+            "same-name",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "legacy"}
+            }),
+        );
+        legacy.metadata.creation_timestamp = Some(stamp.to_string());
+        let mut current = x_backend_traffic_policy(
+            "same-name",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "current"}
+            }),
+        );
+        current.metadata.creation_timestamp = Some(stamp.to_string());
+
+        let forward = super::backend_lb_policy_conflict_losers(
+            &[legacy.clone(), current.clone()],
+            &options(),
+        );
+        let reverse = super::backend_lb_policy_conflict_losers(
+            &[current.clone(), legacy.clone()],
+            &options(),
+        );
+        assert_eq!(
+            forward, reverse,
+            "same-timestamp cross-kind precedence must not depend on input order"
+        );
+
+        // Full resource identity: apiVersion/kind/namespace/name. The
+        // gateway.networking.k8s.io BackendLBPolicy sorts before the
+        // gateway.networking.x-k8s.io XBackendTrafficPolicy sibling.
+        assert!(!forward.contains(&K8sResourceKey::from_object(&legacy)));
+        assert!(forward.contains(&K8sResourceKey::from_object(&current)));
+    }
+
+    #[test]
+    fn backend_lb_policy_status_conflict_is_input_order_independent() {
+        let mut older = x_backend_traffic_policy(
+            "alpha",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "alpha"}
+            }),
+        );
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut newer = backend_lb_policy(
+            "beta",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "beta"}
+            }),
+        );
+        newer.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let forward =
+            super::backend_lb_policy_conflict_losers(&[older.clone(), newer.clone()], &options());
+        let reverse =
+            super::backend_lb_policy_conflict_losers(&[newer.clone(), older.clone()], &options());
+        assert_eq!(forward, reverse);
+        assert!(!forward.contains(&K8sResourceKey::from_object(&older)));
+        assert!(forward.contains(&K8sResourceKey::from_object(&newer)));
+    }
+
+    #[test]
+    fn backend_lb_policy_status_multi_target_partial_conflict_fails_closed() {
+        let mut older = backend_lb_policy(
+            "older-svc-a",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "svc-a"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "a"}
+            }),
+        );
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut multi = backend_lb_policy(
+            "multi",
+            serde_json::json!({
+                "targetRefs": [
+                    {"group": "", "kind": "Service", "name": "svc-a"},
+                    {"group": "", "kind": "Service", "name": "svc-b"}
+                ],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "multi"}
+            }),
+        );
+        multi.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let losers =
+            super::backend_lb_policy_conflict_losers(&[older.clone(), multi.clone()], &options());
+        assert!(
+            losers.contains(&K8sResourceKey::from_object(&multi)),
+            "losing any Service target must Conflict the whole multi-target policy"
+        );
+        assert!(!losers.contains(&K8sResourceKey::from_object(&older)));
+
+        let status = super::backend_lb_policy_status(&multi, true);
+        // Atomic direct-policy behavior: every ancestor reports Conflicted.
+        for ancestor in status["ancestors"].as_array().expect("ancestors") {
+            let condition = &ancestor["conditions"][0];
+            assert_eq!(condition["status"], "False");
+            assert_eq!(condition["reason"], "Conflicted");
+        }
+    }
+
+    #[test]
+    fn backend_lb_policy_status_invalid_policy_stays_rejected_not_conflicted() {
+        let mut older = backend_lb_policy(
+            "older",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "older"}
+            }),
+        );
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut invalid = backend_lb_policy(
+            "invalid",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "type": "Cookie",
+                    "idleTimeout": "10s"
+                }
+            }),
+        );
+        invalid.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let losers =
+            super::backend_lb_policy_conflict_losers(&[older.clone(), invalid.clone()], &options());
+        assert!(
+            losers.is_empty(),
+            "invalid policies must not participate in conflict: {losers:?}"
+        );
+
+        // Validation precedes conflict: even if a caller incorrectly marked
+        // conflicted, the status reason stays UnsupportedValue.
+        let status = super::backend_lb_policy_status(&invalid, true);
+        let condition = accepted_condition(&status);
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "UnsupportedValue");
+        assert!(
+            condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("idleTimeout")
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_diagnostics_omit_hostile_duration_and_service_name() {
+        let hostile_duration = "1s\ninjected-hostile-duration-marker";
+        let hostile_service = "svc-echo\ninjected-hostile-service-marker";
+        let policy = backend_lb_policy(
+            "hostile",
+            serde_json::json!({
+                "targetRefs": [
+                    {"group": "", "kind": "Service", "name": "api"},
+                    {"group": "", "kind": "Service", "name": hostile_service}
+                ],
+                "sessionPersistence": {
+                    "type": "Cookie",
+                    "absoluteTimeout": hostile_duration,
+                    "cookieConfig": {"lifetimeType": "Permanent"}
+                }
+            }),
+        );
+
+        // Duplicate targetRef path uses a second policy with a repeated Service.
+        let duplicate = backend_lb_policy(
+            "dup",
+            serde_json::json!({
+                "targetRefs": [
+                    {"group": "", "kind": "Service", "name": hostile_service},
+                    {"group": "", "kind": "Service", "name": hostile_service}
+                ],
+                "sessionPersistence": {"type": "Cookie"}
+            }),
+        );
+
+        let duration_err = translate_k8s_objects(std::slice::from_ref(&policy), options())
+            .expect_err("hostile duration must fail closed");
+        let duration_msg = duration_err.to_string();
+        assert!(
+            duration_msg.contains("sessionPersistence.absoluteTimeout"),
+            "got: {duration_msg}"
+        );
+        assert!(
+            duration_msg.contains("is not a valid Gateway API duration")
+                || duration_msg.contains("exceeds the sticky-cookie"),
+            "got: {duration_msg}"
+        );
+        assert!(
+            !duration_msg.contains(hostile_duration),
+            "duration diagnostic must not echo operator text: {duration_msg}"
+        );
+        assert!(
+            !duration_msg.contains("injected-hostile-duration-marker"),
+            "got: {duration_msg}"
+        );
+
+        let duration_status = super::backend_lb_policy_status(&policy, false);
+        let duration_status_msg = duration_status["ancestors"][0]["conditions"][0]["message"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !duration_status_msg.contains(hostile_duration)
+                && !duration_status_msg.contains("injected-hostile-duration-marker"),
+            "status must not echo hostile duration: {duration_status_msg}"
+        );
+
+        let dup_err = translate_k8s_objects(std::slice::from_ref(&duplicate), options())
+            .expect_err("duplicate Service targetRef must fail closed");
+        let dup_msg = dup_err.to_string();
+        assert!(
+            dup_msg.contains("duplicates an earlier Service targetRef"),
+            "got: {dup_msg}"
+        );
+        assert!(
+            !dup_msg.contains(hostile_service)
+                && !dup_msg.contains("injected-hostile-service-marker"),
+            "duplicate diagnostic must not echo Service name: {dup_msg}"
+        );
+
+        let dup_status = super::backend_lb_policy_status(&duplicate, false);
+        let dup_status_msg = dup_status["ancestors"][0]["conditions"][0]["message"]
+            .as_str()
+            .unwrap_or("");
+        assert_eq!(
+            dup_status_msg,
+            "spec.targetRefs[1] duplicates an earlier Service targetRef"
+        );
+        assert!(
+            !dup_status_msg.contains(hostile_service)
+                && !dup_status_msg.contains("injected-hostile-service-marker"),
+            "status must not echo Service name: {dup_status_msg}"
         );
     }
 }
