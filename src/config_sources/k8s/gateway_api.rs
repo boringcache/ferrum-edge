@@ -1663,20 +1663,29 @@ pub(crate) fn finalize_frontend_tls_certificates(acc: &mut K8sAccumulator) {
 
     let mut sources: Vec<FrontendTlsCertificateSource> = Vec::new();
     for listener in &pending {
-        for (cert_path, key_path) in &listener.certificates {
-            if sources.len() >= MAX_FRONTEND_TLS_CERTIFICATE_SOURCES {
-                acc.warnings.push(format!(
-                    "Gateway API Gateway {}/{} listener {} field spec.listeners[].tls.certificateRefs exceeds the {} Gateway frontend TLS certificate limit for one config snapshot; leaving this listener's route traffic unmaterialized",
-                    listener.key.namespace,
-                    listener.key.gateway,
-                    listener.key.listener,
-                    MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
-                ));
-                if let Some(policy) = acc.gateway_api_listener_policies.get_mut(&listener.key) {
-                    policy.routes_materializable = false;
-                }
-                break;
+        // certificateRefs are one listener-scoped contract: never retain the
+        // prefix that happened to fit and silently drop the tail. A partial
+        // set could select one certificate for the SNI name while the routes
+        // are withdrawn, or answer with a different key algorithm than the
+        // operator declared. Reserve the whole group before adding any entry.
+        if sources
+            .len()
+            .saturating_add(listener.certificates.len())
+            > MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
+        {
+            acc.warnings.push(format!(
+                "Gateway API Gateway {}/{} listener {} field spec.listeners[].tls.certificateRefs exceeds the {} Gateway frontend TLS certificate limit for one config snapshot; leaving this listener's certificate set and route traffic unmaterialized",
+                listener.key.namespace,
+                listener.key.gateway,
+                listener.key.listener,
+                MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
+            ));
+            if let Some(policy) = acc.gateway_api_listener_policies.get_mut(&listener.key) {
+                policy.routes_materializable = false;
             }
+            continue;
+        }
+        for (cert_path, key_path) in &listener.certificates {
             sources.push(FrontendTlsCertificateSource {
                 namespace: listener.key.namespace.clone(),
                 gateway: listener.key.gateway.clone(),

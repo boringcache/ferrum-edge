@@ -9,7 +9,8 @@
 
 use base64::Engine as _;
 use ferrum_edge::config::types::{
-    GatewayConfig, MAX_FRONTEND_TLS_CERTIFICATE_SOURCES, default_namespace,
+    FrontendTlsCertificateSource, GatewayConfig, MAX_FRONTEND_TLS_CERTIFICATE_SOURCES,
+    default_namespace,
 };
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslation, K8sTranslationOptions, translate_k8s_objects,
@@ -620,6 +621,193 @@ fn snapshot_certificate_count_is_capped() {
             .warnings
             .iter()
             .any(|warning| warning.contains("Gateway frontend TLS certificate limit"))
+    );
+}
+
+#[test]
+fn snapshot_cap_never_retains_a_partial_listener_certificate_set() {
+    let mut listeners: Vec<Value> = (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES - 1)
+        .map(|index| {
+            https_listener(
+                &format!("a-{index:03}"),
+                (10000 + index) as u64,
+                Some(&format!("host-{index}.example.com")),
+                &["cert-a"],
+            )
+        })
+        .collect();
+    listeners.push(https_listener(
+        "zz-bundle",
+        20000,
+        Some("bundle.example.com"),
+        &["cert-a", "cert-b"],
+    ));
+    let result = translate(&[
+        gateway("ferrum", "edge", listeners),
+        tls_secret("cert-a", "ferrum"),
+        tls_secret("cert-b", "ferrum"),
+        route("ferrum", "overflow-route", "edge", "zz-bundle", "/overflow"),
+    ]);
+
+    assert_eq!(
+        result.config.frontend_tls_certificate_sources.len(),
+        MAX_FRONTEND_TLS_CERTIFICATE_SOURCES - 1,
+        "the one remaining slot cannot admit a two-certificate listener atomically"
+    );
+    assert!(
+        result
+            .config
+            .frontend_tls_certificate_sources
+            .iter()
+            .all(|source| source.listener != "zz-bundle"),
+        "no prefix of the overflowing listener's certificateRefs may remain served"
+    );
+    assert!(
+        result
+            .config
+            .proxies
+            .iter()
+            .all(|proxy| !proxy.id.contains("overflow-route")),
+        "routes for the atomically withdrawn listener must also stay unmaterialized"
+    );
+    assert!(result.warnings.iter().any(|warning| {
+        warning.contains("zz-bundle")
+            && warning.contains("certificate set and route traffic unmaterialized")
+    }));
+}
+
+#[test]
+fn native_normalization_truncates_certificate_sources_on_listener_boundaries() {
+    let mut ordered_candidates = GatewayConfig {
+        frontend_tls_certificate_sources: ["declared-first", "declared-second"]
+            .into_iter()
+            .map(|suffix| FrontendTlsCertificateSource {
+                namespace: "ferrum".to_string(),
+                gateway: "edge".to_string(),
+                listener: "https".to_string(),
+                cert_path: format!("/certs/{suffix}.crt"),
+                key_path: format!("/certs/{suffix}.key"),
+                ..Default::default()
+            })
+            .collect(),
+        ..GatewayConfig::default()
+    };
+    ordered_candidates.normalize_fields();
+    assert_eq!(
+        ordered_candidates.frontend_tls_certificate_sources[0].cert_path,
+        "/certs/declared-first.crt",
+        "normalization must preserve certificateRefs order within a listener"
+    );
+
+    let mut sources: Vec<FrontendTlsCertificateSource> =
+        (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES - 1)
+            .map(|index| FrontendTlsCertificateSource {
+                namespace: "ferrum".to_string(),
+                gateway: "edge".to_string(),
+                listener: format!("a-{index:03}"),
+                hostname: Some(format!("host-{index}.example.com")),
+                cert_path: format!("/certs/{index}.crt"),
+                key_path: format!("/certs/{index}.key"),
+                default_certificate: false,
+            })
+            .collect();
+    for suffix in ["rsa", "ecdsa"] {
+        sources.push(FrontendTlsCertificateSource {
+            namespace: "ferrum".to_string(),
+            gateway: "edge".to_string(),
+            listener: "zz-bundle".to_string(),
+            hostname: Some("bundle.example.com".to_string()),
+            cert_path: format!("/certs/bundle-{suffix}.crt"),
+            key_path: format!("/certs/bundle-{suffix}.key"),
+            default_certificate: true,
+        });
+    }
+    let mut config = GatewayConfig {
+        frontend_tls_certificate_sources: sources,
+        ..GatewayConfig::default()
+    };
+
+    config.normalize_fields();
+
+    assert_eq!(
+        config.frontend_tls_certificate_sources.len(),
+        MAX_FRONTEND_TLS_CERTIFICATE_SOURCES - 1
+    );
+    assert!(
+        config
+            .frontend_tls_certificate_sources
+            .iter()
+            .all(|source| source.listener != "zz-bundle")
+    );
+    assert_eq!(
+        config
+            .frontend_tls_certificate_sources
+            .iter()
+            .filter(|source| source.default_certificate)
+            .count(),
+        1
+    );
+    assert!(
+        config
+            .frontend_tls_certificate_sources
+            .iter()
+            .any(|source| Some(source.cert_path.as_str())
+                == config.frontend_tls_cert_path.as_deref()),
+        "the legacy fallback projection must not point at the withdrawn listener"
+    );
+
+    let oversized_group: Vec<FrontendTlsCertificateSource> =
+        (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1)
+            .map(|index| FrontendTlsCertificateSource {
+                namespace: "ferrum".to_string(),
+                gateway: "edge".to_string(),
+                listener: "only-listener".to_string(),
+                cert_path: format!("/certs/oversized-{index}.crt"),
+                key_path: format!("/certs/oversized-{index}.key"),
+                ..Default::default()
+            })
+            .collect();
+    let mut only_oversized = GatewayConfig {
+        frontend_tls_cert_path: Some("/certs/oversized-0.crt".to_string()),
+        frontend_tls_key_path: Some("/certs/oversized-0.key".to_string()),
+        frontend_tls_source_namespace: Some("ferrum".to_string()),
+        frontend_tls_certificate_sources: oversized_group,
+        ..GatewayConfig::default()
+    };
+    only_oversized.normalize_fields();
+    assert!(only_oversized.frontend_tls_certificate_sources.is_empty());
+    assert_eq!(only_oversized.frontend_tls_cert_path, None);
+    assert_eq!(only_oversized.frontend_tls_key_path, None);
+    assert_eq!(only_oversized.frontend_tls_source_namespace, None);
+
+    let mut oversized_with_operator_fallback = GatewayConfig {
+        frontend_tls_cert_path: Some("/operator/fallback.crt".to_string()),
+        frontend_tls_key_path: Some("/operator/fallback.key".to_string()),
+        frontend_tls_certificate_sources: (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1)
+            .map(|index| FrontendTlsCertificateSource {
+                namespace: "ferrum".to_string(),
+                gateway: "edge".to_string(),
+                listener: "only-listener".to_string(),
+                cert_path: format!("/certs/oversized-{index}.crt"),
+                key_path: format!("/certs/oversized-{index}.key"),
+                ..Default::default()
+            })
+            .collect(),
+        ..GatewayConfig::default()
+    };
+    oversized_with_operator_fallback.normalize_fields();
+    assert!(
+        oversized_with_operator_fallback
+            .frontend_tls_certificate_sources
+            .is_empty()
+    );
+    assert_eq!(
+        oversized_with_operator_fallback.frontend_tls_cert_path.as_deref(),
+        Some("/operator/fallback.crt")
+    );
+    assert_eq!(
+        oversized_with_operator_fallback.frontend_tls_key_path.as_deref(),
+        Some("/operator/fallback.key")
     );
 }
 

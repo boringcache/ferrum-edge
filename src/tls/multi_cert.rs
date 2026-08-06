@@ -32,9 +32,11 @@ use crate::tls::source::{CertSource, MaterialKind, SourceScheme, load_material_b
 /// The certificate set is already capped at admission
 /// (`MAX_FRONTEND_TLS_CERTIFICATE_SOURCES`), but a single certificate may carry
 /// an arbitrary number of SANs, so the derived index needs its own ceiling.
-/// Names beyond it are dropped with a warning; the affected certificate is
-/// still reachable through its listener hostname or the fallback slot, so this
-/// degrades selection rather than failing a handshake open.
+/// Every explicit listener hostname is indexed first. Only additional
+/// certificate-derived SAN aliases beyond the bound are dropped with a warning,
+/// so a SAN-heavy certificate can never displace another listener's declared
+/// SNI mapping. An omitted catch-all alias falls through to the deterministic
+/// fallback (and therefore to normal client certificate-name verification).
 pub const MAX_SNI_INDEX_ENTRIES: usize = 4096;
 
 /// One Gateway-owned certificate to install in the resolver.
@@ -48,7 +50,9 @@ pub struct GatewayCertificateInput {
     /// `namespace/gateway/listener` — public metadata, used for diagnostics.
     /// Never contains certificate or key bytes.
     pub identity: String,
-    /// Whether this is the snapshot's fallback certificate.
+    /// Whether this certificate belongs to the snapshot's fallback listener.
+    /// Runtime grouping by `identity` retains every RSA/ECDSA alternative on
+    /// that listener even when only one serialized entry carries the marker.
     pub is_default: bool,
 }
 
@@ -57,11 +61,11 @@ pub struct GatewayCertificateInput {
 /// `Debug` deliberately reports only counts: a `CertifiedKey` holds a live
 /// signing key, and a resolver is reachable from broad runtime state dumps.
 pub struct SniCertResolver {
-    exact: HashMap<String, Arc<CertifiedKey>>,
+    exact: HashMap<String, Vec<Arc<CertifiedKey>>>,
     /// Keyed by the suffix AFTER `*.`, so `*.example.com` is stored as
     /// `example.com` and matched against a client name's parent domain.
-    wildcard: HashMap<String, Arc<CertifiedKey>>,
-    fallback: Arc<CertifiedKey>,
+    wildcard: HashMap<String, Vec<Arc<CertifiedKey>>>,
+    fallback: Vec<Arc<CertifiedKey>>,
 }
 
 impl std::fmt::Debug for SniCertResolver {
@@ -74,21 +78,22 @@ impl std::fmt::Debug for SniCertResolver {
 }
 
 impl SniCertResolver {
-    /// The certificate a server name selects, or `None` to use the fallback.
+    /// The certificate candidates a server name selects, or `None` to use the
+    /// fallback listener's candidates.
     ///
     /// Exact beats wildcard: `a.example.com` prefers a certificate that names
     /// it outright over one that only names `*.example.com`. Wildcards match a
     /// single label, per RFC 6125 — `*.example.com` covers `a.example.com` but
     /// not `a.b.example.com` and not bare `example.com`.
-    fn select(&self, server_name: &str) -> Option<Arc<CertifiedKey>> {
-        if let Some(certified_key) = self.exact.get(server_name) {
-            return Some(certified_key.clone());
+    fn candidates(&self, server_name: &str) -> Option<&[Arc<CertifiedKey>]> {
+        if let Some(certified_keys) = self.exact.get(server_name) {
+            return Some(certified_keys);
         }
         let (label, parent) = server_name.split_once('.')?;
         if label.is_empty() || parent.is_empty() {
             return None;
         }
-        self.wildcard.get(parent).cloned()
+        self.wildcard.get(parent).map(Vec::as_slice)
     }
 }
 
@@ -98,11 +103,32 @@ impl ResolvesServerCert for SniCertResolver {
         // ClientHello without SNI (or with an unknown one) is answered with the
         // fallback rather than a handshake failure — the same credential a
         // single-certificate listener would have presented.
-        let selected = client_hello
+        let signature_schemes = client_hello.signature_schemes();
+        if let Some(candidates) = client_hello
             .server_name()
-            .and_then(|server_name| self.select(server_name));
-        Some(selected.unwrap_or_else(|| self.fallback.clone()))
+            .and_then(|server_name| self.candidates(server_name))
+        {
+            // A claimed exact/wildcard name is authoritative. If none of its
+            // certificates supports the client's signature schemes, fail the
+            // handshake rather than answering that name with an unrelated
+            // fallback certificate.
+            return select_compatible_certified_key(candidates, signature_schemes);
+        }
+        select_compatible_certified_key(&self.fallback, signature_schemes)
     }
+}
+
+/// First certificate whose signing key can satisfy the ClientHello. One
+/// listener may legitimately carry RSA and ECDSA certificateRefs for the same
+/// SNI; retaining only the first would make the other credential unreachable.
+fn select_compatible_certified_key(
+    candidates: &[Arc<CertifiedKey>],
+    signature_schemes: &[rustls::SignatureScheme],
+) -> Option<Arc<CertifiedKey>> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.key.choose_scheme(signature_schemes).is_some())
+        .cloned()
 }
 
 /// Build the frontend `ServerConfig` that serves a Gateway's whole certificate
@@ -123,6 +149,12 @@ pub fn load_gateway_multi_cert_tls_config(
 ) -> Result<Arc<rustls::ServerConfig>, anyhow::Error> {
     if certificates.is_empty() {
         anyhow::bail!("Gateway frontend TLS was requested with no certificate sources");
+    }
+    if certificates.len() > crate::config::types::MAX_FRONTEND_TLS_CERTIFICATE_SOURCES {
+        anyhow::bail!(
+            "Gateway frontend TLS certificate set exceeds {} sources",
+            crate::config::types::MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
+        );
     }
 
     // A single stapled OCSP response is bound to ONE certificate, so it is
@@ -158,14 +190,9 @@ pub fn load_gateway_multi_cert_tls_config(
         (None, _) => Vec::new(),
     };
 
-    let mut exact: HashMap<String, Arc<CertifiedKey>> = HashMap::new();
-    let mut wildcard: HashMap<String, Arc<CertifiedKey>> = HashMap::new();
-    let mut fallback: Option<Arc<CertifiedKey>> = None;
-    let mut indexed_names = 0usize;
-    let mut dropped_names = 0usize;
     let mut cert_display = String::new();
     let mut key_display = String::new();
-    let mut first_key: Option<Arc<CertifiedKey>> = None;
+    let mut loaded = Vec::with_capacity(certificates.len());
 
     for input in certificates {
         let (certified_key, leaf, cert_source_id, key_source_id) =
@@ -175,47 +202,64 @@ pub fn load_gateway_multi_cert_tls_config(
             key_display = key_source_id;
         }
 
-        for name in sni_names_for(input, &leaf) {
-            if indexed_names >= MAX_SNI_INDEX_ENTRIES {
-                dropped_names += 1;
-                continue;
-            }
-            // Own the derived key before choosing a map: taking `&mut` to one
-            // of two maps while a borrow of `name` is still live would not
-            // borrow-check.
-            let wildcard_parent = name
-                .strip_prefix("*.")
-                .filter(|parent| !parent.is_empty())
-                .map(str::to_string);
-            let (map, key) = match wildcard_parent {
-                Some(parent) => (&mut wildcard, parent),
-                None => (&mut exact, name),
-            };
-            match map.entry(key) {
-                std::collections::hash_map::Entry::Occupied(entry) => {
-                    // First writer wins, and the order is the control plane's
-                    // deterministic one, so the same snapshot always resolves
-                    // the same way. Overlapping SANs are ordinary, so this is
-                    // a debug line rather than a warning.
-                    debug!(
-                        server_name = %entry.key(),
-                        certificate = %input.identity,
-                        "Gateway certificate does not take this SNI name; an earlier certificate \
-                         already serves it"
-                    );
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(certified_key.clone());
-                    indexed_names += 1;
-                }
-            }
-        }
+        loaded.push((input, certified_key, leaf));
+    }
 
-        if input.is_default && fallback.is_none() {
-            fallback = Some(certified_key.clone());
+    let mut exact: HashMap<String, Vec<Arc<CertifiedKey>>> = HashMap::new();
+    let mut wildcard: HashMap<String, Vec<Arc<CertifiedKey>>> = HashMap::new();
+    let mut indexed_names = 0usize;
+    let mut dropped_names = 0usize;
+
+    // Declared listener hostnames are the operator's routing contract and must
+    // never lose an index slot to certificate-derived SANs. Index every one in
+    // a first pass; the admitted certificate set is capped at 256, so these
+    // always fit under the separate 4096-name ceiling. If this public loader is
+    // called with a larger hand-built set, fail the snapshot closed rather than
+    // answering a declared hostname with the fallback certificate.
+    for (input, certified_key, _) in &loaded {
+        let Some(raw_hostname) = input.hostname.as_deref() else {
+            continue;
+        };
+        let hostname = normalize_indexable_sni_name(raw_hostname).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Gateway certificate {} has an invalid explicit listener hostname",
+                input.identity
+            )
+        })?;
+        if !index_sni_name(
+            &mut exact,
+            &mut wildcard,
+            hostname,
+            certified_key,
+            &input.identity,
+            &mut indexed_names,
+        ) {
+            anyhow::bail!(
+                "Gateway frontend TLS explicit listener hostname index exceeds {} entries",
+                MAX_SNI_INDEX_ENTRIES
+            );
         }
-        if first_key.is_none() {
-            first_key = Some(certified_key);
+    }
+
+    // Certificate SANs are useful aliases, especially for catch-all listeners,
+    // but they are subordinate to declared listener hostnames. Once the bound
+    // is reached, omit only additional SAN aliases; no later listener can lose
+    // its explicit SNI mapping because those mappings were installed above.
+    for (input, certified_key, leaf) in &loaded {
+        for name in leaf_dns_sans(leaf)
+            .into_iter()
+            .filter_map(|name| normalize_indexable_sni_name(&name))
+        {
+            if !index_sni_name(
+                &mut exact,
+                &mut wildcard,
+                name,
+                certified_key,
+                &input.identity,
+                &mut indexed_names,
+            ) {
+                dropped_names += 1;
+            }
         }
     }
 
@@ -223,18 +267,32 @@ pub fn load_gateway_multi_cert_tls_config(
         warn!(
             dropped_names,
             limit = MAX_SNI_INDEX_ENTRIES,
-            "Gateway frontend TLS SNI index reached its limit; the remaining names are served by \
-             their listener hostname or the fallback certificate"
+            "Gateway frontend TLS SNI index reached its limit; additional certificate SAN aliases \
+             were omitted after every declared listener hostname was indexed"
         );
     }
 
-    // No entry carried the marker (a snapshot from a control plane that
-    // predates it, or a hand-written config): the first certificate in the
-    // control plane's deterministic order takes the slot rather than leaving
-    // the listener with no credential for an unmatched ClientHello.
-    let fallback = fallback.or(first_key).ok_or_else(|| {
-        anyhow::anyhow!("Gateway frontend TLS produced no usable fallback certificate")
-    })?;
+    // The fallback is listener-scoped, not certificate-scoped. If the selected
+    // catch-all/default listener carries RSA + ECDSA refs, retain both so an
+    // unmatched/no-SNI ClientHello can negotiate a compatible signing key.
+    // A snapshot with no marker (older CP / hand-written config) uses the first
+    // listener identity in deterministic input order.
+    let fallback_identity = certificates
+        .iter()
+        .find(|input| input.is_default)
+        .or_else(|| certificates.first())
+        .map(|input| input.identity.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Gateway frontend TLS produced no fallback listener identity")
+        })?;
+    let fallback: Vec<Arc<CertifiedKey>> = loaded
+        .iter()
+        .filter(|(input, _, _)| input.identity == fallback_identity)
+        .map(|(_, certified_key, _)| certified_key.clone())
+        .collect();
+    if fallback.is_empty() {
+        anyhow::bail!("Gateway frontend TLS produced no usable fallback certificate");
+    }
 
     info!(
         certificate_count = certificates.len(),
@@ -329,25 +387,59 @@ fn load_certified_key(
     ))
 }
 
-/// The SNI names one certificate answers to.
-///
-/// The listener `hostname` comes first because it is what the operator
-/// *declared* this listener serves; the leaf's own DNS SANs follow so a
-/// catch-all listener (no hostname) is still reachable by name, and so a
-/// multi-SAN certificate covers every name it was actually issued for.
-fn sni_names_for(input: &GatewayCertificateInput, leaf: &CertificateDer<'_>) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Some(hostname) = input.hostname.as_deref()
-        && is_indexable_sni_name(hostname)
-    {
-        names.push(hostname.to_string());
-    }
-    for san in leaf_dns_sans(leaf) {
-        if is_indexable_sni_name(&san) && !names.contains(&san) {
-            names.push(san);
+/// Add one normalized name without allowing derived aliases to grow the index
+/// past its fixed bound. Returns `false` only when this would be a new entry at
+/// capacity; duplicate names append bounded signature-compatible candidates in
+/// deterministic input order.
+fn index_sni_name(
+    exact: &mut HashMap<String, Vec<Arc<CertifiedKey>>>,
+    wildcard: &mut HashMap<String, Vec<Arc<CertifiedKey>>>,
+    name: String,
+    certified_key: &Arc<CertifiedKey>,
+    identity: &str,
+    indexed_names: &mut usize,
+) -> bool {
+    let wildcard_parent = name
+        .strip_prefix("*.")
+        .filter(|parent| !parent.is_empty())
+        .map(str::to_string);
+    let (map, key) = match wildcard_parent {
+        Some(parent) => (wildcard, parent),
+        None => (exact, name),
+    };
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            if !entry
+                .get()
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, certified_key))
+            {
+                debug!(
+                    server_name = %entry.key(),
+                    certificate = identity,
+                    "Gateway certificate added as another signature-compatible candidate for this SNI name"
+                );
+                entry.into_mut().push(certified_key.clone());
+            }
+            true
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            if *indexed_names >= MAX_SNI_INDEX_ENTRIES {
+                return false;
+            }
+            entry.insert(vec![certified_key.clone()]);
+            *indexed_names += 1;
+            true
         }
     }
-    names
+}
+
+/// Canonicalize a listener hostname or certificate SAN for rustls lookup.
+/// Gateway translation already emits this shape, but the runtime also accepts
+/// native/ConfigSync snapshots and therefore defends the boundary itself.
+fn normalize_indexable_sni_name(name: &str) -> Option<String> {
+    let normalized = name.trim_end_matches('.').to_ascii_lowercase();
+    is_indexable_sni_name(&normalized).then_some(normalized)
 }
 
 /// DNS SANs of a leaf certificate, ASCII-lowercased.
@@ -387,8 +479,11 @@ fn is_indexable_sni_name(name: &str) -> bool {
         return false;
     }
     candidate.split('.').all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
+        let bytes = label.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= 63
+            && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
             && label
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
@@ -399,6 +494,27 @@ fn is_indexable_sni_name(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn test_certified_key(
+        algorithm: &'static rcgen::SignatureAlgorithm,
+        dns_name: &str,
+    ) -> Arc<CertifiedKey> {
+        let key_pair = rcgen::KeyPair::generate_for(algorithm).expect("test key pair");
+        let params = rcgen::CertificateParams::new(vec![dns_name.to_string()])
+            .expect("test certificate parameters");
+        let certificate = params.self_signed(&key_pair).expect("test certificate");
+        let private_key = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
+            .expect("test private key DER");
+        let provider = rustls::crypto::ring::default_provider();
+        let signing_key = provider
+            .key_provider
+            .load_private_key(private_key)
+            .expect("test signing key");
+        Arc::new(CertifiedKey::new(
+            vec![certificate.der().clone()],
+            signing_key,
+        ))
+    }
+
     #[test]
     fn indexable_sni_names_reject_unusable_shapes() {
         assert!(is_indexable_sni_name("api.example.com"));
@@ -407,6 +523,51 @@ mod tests {
         assert!(!is_indexable_sni_name(""));
         assert!(!is_indexable_sni_name("a..b"));
         assert!(!is_indexable_sni_name("a_b.example.com"));
+        assert!(!is_indexable_sni_name("-api.example.com"));
+        assert!(!is_indexable_sni_name("api-.example.com"));
         assert!(!is_indexable_sni_name(&"a".repeat(254)));
+    }
+
+    #[test]
+    fn one_sni_keeps_and_selects_signature_compatible_certificate_candidates() {
+        let ecdsa = test_certified_key(&rcgen::PKCS_ECDSA_P256_SHA256, "api.example.com");
+        let ed25519 = test_certified_key(&rcgen::PKCS_ED25519, "api.example.com");
+        let mut exact = HashMap::new();
+        let mut wildcard = HashMap::new();
+        let mut indexed_names = 0;
+        assert!(index_sni_name(
+            &mut exact,
+            &mut wildcard,
+            "api.example.com".to_string(),
+            &ecdsa,
+            "ferrum/edge/https",
+            &mut indexed_names,
+        ));
+        assert!(index_sni_name(
+            &mut exact,
+            &mut wildcard,
+            "api.example.com".to_string(),
+            &ed25519,
+            "ferrum/edge/https",
+            &mut indexed_names,
+        ));
+
+        let candidates = exact.get("api.example.com").expect("SNI candidates");
+        assert_eq!(indexed_names, 1, "the bound counts names, not algorithms");
+        assert_eq!(candidates.len(), 2);
+        let selected = select_compatible_certified_key(
+            candidates,
+            &[rustls::SignatureScheme::ED25519],
+        )
+        .expect("Ed25519 candidate");
+        assert!(Arc::ptr_eq(&selected, &ed25519));
+        assert!(
+            select_compatible_certified_key(
+                candidates,
+                &[rustls::SignatureScheme::RSA_PKCS1_SHA256],
+            )
+            .is_none(),
+            "an SNI with no compatible key must fail instead of falling back"
+        );
     }
 }

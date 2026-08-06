@@ -1285,7 +1285,7 @@ fn stage_frontend_tls_snapshot(
             // control plane that predates the field) still resolves to
             // exactly the single-certificate behavior it had before.
             let certificates = gateway_certificate_inputs(config);
-            let mut tls_config = if certificates.len() > 1 {
+            let mut tls_config = if !certificates.is_empty() {
                 load_gateway_multi_cert_tls_config(
                     &certificates,
                     proxy_state
@@ -1339,8 +1339,8 @@ fn stage_frontend_tls_snapshot(
 
             Ok(FrontendTlsSnapshotUpdate::Replace {
                 tls_config,
-                cert_source: if certificates.len() > 1 {
-                    format!("{} Gateway certificates", certificates.len())
+                cert_source: if !certificates.is_empty() {
+                    format!("{} Gateway certificate(s)", certificates.len())
                 } else {
                     cert_path.to_string()
                 },

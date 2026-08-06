@@ -8,7 +8,9 @@
 
 use ferrum_edge::config::EnvConfig;
 use ferrum_edge::tls::TlsPolicy;
-use ferrum_edge::tls::multi_cert::{GatewayCertificateInput, load_gateway_multi_cert_tls_config};
+use ferrum_edge::tls::multi_cert::{
+    GatewayCertificateInput, MAX_SNI_INDEX_ENTRIES, load_gateway_multi_cert_tls_config,
+};
 use rustls::pki_types::ServerName;
 use std::sync::{Arc, Once};
 use tempfile::TempDir;
@@ -265,6 +267,33 @@ async fn unmatched_sni_falls_back_to_the_marked_default() {
 }
 
 #[tokio::test]
+async fn declared_listener_hostname_survives_certificate_san_index_saturation() {
+    ensure_crypto_provider();
+    let dir = TempDir::new().expect("temp dir");
+    let san_names: Vec<String> = (0..MAX_SNI_INDEX_ENTRIES)
+        .map(|index| format!("san-{index}.saturation.example"))
+        .collect();
+    let san_refs: Vec<&str> = san_names.iter().map(String::as_str).collect();
+    let saturated = write_certificate(&dir, "saturated", &san_refs);
+    let declared = write_certificate(&dir, "declared", &["certificate-only.example.net"]);
+    let config = server_config(&[
+        input(&saturated, "ferrum/edge/catch-all", None, true),
+        input(
+            &declared,
+            "ferrum/edge/declared",
+            Some("PRIORITY.Example.COM."),
+            false,
+        ),
+    ]);
+
+    assert_eq!(
+        presented_leaf(config, "priority.example.com").await,
+        declared.der,
+        "certificate SAN aliases must never consume the slot for a later listener's explicit, canonically equivalent hostname"
+    );
+}
+
+#[tokio::test]
 async fn rotating_one_certificate_leaves_the_others_serving() {
     ensure_crypto_provider();
     let dir = TempDir::new().expect("temp dir");
@@ -341,6 +370,39 @@ fn one_unloadable_certificate_fails_the_whole_set_closed() {
 }
 
 #[test]
+fn an_invalid_explicit_listener_hostname_fails_the_whole_set_closed() {
+    ensure_crypto_provider();
+    let Fixture {
+        _dir,
+        alpha,
+        fallback,
+        ..
+    } = fixture();
+    let malformed = input(
+        &alpha,
+        "ferrum/edge-a/https",
+        Some("bad host.example.com"),
+        false,
+    );
+
+    let error = load_gateway_multi_cert_tls_config(
+        &[
+            input(&fallback, "ferrum/edge/catch-all", None, true),
+            malformed,
+        ],
+        None,
+        None,
+        &tls_policy(),
+        30,
+        &[],
+    )
+    .expect_err("a malformed declared hostname must reject the whole snapshot");
+
+    assert!(error.to_string().contains("invalid explicit listener hostname"));
+    assert!(!error.to_string().contains("bad host.example.com"));
+}
+
+#[test]
 fn a_mismatched_certificate_and_key_pair_is_refused() {
     ensure_crypto_provider();
     let Fixture {
@@ -393,4 +455,29 @@ async fn an_unmarked_set_still_produces_a_fallback() {
         presented_leaf(config, "unknown.example.org").await,
         alpha.der
     );
+}
+
+#[test]
+fn runtime_refuses_a_hand_built_certificate_set_over_the_admission_bound() {
+    let certificates: Vec<GatewayCertificateInput> =
+        (0..ferrum_edge::config::types::MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1)
+            .map(|index| GatewayCertificateInput {
+                cert_source: format!("/not-loaded/{index}.crt"),
+                key_source: format!("/not-loaded/{index}.key"),
+                hostname: None,
+                identity: format!("ferrum/edge/listener-{index}"),
+                is_default: index == 0,
+            })
+            .collect();
+
+    let error = load_gateway_multi_cert_tls_config(
+        &certificates,
+        None,
+        None,
+        &tls_policy(),
+        30,
+        &[],
+    )
+    .expect_err("the runtime must enforce the same resident certificate bound");
+    assert!(error.to_string().contains("certificate set exceeds"));
 }

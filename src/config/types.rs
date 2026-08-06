@@ -2850,18 +2850,6 @@ impl FrontendTlsCertificateSource {
         format!("{}/{}/{}", self.namespace, self.gateway, self.listener)
     }
 
-    /// Stable ordering / dedup key. `cert_path` participates because one
-    /// listener legitimately serves several certificates (for example an RSA
-    /// and an ECDSA leaf for the same hostname).
-    pub fn identity_key(&self) -> (&str, &str, &str, &str, &str) {
-        (
-            self.namespace.as_str(),
-            self.gateway.as_str(),
-            self.listener.as_str(),
-            self.cert_path.as_str(),
-            self.key_path.as_str(),
-        )
-    }
 }
 
 /// Upper bound on Gateway-delivered frontend TLS certificates in one snapshot.
@@ -3987,16 +3975,122 @@ impl GatewayConfig {
     /// Normalize all resource fields that have canonical in-memory forms and
     /// refresh derived runtime projections skipped by serde.
     pub fn normalize_fields(&mut self) {
+        let had_gateway_certificate_sources = !self.frontend_tls_certificate_sources.is_empty();
+        let legacy_was_gateway_projection = self
+            .frontend_tls_cert_path
+            .as_deref()
+            .zip(self.frontend_tls_key_path.as_deref())
+            .is_some_and(|(cert_path, key_path)| {
+                self.frontend_tls_certificate_sources.iter().any(|source| {
+                    source.cert_path == cert_path && source.key_path == key_path
+                })
+            });
         // Certificate sources are keyed by owning listener, NOT by namespace:
         // one listener may serve several certificateRefs and one namespace may
         // hold several independently owned Gateways (#3267 / #3268). Deduping
         // by namespace here would silently collapse them back into a singleton.
-        self.frontend_tls_certificate_sources
-            .sort_by(|left, right| left.identity_key().cmp(&right.identity_key()));
-        self.frontend_tls_certificate_sources
-            .dedup_by(|left, right| left.identity_key() == right.identity_key());
-        self.frontend_tls_certificate_sources
-            .truncate(MAX_FRONTEND_TLS_CERTIFICATE_SOURCES);
+        // Stable sorting groups listeners deterministically while retaining
+        // certificateRefs order *within* each listener. Candidate order is the
+        // resolver's tie-break when several keys support the same signature
+        // schemes, so sorting by certificate path would silently rewrite it.
+        self.frontend_tls_certificate_sources.sort_by(|left, right| {
+            (
+                left.namespace.as_str(),
+                left.gateway.as_str(),
+                left.listener.as_str(),
+            )
+                .cmp(&(
+                    right.namespace.as_str(),
+                    right.gateway.as_str(),
+                    right.listener.as_str(),
+                ))
+        });
+        let mut seen_certificate_sources = HashSet::new();
+        self.frontend_tls_certificate_sources.retain(|source| {
+            seen_certificate_sources.insert((
+                source.namespace.clone(),
+                source.gateway.clone(),
+                source.listener.clone(),
+                source.cert_path.clone(),
+                source.key_path.clone(),
+            ))
+        });
+        if self.frontend_tls_certificate_sources.len() > MAX_FRONTEND_TLS_CERTIFICATE_SOURCES {
+            // Never split one listener's certificateRefs at the resident-set
+            // bound. Serving a prefix of a listener's credentials would violate
+            // the same atomicity the Kubernetes translator enforces and could
+            // answer the listener with a different certificate set than the
+            // operator declared.
+            let overflow = &self.frontend_tls_certificate_sources
+                [MAX_FRONTEND_TLS_CERTIFICATE_SOURCES];
+            let overflow_listener = (
+                overflow.namespace.clone(),
+                overflow.gateway.clone(),
+                overflow.listener.clone(),
+            );
+            let truncate_at = self.frontend_tls_certificate_sources
+                [..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES]
+                .iter()
+                .position(|source| {
+                    source.namespace == overflow_listener.0
+                        && source.gateway == overflow_listener.1
+                        && source.listener == overflow_listener.2
+                })
+                .unwrap_or(MAX_FRONTEND_TLS_CERTIFICATE_SOURCES);
+            self.frontend_tls_certificate_sources.truncate(truncate_at);
+        }
+
+        // Serialized/native snapshots are allowed to omit or duplicate fallback
+        // markers. Re-derive exactly one per namespace after dedup/capping, then
+        // project the lexicographically-first namespace's choice into the legacy
+        // single-certificate fields. This keeps the one-entry path and the SNI
+        // resolver on the same credential even for a hand-authored snapshot.
+        if !self.frontend_tls_certificate_sources.is_empty() {
+            let mut default_indexes: BTreeMap<String, usize> = BTreeMap::new();
+            for preference in 0..3 {
+                for (index, source) in self.frontend_tls_certificate_sources.iter().enumerate() {
+                    let eligible = match preference {
+                        0 => source.default_certificate,
+                        1 => source.hostname.is_none(),
+                        _ => true,
+                    };
+                    if eligible {
+                        default_indexes
+                            .entry(source.namespace.clone())
+                            .or_insert(index);
+                    }
+                }
+            }
+            for (index, source) in self
+                .frontend_tls_certificate_sources
+                .iter_mut()
+                .enumerate()
+            {
+                source.default_certificate =
+                    default_indexes.get(&source.namespace).copied() == Some(index);
+            }
+            if let Some(default_source) = default_indexes
+                .iter()
+                .next()
+                .and_then(|(_, index)| self.frontend_tls_certificate_sources.get(*index))
+                .cloned()
+            {
+                self.frontend_tls_cert_path = Some(default_source.cert_path);
+                self.frontend_tls_key_path = Some(default_source.key_path);
+                self.frontend_tls_source_namespace = Some(default_source.namespace);
+            }
+        } else if had_gateway_certificate_sources
+            && (self.frontend_tls_source_namespace.is_some() || legacy_was_gateway_projection)
+        {
+            // The only listener group exceeded the bound and was withdrawn in
+            // full. Its legacy fallback projection must be withdrawn too, or
+            // the single-certificate path would resurrect one member of the
+            // rejected group. An unrelated operator fallback has no owning
+            // namespace and does not match a Gateway source, so it survives.
+            self.frontend_tls_cert_path = None;
+            self.frontend_tls_key_path = None;
+            self.frontend_tls_source_namespace = None;
+        }
         self.normalize_hosts();
         for consumer in &mut self.consumers {
             consumer.normalize_fields();
