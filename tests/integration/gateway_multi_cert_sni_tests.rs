@@ -170,7 +170,9 @@ async fn sni_selects_the_certificate_that_names_the_requested_host() {
 #[tokio::test]
 async fn certificate_san_selects_even_without_a_listener_hostname() {
     ensure_crypto_provider();
-    let Fixture { _dir, alpha, beta, .. } = fixture();
+    let Fixture {
+        _dir, alpha, beta, ..
+    } = fixture();
     // Both listeners are catch-all: selection has to come from each leaf's own
     // SANs, which is the shape a Gateway with no `hostname` produces.
     let config = server_config(&[
@@ -376,7 +378,9 @@ fn an_empty_certificate_set_is_refused() {
 #[tokio::test]
 async fn an_unmarked_set_still_produces_a_fallback() {
     ensure_crypto_provider();
-    let Fixture { _dir, alpha, beta, .. } = fixture();
+    let Fixture {
+        _dir, alpha, beta, ..
+    } = fixture();
     // No entry carries the default marker (an older control plane): the first
     // certificate in the delivered order must take the fallback slot rather
     // than leaving the listener without a credential.
