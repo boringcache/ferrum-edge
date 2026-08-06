@@ -266,6 +266,17 @@ async fn unmatched_sni_falls_back_to_the_marked_default() {
     );
 }
 
+/// SANs per saturating certificate.
+///
+/// rustls pairs a leaf through webpki, which reads the certificate's top-level
+/// DER SEQUENCE with a two-byte length limit (65535 bytes). All
+/// `MAX_SNI_INDEX_ENTRIES` names on ONE leaf is roughly 120 KiB and is rejected
+/// at load as `BadEncoding` — no resolver would ever see it, and no product
+/// change could accept it. Spreading the names over several certificates keeps
+/// every leaf servable and models what an alias-heavy catch-all listener with
+/// multiple `certificateRefs` actually looks like. 512 names is about 15 KiB.
+const SATURATION_SANS_PER_CERTIFICATE: usize = 512;
+
 #[tokio::test]
 async fn declared_listener_hostname_survives_certificate_san_index_saturation() {
     ensure_crypto_provider();
@@ -273,18 +284,30 @@ async fn declared_listener_hostname_survives_certificate_san_index_saturation() 
     let san_names: Vec<String> = (0..MAX_SNI_INDEX_ENTRIES)
         .map(|index| format!("san-{index}.saturation.example"))
         .collect();
-    let san_refs: Vec<&str> = san_names.iter().map(String::as_str).collect();
-    let saturated = write_certificate(&dir, "saturated", &san_refs);
+    let saturating: Vec<TestCertificate> = san_names
+        .chunks(SATURATION_SANS_PER_CERTIFICATE)
+        .enumerate()
+        .map(|(part, names)| {
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            write_certificate(&dir, &format!("saturated-{part}"), &refs)
+        })
+        .collect();
     let declared = write_certificate(&dir, "declared", &["certificate-only.example.net"]);
-    let config = server_config(&[
-        input(&saturated, "ferrum/edge/catch-all", None, true),
-        input(
-            &declared,
-            "ferrum/edge/declared",
-            Some("PRIORITY.Example.COM."),
-            false,
-        ),
-    ]);
+
+    // One catch-all listener carrying every saturating certificate, so the
+    // SAN pass alone would exhaust the index before the declared hostname.
+    let mut certificates: Vec<GatewayCertificateInput> = Vec::new();
+    for certificate in &saturating {
+        certificates.push(input(certificate, "ferrum/edge/catch-all", None, true));
+    }
+    let declared_listener = input(
+        &declared,
+        "ferrum/edge/declared",
+        Some("PRIORITY.Example.COM."),
+        false,
+    );
+    certificates.push(declared_listener);
+    let config = server_config(&certificates);
 
     assert_eq!(
         presented_leaf(config, "priority.example.com").await,
