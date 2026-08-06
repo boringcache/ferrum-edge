@@ -1259,6 +1259,7 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
             egress: Vec::new(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }],
         waypoint_bindings: vec![MeshWaypointBinding {
             name: name("waypoint"),

@@ -1590,7 +1590,7 @@ async fn grpc_web_early_rejects_are_browser_safe_on_h1_and_h2() {
             Method::POST,
             "/missing/pkg.Service/Call",
             "route miss",
-            5u32,
+            12u32,
         ),
         (
             Method::PUT,
@@ -1684,7 +1684,7 @@ async fn grpc_web_early_rejects_are_browser_safe_on_h1_and_h2() {
         headers.get("content-type").map(String::as_str),
         Some("application/grpc")
     );
-    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("5"));
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("12"));
     assert!(
         body.is_empty(),
         "native gRPC reject must remain trailers-only"
@@ -2376,7 +2376,10 @@ async fn test_grpc_unmatched_path_returns_grpc_error() {
         "gRPC route miss should return HTTP 200 with grpc-status"
     );
     let grpc_status = headers.get("grpc-status").expect("should have grpc-status");
-    assert_eq!(grpc_status, "5", "Route miss should map to NOT_FOUND (5)");
+    assert_eq!(
+        grpc_status, "12",
+        "Route miss should map to UNIMPLEMENTED (12) per gRPC HTTP mapping / GATEWAY-GRPC"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -2328,9 +2328,10 @@ fn trailer_name_allowlist_from_metadata(
 ///
 /// Spec: <https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md>.
 /// Used only when a numeric `grpc-status` is absent; a valid supplied status
-/// remains authoritative. This is intentionally distinct from the gateway's
-/// reject-path mapper (`http_reject_status_to_grpc_status`), which chooses
-/// richer codes for Ferrum-authored refusals.
+/// remains authoritative. HTTP 404 → UNIMPLEMENTED matches Ferrum's
+/// reject-path mapper (`http_reject_status_to_grpc_status`) so gRPC-Web
+/// trailer synthesis and native trailers-only rejects stay aligned for
+/// Gateway API `GRPCExactMethodMatching` unmatched methods.
 pub(crate) fn http_response_status_to_grpc_status(http_status: u16) -> u32 {
     match http_status {
         400 => 13,                   // INTERNAL

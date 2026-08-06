@@ -8495,6 +8495,24 @@ fn apply_traffic_policy_tls_to_backend_config(
     identity: &str,
     presents_dynamic_svid: bool,
 ) -> Result<(), anyhow::Error> {
+    if let Some(ca_certificates) = tls.ca_certificates.as_deref()
+        && let Err(error) = crate::config::types::validate_tls_material_source_field(
+            "DestinationRule trafficPolicy.tls.ca_certificates",
+            ca_certificates,
+            crate::tls::source::MaterialKind::CaBundle,
+        )
+    {
+        return Err(anyhow::anyhow!(error));
+    }
+    if let Some(error) = crate::config::types::validate_system_trust_roots_skip_verify_pairing(
+        "DestinationRule trafficPolicy.tls.ca_certificates",
+        "DestinationRule trafficPolicy.tls.insecure_skip_verify",
+        tls.ca_certificates.as_deref(),
+        tls.insecure_skip_verify,
+    ) {
+        return Err(anyhow::anyhow!(error));
+    }
+
     match tls.mode {
         MtlsMode::Disable => {
             slot.client_cert_path = None;
@@ -9749,13 +9767,21 @@ fn inject_mesh_global_plugins(
         );
     }
 
-    // Outbound registry: inject the `mesh_outbound_registry` plugin when
-    // either the slice (CRD path) OR the runtime env var declares
-    // REGISTRY_ONLY. Both default to AllowAny (no plugin) so non-mesh
-    // and permissive deployments pay zero per-request cost.
-    let effective_outbound_policy = mesh_slice
-        .outbound_traffic_policy
-        .unwrap_or(runtime.outbound_traffic_policy);
+    // Outbound registry: inject the `mesh_outbound_registry` plugin when the
+    // applicable Istio `Sidecar.outboundTrafficPolicy` (issue #3262), the
+    // mesh-wide slice policy (CRD path), or the runtime env var declares
+    // REGISTRY_ONLY, in that precedence order. All three default to AllowAny
+    // (no plugin) so non-mesh and permissive deployments pay zero per-request
+    // cost. `effective_outbound_traffic_policy` is the single source of that
+    // precedence — `refresh_mesh_outbound_enforcement` reads the same one for
+    // the stream-family lane, so the two families can never disagree about
+    // whether the gate is ARMED. Their registry CONTENTS can still differ: this
+    // lane is handed the merged materialization slice (remote-cluster endpoints
+    // unioned in) while the stream lane reads the un-merged base slice, so a
+    // multicluster remote destination can be admitted here and refused there
+    // (fail-closed on the stream side).
+    let effective_outbound_policy =
+        mesh_slice.effective_outbound_traffic_policy(runtime.outbound_traffic_policy);
     if matches!(
         effective_outbound_policy,
         crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly
@@ -9956,14 +9982,25 @@ fn mesh_outbound_registry_listen_ports(runtime: &MeshRuntimeConfig) -> Vec<u16> 
 /// populated with the slice-derived registry; otherwise the slot is
 /// cleared so the stream proxies fall through to `Decision::Skip` for
 /// every connect.
+///
+/// "Effective" is resolved by the shared `MeshSlice::effective_outbound_traffic_policy`
+/// (workload-scoped Sidecar → mesh-wide slice → env default, issue #3262), the
+/// same call `inject_mesh_global_plugins` makes for the HTTP-family lane, so the
+/// two families can never disagree about whether the gate is ARMED. The admitted
+/// registry CONTENTS are NOT shared: this lane builds from the `slice` it is
+/// handed (the un-merged base slice at the apply site), while HTTP-family
+/// injection builds from the merged materialization slice, so on the multicluster
+/// path a poller-discovered remote destination can be in the HTTP registry and
+/// absent here — a stream connect to it is then refused, which is the
+/// fail-closed direction. Clearing the slot on an `AllowAny` slice is what makes
+/// an update/delete that RELAXES the policy take effect immediately instead of
+/// leaving a stale gate armed.
 fn refresh_mesh_outbound_enforcement(
     proxy_state: &ProxyState,
     runtime: &MeshRuntimeConfig,
     slice: &MeshSlice,
 ) {
-    let effective_policy = slice
-        .outbound_traffic_policy
-        .unwrap_or(runtime.outbound_traffic_policy);
+    let effective_policy = slice.effective_outbound_traffic_policy(runtime.outbound_traffic_policy);
     let next = if matches!(
         effective_policy,
         crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly
@@ -21734,6 +21771,30 @@ mod tests {
     }
 
     #[test]
+    fn dr_tls_system_roots_with_insecure_skip_verify_fails_cold_apply() {
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::Simple,
+                ca_certificates: Some("system://".to_string()),
+                insecure_skip_verify: true,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+
+        let error =
+            apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+                .expect_err(
+                    "cold apply must defend against an unvalidated contradictory trust policy",
+                );
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("insecure_skip_verify"), "{diagnostic}");
+        assert!(diagnostic.contains("system://"), "{diagnostic}");
+    }
+
+    #[test]
     fn dr_tls_istio_mutual_projects_runtime_svid_material() {
         let mut upstream =
             destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
@@ -23316,6 +23377,7 @@ mod tests {
             trust_bundles: None,
             multi_cluster: None,
             outbound_traffic_policy: None,
+            sidecar_outbound_traffic_policy: None,
             sidecar_egress_scope: None,
             extension_configs: Vec::new(),
             runtime_overlay: crate::modes::mesh::config::MeshRuntimeOverlay::default(),

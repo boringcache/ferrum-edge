@@ -3659,6 +3659,73 @@ fn serverless_pre_proxy_overlay_keeps_deduplication_gate_in_candidate_and_runtim
     );
 }
 
+/// Enabling `ai_federation`'s `streaming` block makes it report request
+/// header/body/destination mutation and a backend-boundary header policy, which
+/// is exactly the population `SECURITY_COMPOSITION_PLUGIN_NAMES` exists to make
+/// visible to candidate admission. If it were admitted without construction, an
+/// admin write could persist a `request_deduplication` + streaming-federation
+/// chain that only the runtime plugin-cache build refuses — and a rejected build
+/// wedges every later config reload. The buffered composition must stay allowed.
+#[test]
+fn streaming_ai_federation_deduplication_gate_fires_in_candidate_and_runtime() {
+    let dedup = || {
+        make_plugin_config(
+            "dedup",
+            "request_deduplication",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )
+    };
+    let federation = |streaming: bool| {
+        let mut config = json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "api_key": "sk-test-key",
+                "model_patterns": ["gpt-*"]
+            }]
+        });
+        if streaming {
+            config["streaming"] = json!({"enabled": true});
+        }
+        make_plugin_config_with_json(
+            "federation",
+            "ai_federation",
+            config,
+            PluginScope::Proxy,
+            Some("p1"),
+        )
+    };
+
+    let streaming_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "federation"])],
+        vec![dedup(), federation(true)],
+    );
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&streaming_config, None)
+            .expect_err("candidate must reject request_deduplication + streaming ai_federation");
+    assert!(
+        candidate_error.contains("ai_federation"),
+        "{candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&streaming_config)
+        .err()
+        .expect("runtime cache must repeat the fail-closed refusal");
+    assert!(runtime_error.contains("ai_federation"), "{runtime_error}");
+
+    // Buffered federation declares none of those capabilities, so the existing
+    // deduplication composition must remain admitted on both boundaries.
+    let buffered_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "federation"])],
+        vec![dedup(), federation(false)],
+    );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&buffered_config, None)
+        .expect("buffered ai_federation must still compose with request_deduplication");
+    PluginCache::new(&buffered_config)
+        .expect("buffered ai_federation must still compose with request_deduplication at runtime");
+}
+
 #[test]
 fn candidate_security_validation_constructs_custom_capabilities_without_builtin_gate() {
     let source = include_str!("../../../src/plugin_cache.rs");

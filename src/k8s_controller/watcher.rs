@@ -200,6 +200,20 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
         plural: "referencegrants",
         namespaced: true,
     },
+    CrdSpec {
+        group: "gateway.networking.k8s.io",
+        version: "v1",
+        kind: "BackendTLSPolicy",
+        plural: "backendtlspolicies",
+        namespaced: true,
+    },
+    CrdSpec {
+        group: "gateway.networking.k8s.io",
+        version: "v1alpha3",
+        kind: "BackendTLSPolicy",
+        plural: "backendtlspolicies",
+        namespaced: true,
+    },
     // BackendLBPolicy was removed from the Gateway API experimental channel in
     // v1.3+ (replaced by XBackendTrafficPolicy). Keep watching the historical
     // v1alpha2 shape so clusters that still install the older CRD get sticky
@@ -265,6 +279,14 @@ pub const GATEWAY_API_CORE_RESOURCES: &[CoreResourceSpec] = &[
         version: "v1",
         kind: "Secret",
         plural: "secrets",
+        namespaced: true,
+        field_selector: None,
+    },
+    CoreResourceSpec {
+        group: "",
+        version: "v1",
+        kind: "ConfigMap",
+        plural: "configmaps",
         namespaced: true,
         field_selector: None,
     },
@@ -1426,7 +1448,10 @@ mod tests {
             .iter()
             .map(|resource| resource.kind)
             .collect();
-        assert_eq!(kinds, HashSet::from(["Secret", "Service", "EndpointSlice"]));
+        assert_eq!(
+            kinds,
+            HashSet::from(["Secret", "ConfigMap", "Service", "EndpointSlice"])
+        );
 
         for resource in GATEWAY_API_CORE_RESOURCES {
             assert!(
@@ -1435,6 +1460,22 @@ mod tests {
                 resource.kind
             );
         }
+    }
+
+    #[test]
+    fn gateway_api_watches_backend_tls_policy() {
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "BackendTLSPolicy"
+                && resource.version == "v1"
+                && resource.plural == "backendtlspolicies"
+                && resource.namespaced
+        }));
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "BackendTLSPolicy"
+                && resource.version == "v1alpha3"
+                && resource.plural == "backendtlspolicies"
+                && resource.namespaced
+        }));
     }
 
     #[test]
