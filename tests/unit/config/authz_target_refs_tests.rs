@@ -508,8 +508,23 @@ fn mesh_policy_gateway_target_refs_require_waypoint_binding() {
         "present binding must validate: {with_binding:?}"
     );
 
+    // An empty bindings inventory cannot prove absence (DP slices reconstruct
+    // MeshConfig without waypoint_bindings). Runtime matching stays exact.
+    let empty_inventory = MeshConfig {
+        mesh_policies: vec![policy("deny", PolicyAction::Deny, scope.clone())],
+        ..MeshConfig::default()
+    }
+    .validate();
+    assert!(
+        empty_inventory
+            .iter()
+            .all(|error| !error.contains("Gateway 'default/waypoint-a' was not found")),
+        "empty bindings inventory must not invent a missing-Gateway rejection: {empty_inventory:?}"
+    );
+
     let missing = MeshConfig {
         mesh_policies: vec![policy("deny", PolicyAction::Deny, scope)],
+        waypoint_bindings: vec![binding(WAYPOINT_NS, WAYPOINT_B, Some(CLASS_ISTIO))],
         ..MeshConfig::default()
     }
     .validate();
@@ -517,7 +532,94 @@ fn mesh_policy_gateway_target_refs_require_waypoint_binding() {
         missing
             .iter()
             .any(|error| error.contains("Gateway 'default/waypoint-a' was not found")),
-        "expected missing Gateway error, got {missing:?}"
+        "expected missing Gateway error against a real bindings inventory, got {missing:?}"
+    );
+}
+
+/// A mixed `{valid Service, missing/inapplicable Gateway}` policy must validate:
+/// the unresolved sibling arm must not reject the whole MeshConfig when a valid
+/// applicable target remains. Runtime matching stays exact (no broadening).
+#[test]
+fn mixed_valid_and_missing_gateway_target_refs_do_not_reject_config() {
+    let errors = MeshConfig {
+        services: vec![mesh_service(WAYPOINT_NS, "reviews")],
+        waypoint_bindings: vec![binding(WAYPOINT_NS, WAYPOINT_A, Some(CLASS_ISTIO))],
+        mesh_policies: vec![policy(
+            "deny",
+            PolicyAction::Deny,
+            target_refs(vec![service_ref("reviews"), gateway_ref(WAYPOINT_B)]),
+        )],
+        ..MeshConfig::default()
+    }
+    .validate();
+    assert!(
+        errors
+            .iter()
+            .all(|error| !error.contains("target_refs") && !error.contains("Gateway")),
+        "mixed valid Service + missing Gateway must validate: {errors:?}"
+    );
+}
+
+/// Same mixed-acceptance boundary for a GatewayClass arm owned outside the
+/// Istio root namespace: the Service arm keeps the policy valid.
+#[test]
+fn mixed_valid_service_and_non_root_gateway_class_do_not_reject_config() {
+    let errors = MeshConfig {
+        istio_root_namespace: "istio-system".to_string(),
+        services: vec![mesh_service(WAYPOINT_NS, "reviews")],
+        mesh_policies: vec![policy(
+            "deny",
+            PolicyAction::Deny,
+            target_refs(vec![service_ref("reviews"), class_ref(CLASS_FERRUM)]),
+        )],
+        ..MeshConfig::default()
+    }
+    .validate();
+    assert!(
+        errors
+            .iter()
+            .all(|error| !error.contains("GatewayClass") && !error.contains("root namespace")),
+        "mixed valid Service + non-root GatewayClass must validate: {errors:?}"
+    );
+}
+
+/// All-invalid / no-applicable-target boundary: every attachment unresolved
+/// must still fail closed so the policy cannot silently broaden.
+#[test]
+fn all_invalid_target_refs_fail_closed_without_broadening() {
+    let missing_only = MeshConfig {
+        waypoint_bindings: vec![binding(WAYPOINT_NS, WAYPOINT_B, Some(CLASS_ISTIO))],
+        mesh_policies: vec![policy(
+            "deny",
+            PolicyAction::Deny,
+            target_refs(vec![gateway_ref(WAYPOINT_A), service_ref("missing")]),
+        )],
+        ..MeshConfig::default()
+    }
+    .validate();
+    assert!(
+        missing_only.iter().any(|error| {
+            error.contains("Gateway 'default/waypoint-a' was not found")
+                || error.contains("Service 'default/missing' was not found")
+        }),
+        "all-unresolved attachments must fail closed: {missing_only:?}"
+    );
+
+    let non_root_class_only = MeshConfig {
+        istio_root_namespace: "istio-system".to_string(),
+        mesh_policies: vec![policy(
+            "deny",
+            PolicyAction::Deny,
+            target_refs(vec![class_ref(CLASS_ISTIO)]),
+        )],
+        ..MeshConfig::default()
+    }
+    .validate();
+    assert!(
+        non_root_class_only
+            .iter()
+            .any(|error| error.contains("GatewayClass") && error.contains("root namespace")),
+        "a sole non-root GatewayClass policy must still fail closed: {non_root_class_only:?}"
     );
 }
 

@@ -4402,7 +4402,15 @@ struct MeshPolicyTargetRefsIdentity<'a> {
 ///   an accepted-but-inert security policy.
 /// * `GatewayClass` is cluster-scoped and only the Istio **root namespace** may
 ///   own such a policy.
-/// * Missing targets fail closed rather than silently widening.
+/// * A missing / inapplicable sibling attachment must **not** invalidate the
+///   whole policy when another attachment is still valid and applicable —
+///   retention is OR and runtime matching stays exact, so an unmatched arm
+///   never becomes a wildcard. A policy whose *every* attachment is
+///   unresolved still fails closed rather than silently broadening.
+/// * Gateway presence is checked only when `waypoint_bindings` is a real
+///   inventory. DP slices reconstruct `MeshConfig` without bindings (matching
+///   uses the live `waypoint_name` / class stamp), so an empty bindings list
+///   cannot prove a Gateway target is missing.
 fn validate_mesh_policy_target_refs_scope(
     identity: &MeshPolicyTargetRefsIdentity<'_>,
     scope: &PolicyScope,
@@ -4430,6 +4438,14 @@ fn validate_mesh_policy_target_refs_scope(
             "{context}: supports at most {MAX_POLICY_TARGET_REFS} attachments"
         ));
     }
+
+    // Soft (inventory / ownership) failures are deferred: one unresolved arm
+    // must not reject a mixed policy that still has a valid applicable target.
+    // Emit them only when *no* attachment remains valid, so an all-invalid
+    // policy cannot silently broaden.
+    let mut valid_attachments = 0usize;
+    let mut unresolved: Vec<String> = Vec::new();
+
     for (index, attachment) in attachments.iter().enumerate() {
         let path = format!("{context}[{index}]");
         match attachment {
@@ -4439,6 +4455,7 @@ fn validate_mesh_policy_target_refs_scope(
                     PolicyTargetAttachment::Service { .. } => "Service",
                     _ => "Gateway",
                 };
+                let errors_before = errors.len();
                 validate_non_empty_string(format!("{path}.namespace"), namespace, errors);
                 validate_bounded_string(
                     format!("{path}.namespace"),
@@ -4453,11 +4470,7 @@ fn validate_mesh_policy_target_refs_scope(
                     MAX_POLICY_TARGET_REF_NAME_LEN,
                     errors,
                 );
-                let well_formed = !namespace.trim().is_empty()
-                    && !name.trim().is_empty()
-                    && namespace.len() <= MAX_POLICY_TARGET_REF_NAMESPACE_LEN
-                    && name.len() <= MAX_POLICY_TARGET_REF_NAME_LEN;
-                if !well_formed {
+                if errors.len() > errors_before {
                     continue;
                 }
                 if namespace != policy_namespace {
@@ -4468,26 +4481,40 @@ fn validate_mesh_policy_target_refs_scope(
                     ));
                     continue;
                 }
-                let present = match attachment {
-                    PolicyTargetAttachment::Service { .. } => services
+                let is_service = matches!(attachment, PolicyTargetAttachment::Service { .. });
+                if is_service {
+                    let present = services
                         .iter()
-                        .any(|service| service.namespace == *namespace && service.name == *name),
-                    _ => waypoint_bindings
-                        .iter()
-                        .any(|binding| binding.namespace == *namespace && binding.name == *name),
-                };
-                if !present {
-                    let inventory = match attachment {
-                        PolicyTargetAttachment::Service { .. } => "services",
-                        _ => "waypoint_bindings",
-                    };
-                    errors.push(format!(
-                        "{path}: {kind} '{namespace}/{name}' was not found in {inventory}; \
-                         targeted policies fail closed when the target is missing"
+                        .any(|service| service.namespace == *namespace && service.name == *name);
+                    if present {
+                        valid_attachments += 1;
+                    } else {
+                        unresolved.push(format!(
+                            "{path}: Service '{namespace}/{name}' was not found in services; \
+                             targeted policies fail closed when the target is missing"
+                        ));
+                    }
+                } else if waypoint_bindings.is_empty() {
+                    // No bindings inventory on this validation path (typical DP
+                    // slice reconstruction). Presence cannot be proven or
+                    // disproven; runtime attachment matching remains exact and
+                    // fail-closed.
+                    valid_attachments += 1;
+                } else if waypoint_bindings
+                    .iter()
+                    .any(|binding| binding.namespace == *namespace && binding.name == *name)
+                {
+                    valid_attachments += 1;
+                } else {
+                    unresolved.push(format!(
+                        "{path}: Gateway '{namespace}/{name}' was not found in \
+                         waypoint_bindings; targeted policies fail closed when the \
+                         target is missing"
                     ));
                 }
             }
             PolicyTargetAttachment::GatewayClass { name } => {
+                let errors_before = errors.len();
                 validate_non_empty_string(format!("{path}.name"), name, errors);
                 validate_bounded_string(
                     format!("{path}.name"),
@@ -4495,7 +4522,7 @@ fn validate_mesh_policy_target_refs_scope(
                     MAX_POLICY_TARGET_REF_NAME_LEN,
                     errors,
                 );
-                if name.trim().is_empty() || name.len() > MAX_POLICY_TARGET_REF_NAME_LEN {
+                if errors.len() > errors_before {
                     continue;
                 }
                 // GatewayClass is cluster-scoped: only the root namespace may
@@ -4504,7 +4531,7 @@ fn validate_mesh_policy_target_refs_scope(
                 // trust-bundle-only `validate_mesh_config` entrypoint), so the
                 // ownership rule is not evaluated there.
                 if !istio_root_namespace.is_empty() && policy_namespace != istio_root_namespace {
-                    errors.push(format!(
+                    unresolved.push(format!(
                         "{path}: GatewayClass attachments must be owned by a policy in the Istio \
                          root namespace ('{istio_root_namespace}'), not '{policy_namespace}'"
                     ));
@@ -4518,14 +4545,22 @@ fn validate_mesh_policy_target_refs_scope(
                             .is_some_and(|class| class == name.as_str())
                     });
                     if !known_on_binding {
+                        // Unsupported class name is a structural refusal, not an
+                        // inventory miss — always hard-fail.
                         errors.push(format!(
                             "{path}: GatewayClass '{name}' is unsupported; \
                              Ferrum accepts istio-waypoint/ferrum-waypoint class attachments"
                         ));
+                        continue;
                     }
                 }
+                valid_attachments += 1;
             }
         }
+    }
+
+    if valid_attachments == 0 {
+        errors.extend(unresolved);
     }
 }
 
