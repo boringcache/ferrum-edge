@@ -163,6 +163,7 @@ fn destination_rule_port_level_load_balancer_projects_to_upstream_override() {
                 traffic_policy: None,
                 port_level_settings,
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         })),
@@ -271,6 +272,7 @@ fn destination_rule_port_level_outlier_detection_projects_to_dispatch_override()
                 traffic_policy: None,
                 port_level_settings,
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         })),
@@ -342,6 +344,7 @@ fn destination_rule_top_level_max_connections_fans_out_to_all_target_ports() {
                 }),
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         })),
@@ -424,6 +427,7 @@ fn destination_rule_port_level_max_connections_overrides_top_level() {
                 }),
                 port_level_settings,
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         })),
@@ -485,6 +489,7 @@ fn destination_rule_top_level_max_connections_skips_phantom_ports() {
                 }),
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         })),
@@ -536,6 +541,7 @@ fn destination_rule_top_level_connection_pool_http_projects_inherited_fields() {
                 }),
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         })),
@@ -630,6 +636,7 @@ fn destination_rule_top_level_connection_pool_http_on_sd_upstream_goes_to_fallba
                 }),
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         })),
@@ -722,6 +729,7 @@ fn destination_rule_named_target_port_sd_keeps_per_port_and_fallback_separate() 
                 }),
                 port_level_settings,
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         })),
@@ -802,6 +810,7 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
                 }),
                 port_level_settings,
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         })),
@@ -858,6 +867,7 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
                 traffic_policy: None,
                 port_level_settings,
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         })),
@@ -923,6 +933,7 @@ fn destination_rule_port_level_explicit_default_clears_inherited_h2_upgrade_poli
                 }),
                 port_level_settings,
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         })),
@@ -1013,6 +1024,7 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
                     }),
                     port_level_settings,
                     subsets,
+                    export_to: vec!["*".to_string()],
                 }],
                 ..MeshConfig::default()
             })),
@@ -1133,6 +1145,7 @@ fn destination_rule_subset_zero_pending_fails_while_zero_retries_is_valid() {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         })),
