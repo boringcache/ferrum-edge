@@ -592,7 +592,9 @@ mod tests {
             .and_then(|ctx| ctx.metadata.as_ref())
             .expect("stream metadata");
         assert_eq!(
-            metadata.get("mesh.destination.principal").map(String::as_str),
+            metadata
+                .get("mesh.destination.principal")
+                .map(String::as_str),
             Some("spiffe://cluster.local/ns/default/sa/orders"),
             "set_target must stamp destination principal before finalize"
         );

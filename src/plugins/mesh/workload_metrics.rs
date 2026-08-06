@@ -1001,6 +1001,16 @@ impl Plugin for WorkloadMetrics {
             "tcp"
         };
         let metadata = ctx.metadata.get_or_insert_with(Default::default);
+        // The stream path, rather than an individual plugin instance, owns the
+        // exactly-once TCP opened/closed lifecycle. Prove that at least one
+        // workload_metrics instance actually observed this connection before a
+        // later finalizer can emit it: mesh routing/security code may have
+        // pre-populated other `mesh.*` labels even when an earlier plugin
+        // rejects before this hook is reached.
+        metadata.insert(
+            prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA.to_string(),
+            "1".to_string(),
+        );
         self.insert_common_metadata(metadata);
         self.apply_telemetry_metadata(metadata, &HashMap::new());
         if self.trace_context_enabled() && trace_is_sampled(metadata) {

@@ -674,6 +674,11 @@ fn representative_exposition() -> String {
 
     let mut tcp_meta = HashMap::new();
     tcp_meta.extend([
+        (
+            ferrum_edge::plugins::mesh::prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA
+                .into(),
+            "1".into(),
+        ),
         ("mesh.source.workload".into(), "frontend".into()),
         ("mesh.source.namespace".into(), "default".into()),
         (

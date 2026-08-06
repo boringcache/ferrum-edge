@@ -173,6 +173,11 @@ async fn reload_clears_disable_and_resumes_request_size_recording() {
 fn tcp_opened_closed_and_bytes_follow_connect_disconnect_lifecycle() {
     let registry = MetricsRegistry::new();
     let mut metadata = HashMap::from([
+        (
+            ferrum_edge::plugins::mesh::prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA
+                .into(),
+            "1".into(),
+        ),
         ("mesh.source.workload".into(), "frontend".into()),
         ("mesh.source.namespace".into(), "default".into()),
         (
@@ -366,6 +371,11 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
     let mut metadata = ctx.metadata.clone();
+    metadata.insert(
+        ferrum_edge::plugins::mesh::prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA
+            .into(),
+        "1".into(),
+    );
     metadata.insert("mesh.request_protocol".into(), "tcp".into());
     // Ensure identity labels exist for key construction.
     metadata
@@ -472,6 +482,8 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
 
 const FINALIZED_MARKER: &str =
     ferrum_edge::plugins::mesh::prometheus_helpers::MESH_TCP_OPENED_FINALIZED_METADATA;
+const OBSERVED_MARKER: &str =
+    ferrum_edge::plugins::mesh::prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA;
 
 fn mesh_stream_ctx() -> StreamConnectionContext {
     StreamConnectionContext::new(
@@ -709,6 +721,32 @@ async fn mesh_tcp_finalize_is_idempotent_per_connection() {
     assert!(
         metadata.get(FINALIZED_MARKER).map(String::as_str) == Some("1"),
         "finalizer must stamp the once-only marker"
+    );
+}
+
+#[test]
+fn mesh_tcp_finalize_requires_workload_metrics_observation() {
+    let registry = MetricsRegistry::new();
+    let mut metadata = HashMap::from([
+        ("mesh.request_protocol".to_string(), "tcp".to_string()),
+        ("mesh.destination.service".to_string(), "db".to_string()),
+    ]);
+
+    registry.finalize_mesh_tcp_opened(&mut metadata, "db", Some("db"));
+
+    assert!(
+        !metadata.contains_key(FINALIZED_MARKER),
+        "pre-populated mesh routing metadata must not impersonate workload-metrics observation"
+    );
+    assert!(
+        !metadata.contains_key(OBSERVED_MARKER),
+        "the finalizer must never forge the plugin observation marker"
+    );
+    assert!(
+        !registry
+            .render_uncached()
+            .contains("ferrum_mesh_tcp_connections_opened_total{"),
+        "a stream rejected before workload_metrics ran must not emit its metric family"
     );
 }
 

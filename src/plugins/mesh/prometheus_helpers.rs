@@ -85,6 +85,16 @@ pub struct MeshRequestKey {
 }
 
 pub(crate) const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
+/// Stamped by `workload_metrics::on_stream_connect` when that plugin actually
+/// observed the stream. Stream-path lifecycle finalizers require this marker:
+/// mesh routing/security setup may pre-populate other `mesh.*` metadata before
+/// the plugin chain runs, and an earlier rejecting plugin must not create
+/// workload-metric series that no workload-metrics instance observed.
+///
+/// The `mesh.metrics.` prefix also keeps this internal lifecycle signal out of
+/// trace attributes.
+pub const MESH_WORKLOAD_METRICS_OBSERVED_METADATA: &str =
+    "mesh.metrics.workload_metrics_observed";
 /// Stamped once per mesh TCP stream when `TCP_OPENED_CONNECTIONS` is finalized
 /// under the metadata that path will also use for closed/byte series.
 ///
@@ -1740,13 +1750,15 @@ pub(crate) fn mesh_request_key_for_family_from_metadata(
     key
 }
 
-/// True when stream metadata identifies a mesh TCP connection, using the same
-/// two conditions the opened/closed emitters apply: at least one `mesh.` label
-/// (otherwise `mesh_stream_key_from_metadata` yields no key) and a TCP request
-/// protocol, where an absent protocol defaults to `tcp` exactly as the key
+/// True when `workload_metrics` actually observed a mesh TCP connection.
+///
+/// Other mesh paths stamp routing/security `mesh.*` metadata before the plugin
+/// chain. Requiring the observation marker prevents an earlier plugin rejection
+/// from synthesizing workload-metric lifecycle series under incomplete/default
+/// labels. The request protocol still defaults to `tcp` exactly as the key
 /// builder does.
 pub fn metadata_is_mesh_tcp_stream(metadata: &HashMap<String, String>) -> bool {
-    metadata.keys().any(|key| key.starts_with("mesh."))
+    metadata.contains_key(MESH_WORKLOAD_METRICS_OBSERVED_METADATA)
         && metadata
             .get("mesh.request_protocol")
             .or_else(|| metadata.get("request_protocol"))
@@ -1759,7 +1771,8 @@ pub fn mesh_tcp_opened_finalized(metadata: &HashMap<String, String>) -> bool {
 }
 
 /// Finalize mesh `TCP_OPENED_CONNECTIONS` once for a stream that reached
-/// workload-metrics observation.
+/// workload-metrics observation (proved by
+/// [`MESH_WORKLOAD_METRICS_OBSERVED_METADATA`]).
 ///
 /// Call from the stream path after the last `on_stream_connect` hook that
 /// actually ran — and, for captured mesh egress TCP, after selected target
