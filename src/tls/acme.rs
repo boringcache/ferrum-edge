@@ -1809,6 +1809,15 @@ pub struct AcmeTlsAlpnResolver {
     cache: Mutex<BTreeMap<String, Arc<rustls::sign::CertifiedKey>>>,
 }
 
+impl std::fmt::Debug for AcmeTlsAlpnResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cached_keys = self.cache.lock().map(|cache| cache.len()).unwrap_or(0);
+        f.debug_struct("AcmeTlsAlpnResolver")
+            .field("cached_keys", &cached_keys)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AcmeTlsAlpnResolver {
     pub fn new(fallback: Arc<rustls::sign::CertifiedKey>) -> Self {
         Self {

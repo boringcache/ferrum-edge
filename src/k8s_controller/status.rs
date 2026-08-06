@@ -3762,10 +3762,8 @@ mod tests {
         );
 
         let winner = update_for(&updates, "Gateway", "edge-old");
-        let winner_listener = listener_status_by_name(
-            winner.status["listeners"].as_array().unwrap(),
-            "https",
-        );
+        let winner_listener =
+            listener_status_by_name(winner.status["listeners"].as_array().unwrap(), "https");
         let winner_conditions = winner_listener["conditions"].as_array().unwrap();
         assert_condition(winner_conditions, "Conflicted", "False");
 

@@ -187,9 +187,7 @@ async fn certificate_san_selects_even_without_a_listener_hostname() {
 async fn wildcard_matches_one_label_only() {
     ensure_crypto_provider();
     let Fixture {
-        wildcard,
-        fallback,
-        ..
+        wildcard, fallback, ..
     } = fixture();
     let config = server_config(&[
         input(&fallback, "ferrum/edge/catch-all", None, true),
@@ -377,5 +375,8 @@ async fn an_unmarked_set_still_produces_a_fallback() {
         input(&beta, "ferrum/edge-b/https", Some("b.example.com"), false),
     ]);
 
-    assert_eq!(presented_leaf(config, "unknown.example.org").await, alpha.der);
+    assert_eq!(
+        presented_leaf(config, "unknown.example.org").await,
+        alpha.der
+    );
 }

@@ -472,8 +472,7 @@ fn listener_is_materializable(acc: &K8sAccumulator, object: &K8sObject, listener
     if !listener_is_terminating_tls(listener) {
         return true;
     }
-    listener_frontend_tls_sources(acc, object, listener)
-        .is_some_and(|sources| !sources.is_empty())
+    listener_frontend_tls_sources(acc, object, listener).is_some_and(|sources| !sources.is_empty())
 }
 
 /// Record every terminating-TLS listener's resolved certificate set.
@@ -691,7 +690,9 @@ fn listener_frontend_tls_sources(
     object: &K8sObject,
     listener: &Value,
 ) -> Option<Vec<(String, String)>> {
-    let Some(certificate_refs) = listener.get("tls").and_then(|tls| tls.get("certificateRefs"))
+    let Some(certificate_refs) = listener
+        .get("tls")
+        .and_then(|tls| tls.get("certificateRefs"))
     else {
         return Some(Vec::new());
     };
@@ -5425,7 +5426,9 @@ mod tests {
                 .frontend_tls_certificate_sources
                 .iter()
                 .any(|source| source.gateway == "edge-a"
-                    && source.cert_path.starts_with("k8s://default/cert-a#tls.crt?sha256="))
+                    && source
+                        .cert_path
+                        .starts_with("k8s://default/cert-a#tls.crt?sha256="))
         );
         assert!(
             result
@@ -5433,7 +5436,9 @@ mod tests {
                 .frontend_tls_certificate_sources
                 .iter()
                 .any(|source| source.gateway == "edge-b"
-                    && source.cert_path.starts_with("k8s://default/cert-b#tls.crt?sha256="))
+                    && source
+                        .cert_path
+                        .starts_with("k8s://default/cert-b#tls.crt?sha256="))
         );
         assert_eq!(
             result
@@ -5445,18 +5450,16 @@ mod tests {
             1,
             "exactly one fallback certificate per namespace"
         );
-        assert!(
-            result.config.mesh.as_ref().is_some_and(|mesh| mesh
-                .services
+        assert!(result.config.mesh.as_ref().is_some_and(|mesh| {
+            mesh.services
                 .iter()
-                .any(|service| service.name == "edge-a-https-a"))
-        );
-        assert!(
-            result.config.mesh.as_ref().is_some_and(|mesh| mesh
-                .services
+                .any(|service| service.name == "edge-a-https-a")
+        }));
+        assert!(result.config.mesh.as_ref().is_some_and(|mesh| {
+            mesh.services
                 .iter()
-                .any(|service| service.name == "edge-b-https-b"))
-        );
+                .any(|service| service.name == "edge-b-https-b")
+        }));
         assert!(
             !result.config.proxies.is_empty(),
             "the second Gateway's routes must materialize now that it owns its own certificate"

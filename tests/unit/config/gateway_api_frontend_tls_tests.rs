@@ -146,7 +146,12 @@ fn one_listener_serves_every_certificate_ref() {
         gateway(
             "ferrum",
             "edge",
-            vec![https_listener("https", 443, None, &["rsa-cert", "ecdsa-cert"])],
+            vec![https_listener(
+                "https",
+                443,
+                None,
+                &["rsa-cert", "ecdsa-cert"],
+            )],
         ),
         tls_secret("rsa-cert", "ferrum"),
         tls_secret("ecdsa-cert", "ferrum"),
@@ -316,8 +321,7 @@ fn hostname_collision_fails_the_younger_listener_closed() {
 
     assert_eq!(result.config.frontend_tls_certificate_sources.len(), 1);
     assert_eq!(
-        result.config.frontend_tls_certificate_sources[0].gateway,
-        "edge-old",
+        result.config.frontend_tls_certificate_sources[0].gateway, "edge-old",
         "the older Gateway wins the contested hostname"
     );
     assert!(
@@ -429,11 +433,9 @@ fn one_unresolved_reference_withdraws_only_its_own_listener() {
         result.config.frontend_tls_certificate_sources[0].listener,
         "good"
     );
-    assert!(
-        result.warnings.iter().any(|warning| warning
-            .contains("spec.listeners[].tls.certificateRefs")
-            && warning.contains("partial"))
-    );
+    assert!(result.warnings.iter().any(|warning| {
+        warning.contains("spec.listeners[].tls.certificateRefs") && warning.contains("partial")
+    }));
 }
 
 #[test]
@@ -542,7 +544,12 @@ fn deleting_one_gateway_withdraws_only_its_own_certificates() {
         gateway(
             "ferrum",
             "edge-a",
-            vec![https_listener("https", 443, Some("a.example.com"), &["cert-a"])],
+            vec![https_listener(
+                "https",
+                443,
+                Some("a.example.com"),
+                &["cert-a"],
+            )],
         ),
         gateway(
             "ferrum",
@@ -564,7 +571,12 @@ fn deleting_one_gateway_withdraws_only_its_own_certificates() {
         gateway(
             "ferrum",
             "edge-a",
-            vec![https_listener("https", 443, Some("a.example.com"), &["cert-a"])],
+            vec![https_listener(
+                "https",
+                443,
+                Some("a.example.com"),
+                &["cert-a"],
+            )],
         ),
         tls_secret("cert-a", "ferrum"),
         tls_secret("cert-b", "ferrum"),
