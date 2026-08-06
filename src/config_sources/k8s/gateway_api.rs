@@ -6250,14 +6250,18 @@ fn udp_rule_backends(
         // the complete set is normalized below to Ferrum's smaller target
         // weight representation without changing relative proportions.
         let weight = udp_backend_weight(object, backend_ref)?;
-        if weight == 0 {
-            skipped_zero += 1;
-            continue;
-        }
+        // Zero weight disables selection; it does not waive the BackendRef
+        // boundary. Validate the target identity, supported kind, namespace,
+        // and ReferenceGrant before filtering so an ignored leg cannot hide
+        // an unauthorized cross-namespace reference or unsupported target.
         let backend_name = string_field(backend_ref, "name")
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
         let backend_namespace =
             checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
+        if weight == 0 {
+            skipped_zero += 1;
+            continue;
+        }
         fallback_listen_port.get_or_insert(backend_port);
 
         // A missing Service, or a Service without the referenced port, is an

@@ -967,6 +967,48 @@ fn udp_route_zero_weight_leg_still_has_its_port_validated() {
 }
 
 #[test]
+fn udp_route_zero_weight_leg_still_has_its_target_kind_validated() {
+    let spec = weighted_rule(json!([
+        {"name": "coredns", "port": 5353, "weight": 1},
+        {
+            "group": "example.com",
+            "kind": "DatagramSink",
+            "name": "dark",
+            "port": 5353,
+            "weight": 0
+        }
+    ]));
+    let objects = udp_lab(spec);
+
+    let err = translate_k8s_objects(&objects, options())
+        .expect_err("an unsupported zero-weight target kind fails closed");
+
+    assert!(err.to_string().contains("only core Service backendRefs"));
+}
+
+#[test]
+fn udp_route_zero_weight_cross_namespace_leg_still_requires_reference_grant() {
+    let spec = weighted_rule(json!([
+        {"name": "coredns", "port": 5353, "weight": 1},
+        {
+            "name": "coredns",
+            "namespace": "backends",
+            "port": 5353,
+            "weight": 0
+        }
+    ]));
+    let objects = udp_lab(spec);
+
+    let err = translate_k8s_objects(&objects, multi_namespace_options())
+        .expect_err("an ungranted zero-weight cross-namespace ref fails closed");
+
+    assert!(
+        err.to_string()
+            .contains("requires a matching ReferenceGrant")
+    );
+}
+
+#[test]
 fn udp_route_hostile_weight_shapes_fail_closed() {
     for weight in [json!(1_000_001), json!(-1), json!("high"), json!(1.5)] {
         let spec = weighted_rule(json!([
