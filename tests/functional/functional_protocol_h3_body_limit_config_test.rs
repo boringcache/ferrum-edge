@@ -99,6 +99,7 @@ async fn spawn_h3_gateway(
         .log_level("warn")
         .capture_output()
         .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTP_PORT", "0")
         .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")

@@ -140,6 +140,7 @@ async fn spawn_h3_gateway(backend_port: u16) -> (GatewayHarness, u16) {
             .file_config(h3_file_config(backend_port))
             .log_level("warn")
             .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
             .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
             .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
             .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
