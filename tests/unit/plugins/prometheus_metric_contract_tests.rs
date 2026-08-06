@@ -654,7 +654,10 @@ fn representative_exposition() -> String {
         ("mesh.destination.service".into(), "orders".into()),
         ("mesh.request_protocol".into(), "http".into()),
         ("mesh.response_flags".into(), "-".into()),
-        ("mesh.connection_security_policy".into(), "mutual_tls".into()),
+        (
+            "mesh.connection_security_policy".into(),
+            "mutual_tls".into(),
+        ),
     ]);
     mesh_http.bytes_sent = 128;
     mesh_http.bytes_received = 256;
@@ -689,7 +692,10 @@ fn representative_exposition() -> String {
         ("mesh.destination.service".into(), "db".into()),
         ("mesh.request_protocol".into(), "tcp".into()),
         ("mesh.response_flags".into(), "-".into()),
-        ("mesh.connection_security_policy".into(), "mutual_tls".into()),
+        (
+            "mesh.connection_security_policy".into(),
+            "mutual_tls".into(),
+        ),
     ]);
     registry.record_mesh_tcp_opened(&tcp_meta, "mesh-tcp", Some("db"));
     let mut tcp_summary = make_stream_summary("mesh-tcp", "tcp");

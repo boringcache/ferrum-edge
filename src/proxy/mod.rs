@@ -32488,9 +32488,7 @@ async fn handle_proxy_request_inner(
             .metadata
             .get("request_protocol")
             .or_else(|| ctx.metadata.get("mesh.request_protocol"))
-            .is_some_and(|p| {
-                crate::plugins::mesh::prometheus_helpers::is_mesh_grpc_protocol(p)
-            })
+            .is_some_and(|p| crate::plugins::mesh::prometheus_helpers::is_mesh_grpc_protocol(p))
         {
             body.with_grpc_message_counter(Arc::clone(&ctx.grpc_response_messages_observed))
         } else {

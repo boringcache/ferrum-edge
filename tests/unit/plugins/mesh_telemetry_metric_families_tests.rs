@@ -4,18 +4,21 @@
 //! series presence.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrum_edge::plugins::mesh::prometheus_helpers::{
-    count_grpc_length_prefixed_messages, GrpcLengthPrefixedScanner,
+    GrpcLengthPrefixedScanner, count_grpc_length_prefixed_messages,
 };
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, StreamTransactionSummary};
 use serde_json::json;
 
-fn mesh_http_summary(bytes_sent: u64, bytes_received: u64) -> ferrum_edge::plugins::TransactionSummary {
+fn mesh_http_summary(
+    bytes_sent: u64,
+    bytes_received: u64,
+) -> ferrum_edge::plugins::TransactionSummary {
     ferrum_edge::plugins::TransactionSummary {
         proxy_id: Some("orders".into()),
         proxy_name: Some("orders".into()),
@@ -43,7 +46,10 @@ fn mesh_http_summary(bytes_sent: u64, bytes_received: u64) -> ferrum_edge::plugi
             ("mesh.destination.service".into(), "orders".into()),
             ("mesh.request_protocol".into(), "http".into()),
             ("mesh.response_flags".into(), "-".into()),
-            ("mesh.connection_security_policy".into(), "mutual_tls".into()),
+            (
+                "mesh.connection_security_policy".into(),
+                "mutual_tls".into(),
+            ),
         ]),
         ..Default::default()
     }
@@ -67,19 +73,21 @@ fn request_and_response_size_histograms_record_authoritative_byte_values() {
     assert!(
         output
             .lines()
-            .any(|line| line.starts_with("ferrum_mesh_request_bytes_sum{") && line.ends_with(" 200.00")),
+            .any(|line| line.starts_with("ferrum_mesh_request_bytes_sum{")
+                && line.ends_with(" 200.00")),
         "request size sum must be 100+100:\n{output}"
     );
     assert!(
         output
             .lines()
-            .any(|line| line.starts_with("ferrum_mesh_response_bytes_sum{") && line.ends_with(" 500.00")),
+            .any(|line| line.starts_with("ferrum_mesh_response_bytes_sum{")
+                && line.ends_with(" 500.00")),
         "response size sum must be 250+250:\n{output}"
     );
     assert!(
-        output
-            .lines()
-            .any(|line| line.starts_with("ferrum_mesh_request_bytes_count{") && line.ends_with(" 2")),
+        output.lines().any(
+            |line| line.starts_with("ferrum_mesh_request_bytes_count{") && line.ends_with(" 2")
+        ),
         "request size count must be 2:\n{output}"
     );
 }
@@ -135,7 +143,11 @@ async fn reload_clears_disable_and_resumes_request_size_recording() {
     summary.metadata.extend(ctx.metadata.clone());
     let registry = MetricsRegistry::new();
     registry.record(&summary);
-    assert!(!registry.render_uncached().contains("ferrum_mesh_request_bytes_"));
+    assert!(
+        !registry
+            .render_uncached()
+            .contains("ferrum_mesh_request_bytes_")
+    );
 
     // Simulate Telemetry delete/reload: a new plugin instance without disables.
     ctx.metadata.remove("mesh.metrics.disabled");
@@ -176,16 +188,18 @@ fn tcp_opened_closed_and_bytes_follow_connect_disconnect_lifecycle() {
         ("mesh.destination.service".into(), "db".into()),
         ("mesh.request_protocol".into(), "tcp".into()),
         ("mesh.response_flags".into(), "-".into()),
-        ("mesh.connection_security_policy".into(), "mutual_tls".into()),
+        (
+            "mesh.connection_security_policy".into(),
+            "mutual_tls".into(),
+        ),
     ]);
 
     registry.record_mesh_tcp_opened(&metadata, "db", Some("db"));
     let after_open = registry.render_uncached();
     assert!(
-        after_open
-            .lines()
-            .any(|line| line.starts_with("ferrum_mesh_tcp_connections_opened_total{")
-                && line.ends_with(" 1")),
+        after_open.lines().any(|line| line
+            .starts_with("ferrum_mesh_tcp_connections_opened_total{")
+            && line.ends_with(" 1")),
         "opened must increment on connect:\n{after_open}"
     );
     assert!(
@@ -220,10 +234,9 @@ fn tcp_opened_closed_and_bytes_follow_connect_disconnect_lifecycle() {
     registry.record_stream(&summary);
     let after_close = registry.render_uncached();
     assert!(
-        after_close
-            .lines()
-            .any(|line| line.starts_with("ferrum_mesh_tcp_connections_closed_total{")
-                && line.ends_with(" 1")),
+        after_close.lines().any(|line| line
+            .starts_with("ferrum_mesh_tcp_connections_closed_total{")
+            && line.ends_with(" 1")),
         "closed must increment on disconnect:\n{after_close}"
     );
     assert!(
@@ -234,10 +247,10 @@ fn tcp_opened_closed_and_bytes_follow_connect_disconnect_lifecycle() {
         "sent bytes must equal stream bytes_sent:\n{after_close}"
     );
     assert!(
-        after_close
-            .lines()
-            .any(|line| line.starts_with("ferrum_mesh_tcp_received_bytes_total{")
-                && line.ends_with(" 900")),
+        after_close.lines().any(
+            |line| line.starts_with("ferrum_mesh_tcp_received_bytes_total{")
+                && line.ends_with(" 900")
+        ),
         "received bytes must equal stream bytes_received:\n{after_close}"
     );
 }
@@ -255,17 +268,15 @@ fn grpc_message_counters_use_authoritative_frame_counts() {
     registry.record(&summary);
     let output = registry.render_uncached();
     assert!(
-        output
-            .lines()
-            .any(|line| line.starts_with("ferrum_mesh_request_messages_total{")
-                && line.ends_with(" 2")),
+        output.lines().any(
+            |line| line.starts_with("ferrum_mesh_request_messages_total{") && line.ends_with(" 2")
+        ),
         "request messages must be 2:\n{output}"
     );
     assert!(
-        output
-            .lines()
-            .any(|line| line.starts_with("ferrum_mesh_response_messages_total{")
-                && line.ends_with(" 3")),
+        output.lines().any(
+            |line| line.starts_with("ferrum_mesh_response_messages_total{") && line.ends_with(" 3")
+        ),
         "response messages must be 3:\n{output}"
     );
 }
@@ -317,9 +328,9 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
     metadata
         .entry("mesh.source.namespace".into())
         .or_insert_with(|| "default".into());
-    metadata.entry("mesh.source.principal".into()).or_insert_with(|| {
-        "spiffe://cluster.local/ns/default/sa/frontend".into()
-    });
+    metadata
+        .entry("mesh.source.principal".into())
+        .or_insert_with(|| "spiffe://cluster.local/ns/default/sa/frontend".into());
     metadata
         .entry("mesh.source.app".into())
         .or_insert_with(|| "frontend".into());
@@ -332,9 +343,9 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
     metadata
         .entry("mesh.destination.namespace".into())
         .or_insert_with(|| "default".into());
-    metadata.entry("mesh.destination.principal".into()).or_insert_with(|| {
-        "spiffe://cluster.local/ns/default/sa/db".into()
-    });
+    metadata
+        .entry("mesh.destination.principal".into())
+        .or_insert_with(|| "spiffe://cluster.local/ns/default/sa/db".into());
     metadata
         .entry("mesh.destination.app".into())
         .or_insert_with(|| "db".into());

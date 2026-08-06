@@ -481,7 +481,9 @@ async fn translated_disabled_override_without_match_suppresses_all_mesh_metrics(
         ctx.metadata
             .get("mesh.metrics.disabled")
             .map(String::as_str),
-        Some("request_count,request_duration,request_size,response_size,tcp_opened_connections,tcp_closed_connections,tcp_sent_bytes,tcp_received_bytes,grpc_request_messages,grpc_response_messages")
+        Some(
+            "request_count,request_duration,request_size,response_size,tcp_opened_connections,tcp_closed_connections,tcp_sent_bytes,tcp_received_bytes,grpc_request_messages,grpc_response_messages"
+        )
     );
 
     let registry = MetricsRegistry::new();

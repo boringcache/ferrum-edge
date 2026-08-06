@@ -909,9 +909,8 @@ impl ProxyBody {
     /// Enable authoritative gRPC length-prefixed response message counting.
     pub fn with_grpc_message_counter(mut self, messages: Arc<AtomicU64>) -> Self {
         self.grpc_messages = Some(messages);
-        self.grpc_scanner = Some(
-            crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default(),
-        );
+        self.grpc_scanner =
+            Some(crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default());
         self
     }
 
@@ -1959,9 +1958,8 @@ impl CountingIncoming {
         messages: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         self.grpc_messages = Some(messages);
-        self.grpc_scanner = Some(
-            crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default(),
-        );
+        self.grpc_scanner =
+            Some(crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default());
         self
     }
 
