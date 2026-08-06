@@ -52,9 +52,9 @@ const ROUTE_HOST: &str = "app.example.com";
 /// makes it the namespace the gateway subprocess must be told to load
 /// (`FERRUM_NAMESPACE`), since file mode filters the document by namespace.
 const K8S_NAMESPACE: &str = "default";
-/// Cluster DNS name the translator emits for the `reviews` Service in
-/// `default`. This is the authority the BACKEND must see, and it is distinct
-/// from `BACKEND_SNI` — which is the whole point of the Host assertion.
+// Cluster DNS name the translator emits for the `reviews` Service in
+// `default`. This is the authority the BACKEND must see, and it is distinct
+// from `BACKEND_SNI` — which is the whole point of the Host assertion.
 
 // ---------------------------------------------------------------------------
 // Certificates
