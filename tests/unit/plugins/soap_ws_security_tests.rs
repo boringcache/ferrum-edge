@@ -6803,12 +6803,8 @@ async fn capacity_pressure_cannot_reclaim_a_claim_a_later_generation_still_needs
     let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
     let mut config = digest_config_with_created_window(300, 300);
     config["nonce"]["max_cache_size"] = json!(1);
-    let harness = SoapNonceReplayHarness::with_scope(
-        &config,
-        scope,
-        std::time::Instant::now(),
-    )
-    .expect("narrow generation must admit");
+    let harness = SoapNonceReplayHarness::with_scope(&config, scope, std::time::Instant::now())
+        .expect("narrow generation must admit");
 
     harness
         .claim_at("capacity-nonce-01", Duration::ZERO)
