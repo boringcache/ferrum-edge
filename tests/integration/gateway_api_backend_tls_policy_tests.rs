@@ -934,7 +934,10 @@ fn backend_tls_policy_status_marks_precedence_loser_conflicted() {
 #[test]
 fn backend_tls_policy_status_marks_fully_shadowed_service_policy_conflicted() {
     let objects = vec![
+        gateway_class(),
+        gateway(),
         multi_port_service("api"),
+        http_route("api-route", "api", 8443),
         sectioned_policy("api-http", "api", "http", "http.example.com"),
         sectioned_policy("api-https", "api", "https", "https.example.com"),
         backend_tls_policy_system("api-any", "api"),
@@ -969,7 +972,10 @@ fn backend_tls_policy_status_marks_fully_shadowed_service_policy_conflicted() {
 #[test]
 fn backend_tls_policy_status_keeps_partially_effective_service_policy_accepted() {
     let objects = vec![
+        gateway_class(),
+        gateway(),
         multi_port_service("api"),
+        http_route("api-route", "api", 8443),
         sectioned_policy("api-https", "api", "https", "https.example.com"),
         backend_tls_policy_system("api-any", "api"),
     ];
