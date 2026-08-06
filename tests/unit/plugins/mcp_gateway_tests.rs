@@ -9864,8 +9864,18 @@ async fn aggregate_sse_cancel_is_a_side_effect_with_fixed_tokens() {
     assert_eq!(reject_raw(result).0, 202);
     let outcome = unknown_ctx.metadata.get("mcp.sse.cancel");
     assert_eq!(outcome.map(String::as_str), Some("unknown_stream"));
-    for value in unknown_ctx.metadata.values() {
-        assert!(!value.contains("never-opened"));
+    // No gateway-authored diagnostic may echo the client-controlled request id.
+    // Scoped to `mcp.*` on purpose: `request_body` is the caller-supplied body
+    // text view this fixture seeds itself (see `mcp_ctx`), not something the
+    // plugin wrote, so asserting over every metadata entry would only be
+    // re-asserting the test's own input.
+    for (key, value) in &unknown_ctx.metadata {
+        if key.starts_with("mcp.") {
+            assert!(
+                !value.contains("never-opened"),
+                "mcp metadata key {key} echoed the request id"
+            );
+        }
     }
 
     // An unrepresentable request id is refused as an identity, not coerced.

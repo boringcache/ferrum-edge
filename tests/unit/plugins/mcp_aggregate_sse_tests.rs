@@ -676,13 +676,17 @@ fn byte_budget_bounds_total_retained_bytes() {
     let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
     broker.ensure_session("sess-bytes").unwrap();
     let filler = "x".repeat(3800);
-    let payload = json!({"jsonrpc": "2.0", "id": 1, "result": {"blob": filler}});
+    // Each response must name its OWN stream identity: publishing id 1's body
+    // under id 2 is refused as an invalid envelope long before retention is
+    // consulted, which would make this a byte-budget test in name only.
+    let first_payload = json!({"jsonrpc": "2.0", "id": 1, "result": {"blob": filler.clone()}});
+    let second_payload = json!({"jsonrpc": "2.0", "id": 2, "result": {"blob": filler}});
     let one = number_id(1);
     let two = number_id(2);
     let first = broker.open_stream("sess-bytes", &one).unwrap();
-    first.publish_encoded(&encode(&payload)).unwrap();
+    first.publish_encoded(&encode(&first_payload)).unwrap();
     let second = broker.open_stream("sess-bytes", &two).unwrap();
-    let overflow = second.publish_encoded(&encode(&payload));
+    let overflow = second.publish_encoded(&encode(&second_payload));
     assert_eq!(overflow.unwrap_err(), SseError::RetentionOverflow);
 }
 
