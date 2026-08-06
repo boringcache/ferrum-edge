@@ -918,6 +918,11 @@ pub async fn run(
     // generation of the previous cycle.
     crate::observability_delivery::begin_serving_cycle();
 
+    // Debug-only: arm functional-test DB outage control before any connect
+    // (including offline/lazy bootstrap) so the injector is ready for the
+    // whole serving cycle. No-op in release builds / when unset.
+    crate::config::test_db_fault::arm_from_env().await;
+
     let effective_url = env_config
         .effective_db_url()
         .map_err(anyhow::Error::msg)?

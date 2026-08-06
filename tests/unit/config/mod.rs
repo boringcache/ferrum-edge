@@ -40,5 +40,6 @@ mod pool_config_tests;
 mod separate_listeners_tests;
 mod sql_dialect_tests;
 mod stream_proxy_config_tests;
+mod test_db_fault_tests;
 mod workload_entry_cross_namespace_tests;
 mod workload_entry_local_inbound_slice_tests;
