@@ -205,9 +205,11 @@ fn virtual_service_tcp_weighted_split_skips_zero_weight_and_fails_closed_on_inva
         all_zero_proxy.upstream_id.is_none(),
         "agreeing all-zero destinations collapse to a direct blackhole binding"
     );
-    assert!(all_zero.warnings.iter().any(|warning| {
-        warning.contains("only zero-weight") && warning.contains("blackhole")
-    }));
+    assert!(
+        all_zero.warnings.iter().any(|warning| {
+            warning.contains("only zero-weight") && warning.contains("blackhole")
+        })
+    );
 
     let invalid = translate_k8s_objects(
         &[vs(
@@ -563,9 +565,11 @@ fn virtual_service_tls_all_zero_weight_remains_fail_closed_blackhole() {
     assert_eq!(proxy.backend_host, "ferrum-zero-weight.invalid.");
     assert_eq!(proxy.backend_port, 443);
     assert_eq!(proxy.hosts, vec!["secure.example.com".to_string()]);
-    assert!(result.warnings.iter().any(|warning| {
-        warning.contains("only zero-weight") && warning.contains("blackhole")
-    }));
+    assert!(
+        result.warnings.iter().any(|warning| {
+            warning.contains("only zero-weight") && warning.contains("blackhole")
+        })
+    );
 }
 
 #[test]
