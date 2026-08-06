@@ -23549,7 +23549,9 @@ async fn handle_proxy_request_inner(
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
-    let accepted_local_ip = connection_metadata.accepted_local_addr.map(|addr| addr.ip());
+    let accepted_local_ip = connection_metadata
+        .accepted_local_addr
+        .map(|addr| addr.ip());
 
     let method = req.method().as_str().to_owned();
     let inbound_version = req.version();

@@ -2803,7 +2803,7 @@ impl MeshConfig {
             return SidecarIngressConnectRelay::Deny;
         };
         let authority_ip = authority_ip.to_canonical();
-        if accepted_local_ip.map(std::net::IpAddr::to_canonical) != Some(authority_ip)
+        if accepted_local_ip.map(|ip| ip.to_canonical()) != Some(authority_ip)
             || !self.local_workload_addresses.contains(&authority_ip)
         {
             return SidecarIngressConnectRelay::Deny;

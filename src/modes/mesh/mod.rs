@@ -32715,9 +32715,12 @@ mod tests {
         let config =
             gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
         let mesh = config.mesh.as_deref().expect("prepared mesh");
+        let expected_pod_ip = "10.244.1.7"
+            .parse::<std::net::IpAddr>()
+            .expect("test pod IP");
         assert_eq!(
             mesh.local_workload_addresses,
-            vec!["10.244.1.7".parse().expect("test pod IP")],
+            vec![expected_pod_ip],
             "IPv4-mapped duplicates must canonicalize + dedup to one address"
         );
         assert!(mesh.host_is_local_service_workload_address("10.244.1.7"));
@@ -32728,7 +32731,7 @@ mod tests {
         let remap = mesh.resolve_sidecar_ingress_connect_relay(
             "10.244.1.7",
             16379,
-            Some("10.244.1.7".parse().expect("test pod IP")),
+            Some(expected_pod_ip),
         );
         assert_eq!(remap, expected_redis_remap());
 
@@ -32748,7 +32751,7 @@ mod tests {
         let stale = mesh_v2.resolve_sidecar_ingress_connect_relay(
             "10.244.1.7",
             16379,
-            Some("10.244.1.7".parse().expect("test pod IP")),
+            Some(expected_pod_ip),
         );
         assert_eq!(stale, config::SidecarIngressConnectRelay::NotDeclared);
     }
