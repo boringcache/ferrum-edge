@@ -7067,10 +7067,7 @@ where
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                 let metric_data = coalesce_buf.split().freeze();
                 let out = if let Some(text_mode) = grpc_web_translation_mode {
-                    crate::plugins::grpc_web::encode_streaming_data(
-                        metric_data.clone(),
-                        text_mode,
-                    )
+                    crate::plugins::grpc_web::encode_streaming_data(metric_data.clone(), text_mode)
                 } else {
                     metric_data.clone()
                 };
