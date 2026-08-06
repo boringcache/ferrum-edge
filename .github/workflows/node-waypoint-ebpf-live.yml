@@ -183,6 +183,23 @@ jobs:
           results="target/node-waypoint-ebpf-live/mesh-bpf-metrics"
           mkdir -p "$results"
 
+          # RCA (run 31082004094 / job 92552728464): the prior stimulus curled
+          # http://127.0.0.1:15020/ from src-a, ignored curl failure (`|| true`),
+          # and expected ferrum_mesh_bpf_drops_total{reason="exclude_port_hit"} to
+          # rise. Nothing listens on loopback:15020 in the curl sleep container, so
+          # the dial was connection-refused; after 15s the same-node ambient still
+          # reported all four BPF bypass counters at 0 despite excludePorts
+          # 15001,15006,15008,15020 being configured and the SOCK_OPS consumer
+          # attached. connect4 emits exclude_port_hit on the destination port
+          # before rewrite, but a refused loopback dial is not a fail-closed
+          # proof that an enrolled-workload connect to an excluded port happened.
+          # Stimulus: short-lived ClusterIP Service on excluded port 15020 whose
+          # targetPort is the already-ready dst-a HTTP container port 8080. Dial
+          # the Service ClusterIP directly (no DNS), require a successful HTTP
+          # body from src-a (exclude_port bypasses capture so plaintext reaches
+          # the python server), then require the same-node ambient counter to
+          # advance. Do not weaken the metric assertion.
+
           source_pod="$(kubectl -n ferrum-ebpf-live get pod -l app=src-a -o jsonpath='{.items[0].metadata.name}')"
           source_node="$(kubectl -n ferrum-ebpf-live get "pod/$source_pod" -o jsonpath='{.spec.nodeName}')"
           ambient_pod="$(
@@ -196,10 +213,63 @@ jobs:
             exit 1
           fi
 
+          probe_svc="bpf-exclude-port-probe"
+          kubectl -n ferrum-ebpf-live apply -f - <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${probe_svc}
+            namespace: ferrum-ebpf-live
+            labels:
+              app.kubernetes.io/name: ${probe_svc}
+              app.kubernetes.io/component: live-bpf-bypass-assertion
+          spec:
+            # IPv4-only so the src-a curl URL is unambiguous and hits connect4
+            # (not connect6) against excluded port 15020.
+            ipFamilyPolicy: SingleStack
+            ipFamilies:
+              - IPv4
+            selector:
+              app: dst-a
+            ports:
+              - name: excluded-http
+                port: 15020
+                targetPort: 8080
+                protocol: TCP
+          EOF
+
           kubectl -n ferrum port-forward "pod/$ambient_pod" 19450:19010 \
             >"$results/port-forward.log" 2>&1 &
           port_forward_pid=$!
-          trap 'kill "$port_forward_pid" 2>/dev/null || true; wait "$port_forward_pid" 2>/dev/null || true' EXIT
+          cleanup() {
+            kill "$port_forward_pid" 2>/dev/null || true
+            wait "$port_forward_pid" 2>/dev/null || true
+            kubectl -n ferrum-ebpf-live delete svc "$probe_svc" --ignore-not-found --wait=false \
+              >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          probe_ip=""
+          for _ in $(seq 1 30); do
+            probe_ip="$(
+              kubectl -n ferrum-ebpf-live get "svc/$probe_svc" \
+                -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true
+            )"
+            endpoint_ip="$(
+              kubectl -n ferrum-ebpf-live get endpoints "$probe_svc" \
+                -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || true
+            )"
+            if [[ "$probe_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && -n "$endpoint_ip" ]]; then
+              break
+            fi
+            probe_ip=""
+            sleep 0.5
+          done
+          if [[ -z "$probe_ip" ]]; then
+            echo "failed to resolve IPv4 ClusterIP/endpoints for $probe_svc" >&2
+            kubectl -n ferrum-ebpf-live get svc,endpoints "$probe_svc" -o wide >&2 || true
+            exit 1
+          fi
 
           fetched=false
           for _ in $(seq 1 30); do
@@ -223,9 +293,11 @@ jobs:
             exit 1
           fi
 
+          # Fail closed on the stimulus: require a successful HTTP response from
+          # dst-a via excluded Service port 15020 (ClusterIP literal, no DNS).
           kubectl -n ferrum-ebpf-live exec "pod/$source_pod" -- \
-            curl -fsS --connect-timeout 1 --max-time 1 \
-            http://127.0.0.1:15020/ >/dev/null 2>&1 || true
+            curl -fsS --connect-timeout 5 --max-time 5 \
+            "http://${probe_ip}:15020/" | tee "$results/probe.body" | grep -q 'ok-a'
 
           after="$before"
           for _ in $(seq 1 30); do
@@ -242,13 +314,14 @@ jobs:
           done
 
           if ((after <= before)); then
-            echo "expected $metric to increase after a real excluded-port connection; before=$before after=$after" >&2
+            echo "expected $metric to increase after a real excluded-port connection; before=$before after=$after probe_ip=$probe_ip" >&2
             grep 'ferrum_mesh_bpf_drops_total' "$results/after.prom" >&2 || true
+            cat "$results/probe.body" >&2 || true
             exit 1
           fi
 
-          printf 'source_pod=%s\nsource_node=%s\nambient_pod=%s\nmetric=%s\nbefore=%s\nafter=%s\n' \
-            "$source_pod" "$source_node" "$ambient_pod" "$metric" "$before" "$after" \
+          printf 'source_pod=%s\nsource_node=%s\nambient_pod=%s\nprobe_svc=%s\nprobe_ip=%s\nmetric=%s\nbefore=%s\nafter=%s\n' \
+            "$source_pod" "$source_node" "$ambient_pod" "$probe_svc" "$probe_ip" "$metric" "$before" "$after" \
             >"$results/assertion.txt"
 
       - name: Collect diagnostics
