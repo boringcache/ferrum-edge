@@ -22,7 +22,7 @@ use super::{
     optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
     resource_id, route_backends_require_node_waypoint_authz,
     route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
-    upstream_for_route_with_session,
+    upstream_for_route, upstream_for_route_with_session,
 };
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{HashOnCookieConfig, PluginConfig, Proxy};
