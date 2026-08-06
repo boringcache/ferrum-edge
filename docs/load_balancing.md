@@ -326,7 +326,9 @@ Uses 150 virtual nodes per target on a hash ring for uniform distribution.
 
 #### Hash Key Sources
 
-The `hash_on` field controls what value is used as the hash key:
+The `hash_on` field controls what value is used as the hash key. Header and
+cookie names must use ASCII HTTP token syntax; whitespace, control bytes, and
+separators such as `;`, `=`, and `:` are rejected at config admission.
 
 | `hash_on` value | Description | Cookie injection |
 |---|---|---|
@@ -370,8 +372,37 @@ upstreams:
 
 When `hash_on` is `cookie:<name>`, the gateway establishes sticky sessions automatically:
 
-1. **First request** (no cookie): The gateway selects a target using the client IP as a fallback key, then injects a `Set-Cookie` response header with the selected target's identifier.
-2. **Subsequent requests** (cookie present): The cookie value is used as the hash key, routing the request to the same target.
+1. **First request** (no cookie): The gateway selects a target using the client IP as a fallback key, then injects a `Set-Cookie` response header carrying an **opaque token bound to the target that served that response**. The token is a SHA-256 digest over the namespace-qualified upstream identity and the selected target's **sticky identity** (below), so it discloses no backend address, credential, or secret. It is unkeyed and deterministic, so affinity survives a gateway restart and is identical across gateway replicas. Being unkeyed, it is *obfuscated, not authenticated*: a forged token can only steer a client to a backend the same upstream would already have selected for some other client, never outside the health/subset/port-scoped candidate pool.
+2. **Subsequent requests** (cookie present): The token is resolved through a per-upstream binding index that is materialized at config reload, returning the client to that **exact** target — not merely to a deterministic one.
+3. **Fallback**: a cookie value that is malformed, oversized, scoped to another upstream (Gateway API materializes one route-scoped upstream per persistent route rule, so a token cannot steer across routes, Services, namespaces, or policies), stale after the backend was removed, outside the selected subset/port lane, or currently unhealthy is treated as **no session**: the request falls through to ordinary load-balanced selection and a fresh, correctly bound cookie is issued on the response. Health, subset, port, TLS, authorization, retry, and connection-limit semantics are never bypassed.
+4. **Selected-port policy precedence**: the binding is resolved before the target is known, so it is validated against the initial dispatch port's lane. If the resolved target's own `dispatch_policy_port()` lane is a *different* policy lane whose effective algorithm is not consistent hashing, or whose `hash_on` names a different cookie, the binding **fails closed** to ordinary selection and reissue — a token can never reach past the per-port policy that governs the endpoint it names.
+5. **Retry rotation**: an honored binding is normally not re-issued. But retry may rotate off the bound backend after selection already decided, and rotation does not necessarily eject the failed endpoint. Whenever the backend that actually served the response is not the one the request was bound to, the response carries a **fresh cookie for the serving backend**, so the next request does not go back to the endpoint that just failed. Gateway-synthesized rejections that dialed no backend (mesh-transport or egress screens on a rotated candidate) issue no cookie at all. This holds on HTTP/1.1 and HTTP/2, direct gRPC, WebSocket (including HTTP/2 extended CONNECT), native HTTP/3, the HTTP/3→HTTP and HTTP/3→gRPC cross-protocol bridges, and HTTP/3 WebSocket.
+
+##### Sticky target identity
+
+One route Upstream can legitimately contain the same network endpoint more than once — Gateway API fans several `backendRefs` into a single rule, so two entries can share a pod IP and dial port while naming **different Services**, **different declared Service ports** (and therefore different per-port policy lanes), or different subset labels. The binding must not collapse those, so the digest covers every stable target field that can change routing, policy, authorization, TLS selection, or target meaning:
+
+| Field | Why it is part of the identity |
+|-------|-------------------------------|
+| `host`, `port` | The dial destination |
+| declared Service port (internal `service_port_policy_key`) | Selects the per-port policy lane — its algorithm, `hash_on`, passive-health policy and TLS overlay — and records which Service port owns the target |
+| `tags` | Subset membership (`subsets[].labels`), Service identity, and mesh provenance / HBONE dial facts |
+| `locality` | Locality-LB tier and cross-cluster provenance |
+| `path` | Per-target override of the proxy's `backend_path` |
+
+`weight` is deliberately **not** part of the identity: it only sizes a target's share of *unbound* selections, so two entries differing solely in weight are interchangeable for an already-pinned session — and including it would make an ordinary canary weight shift invalidate every outstanding session cookie on the route. Transient health, ejection, and counter state are excluded for the same reason the value must be reproducible: the token is derived identically on every replica and after every restart.
+
+The encoding is canonical — tags are sorted by key, variable-length fields are length-prefixed, and optional fields carry a presence marker — so it never depends on map iteration order and no rearrangement of two fields can produce the same digest. Two targets that are identical in *all* of the above fields share one binding, which is safe because dispatching to either is indistinguishable. Digests are materialized when the balancer is built (config reload / service-discovery update), not per request.
+
+##### Wildcard-hosted targets: configured identity vs. dial target
+
+A target may be configured with a wildcard host (`*.example.com`) — mesh egress wildcard `ServiceEntry`s with `DNS`/`NONE` resolution are the common case. Such a target is **dialed** through a per-request copy whose host is the concrete request authority that matched the route, because connection, DNS resolution, SNI, and pool keying all need the real name. That per-request copy is a *dial target*, not an identity: it exists for one request and is not an entry the balancer was built from.
+
+Session persistence is expressed in the **configured** selection identity. A response served through a wildcard target's dial copy mints the cookie for the configured `*.example.com` entry, so a returning client resolves that entry through the binding index and the request is re-concretized for its own dial. (Minting from the dial copy instead would emit a token that is not an index key at all: the client would miss on every return and be issued a new cookie forever, with no stickiness.)
+
+Retry selection uses the same configured-vs-dial distinction for HTTP/H3. After a failed attempt the shared retry helper reconciles the just-tried dial clone back to its configured identity for exclusion (full routing/policy field set, not merely `host:port`), selects the next configured candidate, and re-concretizes it with the same validated inbound authority before returning — so callers receive a dial-ready target and never attempt DNS/SNI/pool use of a literal `*.example.com`. Missing or non-matching authority fails closed (no retry) rather than inventing a host. This mapping is independent of whether the upstream mints sticky cookies. TCP/stream connect-retry is separate: it never retained the selected `UpstreamTarget`, so it excludes by effective `(host, dial port, policy lane)` and drops every configured entry on that lane.
+
+The mapping back to the configured entry matches the served target's host against configured wildcard patterns and requires **every other identity field above to be equal**, so two `backendRefs` sharing a wildcard suffix but naming different Services, policy lanes, subsets, localities, or path overrides keep separate bindings. A concrete configured entry always wins over a wildcard that also matches it, and a request authority that matches no configured wildcard is never handed another target's binding. Upstreams with no wildcard target — that is, nearly all of them — skip this entirely on the ordinary path.
 
 ```yaml
 upstreams:
@@ -395,18 +426,19 @@ upstreams:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `path` | string | `"/"` | Cookie `Path` attribute |
-| `ttl_seconds` | integer | `3600` | Cookie `Max-Age` in seconds (1 hour default) |
-| `domain` | string | — | Optional `Domain` attribute |
+| `path` | string | `"/"` | Cookie `Path` attribute; must start with `/` and cannot contain control bytes or `;` |
+| `ttl_seconds` | integer | `3600` | Cookie `Max-Age` in seconds (1 hour default). Ignored when `session_cookie` is true |
+| `session_cookie` | boolean | `false` | Omit `Max-Age` so the cookie is a browser session cookie (Gateway API `lifetimeType: Session`) |
+| `domain` | string | — | Optional ASCII domain name (an optional leading dot is accepted) |
 | `http_only` | boolean | `true` | Set the `HttpOnly` flag |
 | `secure` | boolean | `false` | Set the `Secure` flag |
 | `same_site` | string | — | `SameSite` attribute: `Strict`, `Lax`, or `None` |
 
 If `hash_on_cookie_config` is omitted, sensible defaults are used (path `/`, 1 hour TTL, `HttpOnly` enabled).
 
-The sticky session cookie is injected on HTTP, gRPC, and WebSocket (101 Upgrade) responses.
+The sticky session cookie is injected on HTTP, gRPC, and WebSocket (101 Upgrade) responses. For gRPC this covers both the buffered response path and the fully-streaming fast path (a server-streaming RPC with no response-body-buffering plugin), where the cookie is written into the initial HEADERS frame before it is committed.
 
-When a target is removed or added, only a fraction of keys are remapped — this minimizes cache invalidation across backends.
+When a target is removed or added, only a fraction of *unbound* keys are remapped — this minimizes cache invalidation across backends. Sessions already bound to a surviving target keep their exact target; sessions bound to the removed target re-select and are re-issued a cookie.
 
 **Best for:** Session affinity, caching backends, stateful applications, multi-tenant routing.
 
@@ -665,7 +697,7 @@ proxies:
 - **Connection failures** (TCP refused, DNS, TLS, timeout) are retried for **all HTTP methods** — the request never reached the backend so idempotency is not a concern.
 - **HTTP status-code failures** (e.g., 502, 503) are only retried for methods in `retryable_methods` — `POST` and `PATCH` are excluded by default.
 - **Status-code retries are opt-in** — `retryable_status_codes` defaults to empty. Set it explicitly to enable (e.g., `[502, 503, 504]`).
-- When combined with an upstream, retries **exclude the previously tried target** so each attempt goes to a different backend.
+- When combined with an upstream, retries **exclude the previously tried target** so each attempt goes to a different backend. HTTP/H3 exclusion uses the full configured routing/policy identity (`host`, `port`, declared Service port / policy lane, tags, locality, path) — not merely `host:port` — so two `backendRefs` that share a network endpoint but differ by Service, subset, or path stay distinct. For wildcard-hosted targets the shared retry helper reconciles the just-tried dial clone back to that configured identity, then returns the next candidate already re-concretized with the request's validated authority (failing closed if that authority is missing or unmatched). TCP/stream connect-retry retains only the live `(host, dial port, policy lane)` tuple, so it uses a separate endpoint-lane exclude contract: every configured entry on that effective lane is dropped (including ordinary targets whose `service_port_policy_key` is `None` but whose `dispatch_policy_port()` equals the dial port), and ambiguous same-lane identity siblings are not reselected.
 - Retries apply to HTTP/1.1, HTTP/2, HTTP/3, gRPC, and WebSocket protocols. TCP stream proxies rotate to an alternate target only for connection-phase failures when `retry_on_connect_failure` is enabled; UDP stream proxies do not use retry logic.
 
 ## Circuit Breaker

@@ -49,6 +49,30 @@ fn empty_mesh_config_passes_validation() {
     assert!(errors.is_empty());
 }
 
+/// Issue #2469: the root namespace is a policy-authority boundary, not an
+/// arbitrary label. Native/file config must reject malformed values just as
+/// the xDS carrier boundary does, without echoing hostile input.
+#[test]
+fn mesh_config_rejects_malformed_istio_root_namespace_without_echoing_it() {
+    let hostile = format!("Bad/{}", "SECRET".repeat(40));
+    let mesh = MeshConfig {
+        istio_root_namespace: hostile.clone(),
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("MeshConfig.istio_root_namespace")),
+        "the policy-authority namespace must be rejected: {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|error| error.contains(&hostile)),
+        "the diagnostic must name the field without echoing hostile input: {errors:?}"
+    );
+}
+
 #[test]
 fn workload_validates_trust_domain_consistency() {
     let mut wl = fresh_workload();
@@ -245,6 +269,7 @@ fn mesh_config_validate_rejects_zero_ports_on_full_mesh_resources() {
             traffic_policy: None,
             port_level_settings: HashMap::from([(0, MeshTrafficPolicy::default())]),
             subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
         }],
         sidecars: vec![MeshSidecar {
             name: "sc".into(),
@@ -290,6 +315,7 @@ fn mesh_config_validate_rejects_empty_destination_rule_and_sidecar_fields() {
                 labels: HashMap::new(),
                 traffic_policy: None,
             }],
+            export_to: vec!["*".to_string()],
         }],
         sidecars: vec![MeshSidecar {
             name: "".into(),
@@ -2141,6 +2167,7 @@ fn mesh_config_validate_rejects_destination_rule_outlier_range_gaps() {
             }),
             port_level_settings: HashMap::new(),
             subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
         }],
         ..MeshConfig::default()
     };
@@ -2189,6 +2216,7 @@ fn mesh_config_validate_accepts_zero_consecutive_errors_as_disabled() {
             }),
             port_level_settings: HashMap::new(),
             subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
         }],
         ..MeshConfig::default()
     };
@@ -2242,6 +2270,7 @@ fn mesh_config_validate_rejects_destination_rule_tls_inconsistency() {
                     ..MeshTrafficPolicy::default()
                 }),
             }],
+            export_to: vec!["*".to_string()],
         }],
         ..MeshConfig::default()
     };
@@ -2768,6 +2797,96 @@ mod virtual_service_cors {
             &p, "team-b"
         ));
     }
+
+    /// `export_visibility_admits` is documented as the ONE evaluator shared by
+    /// ServiceEntry, DestinationRule, and VirtualService-derived CORS. This
+    /// pins that VirtualService CORS really does route through it rather than
+    /// carrying a private copy that can drift: for every list shape, the
+    /// verdict must equal the ServiceEntry verdict for the same
+    /// `(export_to, declaring namespace)` pair.
+    #[test]
+    fn export_visibility_matches_the_shared_service_entry_evaluator_exactly() {
+        for export_to in [
+            Vec::new(),
+            vec![".".to_string()],
+            vec!["*".to_string()],
+            vec!["team-a".to_string()],
+            vec!["team-a".to_string(), "team-b".to_string()],
+        ] {
+            let mut cors = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+            cors.export_to = export_to.clone();
+            let entry = ferrum_edge::modes::mesh::config::ServiceEntry {
+                name: "se".into(),
+                namespace: cors.namespace.clone(),
+                hosts: vec!["api.example.com".into()],
+                endpoints: Vec::new(),
+                resolution: Default::default(),
+                location: Default::default(),
+                ports: Vec::new(),
+                export_to,
+                workload_selector: None,
+            };
+            for workload_namespace in ["default", "team-a", "team-b", "other"] {
+                assert_eq!(
+                    virtual_service_cors_policy_exported_to_namespace(&cors, workload_namespace),
+                    ferrum_edge::modes::mesh::config::service_entry_exported_to_namespace(
+                        &entry,
+                        workload_namespace
+                    ),
+                    "export_to {:?} / workload namespace {workload_namespace:?}: the CORS \
+                     evaluator must not diverge from the shared one",
+                    cors.export_to
+                );
+            }
+        }
+    }
+
+    /// Sharing the evaluator is only safe if this list gets the same
+    /// fail-closed boundary check `DestinationRule.exportTo` gets — otherwise
+    /// hostile values could reach policy evaluation instead of being refused.
+    #[test]
+    fn hostile_export_to_values_are_rejected_not_interpreted() {
+        for (label, export_to) in [
+            ("tilde", vec!["~".to_string()]),
+            ("empty entry", vec![String::new()]),
+            ("uppercase namespace", vec!["Team-A".to_string()]),
+            ("namespace with a slash", vec!["team-a/svc".to_string()]),
+            (
+                "wildcard mixed with an explicit namespace",
+                vec!["*".to_string(), "team-a".to_string()],
+            ),
+            (
+                "over-long list",
+                (0..65).map(|i| format!("ns-{i}")).collect(),
+            ),
+        ] {
+            let mut p = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+            p.export_to = export_to;
+            let errors = validate(vec![p]);
+            assert!(
+                errors.iter().any(|error| error.contains("exportTo")),
+                "{label}: must be rejected at validation, got {errors:?}"
+            );
+        }
+    }
+
+    /// And the hostile value itself never reaches the diagnostic.
+    #[test]
+    fn export_to_rejection_does_not_echo_the_hostile_value() {
+        let hostile = "Q".repeat(200);
+        let mut p = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        p.export_to = vec![hostile.clone()];
+        let errors = validate(vec![p]);
+        assert!(
+            errors.iter().any(|error| error.contains("exportTo")),
+            "{errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|error| error.contains(&hostile)),
+            "the diagnostic must name the field and index, never echo the raw \
+             operator-supplied value; got {errors:?}"
+        );
+    }
 }
 
 #[test]
@@ -2777,6 +2896,7 @@ fn mesh_config_validate_rejects_combined_failover_priority_modes() {
             name: "dr".into(),
             namespace: "default".into(),
             host: "reviews.default.svc.cluster.local".into(),
+            export_to: Vec::new(),
             traffic_policy: Some(MeshTrafficPolicy {
                 locality_lb_setting: Some(MeshLocalityLbSetting {
                     enabled: true,
@@ -2810,6 +2930,7 @@ fn mesh_config_validate_rejects_malformed_failover_priority_entries() {
             name: "dr".into(),
             namespace: "default".into(),
             host: "reviews.default.svc.cluster.local".into(),
+            export_to: Vec::new(),
             traffic_policy: Some(MeshTrafficPolicy {
                 locality_lb_setting: Some(MeshLocalityLbSetting {
                     enabled: true,
@@ -2850,6 +2971,7 @@ fn mesh_config_validate_accepts_failover_priority_only() {
             name: "dr".into(),
             namespace: "default".into(),
             host: "reviews.default.svc.cluster.local".into(),
+            export_to: Vec::new(),
             traffic_policy: Some(MeshTrafficPolicy {
                 locality_lb_setting: Some(MeshLocalityLbSetting {
                     enabled: true,
