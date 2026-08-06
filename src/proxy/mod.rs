@@ -2294,27 +2294,94 @@ fn hbone_relay_authority_host_for_mesh(host: &str) -> &str {
     }
 }
 
-/// Build a transparent inbound HBONE relay proxy that dials the CONNECT
-/// `:authority` of an authenticated mesh peer, for an Ambient/Waypoint
-/// terminator where no inbound route is materialized. Returns `None` (caller
-/// 404s) when the authority is missing/portless or is not a safe local relay
-/// target per [`inbound_hbone_relay_destination_allowed`].
+/// A synthesized inbound CONNECT relay proxy plus the declared Sidecar
+/// `ingress[]` listener port to authorize on, when the relay came from an
+/// ingress remap (issue #3260). `None` for the ordinary transparent relay,
+/// which authorizes on the relay's own backend port.
+pub(crate) struct InboundConnectRelay {
+    pub(crate) proxy: Arc<Proxy>,
+    pub(crate) ingress_listener_authz_port: Option<u16>,
+}
+
+/// Build the inbound CONNECT relay proxy for an authenticated mesh peer.
+///
+/// Two shapes share this boundary, in strict order:
+///
+/// 1. **Sidecar `ingress[]` stream remap (issue #3260).** The identity-protected
+///    Sidecar inbound path is a fresh mesh-mTLS H2 CONNECT to `:15006`, so it
+///    never reaches the REDIRECT-captured `local_inbound_tcp_routes` table that
+///    serves direct plaintext. When the authority names THIS workload on a
+///    DECLARED stream-family ingress listener port, relay to that listener's
+///    validated loopback `defaultEndpoint` — `pod-ip:16379` → `127.0.0.1:6379`
+///    — and report the DECLARED listener port so `mesh_authz` authorizes on it.
+///    A declared port that does not resolve to exactly one valid, owner-stamped,
+///    stream-family mapping owned by this workload returns `None` (caller 404s)
+///    instead of falling through to dial the port the operator replaced.
+/// 2. **Ordinary transparent relay** (Ambient / Waypoint terminators, which
+///    materialize NO inbound routes): dial the CONNECT `:authority` itself, the
+///    original destination the peer asked for. Unchanged, and unreachable for a
+///    declared ingress listener port so this can never widen it.
+///
+/// Returns `None` (caller 404s) when the authority is missing/portless or is not
+/// a safe local relay target per [`inbound_hbone_relay_destination_allowed`].
+///
+/// `allow_sidecar_ingress_remap` is `false` for a datagram-over-CONNECT
+/// (`connect-udp`) request: `ingress[]` stream listeners are TCP, the UDP relay
+/// opens a `UdpSocket` straight at the resolved port, and #3260 must not widen
+/// UDP behavior.
 fn build_inbound_hbone_relay_proxy(
     authority: Option<&http::uri::Authority>,
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
-) -> Option<Arc<Proxy>> {
+    allow_sidecar_ingress_remap: bool,
+) -> Option<InboundConnectRelay> {
+    use crate::modes::mesh::config::SidecarIngressConnectRelay;
+
     let authority = authority?;
     let host = hbone_relay_authority_host_for_mesh(authority.host());
     let port = authority.port_u16()?;
     if host.is_empty() || port == 0 {
         return None;
     }
+
+    let ingress_remap = match mesh {
+        Some(mesh) if allow_sidecar_ingress_remap => {
+            mesh.resolve_sidecar_ingress_connect_relay(host, port)
+        }
+        _ => SidecarIngressConnectRelay::NotDeclared,
+    };
+    match ingress_remap {
+        SidecarIngressConnectRelay::NotDeclared => {}
+        SidecarIngressConnectRelay::Deny => {
+            warn!(
+                listener_port = port,
+                "Refusing authenticated inbound CONNECT for a declared Sidecar ingress[] \
+                 listener that does not resolve to a single valid, owner-stamped, \
+                 stream-family loopback endpoint owned by this workload"
+            );
+            return None;
+        }
+        SidecarIngressConnectRelay::Relay {
+            listener_port,
+            endpoint_host,
+            endpoint_port,
+        } => {
+            let endpoint = endpoint_host.as_str();
+            let relay = crate::modes::mesh::mesh_ingress_relay_proxy(endpoint, endpoint_port);
+            return Some(InboundConnectRelay {
+                proxy: Arc::new(relay),
+                ingress_listener_authz_port: Some(listener_port),
+            });
+        }
+    }
+
     if !inbound_hbone_relay_destination_allowed(host, port, mesh) {
         return None;
     }
-    Some(Arc::new(
-        crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
-    ))
+    let relay = crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port);
+    Some(InboundConnectRelay {
+        proxy: Arc::new(relay),
+        ingress_listener_authz_port: None,
+    })
 }
 
 /// A captured NodeWaypoint inbound connection resolved against the live slice:
@@ -16106,6 +16173,13 @@ fn mesh_inbound_peer_auth_app_port(proxy: &Proxy, upstream_target: Option<&Upstr
     // keyed by the workload app/container port behind defaultEndpoint. Route
     // overrides and upstream selection can replace that initial proxy port, so
     // the concrete target port is authoritative once one has been selected.
+    //
+    // This keeps the two inbound lanes in lock-step. Direct plaintext capture
+    // translates the captured listener port through
+    // `MeshInboundTlsPolicy.app_port_by_orig_dst_port` before selecting a
+    // posture; an authenticated CONNECT that a declared ingress listener
+    // remapped (issue #3260) arrives here with `backend_port` ALREADY equal to
+    // that same `defaultEndpoint` port, so both lanes resolve one posture.
     upstream_target
         .map(|target| target.port)
         .unwrap_or(proxy.backend_port)
@@ -24226,19 +24300,38 @@ async fn handle_proxy_request_inner(
             // (`inbound_hbone_relay_destination_allowed`) bounds the authority to
             // a loopback / slice-known workload addr+port the same way — and is
             // then routed to the UDP unframing handler at the dispatch branch.
+            //
+            // The SAME boundary also remaps an authenticated byte-stream CONNECT
+            // that names a DECLARED Sidecar `ingress[]` stream listener onto that
+            // listener's `defaultEndpoint` (issue #3260) — the identity-protected
+            // counterpart of the direct plaintext capture path's
+            // `local_inbound_tcp_routes` lookup, which a fresh mesh-mTLS CONNECT
+            // to `:15006` never reaches. The remap is withheld from the `udp`
+            // flavor (`ingress[]` stream listeners are TCP; UDP behavior is
+            // unchanged).
             let hbone_relay = if is_hbone_connect_any
                 && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             {
-                build_inbound_hbone_relay_proxy(req.uri().authority(), epoch.config.mesh.as_deref())
+                build_inbound_hbone_relay_proxy(
+                    req.uri().authority(),
+                    epoch.config.mesh.as_deref(),
+                    !is_udp_hbone_connect,
+                )
             } else {
                 None
             };
             match hbone_relay {
-                Some(relay_proxy) => {
+                Some(relay) => {
                     // Plugins (incl. the mesh global chain / `mesh_authz`) read
                     // `ctx.headers`, so materialize them before the chain runs.
                     ctx.materialize_headers();
-                    (relay_proxy, 0)
+                    // Sidecar ingress remaps authorize on the DECLARED listener
+                    // port, never the `defaultEndpoint` the relay dials (F6 §6.2
+                    // security, mirroring the materialized ingress HTTP routes).
+                    // Stamped before the plugin chain runs; `None` leaves the
+                    // ordinary transparent relay authorizing on its backend port.
+                    ctx.mesh_inbound_listener_authz_port = relay.ingress_listener_authz_port;
+                    (relay.proxy, 0)
                 }
                 None => {
                     // Outbound-capture route misses under effective
@@ -48720,9 +48813,16 @@ mod tests {
             gate_pos < not_found_pos,
             "REGISTRY_ONLY route-miss evaluation must run before the generic 404 response"
         );
+        // Anchor on the arm's own binding rather than the bare call name: the
+        // function DEFINITION appears far earlier in this file, so a `rfind` on
+        // the name alone would still succeed if the call were deleted.
         let relay_pos = src[..not_found_pos]
-            .rfind("build_inbound_hbone_relay_proxy(req.uri().authority()")
-            .expect("inbound HBONE relay synthesis must remain in the route-miss arm");
+            .rfind("let hbone_relay = if is_hbone_connect_any")
+            .expect("inbound CONNECT relay synthesis must remain in the route-miss arm");
+        assert!(
+            src[relay_pos..not_found_pos].contains("build_inbound_hbone_relay_proxy("),
+            "the route-miss arm must still synthesize the inbound CONNECT relay"
+        );
         assert!(
             relay_pos < gate_pos,
             "inbound HBONE relay synthesis must stay ahead of the REGISTRY_ONLY route-miss gate"
@@ -50604,11 +50704,15 @@ mod tests {
         });
         let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();
 
-        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh))
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), true)
             .expect("bracketed IPv6 authority should build relay");
 
-        assert_eq!(relay.backend_host, "fd00:10:244:1::4");
-        assert_eq!(relay.backend_port, 8080);
+        assert_eq!(relay.proxy.backend_host, "fd00:10:244:1::4");
+        assert_eq!(relay.proxy.backend_port, 8080);
+        assert_eq!(
+            relay.ingress_listener_authz_port, None,
+            "an ordinary transparent relay must not stamp an ingress listener authz port"
+        );
     }
 
     #[test]

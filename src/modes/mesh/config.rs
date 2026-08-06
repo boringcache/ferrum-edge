@@ -1575,11 +1575,17 @@ pub struct ResolvedIngressListener {
     pub endpoint_host: String,
     /// Backend port parsed from `defaultEndpoint`.
     pub endpoint_port: u16,
-    /// Application protocol that resolved. Defaults to `Http` on older
-    /// carriers that predate the field (those only ever carried HTTP-family
-    /// listeners). The materializer re-checks family before emitting a route
-    /// or raw-TCP relay so a hostile carrier cannot smuggle `Udp`/`Unknown`.
-    #[serde(default = "default_resolved_ingress_http_protocol")]
+    /// Application protocol that resolved.
+    ///
+    /// **No compatibility default.** The ECDS / native carrier is an untrusted
+    /// decode boundary, so an OMITTED `protocol` deserializes to
+    /// `AppProtocol::default()` (`Unknown`) — NOT to a live HTTP listener.
+    /// `Unknown` fails [`Self::endpoint_is_valid`], so the back-projection
+    /// chokepoint and the materializer both drop the entry before it can
+    /// become a route or a relay. Same treatment as an explicitly hostile
+    /// `Udp`/`unknown` protocol on the wire: a carrier that cannot say what a
+    /// listener speaks never gets one.
+    #[serde(default)]
     pub protocol: AppProtocol,
     /// Namespace of the local service whose host identity anchors the listener
     /// route. Carried so the materializer and the router/validator derive the
@@ -1591,11 +1597,6 @@ pub struct ResolvedIngressListener {
     /// `owner_namespace`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub owner_service: String,
-}
-
-fn default_resolved_ingress_http_protocol() -> AppProtocol {
-    // Pre-#3260 carriers only ever carried HTTP-family resolved listeners.
-    AppProtocol::Http
 }
 
 impl ResolvedIngressListener {
@@ -1612,7 +1613,8 @@ impl ResolvedIngressListener {
     /// dialing so the carrier path enforces the SAME invariant as resolution
     /// (loopback host — `127.0.0.1`/`::1`, the only forms `resolve()` ever emits
     /// after collapsing the instance-IP wildcards — and a nonzero listener +
-    /// backend port).
+    /// backend port), plus a MODELED protocol so an omitted (`Unknown`) or
+    /// hostile (`Udp`) carrier protocol cannot become a listener on either lane.
     ///
     /// `pub` (like `MeshSidecarIngress::resolve`) so it is testable from the
     /// external mesh-validation test crate; it is a pure, side-effect-free
@@ -2668,6 +2670,162 @@ pub struct MeshConfig {
     /// operator-settable, never serialized.
     #[serde(skip)]
     pub local_inbound_tcp_routes: Vec<MeshInboundTcpRoute>,
+    /// Runtime-only back-projection of THIS workload's own addresses, taken
+    /// from `MeshSlice.local_inbound_workloads` (the un-narrowed local-inbound
+    /// view) and canonicalized for comparison (IPv4-mapped IPv6 folded, DNS
+    /// names ASCII-lowercased).
+    ///
+    /// Deliberately NOT `workloads`: that is the subscription-NAMESPACE view
+    /// and contains sibling replicas and unrelated pods. The authenticated
+    /// inbound CONNECT boundary needs to prove the peer addressed **this**
+    /// workload before it may remap the dial onto a local `ingress[]`
+    /// `defaultEndpoint` (issue #3260), and "some in-mesh workload declares
+    /// this address" is not that proof. Empty ⇒ no local identity resolved,
+    /// and the remap is refused. `serde(skip)`: never operator-settable,
+    /// never serialized.
+    #[serde(skip)]
+    pub local_workload_addresses: Vec<String>,
+}
+
+/// Canonical comparison form for a mesh host: IP literals fold IPv4-mapped
+/// IPv6 to their IPv4 form, everything else is ASCII-lowercased. Used to key
+/// [`MeshConfig::local_workload_addresses`] so a captured/asserted address and
+/// a slice-declared address describe one host exactly once.
+pub fn canonical_mesh_host(host: &str) -> String {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_canonical().to_string(),
+        Err(_) => host.to_ascii_lowercase(),
+    }
+}
+
+/// Outcome of resolving an authenticated inbound CONNECT `:authority` against
+/// this workload's declared Sidecar `ingress[]` listeners (issue #3260).
+///
+/// The identity-protected Sidecar inbound path is a fresh mesh-mTLS HTTP/2
+/// CONNECT to `:15006`, NOT a REDIRECT-captured plaintext stream, so it never
+/// reaches `local_inbound_tcp_routes`. Without this resolution an authenticated
+/// CONNECT for a declared ingress listener (`pod-ip:16379`) would be relayed
+/// straight back to `pod-ip:16379` — the declared listener port — instead of the
+/// `defaultEndpoint` the operator pointed it at (`127.0.0.1:6379`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidecarIngressConnectRelay {
+    /// The authority port matches no declared ingress listener. The ordinary
+    /// transparent-relay open-relay guard decides this CONNECT unchanged; this
+    /// resolution must never widen ordinary HBONE/Ambient relay destinations.
+    NotDeclared,
+    /// The authority port DOES match a declared ingress listener, but the pair
+    /// does not resolve to exactly one valid, owner-stamped, stream-family
+    /// loopback mapping owned by THIS workload. Fail closed: the caller must
+    /// refuse the CONNECT rather than fall back to dialing the authority, which
+    /// would be the very destination the operator replaced.
+    Deny,
+    /// Relay to the listener's validated loopback `defaultEndpoint`, while
+    /// AuthorizationPolicy evaluation stays keyed to `listener_port`.
+    Relay {
+        /// The DECLARED listener port the peer addressed. Authorization
+        /// (`mesh_authz` `destination.port`) is evaluated on this, never on
+        /// `endpoint_port` — a listener-scoped DENY must still fire.
+        listener_port: u16,
+        /// Validated loopback backend host.
+        endpoint_host: String,
+        /// Validated `defaultEndpoint` backend port.
+        endpoint_port: u16,
+    },
+}
+
+impl MeshConfig {
+    /// Whether `host` is an address of THIS workload (see
+    /// [`Self::local_workload_addresses`]). Empty inventory ⇒ `false`.
+    pub fn host_is_local_workload_address(&self, host: &str) -> bool {
+        if self.local_workload_addresses.is_empty() || host.is_empty() {
+            return false;
+        }
+        let canonical = canonical_mesh_host(host);
+        self.local_workload_addresses.contains(&canonical)
+    }
+
+    /// Resolve an authenticated inbound CONNECT `host:port` against this
+    /// workload's declared Sidecar `ingress[]` stream listeners (issue #3260).
+    ///
+    /// `host` must already be unbracketed (the CONNECT boundary normalizes an
+    /// `[::1]`-style authority before calling). Fail-closed rules, in order:
+    ///
+    /// 1. No declared listener on `port` ⇒ [`SidecarIngressConnectRelay::NotDeclared`]
+    ///    (ordinary relay guard decides; behavior unchanged).
+    /// 2. MORE than one declared listener on `port` ⇒ `Deny`. A hostile or
+    ///    duplicated carrier must not pick a mapping by iteration order.
+    /// 3. `host` is not an address of THIS workload ⇒ `Deny`. Sharing a port
+    ///    number with a local listener is not permission to remap another
+    ///    workload's (or a bare loopback) destination onto our application.
+    /// 4. Malformed endpoint / unmodeled protocol / zero port, or a missing
+    ///    owner stamp ⇒ `Deny` (same pair of guards the back-projection
+    ///    chokepoint and the materializer apply).
+    /// 5. Not stream-family ⇒ `Deny`. An HTTP-family listener is served by its
+    ///    materialized `__mesh-ingress-*` HTTP route; a bare byte-stream CONNECT
+    ///    naming it is outside the declared contract and is refused rather than
+    ///    relayed to the listener port the operator replaced.
+    pub fn resolve_sidecar_ingress_connect_relay(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> SidecarIngressConnectRelay {
+        if port == 0 {
+            return SidecarIngressConnectRelay::NotDeclared;
+        }
+        let mut rest = self.local_ingress_listeners.iter();
+        let Some(listener) = rest.find(|entry| entry.port == port) else {
+            return SidecarIngressConnectRelay::NotDeclared;
+        };
+        if rest.any(|entry| entry.port == port) {
+            return SidecarIngressConnectRelay::Deny;
+        }
+        if !self.host_is_local_workload_address(host) {
+            return SidecarIngressConnectRelay::Deny;
+        }
+        if !listener.endpoint_is_valid()
+            || listener.owner_namespace.is_empty()
+            || listener.owner_service.is_empty()
+            || !listener.is_stream_family()
+        {
+            return SidecarIngressConnectRelay::Deny;
+        }
+        SidecarIngressConnectRelay::Relay {
+            listener_port: listener.port,
+            endpoint_host: listener.endpoint_host.clone(),
+            endpoint_port: listener.endpoint_port,
+        }
+    }
+
+    /// Whether `host:port` is EXACTLY the loopback `defaultEndpoint` that
+    /// `listener_port` resolves to right now — the post-plugin re-check for a
+    /// Sidecar ingress CONNECT relay.
+    ///
+    /// The synthesized relay proxy passes through the ordinary `before_proxy`
+    /// chain, so a `mesh_route_dispatch` route override (or an upstream
+    /// selection) can replace the destination between synthesis and dial. Only
+    /// the one mapping this listener declares survives; anything else — a
+    /// different backend, a widened port, a withdrawn listener — fails closed
+    /// before the dial.
+    pub fn sidecar_ingress_connect_relay_endpoint_matches(
+        &self,
+        listener_port: u16,
+        host: &str,
+        port: u16,
+    ) -> bool {
+        let mut rest = self.local_ingress_listeners.iter();
+        let Some(listener) = rest.find(|entry| entry.port == listener_port) else {
+            return false;
+        };
+        if rest.any(|entry| entry.port == listener_port) {
+            return false;
+        }
+        listener.endpoint_is_valid()
+            && listener.is_stream_family()
+            && !listener.owner_namespace.is_empty()
+            && !listener.owner_service.is_empty()
+            && listener.endpoint_port == port
+            && canonical_mesh_host(&listener.endpoint_host) == canonical_mesh_host(host)
+    }
 }
 
 pub fn default_istio_root_namespace() -> String {
@@ -2705,6 +2863,7 @@ impl Default for MeshConfig {
             local_ingress_listeners: Vec::new(),
             declared_ingress_http_ports: 0,
             local_inbound_tcp_routes: Vec::new(),
+            local_workload_addresses: Vec::new(),
         }
     }
 }

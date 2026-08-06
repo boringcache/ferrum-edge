@@ -878,9 +878,12 @@ fn parse_client_ip(client_ip: &str) -> Option<std::net::IpAddr> {
 ///     delivered to the local app at the route's backend (workload/container)
 ///     port, which is the port Istio inbound authz matches on — so authorize on
 ///     `proxy.backend_port`.
-///   * **Sidecar `ingress[]` custom listener** (`__mesh-ingress-*`, F6 §6.2):
-///     the listener declares a port (e.g. `8443`) and forwards to a SEPARATE
-///     `defaultEndpoint` backend port (e.g. `8080`). Istio scopes
+///   * **Sidecar `ingress[]` custom listener** (`__mesh-ingress-*`, F6 §6.2 —
+///     including the synthesized `__mesh-ingress-connect-relay` an
+///     authenticated mesh-mTLS CONNECT remaps onto a declared STREAM listener,
+///     issue #3260): the listener declares a port (e.g. `8443` / `16379`) and
+///     forwards to a SEPARATE `defaultEndpoint` backend port (e.g. `8080` /
+///     `6379`). Istio scopes
 ///     `AuthorizationPolicy` `port` / `destination.port` to the **declared
 ///     listener port**, so authorize on `ingress_listener_authz_port` (stamped
 ///     by the request handler from port selection), NOT the backend port.

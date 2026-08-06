@@ -1327,6 +1327,7 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         local_ingress_listeners: _,
         declared_ingress_http_ports: _,
         local_inbound_tcp_routes: _,
+        local_workload_addresses: _,
     } = MeshConfig::default();
 
     // Every namespaced collection is visible to the ownership accounting.

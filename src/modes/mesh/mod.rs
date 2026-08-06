@@ -1280,6 +1280,33 @@ fn prepare_normalized_gateway_config_for_mesh(
         // floors it at the surviving sibling count, so a hostile carrier can
         // never push it BELOW what materialized.
         mesh.declared_ingress_http_ports = mesh_slice.declared_ingress_http_ports;
+        // Back-project THIS workload's own addresses from the un-narrowed
+        // local-inbound workload view (which rides its own
+        // `LocalInboundWorkloads` ECDS carrier on xDS, so native/file/xDS stay
+        // in lock-step). Canonicalized once here so the authenticated inbound
+        // CONNECT boundary can prove the peer addressed THIS pod before
+        // remapping the dial onto a declared `ingress[]` `defaultEndpoint`
+        // (issue #3260) with a plain slice comparison.
+        //
+        // Deliberately NOT derived from `mesh.workloads`: that is the
+        // subscription-NAMESPACE view and includes sibling replicas, so it
+        // proves nothing about which pod the CONNECT named. `None` (no local
+        // narrowing) and an empty local view both leave this empty, and the
+        // remap is refused.
+        let mut local_addresses: Vec<String> = Vec::new();
+        if let Some(local) = mesh_slice.local_inbound_workloads.as_deref() {
+            for workload in local {
+                for address in &workload.addresses {
+                    let canonical = config::canonical_mesh_host(address);
+                    if !canonical.is_empty() {
+                        local_addresses.push(canonical);
+                    }
+                }
+            }
+            local_addresses.sort();
+            local_addresses.dedup();
+        }
+        mesh.local_workload_addresses = local_addresses;
     }
     materialize_fault_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
     materialize_transformer_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
@@ -4800,6 +4827,24 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
 /// port-scoped policy, exactly as for a materialized sidecar inbound route.
 pub(crate) const MESH_INBOUND_HBONE_RELAY_PROXY_ID: &str = "__mesh-inbound-hbone-relay";
 
+/// Reserved id for a synthesized inbound CONNECT relay that a declared Sidecar
+/// `ingress[]` STREAM listener remapped onto its `defaultEndpoint` (issue
+/// #3260).
+///
+/// Distinct from [`MESH_INBOUND_HBONE_RELAY_PROXY_ID`] on purpose:
+///
+/// * It carries the `MESH_INGRESS_PROXY_ID_PREFIX`, so `mesh_authz`'s
+///   `mesh_inbound_app_port` authorizes on the DECLARED LISTENER port stamped
+///   into `RequestContext::mesh_inbound_listener_authz_port` — not on the
+///   relay's `backend_port`, which is now the `defaultEndpoint` port. A
+///   listener-scoped `AuthorizationPolicy` DENY therefore still fires, and an
+///   unstamped ingress id fails closed rather than authorizing on the backend.
+/// * The Ambient-only relay behaviors keyed on the transparent relay id
+///   (NodeWaypoint inbound socket mark, Ambient UDP source scoping,
+///   ServiceWaypoint destination-scope superset) deliberately do NOT apply to a
+///   Sidecar ingress remap.
+pub(crate) const MESH_INGRESS_HBONE_RELAY_PROXY_ID: &str = "__mesh-ingress-connect-relay";
+
 /// Build the transparent inbound HBONE relay proxy that dials `host:port` — the
 /// CONNECT `:authority` of an authenticated mesh peer. The caller
 /// (`proxy::mod`) gates this on the destination being a safe local target
@@ -4808,10 +4853,28 @@ pub(crate) const MESH_INBOUND_HBONE_RELAY_PROXY_ID: &str = "__mesh-inbound-hbone
 /// breaker / retry: it is a transparent TCP tunnel, and the mesh global plugin
 /// chain (incl. `mesh_authz`) still runs on the outer CONNECT before the relay.
 pub(crate) fn mesh_inbound_hbone_relay_proxy(host: &str, port: u16) -> Proxy {
+    mesh_inbound_connect_relay_proxy(MESH_INBOUND_HBONE_RELAY_PROXY_ID, host, port)
+}
+
+/// Build the inbound CONNECT relay proxy for a declared Sidecar `ingress[]`
+/// STREAM listener, dialing the listener's validated loopback
+/// `defaultEndpoint` rather than the CONNECT `:authority` (issue #3260).
+///
+/// The caller resolves `host:port` from
+/// [`crate::modes::mesh::config::MeshConfig::resolve_sidecar_ingress_connect_relay`],
+/// which requires a single valid, owner-stamped, stream-family listener on the
+/// declared port AND proof that the authority named THIS workload;
+/// `handle_hbone_request` re-checks the EFFECTIVE destination against the same
+/// declared mapping after the plugin chain, so a route override cannot widen it.
+pub(crate) fn mesh_ingress_relay_proxy(host: &str, port: u16) -> Proxy {
+    mesh_inbound_connect_relay_proxy(MESH_INGRESS_HBONE_RELAY_PROXY_ID, host, port)
+}
+
+fn mesh_inbound_connect_relay_proxy(id: &str, host: &str, port: u16) -> Proxy {
     let now = chrono::Utc::now();
     Proxy {
-        id: MESH_INBOUND_HBONE_RELAY_PROXY_ID.to_string(),
-        name: Some("mesh inbound hbone relay".to_string()),
+        id: id.to_string(),
+        name: Some("mesh inbound connect relay".to_string()),
         namespace: String::new(),
         hosts: Vec::new(),
         listen_path: Some("/".to_string()),
@@ -32437,5 +32500,139 @@ mod tests {
                 .is_empty(),
             "withdrawing ingress must clear stream ingress tcp routes"
         );
+    }
+
+    /// A carried listener whose `protocol` the source OMITTED decodes to
+    /// `Unknown` (no compatibility default) and must not materialize on either
+    /// lane — while the DECLARED marker still suppresses the service-port
+    /// defaults it replaced. Complements the carrier-decode coverage in
+    /// `tests/unit/config/sidecar_ingress_stream_tests.rs`; materialization is
+    /// reachable only from inside this module.
+    #[test]
+    fn sidecar_ingress_carrier_without_protocol_materializes_nothing() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            // Exactly what `serde(default)` produces for an omitted carrier
+            // `protocol` field.
+            local_ingress_listeners: vec![ingress_stream_listener(
+                16379,
+                "127.0.0.1",
+                6379,
+                AppProtocol::Unknown,
+            )],
+            sidecar_ingress_declared: true,
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let mesh = config.mesh.as_deref().expect("prepared mesh");
+        assert!(
+            mesh.local_ingress_listeners.is_empty(),
+            "an omitted/unknown carrier protocol must be dropped at the back-projection chokepoint"
+        );
+        assert!(
+            mesh.local_inbound_tcp_routes.is_empty(),
+            "an omitted carrier protocol must not become a raw-TCP inbound relay"
+        );
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-ingress-")),
+            "an omitted carrier protocol must not become an HTTP ingress route"
+        );
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "declared ingress still suppresses the service-port defaults it replaced"
+        );
+    }
+
+    /// The authenticated-CONNECT remap needs proof that the peer addressed THIS
+    /// workload, so mesh preparation back-projects the local workload's own
+    /// addresses (canonicalized) — never the subscription-namespace
+    /// `workloads` view, which carries sibling replicas.
+    #[test]
+    fn local_workload_addresses_are_back_projected_for_the_connect_remap() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("reviews", "reviews");
+        local.addresses = vec!["10.244.1.7".to_string(), "::ffff:10.244.1.7".to_string()];
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local.clone()],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![local]),
+            local_ingress_listeners: vec![ingress_stream_listener(
+                16379,
+                "127.0.0.1",
+                6379,
+                AppProtocol::Redis,
+            )],
+            sidecar_ingress_declared: true,
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let mesh = config.mesh.as_deref().expect("prepared mesh");
+        assert_eq!(
+            mesh.local_workload_addresses,
+            vec!["10.244.1.7".to_string()],
+            "IPv4-mapped duplicates must canonicalize + dedup to one address"
+        );
+        assert!(mesh.host_is_local_workload_address("10.244.1.7"));
+        assert!(!mesh.host_is_local_workload_address("10.244.1.9"));
+        // The declared 16379 listener therefore remaps to its defaultEndpoint
+        // for an authenticated CONNECT naming this pod (mapping semantics are
+        // pinned in `tests/unit/config/sidecar_ingress_stream_tests.rs`).
+        let remap = mesh.resolve_sidecar_ingress_connect_relay("10.244.1.7", 16379);
+        assert_eq!(remap, expected_redis_remap());
+
+        // Withdrawal clears the back-projection too, so a stale address can
+        // never keep authorizing a remap.
+        let withdrawn = MeshSlice {
+            version: "v2".to_string(),
+            local_inbound_workloads: None,
+            local_ingress_listeners: Vec::new(),
+            sidecar_ingress_declared: false,
+            ..slice
+        };
+        let config_v2 =
+            gateway_config_from_mesh_slice(&withdrawn, &runtime, None, None).expect("v2");
+        let mesh_v2 = config_v2.mesh.as_deref().expect("prepared mesh");
+        assert!(mesh_v2.local_workload_addresses.is_empty());
+        let stale = mesh_v2.resolve_sidecar_ingress_connect_relay("10.244.1.7", 16379);
+        assert_eq!(stale, config::SidecarIngressConnectRelay::NotDeclared);
+    }
+
+    /// The mapping `sidecar_ingress_stream_listener_materializes_tcp_route_*`
+    /// declares, expressed once for the CONNECT-remap assertions above.
+    fn expected_redis_remap() -> config::SidecarIngressConnectRelay {
+        config::SidecarIngressConnectRelay::Relay {
+            listener_port: 16379,
+            endpoint_host: "127.0.0.1".to_string(),
+            endpoint_port: 6379,
+        }
     }
 }

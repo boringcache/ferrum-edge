@@ -1453,13 +1453,59 @@ Shared fields for both lanes:
 - **port disambiguation** — on Ferrum's shared `:15006` inbound listener, the captured original destination (the port the client dialed) **and** (HTTP) a peer sidecar's request authority are matched against the **declared listener port** (not the `defaultEndpoint` port, which is the separate forward target). HTTP reuses `select_mesh_inbound_port_route`; stream reuses the `mesh_tcp_inbound` orig-dst table. A request that addresses no declared listener port fails closed rather than being routed to an arbitrary backend.
 - **authorization port** — `mesh_authz` authorizes an ingress listener on its **declared listener port** (e.g. `8443`), not the `defaultEndpoint` backend port (e.g. `8080`). An `AuthorizationPolicy` `to.operation.ports` / `when: destination.port` rule scoped to the listener port therefore matches; authorizing on the backend port would let an ALLOW miss and — worse — a port-scoped **DENY fail open**. (Service-port default inbound routes keep authorizing on the container/backend port, matching Istio inbound authz.)
 
+### Two inbound arrival shapes (both remap to `defaultEndpoint`)
+
+A stream ingress listener is reachable two ways, and both must forward to the
+declared `defaultEndpoint` — not to the listener port:
+
+1. **Direct plaintext capture.** iptables REDIRECT steers the connection into
+   the `:15006` capture listener; `SO_ORIGINAL_DST` recovers the **declared
+   listener port**, which selects the `local_inbound_tcp_routes` entry and
+   relays to `defaultEndpoint`. Stream `mesh_authz` authorizes on the recovered
+   original-destination port (the listener port).
+2. **Identity-protected mesh-mTLS CONNECT.** A peer sidecar's raw-TCP egress
+   opens a **fresh SVID-mTLS HTTP/2 CONNECT** to `:15006` whose `:authority` is
+   the destination `pod-ip:<declared listener port>`. This never touches the
+   REDIRECT capture table, so it is resolved at the CONNECT boundary instead
+   (`build_inbound_hbone_relay_proxy` →
+   `MeshConfig::resolve_sidecar_ingress_connect_relay`): the authority is
+   remapped onto the listener's validated loopback `defaultEndpoint`
+   (`pod-ip:16379` → `127.0.0.1:6379`), and the **declared listener port** is
+   stamped onto the request so `mesh_authz` authorizes on it exactly as in the
+   HTTP ingress case. PeerAuthentication resolves on the `defaultEndpoint` app
+   port on both shapes (direct capture translates the listener port through the
+   pre-handshake alias table; the CONNECT remap arrives with that port already).
+
+The CONNECT remap is deliberately narrow and fails closed before any dial:
+
+- Only for a **byte-stream** CONNECT. A datagram-over-CONNECT (`connect-udp`)
+  is excluded — `ingress[]` stream listeners are TCP and UDP behavior is
+  unchanged.
+- The `:authority` host must **positively identify this workload** (one of its
+  own slice-declared addresses). A sibling replica's IP, a bare loopback
+  authority, or a service FQDN sharing the port number is refused.
+- Exactly **one** valid, owner-stamped, **stream-family** listener must be
+  declared on that port. Ambiguity (two entries on one port), a missing owner
+  stamp, an off-box/`:0`/unmodeled-protocol endpoint, and an HTTP-family
+  listener are all refused rather than dialed.
+- A declared port that fails any of the above returns a route miss — it never
+  falls back to dialing the listener port the operator replaced.
+- After the plugin chain, the **effective** destination is re-checked against
+  the same declared mapping, so a `mesh_route_dispatch` route override or an
+  upstream selection cannot widen it (and a listener withdrawn between
+  synthesis and dial fails closed).
+- Ports this workload never declared as `ingress[]` listeners are untouched and
+  stay on the ordinary transparent-relay open-relay guard.
+
 ### Precedence vs. the default inbound listeners (fail-closed)
 
 Per Istio, when `ingress` is **declared** it **replaces** the workload's default per-service-port inbound listeners. Ferrum mirrors this and **fails closed on the declared signal, not on what resolved**: if the applicable `Sidecar` declares an `ingress` block, the inbound materializer emits routes **only** from the resolved `ingress[]` listeners and skips the service-port default `:15006` → `127.0.0.1:targetPort` materialization for that workload — **even if every entry was unsupported and nothing resolved**. An all-unsupported `ingress[]` therefore yields **no inbound routes** for the workload rather than silently exposing the default service-port routes the operator explicitly replaced (exposing them would be a fail-open regression).
 
 **Omitted vs. explicit-empty `ingress` (Istio-faithful):** an **omitted** `ingress` block keeps the automatic per-service-port inbound defaults, while a **declared** `ingress` — *including an explicit empty `ingress: []`* — configures the workload's inbound listeners explicitly and replaces those defaults. So `ingress: []` suppresses the default inbound routes (the operator declared "no custom inbound listeners"), the same as a non-empty-but-all-unsupported list; it does **not** fall back to the service-port defaults. The K8s translator records `ingress` presence (mirroring `egress`'s omitted-vs-explicit-empty distinction); on the native source a non-empty list always declares, and an explicit `ingress_declared: true` carries the empty-but-declared case. Only a workload whose applicable `Sidecar` **omits** `ingress` entirely keeps the default service-port inbound behavior. This avoids any silent host+path conflict — the two never coexist for one workload. The "ingress was declared" marker is tracked separately from the resolved-listener list and rides its own ECDS carrier so it survives an empty resolved list on the xDS path.
 
-The resolved listeners that ride the slice are **re-validated before dialing**: a `local_ingress_listeners` entry can arrive already resolved over the xDS/native carrier, so the materializer (and the router's sibling grouping) re-check each carried `endpoint_host`/`endpoint_port` against the same loopback-host + nonzero-port allowlist `MeshSidecarIngress::resolve` enforces. A malformed or hostile carrier pointing a listener at an off-box host or a `:0` backend is dropped fail-closed (never dialed), so the carrier path enforces the same invariant as CP-side resolution.
+The resolved listeners that ride the slice are **re-validated before dialing**: a `local_ingress_listeners` entry can arrive already resolved over the xDS/native carrier, so the materializer (and the router's sibling grouping) re-check each carried `endpoint_host`/`endpoint_port`/`protocol` against the same loopback-host + nonzero-port + modeled-protocol allowlist `MeshSidecarIngress::resolve` enforces. A malformed or hostile carrier pointing a listener at an off-box host or a `:0` backend is dropped fail-closed (never dialed), so the carrier path enforces the same invariant as CP-side resolution.
+
+The carrier's `protocol` field has **no compatibility default**: an omitted `protocol` decodes to `Unknown` and is therefore inert on both lanes, exactly like an explicit `udp`/`unknown`. A carrier that cannot say what a listener speaks never gets one — it must not silently become a live HTTP listener on the declared port.
 
 ### Supported and deferred `defaultEndpoint` forms
 
