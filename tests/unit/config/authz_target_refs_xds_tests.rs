@@ -132,7 +132,7 @@ async fn gateway_class_policy_enforced(slice: &MeshSlice) -> bool {
 
 fn workload_for(service: &str) -> Workload {
     Workload {
-        spiffe_id: SpiffeId::new(&format!("spiffe://cluster.local/ns/{NS}/sa/{service}"))
+        spiffe_id: SpiffeId::new(format!("spiffe://cluster.local/ns/{NS}/sa/{service}"))
             .expect("valid spiffe"),
         selector: WorkloadSelector {
             labels: HashMap::from([("app".to_string(), "backend".to_string())]),
