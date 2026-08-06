@@ -379,6 +379,19 @@ fn resolve_one_authorization_policy_target_ref(
                     ),
                 ));
             }
+            // Supported waypoint class names alone are not enough — the
+            // cluster-scoped GatewayClass object must be present (fail closed).
+            // Presence is independent of Ferrum ownership; Istio-owned
+            // `istio-waypoint` classes are valid attachment targets.
+            if !acc.gateway_class_exists(name) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "AuthorizationPolicy {path} GatewayClass '{name}' was not found; \
+                         targeted policies fail closed when the target is missing"
+                    ),
+                ));
+            }
             Ok(PolicyTargetAttachment::GatewayClass {
                 name: name.to_string(),
             })
@@ -6647,8 +6660,25 @@ mod tests {
     #[test]
     fn translates_authorization_policy_gateway_class_target_refs_for_each_supported_class() {
         for class_name in ["istio-waypoint", "ferrum-waypoint"] {
+            // Interoperable waypoint classes may be owned by a non-Ferrum
+            // controller; presence (not Ferrum ownership) gates acceptance.
+            let controller_name = if class_name == "ferrum-waypoint" {
+                "ferrum.io/gateway-controller"
+            } else {
+                "istio.io/gateway-controller"
+            };
+            let mut gateway_class = object_with_metadata(
+                "GatewayClass",
+                "gateway.networking.k8s.io/v1",
+                class_name,
+                "",
+                serde_json::json!({ "controllerName": controller_name }),
+            );
+            gateway_class.metadata.namespace.clear();
+
             let result = translate_k8s_objects(
                 &[
+                    gateway_class,
                     object_with_metadata(
                         "Gateway",
                         "gateway.networking.k8s.io/v1",

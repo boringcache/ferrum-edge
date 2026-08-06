@@ -536,6 +536,11 @@ pub(crate) struct K8sAccumulator {
     pub(crate) gateway_api_route_proxy_kinds: HashMap<NamespacedResourceId, String>,
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
+    /// Pre-pass index of observed GatewayClass names → whether Ferrum owns the
+    /// class (`controllerName == ferrum.io/gateway-controller`). Presence is
+    /// key membership; the bool is ownership only — interoperable waypoint
+    /// classes (`istio-waypoint` / `ferrum-waypoint`) may be owned by another
+    /// controller and must still count as present for authz targetRefs.
     gateway_api_gateway_classes: HashMap<String, bool>,
     pub(crate) namespace_labels: HashMap<String, HashMap<String, String>>,
     /// Flat copy of the Gateway API route conflicts computed over the
@@ -685,6 +690,13 @@ impl K8sAccumulator {
             == Some(FERRUM_GATEWAY_CONTROLLER_NAME);
         self.gateway_api_gateway_classes
             .insert(object.metadata.name.clone(), managed);
+    }
+
+    /// Whether a cluster-scoped GatewayClass object was observed in the
+    /// pre-pass index. Allocation-free cold-path presence check — does not
+    /// consult Ferrum-controller ownership (the stored bool).
+    pub(crate) fn gateway_class_exists(&self, name: &str) -> bool {
+        self.gateway_api_gateway_classes.contains_key(name)
     }
 
     pub(crate) fn gateway_is_managed_by_ferrum(&self, object: &K8sObject) -> bool {
