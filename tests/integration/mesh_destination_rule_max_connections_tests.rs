@@ -623,8 +623,8 @@ fn removing_the_destination_rule_lifts_the_pooled_cap() {
 //
 // A WebSocket to a `mesh.mtls` / `mesh.hbone` destination dials its OWN 1:1
 // tunnel connection, and the WebSocket connect loop already reserves a
-// session-scoped `BackendConnectionGuard` on the SAME `(dial host, policy
-// port)` lane before that dial and holds it for the whole session. If the mesh
+// session-scoped `BackendConnectionGuard` on the logical `(backend host,
+// policy port)` lane before that dial and holds it for the whole session. If the mesh
 // pool ALSO admitted the dial, one physical socket would consume two slots —
 // and at `maxConnections: 1` the dial would refuse itself, so EVERY WebSocket
 // upgrade to a capped mesh destination would fail (observed live as

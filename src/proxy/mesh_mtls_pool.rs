@@ -1072,9 +1072,9 @@ impl MeshMtlsConnectionPool {
         // A WebSocket-over-mesh-mTLS session dials its OWN 1:1 connection, and
         // that connection's `maxConnections` slot is ALREADY held by the caller:
         // the WebSocket connect loop (`src/proxy/mod.rs`) reserves a session
-        // guard on the SAME `(dial host, policy port)` lane before this dial and
-        // holds it for the whole session. Admitting again here would charge the
-        // one socket twice — and at `maxConnections: 1` the dial would refuse
+        // guard on the caller's logical `(backend host, policy port)` lane before
+        // this dial and holds it for the whole session. Admitting again here would
+        // charge the one socket twice — and at `maxConnections: 1` the dial would refuse
         // itself, making every WebSocket upgrade to a capped mesh destination
         // fail. The session guard is the single owner; do NOT re-admit.
         let sender = dial_h2_connect_sender(
