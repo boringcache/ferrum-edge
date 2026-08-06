@@ -432,6 +432,17 @@ mod gateway_startup_classifier_tests {
         )));
     }
 
+    /// File mode logs the full gateway-authored anyhow chain for a fallible
+    /// listener task. The explicit bind context plus the OS cause is enough to
+    /// classify the ephemeral-port race without broadening retry eligibility to
+    /// arbitrary task failures that merely mention address-in-use text.
+    #[test]
+    fn accepts_gateway_listener_task_bind_race_with_full_error_chain() {
+        assert!(gateway_startup_failure_is_bind_race(&diagnostic_with(
+            r#"{"level":"ERROR","fields":{"message":"Gateway listener task 'HTTP proxy listener' failed: HTTP proxy listener failed: Proxy listener bind failed: Address already in use (os error 98)"},"target":"ferrum_edge::modes::file"}"#
+        )));
+    }
+
     /// A listener message that is not an address-in-use bind failure, and an
     /// address-in-use string with nothing tying it to a listener bind, are both
     /// unclassified — and an unclassified failure is never rerun.

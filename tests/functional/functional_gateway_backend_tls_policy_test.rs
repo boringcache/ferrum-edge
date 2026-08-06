@@ -55,7 +55,6 @@ const K8S_NAMESPACE: &str = "default";
 /// Cluster DNS name the translator emits for the `reviews` Service in
 /// `default`. This is the authority the BACKEND must see, and it is distinct
 /// from `BACKEND_SNI` — which is the whole point of the Host assertion.
-const SERVICE_AUTHORITY_HOST: &str = "reviews.default.svc.cluster.local";
 
 // ---------------------------------------------------------------------------
 // Certificates
@@ -111,9 +110,9 @@ fn generate_signed_cert(ca: &GeneratedCa, cn: &str, sans: &[&str]) -> GeneratedC
 ///
 /// It also records the `Host` header of every request it serves and echoes it
 /// back in the response body. That is the only place the backend-visible
-/// authority can be observed on the wire, and it is what proves the H1 SNI dial
-/// (whose URL authority is `validation.hostname`) still presents the REAL
-/// selected target to the backend.
+/// authority can be observed on the wire, and it proves the H1 SNI dial (whose
+/// URL authority is `validation.hostname`) does not replace the effective
+/// HTTPRoute request authority with the TLS-only server name.
 async fn start_https_echo_on(
     listener: TcpListener,
     cert_pem: &str,
@@ -592,22 +591,22 @@ async fn backend_tls_policy_performs_verified_backend_tls() {
         "a trusted, SNI- and SAN-matching backend must be reachable over TLS"
     );
 
-    // The H1 SNI dial puts `validation.hostname` in the request URL's AUTHORITY
+    // The H1 SNI dial puts `validation.hostname` in the request URL's authority
     // (reqwest derives the rustls server name from the URL and exposes no
-    // per-request hook), and relies on an explicit `Host` to keep the backend's
-    // own authority intact. Assert that on the wire, from the backend's side:
-    // the recorded `Host` must name the real selected target, never
-    // `validation.hostname`.
+    // per-request hook). Gateway API preserves the HTTPRoute request Host unless
+    // a route filter rewrites it; BackendTLSPolicy changes only TLS SNI and
+    // certificate validation. Assert that boundary on the wire: the backend
+    // must see the effective request authority, never `validation.hostname`.
     let observed = observed_hosts
         .lock()
         .expect("host recorder lock")
         .last()
         .cloned()
         .expect("the backend must have served the request");
-    let expected_authority = format!("{SERVICE_AUTHORITY_HOST}:{backend_port}");
+    let expected_authority = ROUTE_HOST.to_string();
     assert_eq!(
         observed, expected_authority,
-        "the backend must see the real selected target authority, not validation.hostname"
+        "BackendTLSPolicy must not replace the effective request Host with validation.hostname"
     );
     assert!(
         !observed.contains(BACKEND_SNI),
@@ -618,7 +617,7 @@ async fn backend_tls_policy_performs_verified_backend_tls() {
     let expected_echo = format!(r#""host":"{expected_authority}""#);
     assert!(
         body.contains(&expected_echo),
-        "backend-echoed Host must be the real target authority, got body {body}"
+        "backend-echoed Host must retain the effective request authority, got body {body}"
     );
 
     gateway.shutdown();

@@ -16514,7 +16514,8 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     // exactly one listener — the NodeWaypoint inbound capture socket, which
     // opts in explicitly in `proxy::node_waypoint_ingress_capture` — and never
     // to a whole class of listeners on the strength of a process-wide env var.
-    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)?;
+    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)
+        .map_err(|err| anyhow::Error::new(err).context("Proxy listener bind failed"))?;
 
     // Optional connection limit. Shared across all accept threads so the global
     // max_connections limit is enforced regardless of which thread accepted.
@@ -16540,7 +16541,8 @@ async fn start_proxy_listener_with_tls_source_and_signal(
 
         // Spawn additional listeners (threads 1..N-1)
         for i in 1..accept_threads {
-            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)?;
+            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)
+                .map_err(|err| anyhow::Error::new(err).context("Proxy listener bind failed"))?;
             let state = Arc::clone(&state);
             let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();
@@ -33581,10 +33583,11 @@ pub(crate) async fn proxy_to_backend_retry(
     // so hyper-util's `headers_mut().entry(HOST).or_insert_with(..)` would derive
     // `Host` from the *server name* for a request that carried none — an
     // HTTP/1.0 request, or any request whose frontend could not synthesize an
-    // authority. Every other request already had its `Host` set from
-    // `effective_host` (or preserved) in the loop above, and hyper-util keeps an
-    // explicit value. The backend must see the real target authority, never the
-    // TLS server name.
+    // authority. Every other request already had an explicit effective `Host`
+    // in the loop above: either the preserved/rewritten request authority or,
+    // when preservation is disabled, `effective_host`. Hyper-util keeps that
+    // value. The backend must never see the TLS server name merely because it
+    // was used for SNI.
     if sni_reqwest_dial.is_some() && !headers.contains_key("host") {
         req_builder = req_builder.header("Host", effective_host);
     }
@@ -35742,10 +35745,11 @@ async fn proxy_to_backend(
     // so hyper-util's `headers_mut().entry(HOST).or_insert_with(..)` would derive
     // `Host` from the *server name* for a request that carried none — an
     // HTTP/1.0 request, or any request whose frontend could not synthesize an
-    // authority. Every other request already had its `Host` set from
-    // `effective_host` (or preserved) in the loop above, and hyper-util keeps an
-    // explicit value. The backend must see the real target authority, never the
-    // TLS server name.
+    // authority. Every other request already had an explicit effective `Host`
+    // in the loop above: either the preserved/rewritten request authority or,
+    // when preservation is disabled, `effective_host`. Hyper-util keeps that
+    // value. The backend must never see the TLS server name merely because it
+    // was used for SNI.
     if sni_reqwest_dial.is_some() && !headers.contains_key("host") {
         req_builder = req_builder.header("Host", effective_host);
     }
