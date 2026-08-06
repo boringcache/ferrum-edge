@@ -1,9 +1,9 @@
 use ferrum_edge::_test_support::{
-    MAX_NONCE_REPLAY_SCOPES_FOR_TESTS, SoapNonceReplayHarness,
+    MAX_NONCE_REPLAY_SCOPES_FOR_TESTS, SoapNonceReplayHarness, SoapNonceReplayScopeLease,
     soap_count_wsu_id_occurrences_for_test, soap_decode_xml_body_for_test,
     soap_exclusive_canonicalize_element_for_test, soap_nonce_inconsistent_state_outcome_for_test,
     soap_nonce_replay_registry_contains_for_test, soap_nonce_replay_scope_key_for_test,
-    soap_poison_process_replay_scope_for_test,
+    soap_poison_process_replay_scope_for_test, soap_remove_nonce_replay_scope_for_test,
     soap_retire_inconsistent_process_replay_scope_for_test,
     soap_retire_same_cardinality_drift_scope_for_test,
     soap_shared_claim_retention_seconds_for_test, soap_username_token_created_outcome_for_test,
@@ -6102,12 +6102,20 @@ fn digest_plugin_with_config_id(config_id: Option<&str>) -> SoapWsSecurity {
 
 // These construct a `PluginHttpClient`, so they run on a runtime like every
 // other client-constructing plugin test.
+//
+// Process-global replay scopes are shared by the full unit binary. Every test
+// that joins that registry is serialized on `soap_nonce_replay_registry` so the
+// capacity-fill proof cannot starve siblings, and intentional
+// poisoned/inconsistent leftovers are force-removed via
+// [`SoapNonceReplayScopeLease`] after fail-closed assertions.
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn replay_state_survives_a_reload_generation_swap() {
     // A reload builds a new plugin instance from the same plugin-config
     // resource. Before this fix that instance started from an empty cache, so
     // replaying a captured token across a reload always succeeded.
     let scope = "soap-reload-scope-a";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
     let generation_one = digest_plugin_with_config_id(Some(scope));
     assert!(
         generation_one
@@ -6129,7 +6137,9 @@ async fn replay_state_survives_a_reload_generation_swap() {
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn distinct_plugin_configs_do_not_share_a_replay_scope() {
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&["soap-scope-b", "soap-scope-c"]);
     let a = digest_plugin_with_config_id(Some("soap-scope-b"));
     let b = digest_plugin_with_config_id(Some("soap-scope-c"));
     assert!(a.check_nonce_replay("independent-scope-nonce").is_ok());
@@ -6140,9 +6150,11 @@ async fn distinct_plugin_configs_do_not_share_a_replay_scope() {
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn identityless_construction_gets_private_replay_state() {
     // Admin config validation constructs the plugin without a resource id. That
     // construction must not read, mutate, or consume a live proxy's claims.
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&["soap-scope-d"]);
     let live = digest_plugin_with_config_id(Some("soap-scope-d"));
     assert!(live.check_nonce_replay("validation-probe-nonce").is_ok());
 
@@ -6162,8 +6174,11 @@ async fn identityless_construction_gets_private_replay_state() {
 // ── Retired process replay-scope pruning ────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn active_strong_references_keep_a_replay_scope_from_being_pruned() {
     let scope = "soap-prune-active-ref";
+    let probe = "soap-prune-active-ref-probe";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope, probe]);
     let key = soap_nonce_replay_scope_key_for_test(scope);
     let live = digest_plugin_with_config_id(Some(scope));
     live.check_nonce_replay("active-ref-nonce")
@@ -6171,7 +6186,7 @@ async fn active_strong_references_keep_a_replay_scope_from_being_pruned() {
 
     // Creating an unrelated scope runs cold-path pruning; the live holder keeps
     // strong_count > 1, so the scope must remain.
-    let _probe = digest_plugin_with_config_id(Some("soap-prune-active-ref-probe"));
+    let _probe = digest_plugin_with_config_id(Some(probe));
     assert!(
         soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
         "a scope with a live plugin generation must not be pruned"
@@ -6183,8 +6198,11 @@ async fn active_strong_references_keep_a_replay_scope_from_being_pruned() {
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn a_retired_scope_with_a_live_claim_is_retained() {
     let scope = "soap-prune-live-retired";
+    let probe = "soap-prune-live-retired-probe";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope, probe]);
     let key = soap_nonce_replay_scope_key_for_test(scope);
     {
         let generation = digest_plugin_with_config_id(Some(scope));
@@ -6193,7 +6211,7 @@ async fn a_retired_scope_with_a_live_claim_is_retained() {
             .expect("claim must admit");
     }
     // Registry is now the sole strong owner, but the newest claim is still live.
-    let _probe = digest_plugin_with_config_id(Some("soap-prune-live-retired-probe"));
+    let _probe = digest_plugin_with_config_id(Some(probe));
     assert!(
         soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
         "a retired scope with any live claim must stay fail-closed"
@@ -6206,8 +6224,11 @@ async fn a_retired_scope_with_a_live_claim_is_retained() {
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn a_fully_expired_retired_scope_is_reclaimed() {
     let scope = "soap-prune-expired-retired";
+    let probe = "soap-prune-expired-retired-probe";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope, probe]);
     let key = soap_nonce_replay_scope_key_for_test(scope);
     let epoch = std::time::Instant::now()
         .checked_sub(Duration::from_secs(CLAIM_RETENTION_SECONDS + 120))
@@ -6221,7 +6242,7 @@ async fn a_fully_expired_retired_scope_is_reclaimed() {
             .expect("backdated claim must admit");
     }
     assert!(soap_nonce_replay_registry_contains_for_test(&key).expect("registry"));
-    let _probe = digest_plugin_with_config_id(Some("soap-prune-expired-retired-probe"));
+    let _probe = digest_plugin_with_config_id(Some(probe));
     assert!(
         !soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
         "a retired scope whose newest claim is past retention must be reclaimed"
@@ -6234,13 +6255,16 @@ async fn a_fully_expired_retired_scope_is_reclaimed() {
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn an_empty_retired_scope_is_reclaimable() {
     let scope = "soap-prune-empty-retired";
+    let probe = "soap-prune-empty-retired-probe";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope, probe]);
     let key = soap_nonce_replay_scope_key_for_test(scope);
     {
         let _generation = digest_plugin_with_config_id(Some(scope));
     }
-    let _probe = digest_plugin_with_config_id(Some("soap-prune-empty-retired-probe"));
+    let _probe = digest_plugin_with_config_id(Some(probe));
     assert!(
         !soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
         "an empty retired scope must free its registry slot"
@@ -6248,11 +6272,14 @@ async fn an_empty_retired_scope_is_reclaimable() {
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn retired_empty_scopes_free_registry_capacity() {
     let http = PluginHttpClient::default();
+    let mut lease = SoapNonceReplayScopeLease::empty();
     let mut holders = Vec::new();
     for i in 0..(MAX_NONCE_REPLAY_SCOPES_FOR_TESTS + 8) {
         let id = format!("soap-prune-cap-fill-{i}");
+        lease.track_plugin_config_id(&id);
         match SoapWsSecurity::new_with_http_client_and_config_id(
             &username_token_digest_config(),
             http.clone(),
@@ -6272,6 +6299,7 @@ async fn retired_empty_scopes_free_registry_capacity() {
         !holders.is_empty(),
         "test must hold at least one scope against the registry cap"
     );
+    lease.track_plugin_config_id("soap-prune-cap-overflow-while-held");
     let overflow = SoapWsSecurity::new_with_http_client_and_config_id(
         &username_token_digest_config(),
         http.clone(),
@@ -6283,6 +6311,7 @@ async fn retired_empty_scopes_free_registry_capacity() {
     );
 
     holders.clear();
+    lease.track_plugin_config_id("soap-prune-cap-after-reclaim");
     SoapWsSecurity::new_with_http_client_and_config_id(
         &username_token_digest_config(),
         http,
@@ -6292,12 +6321,15 @@ async fn retired_empty_scopes_free_registry_capacity() {
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn poisoned_retired_scopes_are_not_replaced() {
     let scope = "soap-prune-poisoned";
+    let probe = "soap-prune-poisoned-probe";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope, probe]);
     let key = soap_nonce_replay_scope_key_for_test(scope);
     soap_poison_process_replay_scope_for_test(&username_token_digest_config(), scope)
         .expect("poison helper");
-    let _probe = digest_plugin_with_config_id(Some("soap-prune-poisoned-probe"));
+    let _probe = digest_plugin_with_config_id(Some(probe));
     assert!(
         soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
         "poisoned state must remain fail-closed rather than being silently replaced"
@@ -6313,12 +6345,15 @@ async fn poisoned_retired_scopes_are_not_replaced() {
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn inconsistent_retired_scopes_are_not_replaced() {
     let scope = "soap-prune-inconsistent";
+    let probe = "soap-prune-inconsistent-probe";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope, probe]);
     let key = soap_nonce_replay_scope_key_for_test(scope);
     soap_retire_inconsistent_process_replay_scope_for_test(&username_token_digest_config(), scope)
         .expect("inconsistent retire helper");
-    let _probe = digest_plugin_with_config_id(Some("soap-prune-inconsistent-probe"));
+    let _probe = digest_plugin_with_config_id(Some(probe));
     assert!(
         soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
         "structurally inconsistent state must not be silently replaced"
@@ -6333,12 +6368,15 @@ async fn inconsistent_retired_scopes_are_not_replaced() {
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn same_cardinality_index_drift_is_not_reclaimed() {
     let scope = "soap-prune-same-cardinality-drift";
+    let probe = "soap-prune-same-cardinality-probe";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope, probe]);
     let key = soap_nonce_replay_scope_key_for_test(scope);
     soap_retire_same_cardinality_drift_scope_for_test(&username_token_digest_config(), scope)
         .expect("same-cardinality retire helper");
-    let _probe = digest_plugin_with_config_id(Some("soap-prune-same-cardinality-probe"));
+    let _probe = digest_plugin_with_config_id(Some(probe));
     assert!(
         soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
         "cache/index mapping drift must not be reclaimed as expired state"
@@ -6346,8 +6384,11 @@ async fn same_cardinality_index_drift_is_not_reclaimed() {
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn overlapping_generations_retain_one_shared_replay_state() {
     let scope = "soap-prune-overlap-gens";
+    let probe = "soap-prune-overlap-gens-probe";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope, probe]);
     let key = soap_nonce_replay_scope_key_for_test(scope);
     let generation_one = digest_plugin_with_config_id(Some(scope));
     let generation_two = digest_plugin_with_config_id(Some(scope));
@@ -6355,7 +6396,7 @@ async fn overlapping_generations_retain_one_shared_replay_state() {
         .check_nonce_replay("overlap-nonce")
         .expect("first claim");
     drop(generation_one);
-    let _probe = digest_plugin_with_config_id(Some("soap-prune-overlap-gens-probe"));
+    let _probe = digest_plugin_with_config_id(Some(probe));
     assert!(
         soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
         "an overlapping live generation must keep the shared scope"
@@ -6367,6 +6408,47 @@ async fn overlapping_generations_retain_one_shared_replay_state() {
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
+async fn intentional_poisoned_scope_is_externally_isolated_after_fail_closed_proof() {
+    // Production prune must keep poisoned state fail-closed; external tests
+    // must still be able to free the slot afterward so parallel suite siblings
+    // cannot exhaust the process-global registry cap.
+    let scope = "soap-prune-poisoned-isolation";
+    let probe = "soap-prune-poisoned-isolation-probe";
+    let successor = "soap-prune-poisoned-isolation-successor";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope, probe, successor]);
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+
+    soap_poison_process_replay_scope_for_test(&username_token_digest_config(), scope)
+        .expect("poison helper");
+    let _probe = digest_plugin_with_config_id(Some(probe));
+    assert!(
+        soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "production prune must leave poisoned state in place"
+    );
+    let err = SoapWsSecurity::new_with_http_client_and_config_id(
+        &username_token_digest_config(),
+        PluginHttpClient::default(),
+        Some(scope),
+    )
+    .err()
+    .expect("rejoining a poisoned scope must fail closed");
+    assert!(err.contains("unavailable"), "{err}");
+
+    assert!(
+        soap_remove_nonce_replay_scope_for_test(&key).expect("external isolation"),
+        "test-support removal must free the poisoned slot"
+    );
+    assert!(
+        !soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "external isolation must drop the registry entry without production reclaim"
+    );
+    // Prove a fresh successor can join without hitting the process-global cap.
+    let _successor = digest_plugin_with_config_id(Some(successor));
+}
+
+#[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn blank_plugin_config_id_fails_closed() {
     let err = SoapWsSecurity::new_with_http_client_and_config_id(
         &username_token_digest_config(),
@@ -6680,13 +6762,16 @@ fn a_claim_covers_the_widest_acceptable_instant_and_expires_only_after_it() {
 const PAST_NARROW_GENERATION_RETENTION: u64 = 2_000;
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn a_claim_stays_live_past_the_retention_its_own_generation_would_have_derived() {
     // Under a per-generation retention this nonce was expired at t=901 and the
     // repeat below was an in-place *refresh* — i.e. the captured token admitted
     // a second time. The fixed horizon keeps it a replay.
+    let scope = "soap-future-generation-liveness";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
     let harness = SoapNonceReplayHarness::with_scope(
         &digest_config_with_created_window(300, 300),
-        "soap-future-generation-liveness",
+        scope,
         std::time::Instant::now(),
     )
     .expect("narrow generation must admit");
@@ -6706,17 +6791,20 @@ async fn a_claim_stays_live_past_the_retention_its_own_generation_would_have_der
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn capacity_pressure_cannot_reclaim_a_claim_a_later_generation_still_needs() {
     // The other way a claim used to disappear: once past the narrow
     // generation's own retention it became reclaimable, so ordinary capacity
     // pressure removed it — and a high-water mark cannot resurrect a removed
     // entry. With a one-entry cap, the second nonce must be refused rather than
     // allowed to evict the first.
+    let scope = "soap-future-generation-capacity";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
     let mut config = digest_config_with_created_window(300, 300);
     config["nonce"]["max_cache_size"] = json!(1);
     let harness = SoapNonceReplayHarness::with_scope(
         &config,
-        "soap-future-generation-capacity",
+        scope,
         std::time::Instant::now(),
     )
     .expect("narrow generation must admit");
@@ -6739,6 +6827,7 @@ async fn capacity_pressure_cannot_reclaim_a_claim_a_later_generation_still_needs
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn a_later_maximally_widened_generation_still_detects_the_replay() {
     // The advisory's residual, end to end. A narrow generation claims a nonce.
     // Well past the retention that generation would have derived for itself, a
@@ -6747,6 +6836,7 @@ async fn a_later_maximally_widened_generation_still_detects_the_replay() {
     // still there, and stays there through the widened window's last acceptable
     // instant.
     let scope = "soap-future-generation-widening";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
     let epoch = std::time::Instant::now();
     let narrow = SoapNonceReplayHarness::with_scope(
         &digest_config_with_created_window(300, 300),
@@ -6794,11 +6884,13 @@ async fn a_later_maximally_widened_generation_still_detects_the_replay() {
 }
 
 #[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
 async fn no_generation_can_expire_or_refresh_another_generations_claim() {
     // Both directions at once: neither a narrower nor a wider generation has a
     // retention of its own to impose, so a claim behaves identically whichever
     // generation observes it.
     let scope = "soap-generation-symmetry";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
     let epoch = std::time::Instant::now();
     let wide = SoapNonceReplayHarness::with_scope(
         &digest_config_with_created_window(86_400, 3_600),

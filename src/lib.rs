@@ -2203,6 +2203,57 @@ pub mod _test_support {
         )
     }
 
+    /// Forcibly remove a process replay scope from the shared registry.
+    ///
+    /// External-test isolation only: production prune never removes poisoned or
+    /// structurally inconsistent state. After a unit test has proved that
+    /// fail-closed contract, call this (or drop a
+    /// [`SoapNonceReplayScopeLease`]) so the slot cannot starve parallel
+    /// siblings against the process-global 1024-scope cap.
+    pub fn soap_remove_nonce_replay_scope_for_test(scope_key: &str) -> Result<bool, String> {
+        crate::plugins::soap_ws_security::remove_nonce_replay_scope_for_tests(scope_key)
+    }
+
+    /// RAII lease that force-removes tracked process replay scopes on drop.
+    ///
+    /// Use around tests that deliberately leave non-reclaimable (poisoned /
+    /// inconsistent / live-claim) registry entries, or that temporarily fill
+    /// the shared registry toward [`MAX_NONCE_REPLAY_SCOPES_FOR_TESTS`].
+    pub struct SoapNonceReplayScopeLease {
+        scope_keys: Vec<String>,
+    }
+
+    impl SoapNonceReplayScopeLease {
+        pub fn empty() -> Self {
+            Self {
+                scope_keys: Vec::new(),
+            }
+        }
+
+        pub fn for_plugin_config_ids(plugin_config_ids: &[&str]) -> Self {
+            let mut lease = Self::empty();
+            for plugin_config_id in plugin_config_ids {
+                lease.track_plugin_config_id(plugin_config_id);
+            }
+            lease
+        }
+
+        pub fn track_plugin_config_id(&mut self, plugin_config_id: &str) {
+            let key = soap_nonce_replay_scope_key_for_test(plugin_config_id);
+            if !self.scope_keys.iter().any(|existing| existing == &key) {
+                self.scope_keys.push(key);
+            }
+        }
+    }
+
+    impl Drop for SoapNonceReplayScopeLease {
+        fn drop(&mut self) {
+            for scope_key in self.scope_keys.drain(..) {
+                let _ = soap_remove_nonce_replay_scope_for_test(&scope_key);
+            }
+        }
+    }
+
     /// Build a scoped process-replay plugin and poison its registry mutex.
     pub fn soap_poison_process_replay_scope_for_test(
         config: &serde_json::Value,
