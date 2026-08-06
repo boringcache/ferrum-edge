@@ -35,7 +35,7 @@ adding, removing, or materially changing a workflow.
 
 | Workflow file | Display name | Triggers | Role |
 |---|---|---|---|
-| `ci.yml` | CI | PRs, `merge_group`, push to `main`, manual | Required validation gate plus `latest` prerelease and Docker image publishing from `main`. The `Tests` check runs on PRs and merge-queue groups, and the always-on `Chart Runtime Lint` check is required alongside it. |
+| `ci.yml` | CI | PRs, `merge_group`, push to `main`, manual | Required validation gate plus `latest` prerelease and Docker image publishing from `main`. The `Tests` check runs on PRs and merge-queue groups. |
 | `coverage.yml` | Coverage | PRs, `merge_group`, push to `main`, weekly schedule, manual | Coverage planning/reporting and coverage floor enforcement; `Merge Coverage` is directly required on PRs and merge-queue groups. |
 | `release.yml` | Release | `v*` tag push | Versioned binary, GitHub Release, and Docker publishing after CI/Coverage validation. |
 | `gateway-api-conformance.yml` | Gateway API Conformance | PRs, `merge_group`, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs and merge-queue groups. |
@@ -66,7 +66,6 @@ Pull Request / Merge Queue group
     ├─► Trusted Cross Build Policy
             ├─► PR: `pull_request_target`, base code only, PR tree as data
             └─► Merge group: synthesized queue SHA, `contents: read`, no secrets
-    ├─► Chart Runtime Lint (always on; base-extracted chart runtime checker)
     ├─► CI plan (event-aware base/head; merge_group uses payload base_sha)
             ├─► Docs/license/agent-only: lightweight Tests aggregate
             └─► Full CI
@@ -95,14 +94,13 @@ Push to main
 
 ### Required checks and merge queue
 
-Branch protection / repository rulesets for `main` must require these eight
+Branch protection / repository rulesets for `main` must require these seven
 GitHub Actions check names (exact spelling; source app is **GitHub Actions**,
 app id `15368`):
 
 | Required check name | Owning workflow | Owning job |
 |---|---|---|
 | `Tests` | `.github/workflows/ci.yml` | `test` |
-| `Chart Runtime Lint` | `.github/workflows/ci.yml` | `chart-runtime-lint` |
 | `Merge Coverage` | `.github/workflows/coverage.yml` | `coverage-merge` |
 | `Gateway API Conformance` | `.github/workflows/gateway-api-conformance.yml` | `gate` |
 | `Mesh E2E Sidecar Live` | `.github/workflows/mesh-e2e-sidecar-live.yml` | `gate` |
@@ -139,10 +137,9 @@ under `pull_request_target` and rejects any change to
 `.github/scripts/verify_cross_build_policy.py`. Consequences for operators:
 
 - Do **not** follow the common "trigger required checks on `merge_group` only"
-  advice for these seven owning workflows. Every owner must keep reporting on
-  the pull request as well, and all eight checks must stay *required* so a
-  failing PR-side check blocks queue entry. `ci.yml` owns two of them (`Tests`
-  and `Chart Runtime Lint`). `verify_required_ci.py` enforces both the `merge_group`
+  advice for these seven owners. Every owner must keep reporting on the pull
+  request as well, and all seven must stay *required* so a failing PR-side check
+  blocks queue entry. `verify_required_ci.py` enforces both the `merge_group`
   trigger and an unfiltered `pull_request` / `pull_request_target` trigger for
   each owner.
 - `merge_group.base_sha` is the group's parent commit — the base branch tip
@@ -161,7 +158,7 @@ it does **not** enable the merge queue or mutate branch protection.
 
 1. Merge the workflow/`docs/ci_cd.md` prerequisite so all seven owners report on
    `merge_group`.
-2. Enable the `main` ruleset / branch protection with the eight required checks
+2. Enable the `main` ruleset / branch protection with the seven required checks
    above, merge queue enabled, admin enforcement as intended.
 3. Open a throwaway test PR, enqueue it, confirm each required check runs on
    the synthesized SHA (not a stale PR SHA), and confirm release automation
@@ -212,29 +209,6 @@ filtering, and the `performance-regression` path classifier on both
 `pull_request` and `merge_group` diffs. Merge-group planning diffs
 `merge_group.base_sha...HEAD` and executes the planner from that base SHA so a
 queued planner edit cannot self-classify as light.
-The separate, always-on `chart-runtime-lint` job (`Chart Runtime Lint`) runs the
-trusted node-agent/ambient chart runtime lint
-(`.github/scripts/check_node_agent_chart_runtime.py`): on pull requests and
-merge groups the checker is extracted from the base branch when present, then
-self-tested and executed against the proposed chart tree, so a hostile PR cannot
-replace the gate while adding a Docker/containerd/CRI-O socket mount,
-`runtime.sock`, or a true/dynamic `privileged` assignment. The scan recursively
-governs every chart template, values file, example values file, and chart file
-fragment rather than trusting two workload filenames. The job has no planner
-dependency and no mode gate, so the lint runs on every pull request,
-merge-queue group, and push to `main`. The required `Tests`
-aggregate additionally re-runs the *proposed* checker's self-test and scan
-through `verify_required_ci.py`, which is data-plane validation only — the
-base-extracted run in `chart-runtime-lint` is the authoritative gate.
-
-`chart-runtime-lint` is a standalone job rather than a step in `ci-plan` or an
-input of the `test` aggregate because `Trusted Cross Build Policy` freezes the
-per-job digest of every Cross-sensitive `ci.yml` job (`ci-plan` and `test` are
-both Cross-sensitive) and compares the `test` aggregate byte for byte. A job
-that contains no Cross executable, no Cross configuration input, no ARM64
-target, and no opaque inline shell contributes no surface to that contract and
-may therefore be added by a pull request; it is made blocking by branch
-protection instead of by the aggregate.
 Any unrecognized path, an empty/unavailable diff, a mixed code-and-docs change,
 a push to `main`, or a manual run fails over to full mode. The decision table
 and its executable examples live in `.github/scripts/pr_ci_plan.py`. PR
@@ -252,7 +226,29 @@ force-run on every `main` push). PRs outside those curated path sets skip the
 downstream job before GitHub allocates a runner. Pushes to `main` and manual
 runs force all of these gates on. Rust formatting and the integration-shard
 coverage contract also run as named steps in `CI Plan`, avoiding two additional
-runner allocations. The required `Tests` aggregate runs the first-party
+runner allocations.
+
+The `Helm Chart` job additionally runs the trusted node-agent/ambient chart
+runtime lint (`.github/scripts/check_node_agent_chart_runtime.py`, issue #3615)
+as its first step. On pull requests and merge groups the checker is extracted
+from the base revision when one exists, then self-tested and executed against
+the proposed chart tree, so a pull request cannot replace its own gate while
+adding a Docker/containerd/CRI-O socket mount, a `runtime.sock` host path, or a
+true/dynamic `privileged` assignment. The scan walks every chart template,
+values file, example values file, and chart fragment rather than trusting a
+fixed pair of workload filenames.
+
+It lives in `Helm Chart` rather than in `CI Plan` or a new standalone job for
+two reasons. First, `Trusted Cross Build Policy` freezes the per-job digest of
+every Cross-sensitive `ci.yml` job — `ci-plan` and `test` are both
+Cross-sensitive — and compares the `test` aggregate byte for byte, so a pull
+request cannot add a step to either. Second, `Helm Chart` is already an enforced
+gate: it is a `needs` of the required `Tests` aggregate and is asserted there by
+`require_planned_gate "Helm chart"`, which makes the lint blocking today with no
+branch-protection change and no new required check. Its `run_helm` path gate
+fires on `^charts/`, a strict superset of the `charts/**` tree the checker
+scans, so a pull request that skips the job cannot contain a violation for it to
+find. The required `Tests` aggregate runs the first-party
 Markdown link checker through its CI contract verifier
 (`.github/scripts/check_markdown_links.py`), including in light mode, so
 docs-only PRs still validate relative file targets and GitHub heading slugs.
@@ -305,9 +301,8 @@ and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
 
-Branch protection must require eight independent PR **and** merge-queue checks:
-the unchanged `Tests` aggregate from `ci.yml`, `Chart Runtime Lint` from
-`ci.yml`, `Merge Coverage` from
+Branch protection must require seven independent PR **and** merge-queue checks:
+the unchanged `Tests` aggregate from `ci.yml`, `Merge Coverage` from
 `coverage.yml`, `Gateway API Conformance` from `gateway-api-conformance.yml`,
 `Mesh E2E Sidecar Live` from `mesh-e2e-sidecar-live.yml`,
 `Multicluster Federation Live` from `multicluster-federation-live.yml`,

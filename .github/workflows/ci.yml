@@ -360,67 +360,6 @@ jobs:
           fi
           echo "All $(echo "$actual" | wc -l | tr -d ' ') integration test files are sharded."
 
-  chart-runtime-lint:
-    # Issue #3615. Deliberately its own always-on job rather than a step inside
-    # `ci-plan`: the trusted ARM64 Cross build policy freezes the per-job digest
-    # of every Cross-sensitive `ci.yml` job, and `ci-plan` is one of them, so a
-    # pull request cannot add a step there. This job carries no Cross executable,
-    # no Cross configuration input, no ARM64 target, and no opaque inline shell,
-    # so it contributes no surface to that contract. It is an independently
-    # required branch-protection check rather than a `test` aggregate input,
-    # because the same policy compares that aggregate byte for byte. Keep every
-    # comment and step inside the job key: text between two job keys belongs to
-    # the preceding job's frozen block.
-    name: Chart Runtime Lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-        with:
-          # Full history so the trusted base revision of the checker is reachable.
-          fetch-depth: 0
-          persist-credentials: false
-
-      # Trusted-base chart runtime lint: reject container-runtime socket mounts /
-      # host storage and privileged: true on node-agent/ambient chart surfaces.
-      # Extract the checker from the base branch on pull_request / merge_group so
-      # a hostile PR cannot replace it; bootstrap from the reviewed checkout only
-      # when the base has no checker yet.
-      - name: Check node-agent chart runtime mounts
-        run: |
-          set -euo pipefail
-          checker=.github/scripts/check_node_agent_chart_runtime.py
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            base_ref="origin/${BASE_REF}"
-            git fetch --no-tags origin \
-              "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
-            if git cat-file -e "${base_ref}:${checker}" 2>/dev/null; then
-              trusted_checker="$RUNNER_TEMP/check-node-agent-chart-runtime.py"
-              git show "${base_ref}:${checker}" > "$trusted_checker"
-              checker="$trusted_checker"
-            fi
-          elif [ "$EVENT_NAME" = "merge_group" ]; then
-            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
-              echo "::error::merge_group base_sha missing or malformed" >&2
-              exit 1
-            fi
-            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
-              git fetch --no-tags origin "${MERGE_BASE_SHA}"
-            fi
-            if git cat-file -e "${MERGE_BASE_SHA}:${checker}" 2>/dev/null; then
-              trusted_checker="$RUNNER_TEMP/check-node-agent-chart-runtime.py"
-              git show "${MERGE_BASE_SHA}:${checker}" > "$trusted_checker"
-              checker="$trusted_checker"
-            fi
-          fi
-          python3 -I "$checker" --self-test
-          python3 -I "$checker"
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
 
   test-unit:
     name: Unit Tests
@@ -2015,6 +1954,50 @@ jobs:
       FERRUM_IMAGE: ferrum-edge:helm-chart-ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          # Full history so the trusted base revision of the chart runtime
+          # checker is reachable (issue #3615).
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Trusted-base chart runtime lint: reject container-runtime socket mounts /
+      # host storage and privileged: true on node-agent/ambient chart surfaces.
+      # Extract the checker from the base branch on pull_request / merge_group so
+      # a hostile PR cannot replace it; bootstrap from the reviewed checkout only
+      # when the base has no checker yet.
+      - name: Check node-agent chart runtime mounts
+        run: |
+          set -euo pipefail
+          checker=.github/scripts/check_node_agent_chart_runtime.py
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base_ref="origin/${BASE_REF}"
+            git fetch --no-tags origin \
+              "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            if git cat-file -e "${base_ref}:${checker}" 2>/dev/null; then
+              trusted_checker="$RUNNER_TEMP/check-node-agent-chart-runtime.py"
+              git show "${base_ref}:${checker}" > "$trusted_checker"
+              checker="$trusted_checker"
+            fi
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "${MERGE_BASE_SHA}"
+            fi
+            if git cat-file -e "${MERGE_BASE_SHA}:${checker}" 2>/dev/null; then
+              trusted_checker="$RUNNER_TEMP/check-node-agent-chart-runtime.py"
+              git show "${MERGE_BASE_SHA}:${checker}" > "$trusted_checker"
+              checker="$trusted_checker"
+            fi
+          fi
+          python3 -I "$checker" --self-test
+          python3 -I "$checker"
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
 
       - name: Install Kubernetes tools
         uses: ./.github/actions/setup-kubernetes-tools
