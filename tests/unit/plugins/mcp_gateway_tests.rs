@@ -9619,11 +9619,56 @@ async fn sse_drain_until(body: &mut AggregateSseBody, wanted: &[&str], max: usiz
     seen
 }
 
+/// The final client-visible response-body phase of Ferrum's synthetic
+/// rejection lifecycle, driven over the exact representation `before_proxy`
+/// produced.
+///
+/// Aggregate SSE publishes HERE and only here — a gateway-authored JSON-RPC
+/// response is merely *staged* in `before_proxy` so the response-body
+/// guardrails, semantic transforms, and the authoritative final body policy see
+/// the real payload rather than an empty `202`. A test that wants the
+/// client-visible outcome must therefore drive this phase too.
+async fn finalize_synthetic_response(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    ctx: &mut ferrum_edge::plugins::RequestContext,
+    dispatched: PluginResult,
+) -> PluginResult {
+    let (status_code, body, headers) = match dispatched {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body, headers),
+        other => return other,
+    };
+    match plugin
+        .on_final_response_body(ctx, status_code, &headers, body.as_bytes())
+        .await
+    {
+        PluginResult::Continue => PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        },
+        replacement => replacement,
+    }
+}
+
 async fn ping(
     plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
     session_id: &str,
     id: Value,
 ) -> PluginResult {
+    ping_with_context(plugin, session_id, id).await.0
+}
+
+/// A `ping` driven through the complete gateway-authored lifecycle, returning
+/// the request context so a test can assert the metadata the final phase wrote.
+async fn ping_with_context(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    id: Value,
+) -> (PluginResult, ferrum_edge::plugins::RequestContext) {
     let (mut ctx, mut headers) = mcp_ctx(json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -9631,7 +9676,9 @@ async fn ping(
         "params": {}
     }));
     headers.insert("mcp-session-id".to_string(), session_id.to_string());
-    plugin.before_proxy(&mut ctx, &mut headers).await
+    let dispatched = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let delivered = finalize_synthetic_response(plugin, &mut ctx, dispatched).await;
+    (delivered, ctx)
 }
 
 async fn cancel_notification(
@@ -10008,14 +10055,7 @@ async fn aggregate_sse_retention_overflow_answers_inline_and_keeps_listener() {
 
     // The ring is full and nothing has been consumed yet, so the second
     // response falls back to the POST instead of being dropped.
-    let (mut ctx, mut headers) = mcp_ctx(json!({
-        "jsonrpc": "2.0",
-        "id": "two",
-        "method": "ping",
-        "params": {}
-    }));
-    headers.insert("mcp-session-id".to_string(), session_id.clone());
-    let second = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (second, ctx) = ping_with_context(&plugin, &session_id, json!("two")).await;
     let (status, body, _) = reject_json(second);
     assert_eq!(status, 200);
     assert_eq!(body["id"], json!("two"));
@@ -10158,15 +10198,39 @@ async fn aggregate_sse_multiplexes_a_synthetic_list_and_a_routed_call_on_one_lis
 
     let mut stream = attach_sse_body(&plugin, &session_id).await;
 
-    // 1) A gateway-authored non-ping method under a STRING identity.
+    // 1) A gateway-authored non-ping method under a STRING identity. It is
+    //    STAGED by `before_proxy`, never published there: the POST still
+    //    carries the real JSON-RPC payload so the response-body policies run
+    //    over it, and the stream identity is still open.
     let (mut list_ctx, mut list_headers) = mcp_request(&session_id, json!("list-1"), "tools/list");
-    let listed = plugin.before_proxy(&mut list_ctx, &mut list_headers).await;
+    let dispatched = plugin.before_proxy(&mut list_ctx, &mut list_headers).await;
+    let (staged_status, staged_body, staged_headers) = reject_raw(dispatched);
+    assert_eq!(
+        staged_status, 200,
+        "a gateway-authored response must reach the response lifecycle as itself"
+    );
+    assert!(staged_body.contains("github.create_pr"));
+    assert!(
+        mcp_sse_stream_is_open_for_test(&list_ctx),
+        "the lease must stay open for the final client-visible phase"
+    );
+    assert!(list_ctx.metadata.get("mcp.sse.delivery").is_none());
+
+    let listed = plugin
+        .on_final_response_body(
+            &mut list_ctx,
+            staged_status,
+            &staged_headers,
+            staged_body.as_bytes(),
+        )
+        .await;
     let (status, body, _) = reject_raw(listed);
     assert_eq!(
         status, 202,
         "a multiplexed response answers 202 on the POST"
     );
     assert!(body.is_empty());
+    assert!(!mcp_sse_stream_is_open_for_test(&list_ctx));
     assert_eq!(
         list_ctx
             .metadata
@@ -10210,6 +10274,212 @@ async fn aggregate_sse_multiplexes_a_synthetic_list_and_a_routed_call_on_one_lis
         "synthetic list multiplexed"
     );
     assert!(seen.contains("Partly cloudy"), "routed call multiplexed");
+}
+
+/// Stage a gateway-authored aggregate response: the request context (still
+/// holding the open stream lease) plus the exact representation `before_proxy`
+/// produced and handed to the response lifecycle.
+async fn stage_gateway_authored(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    id: Value,
+    method: &str,
+) -> (ferrum_edge::plugins::RequestContext, PluginResult) {
+    let (mut ctx, mut headers) = mcp_request(session_id, id, method);
+    let dispatched = plugin.before_proxy(&mut ctx, &mut headers).await;
+    (ctx, dispatched)
+}
+
+#[tokio::test]
+async fn aggregate_sse_gateway_authored_error_is_staged_not_published_by_before_proxy() {
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+    let mut stream = attach_sse_body(&plugin, &session_id).await;
+
+    // A gateway-authored JSON-RPC error is exactly the payload a configured
+    // response-body WAF rule / response schema / AI redaction must be able to
+    // see. `before_proxy` must therefore hand it to the response lifecycle
+    // unchanged rather than publishing it and answering the POST with an empty
+    // 202 those policies would then run over instead.
+    let (mut ctx, dispatched) =
+        stage_gateway_authored(&plugin, &session_id, json!("staged-1"), "does/not/exist").await;
+    let (status, body, response_headers) = reject_raw(dispatched);
+    assert_eq!(status, 200);
+    let parsed: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["error"]["code"], json!(-32601));
+    assert_eq!(parsed["id"], json!("staged-1"));
+    assert!(
+        mcp_sse_stream_is_open_for_test(&ctx),
+        "the stream lease must remain open for the final lifecycle"
+    );
+    assert!(
+        ctx.metadata.get("mcp.sse.delivery").is_none(),
+        "no delivery outcome may be recorded before the final phase"
+    );
+    // Nothing reached the listener: the greeting is still the only frame.
+    let before = sse_drain_until(&mut stream, &["staged-1"], 1).await;
+    assert!(before.contains(": mcp-sse"));
+    assert!(
+        !before.contains("staged-1"),
+        "before_proxy must not publish a gateway-authored response"
+    );
+
+    // The final client-visible phase is what publishes and what turns the POST
+    // into the 202.
+    let delivered = plugin
+        .on_final_response_body(&mut ctx, status, &response_headers, body.as_bytes())
+        .await;
+    let (status, delivered_body, _) = reject_raw(delivered);
+    assert_eq!(status, 202);
+    assert!(delivered_body.is_empty());
+    assert_eq!(
+        ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        Some("multiplexed")
+    );
+    assert!(!mcp_sse_stream_is_open_for_test(&ctx));
+    let seen = sse_drain_until(&mut stream, &["staged-1"], 4).await;
+    assert!(seen.contains("staged-1"));
+    assert!(seen.contains("-32601"));
+}
+
+#[tokio::test]
+async fn aggregate_sse_final_body_policy_rejection_answers_inline_and_publishes_nothing() {
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["sessions"] = json!({ "sse_max_streams_per_session": 1 });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let mut stream = attach_sse_body(&plugin, &session_id).await;
+
+    let (mut ctx, dispatched) =
+        stage_gateway_authored(&plugin, &session_id, json!("denied-1"), "ping").await;
+    let (staged_status, staged_body, _) = reject_raw(dispatched);
+    assert_eq!(staged_status, 200);
+    assert!(
+        staged_body.contains("denied-1"),
+        "the staged representation is what the response policies inspect"
+    );
+    assert!(mcp_sse_stream_is_open_for_test(&ctx));
+
+    // A response-body security policy (a `waf` response rule, a `body_validator`
+    // response schema) refused the staged payload and installed its own
+    // governed error. That is the client's answer, on the POST, with its HTTP
+    // failure semantics intact — never a 202, and never a published event.
+    let governed = br#"{"error":"blocked by response policy"}"#;
+    let governed_headers = known_json_response_headers(governed);
+    let inline = plugin
+        .on_final_response_body(&mut ctx, 403, &governed_headers, governed)
+        .await;
+    assert!(
+        matches!(inline, PluginResult::Continue),
+        "the governed non-200 response must remain on the POST"
+    );
+    assert_eq!(
+        ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        Some("inline")
+    );
+    assert!(!mcp_sse_stream_is_open_for_test(&ctx));
+
+    // The identity came back exactly once and the original payload was never
+    // published under it.
+    let pinged = ping(&plugin, &session_id, json!("after-refusal")).await;
+    assert_eq!(reject_raw(pinged).0, 202);
+    let seen = sse_drain_until(&mut stream, &["after-refusal"], 6).await;
+    assert!(seen.contains("after-refusal"));
+    assert!(
+        !seen.contains("denied-1"),
+        "a refused gateway-authored payload must never reach the stream"
+    );
+    assert!(!seen.contains("blocked by response policy"));
+}
+
+#[tokio::test]
+async fn aggregate_sse_final_body_redaction_publishes_the_transformed_bytes() {
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+    let mut stream = attach_sse_body(&plugin, &session_id).await;
+
+    let (mut ctx, dispatched) =
+        stage_gateway_authored(&plugin, &session_id, json!("redact-1"), "does/not/exist").await;
+    let (staged_status, staged_body, staged_headers) = reject_raw(dispatched);
+    assert_eq!(staged_status, 200);
+    assert!(staged_headers.contains_key("content-type"));
+    assert!(staged_body.contains("MCP method not found"));
+
+    // A response transform / AI redaction rewrote the still-valid 200 JSON-RPC
+    // response, keeping the same type-sensitive id. The event must carry the
+    // transformed representation — the bytes the client is actually allowed to
+    // receive — not the pre-policy payload.
+    let redacted = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": "redact-1",
+        "error": { "code": -32601, "message": "[redacted]" }
+    }))
+    .unwrap();
+    let redacted_headers = known_json_response_headers(&redacted);
+    let delivered = plugin
+        .on_final_response_body(&mut ctx, 200, &redacted_headers, &redacted)
+        .await;
+    let (status, delivered_body, _) = reject_raw(delivered);
+    assert_eq!(status, 202);
+    assert!(delivered_body.is_empty());
+    assert_eq!(
+        ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        Some("multiplexed")
+    );
+
+    let seen = sse_drain_until(&mut stream, &["redact-1"], 4).await;
+    assert!(seen.contains("[redacted]"), "transformed bytes published");
+    assert!(
+        !seen.contains("MCP method not found"),
+        "the pre-policy payload must never be published"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_sse_cancellation_after_staging_suppresses_the_gateway_authored_result() {
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+    let mut stream = attach_sse_body(&plugin, &session_id).await;
+
+    let (mut ctx, dispatched) =
+        stage_gateway_authored(&plugin, &session_id, json!(900), "ping").await;
+    let (status, body, response_headers) = reject_raw(dispatched);
+    assert_eq!(status, 200);
+    assert!(mcp_sse_stream_is_open_for_test(&ctx));
+
+    // The cancellation arrives on another connection AFTER the gateway authored
+    // its response but BEFORE the final phase publishes it. Keeping the lease
+    // open across the response lifecycle is what makes that window observable.
+    let (ack, cancel_ctx) = cancel_notification(&plugin, &session_id, json!(900)).await;
+    assert_eq!(reject_raw(ack).0, 202);
+    assert_eq!(
+        cancel_ctx
+            .metadata
+            .get("mcp.sse.cancel")
+            .map(String::as_str),
+        Some("cancelled")
+    );
+
+    let suppressed = plugin
+        .on_final_response_body(&mut ctx, status, &response_headers, body.as_bytes())
+        .await;
+    let (status, delivered_body, _) = reject_raw(suppressed);
+    assert_eq!(status, 202, "a cancelled request is still acknowledged");
+    assert!(delivered_body.is_empty());
+    assert_eq!(
+        ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        Some("suppressed")
+    );
+    assert!(!mcp_sse_stream_is_open_for_test(&ctx));
+
+    let pinged = ping(&plugin, &session_id, json!("after-staged-cancel")).await;
+    assert_eq!(reject_raw(pinged).0, 202);
+    let seen = sse_drain_until(&mut stream, &["after-staged-cancel"], 6).await;
+    assert!(seen.contains("after-staged-cancel"));
+    assert!(
+        !seen.contains("\"id\":900"),
+        "a cancelled gateway-authored result must never be published"
+    );
 }
 
 #[tokio::test]
@@ -10376,8 +10646,7 @@ async fn aggregate_sse_dropped_request_releases_the_identity_exactly_once() {
     let mut in_flight = route_tool_call_with_listener(&plugin, &session_id, 800).await;
     // While it holds the only slot, a second request cannot open one and is
     // answered inline instead — proof the routed request really is open.
-    let (mut second, mut second_headers) = mcp_request(&session_id, json!("second"), "ping");
-    let inline = plugin.before_proxy(&mut second, &mut second_headers).await;
+    let (inline, second) = ping_with_context(&plugin, &session_id, json!("second")).await;
     let (status, body, _) = reject_json(inline);
     assert_eq!(status, 200);
     assert_eq!(body["id"], json!("second"));
@@ -10431,8 +10700,7 @@ async fn aggregate_sse_repeated_retention_overflow_cannot_exhaust_stream_capacit
     // cardinality, which would mean the refusal leaked a stream slot.
     for index in 0..6 {
         let id = format!("overflow-{index}");
-        let (mut ctx, mut headers) = mcp_request(&session_id, json!(id), "ping");
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let (result, ctx) = ping_with_context(&plugin, &session_id, json!(id)).await;
         let (status, body, _) = reject_json(result);
         assert_eq!(status, 200, "an overflowed response is answered inline");
         assert_eq!(body["id"], json!(id));
@@ -10449,8 +10717,7 @@ async fn aggregate_sse_repeated_retention_overflow_cannot_exhaust_stream_capacit
 
     // An inline-completed identity is terminal: retrying it answers inline
     // again and can never be emitted onto the listener.
-    let (mut retry, mut retry_headers) = mcp_request(&session_id, json!("overflow-5"), "ping");
-    let retried = plugin.before_proxy(&mut retry, &mut retry_headers).await;
+    let (retried, retry) = ping_with_context(&plugin, &session_id, json!("overflow-5")).await;
     let (status, body, _) = reject_json(retried);
     assert_eq!(status, 200);
     assert_eq!(body["id"], json!("overflow-5"));
