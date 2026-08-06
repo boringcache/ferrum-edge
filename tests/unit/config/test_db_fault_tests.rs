@@ -44,18 +44,18 @@ async fn fault_control_trips_pool_to_closed_and_restores() {
     std::fs::write(&control, b"1").expect("create control");
     let before = std::fs::read(&db_path).expect("read live db");
     let fault_pool = test_db_fault::tripped_fault_pool().expect("tripped pool");
-    let err = sqlx::query("SELECT 1")
-        .fetch_one(&fault_pool)
-        .await
-        .expect_err("tripped fault pool must refuse acquires");
+    let err = match sqlx::query("SELECT 1").fetch_one(&fault_pool).await {
+        Ok(_) => panic!("tripped fault pool must refuse acquires"),
+        Err(err) => err,
+    };
     assert!(
         matches!(err, sqlx::Error::PoolClosed),
         "expected PoolClosed, got {err:?}"
     );
-    let err = sqlx::query("SELECT 1")
-        .fetch_one(&store.pool())
-        .await
-        .expect_err("DatabaseStore::pool must return fault pool while tripped");
+    let err = match sqlx::query("SELECT 1").fetch_one(&store.pool()).await {
+        Ok(_) => panic!("DatabaseStore::pool must return fault pool while tripped"),
+        Err(err) => err,
+    };
     assert!(
         matches!(err, sqlx::Error::PoolClosed),
         "store.pool() while tripped must be PoolClosed, got {err:?}"
