@@ -316,8 +316,9 @@ setup() {
 }
 
 # Gateway API lab setup with TCPRoute listener ports and experimental CRDs.
-# Kept separate from scripts/gateway_api_data_plane_conformance.sh because that
-# file is a Trusted Cross Build Policy frozen automation surface on main.
+# Kept separate from scripts/gateway_api_data_plane_conformance.sh because its
+# Cross-sensitive executable/configuration surface is protected by the Trusted
+# Cross Build Policy on main.
 
 case "${1:-}" in
   setup)
