@@ -1299,7 +1299,61 @@ collect_bpf_evidence() {
     "bpftool-$NODE_A.txt,bpftool-$NODE_B.txt"
 }
 
+assert_exclude_port_fixture_contract() {
+  # The frozen workflow step curls http://127.0.0.1:15020/ from src-a and
+  # requires ferrum_mesh_bpf_drops_total{reason="exclude_port_hit"} to rise.
+  # Editing that workflow job changes its trusted Cross digest and cannot
+  # merge, so the listener + bounded stimulus must live on this fixture
+  # surface instead.
+  log "checking frozen-workflow exclude-port fixture contract"
+  python3 - "$MANIFESTS" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+marker = "name: src-a"
+start = text.find(marker)
+if start < 0:
+    raise SystemExit(f"{path}: missing src-a workload marker")
+# Prefer the Deployment block (second occurrence after the ServiceAccount).
+deploy_start = text.find(marker, start + len(marker))
+if deploy_start < 0:
+    deploy_start = start
+next_deploy = text.find("\nkind: Deployment\n", deploy_start + len(marker))
+block = text[deploy_start: next_deploy if next_deploy > 0 else len(text)]
+required = (
+    ("exclude-port container name", "name: exclude-port"),
+    ("python:3.12-alpine exclude-port image", "image: python:3.12-alpine"),
+    ("excluded containerPort 15020", "containerPort: 15020"),
+    ("readinessProbe on excluded port", "port: 15020"),
+    ("loopback excluded-port stimulus", '"127.0.0.1"'),
+    ("bounded stimulus interval", "time.sleep(0.5)"),
+    ("listener bind on excluded port", '("0.0.0.0", PORT)'),
+    ("HTTP exclude-port response body", "exclude-port"),
+)
+missing = [label for label, needle in required if needle not in block]
+if missing:
+    raise SystemExit(
+        f"{path}: src-a exclude-port fixture contract missing: "
+        + ", ".join(missing)
+    )
+if "image: curlimages/curl:8.10.1" not in block:
+    raise SystemExit(f"{path}: src-a must keep curl as an exec container")
+# curl must remain the first container so kubectl exec defaults stay stable.
+curl_pos = block.find("name: curl")
+exclude_pos = block.find("name: exclude-port")
+if curl_pos < 0 or exclude_pos < 0 or curl_pos > exclude_pos:
+    raise SystemExit(
+        f"{path}: src-a must declare curl before exclude-port so kubectl exec "
+        "defaults remain the curl container"
+    )
+print("exclude-port fixture contract ok")
+PY
+}
+
 apply_workloads() {
+  assert_exclude_port_fixture_contract
   log "applying live traffic workloads"
   awk -v ns="$WORKLOAD_NS" -v td="$TRUST_DOMAIN" -v require_dual="$REQUIRE_DUAL_STACK" '
     {
