@@ -2189,6 +2189,33 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
         return Err(invalid_resource(object, "ServiceEntry requires spec.hosts"));
     }
 
+    // Istio's omitted or explicitly empty `spec.exportTo` is public. Preserve
+    // that at the Kubernetes boundary as an explicit `["*"]`, because the native
+    // mesh model intentionally interprets an empty list as namespace-local.
+    // Parse strictly: silently dropping a malformed visibility constraint and
+    // then substituting a default would either hide or expose the resource for
+    // the wrong tenants.
+    let export_to = {
+        let declared = optional_string_array(
+            object,
+            &object.spec,
+            "exportTo",
+            "ServiceEntry spec.exportTo",
+        )?;
+        let mut errors = Vec::new();
+        validate_mesh_export_to("ServiceEntry spec", &declared, &mut errors);
+        if let Some(first) = errors.first() {
+            return Err(invalid_resource(object, first.clone()));
+        }
+        if declared.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            let mut entries = declared;
+            crate::modes::mesh::config::normalize_mesh_export_to(&mut entries);
+            entries
+        }
+    };
+
     let mut endpoints = Vec::new();
     for endpoint in object
         .spec
@@ -2237,7 +2264,7 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
             _ => ServiceEntryLocation::MeshExternal,
         },
         ports: service_ports(object)?,
-        export_to: string_array(&object.spec, "exportTo"),
+        export_to,
         workload_selector: object
             .spec
             .get("workloadSelector")
@@ -6296,6 +6323,51 @@ mod tests {
         let mesh = result.config.mesh.expect("mesh config");
         assert_eq!(mesh.service_entries[0].hosts, vec!["api.example.com"]);
         assert_eq!(mesh.service_entries[0].ports[0].protocol, AppProtocol::Tls);
+        assert_eq!(
+            mesh.service_entries[0].export_to,
+            vec!["*"],
+            "Istio's omitted ServiceEntry exportTo must remain public"
+        );
+    }
+
+    #[test]
+    fn service_entry_export_to_is_strict_and_preserves_istio_public_default() {
+        let translate = |export_to: Option<Value>| {
+            let mut spec = serde_json::json!({
+                "hosts": ["api.example.com"],
+                "ports": [{"number": 443, "name": "https", "protocol": "TLS"}]
+            });
+            if let Some(export_to) = export_to {
+                spec["exportTo"] = export_to;
+            }
+            translate_k8s_objects(&[object("ServiceEntry", spec)], options())
+        };
+
+        for declared in [None, Some(serde_json::json!([]))] {
+            let result = translate(declared).expect("public default must translate");
+            let mesh = result.config.mesh.expect("mesh config");
+            assert_eq!(mesh.service_entries[0].export_to, vec!["*"]);
+        }
+
+        let result = translate(Some(serde_json::json!([".", " beta "])))
+            .expect("valid explicit visibility must translate");
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.service_entries[0].export_to, vec![".", "beta"]);
+
+        for invalid in [
+            serde_json::json!("*"),
+            serde_json::json!([7]),
+            serde_json::json!(["*", "beta"]),
+            serde_json::json!(["~"]),
+            serde_json::json!([""]),
+        ] {
+            let error = translate(Some(invalid))
+                .expect_err("malformed ServiceEntry exportTo must fail closed");
+            assert!(
+                error.to_string().contains("ServiceEntry spec.exportTo"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
