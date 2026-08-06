@@ -27,6 +27,7 @@ GRPC_METHOD_ECHO_THREE="${GRPC_ECHO_SERVICE}/EchoThree"
 
 GRPCURL_BIN="${GRPCURL_BIN:-}"
 GRPCURL_VERSION="${GRPCURL_VERSION:-1.9.3}"
+GRPCURL_SHA256="${GRPCURL_SHA256:-a926b62a85787ccf73ef8736b3ae554f1242e39d92bb8767a79d6dd23b11d1d5}"
 
 ensure_grpcurl() {
   if [ -n "$GRPCURL_BIN" ] && [ -x "$GRPCURL_BIN" ]; then
@@ -37,11 +38,14 @@ ensure_grpcurl() {
     return 0
   fi
   local dest="${RUNNER_TEMP:-/tmp}/grpcurl-${GRPCURL_VERSION}"
+  local archive="${dest}/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz"
   mkdir -p "$dest"
   if [ ! -x "$dest/grpcurl" ]; then
     curl -fsSL \
       "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz" \
-      | tar -xz -C "$dest" grpcurl
+      -o "$archive"
+    printf '%s  %s\n' "$GRPCURL_SHA256" "$archive" | sha256sum --check --strict
+    tar -xzf "$archive" -C "$dest" grpcurl
   fi
   GRPCURL_BIN="$dest/grpcurl"
 }
