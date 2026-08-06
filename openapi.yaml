@@ -7397,7 +7397,15 @@ components:
         backend_tls_server_ca_cert_path:
           type: [string, "null"]
           maxLength: 4096
-          description: Path to custom CA bundle for backend TLS verification. Max 4096 characters.
+          description: >-
+            Path (or typed source URI) for the custom CA bundle used for backend
+            TLS verification. Max 4096 characters. The reserved value
+            `system://` selects the built-in system/webpki trust anchors
+            explicitly: unlike leaving this field null, it does NOT fall back to
+            the global `FERRUM_TLS_CA_BUNDLE_PATH` and never inherits
+            `FERRUM_TLS_NO_VERIFY`. `system://` requires
+            `backend_tls_verify_server_cert: true` and must be spelled exactly,
+            with no path or query options.
         dns_override:
           type: [string, "null"]
 
@@ -10139,14 +10147,34 @@ components:
             Path to a PEM CA bundle used as the sole trust anchor when
             verifying backend server certificates for this upstream. When
             set, the system/webpki trust store is NOT used (CA exclusivity).
+            The reserved value `system://` inverts that: it pins the built-in
+            system/webpki trust anchors, and — unlike leaving this field null —
+            deliberately does NOT fall back to the global
+            `FERRUM_TLS_CA_BUNDLE_PATH` and never inherits
+            `FERRUM_TLS_NO_VERIFY`. It is the representation of Gateway API
+            `BackendTLSPolicy` `wellKnownCACertificates: System`, requires
+            `backend_tls_verify_server_cert: true`, and must be spelled
+            exactly, with no path or query options.
         backend_tls_sni:
           type: [string, "null"]
           maxLength: 253
           description: >-
             Optional backend TLS Server Name Indication override. Mesh
-            DestinationRule `trafficPolicy.tls.sni` projects to this field.
-            Stored/projected only — backend handshake SNI consumption is not
-            yet enforced (tracked by GAP-1B).
+            DestinationRule `trafficPolicy.tls.sni` and Gateway API
+            `BackendTLSPolicy` `validation.hostname` both project to this
+            field. Enforced at the backend handshake on every path where
+            Ferrum owns TLS: direct HTTP/2, gRPC over H2, native H3, and the
+            reqwest HTTP/1.1 dial (which carries the override in the request
+            URL authority while pinning the socket to the selected target).
+            It also partitions backend connection pools, so two values never
+            share a connection. Must be an exact DNS hostname — not a
+            wildcard and not an IP literal (RFC 6066 §3). Because the reqwest
+            HTTP/1.1 dial serves them, this field is accepted alongside
+            effective retry, request-body-buffering plugins, and
+            `pool_enable_http2: false`; admission returns no 400 for those
+            combinations. Direct WebSocket (`wss://`) transport cannot apply
+            it and refuses such an upgrade with 502; see
+            `docs/backend_mtls.md`.
         backend_tls_san_allow_list:
           type: array
           maxItems: 256
@@ -10157,9 +10185,13 @@ components:
           description: >-
             Optional allow-list of backend certificate Subject Alternative
             Names. Entries may be exact DNS names, IP literals, or SPIFFE URI
-            SANs. Mesh DestinationRule `trafficPolicy.tls.subjectAltNames`
-            projects to this field. Stored/projected only — SAN allow-list
-            verification is not yet enforced (tracked by GAP-1C).
+            SANs. Mesh DestinationRule `trafficPolicy.tls.subjectAltNames` and
+            Gateway API `BackendTLSPolicy` `validation.subjectAltNames` both
+            project to this field. Enforced by the backend server verifier on
+            the rustls-based backend paths, and part of the backend pool key
+            (as a digest) so two allow-lists never share a connection. Not
+            enforced when per-proxy or global no-verify is enabled, which is
+            warned about at startup; see `docs/backend_mtls.md`.
         locality_lb_strict:
           type: boolean
           default: false

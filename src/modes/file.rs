@@ -426,6 +426,11 @@ pub(crate) async fn await_fallible_listener_handles(
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
+                // Include the anyhow source chain. A top-level listener context
+                // such as `HTTP proxy listener failed` otherwise erases the OS
+                // `AddrInUse` cause that hosted test harnesses need to classify
+                // the one retryable ephemeral-port race. The chain contains no
+                // request/config payload, only gateway-authored listener errors.
                 error!("Gateway listener task '{}' failed: {:#}", name, err);
                 if first_error.is_none() {
                     first_error = Some(err.context(format!("{name} failed")));

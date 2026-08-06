@@ -4377,6 +4377,24 @@ fn validate_mesh_traffic_policy_tls(
     tls: &MeshTrafficPolicyTls,
     errors: &mut Vec<String>,
 ) {
+    if let Some(ca_certificates) = tls.ca_certificates.as_deref()
+        && let Err(error) = crate::config::types::validate_tls_material_source_field(
+            &format!("{context}.ca_certificates"),
+            ca_certificates,
+            crate::tls::source::MaterialKind::CaBundle,
+        )
+    {
+        errors.push(error);
+    }
+    if let Some(error) = crate::config::types::validate_system_trust_roots_skip_verify_pairing(
+        &format!("{context}.ca_certificates"),
+        &format!("{context}.insecure_skip_verify"),
+        tls.ca_certificates.as_deref(),
+        tls.insecure_skip_verify,
+    ) {
+        errors.push(error);
+    }
+
     match tls.mode {
         MtlsMode::Strict | MtlsMode::Permissive => errors.push(format!(
             "{context}.mode: {mode:?} is invalid for DestinationRule client TLS",

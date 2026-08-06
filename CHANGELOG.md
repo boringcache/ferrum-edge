@@ -27,6 +27,176 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callback-lock recursion, raced handoff, stale state, and `ktime` wrap from
   fabricating samples. The metric has fixed microsecond buckets with saturating
   count/bucket counters, drops sum overflow, and adds no per-flow labels (#3309).
+- Gateway API `BackendTLSPolicy` is watched and translated for Service-backed
+  `HTTPRoute`/`GRPCRoute` backends (issue #3276). `validation.hostname` projects
+  to upstream `backend_tls_sni`, optional `subjectAltNames` to
+  `backend_tls_san_allow_list`, and ConfigMap/Secret `caCertificateRefs` to the
+  upstream CA trust posture with `backend_scheme: https`. Policy
+  `status.ancestors` names the targeted Service as Ferrum's single ancestor,
+  with `Accepted` / `ResolvedRefs` conditions using the portable
+  `PolicyConditionReason` vocabulary, preserving third-party controllers'
+  ancestors and stable condition transition times. The ancestor is the Service
+  and not the routing Gateways because nothing on Ferrum's overlay or verdict
+  path takes a Gateway as input, so the verdict cannot vary per Gateway; that
+  also bounds Ferrum's own contribution at one entry, so no number of Gateways
+  can approach the CRD's hard `MaxItems=16` ancestor limit. Ferrum writes policy
+  status only where a managed Gateway *effectively* routes to the targeted
+  Service — a route that materialized on an accepted parentRef, not merely one
+  naming a Gateway. When third-party controllers have filled all 16 ancestor
+  slots, Gateway API forbids adding another entry, so Ferrum publishes none and
+  the same shared predicate makes translation reject the policy: covered
+  backends fail closed with the HTTP 500 fault instead of silently originating
+  backend TLS that no status can report.
+- `wellKnownCACertificates: System` now projects the new first-class
+  `system://` backend TLS trust source rather than an unset CA path. `system://`
+  pins the built-in system/webpki trust anchors for every HTTP/H2/H3/gRPC
+  backend client, health probe, and DTLS/stream backend: unlike an unset CA it
+  deliberately does NOT fall back to the cluster-global
+  `FERRUM_TLS_CA_BUNDLE_PATH`, and it never inherits `FERRUM_TLS_NO_VERIFY`, so
+  a cluster-wide private CA can no longer silently replace the public roots a
+  policy explicitly requested. It partitions backend connection pools, is
+  reported in the TLS material inventory, is rejected on client cert/key fields,
+  is rejected with any path or query options, and is rejected alongside
+  `backend_tls_verify_server_cert: false` on every config surface that builds a
+  backend TLS identity — Proxy, Upstream, the `mesh_route_dispatch`
+  route-local destination override, and Istio `DestinationRule` TLS overlays.
+- A Gateway API route rule whose `backendRefs` mix `BackendTLSPolicy`-covered
+  and uncovered backends now fails closed with a field-specific sanitized
+  warning and an HTTP 500 fault abort. Ferrum folds a rule's backends into one
+  upstream carrying one backend scheme and one TLS identity, so the previous
+  behavior originated TLS — with the covered Service's SNI and trust anchors —
+  to Services no policy covered.
+- `BackendTLSPolicy` `targetRefs[].sectionName` is now resolved against the
+  target Service's real `spec.ports[].name`. A `sectionName` that names no port
+  reports `Accepted=False, reason=TargetNotFound` with a field-specific message
+  and fails to attach, instead of being reported `Accepted=True` on Service
+  existence alone while applying nowhere; it deliberately does not spill onto,
+  or fail closed, the Service's other valid ports.
+- `BackendTLSPolicy` now enforces the Gateway API GEP-1897 transport contract on
+  an explicitly modeled port transport. Translation retains a bounded,
+  deterministic per-Service port index recording each port's classified
+  transport, and a port is eligible only when its `spec.ports[].protocol` is
+  proven `TCP` (omitted counts as TCP, matching the Kubernetes default;
+  comparison is case-insensitive). `UDP`, `SCTP`, and any unrecognized protocol
+  value are all ineligible — the previous `udp: bool` predicate treated SCTP and
+  unrecognized values as "not UDP" and therefore silently admitted them to
+  backend TLS. A policy that explicitly attaches to an ineligible port reports
+  `Accepted=False, reason=Invalid` scoped to that port, leaving sibling TCP ports
+  alone; a Service-wide policy on a Service with no TCP port is rejected the same
+  way because it would govern nothing. Route traffic selecting a rejected policy
+  fails closed with the HTTP 500 fault rather than originating TLS over a non-TCP
+  transport or dropping to plaintext. A Service mixing TCP and non-TCP ports is
+  accepted with a warning in the `Accepted` condition message and takes effect
+  only on its TCP ports. A Service declaring more than 64 ports cannot have its
+  port transport proven and is rejected fail closed. Condition messages name the
+  transport from a fixed set and never echo the raw cluster-supplied `protocol`
+  string. A Service-wide policy
+  that is fully shadowed by section-specific winners now reports
+  `Accepted=False, reason=Conflicted` instead of claiming success while governing
+  no port; it remains accepted when it still wins at least one eligible port.
+- Health probes now fail closed on **any** explicitly configured backend TLS
+  material that cannot be used, in both verified and no-verify modes and on both
+  the HTTP and gRPC probe paths. Previously a configured CA was only enforced
+  when verification was enabled, and a configured mTLS client identity was never
+  enforced at all.
+  - A configured backend CA is the sole trust anchor, so an unloadable or
+    unparseable CA fails the probe instead of silently verifying against the
+    public webpki roots — reachable through a `BackendTLSPolicy`
+    `caCertificateRefs` Secret whose `k8s://…#ca.crt` source becomes unreadable
+    after translation accepted it. Multi-certificate CA bundles are parsed as
+    bundles, the ordinary shape of a Kubernetes `ca.crt`.
+  - A configured backend mTLS client certificate/key pair that cannot be loaded
+    or parsed now fails the probe rather than downgrading it to an anonymous
+    handshake, which measures something real requests never perform: a backend
+    that merely *prefers* client certificates answers the anonymous probe while
+    refusing proxy traffic, marking a target healthy that no request can use. A
+    half-configured pair (certificate without key, or key without certificate)
+    fails for the same reason instead of being ignored.
+  - Disabling verification is a statement about whether the peer certificate is
+    checked, not a licence to ignore material the operator named, so neither rule
+    is relaxed by `backend_tls_verify_server_cert: false` or
+    `FERRUM_TLS_NO_VERIFY=true`. Probe diagnostics carry the material's source
+    identifier and a failure class only, never certificate or key bytes.
+- Backend TLS SNI overrides (`backend_tls_sni` — the projection target of both
+  DestinationRule `trafficPolicy.tls.sni` and `BackendTLSPolicy`
+  `validation.hostname`) are now honored on the reqwest **HTTP/1.1** transport,
+  not only on the direct-H2, gRPC, and native-H3 pools. An HTTP/1.1-only TLS
+  backend — the ordinary `BackendTLSPolicy` case — previously returned a terminal
+  `502` with `gateway-error-reason: backend_tls_sni_requires_direct_h2`, and the
+  reqwest retry path and the H3→HTTP cross-protocol bridge rejected the override
+  outright. reqwest exposes no per-request server-name hook (its connector
+  derives the rustls server name from the request URL host), so the dial carries
+  the override in the URL **authority** while pinning the pooled client's
+  resolver to the selected target's already-resolved, already-egress-screened
+  address; because that resolver answers every name with the pinned address, the
+  override hostname is never itself resolved and the selected backend target
+  stays authoritative for where the socket connects. ALPN is restricted to
+  `http/1.1` on that client so HTTP/2 cannot derive `:authority` from the server
+  name — the backend reads the authority from the explicit `Host` header instead
+  — and both the pinned address and the force-H1 discriminator join the existing
+  SNI/CA/SAN/mTLS/verification components of the reqwest pool key, so an SNI dial
+  shares a client with neither a default h2-capable client nor another target's
+  pin. Retries, timeouts, and streaming bodies are unchanged because the dial
+  reuses the ordinary reqwest path, and the retry path rebuilds the dial against
+  the newly selected target so an LB rotation between attempts still dials the
+  rotated target. The `502` remains the fail-closed answer only where the dial
+  genuinely cannot be constructed (no resolved target address to pin, or a
+  backend URL whose authority does not carry the selected target host). On the
+  H3→HTTP cross-protocol bridge that decision is taken as a **local
+  dispatch-policy** check — before backend admission, before the
+  least-connections connection-start record, and before any client is fetched —
+  so an override that cannot be expressed terminates with the same sanitized
+  `502` and `gateway-error-reason`, halting the H3 request body and dialing no
+  backend, on the buffered and streaming legs alike. A stray override on a
+  plaintext backend has no server name to override and is ignored uniformly —
+  on the H3 bridge, on the HTTP/1.1 and HTTP/2 first attempt, and on the reqwest
+  retry path, which previously answered it with the terminal, non-retryable
+  `502` even though the first attempt dispatched it normally. The `dns_override`
+  literal-target guard on that retry path is likewise waived only for a dial
+  that actually carries the server name in its URL authority, never for a bare
+  `sni` field that will not be applied.
+- Config admission no longer rejects a backend TLS SNI override combined with
+  effective retry, a request-body-buffering plugin, or `pool_enable_http2:
+  false`, for proxy-level overrides and for DestinationRule / `BackendTLSPolicy`
+  per-port TLS overlays alike. Those rejections existed because only the
+  direct-H2 pool could carry a server name; the reqwest/HTTP-1.1 SNI dial above
+  serves all three, so `ferrum-edge validate` and the Admin API were refusing
+  Gateway API `BackendTLSPolicy` shapes that work. The request-body-buffering
+  admission screener that derived the third leg is retired with them. Nothing
+  that is genuinely unrepresentable becomes admissible: the runtime `502` /
+  `gateway-error-reason: backend_tls_sni_requires_direct_h2` still fires when a
+  dial cannot be constructed, and a `wss://` upgrade whose effective backend TLS
+  carries an `sni` value is still refused before dialing, because the WebSocket
+  transport derives both `Host` and the TLS server name from the request URI and
+  cannot apply a distinct server name at all.
+- Active HTTP health probes that carry a backend TLS SNI override are now
+  restricted to **HTTP/1.1**. The probe puts the server name in the URL
+  authority and the real target authority in an explicit `Host` header; HTTP/2
+  rebuilds `:authority` from the URI, so an h2-negotiated probe presented the
+  override to the backend instead of the target it was probing. The client's
+  ALPN advertises `http/1.1` alone, so an h2-capable backend cannot select h2 on
+  it. The same client keeps its resolver pinned to the real target, and a probe
+  whose dial cannot be pinned now fails closed in every case rather than
+  degrading to the unpinned minimal fallback client.
+- Active **HTTP and gRPC** health probes now verify against the same effective
+  backend TLS server name as request traffic. A backend covered by
+  `backend_tls_sni` (`BackendTLSPolicy` `validation.hostname` or a
+  DestinationRule `trafficPolicy.tls.sni`) presents a certificate for the
+  override, not for the target host, so probes previously failed name
+  verification and ejected a target that served requests normally. The probe
+  still dials only the already-resolved, egress-screened target candidate and
+  the backend still sees its own authority: the HTTP probe carries the override
+  in the probe URL while pinning that client's resolver to the real target host
+  and sending an explicit `Host` (so the override hostname is never resolved),
+  and the gRPC probe sets it as the TLS `domain_name` / rustls `ServerName`
+  while tonic's `origin` keeps the target authority. An HTTPS probe with an
+  override is built per target rather than per upstream, and fails closed when
+  the dial cannot be pinned. TCP and UDP probes are unaffected.
+- The authority-host rewrite used by cross-cluster HBONE dispatch and by the
+  backend TLS SNI dial now requires a **host boundary**: a source host of
+  `foo.example` no longer matches the authority `foo.example.evil`. Callers
+  construct exact authorities, so this is defence in depth; bracketed IPv6
+  behaviour is unchanged.
 - Istio `DestinationRule.spec.exportTo` is now honored, and DestinationRules
   are resolved by Istio's lookup hierarchy — client namespace, then target
   service namespace, then the configured `istio_root_namespace` (issues #2465

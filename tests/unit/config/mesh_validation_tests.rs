@@ -2305,6 +2305,40 @@ fn mesh_config_validate_rejects_destination_rule_tls_inconsistency() {
 }
 
 #[test]
+fn mesh_config_validate_rejects_destination_rule_system_roots_without_verification() {
+    let mesh = MeshConfig {
+        destination_rules: vec![MeshDestinationRule {
+            name: "dr".into(),
+            namespace: "default".into(),
+            host: "reviews.default.svc.cluster.local".into(),
+            traffic_policy: Some(MeshTrafficPolicy {
+                tls: Some(MeshTrafficPolicyTls {
+                    mode: MtlsMode::Simple,
+                    ca_certificates: Some("system://".into()),
+                    insecure_skip_verify: true,
+                    ..MeshTrafficPolicyTls::default()
+                }),
+                ..MeshTrafficPolicy::default()
+            }),
+            port_level_settings: HashMap::new(),
+            subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
+        }],
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("ca_certificates")
+                && error.contains("insecure_skip_verify")
+                && error.contains("system://")
+        }),
+        "native/file/xDS validation must reject the contradictory trust policy: {errors:?}"
+    );
+}
+
+#[test]
 fn mesh_config_validate_rejects_tracing_percentage_bounds() {
     let mesh = MeshConfig {
         telemetry_resources: vec![MeshTelemetryResource {
