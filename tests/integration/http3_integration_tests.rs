@@ -345,7 +345,8 @@ async fn test_http3_proxy_state_creation() {
     );
     let dns_cache_for_sd = dns_cache.clone();
     let (backend_svid_rotation_tx, _) = tokio::sync::watch::channel(0u64);
-    let backend_conn_limit = Arc::new(ferrum_edge::backend_conn_limit::BackendConnectionLimiter::new());
+    let backend_conn_limit =
+        Arc::new(ferrum_edge::backend_conn_limit::BackendConnectionLimiter::new());
     let reqwest_conn_admission = Arc::new(
         ferrum_edge::backend_conn_limit::ReqwestConnectionAdmission::new(
             backend_conn_limit.clone(),
@@ -644,7 +645,8 @@ async fn test_http3_full_integration() {
     );
     let dns_cache_for_sd = dns_cache.clone();
     let (backend_svid_rotation_tx, _) = tokio::sync::watch::channel(0u64);
-    let backend_conn_limit = Arc::new(ferrum_edge::backend_conn_limit::BackendConnectionLimiter::new());
+    let backend_conn_limit =
+        Arc::new(ferrum_edge::backend_conn_limit::BackendConnectionLimiter::new());
     let reqwest_conn_admission = Arc::new(
         ferrum_edge::backend_conn_limit::ReqwestConnectionAdmission::new(
             backend_conn_limit.clone(),
