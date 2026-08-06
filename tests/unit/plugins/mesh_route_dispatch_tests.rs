@@ -110,6 +110,55 @@ fn mesh_route_dispatch_rejects_empty_backend_tls_paths_at_admission() {
     }
 }
 
+/// `system://` pins the built-in trust anchors, so pairing it with the
+/// verification opt-out is a contradiction. Proxy and Upstream admission already
+/// reject it; this route-local override is the third surface that builds a
+/// `BackendTlsConfig`, and leaving it out would resolve the contradiction in
+/// favour of not verifying at all on exactly this path.
+#[test]
+fn mesh_route_dispatch_rejects_system_trust_roots_with_verification_disabled() {
+    let config = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {
+                "backend_host": "secure.internal",
+                "backend_port": 443,
+                "backend_tls": {
+                    "server_ca_cert_path": "system://",
+                    "verify_server_cert": false
+                }
+            }
+        }]
+    });
+    let error = MeshRouteDispatch::new(&config)
+        .expect_err("system:// with verification disabled must fail admission");
+    assert!(
+        error.contains("verify_server_cert") && error.contains("system://"),
+        "the rejection must name both halves of the contradiction; got: {error}"
+    );
+    assert!(
+        ferrum_edge::plugins::validate_plugin_config("mesh_route_dispatch", &config).is_err(),
+        "the shared file/admin plugin admission path must reject it too"
+    );
+
+    // The verifying pairing stays admitted: `system://` alone is a valid trust
+    // selection, not a rejected value.
+    let verifying = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {
+                "backend_host": "secure.internal",
+                "backend_port": 443,
+                "backend_tls": {"server_ca_cert_path": "system://"}
+            }
+        }]
+    });
+    assert!(
+        MeshRouteDispatch::new(&verifying).is_ok(),
+        "system:// with the default verify_server_cert: true must be admitted"
+    );
+}
+
 #[test]
 fn mesh_route_dispatch_file_dependency_validation_reports_empty_tls_paths() {
     let config = json!({

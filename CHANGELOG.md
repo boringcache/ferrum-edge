@@ -51,7 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policy explicitly requested. It partitions backend connection pools, is
   reported in the TLS material inventory, is rejected on client cert/key fields,
   is rejected with any path or query options, and is rejected alongside
-  `backend_tls_verify_server_cert: false`.
+  `backend_tls_verify_server_cert: false` on every config surface that builds a
+  backend TLS identity — Proxy, Upstream, and the `mesh_route_dispatch`
+  route-local destination override.
 - A Gateway API route rule whose `backendRefs` mix `BackendTLSPolicy`-covered
   and uncovered backends now fails closed with a field-specific sanitized
   warning and an HTTP 500 fault abort. Ferrum folds a rule's backends into one
@@ -137,8 +139,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so an override that cannot be expressed terminates with the same sanitized
   `502` and `gateway-error-reason`, halting the H3 request body and dialing no
   backend, on the buffered and streaming legs alike. A stray override on a
-  plaintext backend is ignored there exactly as it is on the HTTP/1.1 and
-  HTTP/2 forks, so no config becomes an HTTP/3-only outage.
+  plaintext backend has no server name to override and is ignored uniformly —
+  on the H3 bridge, on the HTTP/1.1 and HTTP/2 first attempt, and on the reqwest
+  retry path, which previously answered it with the terminal, non-retryable
+  `502` even though the first attempt dispatched it normally. The `dns_override`
+  literal-target guard on that retry path is likewise waived only for a dial
+  that actually carries the server name in its URL authority, never for a bare
+  `sni` field that will not be applied.
 - Config admission no longer rejects a backend TLS SNI override combined with
   effective retry, a request-body-buffering plugin, or `pool_enable_http2:
   false`, for proxy-level overrides and for DestinationRule / `BackendTLSPolicy`

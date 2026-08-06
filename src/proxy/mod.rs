@@ -12779,6 +12779,26 @@ fn authority_remainder_is_port_only(remainder: &str) -> bool {
     }
 }
 
+/// Whether the AUTHORITY HOST of a `{scheme}://{host}:{port}{path}` URL is
+/// exactly `host`, under the same host-boundary proof
+/// [`rewrite_backend_url_authority_host`] applies.
+///
+/// Exists so a caller can assert the property positively instead of inferring
+/// it from "the rewrite changed nothing, and the two names happened to match".
+/// Allocation-free: borrowed slices and a byte scan.
+fn backend_url_authority_host_is(url: &str, host: &str) -> bool {
+    let Some(scheme_end) = url.find("://") else {
+        return false;
+    };
+    let rest = &url[scheme_end + 3..];
+    let authority_end_rel = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end_rel];
+    let rendered = url_render_host(host);
+    authority
+        .strip_prefix(rendered.as_ref())
+        .is_some_and(authority_remainder_is_port_only)
+}
+
 /// Rewrite the AUTHORITY HOST of a `{scheme}://{host}:{port}{path}` backend URL,
 /// replacing the rendered `from_host` (in the authority position only) with the
 /// rendered `to_host`. Used by the CROSS-CLUSTER HBONE dispatch to turn a URL
@@ -12950,9 +12970,13 @@ pub(crate) fn resolve_backend_tls_sni_reqwest_dial(
     // `rewrite_backend_url_authority_host` returns its input unchanged when the
     // authority is not exactly the rendered `effective_host` (optionally with a
     // port). An unchanged URL would hand rustls the target's own name as the
-    // server name, so fail closed unless the two are already the same name
-    // anyway.
-    if url == backend_url && !effective_host.eq_ignore_ascii_case(sni) {
+    // server name, so fail closed unless the authority ALREADY is the server
+    // name. Asserted positively against the URL rather than inferred from
+    // `effective_host == sni`: the callers here build the authority from
+    // `effective_host`, but a dial that decides which name rustls verifies must
+    // read that name off the URL it is about to hand reqwest, not off a
+    // separate argument that is only expected to agree with it.
+    if url == backend_url && !backend_url_authority_host_is(backend_url, sni) {
         return None;
     }
     Some(BackendTlsSniReqwestDial {
@@ -33376,13 +33400,29 @@ pub(crate) async fn proxy_to_backend_retry(
         return backend_egress_denied_response(effective_host);
     }
 
-    // A backend TLS SNI override is exempt: its URL authority carries the
+    // Whether this retry attempt will actually build a backend-TLS-SNI dial.
+    //
+    // Scoped to a TLS backend, matching the first attempt (`proxy_to_backend`
+    // reads the override only under `DispatchKind::HttpsPool`) and the H3→HTTP
+    // bridge (`run_plain_attempt_local_policy_or_reject`). A stray `sni` on a
+    // PLAINTEXT backend has no server name to override on any path, so the
+    // first attempt dispatches it normally; failing the retry closed would turn
+    // one transient backend failure into a terminal, non-retryable 502 for a
+    // configuration that otherwise works.
+    let requires_sni_dial = proxy.resolved_tls.sni.is_some()
+        && proxy
+            .backend_scheme
+            .is_some_and(|scheme| scheme.is_tls_backend());
+
+    // A backend TLS SNI dial is exempt: its URL authority carries the
     // overridden server name, which `validate_backend_tls_sni` guarantees is a
     // DNS hostname and never an IP literal, so reqwest's resolver IS consulted
     // and the pinned address IS what the socket dials. See
     // `backend_tls_sni_reqwest_dial` and the identical exemption on the
-    // first-attempt path.
-    if proxy.resolved_tls.sni.is_none()
+    // first-attempt path — which keys off the resolved dial, not off a bare
+    // `sni` field, so an override that will never be applied cannot waive this
+    // guard either.
+    if !requires_sni_dial
         && let Some(conflict) = reqwest_dns_override_literal_conflict(effective_host, proxy)
     {
         warn_reqwest_dns_override_literal_conflict(proxy, effective_host, conflict);
@@ -33423,7 +33463,7 @@ pub(crate) async fn proxy_to_backend_retry(
     // body replay is precisely the case the direct-H2 sender cannot serve, so
     // rejecting here would make every retry-enabled BackendTLSPolicy route a
     // guaranteed 502 on its second attempt.
-    let sni_reqwest_dial = if proxy.resolved_tls.sni.is_some() {
+    let sni_reqwest_dial = if requires_sni_dial {
         // `effective_proxy` is borrowed for the rest of this function (logging,
         // timeouts, headers), so the dial gets the one clone it needs and no
         // more — `resolve_effective_proxy_for_target` returns a borrow unless a
@@ -45944,6 +45984,66 @@ mod tests {
         ));
     }
 
+    /// A stray backend TLS SNI override on a PLAINTEXT backend has no server
+    /// name to override, so the retry path must treat it exactly as the first
+    /// attempt and the H3 bridge do: ignore it.
+    ///
+    /// Two regressions in one, both deterministic and dial-free:
+    ///
+    /// * the retry must not answer with the SNI dispatch-policy rejection
+    ///   (`gateway-error-reason: backend_tls_sni_requires_direct_h2`), which
+    ///   would turn one transient backend failure into a terminal,
+    ///   non-retryable 502 for a configuration whose first attempt succeeds;
+    /// * the `dns_override` / literal-target guard must still run for it. That
+    ///   exemption belongs to a dial that actually carries the server name in
+    ///   its URL authority, and this one never builds such a dial — so the
+    ///   conflicting override must be reported here rather than silently
+    ///   ignored while reqwest dials the URL literal.
+    #[tokio::test]
+    async fn reqwest_retry_ignores_a_backend_tls_sni_override_on_a_plaintext_backend() {
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_host = "127.0.0.1".to_string();
+        proxy.backend_port = 1;
+        proxy.dns_override = Some("127.0.0.2".to_string());
+        proxy.resolved_tls.sni = Some("backend.mesh.internal".to_string());
+        let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+
+        let resp = proxy_to_backend_retry(
+            &state,
+            &proxy,
+            "http://127.0.0.1:1/",
+            "GET",
+            &HashMap::new(),
+            None,
+            None,
+            true,
+            &[],
+            &ctx,
+            "127.0.0.1",
+            "127.0.0.1",
+            false,
+            hyper::Version::HTTP_11,
+        )
+        .await;
+
+        assert_eq!(resp.status_code, 502);
+        assert!(
+            !resp.headers.contains_key("gateway-error-reason"),
+            "a plaintext backend must not take the backend-TLS-SNI rejection"
+        );
+        assert_eq!(
+            resp.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
+        assert_eq!(
+            resp.backend_resolved_ip.as_deref(),
+            Some("127.0.0.2"),
+            "the dns_override literal-target guard must still apply"
+        );
+    }
+
     #[tokio::test]
     async fn reqwest_retry_fails_closed_when_literal_target_differs_from_dns_override() {
         let state = make_test_proxy_state(GatewayConfig::default());
@@ -52988,6 +53088,21 @@ mod tests {
         let host = "pod-a.internal";
         let sibling_dial = sni_dial_borrowed(&proxy, sibling, host, Some("10.4.1.9"));
         assert!(sibling_dial.is_none());
+        // ...and the "already named by the override" escape is proven against
+        // the URL, not against `effective_host`. Here the two arguments agree
+        // with each other but NOT with the authority the dial would present, so
+        // accepting it would hand rustls `other.host` as the server name for a
+        // route that mandates `secure.example.com`.
+        let disagreeing = sni_dial_borrowed(
+            &proxy,
+            "https://other.host:8443/",
+            "secure.example.com",
+            Some("10.4.1.9"),
+        );
+        assert!(
+            disagreeing.is_none(),
+            "an unrewritten authority that is not the server name must fail closed"
+        );
     }
 
     #[test]

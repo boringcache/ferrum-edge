@@ -37,8 +37,15 @@ use super::{
 /// Maximum admitted `caCertificateRefs` entries. Bounds hostile input before
 /// any ConfigMap/Secret resolution work.
 const MAX_CA_CERTIFICATE_REFS: usize = 8;
-/// Maximum admitted `subjectAltNames` entries, matching Ferrum's own
-/// `backend_tls_san_allow_list` ceiling.
+/// Maximum admitted `subjectAltNames` entries.
+///
+/// Bounds hostile input well inside Ferrum's own `backend_tls_san_allow_list`
+/// ceiling (`MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES`, 256), which is the limit a
+/// projected overlay is ultimately validated against. The tighter number here is
+/// the Gateway API CRD's own structural ceiling on
+/// `spec.validation.subjectAltNames`, so a spec exceeding it could only reach
+/// Ferrum from a source the API server never validated — which is exactly the
+/// input this bound exists to refuse.
 const MAX_SUBJECT_ALT_NAMES: usize = 5;
 /// Gateway API v1.5.1 technically admits up to 16 targetRefs but explicitly
 /// recommends that implementations support one until multi-target conflict and

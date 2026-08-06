@@ -4973,7 +4973,7 @@ fn validate_system_trust_roots_source_field(
 /// opt-out. `system://` means "verify against the platform roots"; combining it
 /// with `verify_server_cert: false` is a contradiction that would otherwise
 /// silently resolve in favour of not verifying at all.
-fn validate_system_trust_roots_verify_pairing(
+pub(crate) fn validate_system_trust_roots_verify_pairing(
     ca_field: &str,
     verify_field: &str,
     ca_value: Option<&str>,
