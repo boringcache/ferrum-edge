@@ -2642,7 +2642,7 @@ async fn handle_h3_request(
             ) {
                 crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
                     &ctx.grpc_request_messages_observed,
-                    &body_data,
+                    body_data,
                 );
             }
         }

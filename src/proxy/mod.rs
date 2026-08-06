@@ -39747,12 +39747,10 @@ async fn proxy_to_backend_http2(
     // completion channel (and therefore the response gate) is limit-gated.
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let mut body_cancel_tx = Some(cancel_tx);
-    let observe_grpc = ctx
-        .map(|c| {
-            crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&c.metadata)
-                .then(|| Arc::clone(&c.grpc_request_messages_observed))
-        })
-        .flatten();
+    let observe_grpc = ctx.and_then(|c| {
+        crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&c.metadata)
+            .then(|| Arc::clone(&c.grpc_request_messages_observed))
+    });
     let (body, body_completion_rx) = if effective_max_request_body_size_bytes > 0 {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let mut body = body::SizeLimitedIncoming::new_with_counter_and_completion(

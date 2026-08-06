@@ -2267,11 +2267,12 @@ impl Http3ConnectionPool {
                 .send_data(data)
                 .await
                 .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
-            if let (Some(messages), Some(scanner)) = (grpc_messages.as_ref(), grpc_scanner.as_mut())
-            {
-                if let Some(metric_data) = metric_data.as_ref() {
-                    scanner.push(metric_data, messages);
-                }
+            if let (Some(messages), Some(scanner), Some(metric_data)) = (
+                grpc_messages.as_ref(),
+                grpc_scanner.as_mut(),
+                metric_data.as_ref(),
+            ) {
+                scanner.push(metric_data, messages);
             }
             bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
@@ -2473,11 +2474,12 @@ impl Http3ConnectionPool {
                 .send_data(data)
                 .await
                 .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
-            if let (Some(messages), Some(scanner)) = (grpc_messages.as_ref(), grpc_scanner.as_mut())
-            {
-                if let Some(metric_data) = metric_data.as_ref() {
-                    scanner.push(metric_data, messages);
-                }
+            if let (Some(messages), Some(scanner), Some(metric_data)) = (
+                grpc_messages.as_ref(),
+                grpc_scanner.as_mut(),
+                metric_data.as_ref(),
+            ) {
+                scanner.push(metric_data, messages);
             }
             bytes_seen.fetch_add(len as u64, Ordering::Release);
         }

@@ -4008,12 +4008,14 @@ where
     ) = stream_hyper_incoming(
         stream,
         streaming.body,
-        coalesce,
-        max_resp_bytes,
-        streaming.response_read_timeout_ms,
-        streaming.grpc_deadline_at,
-        grpc_web_translation_mode,
-        &ctx.grpc_response_messages_observed,
+        StreamHyperIncomingOpts {
+            coalesce,
+            max_response_body_size_bytes: max_resp_bytes,
+            response_read_timeout_ms: streaming.response_read_timeout_ms,
+            grpc_deadline_at: streaming.grpc_deadline_at,
+            grpc_web_translation_mode,
+            grpc_response_messages: &ctx.grpc_response_messages_observed,
+        },
     )
     .await;
 
@@ -6844,6 +6846,17 @@ where
     )
 }
 
+/// Bundle streaming/policy knobs for [`stream_hyper_incoming`] so the helper
+/// stays under clippy's argument limit after gRPC response-message accounting.
+struct StreamHyperIncomingOpts<'a> {
+    coalesce: CoalesceConfig,
+    max_response_body_size_bytes: usize,
+    response_read_timeout_ms: u64,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    grpc_web_translation_mode: Option<bool>,
+    grpc_response_messages: &'a AtomicU64,
+}
+
 /// Stream a hyper `Incoming` body into the H3 stream, separating trailer
 /// frames for `send_trailers`. Returns
 /// `(bytes_streamed, body_completed, client_disconnected, body_error_class,
@@ -6851,12 +6864,7 @@ where
 async fn stream_hyper_incoming<S>(
     stream: &mut RequestStream<S, Bytes>,
     mut incoming: Incoming,
-    coalesce: CoalesceConfig,
-    max_response_body_size_bytes: usize,
-    response_read_timeout_ms: u64,
-    grpc_deadline_at: Option<tokio::time::Instant>,
-    grpc_web_translation_mode: Option<bool>,
-    grpc_response_messages: &AtomicU64,
+    opts: StreamHyperIncomingOpts<'_>,
 ) -> (u64, bool, bool, Option<ErrorClass>, Option<HeaderMap>, bool)
 where
     // Send-only: this loop writes the response (`send_data` / `finish` /
@@ -6865,6 +6873,14 @@ where
     // `split()` send half (streaming-request gRPC path).
     S: SendStream<Bytes>,
 {
+    let StreamHyperIncomingOpts {
+        coalesce,
+        max_response_body_size_bytes,
+        response_read_timeout_ms,
+        grpc_deadline_at,
+        grpc_web_translation_mode,
+        grpc_response_messages,
+    } = opts;
     let mut coalesce_buf = BytesMut::with_capacity(coalesce.max_bytes);
     let mut total_streamed: usize = 0;
     let flush_timer = tokio::time::sleep(coalesce.flush_interval);
