@@ -209,6 +209,13 @@ filtering, and the `performance-regression` path classifier on both
 `pull_request` and `merge_group` diffs. Merge-group planning diffs
 `merge_group.base_sha...HEAD` and executes the planner from that base SHA so a
 queued planner edit cannot self-classify as light.
+`CI Plan` also runs the trusted node-agent/ambient chart runtime lint
+(`.github/scripts/check_node_agent_chart_runtime.py`): on pull requests and
+merge groups the checker is extracted from the base branch when present, then
+self-tested and executed against the proposed chart tree, so a hostile PR cannot
+replace the gate while adding a Docker/containerd/CRI-O socket mount,
+`runtime.sock`, or `privileged: true`. The required `Tests` aggregate re-runs the
+proposed checker self-test and scan through `verify_required_ci.py`.
 Any unrecognized path, an empty/unavailable diff, a mixed code-and-docs change,
 a push to `main`, or a manual run fails over to full mode. The decision table
 and its executable examples live in `.github/scripts/pr_ci_plan.py`. PR

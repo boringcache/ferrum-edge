@@ -9,6 +9,10 @@ import sys
 from pathlib import Path
 
 from check_markdown_links import check_repository, run_self_test
+from check_node_agent_chart_runtime import (
+    check_repository as check_node_agent_chart_runtime,
+    main as node_agent_chart_runtime_main,
+)
 from live_suite_path_filter import (
     LIVE_SUITE_DOCUMENTATION_PATHS,
     SUITE_PATTERNS,
@@ -905,6 +909,41 @@ def main() -> int:
         planner_errors.append(
             "jobs.ci-plan must run the integration shard-coverage gate"
         )
+    # Issue #3615: node-agent/ambient chart runtime lint must stay on the
+    # always-on trusted ci-plan path (base-extracted checker + self-test), not a
+    # replaceable PR-only helm step.
+    if "check_node_agent_chart_runtime.py" not in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must invoke check_node_agent_chart_runtime.py"
+        )
+    if "Check node-agent chart runtime mounts" not in ci_yml:
+        planner_errors.append(
+            "jobs.ci-plan must keep the node-agent chart runtime mounts step"
+        )
+    if 'python3 -I "$checker" --self-test' not in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must run the chart runtime lint self-test via "
+            "isolated python3 -I"
+        )
+    if not re.search(r'(?m)^\s*python3 -I "\$checker"\s*$', ci_plan_body):
+        planner_errors.append(
+            "jobs.ci-plan must run the chart runtime lint against the checkout"
+        )
+    if 'git show "${base_ref}:${checker}"' not in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must extract check_node_agent_chart_runtime.py "
+            "from the trusted base on pull requests"
+        )
+    if 'git show "${MERGE_BASE_SHA}:${checker}"' not in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must extract check_node_agent_chart_runtime.py "
+            "from the merge-group base"
+        )
+    if 'trusted_checker="$RUNNER_TEMP/check-node-agent-chart-runtime.py"' not in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must stage the trusted chart runtime checker under "
+            "RUNNER_TEMP"
+        )
     # The scheduling decision above intentionally executes the trusted-base
     # planner on pull requests. Exercise the proposed planner here as data-plane
     # validation only: this verifier publishes no planner outputs and cannot
@@ -921,6 +960,18 @@ def main() -> int:
         planner_errors.append(
             f"live-assertion artifact validator self-test failed: {error}"
         )
+    if node_agent_chart_runtime_main(["--self-test"]) != 0:
+        planner_errors.append(
+            "proposed node-agent chart runtime lint self-test failed"
+        )
+    try:
+        chart_runtime_findings = check_node_agent_chart_runtime()
+    except (OSError, ValueError, NotADirectoryError, FileNotFoundError) as error:
+        planner_errors.append(
+            f"proposed node-agent chart runtime lint failed closed: {error}"
+        )
+    else:
+        planner_errors.extend(chart_runtime_findings)
     planner_errors.extend(validate_artifact_gate_wiring())
     planner_errors.extend(error.format() for error in check_repository())
     release_yml = Path(".github/workflows/release.yml").read_text(encoding="utf-8")

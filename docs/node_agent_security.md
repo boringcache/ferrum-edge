@@ -589,9 +589,9 @@ under the `system:serviceaccount:<ns>:ferrum-node-agent` identity.
 |---|---|---|
 | BPF program from compromised image | Sign agent images, pin digests, scan for unexpected BPF program types | Operator |
 | Capability creep in chart fork | This document + chart fields use `nodeAgent.security.*` toggles, default to least privilege | Gateway |
-| Runtime socket mount (escape vector) | Not present in upstream chart; CI lint rejects diffs that add it | Operator + Gateway |
+| Runtime socket mount (escape vector) | Not present in upstream chart; always-on trusted `CI Plan` lint (`.github/scripts/check_node_agent_chart_runtime.py`, base-extracted on PRs) rejects node-agent/ambient chart workload or values content that adds Docker/containerd/CRI-O sockets or host storage, common `runtime.sock` spellings, or `privileged: true` | Operator + Gateway |
 | Read-write `/sys/fs/cgroup` (host modification) | Chart mounts `readOnly: true`; verify in your own values overlays | Operator |
-| Privileged: true (defeats seccomp) | Chart sets `privileged: false`; gate behind explicit override if needed | Operator |
+| Privileged: true (defeats seccomp) | Chart sets `privileged: false` on the node-agent container; the trusted chart-runtime lint rejects `privileged: true` on node-agent/ambient chart surfaces | Operator + Gateway |
 | Unauthenticated /metrics on cluster network | Loopback-only default (see [`docs/node_agent.md`](node_agent.md)); explicit opt-in to broaden | Gateway |
 | ServiceAccount token theft | Use projected tokens with short `expirationSeconds`; rotate via kubelet | Operator |
 | Excessive RBAC | Chart's ClusterRole is `pods get/list/watch` + `nodes get` — verify on fork | Operator + Gateway |
