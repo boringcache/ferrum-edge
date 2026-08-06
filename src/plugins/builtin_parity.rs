@@ -22,6 +22,7 @@ use super::{
 /// installed. Keep this in sync with the actual `Some`-returning implementations
 /// — `tests/unit/plugins/plugin_doc_parity_tests.rs` asserts the set.
 pub const BUILTIN_RESPONSE_BODY_PRODUCERS: &[&str] = &[
+    "a2a_gateway",
     "ai_response_guard",
     "ai_stream_router",
     "ai_tool_governor",
@@ -459,9 +460,9 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "a2a_gateway",
         classification: BuiltinPluginClassification::Public,
         priority: 2993,
-        active_phases: "before_proxy, after_proxy, on_response_body, response_stream_inspector",
+        active_phases: "before_proxy, after_proxy, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector",
         matrix_protocols: HTTP_GRPC_PROTOCOLS,
-        protocol_rationale: "Detects A2A HTTP/REST/gRPC methods, rewrites HTTP Agent Cards, applies method policy, and emits `a2a.*` metadata",
+        protocol_rationale: "Detects A2A HTTP/REST/gRPC methods, rewrites HTTP and gRPC Agent Cards, applies method policy, and emits `a2a.*` metadata",
     },
     BuiltinPluginParityMeta {
         name: "mesh_route_dispatch",
