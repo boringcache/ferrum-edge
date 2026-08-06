@@ -2310,12 +2310,12 @@ fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, an
                     "Mesh slice VirtualService L4 proxy {index} has invalid ownership or matcher identity"
                 ));
             }
-            if let Some(upstream_id) = proxy.upstream_id.as_deref() {
-                if !carried_upstream_ids.contains(upstream_id) {
-                    return Err(anyhow::anyhow!(
-                        "Mesh slice VirtualService L4 proxy {index} references missing upstream {upstream_id}"
-                    ));
-                }
+            if let Some(upstream_id) = proxy.upstream_id.as_deref()
+                && !carried_upstream_ids.contains(upstream_id)
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice VirtualService L4 proxy {index} references missing upstream {upstream_id}"
+                ));
             }
             Ok(proxy)
         })

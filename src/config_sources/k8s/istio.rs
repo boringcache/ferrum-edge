@@ -3342,15 +3342,14 @@ fn project_l4_proxy_visibility(
             projected_proxy.compiled_stream_match = None;
             if let Some(upstream_id) = projected_proxy.upstream_id.as_deref() {
                 let upstream_key = (namespace.clone(), upstream_id.to_string());
-                if emitted_upstream_keys.insert(upstream_key) {
-                    if let Some(template) = upstream_templates
+                if emitted_upstream_keys.insert(upstream_key)
+                    && let Some(template) = upstream_templates
                         .iter()
                         .find(|upstream| upstream.id == upstream_id)
-                    {
-                        let mut projected_upstream = template.clone();
-                        projected_upstream.namespace = namespace.clone();
-                        projected_upstreams.push(projected_upstream);
-                    }
+                {
+                    let mut projected_upstream = template.clone();
+                    projected_upstream.namespace = namespace.clone();
+                    projected_upstreams.push(projected_upstream);
                 }
             }
             projected.push(projected_proxy);
