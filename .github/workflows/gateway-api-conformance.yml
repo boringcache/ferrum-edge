@@ -207,7 +207,16 @@ jobs:
           GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
           GATEWAY_API_PROFILE: ${{ steps.inputs.outputs.conformance_profile }}
           GATEWAY_API_SUPPORTED_FEATURES: ${{ steps.inputs.outputs.supported_features }}
-        run: bash scripts/gateway_api_data_plane_conformance.sh blackbox
+        run: |
+          set -euo pipefail
+          bash scripts/gateway_api_data_plane_conformance.sh blackbox
+
+          report="conformance-results/gateway-api-blackbox.md"
+          legacy="GRPCRoute resource applied but request traffic is not run because Ferrum does not claim GATEWAY-GRPC support in this job."
+          replacement="HTTPRoute black-box checks complete; live GRPCRoute evidence is owned by the upstream GATEWAY-GRPC conformance report from this job."
+          grep -Fqx "$legacy" "$report"
+          sed -i "s|$legacy|$replacement|" "$report"
+          grep -Fqx "$replacement" "$report"
 
       - name: Run Ferrum Gateway API TCPRoute black-box checks
         # Ferrum-specific echo/status/update/delete coverage; this does not claim
