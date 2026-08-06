@@ -32490,6 +32490,15 @@ async fn handle_proxy_request_inner(
             ProxyBody::full(data)
         }
     };
+    // Attach native gRPC message scanning before the optional gRPC-Web adapter.
+    // Text-mode gRPC-Web base64 and its body-framed terminal metadata are not
+    // native length-prefixed messages; the inner body still sees the original
+    // DATA/trailer split and updates the shared RequestContext counter.
+    if is_streaming_response
+        && crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata)
+    {
+        body = body.with_grpc_message_counter(Arc::clone(&ctx.grpc_response_messages_observed));
+    }
     let body = if let Some((content_type, initial_terminal_metadata)) = grpc_web_streaming_adapter {
         body.into_grpc_web_streaming(
             &content_type,
@@ -32515,15 +32524,6 @@ async fn handle_proxy_request_inner(
     } else {
         body
     };
-    // Streaming responses: count complete length-prefixed messages as DATA
-    // frames are delivered to the client. Buffered responses are counted once
-    // from the complete body at summary construction (fetch_max) so we do not
-    // double-count when the Full body is later polled.
-    if is_streaming_response
-        && crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata)
-    {
-        body = body.with_grpc_message_counter(Arc::clone(&ctx.grpc_response_messages_observed));
-    }
 
     // Detach the logger before handing the body to the builder. `http::Error`
     // doesn't expose the consumed body, so we can't recover the logger after

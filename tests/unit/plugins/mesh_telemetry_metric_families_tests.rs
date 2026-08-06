@@ -336,6 +336,10 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
                 "metric": "TCP_SENT_BYTES",
                 "name": "source_workload",
                 "operation": {"type": "set", "value": "edge"}
+            }, {
+                "metric": "TCP_SENT_BYTES",
+                "name": "response_code",
+                "operation": {"type": "set", "value": "synthetic"}
             }]
         }
     }))
@@ -426,5 +430,12 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
                 && line.contains("source_workload=\"edge\"")
                 && line.ends_with(" 42")),
         "override-scoped sent bytes must keep value 42:\n{output}"
+    );
+    assert!(
+        output
+            .lines()
+            .filter(|line| line.starts_with("ferrum_mesh_tcp_sent_bytes_total{"))
+            .all(|line| !line.contains("response_code=")),
+        "TCP families must not gain an HTTP response_code dimension:\n{output}"
     );
 }

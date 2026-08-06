@@ -44,6 +44,26 @@ fn metric_line_value(metrics: &str, series_prefix: &str) -> Option<u64> {
     })
 }
 
+async fn wait_for_message_metrics(
+    gateway: &GatewayHarness,
+    expected_requests: u64,
+    expected_responses: u64,
+) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let metrics = gateway.metrics().await.expect("scrape metrics");
+        let requests = metric_line_value(&metrics, "ferrum_mesh_request_messages_total{");
+        let responses = metric_line_value(&metrics, "ferrum_mesh_response_messages_total{");
+        if requests == Some(expected_requests) && responses == Some(expected_responses) {
+            return metrics;
+        }
+        if std::time::Instant::now() >= deadline {
+            return metrics;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 fn mesh_metric_plugins() -> serde_json::Value {
     json!([
         {
@@ -157,8 +177,7 @@ async fn h2_grpc_message_metrics_are_nonzero_and_exact() {
         .await
         .expect("h2 grpc");
 
-    sleep(Duration::from_millis(500)).await;
-    let metrics = gateway.metrics().await.expect("scrape metrics");
+    let metrics = wait_for_message_metrics(&gateway, 2, 2).await;
     let req = metric_line_value(&metrics, "ferrum_mesh_request_messages_total{")
         .expect("request message series missing");
     let resp = metric_line_value(&metrics, "ferrum_mesh_response_messages_total{")
@@ -192,8 +211,7 @@ async fn h3_grpc_message_metrics_are_nonzero_and_exact() {
     let mut last_err = String::new();
     for _ in 0..5 {
         let reservation = reserve_port().await.expect("reserve https port");
-        let https_port = reservation.port;
-        drop(reservation);
+        let https_port = reservation.drop_and_take_port();
         let scratch = tempfile::tempdir().expect("scratch");
         let (cert_path, key_path) = write_frontend_certs(scratch.path());
         let config = json!({
@@ -215,6 +233,7 @@ async fn h3_grpc_message_metrics_are_nonzero_and_exact() {
         let yaml = serde_yaml::to_string(&config).expect("yaml");
         let gateway = match GatewayHarness::builder()
             .file_config(yaml)
+            .max_attempts(1)
             .env("FERRUM_ENABLE_HTTP3", "true")
             .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
             .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
@@ -261,8 +280,7 @@ async fn h3_grpc_message_metrics_are_nonzero_and_exact() {
             Some("0")
         );
 
-        sleep(Duration::from_millis(500)).await;
-        let metrics = gateway.metrics().await.expect("scrape metrics");
+        let metrics = wait_for_message_metrics(&gateway, 2, 2).await;
         let req = metric_line_value(&metrics, "ferrum_mesh_request_messages_total{")
             .expect("H3 request message series missing");
         let resp = metric_line_value(&metrics, "ferrum_mesh_response_messages_total{")

@@ -4013,6 +4013,7 @@ where
         streaming.response_read_timeout_ms,
         streaming.grpc_deadline_at,
         grpc_web_translation_mode,
+        &ctx.grpc_response_messages_observed,
     )
     .await;
 
@@ -4633,6 +4634,12 @@ where
     } else {
         body.len() as u64
     };
+    if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+        crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
+            &ctx.grpc_request_messages_observed,
+            &body,
+        );
+    }
 
     // Build the backend-facing header map (X-Forwarded-*, Via, Forwarded,
     // Early-Data) via the shared helper so the buffered and streaming H3 gRPC
@@ -5133,6 +5140,10 @@ where
             // trailers.
             let mut response_status = resp.status;
             let mut response_body = resp.body;
+            // Preserve the native gRPC representation for message accounting.
+            // A later gRPC-Web transform may base64/reframe the client-visible
+            // bytes, which are not themselves native length-prefixed frames.
+            let backend_response_body_for_message_count = response_body.clone();
             let mut response_trailers = resp.trailers;
             if normalize_response_body_for_inspection(
                 plugins,
@@ -5356,6 +5367,7 @@ where
                                 &mut authoritative_trailers_only_terminal_metadata,
                             );
                             buffered_initial_response_header_policy_state = None;
+                            response_body_rejected = true;
                             break;
                         }
                     }
@@ -5597,7 +5609,15 @@ where
                     .await
                 };
                 match body_write {
-                    Ok(()) => bytes_streamed = body_len,
+                    Ok(()) => {
+                        bytes_streamed = body_len;
+                        if !response_body_rejected && !terminal_gateway_deadline {
+                            crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
+                                &ctx.grpc_response_messages_observed,
+                                &backend_response_body_for_message_count,
+                            );
+                        }
+                    }
                     Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                         crate::proxy::insert_grpc_error_metadata(
                             &mut ctx.metadata,
@@ -6836,6 +6856,7 @@ async fn stream_hyper_incoming<S>(
     response_read_timeout_ms: u64,
     grpc_deadline_at: Option<tokio::time::Instant>,
     grpc_web_translation_mode: Option<bool>,
+    grpc_response_messages: &AtomicU64,
 ) -> (u64, bool, bool, Option<ErrorClass>, Option<HeaderMap>, bool)
 where
     // Send-only: this loop writes the response (`send_data` / `finish` /
@@ -6855,6 +6876,8 @@ where
     let mut trailers: Option<HeaderMap> = None;
     let mut clean_deadline_completion = false;
     let mut client_deadline_expired = false;
+    let mut grpc_response_scanner =
+        crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default();
     let read_timeout_active = response_read_timeout_ms > 0 && grpc_deadline_at.is_none();
     let read_deadline = tokio::time::sleep(std::time::Duration::from_millis(
         response_read_timeout_ms.max(1),
@@ -6983,6 +7006,7 @@ where
                                 data_len,
                                 coalesce.min_bytes,
                             ) {
+                                let metric_data = data.clone();
                                 let out = if let Some(text_mode) = grpc_web_translation_mode {
                                     crate::plugins::grpc_web::encode_streaming_data(data, text_mode)
                                 } else {
@@ -6992,6 +7016,8 @@ where
                                 if !await_downstream_write!(stream.send_data(out)) {
                                     break 'outer;
                                 }
+                                grpc_response_scanner
+                                    .push(&metric_data, grpc_response_messages);
                                 bytes_streamed += out_len;
                                 flush_timer
                                     .as_mut()
@@ -7001,16 +7027,21 @@ where
 
                             coalesce_buf.extend_from_slice(&data);
                             if coalesce_buf.len() >= coalesce.min_bytes {
-                                let out = coalesce_buf.split().freeze();
+                                let metric_data = coalesce_buf.split().freeze();
                                 let out = if let Some(text_mode) = grpc_web_translation_mode {
-                                    crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
+                                    crate::plugins::grpc_web::encode_streaming_data(
+                                        metric_data.clone(),
+                                        text_mode,
+                                    )
                                 } else {
-                                    out
+                                    metric_data.clone()
                                 };
                                 let out_len = out.len() as u64;
                                 if !await_downstream_write!(stream.send_data(out)) {
                                     break 'outer;
                                 }
+                                grpc_response_scanner
+                                    .push(&metric_data, grpc_response_messages);
                                 bytes_streamed += out_len;
                                 flush_timer
                                     .as_mut()
@@ -7034,16 +7065,20 @@ where
                 }
             }
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
-                let out = coalesce_buf.split().freeze();
+                let metric_data = coalesce_buf.split().freeze();
                 let out = if let Some(text_mode) = grpc_web_translation_mode {
-                    crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
+                    crate::plugins::grpc_web::encode_streaming_data(
+                        metric_data.clone(),
+                        text_mode,
+                    )
                 } else {
-                    out
+                    metric_data.clone()
                 };
                 let out_len = out.len() as u64;
                 if !await_downstream_write!(stream.send_data(out)) {
                     break 'outer;
                 }
+                grpc_response_scanner.push(&metric_data, grpc_response_messages);
                 bytes_streamed += out_len;
                 flush_timer
                     .as_mut()
@@ -7061,16 +7096,20 @@ where
         }
         if stream_done {
             if !coalesce_buf.is_empty() {
-                let out = coalesce_buf.split().freeze();
+                let metric_data = coalesce_buf.split().freeze();
                 let out = if let Some(text_mode) = grpc_web_translation_mode {
-                    crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
+                    crate::plugins::grpc_web::encode_streaming_data(
+                        metric_data.clone(),
+                        text_mode,
+                    )
                 } else {
-                    out
+                    metric_data.clone()
                 };
                 let out_len = out.len() as u64;
                 if !await_downstream_write!(stream.send_data(out)) {
                     break 'outer;
                 }
+                grpc_response_scanner.push(&metric_data, grpc_response_messages);
                 bytes_streamed += out_len;
             }
             // When trailers are present, the caller writes the trailing

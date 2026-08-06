@@ -53,11 +53,11 @@ Scrape rendering stays allocation-light: the inventory is a documentation/CI con
 
 | Family | Type | Labels | Guidance |
 |--------|------|--------|----------|
-| `ferrum_mesh_tcp_connections_closed_total` | counter | `source_workload`, `source_namespace`, `source_principal`, `source_app`, `source_service`, `destination_workload`, `destination_namespace`, `destination_principal`, `destination_app`, `destination_service`, `request_protocol`, `response_flags`, `connection_security_policy`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh TCP connections closed. |
-| `ferrum_mesh_tcp_connections_opened_total` | counter | `source_workload`, `source_namespace`, `source_principal`, `source_app`, `source_service`, `destination_workload`, `destination_namespace`, `destination_principal`, `destination_app`, `destination_service`, `request_protocol`, `response_flags`, `connection_security_policy`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh TCP connections opened. |
-| `ferrum_mesh_tcp_egress_connections_total` | counter | `transport`, `result`, `namespace` | `mesh` | `documented_only` | `conditional` | Raw-TCP mesh egress relay connections by transport and outcome. |
-| `ferrum_mesh_tcp_received_bytes_total` | counter | `source_workload`, `source_namespace`, `source_principal`, `source_app`, `source_service`, `destination_workload`, `destination_namespace`, `destination_principal`, `destination_app`, `destination_service`, `request_protocol`, `response_flags`, `connection_security_policy`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh TCP bytes received on closed connections. |
-| `ferrum_mesh_tcp_sent_bytes_total` | counter | `source_workload`, `source_namespace`, `source_principal`, `source_app`, `source_service`, `destination_workload`, `destination_namespace`, `destination_principal`, `destination_app`, `destination_service`, `request_protocol`, `response_flags`, `connection_security_policy`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh TCP bytes sent on closed connections. |
+| `ferrum_mesh_tcp_connections_closed_total` | counter | Mesh identity, protocol, response flags, security policy, namespace | Closed TCP connections. |
+| `ferrum_mesh_tcp_connections_opened_total` | counter | Mesh identity, protocol, response flags, security policy, namespace | Opened TCP connections. |
+| `ferrum_mesh_tcp_egress_connections_total` | counter | `transport`, `result`, `namespace` | Raw-TCP mesh egress relays by transport and outcome. |
+| `ferrum_mesh_tcp_received_bytes_total` | counter | Mesh identity, protocol, response flags, security policy, namespace | Bytes received on closed TCP connections. |
+| `ferrum_mesh_tcp_sent_bytes_total` | counter | Mesh identity, protocol, response flags, security policy, namespace | Bytes sent on closed TCP connections. |
 
 **Suggested alert:** `sum(rate(ferrum_mesh_tcp_egress_connections_total{result="failure"}[5m]))` above baseline. Investigate orig-dst capture, outbound registry admits, and HBONE/mTLS dial failures for stream-family ports.
 

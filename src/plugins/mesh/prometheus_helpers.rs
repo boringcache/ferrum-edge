@@ -1709,6 +1709,12 @@ pub(crate) fn mesh_request_key_for_family_from_metadata(
     };
     let mut key = base.clone();
     apply_metric_override_plan(&mut key, plan);
+    // TCP families never carry an HTTP response-code dimension. Preserve that
+    // fixed schema even when an ALL_METRICS plan contains a response-code
+    // UPSERT/rename intended for the HTTP/gRPC families.
+    if family.is_tcp() {
+        key.removed_labels |= 1u16 << MeshMetricLabel::ResponseCode.index();
+    }
     normalize_removed_labels(&mut key);
     key
 }

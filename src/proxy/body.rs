@@ -622,8 +622,6 @@ impl ProxyBody {
         let mut inner = self;
         let client_grpc_deadline_fired = inner.client_grpc_deadline_fired.clone();
         let logger = inner.logger.take();
-        let grpc_messages = inner.grpc_messages.take();
-        let grpc_scanner = inner.grpc_scanner.take();
         let backend_admission_permits = inner._backend_admission_permits.take();
         let backend_admission_outcome = inner.backend_admission_outcome.take();
         let backend_dispatch_outcome = inner.backend_dispatch_outcome.take();
@@ -644,8 +642,6 @@ impl ProxyBody {
         body.client_grpc_deadline_fired = client_grpc_deadline_fired;
         body.grpc_web_terminal_status = Some(terminal_status);
         body.logger = logger;
-        body.grpc_messages = grpc_messages;
-        body.grpc_scanner = grpc_scanner;
         body
     }
 
@@ -1190,12 +1186,6 @@ impl http_body::Body for ProxyBody {
                     this.bytes_streamed
                         .fetch_add(data.len() as u64, Ordering::Relaxed);
                 }
-                if let (Some(messages), Some(scanner)) =
-                    (this.grpc_messages.as_ref(), this.grpc_scanner.as_mut())
-                    && let Some(data) = frame.data_ref()
-                {
-                    scanner.push(data, messages);
-                }
                 let is_trailers = frame.trailers_ref().is_some();
                 // A client-deadline wrapper emits gRPC-Web terminal metadata as
                 // an encoded DATA frame rather than native HTTP trailers. The
@@ -1206,6 +1196,14 @@ impl http_body::Body for ProxyBody {
                     client_deadline_fired && frame.data_ref().is_some();
                 let is_grpc_web_streaming_terminal =
                     grpc_web_terminal_status.is_some() && frame.data_ref().is_some();
+                if !is_grpc_web_deadline_terminal
+                    && !is_grpc_web_streaming_terminal
+                    && let (Some(messages), Some(scanner)) =
+                        (this.grpc_messages.as_ref(), this.grpc_scanner.as_mut())
+                    && let Some(data) = frame.data_ref()
+                {
+                    scanner.push(data, messages);
+                }
                 let grpc_status = frame
                     .trailers_ref()
                     .and_then(|trailers| trailers.get("grpc-status"))

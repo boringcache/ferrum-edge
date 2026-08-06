@@ -2262,14 +2262,17 @@ impl Http3ConnectionPool {
                 continue;
             }
             let data = chunk.copy_to_bytes(len);
-            if let (Some(messages), Some(scanner)) = (grpc_messages.as_ref(), grpc_scanner.as_mut())
-            {
-                scanner.push(&data, messages);
-            }
+            let metric_data = grpc_scanner.as_ref().map(|_| data.clone());
             backend_stream
                 .send_data(data)
                 .await
                 .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
+            if let (Some(messages), Some(scanner)) = (grpc_messages.as_ref(), grpc_scanner.as_mut())
+            {
+                if let Some(metric_data) = metric_data.as_ref() {
+                    scanner.push(metric_data, messages);
+                }
+            }
             bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
         // Forward client REQUEST trailers (trailing metadata) the client sent after
@@ -2465,14 +2468,17 @@ impl Http3ConnectionPool {
                 continue;
             }
             let data = chunk.copy_to_bytes(len);
-            if let (Some(messages), Some(scanner)) = (grpc_messages.as_ref(), grpc_scanner.as_mut())
-            {
-                scanner.push(&data, messages);
-            }
+            let metric_data = grpc_scanner.as_ref().map(|_| data.clone());
             backend_stream
                 .send_data(data)
                 .await
                 .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
+            if let (Some(messages), Some(scanner)) = (grpc_messages.as_ref(), grpc_scanner.as_mut())
+            {
+                if let Some(metric_data) = metric_data.as_ref() {
+                    scanner.push(metric_data, messages);
+                }
+            }
             bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
         backend_stream
