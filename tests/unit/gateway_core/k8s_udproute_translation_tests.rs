@@ -945,7 +945,11 @@ fn udp_route_accepts_and_normalizes_gateway_api_max_weight() {
 
     let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
     let (_, upstream) = sole_proxy_and_upstream(&result);
-    let weights: Vec<u32> = upstream.targets.iter().map(|target| target.weight).collect();
+    let weights: Vec<u32> = upstream
+        .targets
+        .iter()
+        .map(|target| target.weight)
+        .collect();
 
     assert_eq!(weights, vec![1, 65_535]);
 }

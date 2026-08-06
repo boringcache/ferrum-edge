@@ -4881,27 +4881,20 @@ fn udp_rule_backends(
 /// Gateway API's public schema accepts values through 1,000,000. Rejecting the
 /// upper part of that range would make a CRD-valid UDPRoute inert. The caller
 /// normalizes the resolved set proportionally before it reaches an Upstream.
-fn udp_backend_weight(
-    object: &K8sObject,
-    backend_ref: &Value,
-) -> Result<u32, K8sTranslateError> {
+fn udp_backend_weight(object: &K8sObject, backend_ref: &Value) -> Result<u32, K8sTranslateError> {
     let Some(value) = backend_ref.get("weight") else {
         return Ok(1);
     };
     let Some(weight) = value.as_u64() else {
         return Err(invalid_resource(
             object,
-            format!(
-                "backendRefs[].weight must be between 0 and {GATEWAY_API_MAX_BACKEND_WEIGHT}"
-            ),
+            format!("backendRefs[].weight must be between 0 and {GATEWAY_API_MAX_BACKEND_WEIGHT}"),
         ));
     };
     if weight > GATEWAY_API_MAX_BACKEND_WEIGHT {
         return Err(invalid_resource(
             object,
-            format!(
-                "backendRefs[].weight must be between 0 and {GATEWAY_API_MAX_BACKEND_WEIGHT}"
-            ),
+            format!("backendRefs[].weight must be between 0 and {GATEWAY_API_MAX_BACKEND_WEIGHT}"),
         ));
     }
     Ok(weight as u32)

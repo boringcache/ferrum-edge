@@ -283,6 +283,20 @@ spec:
 YAML
 }
 
+udp_weighted_backend_patch() {
+  # Merge patch body for the two-leg weighted backendRefs set. Emitted from a
+  # helper (rather than a heredoc opened inside the `kubectl` command
+  # substitution) so the heredoc receiver stays a plain literal `cat`.
+  local weight_a="$1"
+  local weight_b="$2"
+  cat <<JSON
+{"spec":{"rules":[{"backendRefs":[
+  {"name":"blackbox-udp-a","port":${UDP_ECHO_BACKEND_PORT},"weight":${weight_a}},
+  {"name":"blackbox-udp-b","port":${UDP_ECHO_BACKEND_PORT},"weight":${weight_b}}
+]}]}}
+JSON
+}
+
 udp_exchange() {
   local host="$1"
   local port="$2"
@@ -609,13 +623,8 @@ YAML
   # backendRefs is a SET: both non-zero-weight legs must receive traffic. A
   # "first backendRef wins" implementation fails here because blackbox-udp-a
   # is never reached.
-  kubectl -n "$DP_GATEWAY_NAMESPACE" patch udproute blackbox-udp-main --type=merge -p "$(cat <<JSON
-{"spec":{"rules":[{"backendRefs":[
-  {"name":"blackbox-udp-a","port":${UDP_ECHO_BACKEND_PORT},"weight":1},
-  {"name":"blackbox-udp-b","port":${UDP_ECHO_BACKEND_PORT},"weight":1}
-]}]}}
-JSON
-)"
+  kubectl -n "$DP_GATEWAY_NAMESPACE" patch udproute blackbox-udp-main --type=merge \
+    -p "$(udp_weighted_backend_patch 1 1)"
   wait_for_udproute_parent_condition blackbox-udp-main ResolvedRefs True | tee -a "$report"
   wait_for_weighted_udp_distribution "$UDP_BLACKBOX_PORT_MAIN" 24 4 \
     blackbox-udp-a blackbox-udp-b | tee -a "$report"
@@ -623,13 +632,8 @@ JSON
 
   # Weight-only update: dropping a leg to weight 0 removes it from the target
   # set, so the remaining leg must serve every session.
-  kubectl -n "$DP_GATEWAY_NAMESPACE" patch udproute blackbox-udp-main --type=merge -p "$(cat <<JSON
-{"spec":{"rules":[{"backendRefs":[
-  {"name":"blackbox-udp-a","port":${UDP_ECHO_BACKEND_PORT},"weight":1},
-  {"name":"blackbox-udp-b","port":${UDP_ECHO_BACKEND_PORT},"weight":0}
-]}]}}
-JSON
-)"
+  kubectl -n "$DP_GATEWAY_NAMESPACE" patch udproute blackbox-udp-main --type=merge \
+    -p "$(udp_weighted_backend_patch 1 0)"
   wait_for_exclusive_udp_backend "$UDP_BLACKBOX_PORT_MAIN" 12 6 blackbox-udp-a | tee -a "$report"
   echo "UDPRoute weight-only update withdrew the zero-weight leg on :${UDP_BLACKBOX_PORT_MAIN}" >> "$report"
 
