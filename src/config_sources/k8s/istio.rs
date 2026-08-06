@@ -5371,7 +5371,7 @@ pub(crate) fn classify_sidecar_outbound_traffic_policy(spec: &Value) -> SidecarO
     }
     match block.get("mode") {
         None | Some(Value::Null) => fail_closed(SIDECAR_OUTBOUND_POLICY_MODE_OMITTED),
-        Some(Value::String(mode)) => match mode.trim() {
+        Some(Value::String(mode)) => match mode.as_str() {
             "ALLOW_ANY" => SidecarOutboundPolicy {
                 policy: Some(OutboundTrafficPolicy::AllowAny),
                 deferred: None,

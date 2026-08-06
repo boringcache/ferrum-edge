@@ -183,14 +183,14 @@ fn non_object_outbound_traffic_policy_fails_closed() {
 }
 
 #[test]
-fn surrounding_whitespace_on_a_supported_mode_is_tolerated() {
+fn surrounding_whitespace_on_allow_any_fails_closed() {
     let sidecar = translate_one(spec_with_egress_and_policy(Some(
         json!({ "mode": "  ALLOW_ANY  " }),
     )));
     assert_eq!(
         sidecar.outbound_traffic_policy,
-        Some(OutboundTrafficPolicy::AllowAny),
-        "a padded but otherwise exact token is unambiguous and must not fail closed"
+        Some(OutboundTrafficPolicy::RegistryOnly),
+        "a padded ALLOW_ANY token is not an exact Istio enum and must fail closed"
     );
 }
 

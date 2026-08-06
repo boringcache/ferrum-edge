@@ -1483,7 +1483,7 @@ The workload-scoped policy is applied **only** under `FERRUM_MESH_SIDECAR_ENFORC
 | `mode: ALLOW_ANY` | `ALLOW_ANY` for the selected workloads. |
 | `mode: REGISTRY_ONLY` | `REGISTRY_ONLY` for the selected workloads. |
 | Present, `mode` omitted | **`REGISTRY_ONLY`** — the Istio proto zero value of `OutboundTrafficPolicy.Mode`, which is also the conservative reading. Reported in `deferred_fields` so the implicit mode is never silent. |
-| `mode` unrecognized or not a string (`ALOW_ANY`, the numeric proto form, …) | **`REGISTRY_ONLY` (fail closed)** — the intent is ambiguous. The raw value is never echoed into the status. |
+| `mode` unrecognized or not a string (`ALOW_ANY`, a whitespace-padded token, the numeric proto form, …) | **`REGISTRY_ONLY` (fail closed)** — the intent is ambiguous. The raw value is never echoed into the status. |
 | Block is not an object | **`REGISTRY_ONLY` (fail closed)** — malformed shape. |
 | `egressProxy` set | **`REGISTRY_ONLY` (fail closed)**, regardless of the declared `mode`. Ferrum cannot funnel unmatched egress through a named `Destination`; ignoring the field would send traffic the operator scoped to an egress gateway straight out instead. |
 
@@ -1493,7 +1493,7 @@ The resource is **never rejected** over this field. A rejected `Sidecar` is drop
 
 The `Sidecar` `status.ferrum.translation` block reports:
 
-- `outbound_traffic_policy` — `ALLOW_ANY`, `REGISTRY_ONLY`, or `Inherit`. This is always the mode Ferrum **enforces**, so a fail-closed degradation reads `REGISTRY_ONLY`.
+- `outbound_traffic_policy` — the classified workload-scoped outcome: `ALLOW_ANY`, `REGISTRY_ONLY`, or `Inherit`. `Inherit` means the effective mode still comes from the mesh-wide/runtime tier; a fail-closed degradation reads `REGISTRY_ONLY`.
 - `outbound_traffic_policy_enforced` — whether the enforcement gate above is on. A translated-but-inert policy is distinguishable from a live one.
 - `deferred_fields` — the field-specific reason for any fail-closed degradation.
 
