@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::Utc;
-use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, DispatchKind, Proxy, ResolvedPortOverride,
-};
 use ferrum_edge::backend_conn_limit::{
     BackendConnectionLimiter, ReqwestConnectionAdmission, is_backend_connection_limit_error,
+};
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, DispatchKind, Proxy, ResolvedPortOverride,
 };
 use ferrum_edge::config::{EnvConfig, PoolConfig};
 use ferrum_edge::connection_pool::ConnectionPool;

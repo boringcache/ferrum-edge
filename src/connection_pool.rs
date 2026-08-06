@@ -10,11 +10,11 @@
 //! DNS lookups off the hot request path. A shared pool shell in `src/pool/`
 //! handles the DashMap, key-buffer fast path, and idle cleanup.
 
+use crate::backend_conn_limit::ReqwestConnectionAdmission;
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::pool::{GenericPool, PoolManager};
-use crate::backend_conn_limit::ReqwestConnectionAdmission;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
     BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,

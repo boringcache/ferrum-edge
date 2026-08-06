@@ -7022,12 +7022,11 @@ impl ProxyState {
                 pool_shard_amount,
             ),
         );
-        let reqwest_conn_admission = Arc::new(
-            crate::backend_conn_limit::ReqwestConnectionAdmission::new(
+        let reqwest_conn_admission =
+            Arc::new(crate::backend_conn_limit::ReqwestConnectionAdmission::new(
                 backend_conn_limit.clone(),
                 pool_shard_amount,
-            ),
-        );
+            ));
         let grpc_pool = Arc::new(
             GrpcConnectionPool::new_with_svid_generation_and_shared_crls(
                 global_pool_config.clone(),
