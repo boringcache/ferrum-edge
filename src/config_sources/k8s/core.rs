@@ -305,9 +305,7 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
                 .map(|selector| {
                     selector
                         .iter()
-                        .filter_map(|(k, v)| {
-                            v.as_str().map(|value| (k.clone(), value.to_string()))
-                        })
+                        .filter_map(|(k, v)| v.as_str().map(|value| (k.clone(), value.to_string())))
                         .collect()
                 })
                 .unwrap_or_default(),

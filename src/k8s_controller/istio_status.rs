@@ -536,10 +536,8 @@ fn authorization_policy_status(
                             .filter_map(|entry| {
                                 let kind = entry.get("kind")?.as_str()?;
                                 let name = entry.get("name")?.as_str()?;
-                                let group = entry
-                                    .get("group")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("");
+                                let group =
+                                    entry.get("group").and_then(Value::as_str).unwrap_or("");
                                 Some(json!({
                                     "group": group,
                                     "kind": kind,

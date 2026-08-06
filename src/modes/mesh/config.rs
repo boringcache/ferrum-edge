@@ -893,12 +893,12 @@ pub fn policy_target_attachment_applies_to_service(
     service_name: &str,
 ) -> bool {
     match attachment {
-        PolicyTargetAttachment::Service { namespace, name, .. } => {
-            namespace == service_namespace && name == service_name
-        }
-        PolicyTargetAttachment::ServiceEntry { namespace, name, .. } => {
-            namespace == service_namespace && name == service_name
-        }
+        PolicyTargetAttachment::Service {
+            namespace, name, ..
+        } => namespace == service_namespace && name == service_name,
+        PolicyTargetAttachment::ServiceEntry {
+            namespace, name, ..
+        } => namespace == service_namespace && name == service_name,
         PolicyTargetAttachment::Gateway { .. } | PolicyTargetAttachment::GatewayClass { .. } => {
             false
         }

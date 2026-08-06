@@ -467,8 +467,8 @@ fn authz_target_refs_service_attachment_is_preserved() {
             "from": [{"source": {"namespaces": ["evil"]}}]
         }]
     }));
-    let result =
-        translate_k8s_objects(&[service, policy], options()).expect("targetRefs Service translates");
+    let result = translate_k8s_objects(&[service, policy], options())
+        .expect("targetRefs Service translates");
     let mesh = result.config.mesh.expect("mesh");
     match &mesh.mesh_policies[0].scope {
         PolicyScope::TargetRefs { attachments } => match &attachments[0] {
@@ -478,7 +478,10 @@ fn authz_target_refs_service_attachment_is_preserved() {
                 ..
             } => {
                 assert_eq!(name, "reviews");
-                assert_eq!(selector_labels.get("app").map(String::as_str), Some("reviews"));
+                assert_eq!(
+                    selector_labels.get("app").map(String::as_str),
+                    Some("reviews")
+                );
             }
             other => panic!("expected Service attachment, got {other:?}"),
         },
@@ -494,5 +497,8 @@ fn authz_target_refs_service_attachment_is_preserved() {
         options(),
     )
     .expect_err("selector + targetRefs must fail closed");
-    assert!(err.to_string().contains("at most one of selector or targetRefs"));
+    assert!(
+        err.to_string()
+            .contains("at most one of selector or targetRefs")
+    );
 }

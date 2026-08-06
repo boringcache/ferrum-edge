@@ -12,11 +12,12 @@ use crate::modes::mesh::config::{
     MeshRequestAuthentication, MeshRule, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress,
     MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
     MeshTrafficPolicy, MeshTrafficPolicyTls, MeshVirtualServiceCorsPolicy, MetricTagOverride,
-    MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PolicyTargetAttachment, PortPatternAdmission, PrincipalMatch,
-    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch,
-    TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
-    WorkloadSelector, admit_request_match_port_pattern, is_mesh_condition_ip_key,
-    is_supported_mesh_condition_key, mesh_condition_has_values, validate_mesh_condition_ip_block,
+    MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PolicyTargetAttachment,
+    PortPatternAdmission, PrincipalMatch, RequestMatch, Resolution, ServiceEntry,
+    ServiceEntryLocation, ServicePort, SourceNegationMatch, TagOverrideOperation,
+    TelemetryTracingMode, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
+    admit_request_match_port_pattern, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
+    mesh_condition_has_values, validate_mesh_condition_ip_block,
 };
 
 use super::{
@@ -219,10 +220,16 @@ fn resolve_one_authorization_policy_target_ref(
 ) -> Result<PolicyTargetAttachment, K8sTranslateError> {
     let path = format!("targetRefs[{index}]");
     let kind = string_field(entry, "kind").ok_or_else(|| {
-        invalid_resource(object, format!("AuthorizationPolicy {path}.kind is required"))
+        invalid_resource(
+            object,
+            format!("AuthorizationPolicy {path}.kind is required"),
+        )
     })?;
     let name = string_field(entry, "name").ok_or_else(|| {
-        invalid_resource(object, format!("AuthorizationPolicy {path}.name is required"))
+        invalid_resource(
+            object,
+            format!("AuthorizationPolicy {path}.name is required"),
+        )
     })?;
     if name.trim().is_empty() {
         return Err(invalid_resource(
@@ -347,8 +354,7 @@ fn resolve_one_authorization_policy_target_ref(
                 "ServiceEntry",
                 name,
             )?;
-            let Some(selector_labels) =
-                acc.service_entry_selector_labels(&target_namespace, name)
+            let Some(selector_labels) = acc.service_entry_selector_labels(&target_namespace, name)
             else {
                 return Err(invalid_resource(
                     object,
@@ -879,9 +885,9 @@ fn peer_authentication(
     let scope = istio_policy_scope(options, object, selector);
     let selector = match &scope {
         PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
-        PolicyScope::MeshWide
-        | PolicyScope::Namespace { .. }
-        | PolicyScope::TargetRefs { .. } => None,
+        PolicyScope::MeshWide | PolicyScope::Namespace { .. } | PolicyScope::TargetRefs { .. } => {
+            None
+        }
     };
 
     Ok(PeerAuthentication {
@@ -6501,7 +6507,10 @@ mod tests {
         )
         .expect_err("selector + targetRefs must fail closed");
 
-        assert!(err.to_string().contains("at most one of selector or targetRefs"));
+        assert!(
+            err.to_string()
+                .contains("at most one of selector or targetRefs")
+        );
     }
 
     #[test]

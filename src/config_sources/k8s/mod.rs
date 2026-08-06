@@ -1034,9 +1034,7 @@ where
                 .map(|labels| {
                     labels
                         .iter()
-                        .filter_map(|(k, v)| {
-                            v.as_str().map(|value| (k.clone(), value.to_string()))
-                        })
+                        .filter_map(|(k, v)| v.as_str().map(|value| (k.clone(), value.to_string())))
                         .collect::<HashMap<String, String>>()
                 })
                 .unwrap_or_default();
@@ -1070,9 +1068,7 @@ where
     }
 
     for object in &included_objects {
-        if object.kind == "Gateway"
-            && includes_object_namespace(&acc.options, object)
-        {
+        if object.kind == "Gateway" && includes_object_namespace(&acc.options, object) {
             // Collect waypoint bindings before Istio AuthorizationPolicy
             // translation so targetRefs → Gateway resolution is order-independent.
             if gateway_api::is_waypoint_gateway(object) {

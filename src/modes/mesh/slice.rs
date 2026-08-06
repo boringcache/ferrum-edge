@@ -1314,11 +1314,11 @@ impl MeshSlice {
                 ) || (waypoint.is_some()
                     && matches!(policy.scope, PolicyScope::TargetRefs { .. }));
                 let candidate_match = (!ambient_udp_policy_candidates.is_empty()
-                    && ambient_udp_policy_candidates
-                        .iter()
-                        .any(|(candidate_namespace, labels)| {
+                    && ambient_udp_policy_candidates.iter().any(
+                        |(candidate_namespace, labels)| {
                             policy_scope_applies_to_workload(policy, candidate_namespace, labels)
-                        }))
+                        },
+                    ))
                     || policy_candidate_labels.iter().any(|labels| {
                         policy_scope_applies_to_workload(policy, effective_namespace, *labels)
                     });
@@ -1718,22 +1718,20 @@ fn narrow_for_service_waypoint(
             .into_iter()
             .filter(|policy| {
                 match &policy.scope {
-                    PolicyScope::TargetRefs { attachments } => attachments.iter().any(|attachment| {
-                        match attachment {
+                    PolicyScope::TargetRefs { attachments } => {
+                        attachments.iter().any(|attachment| match attachment {
                             PolicyTargetAttachment::Gateway { namespace, name } => {
                                 name == waypoint_name && namespace == waypoint_namespace
                             }
                             PolicyTargetAttachment::GatewayClass { .. } => true,
                             PolicyTargetAttachment::Service { .. }
-                            | PolicyTargetAttachment::ServiceEntry { .. } => bound
-                                .iter()
-                                .any(|(ns, svc)| {
-                                    policy_target_attachment_applies_to_service(
-                                        attachment, ns, svc,
-                                    )
-                                }),
-                        }
-                    }),
+                            | PolicyTargetAttachment::ServiceEntry { .. } => {
+                                bound.iter().any(|(ns, svc)| {
+                                    policy_target_attachment_applies_to_service(attachment, ns, svc)
+                                })
+                            }
+                        })
+                    }
                     // Selector / namespace / mesh-wide policies stay; Istio
                     // ambient ignores selector policies at waypoints, but
                     // Ferrum continues to evaluate them for Sidecar-parity
