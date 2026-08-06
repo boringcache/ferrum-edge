@@ -2367,13 +2367,21 @@ fn h3_pooled_connection_does_not_park_the_max_connections_slot() {
         .split("async fn create_connection(")
         .nth(1)
         .expect("create_connection must exist");
-    let spawn = create
+    let create = create
+        .split("async fn create_connection_to_target(")
+        .next()
+        .expect("create_connection must precede create_connection_to_target");
+    let driver_task = create
         .split("tokio::spawn(")
         .nth(1)
-        .expect("create_connection must spawn the h3 connection driver");
-    let spawn_head: String = spawn.chars().take(600).collect();
+        .and_then(|spawn| {
+            spawn
+                .split_once("Ok(H3PooledConnection::new")
+                .map(|(driver_task, _)| driver_task)
+        })
+        .expect("create_connection must spawn the h3 driver before returning its pooled handle");
     assert!(
-        spawn_head.contains("conn_slot"),
+        driver_task.contains("conn_slot"),
         "the spawned h3 driver task must own the maxConnections slot so it \
          retires exactly when poll_close completes"
     );
