@@ -38,7 +38,8 @@ use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, MAX_RETRIES, MAX_TARGET_WEIGHT, MAX_TIMEOUT_MS,
     PluginConfig, Proxy, RetryConfig, validate_backend_tls_san_allow_list_entry,
-    validate_backend_tls_sni,
+    validate_backend_tls_sni, validate_system_trust_roots_skip_verify_pairing,
+    validate_tls_material_source_field,
 };
 use crate::plugins::mesh::workload_metrics::{
     is_recognized_unsupported_istio_metric_family, validate_istio_telemetry_config,
@@ -1962,6 +1963,24 @@ fn translate_client_tls_settings(
         .get("insecureSkipVerify")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+
+    if let Some(ca_certificates) = ca_certificates.as_deref()
+        && let Err(error) = validate_tls_material_source_field(
+            "trafficPolicy.tls.caCertificates",
+            ca_certificates,
+            crate::tls::source::MaterialKind::CaBundle,
+        )
+    {
+        return Err(invalid_resource(object, error));
+    }
+    if let Some(error) = validate_system_trust_roots_skip_verify_pairing(
+        "trafficPolicy.tls.caCertificates",
+        "trafficPolicy.tls.insecureSkipVerify",
+        ca_certificates.as_deref(),
+        insecure_skip_verify,
+    ) {
+        return Err(invalid_resource(object, error));
+    }
 
     match mode {
         MtlsMode::IstioMutual => {
@@ -17023,6 +17042,57 @@ extensionProviders:
             .as_ref()
             .expect("tls block");
         assert!(tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn destination_rule_rejects_system_roots_with_insecure_skip_verify() {
+        let error = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "caCertificates": "system://",
+                            "insecureSkipVerify": true
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("system roots with verification disabled must fail translation");
+
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("caCertificates"), "{diagnostic}");
+        assert!(diagnostic.contains("insecureSkipVerify"), "{diagnostic}");
+        assert!(diagnostic.contains("system://"), "{diagnostic}");
+    }
+
+    #[test]
+    fn destination_rule_rejects_noncanonical_system_roots_source() {
+        let error = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "caCertificates": "system://corp-ca.pem"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("a system trust source with a path suffix must fail translation");
+
+        assert!(
+            error.to_string().contains("must be exactly 'system://'"),
+            "{error}"
+        );
     }
 
     #[test]

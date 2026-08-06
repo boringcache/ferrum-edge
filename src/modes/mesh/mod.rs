@@ -8494,6 +8494,26 @@ fn apply_traffic_policy_tls_to_backend_config(
     identity: &str,
     presents_dynamic_svid: bool,
 ) -> Result<(), anyhow::Error> {
+    if let Some(ca_certificates) = tls.ca_certificates.as_deref()
+        && let Err(error) = crate::config::types::validate_tls_material_source_field(
+            "DestinationRule trafficPolicy.tls.ca_certificates",
+            ca_certificates,
+            crate::tls::source::MaterialKind::CaBundle,
+        )
+    {
+        return Err(anyhow::anyhow!(error));
+    }
+    if let Some(error) =
+        crate::config::types::validate_system_trust_roots_skip_verify_pairing(
+            "DestinationRule trafficPolicy.tls.ca_certificates",
+            "DestinationRule trafficPolicy.tls.insecure_skip_verify",
+            tls.ca_certificates.as_deref(),
+            tls.insecure_skip_verify,
+        )
+    {
+        return Err(anyhow::anyhow!(error));
+    }
+
     match tls.mode {
         MtlsMode::Disable => {
             slot.client_cert_path = None;
@@ -21730,6 +21750,31 @@ mod tests {
             .expect("traffic policy applies");
 
         assert!(!upstream.backend_tls_verify_server_cert);
+    }
+
+    #[test]
+    fn dr_tls_system_roots_with_insecure_skip_verify_fails_cold_apply() {
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::Simple,
+                ca_certificates: Some("system://".to_string()),
+                insecure_skip_verify: true,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+
+        let error = apply_traffic_policy_to_upstream(
+            &mut upstream,
+            &policy,
+            &test_mesh_runtime_config(),
+        )
+        .expect_err("cold apply must defend against an unvalidated contradictory trust policy");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("insecure_skip_verify"), "{diagnostic}");
+        assert!(diagnostic.contains("system://"), "{diagnostic}");
     }
 
     #[test]

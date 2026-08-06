@@ -52,8 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported in the TLS material inventory, is rejected on client cert/key fields,
   is rejected with any path or query options, and is rejected alongside
   `backend_tls_verify_server_cert: false` on every config surface that builds a
-  backend TLS identity — Proxy, Upstream, and the `mesh_route_dispatch`
-  route-local destination override.
+  backend TLS identity — Proxy, Upstream, the `mesh_route_dispatch`
+  route-local destination override, and Istio `DestinationRule` TLS overlays.
 - A Gateway API route rule whose `backendRefs` mix `BackendTLSPolicy`-covered
   and uncovered backends now fails closed with a field-specific sanitized
   warning and an HTTP 500 fault abort. Ferrum folds a rule's backends into one
@@ -84,7 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only on its TCP ports. A Service declaring more than 64 ports cannot have its
   port transport proven and is rejected fail closed. Condition messages name the
   transport from a fixed set and never echo the raw cluster-supplied `protocol`
-  string.
+  string. A Service-wide policy
+  that is fully shadowed by section-specific winners now reports
+  `Accepted=False, reason=Conflicted` instead of claiming success while governing
+  no port; it remains accepted when it still wins at least one eligible port.
 - Health probes now fail closed on **any** explicitly configured backend TLS
   material that cannot be used, in both verified and no-verify modes and on both
   the HTTP and gRPC probe paths. Previously a configured CA was only enforced

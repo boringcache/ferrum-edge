@@ -932,6 +932,60 @@ fn backend_tls_policy_status_marks_precedence_loser_conflicted() {
 }
 
 #[test]
+fn backend_tls_policy_status_marks_fully_shadowed_service_policy_conflicted() {
+    let objects = vec![
+        multi_port_service("api"),
+        sectioned_policy("api-http", "api", "http", "http.example.com"),
+        sectioned_policy("api-https", "api", "https", "https.example.com"),
+        backend_tls_policy_system("api-any", "api"),
+    ];
+
+    let wildcard = policy_status_update(&objects, "api-any").expect("wildcard status update");
+    let wildcard_ancestors = ferrum_ancestors(&wildcard);
+    let accepted = condition(&wildcard_ancestors[0], "Accepted");
+    assert_eq!(
+        accepted.get("status").and_then(Value::as_str),
+        Some("False")
+    );
+    assert_eq!(
+        accepted.get("reason").and_then(Value::as_str),
+        Some("Conflicted"),
+        "a Service-wide policy that loses every eligible port governs nothing"
+    );
+
+    for winner in ["api-http", "api-https"] {
+        let update = policy_status_update(&objects, winner).expect("section status update");
+        let ancestors = ferrum_ancestors(&update);
+        assert_eq!(
+            condition(&ancestors[0], "Accepted")
+                .get("status")
+                .and_then(Value::as_str),
+            Some("True"),
+            "the section-specific winner {winner} must stay accepted"
+        );
+    }
+}
+
+#[test]
+fn backend_tls_policy_status_keeps_partially_effective_service_policy_accepted() {
+    let objects = vec![
+        multi_port_service("api"),
+        sectioned_policy("api-https", "api", "https", "https.example.com"),
+        backend_tls_policy_system("api-any", "api"),
+    ];
+
+    let wildcard = policy_status_update(&objects, "api-any").expect("wildcard status update");
+    let wildcard_ancestors = ferrum_ancestors(&wildcard);
+    assert_eq!(
+        condition(&wildcard_ancestors[0], "Accepted")
+            .get("status")
+            .and_then(Value::as_str),
+        Some("True"),
+        "the Service-wide policy still governs the unclaimed http port"
+    );
+}
+
+#[test]
 fn backend_tls_policy_status_reports_invalid_target_reference_kind() {
     let mut policy = backend_tls_policy_system("bad-target", "reviews");
     policy.spec["targetRefs"][0]["kind"] = serde_json::json!("Deployment");

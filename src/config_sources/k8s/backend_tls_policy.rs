@@ -480,15 +480,20 @@ impl BackendTlsPolicyIndex {
             .push(entry);
     }
 
-    /// Policies that lose Gateway API precedence for the same Service section.
+    /// Policies that lose Gateway API precedence everywhere they could apply.
     ///
     /// Runtime lookup already selects the oldest policy, then the lexical
     /// `{namespace}/{name}` winner. Status must make the same decision after the
     /// complete snapshot is indexed; deciding while collecting would be input
     /// order dependent because an older policy may appear later in the list.
-    pub(super) fn conflicted_policy_ids(&self) -> HashSet<(String, String)> {
+    /// A Service-wide policy is also a loser when section-scoped policies own
+    /// every eligible port, but stays accepted if it still wins any one port.
+    pub(super) fn conflicted_policy_ids(
+        &self,
+        service_port_specs: &HashMap<String, HashMap<String, ServicePortIndex>>,
+    ) -> HashSet<(String, String)> {
         let mut conflicted = HashSet::new();
-        for entries in self.by_service.values() {
+        for ((service_namespace, service_name), entries) in &self.by_service {
             for candidate in entries {
                 let candidate_id = (&candidate.policy_namespace, &candidate.policy_name);
                 let loses = entries.iter().any(|other| {
@@ -498,6 +503,46 @@ impl BackendTlsPolicyIndex {
                         && compare_policy_precedence(other, candidate) == Ordering::Less
                 });
                 if loses {
+                    conflicted.insert((
+                        candidate.policy_namespace.clone(),
+                        candidate.policy_name.clone(),
+                    ));
+                    continue;
+                }
+
+                // A Service-wide policy is also fully conflicted when a more
+                // specific section policy wins on EVERY Service port the
+                // wildcard could govern. Runtime lookup already prefers those
+                // section policies; reporting Accepted=True for the wildcard
+                // after it has no effective port would make status disagree
+                // with the data plane. Keep it accepted when it still wins on
+                // even one eligible port.
+                let Some(port_index) = service_port_specs
+                    .get(service_namespace)
+                    .and_then(|services| services.get(service_name))
+                else {
+                    continue;
+                };
+                let mut governs_any_port = false;
+                let mut wins_any_port = false;
+                for port in &port_index.ports {
+                    if !candidate.governs(Some(port_index), Some(port.port)) {
+                        continue;
+                    }
+                    governs_any_port = true;
+                    let winner = entries
+                        .iter()
+                        .filter(|entry| entry.governs(Some(port_index), Some(port.port)))
+                        .min_by(|left, right| compare_policy_for_lookup(left, right));
+                    if winner.is_some_and(|winner| {
+                        winner.policy_namespace == candidate.policy_namespace
+                            && winner.policy_name == candidate.policy_name
+                    }) {
+                        wins_any_port = true;
+                        break;
+                    }
+                }
+                if governs_any_port && !wins_any_port {
                     conflicted.insert((
                         candidate.policy_namespace.clone(),
                         candidate.policy_name.clone(),
@@ -1241,6 +1286,22 @@ fn compare_policy_precedence(
     )
 }
 
+fn compare_policy_for_lookup(
+    left: &IndexedBackendTlsPolicy,
+    right: &IndexedBackendTlsPolicy,
+) -> Ordering {
+    // A section-scoped policy is more specific than a Service-wide policy for
+    // the port it names. Equal-specificity candidates use the Gateway API
+    // oldest-creationTimestamp, then lexical resource-identity precedence.
+    let left_specific = left.section_name.is_some();
+    let right_specific = right.section_name.is_some();
+    match (left_specific, right_specific) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => compare_policy_precedence(left, right),
+    }
+}
+
 pub(super) fn lookup_for_service(
     acc: &K8sAccumulator,
     service_namespace: &str,
@@ -1278,16 +1339,7 @@ pub(super) fn lookup_for_service(
         return BackendTlsPolicyLookup::None;
     }
 
-    matching.sort_by(|left, right| {
-        // Prefer section-scoped policies over wildcard (no sectionName).
-        let left_specific = left.section_name.is_some();
-        let right_specific = right.section_name.is_some();
-        match (left_specific, right_specific) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            _ => compare_policy_precedence(left, right),
-        }
-    });
+    matching.sort_by(|left, right| compare_policy_for_lookup(left, right));
 
     let winner = matching[0];
     match &winner.record {

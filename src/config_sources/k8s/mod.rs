@@ -971,7 +971,9 @@ impl K8sAccumulator {
         // BackendTLSPolicy precedence depends on the complete snapshot. Mark
         // losers only after every policy has been indexed so status is stable
         // under input reordering and matches runtime lookup's winner.
-        let conflicted_policies = self.backend_tls_policies.conflicted_policy_ids();
+        let conflicted_policies = self
+            .backend_tls_policies
+            .conflicted_policy_ids(&self.service_port_specs);
         for status in &mut self.backend_tls_policy_statuses {
             if status.accepted
                 && conflicted_policies
@@ -979,9 +981,9 @@ impl K8sAccumulator {
             {
                 status.accepted = false;
                 status.accepted_reason = "Conflicted".to_string();
-                status.accepted_message =
-                    "An older BackendTLSPolicy takes precedence for the same Service section"
-                        .to_string();
+                status.accepted_message = "An older or more specific BackendTLSPolicy takes \
+                    precedence for every Service section this policy could govern"
+                    .to_string();
             }
         }
         gateway_api::finalize_dispatch_plugin_precedence(&mut self.config.plugin_configs);

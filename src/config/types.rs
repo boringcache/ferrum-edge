@@ -4925,7 +4925,7 @@ fn valid_hash_on_cookie_domain(domain: &str) -> bool {
         })
 }
 
-fn validate_tls_material_source_field(
+pub(crate) fn validate_tls_material_source_field(
     field_name: &str,
     value: &str,
     kind: crate::tls::source::MaterialKind,
@@ -4983,6 +4983,26 @@ pub(crate) fn validate_system_trust_roots_verify_pairing(
     if selects_system && !verify_server_cert {
         return Some(format!(
             "{verify_field} cannot be false when {ca_field} is '{}' — the system trust-roots source requires server certificate verification",
+            crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
+        ));
+    }
+    None
+}
+
+/// Reject an explicit system-trust-roots selection paired with Istio's
+/// `insecureSkipVerify` opt-out. This is the same trust invariant as
+/// [`validate_system_trust_roots_verify_pairing`], expressed in the polarity
+/// used by `DestinationRule.trafficPolicy.tls`.
+pub(crate) fn validate_system_trust_roots_skip_verify_pairing(
+    ca_field: &str,
+    skip_verify_field: &str,
+    ca_value: Option<&str>,
+    insecure_skip_verify: bool,
+) -> Option<String> {
+    let selects_system = ca_value.is_some_and(crate::tls::source::is_system_trust_roots_source);
+    if selects_system && insecure_skip_verify {
+        return Some(format!(
+            "{skip_verify_field} cannot be true when {ca_field} is '{}' — the system trust-roots source requires server certificate verification",
             crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
         ));
     }
