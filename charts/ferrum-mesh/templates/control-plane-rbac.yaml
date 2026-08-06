@@ -18,12 +18,14 @@ rules:
       - tcproutes
       - udproutes
       - referencegrants
+      - backendtlspolicies
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources:
       - namespaces
       - services
       - secrets
+      - configmaps
     verbs: ["get", "list", "watch"]
   - apiGroups: ["discovery.k8s.io"]
     resources:
@@ -38,6 +40,10 @@ rules:
       - tlsroutes/status
       - tcproutes/status
       - udproutes/status
+      # BackendTLSPolicy status is a Gateway API PolicyStatus
+      # (`status.ancestors[]`). The writer reads live status first so
+      # third-party controllers' ancestors are preserved.
+      - backendtlspolicies/status
     # The status writer reads live status before merge-patching so it can
     # preserve non-Ferrum conditions. Newer kube-rs SSA paths may fall
     # back to `update status` after a 409 conflict, and the Gateway API

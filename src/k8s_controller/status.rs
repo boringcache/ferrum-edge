@@ -8,15 +8,19 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::config::types::GatewayConfig;
+use crate::config_sources::k8s::backend_tls_policy::{
+    MAX_POLICY_ANCESTORS, policy_status_ancestor_capacity, policy_status_ancestor_services,
+};
 use crate::config_sources::k8s::{
-    GatewayApiAllowedRoutesNamespaces, GatewayApiMaterializedRouteParent, GatewayApiRouteConflict,
-    GatewayApiRouteConflictKey, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation,
-    K8sTranslationOptions, UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers,
-    backend_lb_policy_status, gateway_api_route_conflict_keys_with_acc,
-    gateway_api_status_conflict_context, merge_backend_lb_policy_status,
-    namespace_selector_matches, parse_gateway_listener_allowed_route_namespaces,
-    parse_reference_grant_permissions, secret_object_is_valid_tls_certificate,
-    translate_k8s_objects_collecting_skips, validate_gateway_listener_allowed_routes,
+    GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus,
+    GatewayApiMaterializedRouteParent, GatewayApiRouteConflict, GatewayApiRouteConflictKey,
+    K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
+    UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers, backend_lb_policy_status,
+    gateway_api_route_conflict_keys_with_acc, gateway_api_status_conflict_context,
+    merge_backend_lb_policy_status, namespace_selector_matches,
+    parse_gateway_listener_allowed_route_namespaces, parse_reference_grant_permissions,
+    secret_object_is_valid_tls_certificate, translate_k8s_objects_collecting_skips,
+    validate_gateway_listener_allowed_routes,
 };
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
@@ -98,7 +102,12 @@ impl GatewayApiStatusWriter {
             let kind = update.kind.clone();
             let namespace = update.namespace.clone();
             Some(async move {
-                let result = if route_status_kind(&update.kind) {
+                let result = if route_status_kind(&update.kind) || policy_status_kind(&update.kind)
+                {
+                    // `status.parents` / `status.ancestors` are atomic arrays in
+                    // the upstream CRDs: they cannot be split by server-side
+                    // apply ownership, so both follow the Gateway API
+                    // read-modify-write mandate with a resourceVersion guard.
                     patch_route_status_with_retry(&api, &update).await
                 } else {
                     patch_gateway_status_with_apply(&api, &update).await
@@ -178,8 +187,11 @@ async fn patch_route_status_with_retry(
             );
             return Ok(());
         };
-        let patch =
-            route_status_merge_patch_for_update(update, live.data.get("status"), resource_version);
+        let patch = if policy_status_kind(&update.kind) {
+            policy_status_merge_patch_for_update(update, live.data.get("status"), resource_version)
+        } else {
+            route_status_merge_patch_for_update(update, live.data.get("status"), resource_version)
+        };
         let params = route_status_patch_params();
         match api
             .patch_status(&update.name, &params, &Patch::Merge(&patch))
@@ -215,6 +227,12 @@ fn route_status_kind(kind: &str) -> bool {
         kind,
         "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" | "UDPRoute"
     )
+}
+
+/// Kinds whose status is a Gateway API `PolicyStatus` (`status.ancestors[]`)
+/// rather than a `RouteStatus` (`status.parents[]`).
+fn policy_status_kind(kind: &str) -> bool {
+    matches!(kind, "BackendTLSPolicy")
 }
 
 fn kube_error_is_conflict(error: &kube::Error) -> bool {
@@ -408,10 +426,23 @@ struct GatewayApiStatusIndexes<'a> {
     reference_grant_permissions: ReferenceGrantPermissionIndex<'a>,
     has_any_service: bool,
     conflicts_by_loser: HashMap<K8sResourceKey, Vec<&'a GatewayApiRouteConflict>>,
+    /// Backend Services `(namespace, name)` that a managed Gateway actually
+    /// carries traffic to.
+    ///
+    /// This scopes Ferrum's `BackendTLSPolicy` status responsibility. Membership
+    /// requires a route that **materialized** on a parentRef targeting a managed
+    /// Gateway, not merely a route that names one: a parentRef rejected by the
+    /// Gateway's `allowedRoutes`, or one that produced no live configuration,
+    /// must not make Ferrum claim the policy is effective anywhere.
+    effective_backend_services: HashSet<(&'a str, &'a str)>,
 }
 
 impl<'a> GatewayApiStatusIndexes<'a> {
-    fn build(objects: &'a [K8sObject], route_conflicts: &'a [GatewayApiRouteConflict]) -> Self {
+    fn build(
+        objects: &'a [K8sObject],
+        route_conflicts: &'a [GatewayApiRouteConflict],
+        materialized_route_parents: &HashSet<GatewayApiMaterializedRouteParent>,
+    ) -> Self {
         let mut gateway_classes_by_name = HashMap::new();
         let mut gateways_by_ns_name = HashMap::new();
         let mut secrets_by_ns_name = HashMap::new();
@@ -496,6 +527,30 @@ impl<'a> GatewayApiStatusIndexes<'a> {
                 .push(conflict);
         }
 
+        // Backend Services a managed Gateway effectively routes to. A route
+        // only counts through a parentRef the translator actually materialized,
+        // so a parentRef the Gateway's listeners rejected — or one that emitted
+        // no configuration — never widens Ferrum's policy-status scope.
+        let mut effective_backend_services: HashSet<(&str, &str)> = HashSet::new();
+        for object in objects {
+            if !matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute") {
+                continue;
+            }
+            let route_key = K8sResourceKey::from_object(object);
+            let attached = route_parent_refs_borrowed(object).iter().any(|parent_ref| {
+                parent_ref_gateway_target(object, parent_ref)
+                    .is_some_and(|target| managed_gateways.contains(&target))
+                    && materialized_route_parents.contains(&GatewayApiMaterializedRouteParent {
+                        route: route_key.clone(),
+                        parent_ref: route_parent_ref_key(object, parent_ref),
+                    })
+            });
+            if !attached {
+                continue;
+            }
+            effective_backend_services.extend(route_backend_service_targets(object));
+        }
+
         Self {
             gateways_by_ns_name,
             managed_gateways,
@@ -506,8 +561,46 @@ impl<'a> GatewayApiStatusIndexes<'a> {
             reference_grant_permissions,
             has_any_service,
             conflicts_by_loser,
+            effective_backend_services,
         }
     }
+}
+
+/// Backend Service `(namespace, name)` targets named by an HTTP-family route.
+///
+/// Mirrors [`route_unresolved_backend_ref_reason`]'s traversal: core-group
+/// `Service` kind only, zero-weight refs skipped (they receive no traffic, so a
+/// policy on them is not effective for this Gateway).
+fn route_backend_service_targets(route: &K8sObject) -> Vec<(&str, &str)> {
+    route
+        .spec
+        .get("rules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| rule.get("backendRefs").and_then(Value::as_array))
+        .flatten()
+        .filter(|backend_ref| backend_ref.get("weight").and_then(Value::as_u64) != Some(0))
+        .filter(|backend_ref| {
+            let group = backend_ref
+                .get("group")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let kind = backend_ref
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("Service");
+            group.is_empty() && kind == "Service"
+        })
+        .filter_map(|backend_ref| {
+            let name = backend_ref.get("name").and_then(Value::as_str)?;
+            let namespace = backend_ref
+                .get("namespace")
+                .and_then(Value::as_str)
+                .unwrap_or(route.metadata.namespace.as_str());
+            Some((namespace, name))
+        })
+        .collect()
 }
 
 fn gateway_is_managed_by_ferrum_indexed(
@@ -563,7 +656,6 @@ pub fn plan_gateway_api_status_updates_budgeted(
     translation_reuse: Option<&StatusTranslationReuse>,
     budget: StatusPlanBudget,
 ) -> GatewayApiStatusPlanOutcome {
-    let indexes = GatewayApiStatusIndexes::build(objects, route_conflicts);
     let conflict_context = gateway_api_status_conflict_context(objects, options.clone());
     let backend_lb_conflict_losers = backend_lb_policy_conflict_losers(objects, &options);
 
@@ -585,6 +677,14 @@ pub fn plan_gateway_api_status_updates_budgeted(
             &owned_reuse
         }
     };
+
+    // Built after translation: policy-status scoping needs the materialized
+    // route→parentRef records, which only exist once translation has run.
+    let indexes = GatewayApiStatusIndexes::build(
+        objects,
+        route_conflicts,
+        &reuse.translation.materialized_route_parents,
+    );
 
     let mut eligible: Vec<&K8sObject> = objects
         .iter()
@@ -707,6 +807,7 @@ fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_
             ctx.route_conflicts,
             ctx.route_keys,
         ),
+        "BackendTLSPolicy" => backend_tls_policy_status(object, ctx.translation_result),
         "BackendLBPolicy" | "XBackendTrafficPolicy" => {
             let conflicted = ctx
                 .backend_lb_conflict_losers
@@ -715,6 +816,183 @@ fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_
         }
         _ => Value::Object(Default::default()),
     }
+}
+
+/// Desired `status.ancestors` for one `BackendTLSPolicy`.
+///
+/// Ferrum's ancestor is the **targeted Service**, not the managed Gateways that
+/// route to it. See `backend_tls_policy::policy_status_ancestor_services` for
+/// why that is exact here: nothing on the overlay or verdict path takes a
+/// Gateway as input, so the conditions cannot vary per Gateway. It also bounds
+/// Ferrum's own contribution at one entry, so no number of Gateways can push
+/// `status.ancestors` toward the MaxItems=16 ceiling.
+///
+/// The remaining way to reach the ceiling is third-party controllers filling
+/// it. Gateway API forbids adding an entry then, so Ferrum publishes none — and
+/// translation independently refuses the policy through the shared
+/// `backend_tls_policy::policy_status_ancestors_representable` predicate, so
+/// behaviour and status stay in agreement instead of the policy silently
+/// governing traffic it cannot report.
+fn backend_tls_policy_status(
+    object: &K8sObject,
+    result: Result<&K8sTranslation, &K8sTranslateError>,
+) -> Value {
+    let policy_key = K8sResourceKey::from_object(object);
+    let outcome = match result {
+        Ok(translation) => translation
+            .backend_tls_policy_statuses
+            .iter()
+            .find(|entry| entry.policy == policy_key),
+        Err(_) => None,
+    };
+
+    let ancestors_set = policy_status_ancestor_services(object);
+    let verdict = policy_condition_verdict(result, outcome);
+
+    let existing_ancestors = object.status.get("ancestors");
+    let mut ancestors = retained_non_ferrum_status_entries(&object.status, "ancestors");
+    // Capacity is measured over the retained third-party entries only, exactly
+    // as the translator measures it. All-or-nothing: a partial write would be
+    // the silent truncation the spec forbids.
+    let representable = ancestors_set.len() <= policy_status_ancestor_capacity(&object.status);
+    debug_assert_eq!(
+        policy_status_ancestor_capacity(&object.status),
+        MAX_POLICY_ANCESTORS.saturating_sub(ancestors.len()),
+        "policy ancestor capacity must be measured over the same retained entries"
+    );
+    if representable {
+        for (service_namespace, service_name) in ancestors_set {
+            let ancestor_ref = json!({
+                "group": "",
+                "kind": "Service",
+                "namespace": service_namespace,
+                "name": service_name,
+            });
+            let existing_conditions =
+                existing_ancestor_conditions(existing_ancestors, object, &ancestor_ref);
+            let conditions = vec![
+                condition_at(
+                    object,
+                    existing_conditions,
+                    "Accepted",
+                    verdict.accepted,
+                    &verdict.accepted_reason,
+                    &verdict.accepted_message,
+                ),
+                condition_at(
+                    object,
+                    existing_conditions,
+                    "ResolvedRefs",
+                    verdict.resolved_refs,
+                    &verdict.resolved_refs_reason,
+                    &verdict.resolved_refs_message,
+                ),
+            ];
+            let conditions = merge_condition_entries(existing_conditions, conditions);
+            ancestors.push(json!({
+                "ancestorRef": ancestor_ref,
+                "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
+                "conditions": conditions,
+            }));
+        }
+    }
+
+    let mut status = object.status.clone();
+    ensure_status_object(&mut status).insert("ancestors".to_string(), Value::Array(ancestors));
+    status
+}
+
+/// The two Ferrum-authored policy conditions for one `BackendTLSPolicy`.
+struct PolicyConditionVerdict {
+    accepted: bool,
+    accepted_reason: String,
+    accepted_message: String,
+    resolved_refs: bool,
+    resolved_refs_reason: String,
+    resolved_refs_message: String,
+}
+
+const POLICY_REFS_OK: &str = "All BackendTLSPolicy references accepted by Ferrum";
+
+fn policy_condition_verdict(
+    result: Result<&K8sTranslation, &K8sTranslateError>,
+    outcome: Option<&GatewayApiBackendTlsPolicyStatus>,
+) -> PolicyConditionVerdict {
+    match (result, outcome) {
+        (Err(error), _) => {
+            let message = format!("Ferrum rejected this BackendTLSPolicy: {error}");
+            PolicyConditionVerdict {
+                accepted: false,
+                accepted_reason: "Invalid".to_string(),
+                accepted_message: message.clone(),
+                resolved_refs: false,
+                resolved_refs_reason: "Invalid".to_string(),
+                resolved_refs_message: message,
+            }
+        }
+        (Ok(_), Some(outcome)) => PolicyConditionVerdict {
+            accepted: outcome.accepted,
+            accepted_reason: outcome.accepted_reason.clone(),
+            accepted_message: outcome.accepted_message.clone(),
+            resolved_refs: outcome.resolved_refs,
+            resolved_refs_reason: outcome.resolved_refs_reason.clone(),
+            resolved_refs_message: outcome.resolved_refs_message.clone(),
+        },
+        // The snapshot translated, but this policy produced no outcome — it was
+        // filtered out of the translated configuration scope. Report it as not
+        // accepted rather than silently claiming success.
+        (Ok(_), None) => PolicyConditionVerdict {
+            accepted: false,
+            accepted_reason: "Invalid".to_string(),
+            accepted_message: NOT_EVALUATED_MESSAGE.to_string(),
+            resolved_refs: true,
+            resolved_refs_reason: "ResolvedRefs".to_string(),
+            resolved_refs_message: POLICY_REFS_OK.to_string(),
+        },
+    }
+}
+
+const NOT_EVALUATED_MESSAGE: &str =
+    "Ferrum did not evaluate this BackendTLSPolicy in the translated configuration scope";
+
+/// Whether a managed Gateway effectively carries traffic to this Service.
+///
+/// Deliberately a scan rather than a hash lookup: the set members borrow the
+/// snapshot, while a caller's Service name may borrow the translation instead,
+/// and the two lifetimes are unrelated. The set holds one entry per distinct
+/// routed backend Service and this runs only per policy target inside the
+/// already-budgeted status window.
+fn service_is_effectively_routed(
+    indexes: &GatewayApiStatusIndexes<'_>,
+    namespace: &str,
+    name: &str,
+) -> bool {
+    indexes
+        .effective_backend_services
+        .iter()
+        .any(|(entry_namespace, entry_name)| *entry_namespace == namespace && *entry_name == name)
+}
+
+fn existing_ancestor_conditions<'a>(
+    existing_ancestors: Option<&'a Value>,
+    object: &K8sObject,
+    ancestor_ref: &Value,
+) -> Option<&'a [Value]> {
+    let key = route_parent_ref_key(object, ancestor_ref);
+    existing_ancestors
+        .and_then(Value::as_array)
+        .and_then(|ancestors| {
+            ancestors.iter().find(|ancestor| {
+                ancestor.get("controllerName").and_then(Value::as_str)
+                    == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+                    && ancestor.get("ancestorRef").is_some_and(|existing_ref| {
+                        route_parent_ref_key(object, existing_ref) == key
+                    })
+            })
+        })
+        .and_then(|ancestor| ancestor.get("conditions"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
 }
 
 fn gateway_class_status(object: &K8sObject) -> Value {
@@ -1971,6 +2249,112 @@ fn route_status_merge_patch_for_update(
     })
 }
 
+/// Merge patch for a Gateway API `PolicyStatus` (`status.ancestors[]`).
+///
+/// Same contract as [`route_status_merge_patch_for_update`], one array over:
+/// non-Ferrum ancestors written by third-party controllers are preserved from
+/// the freshly-read live status, Ferrum's own ancestors are replaced, and the
+/// write is guarded by `metadata.resourceVersion` so a concurrent third-party
+/// write is retried rather than clobbered.
+fn policy_status_merge_patch_for_update(
+    update: &GatewayApiStatusUpdate,
+    live_status: Option<&Value>,
+    resource_version: &str,
+) -> Value {
+    let desired_ancestors: Vec<Value> = ferrum_status_entries(&update.status, "ancestors")
+        .into_iter()
+        .map(|ancestor| {
+            preserve_live_ancestor_condition_transition_times(update, ancestor, live_status)
+        })
+        .collect();
+    let ancestors = match live_status {
+        Some(status) => {
+            let mut retained = retained_non_ferrum_status_entries(status, "ancestors");
+            let available = MAX_POLICY_ANCESTORS.saturating_sub(retained.len());
+            retained.extend(desired_ancestors.into_iter().take(available));
+            retained
+        }
+        None => desired_ancestors
+            .into_iter()
+            .take(MAX_POLICY_ANCESTORS)
+            .collect(),
+    };
+
+    json!({
+        "metadata": {
+            "resourceVersion": resource_version,
+        },
+        "status": {
+            "ancestors": ancestors,
+        },
+    })
+}
+
+fn preserve_live_ancestor_condition_transition_times(
+    update: &GatewayApiStatusUpdate,
+    mut desired_ancestor: Value,
+    live_status: Option<&Value>,
+) -> Value {
+    let Some(desired_ref) = desired_ancestor.get("ancestorRef") else {
+        return desired_ancestor;
+    };
+    let desired_key = route_parent_ref_key_for_namespace(&update.namespace, desired_ref);
+    let live_conditions = live_status
+        .and_then(|status| status.get("ancestors"))
+        .and_then(Value::as_array)
+        .and_then(|ancestors| {
+            ancestors.iter().find(|ancestor| {
+                ancestor.get("controllerName").and_then(Value::as_str)
+                    == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+                    && ancestor.get("ancestorRef").is_some_and(|ancestor_ref| {
+                        route_parent_ref_key_for_namespace(&update.namespace, ancestor_ref)
+                            == desired_key
+                    })
+            })
+        })
+        .and_then(|ancestor| ancestor.get("conditions"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice);
+    let desired_conditions = desired_ancestor
+        .get("conditions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let conditions = preserve_live_condition_transition_times(desired_conditions, live_conditions);
+    if let Value::Object(ancestor) = &mut desired_ancestor {
+        ancestor.insert("conditions".to_string(), Value::Array(conditions));
+    }
+    desired_ancestor
+}
+
+fn ferrum_status_entries(status: &Value, field: &str) -> Vec<Value> {
+    status
+        .get(field)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry.get("controllerName").and_then(Value::as_str)
+                == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+        })
+        .cloned()
+        .collect()
+}
+
+fn retained_non_ferrum_status_entries(status: &Value, field: &str) -> Vec<Value> {
+    status
+        .get(field)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry.get("controllerName").and_then(Value::as_str)
+                != Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+        })
+        .cloned()
+        .collect()
+}
+
 fn preserve_live_condition_transition_times(
     desired_conditions: Vec<Value>,
     live_conditions: Option<&[Value]>,
@@ -2299,9 +2683,32 @@ fn status_candidate_is_eligible(object: &K8sObject, indexes: &GatewayApiStatusIn
             route_has_managed_parent_ref_indexed(object, indexes)
                 || has_ferrum_parent_status(&object.status)
         }
+        // A policy is Ferrum's business when at least one target Service is
+        // effectively routed to by a managed Gateway — attachment, not a bare
+        // parentRef — or when Ferrum previously wrote ancestors on it, so a
+        // policy that fell out of scope still gets its stale Ferrum entries
+        // reconciled away rather than left behind.
+        "BackendTLSPolicy" => {
+            let is_in_scope = policy_status_ancestor_services(object)
+                .into_iter()
+                .any(|(namespace, name)| service_is_effectively_routed(indexes, &namespace, &name));
+            is_in_scope || has_ferrum_status_entry(&object.status, "ancestors")
+        }
         "BackendLBPolicy" | "XBackendTrafficPolicy" => true,
         _ => false,
     }
+}
+
+fn has_ferrum_status_entry(status: &Value, field: &str) -> bool {
+    status
+        .get(field)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|entry| {
+            entry.get("controllerName").and_then(Value::as_str)
+                == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+        })
 }
 
 fn route_has_managed_parent_ref_indexed(
@@ -2779,6 +3186,7 @@ fn is_status_kind(kind: &str) -> bool {
             | "TCPRoute"
             | "TLSRoute"
             | "UDPRoute"
+            | "BackendTLSPolicy"
             | "BackendLBPolicy"
             | "XBackendTrafficPolicy"
     )
@@ -2794,6 +3202,9 @@ fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResourc
         ("TCPRoute", "v1alpha2") => "tcproutes",
         ("TLSRoute", "v1alpha2") => "tlsroutes",
         ("UDPRoute", "v1alpha2") => "udproutes",
+        // Both channels Ferrum watches. An object served under any other
+        // version is skipped rather than patched through a guessed plural.
+        ("BackendTLSPolicy", "v1" | "v1alpha3") => "backendtlspolicies",
         ("BackendLBPolicy", "v1alpha2") => "backendlbpolicies",
         ("XBackendTrafficPolicy", "v1alpha1") => "xbackendtrafficpolicies",
         _ => return None,

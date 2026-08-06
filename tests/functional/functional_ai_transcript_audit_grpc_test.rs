@@ -433,9 +433,10 @@ mod gateway_startup_classifier_tests {
         )));
     }
 
-    /// `await_fallible_listener_handles` logs the full anyhow chain so a real
-    /// bind race exposes the OS "Address already in use" source; the outer
-    /// context alone must stay non-retryable.
+    /// File mode logs the full gateway-authored anyhow chain for a fallible
+    /// listener task. The explicit bind context plus the OS cause is enough to
+    /// classify the ephemeral-port race without broadening retry eligibility to
+    /// arbitrary task failures that merely mention address-in-use text.
     #[test]
     fn accepts_gateway_listener_task_bind_race_with_full_error_chain() {
         assert!(gateway_startup_failure_is_bind_race(&diagnostic_with(

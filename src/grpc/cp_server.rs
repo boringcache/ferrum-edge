@@ -3375,6 +3375,7 @@ mod tests {
                     }],
                     ingress_declared: false,
                     ingress: Vec::new(),
+                    outbound_traffic_policy: None,
                 }],
                 services: vec![
                     service("alpha", "reviews"),

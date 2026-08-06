@@ -67,7 +67,7 @@ See [Response Body Streaming — Interaction with Response Size Limits](response
 
 Ordinary plain-HTTPS traffic prefers the multiplexed direct HTTP/2 pool only when **both** `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` and `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` are `0` (and retries / request-body-buffering plugins are absent). Under the default nonzero body caps the gateway stays on the reqwest path for those ordinary routes — a silent **performance** cliff away from multiplexed H2 (logged at `debug!` only). Set both limits to `0` when you need direct-H2 preference and can accept unlimited body sizes at the gateway layer.
 
-Backend TLS SNI overrides are the exception: they cannot use reqwest, so they dispatch on direct-H2 even with nonzero body limits and enforce 413/502 in-path. Combinations that still cannot dispatch (retry body replay, request-body-buffering plugins, `pool_enable_http2: false`) are rejected at config admission — see [DestinationRule TLS SNI](mesh.md).
+Backend TLS SNI overrides are the exception: they prefer direct-H2 even with nonzero body limits and enforce 413/502 in-path. Combinations direct-H2 cannot serve (retry body replay, request-body-buffering plugins, `pool_enable_http2: false`) fall through to the reqwest HTTP/1.1 SNI dial, which carries the override in the request URL authority while pinning the socket to the selected target; they are **admitted**, not rejected at config admission. A dial that genuinely cannot be constructed still fails closed at runtime with a `502` — see [DestinationRule TLS SNI](mesh.md).
 
 ## HTTP/3 (QUIC) Enforcement
 

@@ -97,7 +97,9 @@ CRDs plus the xDS type URLs Ferrum subscribes to.
 - **`istio_service_entry_egress`** — `location: MESH_EXTERNAL` vs
   `MESH_INTERNAL`, HTTP-family + stream-family egress materialization
   (T5-A, PR #907), `outboundTrafficPolicy: REGISTRY_ONLY` injection
-  (T5-B, PR #893), hostname normalization.
+  (T5-B, PR #893), workload-scoped `Sidecar.outboundTrafficPolicy`
+  override in both directions plus its fail-closed unsupported variants
+  (issue #3262), hostname normalization.
 - **`xds_type_urls`** — every type URL Ferrum subscribes to in
   `XDS_TYPE_URLS` (CDS, EDS, LDS, RDS, SDS, ECDS, RTDS) plus the ECDS
   DR-carrier inner
