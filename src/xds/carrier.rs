@@ -44,9 +44,9 @@ use std::collections::BTreeMap;
 
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
-    AppProtocol, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshService,
-    MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MultiClusterConfig, OutboundTrafficPolicy,
-    PeerAuthentication, ResolvedIngressListener, ServiceEntry, TrustBundleSet, Workload,
+    MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshService, MeshTelemetryResource,
+    MeshVirtualServiceCorsPolicy, MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication,
+    ResolvedIngressListener, ServiceEntry, TrustBundleSet, Workload,
 };
 use crate::modes::mesh::revision::MeshConfigRevision;
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
@@ -846,7 +846,7 @@ pub fn decode_node_metadata(bytes: &[u8]) -> XdsNodeMetadata {
 mod tests {
     use super::*;
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
-    use crate::modes::mesh::config::TrustBundle;
+    use crate::modes::mesh::config::{AppProtocol, TrustBundle};
 
     fn sample_trust_bundle_set() -> TrustBundleSet {
         TrustBundleSet {

@@ -5283,9 +5283,8 @@ pub(crate) fn sidecar_ingress_protocol_is_stream_family(protocol: Option<&str>) 
 /// Whether a Sidecar `ingress[].port.protocol` string is modeled on either the
 /// HTTP or stream inbound lane (vs. deferred `Unknown`/`Udp`).
 pub(crate) fn sidecar_ingress_protocol_is_modeled(protocol: Option<&str>) -> bool {
-    crate::modes::mesh::config::is_modeled_ingress_app_protocol(sidecar_ingress_app_protocol(
-        protocol,
-    ))
+    sidecar_ingress_protocol_is_http_family(protocol)
+        || sidecar_ingress_protocol_is_stream_family(protocol)
 }
 
 fn telemetry(
@@ -19421,7 +19420,9 @@ extensionProviders:
             "a missing protocol defaults to Tcp, got {:?}",
             entry.protocol
         );
-        let resolved = entry.resolve().expect("missing protocol + loopback endpoint resolves as stream");
+        let resolved = entry
+            .resolve()
+            .expect("missing protocol + loopback endpoint resolves as stream");
         assert!(resolved.is_stream_family());
         assert!(!resolved.is_http_family());
     }
@@ -19463,10 +19464,8 @@ extensionProviders:
             (Some("nonsense"), false, false),
             (None, false, true), // missing → TCP default → stream-modeled
         ] {
-            let status_http =
-                crate::config_sources::k8s::sidecar_ingress_protocol_is_http_family(proto);
-            let status_stream =
-                crate::config_sources::k8s::sidecar_ingress_protocol_is_stream_family(proto);
+            let status_http = sidecar_ingress_protocol_is_http_family(proto);
+            let status_stream = sidecar_ingress_protocol_is_stream_family(proto);
             let status_modeled =
                 crate::config_sources::k8s::sidecar_ingress_protocol_is_modeled(proto);
             let carried = sidecar_ingress_app_protocol(proto);

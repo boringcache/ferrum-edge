@@ -3727,7 +3727,9 @@ mod tests {
             "unix-socket listener must be deferred, got {deferred:?}"
         );
         assert!(
-            deferred.iter().any(|f| f.contains("unrecognized") || f.contains("unsupported")),
+            deferred
+                .iter()
+                .any(|f| f.contains("unrecognized") || f.contains("unsupported")),
             "mistyped protocol must be deferred, got {deferred:?}"
         );
     }
@@ -3795,7 +3797,9 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred.iter().any(|f| f.contains("unrecognized") || f.contains("unsupported")),
+            deferred
+                .iter()
+                .any(|f| f.contains("unrecognized") || f.contains("unsupported")),
             "a mistyped protocol must be reported as deferred, got {deferred:?}"
         );
     }
@@ -3902,7 +3906,9 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred.iter().any(|f| f.contains("unrecognized") || f.contains("unsupported")),
+            deferred
+                .iter()
+                .any(|f| f.contains("unrecognized") || f.contains("unsupported")),
             "the mistyped entry is deferred, got {deferred:?}"
         );
         assert!(

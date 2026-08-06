@@ -32406,10 +32406,15 @@ mod tests {
             sidecar_ingress_declared: true,
             ..MeshSlice::default()
         };
-        let config_v1 = gateway_config_from_mesh_slice(&with_ingress, &runtime, None, None)
-            .expect("v1");
+        let config_v1 =
+            gateway_config_from_mesh_slice(&with_ingress, &runtime, None, None).expect("v1");
         assert_eq!(
-            config_v1.mesh.as_ref().unwrap().local_inbound_tcp_routes.len(),
+            config_v1
+                .mesh
+                .as_ref()
+                .unwrap()
+                .local_inbound_tcp_routes
+                .len(),
             1
         );
 
@@ -32421,8 +32426,8 @@ mod tests {
         };
         // content_eq must see the undeclare as a content change.
         assert!(!with_ingress.content_eq(&without_ingress));
-        let config_v2 = gateway_config_from_mesh_slice(&without_ingress, &runtime, None, None)
-            .expect("v2");
+        let config_v2 =
+            gateway_config_from_mesh_slice(&without_ingress, &runtime, None, None).expect("v2");
         assert!(
             config_v2
                 .mesh

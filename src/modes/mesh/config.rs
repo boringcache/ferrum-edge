@@ -1715,8 +1715,7 @@ impl MeshSidecarIngress {
 
 /// HTTP-family classification for Sidecar `ingress[]` listeners, shared by
 /// ingress-listener resolution ([`MeshSidecarIngress::resolve`]) and the K8s
-/// status writer's deferred-field report (via
-/// [`sidecar_ingress_protocol_is_http_family`](crate::config_sources::k8s::sidecar_ingress_protocol_is_http_family)),
+/// status writer's shared modeled-listener predicate,
 /// kept here so the config model can resolve ingress entries without importing
 /// the mode module and so the two callers can never disagree on whether a
 /// listener is modeled as HTTP.

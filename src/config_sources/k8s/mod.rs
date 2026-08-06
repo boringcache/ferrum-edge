@@ -25,14 +25,10 @@ pub use istio::{MAX_L4_CANDIDATE_PROXIES, MAX_PROJECTED_L4_PROXIES};
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
 // status writer's deferred-field reporting use one predicate and never diverge.
 pub(crate) use istio::cors_policy_translatable;
-// Shared with the Istio status writer the same way: the Sidecar `ingress[]`
-// HTTP-family classification used by resolution and by deferred-field reporting
-// is one predicate, so an HTTPS (→ Unknown → HTTP-family) listener is never
-// modeled by resolution yet reported as a deferred non-HTTP listener.
-pub(crate) use istio::{
-    sidecar_ingress_protocol_is_http_family, sidecar_ingress_protocol_is_modeled,
-    sidecar_ingress_protocol_is_stream_family,
-};
+// Shared with the Istio status writer the same way: Sidecar `ingress[]`
+// classification used by resolution and deferred-field reporting is one
+// predicate, so modeled HTTP and stream listeners cannot be reported deferred.
+pub(crate) use istio::sidecar_ingress_protocol_is_modeled;
 // Shared with the Istio status writer the same way: the ServiceEntry UDP-port
 // classification used by translation/materialization (a `protocol: UDP` port is
 // classified `AppProtocol::Udp` and its egress materialization is deferred/inert
