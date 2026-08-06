@@ -174,6 +174,20 @@ pub const FERRUM_ECDS_MULTI_CLUSTER_TYPE_URL: &str =
 /// Inner `type_url` for the Sidecar egress-scope snapshot carrier.
 pub const FERRUM_ECDS_SIDECAR_EGRESS_SCOPE_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.SidecarEgressScopeCarrier";
+/// Inner `type_url` for the authoritative waypoint `Gateway.spec.gatewayClassName`
+/// (issue #3226). Emitted only when the slice is a ServiceWaypoint with a known
+/// class so GatewayClass `targetRefs` can exact-match fail-closed over xDS.
+pub const FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.WaypointGatewayClassCarrier";
+
+/// DNS-1123 subdomain upper bound for a waypoint GatewayClass name on the
+/// ECDS carrier and native TargetRef attachment boundary.
+pub const MAX_WAYPOINT_GATEWAY_CLASS_LEN: usize = 253;
+
+/// Absolute byte ceiling for the WaypointGatewayClass carrier JSON payload
+/// (quoted string + framing). Hostile oversized inputs are rejected before
+/// allocation into the recovered slice.
+pub const MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES: usize = 512;
 
 /// Stable ECDS resource name for each slice carrier. The CP emits exactly one
 /// ECDS resource per non-empty carrier under these names; the DP requires
@@ -227,6 +241,11 @@ pub enum MeshSliceCarrier {
     OutboundTrafficPolicy(OutboundTrafficPolicy),
     MultiCluster(MultiClusterConfig),
     SidecarEgressScope(MeshEgressScopeSnapshot),
+    /// Authoritative waypoint `Gateway.spec.gatewayClassName` (issue #3226);
+    /// see [`FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL`]. Always a nonempty
+    /// trimmed name when emitted; absence means the DP has no class stamp and
+    /// GatewayClass targetRefs fail closed.
+    WaypointGatewayClass(String),
 }
 
 impl MeshSliceCarrier {
@@ -279,6 +298,9 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::OutboundTrafficPolicy(_) => FERRUM_ECDS_OUTBOUND_POLICY_TYPE_URL,
             MeshSliceCarrier::MultiCluster(_) => FERRUM_ECDS_MULTI_CLUSTER_TYPE_URL,
             MeshSliceCarrier::SidecarEgressScope(_) => FERRUM_ECDS_SIDECAR_EGRESS_SCOPE_TYPE_URL,
+            MeshSliceCarrier::WaypointGatewayClass(_) => {
+                FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL
+            }
         }
     }
 
@@ -315,6 +337,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::OutboundTrafficPolicy(_) => "outbound-traffic-policy",
             MeshSliceCarrier::MultiCluster(_) => "multi-cluster",
             MeshSliceCarrier::SidecarEgressScope(_) => "sidecar-egress-scope",
+            MeshSliceCarrier::WaypointGatewayClass(_) => "waypoint-gateway-class",
         };
         format!("{FERRUM_CARRIER_RESOURCE_NAME_PREFIX}{suffix}")
     }
@@ -348,6 +371,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::OutboundTrafficPolicy(value) => encode(value),
             MeshSliceCarrier::MultiCluster(value) => encode(value),
             MeshSliceCarrier::SidecarEgressScope(value) => encode(value),
+            MeshSliceCarrier::WaypointGatewayClass(value) => encode(value),
         }
     }
 
@@ -438,6 +462,9 @@ impl MeshSliceCarrier {
             FERRUM_ECDS_SIDECAR_EGRESS_SCOPE_TYPE_URL => {
                 MeshSliceCarrier::SidecarEgressScope(decode_json(value)?)
             }
+            FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL => {
+                MeshSliceCarrier::WaypointGatewayClass(decode_waypoint_gateway_class(value)?)
+            }
             _ => return Ok(None),
         };
         Ok(Some(carrier))
@@ -500,6 +527,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         FERRUM_ECDS_SIDECAR_EGRESS_SCOPE_TYPE_URL => {
             Some("ferrum-mesh-carrier/sidecar-egress-scope")
         }
+        FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL => {
+            Some("ferrum-mesh-carrier/waypoint-gateway-class")
+        }
         _ => None,
     }
 }
@@ -510,6 +540,36 @@ fn decode_json<T: DeserializeOwned>(value: &[u8]) -> Result<T, serde_json::Error
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(value)
+}
+
+/// Fail-closed decode for the WaypointGatewayClass carrier: bounded payload,
+/// nonempty trimmed string, single authoritative value (duplicates rejected by
+/// the recover loop). Does not log the raw payload.
+fn decode_waypoint_gateway_class(value: &[u8]) -> Result<String, serde_json::Error> {
+    use serde::de::Error;
+    if value.len() > MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES {
+        return Err(Error::custom(format!(
+            "WaypointGatewayClass carrier payload exceeds {MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES} bytes"
+        )));
+    }
+    let class: String = decode_json(value)?;
+    let trimmed = class.trim();
+    if trimmed.is_empty() {
+        return Err(Error::custom(
+            "WaypointGatewayClass carrier value must be nonempty",
+        ));
+    }
+    if class != trimmed {
+        return Err(Error::custom(
+            "WaypointGatewayClass carrier value must not have leading or trailing whitespace",
+        ));
+    }
+    if class.len() > MAX_WAYPOINT_GATEWAY_CLASS_LEN {
+        return Err(Error::custom(format!(
+            "WaypointGatewayClass name exceeds {MAX_WAYPOINT_GATEWAY_CLASS_LEN} bytes"
+        )));
+    }
+    Ok(class)
 }
 
 /// Build every slice carrier for `slice`.
@@ -669,6 +729,17 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     if let Some(scope) = slice.sidecar_egress_scope.as_ref() {
         carriers.push(MeshSliceCarrier::SidecarEgressScope(scope.clone()));
     }
+    // Authoritative waypoint GatewayClass (issue #3226). Emitted only when the
+    // ServiceWaypoint slice stamped a nonempty class; absence leaves the DP
+    // without a class stamp so GatewayClass targetRefs fail closed.
+    if let Some(class) = slice
+        .waypoint_gateway_class
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        carriers.push(MeshSliceCarrier::WaypointGatewayClass(class.to_string()));
+    }
     carriers
 }
 
@@ -723,6 +794,9 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         }
         MeshSliceCarrier::MultiCluster(value) => slice.multi_cluster = Some(value),
         MeshSliceCarrier::SidecarEgressScope(value) => slice.sidecar_egress_scope = Some(value),
+        MeshSliceCarrier::WaypointGatewayClass(value) => {
+            slice.waypoint_gateway_class = Some(value)
+        }
     }
 }
 
@@ -904,6 +978,7 @@ mod tests {
             MeshSliceCarrier::OutboundTrafficPolicy(OutboundTrafficPolicy::RegistryOnly),
             MeshSliceCarrier::MultiCluster(MultiClusterConfig::default()),
             MeshSliceCarrier::SidecarEgressScope(MeshEgressScopeSnapshot::default()),
+            MeshSliceCarrier::WaypointGatewayClass("istio-waypoint".to_string()),
         ];
         for carrier in carriers {
             let type_url = carrier.type_url();
@@ -1002,6 +1077,7 @@ mod tests {
             MeshSliceCarrier::OutboundTrafficPolicy(OutboundTrafficPolicy::AllowAny),
             MeshSliceCarrier::MultiCluster(MultiClusterConfig::default()),
             MeshSliceCarrier::SidecarEgressScope(MeshEgressScopeSnapshot::default()),
+            MeshSliceCarrier::WaypointGatewayClass("ferrum-waypoint".to_string()),
         ];
         let mut names: Vec<String> = carriers.iter().map(|c| c.resource_name()).collect();
         names.sort();
@@ -1014,6 +1090,53 @@ mod tests {
                 Some(resource_name.as_str())
             );
         }
+    }
+
+    #[test]
+    fn waypoint_gateway_class_carrier_rejects_hostile_input() {
+        assert!(
+            MeshSliceCarrier::decode(FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL, b"\"\"")
+                .is_err(),
+            "empty string must fail closed"
+        );
+        assert!(
+            MeshSliceCarrier::decode(FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL, b"\"   \"")
+                .is_err(),
+            "whitespace-only must fail closed"
+        );
+        assert!(
+            MeshSliceCarrier::decode(FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL, b"\" istio-waypoint\"")
+                .is_err(),
+            "leading whitespace must fail closed"
+        );
+        let oversized_name = "a".repeat(MAX_WAYPOINT_GATEWAY_CLASS_LEN + 1);
+        let oversized_json = serde_json::to_vec(&oversized_name).expect("json");
+        assert!(
+            MeshSliceCarrier::decode(
+                FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL,
+                &oversized_json
+            )
+            .is_err(),
+            "over-length class name must fail closed"
+        );
+        let oversized_payload =
+            format!("\"{}\"", "b".repeat(MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES));
+        assert!(
+            oversized_payload.len() > MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES
+        );
+        assert!(
+            MeshSliceCarrier::decode(
+                FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL,
+                oversized_payload.as_bytes()
+            )
+            .is_err(),
+            "oversized carrier payload must fail closed"
+        );
+        assert!(
+            MeshSliceCarrier::decode(FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL, b"{not json")
+                .is_err(),
+            "malformed JSON must fail closed"
+        );
     }
 
     // `encode` helper is exercised indirectly by translator; keep a direct

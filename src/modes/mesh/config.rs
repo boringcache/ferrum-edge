@@ -339,6 +339,27 @@ pub const MAX_POLICY_TARGET_REFS: usize = 16;
 /// `targetRefs` attachment.
 pub const MAX_POLICY_TARGET_SELECTOR_LABELS: usize = 64;
 
+/// DNS-1123 subdomain / API-group length bound for TargetRef `group` strings
+/// at the native/file and K8s translation boundaries.
+pub const MAX_POLICY_TARGET_REF_GROUP_LEN: usize = 253;
+
+/// Kubernetes kind-name length bound for TargetRef `kind` strings.
+pub const MAX_POLICY_TARGET_REF_KIND_LEN: usize = 63;
+
+/// TargetRef resource name length bound (DNS-1123 subdomain; same ceiling as
+/// the WaypointGatewayClass ECDS carrier).
+pub const MAX_POLICY_TARGET_REF_NAME_LEN: usize = 253;
+
+/// TargetRef namespace length bound (reuses the shared Ferrum namespace ceiling).
+pub const MAX_POLICY_TARGET_REF_NAMESPACE_LEN: usize =
+    crate::config::types::MAX_NAMESPACE_LENGTH;
+
+/// Kubernetes label-key length bound (`prefix/name`, DNS subdomain + `/` + 63).
+pub const MAX_POLICY_TARGET_REF_SELECTOR_KEY_LEN: usize = 253 + 1 + 63;
+
+/// Kubernetes label-value length bound.
+pub const MAX_POLICY_TARGET_REF_SELECTOR_VALUE_LEN: usize = 63;
+
 /// One resolved `AuthorizationPolicy` / policy `targetRefs[]` attachment.
 ///
 /// Captures the concrete resource the policy attaches to. Service /
@@ -4175,10 +4196,24 @@ fn validate_mesh_policy_target_refs_scope(
                 selector_labels,
             } => {
                 validate_non_empty_string(format!("{path}.namespace"), namespace, errors);
+                validate_bounded_string(
+                    format!("{path}.namespace"),
+                    namespace,
+                    MAX_POLICY_TARGET_REF_NAMESPACE_LEN,
+                    errors,
+                );
                 validate_non_empty_string(format!("{path}.name"), name, errors);
+                validate_bounded_string(
+                    format!("{path}.name"),
+                    name,
+                    MAX_POLICY_TARGET_REF_NAME_LEN,
+                    errors,
+                );
                 validate_target_ref_selector_labels(&path, selector_labels, errors);
                 if !namespace.trim().is_empty()
                     && !name.trim().is_empty()
+                    && namespace.len() <= MAX_POLICY_TARGET_REF_NAMESPACE_LEN
+                    && name.len() <= MAX_POLICY_TARGET_REF_NAME_LEN
                     && !services
                         .iter()
                         .any(|service| service.namespace == *namespace && service.name == *name)
@@ -4195,10 +4230,24 @@ fn validate_mesh_policy_target_refs_scope(
                 selector_labels,
             } => {
                 validate_non_empty_string(format!("{path}.namespace"), namespace, errors);
+                validate_bounded_string(
+                    format!("{path}.namespace"),
+                    namespace,
+                    MAX_POLICY_TARGET_REF_NAMESPACE_LEN,
+                    errors,
+                );
                 validate_non_empty_string(format!("{path}.name"), name, errors);
+                validate_bounded_string(
+                    format!("{path}.name"),
+                    name,
+                    MAX_POLICY_TARGET_REF_NAME_LEN,
+                    errors,
+                );
                 validate_target_ref_selector_labels(&path, selector_labels, errors);
                 if !namespace.trim().is_empty()
                     && !name.trim().is_empty()
+                    && namespace.len() <= MAX_POLICY_TARGET_REF_NAMESPACE_LEN
+                    && name.len() <= MAX_POLICY_TARGET_REF_NAME_LEN
                     && !service_entries
                         .iter()
                         .any(|entry| entry.namespace == *namespace && entry.name == *name)
@@ -4211,9 +4260,23 @@ fn validate_mesh_policy_target_refs_scope(
             }
             PolicyTargetAttachment::Gateway { namespace, name } => {
                 validate_non_empty_string(format!("{path}.namespace"), namespace, errors);
+                validate_bounded_string(
+                    format!("{path}.namespace"),
+                    namespace,
+                    MAX_POLICY_TARGET_REF_NAMESPACE_LEN,
+                    errors,
+                );
                 validate_non_empty_string(format!("{path}.name"), name, errors);
+                validate_bounded_string(
+                    format!("{path}.name"),
+                    name,
+                    MAX_POLICY_TARGET_REF_NAME_LEN,
+                    errors,
+                );
                 if !namespace.trim().is_empty()
                     && !name.trim().is_empty()
+                    && namespace.len() <= MAX_POLICY_TARGET_REF_NAMESPACE_LEN
+                    && name.len() <= MAX_POLICY_TARGET_REF_NAME_LEN
                     && !waypoint_bindings.iter().any(|binding| {
                         binding.namespace == *namespace && binding.name == *name
                     })
@@ -4226,7 +4289,16 @@ fn validate_mesh_policy_target_refs_scope(
             }
             PolicyTargetAttachment::GatewayClass { name } => {
                 validate_non_empty_string(format!("{path}.name"), name, errors);
-                if !name.trim().is_empty() && !is_supported_waypoint_gateway_class_name(name) {
+                validate_bounded_string(
+                    format!("{path}.name"),
+                    name,
+                    MAX_POLICY_TARGET_REF_NAME_LEN,
+                    errors,
+                );
+                if !name.trim().is_empty()
+                    && name.len() <= MAX_POLICY_TARGET_REF_NAME_LEN
+                    && !is_supported_waypoint_gateway_class_name(name)
+                {
                     let known_on_binding = waypoint_bindings.iter().any(|binding| {
                         binding
                             .gateway_class_name
@@ -4264,12 +4336,33 @@ fn validate_target_ref_selector_labels(
                 "{path}.selector_labels['{key}']: label value must not be empty"
             ));
         }
+        validate_bounded_string(
+            format!("{path}.selector_labels key"),
+            key,
+            MAX_POLICY_TARGET_REF_SELECTOR_KEY_LEN,
+            errors,
+        );
+        validate_bounded_string(
+            format!("{path}.selector_labels['{key}']"),
+            value,
+            MAX_POLICY_TARGET_REF_SELECTOR_VALUE_LEN,
+            errors,
+        );
     }
 }
 
 fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<String>) {
     if value.trim().is_empty() {
         errors.push(format!("{context}: must not be empty"));
+    }
+}
+
+fn validate_bounded_string(context: String, value: &str, max_len: usize, errors: &mut Vec<String>) {
+    if !value.trim().is_empty() && value.len() > max_len {
+        errors.push(format!(
+            "{context}: must be at most {max_len} characters (got {})",
+            value.len()
+        ));
     }
 }
 

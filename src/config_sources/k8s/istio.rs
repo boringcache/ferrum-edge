@@ -219,6 +219,11 @@ fn resolve_one_authorization_policy_target_ref(
     index: usize,
     entry: &Value,
 ) -> Result<PolicyTargetAttachment, K8sTranslateError> {
+    use crate::modes::mesh::config::{
+        MAX_POLICY_TARGET_REF_GROUP_LEN, MAX_POLICY_TARGET_REF_KIND_LEN,
+        MAX_POLICY_TARGET_REF_NAME_LEN, MAX_POLICY_TARGET_REF_NAMESPACE_LEN,
+    };
+
     let path = format!("targetRefs[{index}]");
     let kind = string_field(entry, "kind").ok_or_else(|| {
         invalid_resource(
@@ -226,6 +231,14 @@ fn resolve_one_authorization_policy_target_ref(
             format!("AuthorizationPolicy {path}.kind is required"),
         )
     })?;
+    if kind.len() > MAX_POLICY_TARGET_REF_KIND_LEN {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "AuthorizationPolicy {path}.kind must be at most {MAX_POLICY_TARGET_REF_KIND_LEN} characters"
+            ),
+        ));
+    }
     let name = string_field(entry, "name").ok_or_else(|| {
         invalid_resource(
             object,
@@ -238,10 +251,36 @@ fn resolve_one_authorization_policy_target_ref(
             format!("AuthorizationPolicy {path}.name must be non-empty"),
         ));
     }
+    if name.len() > MAX_POLICY_TARGET_REF_NAME_LEN {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "AuthorizationPolicy {path}.name must be at most {MAX_POLICY_TARGET_REF_NAME_LEN} characters"
+            ),
+        ));
+    }
     let group = string_field(entry, "group").unwrap_or("");
+    if group.len() > MAX_POLICY_TARGET_REF_GROUP_LEN {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "AuthorizationPolicy {path}.group must be at most {MAX_POLICY_TARGET_REF_GROUP_LEN} characters"
+            ),
+        ));
+    }
     let normalized_group = normalize_target_ref_group(group);
     let target_namespace = match string_field(entry, "namespace") {
-        Some(ns) if !ns.trim().is_empty() => ns.to_string(),
+        Some(ns) if !ns.trim().is_empty() => {
+            if ns.len() > MAX_POLICY_TARGET_REF_NAMESPACE_LEN {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "AuthorizationPolicy {path}.namespace must be at most {MAX_POLICY_TARGET_REF_NAMESPACE_LEN} characters"
+                    ),
+                ));
+            }
+            ns.to_string()
+        }
         Some(_) => {
             return Err(invalid_resource(
                 object,

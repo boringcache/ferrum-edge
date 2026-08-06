@@ -4,6 +4,7 @@ mod admin_listeners_tests;
 mod admin_security_tests;
 mod audit_retention_tests;
 mod authz_target_refs_tests;
+mod authz_target_refs_xds_tests;
 mod auto_bool_tests;
 mod backend_egress_policy_tests;
 mod batch_atomicity_tests;

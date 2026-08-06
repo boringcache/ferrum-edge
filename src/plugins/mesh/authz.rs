@@ -53,7 +53,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::config::types::Proxy;
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
-    MeshPolicy, PolicyAction, PolicyScope, PolicyTargetAttachment, is_mesh_condition_ip_key,
+    MeshPolicy, PolicyAction, PolicyScope, is_mesh_condition_ip_key,
     is_supported_mesh_condition_key, mesh_condition_has_values,
     normalize_request_match_host_pattern, policy_scope_applies_to_workload,
     policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
@@ -1155,11 +1155,6 @@ impl MeshAuthz {
                     waypoint_name.as_deref(),
                     waypoint_gateway_class.as_deref(),
                 ) || target_refs_attach_to_slice_services(policy, &slice.services)
-                    || target_refs_gateway_class_retained_without_stamp(
-                        policy,
-                        waypoint_name.as_deref(),
-                        waypoint_gateway_class.as_deref(),
-                    )
             });
         }
 
@@ -1647,28 +1642,6 @@ fn target_refs_attach_to_slice_services(
             )
         })
     })
-}
-
-/// xDS reverse-translate does not yet stamp `waypoint_gateway_class` on the
-/// slice. GatewayClass policies that reached a waypoint slice were already
-/// exact-class-filtered by CP `from_gateway_config` / ServiceWaypoint
-/// narrowing; retaining them here does not broaden. When the class *is*
-/// stamped, exact matching in [`policy_scope_applies_with_waypoint`] applies
-/// instead — never fall open across classes.
-fn target_refs_gateway_class_retained_without_stamp(
-    policy: &MeshPolicy,
-    waypoint_name: Option<&str>,
-    waypoint_gateway_class: Option<&str>,
-) -> bool {
-    if waypoint_name.is_none() || waypoint_gateway_class.is_some() {
-        return false;
-    }
-    let PolicyScope::TargetRefs { attachments } = &policy.scope else {
-        return false;
-    };
-    attachments
-        .iter()
-        .any(|attachment| matches!(attachment, PolicyTargetAttachment::GatewayClass { .. }))
 }
 
 fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result<(), String> {
