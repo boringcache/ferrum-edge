@@ -3000,21 +3000,29 @@ fn h3_native_grpc_header_wait_expiry_blames_the_party_it_waited_on() {
     }
 }
 
-/// The relay must snapshot upload progress at the START of the header wait and
-/// hand that snapshot to the classifier — a snapshot taken anywhere else would
-/// compare against the wrong baseline.
+/// The relay must snapshot upload progress before spawning the upload pump and
+/// hand that snapshot to the classifier. Otherwise a multi-threaded runtime can
+/// forward the client's first frame before the snapshot and erase the evidence
+/// that the gateway spent the response-header phase waiting on the backend.
 #[test]
 fn h3_native_grpc_header_wait_snapshots_progress_before_waiting() {
     let relay = native_h3_grpc_relay_source();
     let snapshot_at = relay
         .find("let upload_progress_before_wait = upload.progress();")
         .expect("header-wait progress snapshot");
+    let spawn_at = relay
+        .find("tokio::spawn(run_h3_grpc_upload_pump(")
+        .expect("upload pump spawn");
     let timeout_at = relay
         .find("tokio::time::timeout_at(at, header_fut)")
         .expect("bounded header wait");
     assert!(
+        snapshot_at < spawn_at,
+        "the progress snapshot must be taken before the upload pump can run"
+    );
+    assert!(
         snapshot_at < timeout_at,
-        "the progress snapshot must be taken before the wait begins"
+        "the progress snapshot must remain before the response-header wait"
     );
     let expiry = relay
         .split("tokio::time::timeout_at(at, header_fut)")

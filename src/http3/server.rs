@@ -10549,6 +10549,11 @@ async fn dispatch_grpc_native_h3(
     // structural `?` — can detach the task or drop the only shutdown notifier.
     let (mut send_half, frontend_recv) = stream.split();
     let pump_shutdown = Arc::new(tokio::sync::Notify::new());
+    // Snapshot before the pump can run. A multi-threaded runtime may forward the
+    // client's first request frame as soon as it is spawned; sampling afterward
+    // would erase that evidence and could misattribute a dead backend to an
+    // otherwise healthy bidirectional client that is waiting for its response.
+    let upload_progress_before_wait = upload.progress();
     let pump_guard = H3GrpcUploadPumpGuard::new(
         Arc::clone(&pump_shutdown),
         tokio::spawn(run_h3_grpc_upload_pump(
@@ -10576,11 +10581,6 @@ async fn dispatch_grpc_native_h3(
             head = crate::http3::client::recv_h3_backend_response_head(&mut backend_recv) => head,
         }
     };
-    // Snapshot upload progress at the START of the header wait. Completion alone
-    // cannot attribute an expiry on a duplex relay — a healthy bidirectional
-    // client keeps its request direction open for the whole RPC by design — so
-    // the classifier compares against this snapshot instead.
-    let upload_progress_before_wait = upload.progress();
     let head_result = match dispatch_deadline_at {
         Some(at) => match tokio::time::timeout_at(at, header_fut).await {
             Ok(result) => result,
