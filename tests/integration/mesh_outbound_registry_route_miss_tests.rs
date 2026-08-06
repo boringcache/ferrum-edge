@@ -14,7 +14,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -142,7 +141,6 @@ async fn start_test_gateway(state: ProxyState) -> (SocketAddr, tokio::task::Join
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
     (gateway_addr, handle)
 }
 
