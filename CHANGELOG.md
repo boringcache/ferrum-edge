@@ -726,7 +726,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace, and the configured `istio_root_namespace` are no longer admitted
   to a subscriber's slice at all, and DestinationRules in the configured root
   namespace are now admitted (they previously were not).
- - Reqwest backend TLS clients built via `use_preconfigured_tls` /
+- Reqwest backend TLS clients built via `use_preconfigured_tls` /
   `BackendTlsConfigBuilder::build_rustls_for_reqwest` now advertise ALPN
   `[h2, http/1.1]` unless the proxy forces HTTP/1.1 (`h2UpgradePolicy:
   DO_NOT_UPGRADE` or `pool_enable_http2: false`). Previously the
