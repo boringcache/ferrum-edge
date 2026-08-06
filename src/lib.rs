@@ -5424,9 +5424,6 @@ pub mod _test_support {
     /// tests can pin the attribution contract without a live QUIC backend.
     #[derive(Clone, Copy, Debug, Default)]
     pub struct H3GrpcHeaderWaitScenario {
-        /// Upload steps recorded WHILE the header wait was running: client
-        /// frames taken off the frontend and frames the backend accepted.
-        pub progress_steps_during_wait: u64,
         /// The upload reached a clean FIN before the wait expired.
         pub upload_complete: bool,
         /// The pump is parked on a backend write / FIN, not on the client.
@@ -5442,12 +5439,6 @@ pub mod _test_support {
         scenario: H3GrpcHeaderWaitScenario,
     ) -> bool {
         let state = crate::http3::server::H3GrpcUploadState::new();
-        // Snapshot exactly where the relay does: before modeled upload work can
-        // begin (production takes this sample before spawning the pump).
-        let progress_at_wait_start = state.progress();
-        for _ in 0..scenario.progress_steps_during_wait {
-            state.note_progress();
-        }
         if scenario.upload_complete {
             state.mark_complete();
         }
@@ -5456,10 +5447,7 @@ pub mod _test_support {
             state.publish_fault(h3_grpc_upload_fault_for_test(kind));
         }
         matches!(
-            crate::http3::server::classify_h3_grpc_header_wait_expiry(
-                &state,
-                progress_at_wait_start,
-            ),
+            crate::http3::server::classify_h3_grpc_header_wait_expiry(&state),
             crate::http3::server::H3GrpcHeaderWaitExpiry::BackendStalled
         )
     }

@@ -9570,13 +9570,6 @@ pub(crate) struct H3GrpcUploadState {
     complete: std::sync::atomic::AtomicBool,
     /// Latched [`H3GrpcUploadFault`] code; `NONE` until the first fault.
     fault: std::sync::atomic::AtomicU8,
-    /// Monotonic count of completed upload steps: one per client DATA frame
-    /// taken off the frontend, one per frame the backend accepted. Snapshotted
-    /// before the upload pump is spawned so no scheduler interleaving can erase
-    /// early progress; an expiry can then tell a client that is ACTIVELY
-    /// streaming — a healthy bidirectional client whose backend simply owes
-    /// HEADERS — from one that produced nothing at all.
-    progress: std::sync::atomic::AtomicU64,
     /// True while the pump is parked on a BACKEND write / FIN rather than on the
     /// client. A backend that never opens flow-control credit for the upload and
     /// never answers is the backend's fault, not a stalled client.
@@ -9592,7 +9585,6 @@ impl H3GrpcUploadState {
             bytes: std::sync::atomic::AtomicU64::new(0),
             complete: std::sync::atomic::AtomicBool::new(false),
             fault: std::sync::atomic::AtomicU8::new(H3GrpcUploadFault::NONE),
-            progress: std::sync::atomic::AtomicU64::new(0),
             blocked_on_backend: std::sync::atomic::AtomicBool::new(false),
             fault_signal: tokio::sync::Notify::new(),
         }
@@ -9605,19 +9597,6 @@ impl H3GrpcUploadState {
 
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Record one completed upload step. Deliberately NOT byte-valued: a valid
-    /// zero-message / trailers-only client-streaming RPC forwards no body bytes,
-    /// and a client whose frames are all buffered behind one blocked backend
-    /// write is still making progress the gateway can see.
-    pub(crate) fn note_progress(&self) {
-        self.progress
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-    }
-
-    pub(crate) fn progress(&self) -> u64 {
-        self.progress.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn set_blocked_on_backend(&self, blocked: bool) {
@@ -9701,9 +9680,13 @@ pub(crate) enum H3GrpcHeaderWaitExpiry {
 /// breaker, passive health, adaptive concurrency, and the H3 fallback signal
 /// entirely, which is why completion alone is not the discriminator.
 ///
-/// The question asked instead is "who were we waiting on, and did anything at
-/// all happen?", and only a wait in which the client produced NOTHING is charged
-/// to the client:
+/// The question asked instead is "who was the pump waiting on at expiry?". The
+/// health boundary must not trust earlier client activity: an untrusted client
+/// can send one DATA frame and then stall without half-closing, while a valid
+/// client-streaming backend is allowed to wait for that half-close before it
+/// returns HEADERS. Treating any historical progress as proof that the backend
+/// owes a response lets one client poison circuit-breaker and passive-health
+/// state for every other client.
 ///
 /// * A latched fault decides on its own: a terminating one (client abort,
 ///   undecodable trailing metadata, oversized upload) is client-caused, while
@@ -9712,14 +9695,12 @@ pub(crate) enum H3GrpcHeaderWaitExpiry {
 /// * Upload complete — the backend owes HEADERS.
 /// * The pump parked on a backend write / FIN — the backend is not draining the
 ///   upload it asked for.
-/// * Upload progress advanced during the wait — the client is streaming fine.
-/// * Otherwise a genuinely stalled client, which includes the valid zero-message
-///   / trailers-only client-streaming RPC that opens the stream and sends
-///   nothing. The forwarded BYTE count is deliberately not the test: that RPC
-///   forwards no body bytes at all.
+/// * Otherwise the upload is incomplete and the pump is waiting on the client;
+///   the expiry stays health-neutral. This includes a zero-message/trailers-only
+///   RPC and a partially uploaded client-streaming RPC. The request still ends at
+///   the configured deadline; only backend health attribution is neutralized.
 pub(crate) fn classify_h3_grpc_header_wait_expiry(
     upload: &H3GrpcUploadState,
-    progress_at_wait_start: u64,
 ) -> H3GrpcHeaderWaitExpiry {
     // A terminating fault normally wins the race inside the header wait itself;
     // this arm only matters when the deadline fires in the same instant, and it
@@ -9731,10 +9712,7 @@ pub(crate) fn classify_h3_grpc_header_wait_expiry(
             H3GrpcHeaderWaitExpiry::BackendStalled
         };
     }
-    if upload.is_complete()
-        || upload.is_blocked_on_backend()
-        || upload.progress() > progress_at_wait_start
-    {
+    if upload.is_complete() || upload.is_blocked_on_backend() {
         return H3GrpcHeaderWaitExpiry::BackendStalled;
     }
     H3GrpcHeaderWaitExpiry::ClientStalled
@@ -9804,9 +9782,6 @@ async fn run_h3_grpc_upload_pump(
                 }
             },
         };
-        // The client handed us a frame: observable progress even if the backend
-        // write below then blocks, and even for a zero-length DATA frame.
-        upload.note_progress();
         let len = chunk.remaining();
         if max_request_body_size > 0 {
             total_sent += len;
@@ -9836,7 +9811,6 @@ async fn run_h3_grpc_upload_pump(
             break 'pump H3UploadPumpExit::Halted;
         }
         upload.add_bytes(len as u64);
-        upload.note_progress();
     };
 
     if exit == H3UploadPumpExit::ClientEof && upload.fault().is_none() {
@@ -9858,7 +9832,6 @@ async fn run_h3_grpc_upload_pump(
         };
         match trailers {
             Some(Ok(Some(mut trailers))) if !trailers.is_empty() => {
-                upload.note_progress();
                 sanitize_backend_request_trailers(&mut trailers);
                 if !trailers.is_empty() {
                     upload.set_blocked_on_backend(true);
@@ -10555,11 +10528,6 @@ async fn dispatch_grpc_native_h3(
     // structural `?` — can detach the task or drop the only shutdown notifier.
     let (mut send_half, frontend_recv) = stream.split();
     let pump_shutdown = Arc::new(tokio::sync::Notify::new());
-    // Snapshot before the pump can run. A multi-threaded runtime may forward the
-    // client's first request frame as soon as it is spawned; sampling afterward
-    // would erase that evidence and could misattribute a dead backend to an
-    // otherwise healthy bidirectional client that is waiting for its response.
-    let upload_progress_before_wait = upload.progress();
     let pump_guard = H3GrpcUploadPumpGuard::new(
         Arc::clone(&pump_shutdown),
         tokio::spawn(run_h3_grpc_upload_pump(
@@ -10595,11 +10563,10 @@ async fn dispatch_grpc_native_h3(
                 // waiting on. `BackendStalled` is a real post-wire read timeout
                 // (504 + `ReadWriteTimeout`, no capability downgrade), so CB /
                 // passive health / adaptive concurrency / LB fallback all see a
-                // dead backend; `ClientStalled` means nothing at all arrived from
-                // the client for the whole wait and stays health-neutral. See
+                // dead backend; `ClientStalled` means the incomplete upload is
+                // currently waiting on the client and stays health-neutral. See
                 // `classify_h3_grpc_header_wait_expiry`.
-                let expiry =
-                    classify_h3_grpc_header_wait_expiry(&upload, upload_progress_before_wait);
+                let expiry = classify_h3_grpc_header_wait_expiry(&upload);
                 if expiry == H3GrpcHeaderWaitExpiry::BackendStalled {
                     Err(crate::http3::client::H3PoolError::read_timeout(
                         anyhow::anyhow!(

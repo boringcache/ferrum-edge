@@ -2655,19 +2655,17 @@ fn h3_native_grpc_upload_pump_halts_the_frontend_receive_half_gracefully() {
     );
 }
 
-/// The pump publishes the signals the response-header wait needs to attribute
-/// an expiry, and publishes `blocked_on_backend` around the BACKEND awaits only.
+/// The pump publishes `blocked_on_backend` around BACKEND awaits only. Earlier
+/// client progress is deliberately not shared into health attribution because
+/// it is attacker-controlled and says nothing about whether request EOF is owed.
 #[test]
-fn h3_native_grpc_upload_pump_publishes_progress_and_blocked_state() {
+fn h3_native_grpc_upload_pump_publishes_only_backend_blocked_state() {
     let pump = native_h3_grpc_upload_pump_source();
 
-    // One per client frame taken off the frontend (DATA and trailing metadata)
-    // and one per DATA frame the backend accepted.
-    assert_eq!(
-        pump.matches("upload.note_progress()").count(),
-        3,
-        "progress must be recorded when the client hands us a frame and when the \
-         backend accepts one, so a wait that saw neither is provably client-owned"
+    assert!(
+        !pump.contains("note_progress") && !pump.contains("progress_at_wait_start"),
+        "client-controlled historical progress must not be promoted into shared \
+         backend health state"
     );
 
     // `blocked_on_backend` must be set true only immediately before a backend
@@ -3049,29 +3047,17 @@ async fn h3_native_grpc_terminating_upload_fault_wakes_the_relay() {
 /// A response-header wait that expires must be attributed by WHO the gateway was
 /// waiting on, not by whether the client upload happened to be complete.
 ///
-/// On the duplex relay a healthy bidirectional client keeps its request
-/// direction open for the entire RPC, so `upload_complete == false` is the
-/// NORMAL steady state. Using completion alone as the discriminator would file
-/// every dead backend that accepts a stream and never sends HEADERS as a
-/// "stalled client", making it health-neutral: no circuit-breaker trip, no
-/// passive-health demotion, no adaptive-concurrency signal, no LB fallback.
+/// On the duplex relay an incomplete request can be either a healthy
+/// bidirectional RPC or a client-streaming RPC whose backend legitimately waits
+/// for request EOF. Earlier client progress cannot distinguish those cases: an
+/// untrusted client can send one frame and then stall, so using that progress to
+/// indict the backend would let the client poison shared health state.
 #[test]
 fn h3_native_grpc_header_wait_expiry_blames_the_party_it_waited_on() {
     use ferrum_edge::_test_support::{
         H3GrpcHeaderWaitScenario, H3GrpcUploadFaultKind,
         h3_grpc_header_wait_expiry_blames_backend_for_test as blames_backend,
     };
-
-    // The regression: a client actively streaming while the backend accepted the
-    // stream and never answered. Upload is NOT complete — and that is fine.
-    assert!(
-        blames_backend(H3GrpcHeaderWaitScenario {
-            progress_steps_during_wait: 4,
-            ..Default::default()
-        }),
-        "a client that made progress throughout the wait is healthy; the backend \
-         owes the response headers"
-    );
 
     // The backend is not even draining the upload it asked for.
     assert!(
@@ -3101,10 +3087,9 @@ fn h3_native_grpc_header_wait_expiry_blames_the_party_it_waited_on() {
         "a completed upload leaves only the backend to wait on"
     );
 
-    // Genuinely stalled client: parked on the frontend receive, nothing arrived
-    // for the whole wait. This is also the valid zero-message / trailers-only
-    // client-streaming RPC — the shape a forwarded-BYTE-count test would get
-    // wrong, since it forwards no body bytes at all.
+    // Incomplete upload while parked on the frontend receive stays neutral. This
+    // covers both a valid zero-message/trailers-only client-streaming RPC and a
+    // client that sent one or more frames and then stopped without half-closing.
     assert!(
         !blames_backend(H3GrpcHeaderWaitScenario::default()),
         "a wait in which the client produced nothing is neutral for backend health"
@@ -3118,8 +3103,6 @@ fn h3_native_grpc_header_wait_expiry_blames_the_party_it_waited_on() {
     ] {
         assert!(
             !blames_backend(H3GrpcHeaderWaitScenario {
-                // Even with progress recorded, the latched client fault decides.
-                progress_steps_during_wait: 2,
                 fault: Some(client_fault),
                 ..Default::default()
             }),
@@ -3128,29 +3111,15 @@ fn h3_native_grpc_header_wait_expiry_blames_the_party_it_waited_on() {
     }
 }
 
-/// The relay must snapshot upload progress before spawning the upload pump and
-/// hand that snapshot to the classifier. Otherwise a multi-threaded runtime can
-/// forward the client's first frame before the snapshot and erase the evidence
-/// that the gateway spent the response-header phase waiting on the backend.
+/// Historical client progress must not be used to blame the backend for a
+/// response-header timeout: it is attacker-controlled and cannot distinguish a
+/// bidirectional RPC from a client-streaming RPC waiting for request EOF.
 #[test]
-fn h3_native_grpc_header_wait_snapshots_progress_before_waiting() {
+fn h3_native_grpc_header_wait_does_not_trust_client_progress() {
     let relay = native_h3_grpc_relay_source();
-    let snapshot_at = relay
-        .find("let upload_progress_before_wait = upload.progress();")
-        .expect("header-wait progress snapshot");
-    let spawn_at = relay
-        .find("tokio::spawn(run_h3_grpc_upload_pump(")
-        .expect("upload pump spawn");
-    let timeout_at = relay
-        .find("tokio::time::timeout_at(at, header_fut)")
-        .expect("bounded header wait");
     assert!(
-        snapshot_at < spawn_at,
-        "the progress snapshot must be taken before the upload pump can run"
-    );
-    assert!(
-        snapshot_at < timeout_at,
-        "the progress snapshot must remain before the response-header wait"
+        !relay.contains("upload_progress_before_wait") && !relay.contains("upload.progress()"),
+        "client-controlled historical progress must not drive backend health attribution"
     );
     let expiry = relay
         .split("tokio::time::timeout_at(at, header_fut)")
@@ -3160,13 +3129,12 @@ fn h3_native_grpc_header_wait_snapshots_progress_before_waiting() {
         .next()
         .expect("bounded header-wait expiry arm");
     assert!(
-        expiry.contains("classify_h3_grpc_header_wait_expiry(")
-            && expiry.contains("upload_progress_before_wait"),
-        "the expiry must be attributed through the classifier with the snapshot"
+        expiry.contains("classify_h3_grpc_header_wait_expiry(&upload)"),
+        "the expiry must be attributed through the current pump-owner classifier"
     );
     assert!(
         !expiry.contains("upload.is_complete()"),
-        "regression: completion alone cannot attribute a duplex header wait — a \
-         healthy bidi client is never complete while the RPC is live"
+        "the dispatch arm must use the centralized classifier rather than \
+         re-implementing upload ownership ad hoc"
     );
 }
