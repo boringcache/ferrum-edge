@@ -546,9 +546,13 @@ mod tests {
     #[tokio::test]
     async fn set_target_stamps_principal_before_tcp_finalize_marker() {
         let mut ctx = stream_context();
-        ctx.metadata
-            .get_or_insert_with(Default::default)
-            .insert("mesh.request_protocol".to_string(), "tcp".to_string());
+        let metadata = ctx.metadata.get_or_insert_with(Default::default);
+        metadata.insert("mesh.request_protocol".to_string(), "tcp".to_string());
+        metadata.insert(
+            crate::plugins::mesh::prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA
+                .to_string(),
+            "1".to_string(),
+        );
         let mut lifecycle = CapturedMeshEgressLifecycle {
             plugins: vec![],
             stream_ctx: Some(ctx),
