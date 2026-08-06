@@ -90,7 +90,7 @@ fn run_ferrum_cni_gc(stdin_config: serde_json::Value) -> std::process::Output {
 /// staging directory and atomically renames into place, so the pathname can lag
 /// under runner load while ferrum-cni would fail the invocation.
 async fn wait_for_cni_listener_ready(socket_path: &std::path::Path) {
-    let result = tokio::time::timeout(Duration::from_secs(2), async {
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if tokio::net::UnixStream::connect(socket_path).await.is_ok() {
                 return;
@@ -102,7 +102,7 @@ async fn wait_for_cni_listener_ready(socket_path: &std::path::Path) {
 
     if result.is_err() {
         panic!(
-            "CNI listener socket {:?} did not become connectable within 2s",
+            "CNI listener socket {:?} did not become connectable within 5s",
             socket_path
         );
     }
