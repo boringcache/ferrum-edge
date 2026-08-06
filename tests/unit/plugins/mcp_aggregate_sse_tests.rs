@@ -703,9 +703,7 @@ async fn reserved_publication_is_invisible_and_protects_commit_capacity() {
     let mut body = listener.take_body().unwrap();
     assert!(frame_text(next_frame(&mut body).await).contains(": mcp-sse"));
 
-    let first = broker
-        .open_stream("sess-reserved", &number_id(1))
-        .unwrap();
+    let first = broker.open_stream("sess-reserved", &number_id(1)).unwrap();
     let first_payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
     let reserved = first.reserve_encoded(&first_payload).unwrap();
     assert!(
@@ -715,9 +713,7 @@ async fn reserved_publication_is_invisible_and_protects_commit_capacity() {
 
     publish(&broker, "sess-reserved", 2)
         .expect("one direct publication fits beside the promised event");
-    let third = broker
-        .open_stream("sess-reserved", &number_id(3))
-        .unwrap();
+    let third = broker.open_stream("sess-reserved", &number_id(3)).unwrap();
     let third_payload = encode(&json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
     assert_eq!(
         third.publish_encoded(&third_payload).unwrap_err(),

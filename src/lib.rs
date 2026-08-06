@@ -351,9 +351,7 @@ pub mod _test_support {
 
     /// Whether final body policy reserved an aggregate-SSE event that is still
     /// invisible pending the committed-response boundary.
-    pub fn mcp_sse_publication_is_pending_for_test(
-        ctx: &crate::plugins::RequestContext,
-    ) -> bool {
+    pub fn mcp_sse_publication_is_pending_for_test(ctx: &crate::plugins::RequestContext) -> bool {
         ctx.mcp_sse_publication.is_some()
     }
 

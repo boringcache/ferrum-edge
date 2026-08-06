@@ -2745,8 +2745,7 @@ pub struct RequestContext {
     /// publishes it only if that exact acknowledgement survives the remaining
     /// response-header lifecycle; drop/abort returns the reservation and stream
     /// capacity exactly once. Private so metadata cannot forge publication.
-    pub(crate) mcp_sse_publication:
-        Option<mcp_aggregate_sse::AggregateSsePublication>,
+    pub(crate) mcp_sse_publication: Option<mcp_aggregate_sse::AggregateSsePublication>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log

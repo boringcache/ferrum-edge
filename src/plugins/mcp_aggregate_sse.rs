@@ -778,10 +778,8 @@ impl SessionState {
         let incoming_events = inner.reserved_events.saturating_add(1);
         let incoming_bytes = inner.reserved_bytes.saturating_add(reserved_bytes);
         inner.trim_for_admission(&self.bounds, incoming_events, incoming_bytes);
-        if inner.history.len().saturating_add(incoming_events)
-            > self.bounds.max_retained_events
-            || inner.history_bytes.saturating_add(incoming_bytes)
-                > self.bounds.max_retained_bytes
+        if inner.history.len().saturating_add(incoming_events) > self.bounds.max_retained_events
+            || inner.history_bytes.saturating_add(incoming_bytes) > self.bounds.max_retained_bytes
         {
             inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
             inner.last_activity = Instant::now();

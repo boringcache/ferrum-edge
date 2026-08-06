@@ -1,9 +1,9 @@
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
     build_aggregate_sse_reject_for_test, drop_mcp_sse_stream_for_test,
-    mcp_aggregate_sse_listener_is_staged_for_test,
-    mcp_sse_publication_is_pending_for_test, mcp_sse_stream_is_open_for_test,
-    reject_headers_select_event_stream_for_test, take_mcp_aggregate_sse_listener_for_test,
+    mcp_aggregate_sse_listener_is_staged_for_test, mcp_sse_publication_is_pending_for_test,
+    mcp_sse_stream_is_open_for_test, reject_headers_select_event_stream_for_test,
+    take_mcp_aggregate_sse_listener_for_test,
 };
 use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::{
@@ -10423,7 +10423,11 @@ async fn aggregate_sse_late_response_replacement_aborts_reserved_event() {
     );
 
     let next = ping(&plugin, &session_id, json!("after-late-policy")).await;
-    assert_eq!(reject_raw(next).0, 202, "aborted reservation returns capacity");
+    assert_eq!(
+        reject_raw(next).0,
+        202,
+        "aborted reservation returns capacity"
+    );
     let seen = sse_drain_until(&mut stream, &["after-late-policy"], 6).await;
     assert!(seen.contains("after-late-policy"));
     assert!(!seen.contains("\"id\":\"late-policy\""));
