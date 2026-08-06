@@ -231,10 +231,7 @@ fn gateway_target_ref_resolves_regardless_of_object_order() {
     );
     let gateway = waypoint_gateway("waypoint", "default", "istio-waypoint");
 
-    for objects in [
-        vec![policy.clone(), gateway.clone()],
-        vec![gateway, policy],
-    ] {
+    for objects in [vec![policy.clone(), gateway.clone()], vec![gateway, policy]] {
         let result = translate_k8s_objects(&objects, options_ns_root("default", "istio-system"))
             .expect("Gateway targetRef resolves in either order");
         let mesh = result.config.mesh.expect("mesh config");

@@ -237,11 +237,9 @@ async fn xds_round_trip_mixed_target_refs_do_not_broaden_to_sibling_destination(
         ],
     );
     let native = waypoint_slice(Some("istio-waypoint"), vec![mixed.clone()]);
-    let recovered = recover_from_snapshot(
-        &translate_mesh_slice_to_snapshot(&native),
-        Some(WAYPOINT),
-    )
-    .expect("mixed-ref snapshot recovers");
+    let recovered =
+        recover_from_snapshot(&translate_mesh_slice_to_snapshot(&native), Some(WAYPOINT))
+            .expect("mixed-ref snapshot recovers");
 
     assert_eq!(
         recovered.mesh_policies, native.mesh_policies,
@@ -491,7 +489,9 @@ fn native_target_refs_reject_over_limit_attachment_count() {
     }
     .validate();
     assert!(
-        errors.iter().any(|e| e.contains("at most") && e.contains("attachments")),
+        errors
+            .iter()
+            .any(|e| e.contains("at most") && e.contains("attachments")),
         "over-limit attachment count must reject: {errors:?}"
     );
 }
