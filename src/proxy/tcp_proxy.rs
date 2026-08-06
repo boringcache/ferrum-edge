@@ -2244,6 +2244,11 @@ async fn run_tcp_stream_connect_plugins(
             );
         }
     }
+    // The whole chain accepted, so mesh identity/tag/disable metadata is final:
+    // this is the single point where the mesh TCP opened counter is emitted for
+    // the passthrough, TCP/TLS, and plaintext TCP admission paths. Non-mesh
+    // streams carry no mesh metadata and are a no-op here.
+    crate::plugins::mesh::prometheus_helpers::record_admitted_mesh_tcp_stream(stream_ctx);
     Ok(())
 }
 

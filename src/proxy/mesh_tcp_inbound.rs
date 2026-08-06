@@ -317,6 +317,10 @@ pub(crate) async fn handle_mesh_tcp_inbound(
             return;
         }
     }
+    // Chain accepted: mesh metadata is final, so record the mesh TCP opened
+    // counter once for this captured inbound connection (also covers the
+    // NodeWaypoint transparent ingress capture relay, which funnels here).
+    crate::plugins::mesh::prometheus_helpers::record_admitted_mesh_tcp_stream(&mut stream_ctx);
 
     // Marked when the entry demands it (NodeWaypoint capture relay): the dial
     // leaves the host netns and must be recognized as an authorized relay dial

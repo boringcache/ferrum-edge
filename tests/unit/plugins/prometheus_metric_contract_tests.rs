@@ -697,7 +697,7 @@ fn representative_exposition() -> String {
             "mutual_tls".into(),
         ),
     ]);
-    registry.record_mesh_tcp_opened(&tcp_meta, "mesh-tcp", Some("db"));
+    registry.record_mesh_tcp_admitted(&mut tcp_meta, "mesh-tcp", Some("db"));
     let mut tcp_summary = make_stream_summary("mesh-tcp", "tcp");
     tcp_summary.metadata = tcp_meta;
     tcp_summary.bytes_sent = 1024;

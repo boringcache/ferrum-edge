@@ -119,6 +119,16 @@ impl CapturedMeshEgressLifecycle {
             "mesh.destination.service".to_string(),
             destination_service.to_string(),
         );
+        // Record mesh TCP admission only once the chain accepted AND this
+        // path's own destination/security metadata is stamped, so the opened
+        // counter carries the same labels the disconnect summary will. A
+        // rejected chain stays uncounted on both halves of the lifecycle, and
+        // captured UDP egress is excluded by its `udp` request protocol.
+        if !rejected {
+            crate::plugins::mesh::prometheus_helpers::record_admitted_mesh_tcp_stream(
+                &mut stream_ctx,
+            );
+        }
 
         Some(Self {
             plugins,

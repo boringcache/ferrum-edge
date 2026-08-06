@@ -12,6 +12,7 @@ use dashmap::mapref::entry::Entry;
 
 use crate::identity::ca::PublishedTrustBundle;
 use crate::identity::spiffe::SpiffeId;
+use crate::plugins::StreamConnectionContext;
 use crate::plugins::TransactionSummary;
 use crate::plugins::prometheus_metrics::{HistogramBuckets, escape_label_value};
 
@@ -84,6 +85,21 @@ pub struct MeshRequestKey {
 }
 
 pub(crate) const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
+/// Stamped once per mesh TCP stream whose complete `on_stream_connect` chain
+/// accepted the connection, at the point where mesh identity / tag-override /
+/// disable metadata is final.
+///
+/// Ferrum allows several effective `workload_metrics` instances on one proxy,
+/// so the plugin hook itself runs once per instance over intermediate metadata.
+/// The opened counter therefore cannot be emitted from the hook: the marker is
+/// what makes admission — and the TCP lifecycle counters keyed on it —
+/// exactly-once per connection under the FINAL policy. It also gates the
+/// closed/byte half, so a rejected chain contributes to neither side rather
+/// than leaving `opened` and `closed` permanently unbalanced.
+///
+/// The `mesh.metrics.` prefix keeps it out of `mesh_trace_attributes`, exactly
+/// like the disable/tag-override plans.
+pub const MESH_TCP_STREAM_ADMITTED_METADATA: &str = "mesh.metrics.tcp_stream_admitted";
 pub(crate) const MESH_REQUEST_COUNT_OVERRIDES_METADATA: &str =
     "mesh.metrics.request_count.tag_overrides";
 pub(crate) const MESH_REQUEST_DURATION_OVERRIDES_METADATA: &str =
@@ -1717,6 +1733,43 @@ pub(crate) fn mesh_request_key_for_family_from_metadata(
     }
     normalize_removed_labels(&mut key);
     key
+}
+
+/// True when stream metadata identifies a mesh TCP connection, using the same
+/// two conditions the opened/closed emitters apply: at least one `mesh.` label
+/// (otherwise `mesh_stream_key_from_metadata` yields no key) and a TCP request
+/// protocol, where an absent protocol defaults to `tcp` exactly as the key
+/// builder does.
+pub fn metadata_is_mesh_tcp_stream(metadata: &HashMap<String, String>) -> bool {
+    metadata.keys().any(|key| key.starts_with("mesh."))
+        && metadata
+            .get("mesh.request_protocol")
+            .or_else(|| metadata.get("request_protocol"))
+            .is_none_or(|protocol| is_mesh_tcp_protocol(protocol))
+}
+
+/// True when this stream's `on_stream_connect` chain accepted the connection
+/// and mesh TCP admission was already recorded for it.
+pub fn mesh_tcp_stream_admitted(metadata: &HashMap<String, String>) -> bool {
+    metadata.contains_key(MESH_TCP_STREAM_ADMITTED_METADATA)
+}
+
+/// Record mesh TCP admission for a stream whose complete `on_stream_connect`
+/// plugin chain accepted the connection.
+///
+/// Call this once, from the accept path, after the last hook returned — never
+/// from a plugin hook. At that point `ctx.metadata` carries the final mesh
+/// identity, tag-override, and disable policy, so the opened counter is emitted
+/// once per connection under the same metadata the disconnect summary will
+/// carry.
+pub(crate) fn record_admitted_mesh_tcp_stream(ctx: &mut StreamConnectionContext) {
+    let proxy_id = ctx.proxy_id.as_str();
+    let proxy_name = ctx.proxy_name.as_deref();
+    let Some(metadata) = ctx.metadata.as_mut() else {
+        return;
+    };
+    let registry = crate::plugins::prometheus_metrics::global_registry();
+    registry.record_mesh_tcp_admitted(metadata, proxy_id, proxy_name);
 }
 
 pub fn is_mesh_tcp_protocol(protocol: &str) -> bool {

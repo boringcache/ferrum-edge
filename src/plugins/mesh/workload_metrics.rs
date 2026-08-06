@@ -1059,13 +1059,12 @@ impl Plugin for WorkloadMetrics {
                 self.insert_proxy_destination_labels(metadata, &proxy_namespace, &proxy_name);
             }
         }
-        if crate::plugins::mesh::prometheus_helpers::is_mesh_tcp_protocol(request_protocol) {
-            crate::plugins::prometheus_metrics::global_registry().record_mesh_tcp_opened(
-                metadata,
-                ctx.proxy_id.as_str(),
-                ctx.proxy_name.as_deref(),
-            );
-        }
+        // TCP_OPENED_CONNECTIONS is deliberately NOT emitted here. Several
+        // effective `workload_metrics` instances may run this hook for one
+        // connection, each over metadata that later instances still modify, and
+        // a later plugin may still reject the stream. The accept path emits it
+        // once, after the complete chain accepted, via
+        // `prometheus_helpers::record_admitted_mesh_tcp_stream`.
         PluginResult::Continue
     }
 
