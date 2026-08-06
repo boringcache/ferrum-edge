@@ -181,7 +181,10 @@ fn xds_round_trip_malformed_and_oversized_gateway_class_carrier_rejected() {
     assert!(
         MeshSliceCarrier::decode(FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL, &oversized).is_err()
     );
-    let huge_payload = format!("\"{}\"", "x".repeat(MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES));
+    let huge_payload = format!(
+        "\"{}\"",
+        "x".repeat(MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES)
+    );
     assert!(
         MeshSliceCarrier::decode(
             FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL,

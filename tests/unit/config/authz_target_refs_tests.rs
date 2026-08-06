@@ -95,8 +95,11 @@ fn gateway_target_ref_applies_to_every_destination_at_matching_waypoint() {
             name: "waypoint".to_string(),
         }],
     });
-    let destination =
-        cache_with_service(HashMap::from([("app".to_string(), "reviews".to_string())]), "default", "reviews");
+    let destination = cache_with_service(
+        HashMap::from([("app".to_string(), "reviews".to_string())]),
+        "default",
+        "reviews",
+    );
     assert!(destination.policy_applies_for_destination(&policy));
     assert!(!destination.policy_applies(&policy));
 

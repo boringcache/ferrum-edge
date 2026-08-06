@@ -351,8 +351,7 @@ pub const MAX_POLICY_TARGET_REF_KIND_LEN: usize = 63;
 pub const MAX_POLICY_TARGET_REF_NAME_LEN: usize = 253;
 
 /// TargetRef namespace length bound (reuses the shared Ferrum namespace ceiling).
-pub const MAX_POLICY_TARGET_REF_NAMESPACE_LEN: usize =
-    crate::config::types::MAX_NAMESPACE_LENGTH;
+pub const MAX_POLICY_TARGET_REF_NAMESPACE_LEN: usize = crate::config::types::MAX_NAMESPACE_LENGTH;
 
 /// Kubernetes label-key length bound (`prefix/name`, DNS subdomain + `/` + 63).
 pub const MAX_POLICY_TARGET_REF_SELECTOR_KEY_LEN: usize = 253 + 1 + 63;
@@ -4277,9 +4276,9 @@ fn validate_mesh_policy_target_refs_scope(
                     && !name.trim().is_empty()
                     && namespace.len() <= MAX_POLICY_TARGET_REF_NAMESPACE_LEN
                     && name.len() <= MAX_POLICY_TARGET_REF_NAME_LEN
-                    && !waypoint_bindings.iter().any(|binding| {
-                        binding.namespace == *namespace && binding.name == *name
-                    })
+                    && !waypoint_bindings
+                        .iter()
+                        .any(|binding| binding.namespace == *namespace && binding.name == *name)
                 {
                     errors.push(format!(
                         "{path}: Gateway '{namespace}/{name}' was not found in waypoint_bindings; \
@@ -4329,7 +4328,9 @@ fn validate_target_ref_selector_labels(
     }
     for (key, value) in selector_labels {
         if key.trim().is_empty() {
-            errors.push(format!("{path}.selector_labels: label key must not be empty"));
+            errors.push(format!(
+                "{path}.selector_labels: label key must not be empty"
+            ));
         }
         if value.trim().is_empty() {
             errors.push(format!(

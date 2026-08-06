@@ -1965,11 +1965,9 @@ fn apply_recovered_carrier(
         MeshSliceCarrier::SidecarEgressScope(value) => recovered.sidecar_egress_scope = Some(value),
         MeshSliceCarrier::WaypointGatewayClass(value) => {
             if recovered.waypoint_gateway_class_seen {
-                return Err(
-                    "xDS WaypointGatewayClass carrier appeared more than once; \
+                return Err("xDS WaypointGatewayClass carrier appeared more than once; \
                      exactly one authoritative class value is required"
-                        .to_string(),
-                );
+                    .to_string());
             }
             recovered.waypoint_gateway_class_seen = true;
             recovered.waypoint_gateway_class = Some(value);
@@ -4936,12 +4934,11 @@ mod tests {
         let mut changed = native.clone();
         changed.waypoint_gateway_class = Some("ferrum-waypoint".to_string());
         assert!(!native.content_eq(&changed));
-        let changed_recovered = accumulator_from_snapshot(&translate_mesh_slice_to_snapshot(
-            &changed,
-        ))
-        .try_build_mesh_slice(&config)
-        .expect("changed class recovers")
-        .expect("present");
+        let changed_recovered =
+            accumulator_from_snapshot(&translate_mesh_slice_to_snapshot(&changed))
+                .try_build_mesh_slice(&config)
+                .expect("changed class recovers")
+                .expect("present");
         assert_eq!(
             changed_recovered.waypoint_gateway_class.as_deref(),
             Some("ferrum-waypoint")
@@ -4949,11 +4946,12 @@ mod tests {
 
         let mut missing_class = native.clone();
         missing_class.waypoint_gateway_class = None;
-        let missing_class_error = accumulator_from_snapshot(&translate_mesh_slice_to_snapshot(
-            &missing_class,
-        ))
-        .try_build_mesh_slice(&config)
-        .expect_err("an enforcing GatewayClass policy without its class carrier must be rejected");
+        let missing_class_error =
+            accumulator_from_snapshot(&translate_mesh_slice_to_snapshot(&missing_class))
+                .try_build_mesh_slice(&config)
+                .expect_err(
+                    "an enforcing GatewayClass policy without its class carrier must be rejected",
+                );
         assert!(
             missing_class_error.contains(
                 "enforcing GatewayClass-targeted policy but no authoritative WaypointGatewayClass carrier"
@@ -4964,12 +4962,11 @@ mod tests {
         let mut cleared = native.clone();
         cleared.waypoint_gateway_class = None;
         cleared.mesh_policies.clear();
-        let cleared_recovered = accumulator_from_snapshot(&translate_mesh_slice_to_snapshot(
-            &cleared,
-        ))
-        .try_build_mesh_slice(&config)
-        .expect("coherent class and policy removal recovers")
-        .expect("present");
+        let cleared_recovered =
+            accumulator_from_snapshot(&translate_mesh_slice_to_snapshot(&cleared))
+                .try_build_mesh_slice(&config)
+                .expect("coherent class and policy removal recovers")
+                .expect("present");
         assert!(
             cleared_recovered.waypoint_gateway_class.is_none(),
             "missing carrier must not reuse a stale class stamp"

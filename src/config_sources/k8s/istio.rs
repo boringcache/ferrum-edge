@@ -173,8 +173,7 @@ fn authorization_policy(
     })
 }
 
-const AUTHZ_TARGET_REF_MAX: usize =
-    crate::modes::mesh::config::MAX_POLICY_TARGET_REFS;
+const AUTHZ_TARGET_REF_MAX: usize = crate::modes::mesh::config::MAX_POLICY_TARGET_REFS;
 const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
 const ISTIO_NETWORKING_GROUP: &str = "networking.istio.io";
 
@@ -6871,7 +6870,9 @@ mod tests {
         let mesh = result.config.mesh.expect("mesh config");
         match &mesh.mesh_policies[0].scope {
             PolicyScope::TargetRefs { attachments } => match &attachments[0] {
-                PolicyTargetAttachment::Service { namespace, name, .. } => {
+                PolicyTargetAttachment::Service {
+                    namespace, name, ..
+                } => {
                     assert_eq!(namespace, "other");
                     assert_eq!(name, "payments");
                 }

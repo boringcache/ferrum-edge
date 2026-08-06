@@ -794,9 +794,7 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         }
         MeshSliceCarrier::MultiCluster(value) => slice.multi_cluster = Some(value),
         MeshSliceCarrier::SidecarEgressScope(value) => slice.sidecar_egress_scope = Some(value),
-        MeshSliceCarrier::WaypointGatewayClass(value) => {
-            slice.waypoint_gateway_class = Some(value)
-        }
+        MeshSliceCarrier::WaypointGatewayClass(value) => slice.waypoint_gateway_class = Some(value),
     }
 }
 
@@ -1095,8 +1093,7 @@ mod tests {
     #[test]
     fn waypoint_gateway_class_carrier_rejects_hostile_input() {
         assert!(
-            MeshSliceCarrier::decode(FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL, b"\"\"")
-                .is_err(),
+            MeshSliceCarrier::decode(FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL, b"\"\"").is_err(),
             "empty string must fail closed"
         );
         assert!(
@@ -1105,25 +1102,25 @@ mod tests {
             "whitespace-only must fail closed"
         );
         assert!(
-            MeshSliceCarrier::decode(FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL, b"\" istio-waypoint\"")
-                .is_err(),
+            MeshSliceCarrier::decode(
+                FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL,
+                b"\" istio-waypoint\""
+            )
+            .is_err(),
             "leading whitespace must fail closed"
         );
         let oversized_name = "a".repeat(MAX_WAYPOINT_GATEWAY_CLASS_LEN + 1);
         let oversized_json = serde_json::to_vec(&oversized_name).expect("json");
         assert!(
-            MeshSliceCarrier::decode(
-                FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL,
-                &oversized_json
-            )
-            .is_err(),
+            MeshSliceCarrier::decode(FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL, &oversized_json)
+                .is_err(),
             "over-length class name must fail closed"
         );
-        let oversized_payload =
-            format!("\"{}\"", "b".repeat(MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES));
-        assert!(
-            oversized_payload.len() > MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES
+        let oversized_payload = format!(
+            "\"{}\"",
+            "b".repeat(MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES)
         );
+        assert!(oversized_payload.len() > MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES);
         assert!(
             MeshSliceCarrier::decode(
                 FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL,
