@@ -1596,8 +1596,8 @@ paths:
         so load balancers and monitoring probes can act on the level without
         seeing resource internals. The **full** snapshot — resource pressure
         (file descriptors, connections, requests, event-loop latency), active
-        counts, port-exhaustion events, load-shedding actions, and stream-listener
-        diagnostics — requires a valid admin JWT, a matching
+        counts, port-exhaustion events, load-shedding actions, stream-listener
+        diagnostics, and `listener_failures` — requires a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS`
         source IP.
 

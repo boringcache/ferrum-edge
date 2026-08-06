@@ -238,11 +238,11 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **What it stores:** Per-consumer charge accumulators with nanosecond-precision timestamps for staleness detection.
 
-**Default limit:** No hard entry cap -- bounded by the number of active consumers.
+**Default limit:** Hard budgets on retained billing rows and bytes. `max_entries` defaults to `100000` and `max_retained_bytes` defaults to `67108864` (64 MiB). When the retained-entry budget is exhausted, new identities fold into a single internal `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1` aggregate row (per-identity attribution is lost; invoice totals are preserved).
 
-**Config field:** N/A.
+**Config fields:** `max_entries`, `max_retained_bytes` (process-global — every enabled instance must use the same values), and `render_cache_ttl_seconds` (default `60`).
 
-**Cleanup mechanism:** Background eviction task runs periodically and removes entries that have not been updated within the configured staleness window. The rendered Prometheus/JSON output is cached with a configurable TTL (`render_cache_ttl_seconds`, default 60s).
+**Cleanup mechanism:** Background eviction task runs periodically and removes entries that have not been updated within the configured staleness window. The rendered Prometheus/JSON output is cached with a configurable TTL (`render_cache_ttl_seconds`, default 60s). Registry saturation is exported via `ferrum_api_chargeback_registry_entries`, `ferrum_api_chargeback_registry_max_entries`, `ferrum_api_chargeback_registry_retained_bytes`, `ferrum_api_chargeback_registry_max_retained_bytes`, `ferrum_api_chargeback_identity_overflow_total`, and `ferrum_api_chargeback_dropped_charges_total`.
 
 ### Prometheus Metrics
 
@@ -289,6 +289,8 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 | `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results |
 | `ldap_auth` | `cache_ttl_seconds` | `0` | LDAP cache entry TTL (`0` = disabled; maximum `86400`) |
 | `jwks_auth` | `jwks_refresh_interval_secs` | `900` | JWKS key set refresh interval |
+| `api_chargeback` | `max_entries` | `100000` | Hard ceiling on retained billing rows (complete registry entry keys) |
+| `api_chargeback` | `max_retained_bytes` | `67108864` | Hard ceiling on retained billing-row bytes |
 | `api_chargeback` | `render_cache_ttl_seconds` | `60` | Rendered output cache TTL |
 | `prometheus_metrics` | `render_cache_ttl_seconds` | `60` | Rendered output cache TTL |
 
