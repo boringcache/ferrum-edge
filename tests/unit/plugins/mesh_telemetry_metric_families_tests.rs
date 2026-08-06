@@ -239,34 +239,33 @@ fn tcp_opened_closed_and_bytes_follow_connect_disconnect_lifecycle() {
             && line.ends_with(" 1")),
         "closed must increment on disconnect:\n{after_close}"
     );
-    // Direction contract: Ferrum's gateway-perspective convention, matching
-    // `StreamTransactionSummary.bytes_sent` / `bytes_received` and
-    // `ferrum_api_bytes_{sent,received}_total`. `sent` is client->backend and
-    // `received` is backend->client. Istio names `istio_tcp_sent_bytes_total`
-    // the other way round, so do not "fix" this by swapping the two arms —
-    // that would contradict every other Ferrum byte counter. The rendered HELP
-    // text states the direction and is pinned by the metric-contract test.
+    // Direction contract: these mesh families implement Istio Telemetry's
+    // canonical TCP_SENT_BYTES=response and TCP_RECEIVED_BYTES=request
+    // semantics. StreamTransactionSummary uses Ferrum's gateway-perspective
+    // field names, so the producer intentionally maps bytes_received to sent
+    // and bytes_sent to received. General Ferrum transaction/API counters keep
+    // their existing gateway-perspective convention.
     assert!(
         after_close
             .lines()
             .any(|line| line.starts_with("ferrum_mesh_tcp_sent_bytes_total{")
-                && line.ends_with(" 700")),
-        "sent bytes must equal stream bytes_sent (client->backend):\n{after_close}"
+                && line.ends_with(" 900")),
+        "TCP_SENT_BYTES must equal response bytes (backend->client):\n{after_close}"
     );
     assert!(
         after_close.lines().any(
             |line| line.starts_with("ferrum_mesh_tcp_received_bytes_total{")
-                && line.ends_with(" 900")
+                && line.ends_with(" 700")
         ),
-        "received bytes must equal stream bytes_received (backend->client):\n{after_close}"
+        "TCP_RECEIVED_BYTES must equal request bytes (client->backend):\n{after_close}"
     );
     assert!(
-        after_close.contains("sent client->backend on closed connections."),
-        "sent-bytes HELP must state the gateway-perspective direction:\n{after_close}"
+        after_close.contains("response bytes sent backend->client on closed connections."),
+        "sent-bytes HELP must state the Istio response direction:\n{after_close}"
     );
     assert!(
-        after_close.contains("received backend->client on closed connections."),
-        "received-bytes HELP must state the gateway-perspective direction:\n{after_close}"
+        after_close.contains("request bytes received client->backend on closed connections."),
+        "received-bytes HELP must state the Istio request direction:\n{after_close}"
     );
 }
 
@@ -443,8 +442,8 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
             .lines()
             .any(|line| line.starts_with("ferrum_mesh_tcp_sent_bytes_total{")
                 && line.contains("source_workload=\"edge\"")
-                && line.ends_with(" 42")),
-        "override-scoped sent bytes must keep value 42:\n{output}"
+                && line.ends_with(" 7")),
+        "override-scoped TCP_SENT_BYTES must keep the response-byte value 7:\n{output}"
     );
     assert!(
         output

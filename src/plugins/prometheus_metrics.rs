@@ -592,9 +592,9 @@ pub struct MetricsRegistry {
     pub mesh_tcp_opened_counter: DashMap<MeshRequestKey, TimestampedCounter>,
     /// Mesh TCP connections closed (TCP_CLOSED_CONNECTIONS).
     pub mesh_tcp_closed_counter: DashMap<MeshRequestKey, TimestampedCounter>,
-    /// Mesh TCP bytes sent (TCP_SENT_BYTES).
+    /// Mesh TCP response bytes sent (Istio TCP_SENT_BYTES semantics).
     pub mesh_tcp_sent_bytes_counter: DashMap<MeshRequestKey, TimestampedCounter>,
-    /// Mesh TCP bytes received (TCP_RECEIVED_BYTES).
+    /// Mesh TCP request bytes received (Istio TCP_RECEIVED_BYTES semantics).
     pub mesh_tcp_received_bytes_counter: DashMap<MeshRequestKey, TimestampedCounter>,
     /// Mesh gRPC request messages (GRPC_REQUEST_MESSAGES).
     pub mesh_grpc_request_messages_counter: DashMap<MeshRequestKey, TimestampedCounter>,
@@ -947,7 +947,10 @@ impl MetricsRegistry {
             self.mesh_tcp_sent_bytes_counter
                 .entry(key)
                 .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                .add(summary.bytes_sent, self.epoch);
+                // Istio Telemetry defines TCP_SENT_BYTES as response bytes.
+                // StreamTransactionSummary uses Ferrum's gateway-perspective
+                // names, where bytes_received is backend->client.
+                .add(summary.bytes_received, self.epoch);
         }
         if !prometheus_helpers::mesh_metric_disabled_metadata(
             &summary.metadata,
@@ -961,7 +964,9 @@ impl MetricsRegistry {
             self.mesh_tcp_received_bytes_counter
                 .entry(key)
                 .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                .add(summary.bytes_received, self.epoch);
+                // Istio Telemetry defines TCP_RECEIVED_BYTES as request bytes.
+                // StreamTransactionSummary.bytes_sent is client->backend.
+                .add(summary.bytes_sent, self.epoch);
         }
     }
 
@@ -2271,12 +2276,12 @@ impl MetricsRegistry {
             (
                 &self.mesh_tcp_sent_bytes_counter,
                 "ferrum_mesh_tcp_sent_bytes_total",
-                "Mesh TCP bytes the gateway sent client->backend on closed connections.",
+                "Mesh TCP response bytes sent backend->client on closed connections.",
             ),
             (
                 &self.mesh_tcp_received_bytes_counter,
                 "ferrum_mesh_tcp_received_bytes_total",
-                "Mesh TCP bytes the gateway received backend->client on closed connections.",
+                "Mesh TCP request bytes received client->backend on closed connections.",
             ),
             (
                 &self.mesh_grpc_request_messages_counter,

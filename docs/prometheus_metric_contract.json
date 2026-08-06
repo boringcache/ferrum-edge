@@ -2230,7 +2230,7 @@
   {
     "name": "ferrum_mesh_tcp_received_bytes_total",
     "type": "counter",
-    "help": "Mesh TCP bytes the gateway received backend->client on closed connections.",
+    "help": "Mesh TCP request bytes received client->backend on closed connections.",
     "labels": [
       "source_workload",
       "source_namespace",
@@ -2255,7 +2255,7 @@
   {
     "name": "ferrum_mesh_tcp_sent_bytes_total",
     "type": "counter",
-    "help": "Mesh TCP bytes the gateway sent client->backend on closed connections.",
+    "help": "Mesh TCP response bytes sent backend->client on closed connections.",
     "labels": [
       "source_workload",
       "source_namespace",
