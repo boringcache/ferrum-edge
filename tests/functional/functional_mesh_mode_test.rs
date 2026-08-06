@@ -53,10 +53,12 @@ use ferrum_edge::identity::workload_api::proto::{
     X509svidResponse,
 };
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, EastWestGateway, MeshConfig, MeshPolicy, MeshRule, MeshService, MtlsMode,
-    MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope, PolicyTargetAttachment,
-    PrincipalMatch, ServicePort, ServiceTargetPort, TrustBundle, TrustBundleSet, Workload,
-    WorkloadPort, WorkloadRef, WorkloadSelector,
+    AppProtocol, EastWestGateway, MeshConfig, MeshConsistentHash, MeshDestinationRule,
+    MeshEndpoint, MeshLoadBalancer, MeshPolicy, MeshRule, MeshService, MeshSimpleLb,
+    MeshTrafficPolicy, MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope,
+    PolicyTargetAttachment, PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation,
+    ServicePort, ServiceTargetPort, TrustBundle, TrustBundleSet, Workload, WorkloadPort,
+    WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::xds::XdsAdsServer;
@@ -879,6 +881,7 @@ const MESH_MODE_TEST_SOURCE: &str = include_str!(concat!(
 /// Multi-gateway mesh fixtures that spawn gateway subprocesses under a bounded
 /// retry loop. Every one of them must gate readiness on the SPAWNED CHILD.
 const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
+    "drive_dr_live_visibility",
     "drive_egress_a_to_b",
     "drive_grpc_egress_a_to_b",
     "drive_websocket_egress_a_to_b",
@@ -891,6 +894,7 @@ const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
 
 /// Drivers that must void an attempt whose gateway died mid-run.
 const DEAD_GATEWAY_VOIDING_DRIVERS: &[&str] = &[
+    "drive_dr_live_visibility",
     "drive_egress_a_to_b",
     "drive_grpc_egress_a_to_b",
     "drive_websocket_egress_a_to_b",
@@ -1456,6 +1460,411 @@ async fn functional_mesh_mode_rejects_egress_gateway_without_mtls_material() {
     assert!(
         tcp_port_stays_closed(egress_port, Duration::from_millis(500)).await,
         "egress mTLS listener should not bind after failed validation\n{output}"
+    );
+}
+
+// ── DestinationRule visibility + lookup tier, on the real data plane ─────────
+//
+// Issues #2465 (`exportTo` visibility) and #2469 (client → service → root
+// lookup hierarchy). Static/integration coverage proves the resolver in
+// isolation; these cases prove the SHIPPED BINARY resolves one winner across
+// three namespaces and that the winner is observable ON THE WIRE, not merely
+// present in a prepared config.
+//
+// The observable is load balancing across two labelled backends behind one
+// destination:
+//
+// * no applicable rule  → the materialized upstream keeps its default
+//   ROUND_ROBIN, so consecutive requests reach BOTH backends;
+// * an applicable `consistentHash{useSourceIp}` rule → every request from the
+//   one fixture client IP pins to a SINGLE backend.
+//
+// That makes "the rule applied" and "the rule did not apply" two different
+// wire outcomes with no timing component, so each scenario below is a
+// deterministic accept/reject of one visibility or tier decision.
+//
+// The subscriber (client) namespace is the gateway's own `FERRUM_NAMESPACE`;
+// the destination is declared by a ServiceEntry in a DIFFERENT namespace, and
+// the mesh root namespace is a third.
+
+/// Client (subscriber) namespace — Istio's FIRST lookup tier.
+const DR_LIVE_CLIENT_NAMESPACE: &str = "ferrum";
+/// Namespace that DECLARES the destination — the SECOND lookup tier.
+const DR_LIVE_SERVICE_NAMESPACE: &str = "beta";
+/// `meshConfig.rootNamespace` — the THIRD (fallback) lookup tier.
+const DR_LIVE_ROOT_NAMESPACE: &str = "istio-system";
+/// Destination host. Egress upstream targets are the ServiceEntry's own static
+/// endpoint addresses, so the DestinationRule host is that address.
+const DR_LIVE_DESTINATION_HOST: &str = "127.0.0.1";
+/// Requests driven after the route converges. Round-robin over two backends
+/// reaches both well within this count; a consistent-hash winner cannot.
+const DR_LIVE_REQUESTS: usize = 8;
+
+/// One DestinationRule for the shared destination host.
+///
+/// `sticky = true` requests `consistentHash{useSourceIp}` (the fixture client
+/// always dials from one loopback address, so the hash pins ONE backend);
+/// `sticky = false` requests an explicit `ROUND_ROBIN`, which is also the
+/// materialized default — that is deliberate, because it lets a CLIENT-tier
+/// rule visibly override a sticky service/root-tier rule.
+fn dr_live_rule(
+    name: &str,
+    namespace: &str,
+    export_to: &[&str],
+    sticky: bool,
+) -> MeshDestinationRule {
+    let load_balancer = if sticky {
+        MeshLoadBalancer::ConsistentHash(MeshConsistentHash {
+            http_header_name: None,
+            http_cookie_name: None,
+            use_source_ip: true,
+        })
+    } else {
+        MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin)
+    };
+    MeshDestinationRule {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        host: DR_LIVE_DESTINATION_HOST.to_string(),
+        traffic_policy: Some(MeshTrafficPolicy {
+            load_balancer: Some(load_balancer),
+            ..MeshTrafficPolicy::default()
+        }),
+        port_level_settings: HashMap::new(),
+        subsets: Vec::new(),
+        export_to: export_to.iter().map(|entry| entry.to_string()).collect(),
+    }
+}
+
+/// Extract the labelled backend's entity body from `mesh_inbound_http_get`'s
+/// full HTTP/1 response. Policy assertions must never key on gateway-managed
+/// headers such as `Date`: doing so both rejects a correct response as an
+/// unknown label and makes a sticky-backend sample appear to change when the
+/// requests cross a wall-clock second.
+fn dr_live_backend_label(response: &str) -> Result<String, String> {
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("response has no HTTP header/body boundary: {response:?}"))?;
+    let label = body.trim();
+    if label == "backend-a" || label == "backend-b" {
+        Ok(label.to_string())
+    } else {
+        Err(format!(
+            "response entity is not a fixture backend label: {label:?}; response={response:?}"
+        ))
+    }
+}
+
+/// Slice for the live DestinationRule cases: one externally-declared
+/// destination in `beta` with two labelled endpoints, plus whatever rules the
+/// scenario is testing.
+fn dr_live_slice(
+    node_id: &str,
+    backend_a: u16,
+    backend_b: u16,
+    destination_rules: Vec<MeshDestinationRule>,
+) -> MeshSlice {
+    let endpoint = |port: u16| MeshEndpoint {
+        address: DR_LIVE_DESTINATION_HOST.to_string(),
+        ports: HashMap::from([("http".to_string(), port)]),
+        labels: HashMap::new(),
+        network: None,
+    };
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: DR_LIVE_CLIENT_NAMESPACE.to_string(),
+        version: Utc::now().to_rfc3339(),
+        istio_root_namespace: DR_LIVE_ROOT_NAMESPACE.to_string(),
+        service_entries: vec![ServiceEntry {
+            name: "dr-live-external".to_string(),
+            namespace: DR_LIVE_SERVICE_NAMESPACE.to_string(),
+            hosts: vec![DR_LIVE_DESTINATION_HOST.to_string()],
+            endpoints: vec![endpoint(backend_a), endpoint(backend_b)],
+            resolution: Resolution::Static,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 80,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            // The DESTINATION is visible mesh-wide on purpose: every scenario
+            // below varies only the DestinationRules' visibility/tier, never
+            // whether the subscriber can see the service at all.
+            export_to: vec!["*".to_string()],
+            workload_selector: None,
+        }],
+        destination_rules,
+        ..MeshSlice::default()
+    }
+}
+
+/// Spawn a real egress-gateway mesh data plane for `destination_rules`, drive
+/// [`DR_LIVE_REQUESTS`] mTLS requests at the destination, and return the set of
+/// backend labels that actually served them.
+///
+/// Attempt discipline follows the harness contract: readiness is bound to the
+/// spawned child, an attempt whose gateway died mid-run is VOID (retried with
+/// fresh ports/dirs/control plane), and the route-convergence poll stops at the
+/// FIRST authoritative response — the measured requests are then driven exactly
+/// once each and every one of them must succeed.
+async fn drive_dr_live_visibility(
+    scenario: &str,
+    destination_rules: Vec<MeshDestinationRule>,
+) -> HashSet<String> {
+    ensure_gateway_built().expect("gateway binary built");
+    let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/egress";
+    let client_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client";
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-dr-live-{scenario}-{attempt}");
+        let temp = TempDir::new().expect("temp dir");
+        let peers = generate_mesh_peer_svids(temp.path(), server_spiffe, client_spiffe);
+        let backend_a = start_labeled_echo_backend("backend-a").await;
+        let backend_b = start_labeled_echo_backend("backend-b").await;
+
+        let cp = start_static_mesh_cp(dr_live_slice(
+            &node_id,
+            backend_a,
+            backend_b,
+            destination_rules.clone(),
+        ))
+        .await;
+        let ports = reserve_mesh_ports().await;
+        let egress_port = ports.egress;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "egress_gateway",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        let readiness = wait_for_gateway_listener(&mut child, egress_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
+            last_failure = format!(
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("egress gateway", egress_port),
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            continue;
+        }
+
+        let ca_pem = peers.ca_pem.clone();
+        let client_cert_pem = peers.client_cert_pem.clone();
+        let client_key_pem = peers.client_key_pem.clone();
+        let request = || {
+            let ca = ca_pem.clone();
+            let cert = client_cert_pem.clone();
+            let key = client_key_pem.clone();
+            async move {
+                mesh_inbound_http_get(
+                    egress_port,
+                    &ca,
+                    server_spiffe,
+                    Some((&cert, &key)),
+                    DR_LIVE_DESTINATION_HOST,
+                    "/",
+                )
+                .await
+            }
+        };
+
+        // Convergence only: the egress route table can still be publishing when
+        // the listener accepts. Retried outcomes are non-authoritative
+        // (transport setup / route not yet materialized) and bounded.
+        let deadline = Instant::now() + CROSS_CLUSTER_CONVERGENCE_TIMEOUT;
+        let mut observed: HashSet<String> = HashSet::new();
+        let mut converged = None;
+        while Instant::now() < deadline {
+            match request().await {
+                Ok((200, response)) => match dr_live_backend_label(&response) {
+                    Ok(label) => {
+                        converged = Some(label);
+                        break;
+                    }
+                    Err(error) => {
+                        last_failure = format!("attempt {attempt}: {error}");
+                        break;
+                    }
+                },
+                Ok((status, body)) => {
+                    last_failure =
+                        format!("attempt {attempt}: convergence status {status}, body {body:?}");
+                }
+                Err(error) => {
+                    last_failure = format!("attempt {attempt}: convergence error {error}");
+                }
+            }
+            let died = exited_gateway_diagnostic(&mut [("egress gateway", &mut child)]);
+            if let Some(diagnostic) = died {
+                last_failure = format!("attempt {attempt}: {diagnostic}");
+                break;
+            }
+            tokio::time::sleep(CROSS_CLUSTER_CONVERGENCE_POLL_INTERVAL).await;
+        }
+
+        let Some(first_body) = converged else {
+            last_failure = format!("{last_failure}\n{}", captured_output(&temp));
+            kill_child(&mut child);
+            cp.shutdown().await;
+            continue;
+        };
+        observed.insert(first_body);
+
+        // Authoritative measurement: each remaining request is driven exactly
+        // once and must be served.
+        let mut measurement_failure = None;
+        for index in 1..DR_LIVE_REQUESTS {
+            match request().await {
+                Ok((200, response)) => match dr_live_backend_label(&response) {
+                    Ok(label) => {
+                        observed.insert(label);
+                    }
+                    Err(error) => {
+                        measurement_failure = Some(format!("request {index}: {error}"));
+                        break;
+                    }
+                },
+                Ok((status, body)) => {
+                    measurement_failure =
+                        Some(format!("request {index} returned {status}, body {body:?}"));
+                    break;
+                }
+                Err(error) => {
+                    measurement_failure = Some(format!("request {index} failed: {error}"));
+                    break;
+                }
+            }
+        }
+
+        let gateway_died = exited_gateway_diagnostic(&mut [("egress gateway", &mut child)]);
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        // An attempt whose gateway died mid-run is VOID: its transport errors
+        // describe a dead process, not a policy decision.
+        if let Some(diagnostic) = gateway_died {
+            last_failure = format!("attempt {attempt}: {diagnostic}\n{output}");
+            continue;
+        }
+        if let Some(failure) = measurement_failure {
+            panic!("[{scenario}] {failure}\n{output}");
+        }
+        assert!(
+            observed
+                .iter()
+                .all(|label| label == "backend-a" || label == "backend-b"),
+            "[{scenario}] unexpected backend labels {observed:?}\n{output}"
+        );
+        return observed;
+    }
+
+    panic!("[{scenario}] no attempt produced a converged egress datapath\n{last_failure}");
+}
+
+/// #2465, on the wire: a DestinationRule declared `exportTo: ["."]` in the
+/// DESTINATION's namespace is invisible to a subscriber in another namespace,
+/// so it must not change that subscriber's traffic. If visibility leaked, the
+/// sticky rule would apply and every request would pin to one backend.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_dr_namespace_local_rule_does_not_reach_another_namespace() {
+    let observed = drive_dr_live_visibility(
+        "hidden-service-rule",
+        vec![dr_live_rule(
+            "service-dr",
+            DR_LIVE_SERVICE_NAMESPACE,
+            &["."],
+            true,
+        )],
+    )
+    .await;
+
+    assert_eq!(
+        observed.len(),
+        2,
+        "a DestinationRule exported only to its own namespace must not govern a \
+         subscriber in another namespace; the default round-robin must still reach \
+         both backends, but traffic pinned to {observed:?}"
+    );
+}
+
+/// Control for the case above: the SAME sticky rule, exported mesh-wide from
+/// the root namespace, DOES reach the subscriber. Without this the previous
+/// assertion could pass simply because the rule never applies at all.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_dr_root_namespace_rule_applies_when_exported() {
+    let observed = drive_dr_live_visibility(
+        "visible-root-rule",
+        vec![dr_live_rule(
+            "root-dr",
+            DR_LIVE_ROOT_NAMESPACE,
+            &["*"],
+            true,
+        )],
+    )
+    .await;
+
+    assert_eq!(
+        observed.len(),
+        1,
+        "a mesh-wide root-namespace DestinationRule must govern this subscriber, \
+         pinning every request to one backend; observed {observed:?}"
+    );
+}
+
+/// #2469, on the wire: with visible rules at ALL THREE tiers, the CLIENT
+/// namespace's rule wins outright. The service- and root-tier rules are sticky
+/// and the client-tier rule is round-robin, so a wrong winner pins traffic to
+/// one backend. That also inverts Ferrum's pre-#2469 "layer every match in
+/// `(namespace, name)` order, last writer wins" behaviour: `istio-system` sorts
+/// after the `ferrum` client namespace, so the old code would have applied the
+/// sticky root rule last and won with it.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_dr_client_namespace_rule_wins_over_service_and_root() {
+    let observed = drive_dr_live_visibility(
+        "client-tier-wins",
+        vec![
+            dr_live_rule("service-dr", DR_LIVE_SERVICE_NAMESPACE, &["*"], true),
+            dr_live_rule("root-dr", DR_LIVE_ROOT_NAMESPACE, &["*"], true),
+            dr_live_rule("client-dr", DR_LIVE_CLIENT_NAMESPACE, &["*"], false),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        observed.len(),
+        2,
+        "the client-namespace DestinationRule must win the lookup outright, so its \
+         round-robin governs and both backends serve; traffic instead behaved like a \
+         service/root-tier winner and pinned to {observed:?}"
     );
 }
 

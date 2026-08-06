@@ -640,10 +640,16 @@ capture_boundary() {
 
 assert_metric_admin_parity() {
   local context="$1" token="$2" peer="$3" td="$4"
-  local json_file="$RESULTS_DIR/parity.json" metrics_file="$RESULTS_DIR/parity.prom"
-  admin_json "$context" "$token" > "$json_file"; metrics "$context" "$token" > "$metrics_file"
+  local json_before="$RESULTS_DIR/parity-before.json"
+  local json_after="$RESULTS_DIR/parity-after.json"
+  local metrics_file="$RESULTS_DIR/parity.prom"
+  # Admin/metrics are separate HTTP requests. Capture enclosing admin snapshots
+  # so a poll that lands between them cannot fail a single-generation parity check.
+  admin_json "$context" "$token" > "$json_before"
+  metrics "$context" "$token" > "$metrics_file"
+  admin_json "$context" "$token" > "$json_after"
   python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
-    assert-metric-admin-parity "$json_file" "$metrics_file" "$peer" "$td"
+    assert-metric-admin-parity "$json_before" "$metrics_file" "$json_after" "$peer" "$td"
 }
 
 projected_config_withdrawn() {
@@ -797,7 +803,9 @@ scenario_transient() {
   record multicluster_poller.metrics.failure_backoff_recovery_bounded pass \
     "bounded-partition-deltas-federation-$TRANSIENT_FEDERATION_FAILURE_DELTA-discovery-$TRANSIENT_DISCOVERY_FAILURE_DELTA-redacted-labels-recovered" \
     "poller.initial.polled_trust_endpoints_installed.prom,poller.transient.last_good_retained.prom,poller.metrics.failure_backoff_recovery_cache_age.prom"
-  record multicluster_poller.metrics.admin_status_parity pass "cache-ages-within-two-seconds" "parity.{json,prom}"
+  record multicluster_poller.metrics.admin_status_parity pass \
+    "cache-ages-match-enclosing-admin-snapshots-within-two-seconds" \
+    "parity-before.json,parity.prom,parity-after.json"
 }
 
 scenario_endpoint_expiry() {

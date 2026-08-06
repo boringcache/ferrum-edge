@@ -43,6 +43,7 @@ fn destination_rule(traffic_policy: Option<MeshTrafficPolicy>) -> MeshDestinatio
         traffic_policy,
         port_level_settings: HashMap::new(),
         subsets: Vec::new(),
+        export_to: vec!["*".to_string()],
     }
 }
 

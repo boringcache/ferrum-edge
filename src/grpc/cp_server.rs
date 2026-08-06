@@ -1043,8 +1043,18 @@ impl CpGrpcServer {
                 &istio_root_namespace,
             )
         });
-        mesh.destination_rules
-            .retain(|rule| visible_namespaces.contains(&rule.namespace));
+        // The configured root namespace is an Istio lookup tier, not an
+        // ordinary destination namespace. Preserve its rules through this
+        // coarse CP prefilter even when a Sidecar imports only the target
+        // service namespace; `MeshSlice::from_gateway_config` subsequently
+        // applies export visibility, host scope, and the shared
+        // client → service → root resolver. Dropping root rules here made the
+        // fallback depend on an unrelated Sidecar host pattern.
+        mesh.destination_rules.retain(|rule| {
+            visible_namespaces.contains(&rule.namespace)
+                || (!istio_root_namespace.trim().is_empty()
+                    && rule.namespace.trim() == istio_root_namespace.trim())
+        });
         mesh.proxy_configs.retain(|config| {
             Self::policy_scope_can_apply_to_namespace(
                 &config.namespace,
@@ -3374,9 +3384,11 @@ mod tests {
             traffic_policy: None,
             port_level_settings: Default::default(),
             subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
+                istio_root_namespace: "mesh-root".to_string(),
                 sidecars: vec![MeshSidecar {
                     name: "beta-egress".to_string(),
                     namespace: "alpha".to_string(),
@@ -3392,11 +3404,17 @@ mod tests {
                 services: vec![
                     service("alpha", "reviews"),
                     service("beta", "checkout"),
+                    service("beta", "catalog"),
                     service("gamma", "payments"),
                 ],
                 destination_rules: vec![
                     destination_rule("alpha", "alpha-reviews-dr", "reviews"),
                     destination_rule("beta", "beta-checkout-dr", "checkout"),
+                    destination_rule(
+                        "mesh-root",
+                        "root-catalog-dr",
+                        "catalog.beta.svc.cluster.local",
+                    ),
                     destination_rule("gamma", "gamma-payments-dr", "payments"),
                 ],
                 ..MeshConfig::default()
@@ -3436,6 +3454,12 @@ mod tests {
             "sidecar-admitted beta DestinationRule must survive the prefilter"
         );
         assert!(
+            mesh.destination_rules
+                .iter()
+                .any(|rule| rule.name == "root-catalog-dr"),
+            "the configured root fallback must survive independently of the Sidecar's imported namespaces"
+        );
+        assert!(
             !mesh
                 .destination_rules
                 .iter()
@@ -3467,11 +3491,34 @@ mod tests {
         );
 
         let slice = MeshSlice::from_gateway_config(&filtered, request);
-        assert_eq!(slice.services.len(), 1);
-        assert_eq!(slice.services[0].namespace, "beta");
-        assert_eq!(slice.services[0].name, "checkout");
-        assert_eq!(slice.destination_rules.len(), 1);
-        assert_eq!(slice.destination_rules[0].name, "beta-checkout-dr");
+        assert_eq!(slice.services.len(), 2);
+        assert!(
+            slice
+                .services
+                .iter()
+                .all(|service| service.namespace == "beta")
+        );
+        assert!(
+            slice
+                .services
+                .iter()
+                .any(|service| service.name == "checkout")
+        );
+        assert!(
+            slice
+                .services
+                .iter()
+                .any(|service| service.name == "catalog")
+        );
+        let admitted_rule_names: HashSet<_> = slice
+            .destination_rules
+            .iter()
+            .map(|rule| rule.name.as_str())
+            .collect();
+        assert_eq!(
+            admitted_rule_names,
+            HashSet::from(["beta-checkout-dr", "root-catalog-dr"])
+        );
     }
 
     #[test]
