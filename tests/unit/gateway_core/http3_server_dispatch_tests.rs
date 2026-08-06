@@ -213,7 +213,7 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
     // writer already halts after HEADERS; do not duplicate STOP_SENDING.
     // Read: client gone — halt, finalize cleanup, no response write.
     // TimedOut: mid-recv_data cancel — write under post-deadline grace with
-    // halt_recv=false; STOP_SENDING would unwrap-abort h3-quinn's empty slot.
+    // halt_recv=false, then let the wrapper halt through the vendored transport.
     let oversize = terminal_dispatch
         .split("Ok(None)")
         .nth(1)
@@ -284,11 +284,11 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
     assert!(timed_out.contains("&rejection.headers"));
     assert!(
         timed_out.contains("false,\n                    )\n                    .await?;"),
-        "timed-out terminal upload must pass halt_recv=false after mid-recv cancel"
+        "timed-out terminal upload must defer the halt until its bounded write settles"
     );
     assert!(
         !timed_out.contains("halt_cancelled_h3_upload("),
-        "timed-out mid-recv cancel must not STOP_SENDING the invalid receive slot"
+        "the timed-out branch must not halt before the response writer runs"
     );
 
     assert!(terminal_dispatch.contains("H3RequestBodyReadError::DeadlineExceeded"));
@@ -478,9 +478,13 @@ fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
     assert!(timed_out.contains("ctx,"));
     assert!(
         timed_out.contains("false,\n                )"),
-        "timed-out bridge upload must skip STOP_SENDING after mid-recv cancel"
+        "timed-out bridge upload must defer STOP_SENDING until after the bounded write"
     );
     assert!(timed_out.contains("await_post_deadline_terminal_response_write("));
+    assert!(
+        timed_out.contains("halt_request_body(stream)"),
+        "the full-stream bridge must halt after the bounded terminal write settles"
+    );
     let deadline = body
         .find("H3RequestBodyReadError::DeadlineExceeded")
         .expect("missing deadline upload branch");
@@ -903,8 +907,8 @@ fn h3_request_plugin_deadlines_mark_and_bound_terminal_rejections() {
     assert!(writer.contains("ctx.gateway_deadline_response_selected()"));
     assert!(writer.contains("replace_buffered_h3_response_with_grpc_deadline("));
     // Already-selected gateway deadline rejections use the shared post-deadline
-    // grace (not the expired absolute deadline). Grace expiry aborts the send
-    // half without STOP_SENDING after a mid-recv cancel.
+    // grace (not the expired absolute deadline), then halt the full request
+    // stream through the vendored transport even after a mid-recv cancel.
     assert!(writer.contains("await_post_deadline_terminal_response_write("));
     assert!(!writer.contains("await_terminal_response_write_before_deadline("));
     assert_eq!(
@@ -919,9 +923,10 @@ fn h3_request_plugin_deadlines_mark_and_bound_terminal_rejections() {
         2,
         "each grace-expiry arm must abort the response send half"
     );
-    assert!(
-        !writer.contains("halt_request_body(stream)"),
-        "post-cancel grace paths must not STOP_SENDING the invalid receive slot"
+    assert_eq!(
+        writer.matches("halt_request_body(stream)").count(),
+        2,
+        "each bounded full-stream branch must halt the request direction after the write settles"
     );
 }
 

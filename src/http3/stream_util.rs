@@ -117,8 +117,11 @@ where
 /// Biases the write so an immediately-ready HEADERS/FIN completes; a Pending
 /// flow-control wait is cancelled when the grace expires. Callers that see
 /// [`H3ResponseWriteError::DeadlineExceeded`] must
-/// [`abort_response_stream`] and must **not** call [`halt_request_body`] after
-/// a mid-`recv_data` cancel (h3-quinn's recv slot is `None`).
+/// [`abort_response_stream`]. Full-stream callers may then call
+/// [`halt_request_body`] even after a mid-`recv_data` cancel: the vendored
+/// h3-quinn transport keeps the receive stream reachable in that state. A
+/// split-stream caller still leaves the halt to the task that owns its receive
+/// half.
 pub(crate) async fn await_post_deadline_terminal_response_write<F, T, E>(
     write: F,
 ) -> Result<T, H3ResponseWriteError<E>>

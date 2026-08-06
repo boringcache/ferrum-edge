@@ -150,10 +150,10 @@ where
 ///
 /// Call this **after** protocol-appropriate response HEADERS (and body /
 /// trailers / FIN) are written whenever a drain ends without forwarding the
-/// body. Issuing `STOP_SENDING` before the response is observable can panic
-/// inside h3-quinn after a cancelled mid-`recv_data` poll and lets Quinn's
-/// `SendStream` Drop FIN the response half with no HEADERS
-/// (`H3_FRAME_UNEXPECTED` at the client). The helper itself is idempotent.
+/// body. Issuing `STOP_SENDING` first reverses response-before-teardown ordering
+/// and can let Quinn's `SendStream` Drop FIN the response half with no HEADERS
+/// (`H3_FRAME_UNEXPECTED` at the client). The vendored h3-quinn transport makes
+/// the helper total after a cancelled mid-`recv_data` poll; it is idempotent.
 #[inline]
 fn halt_cancelled_h3_upload<S>(stream: &mut RequestStream<S, Bytes>)
 where
@@ -13165,9 +13165,9 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
             RejectBodyDisposition::for_request(&ctx.method, deadline_status.as_u16());
         // Gateway already selected the deadline rejection; give HEADERS a real
         // opportunity under the shared post-deadline grace (not the expired
-        // absolute deadline). Skip STOP_SENDING after mid-recv_data cancel —
-        // h3-quinn would unwrap-abort under panic=abort. Grace expiry aborts
-        // only the send half.
+        // absolute deadline). The inner writer defers STOP_SENDING until the
+        // bounded write settles; the vendored h3-quinn transport then makes the
+        // post-cancel halt total even when recv_data was in flight.
         let write = async {
             if grpc_web_response_content_type.is_some() {
                 send_h3_finalized_reject_response_with_recv_halt(
@@ -13195,16 +13195,19 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
                 .await
             }
         };
-        return match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
-            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                crate::http3::stream_util::abort_response_stream(stream);
-                Ok(())
-            }
-        };
+        let result =
+            match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    Ok(())
+                }
+            };
+        crate::http3::stream_util::halt_request_body(stream);
+        return result;
     }
 
     // Snapshot the `serverless_function` terminate provenance before the write
@@ -13240,19 +13243,23 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
         )
         .await
     };
-    // Operator timeout / mid-recv cancel paths pass halt_recv=false; bound the
-    // same way so flow-control cannot retain the task after the upload bound.
+    // Operator timeout / mid-recv cancel paths pass halt_recv=false so the
+    // writer itself does not halt until its post-deadline grace has settled.
+    // The vendored h3-quinn transport makes the explicit halt below total.
     if !halt_recv {
-        return match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
-            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                crate::http3::stream_util::abort_response_stream(stream);
-                Ok(())
-            }
-        };
+        let result =
+            match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    Ok(())
+                }
+            };
+        crate::http3::stream_util::halt_request_body(stream);
+        return result;
     }
     write.await
 }
@@ -13263,9 +13270,10 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
 /// the client sees a valid gRPC error instead of a raw HTTP/JSON payload.
 /// Same recv-half halt contract as `send_h3_response`.
 ///
-/// `halt_recv = false` after a mid-`recv_data` timeout/deadline cancel, and on
-/// any path whose receive half is owned elsewhere — see
-/// [`send_h3_grpc_error_send`] for the split-stream case.
+/// `halt_recv = false` after a mid-`recv_data` timeout/deadline cancel defers the
+/// halt to the caller's bounded post-deadline wrapper. A split-stream caller
+/// uses [`send_h3_grpc_error_send`] instead because its receive half is owned
+/// elsewhere.
 async fn send_h3_grpc_error_with_recv_halt(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     grpc_status: u32,
@@ -13507,10 +13515,10 @@ async fn send_h3_error_flavor_aware_with_policy(
     .await
 }
 
-/// `halt_recv = false` after a mid-`recv_data` timeout/deadline cancel so
-/// h3-quinn's `stop_sending` cannot abort under `panic = "abort"`. When
-/// `halt_recv` is false the write is also bounded by the shared post-deadline
-/// grace so a flow-control-blocked client cannot retain the task indefinitely.
+/// `halt_recv = false` after a mid-`recv_data` timeout/deadline cancel defers the
+/// receive halt until the write has settled under the shared post-deadline
+/// grace. The outer branch then halts explicitly; the vendored h3-quinn
+/// transport makes that safe even though the cancelled read was in flight.
 #[allow(clippy::too_many_arguments)]
 async fn send_h3_error_flavor_aware_with_policy_and_recv_halt(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
@@ -13580,16 +13588,19 @@ async fn send_h3_error_flavor_aware_with_policy_and_recv_halt(
         }
     };
     if !halt_recv {
-        return match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
-            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                crate::http3::stream_util::abort_response_stream(stream);
-                Ok(())
-            }
-        };
+        let result =
+            match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    Ok(())
+                }
+            };
+        crate::http3::stream_util::halt_request_body(stream);
+        return result;
     }
     write.await
 }
