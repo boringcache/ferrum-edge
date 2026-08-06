@@ -941,7 +941,9 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
     // lifetime: `send_response`/`send_data` await QUIC flow control, and a
     // parked task never polls the body's own timer.
     assert_eq!(
-        sse_writer.matches("tokio::time::timeout_at(deadline,").count(),
+        sse_writer
+            .matches("tokio::time::timeout_at(deadline,")
+            .count(),
         2,
         "the header write and the DATA pump must share one hard listener bound"
     );
