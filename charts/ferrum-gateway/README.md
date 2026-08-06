@@ -283,7 +283,8 @@ listener becomes a UDP datagram relay, a `TCPRoute` on a `protocol: TCP`
 listener a TCP stream relay. Chart installs that terminate north-south TCP or
 UDP must publish matching `streamPorts` with the matching `protocol` (and
 `service: true` when the Service should expose them). The Gateway API
-conformance lab exercises both paths with dedicated NodePorts; see
+conformance lab exercises the TCPRoute path with dedicated NodePorts;
+`UDPRoute` is covered by CI Unit Tests — see
 [`docs/gateway_api_conformance.md`](../../docs/gateway_api_conformance.md).
 
 ## TLS material

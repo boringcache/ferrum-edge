@@ -29,11 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-UDP listener, multiple matchless rules are rejected rather than resolved
   by bind order, and `spec.hostnames` (not a Gateway API `UDPRoute` field, and
   unmatchable on a datagram) is rejected rather than silently ignored. Update and
-  delete regenerate live stream listeners and upstreams. Live
-  attachment/traffic/weighted-distribution/status/update/deletion evidence is
-  gated by a new black-box lab step
-  (`scripts/gateway_api_udproute_conformance.sh`); the upstream profile stays
-  `GATEWAY-HTTP` and no `GATEWAY-UDP` profile is claimed.
+  delete regenerate live stream listeners and upstreams. Attachment, weighted
+  backend sets, ReferenceGrant fail-closed behavior, status, update, and
+  deletion are gated by CI Unit Tests
+  (`tests/unit/gateway_core/k8s_udproute_translation_tests.rs`); the Gateway API
+  conformance lab does not add a UDPRoute black-box step. The upstream profile
+  stays `GATEWAY-HTTP` and no `GATEWAY-UDP` profile is claimed.
 - NodeWaypoint captured TCP observability now exports the bounded-cardinality
   `ferrum_mesh_bpf_accept_to_first_byte_microseconds` histogram for IPv4 and
   IPv6. SOCK_OPS timestamps passive establishment and enrolls the exact accepted

@@ -463,7 +463,8 @@ on every entry, core `Service` backends only, `ReferenceGrant` for
 cross-namespace backends, no cross-namespace `parentRefs`, at most one rule per
 `UDPRoute`, and no listener at all for a declared Gateway parent that matches
 nothing). See [gateway_api_conformance.md](gateway_api_conformance.md) for the
-full field table, the exact support boundary, and the live black-box coverage.
+full field table, the exact support boundary, and the unit-test evidence that
+gates `UDPRoute` (TCPRoute retains Ferrum live black-box coverage).
 
 ## Compatible Plugins
 

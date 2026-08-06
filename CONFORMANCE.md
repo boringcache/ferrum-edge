@@ -3,11 +3,11 @@
 Ferrum's conformance story spans two surfaces, each with its own owner doc:
 
 1. **Upstream Gateway API conformance** — the `gateway.networking.k8s.io`
-   `GatewayClass` / `Gateway` / `HTTPRoute` surface (plus watched `GRPCRoute`
-   and live black-box `TCPRoute` / `UDPRoute`), validated by the standalone
-   **`Gateway API Conformance`** GitHub Actions workflow
+   `GatewayClass` / `Gateway` / `HTTPRoute` surface (plus watched `GRPCRoute`,
+   live black-box `TCPRoute`, and unit-tested `UDPRoute`), validated by the
+   standalone **`Gateway API Conformance`** GitHub Actions workflow
    (`.github/workflows/gateway-api-conformance.yml`) against a real
-   `kind` data plane.
+   `kind` data plane for HTTP/TCP, with `UDPRoute` gated by CI Unit Tests.
 2. **Istio + xDS compatibility** — the in-process suite under
    `tests/conformance/`, documented in
    [Istio + xDS Conformance Suite](#istio--xds-conformance-suite) below.
@@ -34,14 +34,16 @@ citations):
   / CI surface changed.
 - **Profile & features.** Gateway API `v1.5.1`, profile `GATEWAY-HTTP`,
   supported features `Gateway,ReferenceGrant,HTTPRoute`, GatewayClass `ferrum`,
-  controller `ferrum.io/gateway-controller`. Live `TCPRoute` and `UDPRoute`
-  data-plane behavior is release-gated by Ferrum black-box checks in the same
-  workflow (not by advertising an upstream `GATEWAY-TCP` / `GATEWAY-UDP`
-  profile on this pin).
+  controller `ferrum.io/gateway-controller`. Live `TCPRoute` data-plane behavior
+  is release-gated by Ferrum black-box checks in the same workflow.
+  `UDPRoute` translation/status/update/delete evidence is release-gated by CI
+  Unit Tests (`tests/unit/gateway_core/k8s_udproute_translation_tests.rs`), not
+  by a live black-box step in this workflow. Neither an upstream `GATEWAY-TCP`
+  nor `GATEWAY-UDP` profile is advertised on this pin.
 - **Data plane.** The lab deploys a routable Ferrum **data plane** (NodePort
-  mapped to host ports 80/443 plus TCPRoute and UDPRoute stream ports) plus
-  HTTP/TCP/UDP echo backends, then runs the upstream suite **and** direct
-  black-box traffic checks — it is not a control-plane-only status run.
+  mapped to host ports 80/443 plus TCPRoute stream ports) plus HTTP/TCP echo
+  backends, then runs the upstream suite **and** direct black-box traffic
+  checks — it is not a control-plane-only status run.
 - **Status.** GatewayClass, Gateway top-level, **per-listener**
   (`status.listeners[]` conditions / `attachedRoutes` / `supportedKinds`), and
   HTTPRoute/GRPCRoute/TCPRoute/UDPRoute parent status are all emitted. The
@@ -50,11 +52,9 @@ citations):
 - **Artifacts.** A `gateway-api-conformance-<version>` bundle
   (`conformance-results/`, 90-day retention). The **run-local `CONFORMANCE.md`**
   inside that bundle is generated per run by
-  `scripts/gateway_api_data_plane_conformance.sh` (with TCPRoute and UDPRoute
-  ports and resources appended by
-  `scripts/gateway_api_tcproute_conformance.sh` and
-  `scripts/gateway_api_udproute_conformance.sh`) and is a different file from
-  this repo-root page.
+  `scripts/gateway_api_data_plane_conformance.sh` (with TCPRoute ports and
+  resources appended by `scripts/gateway_api_tcproute_conformance.sh`) and is a
+  different file from this repo-root page.
 
 # Istio + xDS Conformance Suite
 

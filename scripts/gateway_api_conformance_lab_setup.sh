@@ -23,19 +23,6 @@ TCP_BLACKBOX_NODEPORT_FAIL="${TCP_BLACKBOX_NODEPORT_FAIL:-30903}"
 TCP_BLACKBOX_NODEPORT_DELETE="${TCP_BLACKBOX_NODEPORT_DELETE:-30904}"
 TCP_ECHO_BACKEND_PORT="${TCP_ECHO_BACKEND_PORT:-9090}"
 
-# Live UDPRoute black-box listeners. Same shape as the TCP ones, on a distinct
-# port block and mapped through UDP NodePorts so the datagram path is dialed
-# from the host without an in-cluster client.
-UDP_BLACKBOX_PORT_MAIN="${UDP_BLACKBOX_PORT_MAIN:-9011}"
-UDP_BLACKBOX_PORT_CROSS="${UDP_BLACKBOX_PORT_CROSS:-9012}"
-UDP_BLACKBOX_PORT_FAIL="${UDP_BLACKBOX_PORT_FAIL:-9013}"
-UDP_BLACKBOX_PORT_DELETE="${UDP_BLACKBOX_PORT_DELETE:-9014}"
-UDP_BLACKBOX_NODEPORT_MAIN="${UDP_BLACKBOX_NODEPORT_MAIN:-30911}"
-UDP_BLACKBOX_NODEPORT_CROSS="${UDP_BLACKBOX_NODEPORT_CROSS:-30912}"
-UDP_BLACKBOX_NODEPORT_FAIL="${UDP_BLACKBOX_NODEPORT_FAIL:-30913}"
-UDP_BLACKBOX_NODEPORT_DELETE="${UDP_BLACKBOX_NODEPORT_DELETE:-30914}"
-UDP_ECHO_BACKEND_PORT="${UDP_ECHO_BACKEND_PORT:-9091}"
-
 CP_NAMESPACE="${CP_NAMESPACE:-ferrum}"
 DP_SERVICE_NAME="${DP_SERVICE_NAME:-ferrum-gateway-data-plane}"
 DP_GATEWAY_NAMESPACE="${DP_GATEWAY_NAMESPACE:-gateway-conformance-infra}"
@@ -78,18 +65,6 @@ nodes:
       - containerPort: ${TCP_BLACKBOX_NODEPORT_DELETE}
         hostPort: ${TCP_BLACKBOX_PORT_DELETE}
         protocol: TCP
-      - containerPort: ${UDP_BLACKBOX_NODEPORT_MAIN}
-        hostPort: ${UDP_BLACKBOX_PORT_MAIN}
-        protocol: UDP
-      - containerPort: ${UDP_BLACKBOX_NODEPORT_CROSS}
-        hostPort: ${UDP_BLACKBOX_PORT_CROSS}
-        protocol: UDP
-      - containerPort: ${UDP_BLACKBOX_NODEPORT_FAIL}
-        hostPort: ${UDP_BLACKBOX_PORT_FAIL}
-        protocol: UDP
-      - containerPort: ${UDP_BLACKBOX_NODEPORT_DELETE}
-        hostPort: ${UDP_BLACKBOX_PORT_DELETE}
-        protocol: UDP
 YAML
   kind create cluster --name "$KIND_CLUSTER_NAME" --config "$(kind_config_path)" --wait 120s
   kind load docker-image "$FERRUM_IMAGE" --name "$KIND_CLUSTER_NAME"
@@ -97,11 +72,10 @@ YAML
 
 install_gateway_api_crds() {
   # Install the experimental-channel bundle (includes standard resources plus
-  # TCPRoute and UDPRoute). Mixing standard-install with a standalone
-  # experimental route CRD fails upstream init with "multiple gateway API CRDs
-  # channels detected". Profile/features stay GATEWAY-HTTP /
-  # Gateway,ReferenceGrant,HTTPRoute; TCPRoute and UDPRoute coverage remains
-  # Ferrum black-box only.
+  # TCPRoute). Mixing standard-install with a standalone experimental TCPRoute
+  # CRD fails upstream init with "multiple gateway API CRDs channels detected".
+  # Profile/features stay GATEWAY-HTTP / Gateway,ReferenceGrant,HTTPRoute;
+  # TCPRoute coverage remains Ferrum black-box only.
   kubectl apply --server-side=true \
     -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml"
   for crd in \
@@ -110,7 +84,6 @@ install_gateway_api_crds() {
     httproutes.gateway.networking.k8s.io \
     grpcroutes.gateway.networking.k8s.io \
     tcproutes.gateway.networking.k8s.io \
-    udproutes.gateway.networking.k8s.io \
     referencegrants.gateway.networking.k8s.io; do
     kubectl wait --for=condition=Established "crd/${crd}" --timeout=120s
   done
@@ -226,18 +199,6 @@ spec:
               containerPort: ${TCP_BLACKBOX_PORT_FAIL}
             - name: tcp-delete
               containerPort: ${TCP_BLACKBOX_PORT_DELETE}
-            - name: udp-main
-              containerPort: ${UDP_BLACKBOX_PORT_MAIN}
-              protocol: UDP
-            - name: udp-cross
-              containerPort: ${UDP_BLACKBOX_PORT_CROSS}
-              protocol: UDP
-            - name: udp-fail
-              containerPort: ${UDP_BLACKBOX_PORT_FAIL}
-              protocol: UDP
-            - name: udp-delete
-              containerPort: ${UDP_BLACKBOX_PORT_DELETE}
-              protocol: UDP
           env:
             - name: FERRUM_MODE
               value: dp
@@ -314,26 +275,6 @@ spec:
       port: ${TCP_BLACKBOX_PORT_DELETE}
       targetPort: ${TCP_BLACKBOX_PORT_DELETE}
       nodePort: ${TCP_BLACKBOX_NODEPORT_DELETE}
-    - name: udp-main
-      protocol: UDP
-      port: ${UDP_BLACKBOX_PORT_MAIN}
-      targetPort: ${UDP_BLACKBOX_PORT_MAIN}
-      nodePort: ${UDP_BLACKBOX_NODEPORT_MAIN}
-    - name: udp-cross
-      protocol: UDP
-      port: ${UDP_BLACKBOX_PORT_CROSS}
-      targetPort: ${UDP_BLACKBOX_PORT_CROSS}
-      nodePort: ${UDP_BLACKBOX_NODEPORT_CROSS}
-    - name: udp-fail
-      protocol: UDP
-      port: ${UDP_BLACKBOX_PORT_FAIL}
-      targetPort: ${UDP_BLACKBOX_PORT_FAIL}
-      nodePort: ${UDP_BLACKBOX_NODEPORT_FAIL}
-    - name: udp-delete
-      protocol: UDP
-      port: ${UDP_BLACKBOX_PORT_DELETE}
-      targetPort: ${UDP_BLACKBOX_PORT_DELETE}
-      nodePort: ${UDP_BLACKBOX_NODEPORT_DELETE}
 YAML
   kubectl -n "$CP_NAMESPACE" rollout status "deployment/${DP_SERVICE_NAME}" --timeout=240s
 }
@@ -373,7 +314,7 @@ setup() {
   wait_for_gateway_class
 }
 
-# Gateway API lab setup with TCPRoute/UDPRoute listener ports and experimental CRDs.
+# Gateway API lab setup with TCPRoute listener ports and experimental CRDs.
 # Kept separate from scripts/gateway_api_data_plane_conformance.sh because that
 # file is a Trusted Cross Build Policy frozen automation surface on main.
 
