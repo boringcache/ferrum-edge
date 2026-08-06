@@ -435,7 +435,7 @@ pub(crate) async fn await_fallible_listener_handles(
                 }
             }
             Err(err) => {
-                error!("Gateway listener task '{}' failed: {:#}", name, err);
+                error!("Gateway listener task '{}' failed: {}", name, err);
                 if first_error.is_none() {
                     first_error = Some(if err.is_panic() {
                         anyhow::anyhow!("{name} panicked: {err}")
