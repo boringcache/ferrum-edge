@@ -3094,6 +3094,10 @@ fn test_map_http_reject_status_to_grpc_status_uses_semantic_codes() {
         grpc_status::PERMISSION_DENIED
     );
     assert_eq!(
+        map_http_reject_status_to_grpc_status(StatusCode::NOT_FOUND),
+        grpc_status::UNIMPLEMENTED
+    );
+    assert_eq!(
         map_http_reject_status_to_grpc_status(StatusCode::TOO_MANY_REQUESTS),
         grpc_status::RESOURCE_EXHAUSTED
     );

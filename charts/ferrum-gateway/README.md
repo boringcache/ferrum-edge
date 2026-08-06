@@ -287,6 +287,9 @@ installs that expose north-south TCP or TLS passthrough must publish matching
 conformance lab exercises both paths with dedicated NodePorts; see
 [`docs/gateway_api_conformance.md`](../../docs/gateway_api_conformance.md).
 
+Gateway API `GRPCRoute` attaches to HTTP/HTTPS listeners and is release-gated by
+the upstream `GATEWAY-GRPC` profile (same doc).
+
 ## TLS material
 
 Each surface under `tls.*` (`frontend`, `admin`, `backend`, `cpGrpc`, `dpGrpc`)
