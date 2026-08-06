@@ -93,8 +93,7 @@ pub(crate) const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
 ///
 /// The `mesh.metrics.` prefix also keeps this internal lifecycle signal out of
 /// trace attributes.
-pub const MESH_WORKLOAD_METRICS_OBSERVED_METADATA: &str =
-    "mesh.metrics.workload_metrics_observed";
+pub const MESH_WORKLOAD_METRICS_OBSERVED_METADATA: &str = "mesh.metrics.workload_metrics_observed";
 /// Stamped once per mesh TCP stream when `TCP_OPENED_CONNECTIONS` is finalized
 /// under the metadata that path will also use for closed/byte series.
 ///

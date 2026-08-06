@@ -21,7 +21,8 @@ use crate::plugins::mesh::authz::{
     parse_trust_domain_aliases, parse_trusted_hbone_assertors,
 };
 use crate::plugins::mesh::prometheus_helpers::{
-    MESH_METRICS_DISABLED_METADATA, MeshMetricFamily, MeshMetricLabel,
+    MESH_METRICS_DISABLED_METADATA, MESH_WORKLOAD_METRICS_OBSERVED_METADATA, MeshMetricFamily,
+    MeshMetricLabel,
 };
 use crate::plugins::otel_tracing::{
     OtelTracing, SpanData, SpanKind, TraceExporter, build_traceparent, ensure_trace_metadata,
@@ -1008,7 +1009,7 @@ impl Plugin for WorkloadMetrics {
         // pre-populated other `mesh.*` labels even when an earlier plugin
         // rejects before this hook is reached.
         metadata.insert(
-            prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA.to_string(),
+            MESH_WORKLOAD_METRICS_OBSERVED_METADATA.to_string(),
             "1".to_string(),
         );
         self.insert_common_metadata(metadata);
