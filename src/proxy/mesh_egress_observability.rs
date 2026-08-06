@@ -119,13 +119,13 @@ impl CapturedMeshEgressLifecycle {
             "mesh.destination.service".to_string(),
             destination_service.to_string(),
         );
-        // Record mesh TCP admission only once the chain accepted AND this
-        // path's own destination/security metadata is stamped, so the opened
-        // counter carries the same labels the disconnect summary will. A
-        // rejected chain stays uncounted on both halves of the lifecycle, and
-        // captured UDP egress is excluded by its `udp` request protocol.
-        if !rejected {
-            crate::plugins::mesh::prometheus_helpers::record_admitted_mesh_tcp_stream(
+        // Captured TCP egress must NOT finalize here: `set_target` later stamps
+        // `mesh.destination.principal`, and opened/closed must share that label
+        // set. A plugin-rejected path never reaches target selection, so
+        // finalize once under the destination/security metadata stamped above.
+        // Captured UDP egress stays excluded by its `udp` request protocol.
+        if rejected {
+            crate::plugins::mesh::prometheus_helpers::finalize_mesh_tcp_opened_stream(
                 &mut stream_ctx,
             );
         }
@@ -188,6 +188,22 @@ impl CapturedMeshEgressLifecycle {
         {
             metadata.insert("mesh.destination.principal".to_string(), identity.clone());
         }
+        // Selected target metadata is now stamped; finalize TCP opened once so
+        // opened and closed share `mesh.destination.principal` when present.
+        // Idempotent if start already finalized a rejected path. UDP is a no-op.
+        self.finalize_tcp_opened_once();
+    }
+
+    /// Finalize mesh TCP opened under the current stream metadata, once.
+    /// No-op for UDP and when metadata is absent or already finalized.
+    fn finalize_tcp_opened_once(&mut self) {
+        if self.protocol != "tcp" {
+            return;
+        }
+        let Some(stream_ctx) = self.stream_ctx.as_mut() else {
+            return;
+        };
+        crate::plugins::mesh::prometheus_helpers::finalize_mesh_tcp_opened_stream(stream_ctx);
     }
 
     pub(crate) fn complete_tcp(&mut self, result: &crate::proxy::tcp_proxy::StreamCopyResult) {
@@ -267,6 +283,10 @@ impl CapturedMeshEgressLifecycle {
     }
 
     fn take_summary(&mut self) -> Option<StreamTransactionSummary> {
+        // Setup failures that never reached `set_target` still need a coherent
+        // once-only TCP lifecycle under the final metadata available here.
+        // Idempotent when start (rejection) or set_target already finalized.
+        self.finalize_tcp_opened_once();
         let mut stream_ctx = self.stream_ctx.take()?;
         Some(StreamTransactionSummary {
             namespace: self.namespace.clone(),
@@ -521,5 +541,128 @@ mod tests {
             Some(DisconnectCause::GracefulShutdown)
         );
         assert!(summary.connection_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_target_stamps_principal_before_tcp_finalize_marker() {
+        let mut ctx = stream_context();
+        ctx.metadata
+            .get_or_insert_with(Default::default)
+            .insert("mesh.request_protocol".to_string(), "tcp".to_string());
+        let mut lifecycle = CapturedMeshEgressLifecycle {
+            plugins: vec![],
+            stream_ctx: Some(ctx),
+            namespace: "default".to_string(),
+            proxy_id: "mesh-egress".to_string(),
+            proxy_name: Some("orders.default.svc.cluster.local".to_string()),
+            client_ip: "10.0.0.2".to_string(),
+            backend_target: "orders.default.svc.cluster.local".to_string(),
+            protocol: "tcp".to_string(),
+            connected_wall_at: chrono::Utc::now(),
+            connected_at: std::time::Instant::now(),
+            bytes_sent: 0,
+            bytes_received: 0,
+            connection_error: Some("setup failed".to_string()),
+            error_class: Some(ErrorClass::ConnectionPoolError),
+            disconnect_direction: Some(Direction::ClientToBackend),
+            disconnect_cause: Some(DisconnectCause::BackendError),
+            udp_outcome_signal: None,
+            udp_byte_counters: None,
+            completion_recorded: false,
+        };
+
+        let mut target = crate::config::types::UpstreamTarget {
+            host: "10.0.0.8".to_string(),
+            port: 5432,
+            service_port_policy_key: None,
+            weight: 1,
+            tags: Default::default(),
+            locality: None,
+            path: None,
+        };
+        target.tags.insert(
+            crate::proxy::hbone_pool::MESH_SPIFFE_ID_TAG.to_string(),
+            "spiffe://cluster.local/ns/default/sa/orders".to_string(),
+        );
+        lifecycle.set_target(&target);
+
+        let metadata = lifecycle
+            .stream_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.metadata.as_ref())
+            .expect("stream metadata");
+        assert_eq!(
+            metadata.get("mesh.destination.principal").map(String::as_str),
+            Some("spiffe://cluster.local/ns/default/sa/orders"),
+            "set_target must stamp destination principal before finalize"
+        );
+        assert!(
+            crate::plugins::mesh::prometheus_helpers::mesh_tcp_opened_finalized(metadata),
+            "set_target must finalize TCP opened after principal insertion"
+        );
+
+        // Idempotent: a second finalize (as teardown would) must not clear the marker.
+        lifecycle.finalize_tcp_opened_once();
+        let metadata = lifecycle
+            .stream_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.metadata.as_ref())
+            .expect("stream metadata");
+        assert!(crate::plugins::mesh::prometheus_helpers::mesh_tcp_opened_finalized(metadata));
+    }
+
+    #[tokio::test]
+    async fn udp_set_target_does_not_finalize_tcp_opened() {
+        let mut ctx = stream_context();
+        ctx.metadata
+            .get_or_insert_with(Default::default)
+            .insert("mesh.request_protocol".to_string(), "udp".to_string());
+        let mut lifecycle = CapturedMeshEgressLifecycle {
+            plugins: vec![],
+            stream_ctx: Some(ctx),
+            namespace: "default".to_string(),
+            proxy_id: "mesh-egress".to_string(),
+            proxy_name: Some("dns.kube-system.svc.cluster.local".to_string()),
+            client_ip: "10.0.0.2".to_string(),
+            backend_target: "dns.kube-system.svc.cluster.local".to_string(),
+            protocol: "udp".to_string(),
+            connected_wall_at: chrono::Utc::now(),
+            connected_at: std::time::Instant::now(),
+            bytes_sent: 0,
+            bytes_received: 0,
+            connection_error: Some("setup failed".to_string()),
+            error_class: Some(ErrorClass::ConnectionPoolError),
+            disconnect_direction: Some(Direction::ClientToBackend),
+            disconnect_cause: Some(DisconnectCause::BackendError),
+            udp_outcome_signal: None,
+            udp_byte_counters: None,
+            completion_recorded: false,
+        };
+
+        let mut target = crate::config::types::UpstreamTarget {
+            host: "10.0.0.8".to_string(),
+            port: 53,
+            service_port_policy_key: None,
+            weight: 1,
+            tags: Default::default(),
+            locality: None,
+            path: None,
+        };
+        target.tags.insert(
+            crate::proxy::hbone_pool::MESH_SPIFFE_ID_TAG.to_string(),
+            "spiffe://cluster.local/ns/kube-system/sa/coredns".to_string(),
+        );
+        lifecycle.set_target(&target);
+        lifecycle.finalize_tcp_opened_once();
+
+        let metadata = lifecycle
+            .stream_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.metadata.as_ref())
+            .expect("stream metadata");
+        assert!(
+            !crate::plugins::mesh::prometheus_helpers::mesh_tcp_opened_finalized(metadata),
+            "UDP captured egress must never finalize TCP opened"
+        );
     }
 }

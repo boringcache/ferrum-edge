@@ -197,7 +197,7 @@ fn tcp_opened_closed_and_bytes_follow_connect_disconnect_lifecycle() {
         ),
     ]);
 
-    registry.record_mesh_tcp_admitted(&mut metadata, "db", Some("db"));
+    registry.finalize_mesh_tcp_opened(&mut metadata, "db", Some("db"));
     let after_open = registry.render_uncached();
     assert!(
         after_open.lines().any(|line| line
@@ -406,7 +406,7 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
         .or_insert_with(|| "mutual_tls".into());
 
     let registry = MetricsRegistry::new();
-    registry.record_mesh_tcp_admitted(&mut metadata, "db", Some("db"));
+    registry.finalize_mesh_tcp_opened(&mut metadata, "db", Some("db"));
     assert!(
         !registry
             .render_uncached()
@@ -458,18 +458,20 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
 }
 
 // ---------------------------------------------------------------------------
-// Mesh TCP opened/closed lifecycle is owned by the ACCEPT PATH, not by the
-// `workload_metrics` hook. Ferrum permits several effective `workload_metrics`
-// instances per proxy, and every one of them runs `on_stream_connect` over
-// metadata that later instances still change, so an increment from the hook
-// counted one connection once per instance under intermediate policy. The
-// accept path instead calls `record_mesh_tcp_admitted` once, after the whole
-// chain accepted, and that call is what stamps the admission marker gating the
-// closed/byte half.
+// Mesh TCP opened/closed lifecycle is owned by the STREAM PATH finalizer, not
+// by the `workload_metrics` hook. Ferrum permits several effective
+// `workload_metrics` instances per proxy, and every one of them runs
+// `on_stream_connect` over metadata that later instances still change, so an
+// increment from the hook counted one connection once per instance under
+// intermediate policy. The stream path instead calls `finalize_mesh_tcp_opened`
+// once after the last hook that actually ran (accepted, rejected, or
+// client-disconnect-during-admission), and that call stamps the finalized
+// marker gating the closed/byte half. This is a connection lifecycle family,
+// not an authorization-success counter.
 // ---------------------------------------------------------------------------
 
-const ADMITTED_MARKER: &str =
-    ferrum_edge::plugins::mesh::prometheus_helpers::MESH_TCP_STREAM_ADMITTED_METADATA;
+const FINALIZED_MARKER: &str =
+    ferrum_edge::plugins::mesh::prometheus_helpers::MESH_TCP_OPENED_FINALIZED_METADATA;
 
 fn mesh_stream_ctx() -> StreamConnectionContext {
     StreamConnectionContext::new(
@@ -528,6 +530,13 @@ fn series_lines<'a>(output: &'a str, family: &str) -> Vec<&'a str> {
         .collect()
 }
 
+fn label_value<'a>(series_line: &'a str, label: &str) -> Option<&'a str> {
+    let needle = format!("{label}=\"");
+    let start = series_line.find(&needle)? + needle.len();
+    let end = series_line[start..].find('"')? + start;
+    Some(&series_line[start..end])
+}
+
 #[tokio::test]
 async fn multiple_workload_metrics_applications_record_one_tcp_opened_under_final_policy() {
     // Two effective instances both stamp the connection. The second one owns
@@ -552,7 +561,7 @@ async fn multiple_workload_metrics_applications_record_one_tcp_opened_under_fina
     ));
 
     let registry = MetricsRegistry::new();
-    registry.record_mesh_tcp_admitted(
+    registry.finalize_mesh_tcp_opened(
         ctx.metadata.as_mut().expect("mesh stream metadata"),
         "db",
         Some("db"),
@@ -604,7 +613,7 @@ async fn disabled_final_tcp_opened_policy_records_no_opened_but_keeps_closed() {
     plugin.on_stream_connect(&mut ctx).await;
 
     let registry = MetricsRegistry::new();
-    registry.record_mesh_tcp_admitted(
+    registry.finalize_mesh_tcp_opened(
         ctx.metadata.as_mut().expect("mesh stream metadata"),
         "db",
         Some("db"),
@@ -615,7 +624,7 @@ async fn disabled_final_tcp_opened_policy_records_no_opened_but_keeps_closed() {
         "a disabled final TCP_OPENED_CONNECTIONS policy must record nothing:\n{after_open}"
     );
 
-    // Disabling opened is per-family: the connection was still admitted, so the
+    // Disabling opened is per-family: the connection was still finalized, so the
     // closed/byte families keep reporting.
     let metadata = ctx.metadata.clone().expect("mesh stream metadata");
     registry.record_stream(&stream_summary_from(metadata));
@@ -628,67 +637,188 @@ async fn disabled_final_tcp_opened_policy_records_no_opened_but_keeps_closed() {
 }
 
 #[tokio::test]
-async fn rejected_stream_chain_records_no_tcp_lifecycle() {
-    // `workload_metrics` ran and stamped mesh identity metadata, but a later
-    // plugin in the chain rejected the stream, so the accept path never calls
-    // `record_mesh_tcp_admitted`. Neither half of the lifecycle may appear —
-    // counting only the close would unbalance the counters forever.
+async fn rejected_stream_chain_finalizes_balanced_tcp_lifecycle() {
+    // `workload_metrics` ran and stamped mesh identity metadata; a later plugin
+    // rejected the stream. The stream path still finalizes once after the last
+    // hook that ran, before the zero-byte disconnect summary, so opened/closed
+    // stay balanced. TCP_OPENED_CONNECTIONS is a lifecycle family, not an
+    // authorization-success counter.
     let plugin = workload_metrics_instance(json!({}));
     let mut ctx = mesh_stream_ctx();
     plugin.on_stream_connect(&mut ctx).await;
 
     let registry = MetricsRegistry::new();
-    let mut metadata = ctx.metadata.clone().expect("mesh stream metadata");
+    let metadata = ctx.metadata.as_mut().expect("mesh stream metadata");
+    registry.finalize_mesh_tcp_opened(metadata, "db", Some("db"));
+
+    let after_open = registry.render_uncached();
+    let opened = series_lines(&after_open, "ferrum_mesh_tcp_connections_opened_total");
+    assert_eq!(
+        opened.len(),
+        1,
+        "rejection after workload-metrics observation must still open once:\n{after_open}"
+    );
+    assert!(
+        opened[0].ends_with(" 1"),
+        "rejected path must count exactly one opened:\n{after_open}"
+    );
+
     let mut summary = stream_summary_from(metadata.clone());
     summary.bytes_sent = 0;
     summary.bytes_received = 0;
     registry.record_stream(&summary);
 
-    let output = registry.render_uncached();
-    for family in [
-        "ferrum_mesh_tcp_connections_opened_total",
-        "ferrum_mesh_tcp_connections_closed_total",
-        "ferrum_mesh_tcp_sent_bytes_total",
-        "ferrum_mesh_tcp_received_bytes_total",
-    ] {
-        assert!(
-            series_lines(&output, family).is_empty(),
-            "a rejected stream chain must not record {family}:\n{output}"
-        );
-    }
-
-    // Only admission arms the lifecycle.
-    registry.record_mesh_tcp_admitted(&mut metadata, "db", Some("db"));
-    let after_admit = registry.render_uncached();
+    let after_close = registry.render_uncached();
+    let closed = series_lines(&after_close, "ferrum_mesh_tcp_connections_closed_total");
     assert_eq!(
-        series_lines(&after_admit, "ferrum_mesh_tcp_connections_opened_total").len(),
+        closed.len(),
         1,
-        "admission must record the opened counter:\n{after_admit}"
+        "rejected path must close once under the same lifecycle:\n{after_close}"
+    );
+    assert!(
+        closed[0].ends_with(" 1"),
+        "rejected open/close must stay balanced:\n{after_close}"
+    );
+    let sent = series_lines(&after_close, "ferrum_mesh_tcp_sent_bytes_total");
+    let received = series_lines(&after_close, "ferrum_mesh_tcp_received_bytes_total");
+    assert!(
+        sent.iter().any(|line| line.ends_with(" 0"))
+            && received.iter().any(|line| line.ends_with(" 0")),
+        "rejected disconnect is a zero-byte close:\n{after_close}"
     );
 }
 
 #[tokio::test]
-async fn mesh_tcp_admission_is_recorded_at_most_once_per_connection() {
+async fn mesh_tcp_finalize_is_idempotent_per_connection() {
     let plugin = workload_metrics_instance(json!({}));
     let mut ctx = mesh_stream_ctx();
     plugin.on_stream_connect(&mut ctx).await;
     let metadata = ctx.metadata.as_mut().expect("mesh stream metadata");
 
     let registry = MetricsRegistry::new();
-    registry.record_mesh_tcp_admitted(metadata, "db", Some("db"));
-    registry.record_mesh_tcp_admitted(metadata, "db", Some("db"));
+    registry.finalize_mesh_tcp_opened(metadata, "db", Some("db"));
+    registry.finalize_mesh_tcp_opened(metadata, "db", Some("db"));
 
     let output = registry.render_uncached();
     let opened = series_lines(&output, "ferrum_mesh_tcp_connections_opened_total");
     assert_eq!(opened.len(), 1, "one series expected:\n{output}");
     assert!(
         opened[0].ends_with(" 1"),
-        "a second admission call must not double count one connection:\n{output}"
+        "a second finalize call must not double count one connection:\n{output}"
+    );
+    assert!(
+        metadata.get(FINALIZED_MARKER).map(String::as_str) == Some("1"),
+        "finalizer must stamp the once-only marker"
     );
 }
 
 #[tokio::test]
-async fn udp_stream_admission_records_no_tcp_series() {
+async fn captured_egress_tcp_opened_closed_share_destination_principal() {
+    // Captured mesh egress stamps destination/security metadata first, then
+    // `set_target` inserts `mesh.destination.principal`. Finalizing only after
+    // that insertion keeps opened and closed on the same label set.
+    let plugin = workload_metrics_instance(json!({}));
+    let mut ctx = mesh_stream_ctx();
+    plugin.on_stream_connect(&mut ctx).await;
+    let metadata = ctx.metadata.as_mut().expect("mesh stream metadata");
+    metadata.insert(
+        "mesh.connection_security_policy".into(),
+        "mutual_tls".into(),
+    );
+    metadata.insert("mesh.destination.namespace".into(), "default".into());
+    metadata.insert("mesh.destination.workload".into(), "db".into());
+    metadata.insert("mesh.destination.app".into(), "db".into());
+    metadata.insert("mesh.destination.service".into(), "db".into());
+    metadata.insert(
+        "mesh.destination.principal".into(),
+        "spiffe://cluster.local/ns/default/sa/db".into(),
+    );
+
+    let registry = MetricsRegistry::new();
+    registry.finalize_mesh_tcp_opened(metadata, "db", Some("db"));
+    let after_open = registry.render_uncached();
+    let opened = series_lines(&after_open, "ferrum_mesh_tcp_connections_opened_total");
+    assert_eq!(opened.len(), 1, "one opened series:\n{after_open}");
+    assert_eq!(
+        label_value(opened[0], "destination_principal"),
+        Some("spiffe://cluster.local/ns/default/sa/db"),
+        "opened must carry destination principal:\n{after_open}"
+    );
+
+    registry.record_stream(&stream_summary_from(metadata.clone()));
+    let after_close = registry.render_uncached();
+    let closed = series_lines(&after_close, "ferrum_mesh_tcp_connections_closed_total");
+    assert_eq!(closed.len(), 1, "one closed series:\n{after_close}");
+    assert_eq!(
+        label_value(closed[0], "destination_principal"),
+        Some("spiffe://cluster.local/ns/default/sa/db"),
+        "closed must reuse the same destination principal:\n{after_close}"
+    );
+    let sent = series_lines(&after_close, "ferrum_mesh_tcp_sent_bytes_total");
+    assert_eq!(
+        label_value(sent[0], "destination_principal"),
+        Some("spiffe://cluster.local/ns/default/sa/db"),
+        "byte series must share the opened label set:\n{after_close}"
+    );
+}
+
+#[tokio::test]
+async fn captured_egress_no_target_setup_failure_finalizes_balanced_lifecycle() {
+    // Setup failed before target selection: finalize under the destination
+    // metadata available at teardown (no destination principal).
+    let plugin = workload_metrics_instance(json!({}));
+    let mut ctx = mesh_stream_ctx();
+    plugin.on_stream_connect(&mut ctx).await;
+    let metadata = ctx.metadata.as_mut().expect("mesh stream metadata");
+    metadata.insert(
+        "mesh.connection_security_policy".into(),
+        "mutual_tls".into(),
+    );
+    metadata.insert("mesh.destination.service".into(), "db".into());
+    // Explicitly clear any destination principal so teardown mirrors a
+    // no-target captured egress path.
+    metadata.remove("mesh.destination.principal");
+
+    let registry = MetricsRegistry::new();
+    registry.finalize_mesh_tcp_opened(metadata, "db", Some("db"));
+    let after_open = registry.render_uncached();
+    let opened = series_lines(&after_open, "ferrum_mesh_tcp_connections_opened_total");
+    assert_eq!(
+        opened.len(),
+        1,
+        "no-target setup failure must still open once:\n{after_open}"
+    );
+    assert_eq!(
+        label_value(opened[0], "destination_principal"),
+        Some("unknown"),
+        "no-target path must keep the default unknown principal:\n{after_open}"
+    );
+
+    let mut summary = stream_summary_from(metadata.clone());
+    summary.bytes_sent = 0;
+    summary.bytes_received = 0;
+    summary.connection_error = Some("captured mesh egress setup failed".into());
+    registry.record_stream(&summary);
+    let after_close = registry.render_uncached();
+    let closed = series_lines(&after_close, "ferrum_mesh_tcp_connections_closed_total");
+    assert_eq!(
+        closed.len(),
+        1,
+        "no-target teardown must close once:\n{after_close}"
+    );
+    assert!(
+        closed[0].ends_with(" 1"),
+        "no-target open/close must stay balanced:\n{after_close}"
+    );
+    assert_eq!(
+        label_value(closed[0], "destination_principal"),
+        Some("unknown"),
+        "closed must match the no-principal opened label set:\n{after_close}"
+    );
+}
+
+#[tokio::test]
+async fn udp_stream_finalize_records_no_tcp_series() {
     // UDP/DTLS must never be misclassified as a mesh TCP connection.
     let plugin = workload_metrics_instance(json!({}));
     let mut ctx = StreamConnectionContext::new(
@@ -704,10 +834,10 @@ async fn udp_stream_admission_records_no_tcp_series() {
 
     let registry = MetricsRegistry::new();
     let metadata = ctx.metadata.as_mut().expect("mesh stream metadata");
-    registry.record_mesh_tcp_admitted(metadata, "dns", Some("dns"));
+    registry.finalize_mesh_tcp_opened(metadata, "dns", Some("dns"));
     assert!(
-        !metadata.contains_key(ADMITTED_MARKER),
-        "a UDP stream must not be stamped as an admitted mesh TCP connection"
+        !metadata.contains_key(FINALIZED_MARKER),
+        "a UDP stream must not be stamped as a finalized mesh TCP connection"
     );
 
     let mut summary = stream_summary_from(ctx.metadata.clone().expect("metadata"));

@@ -85,21 +85,26 @@ pub struct MeshRequestKey {
 }
 
 pub(crate) const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
-/// Stamped once per mesh TCP stream whose complete `on_stream_connect` chain
-/// accepted the connection, at the point where mesh identity / tag-override /
-/// disable metadata is final.
+/// Stamped once per mesh TCP stream when `TCP_OPENED_CONNECTIONS` is finalized
+/// under the metadata that path will also use for closed/byte series.
+///
+/// This is a connection-lifecycle marker, not an authorization-success flag:
+/// every TCP stream path that reaches workload-metrics observation finalizes
+/// exactly once after the last hook that actually ran (accepted chain, plugin
+/// rejection, or client-disconnect-during-admission), before the disconnect
+/// summary is emitted. Captured mesh egress TCP finalizes after selected
+/// target metadata is stamped (or at teardown when no target was selected).
 ///
 /// Ferrum allows several effective `workload_metrics` instances on one proxy,
 /// so the plugin hook itself runs once per instance over intermediate metadata.
 /// The opened counter therefore cannot be emitted from the hook: the marker is
-/// what makes admission — and the TCP lifecycle counters keyed on it —
-/// exactly-once per connection under the FINAL policy. It also gates the
-/// closed/byte half, so a rejected chain contributes to neither side rather
-/// than leaving `opened` and `closed` permanently unbalanced.
+/// what makes the TCP lifecycle counters exactly-once per connection under the
+/// FINAL policy for that path. It also gates the closed/byte half so opened and
+/// closed stay balanced.
 ///
 /// The `mesh.metrics.` prefix keeps it out of `mesh_trace_attributes`, exactly
 /// like the disable/tag-override plans.
-pub const MESH_TCP_STREAM_ADMITTED_METADATA: &str = "mesh.metrics.tcp_stream_admitted";
+pub const MESH_TCP_OPENED_FINALIZED_METADATA: &str = "mesh.metrics.tcp_opened_finalized";
 pub(crate) const MESH_REQUEST_COUNT_OVERRIDES_METADATA: &str =
     "mesh.metrics.request_count.tag_overrides";
 pub(crate) const MESH_REQUEST_DURATION_OVERRIDES_METADATA: &str =
@@ -1748,28 +1753,26 @@ pub fn metadata_is_mesh_tcp_stream(metadata: &HashMap<String, String>) -> bool {
             .is_none_or(|protocol| is_mesh_tcp_protocol(protocol))
 }
 
-/// True when this stream's `on_stream_connect` chain accepted the connection
-/// and mesh TCP admission was already recorded for it.
-pub fn mesh_tcp_stream_admitted(metadata: &HashMap<String, String>) -> bool {
-    metadata.contains_key(MESH_TCP_STREAM_ADMITTED_METADATA)
+/// True when `TCP_OPENED_CONNECTIONS` was already finalized for this stream.
+pub fn mesh_tcp_opened_finalized(metadata: &HashMap<String, String>) -> bool {
+    metadata.contains_key(MESH_TCP_OPENED_FINALIZED_METADATA)
 }
 
-/// Record mesh TCP admission for a stream whose complete `on_stream_connect`
-/// plugin chain accepted the connection.
+/// Finalize mesh `TCP_OPENED_CONNECTIONS` once for a stream that reached
+/// workload-metrics observation.
 ///
-/// Call this once, from the accept path, after the last hook returned — never
-/// from a plugin hook. At that point `ctx.metadata` carries the final mesh
-/// identity, tag-override, and disable policy, so the opened counter is emitted
-/// once per connection under the same metadata the disconnect summary will
-/// carry.
-pub(crate) fn record_admitted_mesh_tcp_stream(ctx: &mut StreamConnectionContext) {
+/// Call from the stream path after the last `on_stream_connect` hook that
+/// actually ran — and, for captured mesh egress TCP, after selected target
+/// metadata is stamped — never from a plugin hook. Idempotent: a second call
+/// is a no-op. UDP/DTLS remain excluded by request protocol.
+pub(crate) fn finalize_mesh_tcp_opened_stream(ctx: &mut StreamConnectionContext) {
     let proxy_id = ctx.proxy_id.as_str();
     let proxy_name = ctx.proxy_name.as_deref();
     let Some(metadata) = ctx.metadata.as_mut() else {
         return;
     };
     let registry = crate::plugins::prometheus_metrics::global_registry();
-    registry.record_mesh_tcp_admitted(metadata, proxy_id, proxy_name);
+    registry.finalize_mesh_tcp_opened(metadata, proxy_id, proxy_name);
 }
 
 pub fn is_mesh_tcp_protocol(protocol: &str) -> bool {

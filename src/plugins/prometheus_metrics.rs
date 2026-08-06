@@ -877,21 +877,23 @@ impl MetricsRegistry {
         self.maybe_invalidate_cache();
     }
 
-    /// Mark a mesh TCP stream as admitted and record TCP_OPENED_CONNECTIONS
-    /// exactly once for it.
+    /// Finalize mesh `TCP_OPENED_CONNECTIONS` exactly once for a stream under
+    /// the metadata that path will also use for closed/byte series.
     ///
-    /// The caller is the accept path, after the COMPLETE `on_stream_connect`
-    /// chain accepted the connection — never an individual plugin hook. Ferrum
+    /// The caller is the stream path after the last `on_stream_connect` hook
+    /// that actually ran (or, for captured mesh egress TCP, after selected
+    /// target metadata is stamped) — never an individual plugin hook. Ferrum
     /// allows several effective `workload_metrics` instances per proxy and each
     /// one runs the hook, so emitting from the hook counted one connection once
-    /// per instance, under whatever intermediate tag/disable metadata that
-    /// instance happened to see. Stamping first and returning early on an
-    /// already-stamped map keeps the counter at one increment per connection
-    /// even if a future accept path calls this twice.
+    /// per instance under intermediate tag/disable metadata. Stamping first and
+    /// returning early on an already-stamped map keeps the counter at one
+    /// increment per connection even if a path calls this twice.
     ///
-    /// The stamp also gates `record_mesh_tcp_closed_and_bytes`, so a rejected
-    /// chain contributes to neither half of the lifecycle.
-    pub fn record_mesh_tcp_admitted(
+    /// This is a connection lifecycle finalizer, not an authorization-success
+    /// counter: rejection and client-disconnect-during-admission paths that
+    /// reached workload-metrics observation finalize here too so opened/closed
+    /// stay balanced. The stamp gates `record_mesh_tcp_closed_and_bytes`.
+    pub fn finalize_mesh_tcp_opened(
         &self,
         metadata: &mut std::collections::HashMap<String, String>,
         proxy_id: &str,
@@ -900,15 +902,15 @@ impl MetricsRegistry {
         if !prometheus_helpers::metadata_is_mesh_tcp_stream(metadata) {
             return;
         }
-        let marker = prometheus_helpers::MESH_TCP_STREAM_ADMITTED_METADATA.to_string();
+        let marker = prometheus_helpers::MESH_TCP_OPENED_FINALIZED_METADATA.to_string();
         if metadata.insert(marker, "1".to_string()).is_some() {
             return;
         }
         self.record_mesh_tcp_opened(metadata, proxy_id, proxy_name);
     }
 
-    /// Record TCP_OPENED_CONNECTIONS under the finalized mesh metadata of an
-    /// admitted connection. Reached only through `record_mesh_tcp_admitted`.
+    /// Record TCP_OPENED_CONNECTIONS under the finalized mesh metadata of a
+    /// stream. Reached only through `finalize_mesh_tcp_opened`.
     fn record_mesh_tcp_opened(
         &self,
         metadata: &std::collections::HashMap<String, String>,
@@ -942,12 +944,10 @@ impl MetricsRegistry {
     }
 
     fn record_mesh_tcp_closed_and_bytes(&self, summary: &StreamTransactionSummary) {
-        // The closed/byte families are the disconnect half of an ADMITTED
-        // connection's lifecycle. A stream whose `on_stream_connect` chain
-        // rejected still produces a (zero-byte) disconnect summary carrying
-        // mesh metadata, and counting its close would leave opened/closed
-        // permanently unbalanced now that opened is emitted only on admission.
-        if !prometheus_helpers::mesh_tcp_stream_admitted(&summary.metadata) {
+        // The closed/byte families are the disconnect half of a FINALIZED
+        // connection lifecycle. Finalize before emitting the disconnect summary
+        // so opened and closed share the same effective metadata labels.
+        if !prometheus_helpers::mesh_tcp_opened_finalized(&summary.metadata) {
             return;
         }
         let Some(base) = prometheus_helpers::mesh_stream_key_from_metadata(

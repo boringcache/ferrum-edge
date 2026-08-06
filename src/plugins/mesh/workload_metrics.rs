@@ -1062,9 +1062,11 @@ impl Plugin for WorkloadMetrics {
         // TCP_OPENED_CONNECTIONS is deliberately NOT emitted here. Several
         // effective `workload_metrics` instances may run this hook for one
         // connection, each over metadata that later instances still modify, and
-        // a later plugin may still reject the stream. The accept path emits it
-        // once, after the complete chain accepted, via
-        // `prometheus_helpers::record_admitted_mesh_tcp_stream`.
+        // a later plugin may still reject the stream or the client may
+        // disconnect during admission. The stream path finalizes the opened
+        // counter once after the last hook that actually ran (and, for captured
+        // mesh egress TCP, after selected target metadata is stamped) via
+        // `prometheus_helpers::finalize_mesh_tcp_opened_stream`.
         PluginResult::Continue
     }
 

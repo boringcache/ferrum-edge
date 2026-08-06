@@ -2222,6 +2222,12 @@ async fn run_tcp_stream_connect_plugins(
                 result = plugin.on_stream_connect(stream_ctx) => result,
                 () = wait_for_tcp_peer_reset(client_stream) => {
                     stream_ctx.release_admission_permits();
+                    // Last completed hooks left the metadata that the eventual
+                    // disconnect summary will carry; finalize the TCP lifecycle
+                    // under it before returning so opened/closed stay balanced.
+                    crate::plugins::mesh::prometheus_helpers::finalize_mesh_tcp_opened_stream(
+                        stream_ctx,
+                    );
                     return Err(StreamSetupError::new(
                         StreamSetupKind::ClientDisconnectedDuringAdmission,
                         connection_label,
@@ -2239,16 +2245,19 @@ async fn run_tcp_stream_connect_plugins(
                 connection = connection_label,
                 "TCP stream connection rejected by plugin"
             );
+            // Finalize after the rejecting hook (and every prior hook) ran,
+            // before the caller emits the disconnect summary. Non-mesh streams
+            // carry no mesh metadata and are a no-op here.
+            crate::plugins::mesh::prometheus_helpers::finalize_mesh_tcp_opened_stream(stream_ctx);
             return Err(
                 StreamSetupError::new(StreamSetupKind::RejectedByPlugin, rejection_detail).into(),
             );
         }
     }
-    // The whole chain accepted, so mesh identity/tag/disable metadata is final:
-    // this is the single point where the mesh TCP opened counter is emitted for
-    // the passthrough, TCP/TLS, and plaintext TCP admission paths. Non-mesh
-    // streams carry no mesh metadata and are a no-op here.
-    crate::plugins::mesh::prometheus_helpers::record_admitted_mesh_tcp_stream(stream_ctx);
+    // Full chain accepted: mesh identity/tag/disable metadata is final for the
+    // passthrough, TCP/TLS, and plaintext TCP paths. Non-mesh streams carry no
+    // mesh metadata and are a no-op here.
+    crate::plugins::mesh::prometheus_helpers::finalize_mesh_tcp_opened_stream(stream_ctx);
     Ok(())
 }
 
