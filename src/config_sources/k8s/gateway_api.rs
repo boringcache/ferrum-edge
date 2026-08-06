@@ -17,10 +17,10 @@ use super::{
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewaySessionPersistence, K8sAccumulator,
     K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslationOptions,
     MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
-    attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
-    mesh_route_dispatch_plugin_from_rules, namespaced_resource_key, optional_port_field,
-    optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
-    resource_id, route_backends_require_node_waypoint_authz,
+    UNSUPPORTED_SHAPE_MARKER, attach_route_plugins_to_proxy, exact_path_listen_path,
+    invalid_resource, mesh_route_dispatch_plugin_from_rules, namespaced_resource_key,
+    optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
+    proxy_for_route, resource_id, route_backends_require_node_waypoint_authz,
     route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
     upstream_for_route, upstream_for_route_with_session,
 };
@@ -5708,12 +5708,29 @@ const MAX_UDP_ROUTE_BACKEND_REFS: usize = 16;
 /// normalized proportionally after the whole backend set is resolved.
 const GATEWAY_API_MAX_BACKEND_WEIGHT: u64 = 1_000_000;
 
-/// A `UDPRouteRule` carries no match predicate (pinned v1.5.1
-/// `udproute_types.go`: the rule has only `name` and `backendRefs`), so two
-/// rules on one listener are indistinguishable and the standard defines no
-/// precedence between them. Materializing both would queue two competing OS
-/// listeners on the same UDP port and make the winner depend on bind order.
-/// Reject the shape fail closed with a field-specific diagnostic instead.
+/// Ferrum's supported `UDPRouteSpec.rules` cardinality.
+///
+/// The pinned Gateway API v1.5.1 CRD accepts `1..=16` rules
+/// (`apis/v1alpha2/udproute_types.go`: `MinItems=1`, `MaxItems=16`,
+/// `listType=atomic`), so a 2..=16-rule object is **valid upstream** — Ferrum
+/// declines to serve it rather than calling it malformed, and says so in
+/// status with the upstream `UnsupportedValue` reason.
+const MAX_SUPPORTED_UDP_ROUTE_RULES: usize = 1;
+
+/// Reject a `UDPRoute` carrying more rules than Ferrum can represent.
+///
+/// A `UDPRouteRule` has exactly two fields on the pinned tag — `name` and
+/// `backendRefs` — and therefore no match predicate. Two rules on one listener
+/// are indistinguishable to a datagram, the standard defines no precedence
+/// between them, and their `backendRefs` weights are declared per rule and are
+/// not comparable across rules, so there is no aggregate Ferrum could
+/// materialize without inventing semantics: merging the sets would silently
+/// turn a two-rule object into one weighted split, and materializing both
+/// would queue competing OS listeners on the same UDP port whose winner is
+/// bind order. Fail closed with a field-specific diagnostic instead, tagged
+/// with [`UNSUPPORTED_SHAPE_MARKER`] so status reports `Accepted=False` /
+/// `UnsupportedValue` rather than the generic `Invalid`.
+///
 /// `TCPRoute`/`TLSRoute` keep their historical behavior.
 fn ensure_udp_route_rule_shape(
     object: &K8sObject,
@@ -5727,13 +5744,16 @@ fn ensure_udp_route_rule_shape(
         .get("rules")
         .and_then(Value::as_array)
         .map_or(0, |rules| rules.len());
-    if rule_count > 1 {
+    if rule_count > MAX_SUPPORTED_UDP_ROUTE_RULES {
         return Err(invalid_resource(
             object,
             format!(
-                "{} spec.rules must contain at most one rule: a UDPRouteRule carries no match \
-                 predicate, so {rule_count} rules would be {rule_count} competing listeners on \
-                 the same port with no standards-defined precedence",
+                "{} spec.rules holds {rule_count} rules, which {UNSUPPORTED_SHAPE_MARKER}: \
+                 Gateway API v1.5.1 permits 1..=16 rules, but a UDPRouteRule carries only \
+                 `name` and `backendRefs` and so has no match predicate, leaving \
+                 {rule_count} indistinguishable rules on one listener port with no \
+                 standards-defined precedence and no cross-rule weight comparison; Ferrum \
+                 serves exactly {MAX_SUPPORTED_UDP_ROUTE_RULES} rule per UDPRoute",
                 object.kind
             ),
         ));

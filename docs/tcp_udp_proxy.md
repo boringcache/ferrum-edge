@@ -462,9 +462,14 @@ Route admission is strict and fail closed (required numeric `backendRefs[].port`
 on every entry, core `Service` backends only, `ReferenceGrant` for
 cross-namespace backends, no cross-namespace `parentRefs`, at most one rule per
 `UDPRoute`, and no listener at all for a declared Gateway parent that matches
-nothing). See [gateway_api_conformance.md](gateway_api_conformance.md) for the
-full field table, the exact support boundary, and the unit-test evidence that
-gates `UDPRoute` (TCPRoute retains Ferrum live black-box coverage).
+nothing). A multi-rule `UDPRoute` is valid under the upstream CRD but has no
+representable aggregate here, so it is refused as `Accepted=False` /
+`UnsupportedValue` on `spec.rules` rather than resolved by listener bind order.
+See [gateway_api_conformance.md](gateway_api_conformance.md) for the full field
+table, the exact support boundary, and the evidence that gates `UDPRoute` — CI
+Unit Tests for translation/status plus a live UDP data-path integration suite
+that serves a translated route through this page's UDP runtime (TCPRoute
+retains Ferrum live black-box coverage).
 
 ## Compatible Plugins
 

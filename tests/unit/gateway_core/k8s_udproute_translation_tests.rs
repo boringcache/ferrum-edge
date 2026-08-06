@@ -149,10 +149,11 @@ fn reference_grant(name: &str, from_kind: &str) -> K8sObject {
     object_in("ReferenceGrant", version, "backends", name, spec)
 }
 
-fn route_condition(
+fn route_condition_field(
     updates: &[GatewayApiStatusUpdate],
     name: &str,
     condition: &str,
+    field: &str,
 ) -> Option<String> {
     let update = updates
         .iter()
@@ -165,8 +166,24 @@ fn route_condition(
         .filter_map(|parent| parent.get("conditions")?.as_array())
         .flatten()
         .find(|entry| entry.get("type").and_then(Value::as_str) == Some(condition))
-        .and_then(|entry| entry.get("status").and_then(Value::as_str))
+        .and_then(|entry| entry.get(field).and_then(Value::as_str))
         .map(ToOwned::to_owned)
+}
+
+fn route_condition(
+    updates: &[GatewayApiStatusUpdate],
+    name: &str,
+    condition: &str,
+) -> Option<String> {
+    route_condition_field(updates, name, condition, "status")
+}
+
+fn route_condition_reason(
+    updates: &[GatewayApiStatusUpdate],
+    name: &str,
+    condition: &str,
+) -> Option<String> {
+    route_condition_field(updates, name, condition, "reason")
 }
 
 #[test]
@@ -970,27 +987,97 @@ fn udp_route_backend_ref_fan_out_is_bounded() {
     assert!(err.to_string().contains("at most 16 entries"));
 }
 
-#[test]
-fn udp_route_multiple_matchless_rules_fail_closed() {
-    // A UDPRouteRule carries no match predicate, so two rules on one listener
-    // would be two competing OS listeners on the same port with no
-    // standards-defined precedence.
-    let spec = json!({
+/// Two matchless rules on one listener, each with its own backend.
+///
+/// The pinned Gateway API v1.5.1 CRD accepts `1..=16` `UDPRouteSpec.rules`, so
+/// this object is **valid upstream**.
+fn multi_rule_spec() -> Value {
+    json!({
         "parentRefs": [{"name": "edge", "sectionName": "dns"}],
         "rules": [
             {"backendRefs": [{"name": "coredns-a", "port": 5353}]},
             {"backendRefs": [{"name": "coredns-b", "port": 5354}]}
         ]
-    });
-    let objects = udp_lab(spec);
+    })
+}
+
+/// `UDPRouteRule` carries only `name` and `backendRefs` — no match predicate —
+/// so N rules are N indistinguishable matches on one port with no
+/// standards-defined precedence, and their per-rule weights are not comparable
+/// across rules. Ferrum declines to invent an aggregate and rejects fail closed
+/// with a `spec.rules`-specific diagnostic that states the upstream bound and
+/// Ferrum's own.
+#[test]
+fn udp_route_multiple_matchless_rules_fail_closed() {
+    let objects = udp_lab(multi_rule_spec());
 
     let err = translate_k8s_objects(&objects, options()).expect_err("competing rules fail closed");
 
-    assert!(
-        err.to_string()
-            .contains("spec.rules must contain at most one rule")
+    let message = err.to_string();
+    assert!(message.contains("UDPRoute spec.rules"), "{message}");
+    // The diagnostic must name the exact upstream bound it is declining, not
+    // imply the object is malformed.
+    assert!(message.contains("permits 1..=16 rules"), "{message}");
+    assert!(message.contains("not implemented by Ferrum"), "{message}");
+    assert!(message.contains("no match predicate"), "{message}");
+}
+
+/// The whole point of the previous test's marker: an upstream-valid object
+/// Ferrum declines must report `Accepted=False` with the upstream
+/// `UnsupportedValue` reason, never the generic `Invalid` (which claims the
+/// object is malformed). Backend resolution is reported on its own terms.
+#[test]
+fn udp_route_multiple_rules_report_unsupported_value_not_invalid() {
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        service("default", "coredns-a", 5353),
+        service("default", "coredns-b", 5354),
+        udp_route("dns", multi_rule_spec()),
+    ];
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+
+    assert_eq!(
+        route_condition(&updates, "dns", "Accepted").as_deref(),
+        Some("False")
     );
-    assert!(err.to_string().contains("UDPRoute"));
+    assert_eq!(
+        route_condition_reason(&updates, "dns", "Accepted").as_deref(),
+        Some("UnsupportedValue")
+    );
+    assert_eq!(
+        route_condition(&updates, "dns", "Programmed").as_deref(),
+        Some("False")
+    );
+    assert_eq!(
+        route_condition(&updates, "dns", "ResolvedRefs").as_deref(),
+        Some("True")
+    );
+}
+
+/// A shape the CRD itself forbids stays `Invalid`: the marker must not widen
+/// into "every rejection is merely unsupported".
+#[test]
+fn udp_route_malformed_shape_still_reports_invalid() {
+    let spec = json!({
+        "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+        "hostnames": ["dns.example.com"],
+        "rules": [{"backendRefs": [{"name": "coredns", "port": 5353}]}]
+    });
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        service("default", "coredns", 5353),
+        udp_route("dns", spec),
+    ];
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+
+    assert_eq!(
+        route_condition_reason(&updates, "dns", "Accepted").as_deref(),
+        Some("Invalid")
+    );
 }
 
 #[test]

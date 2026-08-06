@@ -11,9 +11,9 @@ use crate::config::types::GatewayConfig;
 use crate::config_sources::k8s::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiMaterializedRouteParent, GatewayApiRouteConflict,
     GatewayApiRouteConflictKey, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation,
-    K8sTranslationOptions, backend_lb_policy_conflict_losers, backend_lb_policy_status,
-    gateway_api_route_conflict_keys_with_acc, gateway_api_status_conflict_context,
-    merge_backend_lb_policy_status, namespace_selector_matches,
+    K8sTranslationOptions, UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers,
+    backend_lb_policy_status, gateway_api_route_conflict_keys_with_acc,
+    gateway_api_status_conflict_context, merge_backend_lb_policy_status, namespace_selector_matches,
     parse_gateway_listener_allowed_route_namespaces, parse_reference_grant_permissions,
     secret_object_is_valid_tls_certificate, translate_k8s_objects_collecting_skips,
     validate_gateway_listener_allowed_routes,
@@ -1610,6 +1610,26 @@ fn route_status(
                         "ResolvedRefs",
                         format!("Ferrum rejected this route attachment: {error}"),
                     )
+                } else if error_is_unsupported_shape(error) {
+                    // An object that is valid under the pinned Gateway API CRD
+                    // but names a shape Ferrum does not implement is
+                    // `Accepted=False` / `UnsupportedValue` — the upstream
+                    // constant for exactly this — not the generic `Invalid`,
+                    // which would report a well-formed object as malformed.
+                    // Reference resolution is independent of the unsupported
+                    // field, so it is still reported on its own terms.
+                    let unresolved_refs_reason =
+                        route_unresolved_backend_ref_reason(object, indexes);
+                    let resolved_refs = unresolved_refs_reason.is_none();
+                    let resolved_refs_reason = unresolved_refs_reason.unwrap_or("ResolvedRefs");
+                    (
+                        false,
+                        resolved_refs,
+                        false,
+                        "UnsupportedValue",
+                        resolved_refs_reason,
+                        format!("Ferrum does not implement this route shape: {error}"),
+                    )
                 } else {
                     (
                         false,
@@ -2674,6 +2694,23 @@ fn error_is_parent_ref_no_matching(error: &K8sTranslateError) -> bool {
         K8sTranslateError::InvalidResource { message, .. } => {
             message.contains("parentRef")
                 && message.contains("does not match any known Gateway listener")
+        }
+        K8sTranslateError::Unsupported(_) => false,
+    }
+}
+
+/// True when the translator rejected an object that is **valid** under the
+/// pinned Gateway API CRD schema because Ferrum does not implement that shape.
+///
+/// The diagnostic carries [`UNSUPPORTED_SHAPE_MARKER`] verbatim and names the
+/// offending field, so the route reports the upstream `UnsupportedValue`
+/// reason instead of the generic `Invalid`. A malformed object (a field the
+/// CRD does not define, a value outside the CRD's own bounds) is not tagged
+/// and keeps reporting `Invalid`.
+fn error_is_unsupported_shape(error: &K8sTranslateError) -> bool {
+    match error {
+        K8sTranslateError::InvalidResource { message, .. } => {
+            message.contains(UNSUPPORTED_SHAPE_MARKER)
         }
         K8sTranslateError::Unsupported(_) => false,
     }

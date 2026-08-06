@@ -26,13 +26,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including zero-weight ones, only core `Service` backends are accepted,
   cross-namespace backendRefs need an exact `UDPRoute` ReferenceGrant,
   cross-namespace `parentRefs` are refused, a `UDPRoute` never attaches to a
-  non-UDP listener, multiple matchless rules are rejected rather than resolved
-  by bind order, and `spec.hostnames` (not a Gateway API `UDPRoute` field, and
-  unmatchable on a datagram) is rejected rather than silently ignored. Update and
-  delete regenerate live stream listeners and upstreams. Attachment, weighted
-  backend sets, ReferenceGrant fail-closed behavior, status, update, and
-  deletion are gated by CI Unit Tests
-  (`tests/unit/gateway_core/k8s_udproute_translation_tests.rs`); the Gateway API
+  non-UDP listener, and `spec.hostnames` (not a Gateway API `UDPRoute` field,
+  and unmatchable on a datagram) is rejected rather than silently ignored.
+  `spec.rules` is supported at exactly one rule: the pinned CRD accepts
+  `1..=16`, but a `UDPRouteRule` carries only `name` and `backendRefs` and so
+  has no match predicate, leaving N rules as N indistinguishable matches on one
+  port with no standards-defined precedence and no cross-rule weight
+  comparison. Rather than invent an aggregate or let listener bind order pick a
+  winner, a multi-rule `UDPRoute` is refused with a `spec.rules` diagnostic that
+  names the upstream bound, and — because the object is upstream-valid — status
+  reports `Accepted=False` with the upstream `UnsupportedValue` reason instead
+  of the generic `Invalid`, while `ResolvedRefs` is still evaluated on its own
+  terms. Update and delete regenerate live stream listeners and upstreams.
+  Attachment, weighted backend sets, ReferenceGrant fail-closed behavior,
+  status, update, and deletion are gated by CI Unit Tests
+  (`tests/unit/gateway_core/k8s_udproute_translation_tests.rs`), and the **live
+  UDP data path** by CI Integration Tests
+  (`tests/integration/gateway_api_udproute_datapath_tests.rs`), which bind the
+  translator's own listener port with the production `start_udp_listener` and
+  assert a datagram round-trips to the backend the route named, that two
+  `UDPRoute`s on two UDP listeners do not cross-talk, that a weighted set is
+  served from its generated upstream one leg per session, and that a leg naming
+  an absent `Service` is dropped rather than answered. The Gateway API
   conformance lab does not add a UDPRoute black-box step. The upstream profile
   stays `GATEWAY-HTTP` and no `GATEWAY-UDP` profile is claimed.
 - NodeWaypoint captured TCP observability now exports the bounded-cardinality
