@@ -465,13 +465,17 @@ above), not per datagram, so distribution converges over sessions. A leg whose
 `Service` is missing keeps its weight but points at an unresolvable target, so
 its share of sessions is dropped rather than handed to the healthy legs.
 
-Route admission is strict and fail closed (required numeric `backendRefs[].port`
-on every entry, core `Service` backends only, `ReferenceGrant` for
-cross-namespace backends, no cross-namespace `parentRefs`, at most one rule per
-`UDPRoute`, and no listener at all for a declared Gateway parent that matches
-nothing). A multi-rule `UDPRoute` is valid under the upstream CRD but has no
+Route admission is strict and fail closed (required `spec.rules` and
+`rules[].backendRefs` arrays with at least one entry each, required numeric
+`backendRefs[].port` on every entry, core `Service` backends only,
+`ReferenceGrant` for cross-namespace backends, no cross-namespace `parentRefs`,
+at most one *supported* rule per `UDPRoute`, same-listener UDPRoute ownership
+by oldest `creationTimestamp` then `{namespace}/{name}`, and no listener at all
+for a declared Gateway parent that matches nothing or lost every claimed
+listener). A multi-rule `UDPRoute` is valid under the upstream CRD but has no
 representable aggregate here, so it is refused as `Accepted=False` /
 `UnsupportedValue` on `spec.rules` rather than resolved by listener bind order.
+Missing/empty/non-array `rules` or `backendRefs` reject as `Invalid`.
 See [gateway_api_conformance.md](gateway_api_conformance.md) for the full field
 table, the exact support boundary, and the evidence that gates `UDPRoute` — CI
 Unit Tests for translation/status plus a live UDP data-path integration suite

@@ -1517,6 +1517,15 @@ fn route_conflict_message(conflict: &GatewayApiRouteConflict) -> String {
             conflict.winner.name
         );
     }
+    if conflict.loser.kind == "UDPRoute" {
+        return format!(
+            "Ferrum rejected this UDPRoute on parent={} because another UDPRoute already owns the same UDP listener ({}); winner is {}/{}",
+            conflict.key.parent_ref,
+            conflict.key.listen_path,
+            conflict.winner.namespace,
+            conflict.winner.name
+        );
+    }
     format!(
         "Ferrum rejected part of this route because it conflicts on parent={} host={} path={}; winner is {}/{}",
         conflict.key.parent_ref,

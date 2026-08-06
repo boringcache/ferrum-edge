@@ -2101,11 +2101,12 @@ pub(crate) fn route_conflicts<'a>(
         Vec<GatewayApiRouteConflictCandidate>,
     > = HashMap::new();
     let mut route_entries: Vec<CrossKindRouteEntry> = Vec::new();
+    let mut udp_entries: Vec<UdpRouteConflictEntry> = Vec::new();
 
     for object in objects
         .into_iter()
         .filter(|object| super::includes_object_namespace(options, object))
-        .filter(|object| matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute"))
+        .filter(|object| matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute" | "UDPRoute"))
     {
         let resource = K8sResourceKey::from_object(object);
         let creation_timestamp = object
@@ -2113,6 +2114,19 @@ pub(crate) fn route_conflicts<'a>(
             .creation_timestamp
             .as_deref()
             .and_then(parse_k8s_timestamp);
+        let candidate = GatewayApiRouteConflictCandidate {
+            resource: resource.clone(),
+            creation_timestamp,
+        };
+        if object.kind == "UDPRoute" {
+            // UDPRoute arbitration is listener-identity scoped (below), not
+            // keyed by the literal parentRef selector spelling.
+            udp_entries.push(UdpRouteConflictEntry {
+                candidate,
+                claims: udp_route_conflict_claims(object, acc),
+            });
+            continue;
+        }
         let key_set = route_conflict_key_set(object, acc);
         for key in &key_set.keys {
             candidates_by_key.entry(key.clone()).or_default().push(
@@ -2123,16 +2137,14 @@ pub(crate) fn route_conflicts<'a>(
             );
         }
         route_entries.push(CrossKindRouteEntry {
-            candidate: GatewayApiRouteConflictCandidate {
-                resource,
-                creation_timestamp,
-            },
+            candidate,
             keys: key_set.keys,
             listeners: key_set.listeners,
         });
     }
 
     let mut conflicts = cross_kind_route_conflicts(&route_entries);
+    conflicts.extend(udp_route_conflicts(&udp_entries));
     for (key, mut candidates) in candidates_by_key {
         candidates.sort_by(compare_conflict_candidates);
         candidates.dedup_by(|left, right| left.resource == right.resource);
@@ -2346,6 +2358,184 @@ fn cross_kind_hostnames_overlap(left: &BTreeSet<&str>, right: &BTreeSet<&str>) -
     })
 }
 
+/// One UDPRoute participating in same-listener conflict resolution.
+///
+/// Claims carry both the status-facing conflict key (keyed by the authored
+/// parentRef spelling) and the concrete Gateway listener that parentRef
+/// resolved to. Arbitration runs on the listener identity; status and
+/// materialization suppression key on the conflict key.
+struct UdpRouteConflictEntry {
+    candidate: GatewayApiRouteConflictCandidate,
+    claims: Vec<(GatewayApiRouteConflictKey, GatewayApiListenerKey)>,
+}
+
+/// Resolve UDPRoute vs UDPRoute ownership of a concrete UDP Gateway listener.
+///
+/// A UDP listener has no hostname/SNI/path discriminator, so two UDPRoutes
+/// that attach to the same listener cannot both receive traffic. Gateway API
+/// picks the oldest `metadata.creationTimestamp`, then `{namespace}/{name}`.
+/// Ferrum materializes that decision fail-closed: the loser emits neither a
+/// stream proxy nor a generated upstream for the conflicted listener, and
+/// status reports `Conflicted` rather than `Programmed`.
+///
+/// Arbitration is scoped to resolved [`GatewayApiListenerKey`] identity, not
+/// the literal parentRef selector string, so a wildcard reference and a
+/// `sectionName` / `port` reference that name one listener contend with each
+/// other. Distinct listeners stay independent: a route that loses on one
+/// listener may still materialize on another non-conflicting listener.
+fn udp_route_conflicts(entries: &[UdpRouteConflictEntry]) -> Vec<GatewayApiRouteConflict> {
+    let mut claimants_by_listener: BTreeMap<
+        GatewayApiListenerKey,
+        Vec<(usize, GatewayApiRouteConflictKey)>,
+    > = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        for (key, listener) in &entry.claims {
+            claimants_by_listener
+                .entry(listener.clone())
+                .or_default()
+                .push((index, key.clone()));
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    for claimants in claimants_by_listener.into_values() {
+        // Collapse one route that reaches the same listener through multiple
+        // parentRef spellings into a single ownership candidate, preserving
+        // every claim key so each losing parentRef reports Conflicted.
+        let mut by_resource: BTreeMap<K8sResourceKey, (usize, Vec<GatewayApiRouteConflictKey>)> =
+            BTreeMap::new();
+        for (index, key) in claimants {
+            let resource = entries[index].candidate.resource.clone();
+            let slot = by_resource.entry(resource).or_insert_with(|| (index, Vec::new()));
+            slot.1.push(key);
+        }
+
+        let mut ordered = by_resource.into_iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| {
+            compare_conflict_candidates(&entries[left.1.0].candidate, &entries[right.1.0].candidate)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let Some((_, (winner_index, _))) = ordered.first() else {
+            continue;
+        };
+        let winner = entries[*winner_index].candidate.resource.clone();
+        for (_, (index, keys)) in ordered.into_iter().skip(1) {
+            let mut keys = keys;
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                conflicts.push(GatewayApiRouteConflict {
+                    key,
+                    winner: winner.clone(),
+                    loser: entries[index].candidate.resource.clone(),
+                });
+            }
+        }
+    }
+    conflicts
+}
+
+/// Conflict-key + concrete-listener claims for one UDPRoute.
+fn udp_route_conflict_claims(
+    object: &K8sObject,
+    acc: Option<&K8sAccumulator>,
+) -> Vec<(GatewayApiRouteConflictKey, GatewayApiListenerKey)> {
+    let Some(acc) = acc else {
+        // Without listener policy the concrete listener is unknown; fall back
+        // to a parentRef-shaped synthetic key so status still has a stable
+        // identity, matching the HTTP unresolved-parentRef fallback.
+        return route_parent_ref_keys(object)
+            .into_iter()
+            .map(|parent_ref| {
+                let listener = GatewayApiListenerKey {
+                    namespace: object.metadata.namespace.clone(),
+                    gateway: "*".to_string(),
+                    listener: parent_ref.clone(),
+                };
+                (udp_route_conflict_key(&parent_ref, &listener), listener)
+            })
+            .collect();
+    };
+
+    let mut claims = Vec::new();
+    for claim in udp_route_listener_claims(object, acc) {
+        claims.push((
+            udp_route_conflict_key(&claim.parent_ref, &claim.listener),
+            claim.listener,
+        ));
+    }
+    claims.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+    claims.dedup();
+    claims
+}
+
+fn udp_route_conflict_key(
+    parent_ref: &str,
+    listener: &GatewayApiListenerKey,
+) -> GatewayApiRouteConflictKey {
+    GatewayApiRouteConflictKey {
+        route_family: "udproute".to_string(),
+        parent_ref: parent_ref.to_string(),
+        hostname: "*".to_string(),
+        listen_path: format!(
+            "udp-listener:{}/{}/{}",
+            listener.namespace, listener.gateway, listener.listener
+        ),
+        match_signature: String::new(),
+    }
+}
+
+/// One concrete UDP Gateway listener a UDPRoute attaches to.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct UdpListenerClaim {
+    parent_ref: String,
+    listener: GatewayApiListenerKey,
+    port: u16,
+}
+
+/// Resolve every materializable UDP listener a UDPRoute attaches to, preserving
+/// the authored parentRef spelling that selected it.
+fn udp_route_listener_claims(object: &K8sObject, acc: &K8sAccumulator) -> Vec<UdpListenerClaim> {
+    let mut claims = Vec::new();
+    for parent_ref in object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if !parent_ref_is_gateway(parent_ref) {
+            continue;
+        }
+        let parent_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        let Some(parent_gateway) = string_field(parent_ref, "name") else {
+            continue;
+        };
+        if route_parent_ref_disallow_error(acc, object, parent_ref).is_some() {
+            continue;
+        }
+        let parent_ref_key = route_parent_ref_key_for_parent(object, parent_ref);
+        for (key, policy) in &acc.gateway_api_listener_policies {
+            if key.namespace == parent_namespace
+                && key.gateway == parent_gateway
+                && parent_ref_matches_listener_policy(parent_ref, key, policy)
+                && route_listener_policy_materializes_route(acc, object, parent_namespace, policy)
+                && let Some(port) = policy.port.and_then(|port| u16::try_from(port).ok())
+            {
+                claims.push(UdpListenerClaim {
+                    parent_ref: parent_ref_key.clone(),
+                    listener: key.clone(),
+                    port,
+                });
+            }
+        }
+    }
+    claims.sort();
+    claims.dedup();
+    claims
+}
+
 pub(crate) fn route_conflict_keys_for_acc(
     object: &K8sObject,
     acc: Option<&K8sAccumulator>,
@@ -2368,6 +2558,25 @@ struct RouteConflictKeySet {
 }
 
 fn route_conflict_key_set(object: &K8sObject, acc: Option<&K8sAccumulator>) -> RouteConflictKeySet {
+    if object.kind == "UDPRoute" {
+        let claims = udp_route_conflict_claims(object, acc);
+        let mut keys = Vec::new();
+        let mut listeners: BTreeMap<String, BTreeMap<String, BTreeSet<GatewayApiListenerKey>>> =
+            BTreeMap::new();
+        for (key, listener) in claims {
+            listeners
+                .entry(key.parent_ref.clone())
+                .or_default()
+                .entry(key.hostname.clone())
+                .or_default()
+                .insert(listener);
+            keys.push(key);
+        }
+        keys.sort();
+        keys.dedup();
+        return RouteConflictKeySet { keys, listeners };
+    }
+
     let requested_hostnames = route_hostnames(object);
     let hostnames = acc
         .and_then(|acc| {
@@ -5615,13 +5824,18 @@ fn l4_route_proxies(
     ensure_l4_parent_refs_are_same_namespace(object)?;
     let hosts = l4_route_hosts(object, scheme)?;
     ensure_udp_route_rule_shape(object, scheme)?;
-    let materialized_parent_refs = route_materialized_parent_ref_keys_for_namespace(
-        object,
-        acc,
-        Some(&object.metadata.namespace),
-    );
-    let materialized_listener_ports =
-        l4_route_listener_ports_for_namespace(object, acc, Some(&object.metadata.namespace));
+    let (materialized_listener_ports, materialized_parent_refs) = if scheme.is_udp() {
+        udp_route_surviving_materialization(object, acc)
+    } else {
+        (
+            l4_route_listener_ports_for_namespace(object, acc, Some(&object.metadata.namespace)),
+            route_materialized_parent_ref_keys_for_namespace(
+                object,
+                acc,
+                Some(&object.metadata.namespace),
+            ),
+        )
+    };
 
     // Fail closed on a declared-but-unmatched Gateway parent.
     //
@@ -5636,12 +5850,28 @@ fn l4_route_proxies(
     // only for the parentless legacy shape (a bare TCPRoute/TLSRoute/UDPRoute
     // supplied by a non-Kubernetes config source), which has no parent to
     // contradict.
+    //
+    // For UDPRoute this set is additionally filtered by same-listener conflict
+    // losers: a route that lost ownership of every declared listener opens
+    // nothing and creates no upstream, so duplicate OS binds cannot race.
     if materialized_listener_ports.is_empty() && route_declares_gateway_parent_ref(object) {
-        acc.warnings.push(format!(
-            "{} {}/{} declares Gateway parentRefs but none resolved to a materializable listener; \
-             no listener was opened",
-            object.kind, object.metadata.namespace, object.metadata.name
-        ));
+        if scheme.is_udp()
+            && acc
+                .gateway_api_conflict_losers
+                .contains_key(&K8sResourceKey::from_object(object))
+        {
+            acc.warnings.push(format!(
+                "{} {}/{} lost every claimed UDP listener to an older competing UDPRoute; \
+                 no listener was opened",
+                object.kind, object.metadata.namespace, object.metadata.name
+            ));
+        } else {
+            acc.warnings.push(format!(
+                "{} {}/{} declares Gateway parentRefs but none resolved to a materializable listener; \
+                 no listener was opened",
+                object.kind, object.metadata.namespace, object.metadata.name
+            ));
+        }
         return Ok(Vec::new());
     }
 
@@ -5668,7 +5898,9 @@ fn l4_route_proxies(
         // One leg dispatches directly; a set of legs becomes one namespaced
         // upstream whose weighted targets preserve the declared relative
         // weights. The upstream is listener-independent, so every listen port
-        // for this rule shares it.
+        // for this rule shares it. Create it only when at least one listen
+        // port survives — a UDPRoute conflict loser must not leave an orphan
+        // upstream behind.
         let (backend_host, backend_port, upstream_id) = if resolved.backends.len() == 1 {
             let Some(backend) = resolved.backends.into_iter().next() else {
                 continue;
@@ -5725,6 +5957,39 @@ fn l4_route_proxies(
     Ok(proxies)
 }
 
+/// UDP listener ports and parentRefs that survive same-listener conflict loss.
+///
+/// Arbitration is per concrete listener: a route that loses on one listener may
+/// still keep another. ParentRefs that retain at least one surviving listener
+/// are recorded as materialized so status `Programmed` tracks live ownership.
+fn udp_route_surviving_materialization(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+) -> (Vec<u16>, Vec<String>) {
+    let losing_conflict_keys: HashSet<GatewayApiRouteConflictKey> = acc
+        .gateway_api_conflict_losers
+        .get(&K8sResourceKey::from_object(object))
+        .into_iter()
+        .flat_map(|conflicts| conflicts.iter().map(|conflict| conflict.key.clone()))
+        .collect();
+
+    let mut ports = Vec::new();
+    let mut parent_refs = Vec::new();
+    for claim in udp_route_listener_claims(object, acc) {
+        let key = udp_route_conflict_key(&claim.parent_ref, &claim.listener);
+        if losing_conflict_keys.contains(&key) {
+            continue;
+        }
+        ports.push(claim.port);
+        parent_refs.push(claim.parent_ref);
+    }
+    ports.sort();
+    ports.dedup();
+    parent_refs.sort();
+    parent_refs.dedup();
+    (ports, parent_refs)
+}
+
 /// True when the route names at least one Gateway `parentRefs[]` entry.
 ///
 /// A non-Gateway parent (a GAMMA `Service` parent, say) is not a listener
@@ -5755,6 +6020,7 @@ fn l4_rule_suffix(scheme: BackendScheme, rule_index: usize) -> String {
 /// at 16 entries each. A non-Kubernetes config source is not CRD-validated, so
 /// the cold path enforces the same ceiling rather than expanding an unbounded
 /// hostile fan-out.
+const MAX_UDP_ROUTE_RULES: usize = 16;
 const MAX_UDP_ROUTE_BACKEND_REFS: usize = 16;
 /// Gateway API v1.5.1 `BackendRef.weight` upper bound. Ferrum stores target
 /// weights under [`MAX_TARGET_WEIGHT`], so accepted UDPRoute weights are
@@ -5770,19 +6036,13 @@ const GATEWAY_API_MAX_BACKEND_WEIGHT: u64 = 1_000_000;
 /// status with the upstream `UnsupportedValue` reason.
 const MAX_SUPPORTED_UDP_ROUTE_RULES: usize = 1;
 
-/// Reject a `UDPRoute` carrying more rules than Ferrum can represent.
+/// Reject a `UDPRoute` whose `spec.rules` shape is hostile or unrepresentable.
 ///
-/// A `UDPRouteRule` has exactly two fields on the pinned tag — `name` and
-/// `backendRefs` — and therefore no match predicate. Two rules on one listener
-/// are indistinguishable to a datagram, the standard defines no precedence
-/// between them, and their `backendRefs` weights are declared per rule and are
-/// not comparable across rules, so there is no aggregate Ferrum could
-/// materialize without inventing semantics: merging the sets would silently
-/// turn a two-rule object into one weighted split, and materializing both
-/// would queue competing OS listeners on the same UDP port whose winner is
-/// bind order. Fail closed with a field-specific diagnostic instead, tagged
-/// with [`UNSUPPORTED_SHAPE_MARKER`] so status reports `Accepted=False` /
-/// `UnsupportedValue` rather than the generic `Invalid`.
+/// The CRD requires `rules` to be an array with `MinItems=1` / `MaxItems=16`.
+/// Missing, non-array, empty, and over-long shapes are rejected fail closed as
+/// `Invalid`. A CRD-valid `2..=16`-rule object remains
+/// [`UNSUPPORTED_SHAPE_MARKER`] / `UnsupportedValue` because Ferrum still
+/// cannot represent matchless competing rules on one listener.
 ///
 /// `TCPRoute`/`TLSRoute` keep their historical behavior.
 fn ensure_udp_route_rule_shape(
@@ -5792,22 +6052,56 @@ fn ensure_udp_route_rule_shape(
     if !scheme.is_udp() {
         return Ok(());
     }
-    let rule_count = object
-        .spec
-        .get("rules")
-        .and_then(Value::as_array)
-        .map_or(0, |rules| rules.len());
-    if rule_count > MAX_SUPPORTED_UDP_ROUTE_RULES {
+    let Some(rules_value) = object.spec.get("rules") else {
         return Err(invalid_resource(
             object,
             format!(
-                "{} spec.rules holds {rule_count} rules, which {UNSUPPORTED_SHAPE_MARKER}: \
-                 Gateway API v1.5.1 permits 1..=16 rules, but a UDPRouteRule carries only \
+                "{} spec.rules is required and must be an array with 1..={MAX_UDP_ROUTE_RULES} entries",
+                object.kind
+            ),
+        ));
+    };
+    let Some(rules) = rules_value.as_array() else {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} spec.rules must be an array with 1..={MAX_UDP_ROUTE_RULES} entries",
+                object.kind
+            ),
+        ));
+    };
+    if rules.is_empty() {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} spec.rules must contain at least 1 entry (Gateway API MinItems=1)",
+                object.kind
+            ),
+        ));
+    }
+    if rules.len() > MAX_UDP_ROUTE_RULES {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} spec.rules supports at most {MAX_UDP_ROUTE_RULES} entries (got {})",
+                object.kind,
+                rules.len()
+            ),
+        ));
+    }
+    if rules.len() > MAX_SUPPORTED_UDP_ROUTE_RULES {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} spec.rules holds {} rules, which {UNSUPPORTED_SHAPE_MARKER}: \
+                 Gateway API v1.5.1 permits 1..={MAX_UDP_ROUTE_RULES} rules, but a UDPRouteRule carries only \
                  `name` and `backendRefs` and so has no match predicate, leaving \
-                 {rule_count} indistinguishable rules on one listener port with no \
+                 {} indistinguishable rules on one listener port with no \
                  standards-defined precedence and no cross-rule weight comparison; Ferrum \
                  serves exactly {MAX_SUPPORTED_UDP_ROUTE_RULES} rule per UDPRoute",
-                object.kind
+                object.kind,
+                rules.len(),
+                rules.len()
             ),
         ));
     }
@@ -5892,9 +6186,33 @@ fn udp_rule_backends(
     rule: &Value,
     acc: &mut K8sAccumulator,
 ) -> Result<Option<L4RuleBackends>, K8sTranslateError> {
-    let Some(backend_refs) = rule.get("backendRefs").and_then(Value::as_array) else {
-        return Ok(None);
+    let Some(backend_refs_value) = rule.get("backendRefs") else {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} backendRefs is required and must be an array with 1..={MAX_UDP_ROUTE_BACKEND_REFS} entries",
+                object.kind
+            ),
+        ));
     };
+    let Some(backend_refs) = backend_refs_value.as_array() else {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} backendRefs must be an array with 1..={MAX_UDP_ROUTE_BACKEND_REFS} entries",
+                object.kind
+            ),
+        ));
+    };
+    if backend_refs.is_empty() {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} backendRefs must contain at least 1 entry (Gateway API MinItems=1)",
+                object.kind
+            ),
+        ));
+    }
     if backend_refs.len() > MAX_UDP_ROUTE_BACKEND_REFS {
         return Err(invalid_resource(
             object,

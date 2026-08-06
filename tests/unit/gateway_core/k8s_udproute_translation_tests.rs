@@ -64,6 +64,19 @@ fn udp_route(name: &str, spec: Value) -> K8sObject {
     object_in("UDPRoute", version, "default", name, spec)
 }
 
+fn udp_route_at(name: &str, created_at: &str, spec: Value) -> K8sObject {
+    let mut route = udp_route(name, spec);
+    route.metadata.creation_timestamp = Some(created_at.to_string());
+    route
+}
+
+fn udp_route_in(namespace: &str, name: &str, created_at: &str, spec: Value) -> K8sObject {
+    let version = "gateway.networking.k8s.io/v1alpha2";
+    let mut route = object_in("UDPRoute", version, namespace, name, spec);
+    route.metadata.creation_timestamp = Some(created_at.to_string());
+    route
+}
+
 fn gateway_class() -> K8sObject {
     let spec = json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME});
     let version = "gateway.networking.k8s.io/v1";
@@ -1078,6 +1091,433 @@ fn udp_route_malformed_shape_still_reports_invalid() {
         route_condition_reason(&updates, "dns", "Accepted").as_deref(),
         Some("Invalid")
     );
+}
+
+#[test]
+fn udp_route_missing_rules_rejects_invalid() {
+    let spec = json!({
+        "parentRefs": [{"name": "edge", "sectionName": "dns"}]
+    });
+    let objects = udp_lab(spec);
+
+    let err = translate_k8s_objects(&objects, options()).expect_err("missing rules fail closed");
+    let message = err.to_string();
+    assert!(message.contains("UDPRoute spec.rules"), "{message}");
+    assert!(message.contains("required"), "{message}");
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+    assert_eq!(
+        route_condition_reason(&updates, "dns", "Accepted").as_deref(),
+        Some("Invalid")
+    );
+}
+
+#[test]
+fn udp_route_non_array_rules_rejects_invalid() {
+    let spec = json!({
+        "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+        "rules": {"backendRefs": [{"name": "coredns", "port": 5353}]}
+    });
+    let objects = udp_lab(spec);
+
+    let err = translate_k8s_objects(&objects, options()).expect_err("non-array rules fail closed");
+    assert!(err.to_string().contains("UDPRoute spec.rules must be an array"));
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+    assert_eq!(
+        route_condition_reason(&updates, "dns", "Accepted").as_deref(),
+        Some("Invalid")
+    );
+}
+
+#[test]
+fn udp_route_empty_rules_rejects_invalid() {
+    let spec = json!({
+        "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+        "rules": []
+    });
+    let objects = udp_lab(spec);
+
+    let err = translate_k8s_objects(&objects, options()).expect_err("empty rules fail closed");
+    assert!(err.to_string().contains("UDPRoute spec.rules must contain at least 1"));
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+    assert_eq!(
+        route_condition_reason(&updates, "dns", "Accepted").as_deref(),
+        Some("Invalid")
+    );
+}
+
+#[test]
+fn udp_route_missing_backend_refs_rejects_invalid() {
+    let spec = json!({
+        "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+        "rules": [{}]
+    });
+    let objects = udp_lab(spec);
+
+    let err =
+        translate_k8s_objects(&objects, options()).expect_err("missing backendRefs fail closed");
+    assert!(err.to_string().contains("UDPRoute backendRefs is required"));
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+    assert_eq!(
+        route_condition_reason(&updates, "dns", "Accepted").as_deref(),
+        Some("Invalid")
+    );
+}
+
+#[test]
+fn udp_route_non_array_backend_refs_rejects_invalid() {
+    let spec = json!({
+        "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+        "rules": [{"backendRefs": {"name": "coredns", "port": 5353}}]
+    });
+    let objects = udp_lab(spec);
+
+    let err =
+        translate_k8s_objects(&objects, options()).expect_err("non-array backendRefs fail closed");
+    assert!(err.to_string().contains("UDPRoute backendRefs must be an array"));
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+    assert_eq!(
+        route_condition_reason(&updates, "dns", "Accepted").as_deref(),
+        Some("Invalid")
+    );
+}
+
+#[test]
+fn udp_route_empty_backend_refs_rejects_invalid() {
+    let spec = json!({
+        "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+        "rules": [{"backendRefs": []}]
+    });
+    let objects = udp_lab(spec);
+
+    let err =
+        translate_k8s_objects(&objects, options()).expect_err("empty backendRefs fail closed");
+    assert!(err
+        .to_string()
+        .contains("UDPRoute backendRefs must contain at least 1"));
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+    assert_eq!(
+        route_condition_reason(&updates, "dns", "Accepted").as_deref(),
+        Some("Invalid")
+    );
+}
+
+#[test]
+fn udp_routes_on_the_same_listener_arbitrate_oldest_wins() {
+    let winner = udp_route_at(
+        "dns-old",
+        "2024-01-01T00:00:00Z",
+        attached_rule("edge", "dns", "coredns-a", 5353),
+    );
+    let mut loser = udp_route_at(
+        "dns-new",
+        "2024-01-02T00:00:00Z",
+        attached_rule("edge", "dns", "coredns-b", 5354),
+    );
+    // Weighted loser would otherwise generate an upstream; conflict must
+    // suppress that orphan as well as the listen-port proxy.
+    loser.spec = json!({
+        "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+        "rules": [{"backendRefs": [
+            {"name": "coredns-b", "port": 5354, "weight": 1},
+            {"name": "coredns-c", "port": 5355, "weight": 1}
+        ]}]
+    });
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        winner,
+        loser,
+    ];
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+    assert_eq!(result.config.proxies.len(), 1, "exactly one listener owner");
+    assert_eq!(result.config.proxies[0].listen_port, Some(15353));
+    assert_eq!(
+        result.config.proxies[0].backend_host,
+        "coredns-a.default.svc.cluster.local"
+    );
+    assert!(
+        result.config.upstreams.is_empty(),
+        "weighted conflict loser must not leave an orphan upstream: {:?}",
+        result
+            .config
+            .upstreams
+            .iter()
+            .map(|upstream| upstream.id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        result
+            .route_conflicts
+            .iter()
+            .any(|conflict| conflict.loser.name == "dns-new" && conflict.winner.name == "dns-old"),
+        "expected conflict evidence, got {:?}",
+        result.route_conflicts
+    );
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &result.route_conflicts);
+    assert_eq!(
+        route_condition(&updates, "dns-old", "Programmed").as_deref(),
+        Some("True")
+    );
+    assert_eq!(
+        route_condition_reason(&updates, "dns-new", "Accepted").as_deref(),
+        Some("Conflicted")
+    );
+    assert_eq!(
+        route_condition_reason(&updates, "dns-new", "Programmed").as_deref(),
+        Some("Conflicted")
+    );
+    assert_eq!(
+        route_condition(&updates, "dns-new", "Conflicted").as_deref(),
+        Some("True")
+    );
+}
+
+#[test]
+fn udp_routes_on_distinct_listeners_remain_independent() {
+    let gateway = gateway_object(
+        "edge",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "dns",
+                    "port": 15353,
+                    "protocol": "UDP",
+                    "allowedRoutes": {"kinds": [{"kind": "UDPRoute"}]}
+                },
+                {
+                    "name": "metrics",
+                    "port": 15354,
+                    "protocol": "UDP",
+                    "allowedRoutes": {"kinds": [{"kind": "UDPRoute"}]}
+                }
+            ]
+        }),
+    );
+    let objects = [
+        gateway_class(),
+        gateway,
+        udp_route(
+            "dns",
+            attached_rule("edge", "dns", "coredns-a", 5353),
+        ),
+        udp_route(
+            "metrics",
+            attached_rule("edge", "metrics", "coredns-b", 5354),
+        ),
+    ];
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+    assert!(result.route_conflicts.is_empty(), "{:?}", result.route_conflicts);
+    let mut ports: Vec<Option<u16>> = result
+        .config
+        .proxies
+        .iter()
+        .map(|proxy| proxy.listen_port)
+        .collect();
+    ports.sort();
+    assert_eq!(ports, vec![Some(15353), Some(15354)]);
+}
+
+#[test]
+fn udp_route_selector_aliases_to_the_same_listener_conflict() {
+    // Wildcard parentRef and sectionName both resolve to listener `dns`.
+    let winner = udp_route_at(
+        "wildcard",
+        "2024-01-01T00:00:00Z",
+        json!({
+            "parentRefs": [{"name": "edge"}],
+            "rules": [{"backendRefs": [{"name": "coredns-a", "port": 5353}]}]
+        }),
+    );
+    let loser = udp_route_at(
+        "section",
+        "2024-01-02T00:00:00Z",
+        attached_rule("edge", "dns", "coredns-b", 5354),
+    );
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        winner,
+        loser,
+    ];
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+    assert_eq!(result.config.proxies.len(), 1);
+    assert_eq!(
+        result.config.proxies[0].backend_host,
+        "coredns-a.default.svc.cluster.local"
+    );
+    assert!(
+        result
+            .route_conflicts
+            .iter()
+            .any(|conflict| conflict.loser.name == "section" && conflict.winner.name == "wildcard"),
+        "{:?}",
+        result.route_conflicts
+    );
+}
+
+#[test]
+fn udp_route_equal_timestamp_tie_breaks_by_namespace_name() {
+    let older_name = udp_route_in(
+        "default",
+        "a-route",
+        "2024-01-01T00:00:00Z",
+        attached_rule("edge", "dns", "coredns-a", 5353),
+    );
+    let newer_name = udp_route_in(
+        "default",
+        "b-route",
+        "2024-01-01T00:00:00Z",
+        attached_rule("edge", "dns", "coredns-b", 5354),
+    );
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        newer_name,
+        older_name,
+    ];
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+    assert_eq!(result.config.proxies.len(), 1);
+    assert_eq!(
+        result.config.proxies[0].backend_host,
+        "coredns-a.default.svc.cluster.local"
+    );
+    assert!(
+        result
+            .route_conflicts
+            .iter()
+            .any(|conflict| conflict.winner.name == "a-route" && conflict.loser.name == "b-route"),
+        "{:?}",
+        result.route_conflicts
+    );
+}
+
+#[test]
+fn udp_route_partial_listener_conflict_keeps_the_non_colliding_listener() {
+    let gateway = gateway_object(
+        "edge",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "dns",
+                    "port": 15353,
+                    "protocol": "UDP",
+                    "allowedRoutes": {"kinds": [{"kind": "UDPRoute"}]}
+                },
+                {
+                    "name": "metrics",
+                    "port": 15354,
+                    "protocol": "UDP",
+                    "allowedRoutes": {"kinds": [{"kind": "UDPRoute"}]}
+                }
+            ]
+        }),
+    );
+    let exclusive = udp_route_at(
+        "dns-only",
+        "2024-01-01T00:00:00Z",
+        attached_rule("edge", "dns", "coredns-a", 5353),
+    );
+    let shared = udp_route_at(
+        "both",
+        "2024-01-02T00:00:00Z",
+        json!({
+            "parentRefs": [{"name": "edge"}],
+            "rules": [{"backendRefs": [{"name": "coredns-b", "port": 5354}]}]
+        }),
+    );
+    let objects = [gateway_class(), gateway, exclusive, shared];
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+    let mut ports: Vec<Option<u16>> = result
+        .config
+        .proxies
+        .iter()
+        .map(|proxy| proxy.listen_port)
+        .collect();
+    ports.sort();
+    // dns-only owns 15353; both keeps only the non-colliding metrics listener.
+    assert_eq!(ports, vec![Some(15353), Some(15354)]);
+    let metrics_owner = result
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_port == Some(15354))
+        .expect("metrics listener remains");
+    assert!(metrics_owner.id.contains("both"));
+    assert!(
+        result
+            .route_conflicts
+            .iter()
+            .any(|conflict| conflict.loser.name == "both" && conflict.winner.name == "dns-only"),
+        "{:?}",
+        result.route_conflicts
+    );
+}
+
+#[test]
+fn udp_route_conflict_loser_promotes_after_winner_delete() {
+    let gateway = udp_gateway("edge", "dns", 15353);
+    let winner = udp_route_at(
+        "dns-old",
+        "2024-01-01T00:00:00Z",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+            "rules": [{"backendRefs": [
+                {"name": "coredns-a", "port": 5353, "weight": 1},
+                {"name": "coredns-b", "port": 5354, "weight": 1}
+            ]}]
+        }),
+    );
+    let loser = udp_route_at(
+        "dns-new",
+        "2024-01-02T00:00:00Z",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+            "rules": [{"backendRefs": [
+                {"name": "coredns-c", "port": 5355, "weight": 1},
+                {"name": "coredns-d", "port": 5356, "weight": 1}
+            ]}]
+        }),
+    );
+
+    let contested = translate_k8s_objects(
+        &[
+            gateway_class(),
+            gateway.clone(),
+            winner.clone(),
+            loser.clone(),
+        ],
+        options(),
+    )
+    .expect("translation succeeds");
+    assert_eq!(contested.config.proxies.len(), 1);
+    assert_eq!(contested.config.upstreams.len(), 1);
+    assert!(contested.config.upstreams[0].id.contains("dns-old"));
+
+    let after_delete = translate_k8s_objects(&[gateway_class(), gateway, loser], options())
+        .expect("translation succeeds");
+    assert_eq!(after_delete.config.proxies.len(), 1);
+    assert_eq!(after_delete.config.upstreams.len(), 1);
+    assert!(after_delete.config.upstreams[0].id.contains("dns-new"));
+    assert!(after_delete.route_conflicts.is_empty());
 }
 
 #[test]
