@@ -11,6 +11,7 @@ import hmac
 import json
 import re
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -337,20 +338,55 @@ def metric_value(text: str, name: str, labels: dict[str, str]) -> float:
     raise SystemExit(f"missing {name}")
 
 
+PARITY_AGE_TOLERANCE_SECONDS = 2
+
+
+def remote_cache_ages(payload: object, peer: str) -> tuple[float, float]:
+    if not isinstance(payload, dict):
+        raise SystemExit(1)
+    configured_rows = payload.get("configured")
+    discovered_rows = payload.get("discovered")
+    if not isinstance(configured_rows, list) or not isinstance(
+        discovered_rows, list
+    ):
+        raise SystemExit(1)
+    configured = next(
+        row
+        for row in configured_rows
+        if isinstance(row, dict) and row.get("cluster_name") == peer
+    )
+    discovered = next(
+        row
+        for row in discovered_rows
+        if isinstance(row, dict) and row.get("cluster_name") == peer
+    )
+    try:
+        return (
+            float(configured["trust_bundle_age_seconds"]),
+            float(discovered["age_seconds"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        raise SystemExit(1) from None
+
+
+def metric_age_matches_admin_snapshot(
+    metric_age: float, admin_age: float, tolerance: float = PARITY_AGE_TOLERANCE_SECONDS
+) -> bool:
+    return abs(metric_age - admin_age) <= tolerance
+
+
 def assert_metric_admin_parity(
-    json_path: Path,
+    json_before_path: Path,
     metrics_path: Path,
+    json_after_path: Path,
     peer: str,
     trust_domain: str,
 ) -> None:
-    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    before = json.loads(json_before_path.read_text(encoding="utf-8"))
+    after = json.loads(json_after_path.read_text(encoding="utf-8"))
     text = metrics_path.read_text(encoding="utf-8")
-    configured = next(
-        row for row in payload["configured"] if row["cluster_name"] == peer
-    )
-    discovered = next(
-        row for row in payload["discovered"] if row["cluster_name"] == peer
-    )
+    trust_before, endpoint_before = remote_cache_ages(before, peer)
+    trust_after, endpoint_after = remote_cache_ages(after, peer)
     federation_age = metric_value(
         text,
         "ferrum_mesh_federation_bundle_age_seconds",
@@ -361,9 +397,13 @@ def assert_metric_admin_parity(
         "ferrum_mesh_remote_discovery_endpoint_age_seconds",
         {"cluster": peer, "trust_domain": trust_domain},
     )
-    if abs(federation_age - configured["trust_bundle_age_seconds"]) > 2 or abs(
-        endpoint_age - discovered["age_seconds"]
-    ) > 2:
+    trust_ok = metric_age_matches_admin_snapshot(
+        federation_age, trust_before
+    ) or metric_age_matches_admin_snapshot(federation_age, trust_after)
+    endpoint_ok = metric_age_matches_admin_snapshot(
+        endpoint_age, endpoint_before
+    ) or metric_age_matches_admin_snapshot(endpoint_age, endpoint_after)
+    if not trust_ok or not endpoint_ok:
         raise SystemExit("admin/metric cache-age parity exceeded 2s")
     if (
         'endpoint="redacted"' not in text
@@ -392,6 +432,67 @@ def assert_metric_admin_parity(
             raise SystemExit(
                 f"bounded cardinality violated for {family}: {len(matches)}"
             )
+
+
+def self_test_metric_admin_parity() -> None:
+    peer = "cluster-b"
+    trust_domain = "cluster-b.example"
+    before = {
+        "configured": [
+            {"cluster_name": peer, "trust_bundle_age_seconds": 5},
+        ],
+        "discovered": [
+            {"cluster_name": peer, "age_seconds": 5},
+        ],
+    }
+    after = {
+        "configured": [
+            {"cluster_name": peer, "trust_bundle_age_seconds": 0},
+        ],
+        "discovered": [
+            {"cluster_name": peer, "age_seconds": 5},
+        ],
+    }
+    metrics = "\n".join(
+        [
+            (
+                'ferrum_mesh_federation_bundle_age_seconds'
+                f'{{trust_domain="{trust_domain}"}} 0'
+            ),
+            (
+                'ferrum_mesh_remote_discovery_endpoint_age_seconds'
+                f'{{cluster="{peer}",trust_domain="{trust_domain}"}} 5'
+            ),
+            'ferrum_mesh_federation_poll_failures_total'
+            f'{{trust_domain="{trust_domain}",endpoint="redacted"}} 1',
+            'ferrum_mesh_remote_discovery_poll_failures_total'
+            f'{{cluster="{peer}",control_plane="redacted"}} 1',
+            'ferrum_mesh_remote_discovery_poll_successes_total'
+            f'{{cluster="{peer}",trust_domain="{trust_domain}"}} 2',
+        ]
+    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        before_path = root / "before.json"
+        after_path = root / "after.json"
+        metrics_path = root / "metrics.prom"
+        before_path.write_text(json.dumps(before), encoding="utf-8")
+        after_path.write_text(json.dumps(after), encoding="utf-8")
+        metrics_path.write_text(metrics, encoding="utf-8")
+        assert_metric_admin_parity(
+            before_path, metrics_path, after_path, peer, trust_domain
+        )
+        stale_metrics = metrics.replace(" 0\n", " 9\n", 1)
+        metrics_path.write_text(stale_metrics, encoding="utf-8")
+        try:
+            assert_metric_admin_parity(
+                before_path, metrics_path, after_path, peer, trust_domain
+            )
+        except SystemExit as error:
+            if str(error) != "admin/metric cache-age parity exceeded 2s":
+                raise
+        else:
+            raise SystemExit("parity self-test expected stale trust age to fail")
 
 
 def redact_toxiproxy() -> None:
@@ -443,8 +544,13 @@ def main(argv: list[str]) -> None:
         ages_between(argv[2], int(argv[3]), int(argv[4]))
     elif operation == "admin-ages" and len(argv) == 3:
         print(*remote_ages(argv[2]))
-    elif operation == "assert-metric-admin-parity" and len(argv) == 6:
-        assert_metric_admin_parity(Path(argv[2]), Path(argv[3]), argv[4], argv[5])
+    elif operation == "self-test" and len(argv) == 2:
+        self_test_metric_admin_parity()
+        print("live_assertions self-test passed")
+    elif operation == "assert-metric-admin-parity" and len(argv) == 7:
+        assert_metric_admin_parity(
+            Path(argv[2]), Path(argv[3]), Path(argv[4]), argv[5], argv[6]
+        )
     elif operation == "redact-toxiproxy" and len(argv) == 2:
         redact_toxiproxy()
     elif len(argv) < 3:

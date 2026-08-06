@@ -6606,3 +6606,203 @@ fn an_internally_disabled_local_mcp_gateway_shadows_an_enabled_global_one() {
          which applies no rewrite"
     );
 }
+
+// ── request_deduplication / a2a_gateway CONDITIONAL composition ──────────────
+//
+// Unlike `mcp_gateway`, `a2a_gateway` is not dynamic by name. With
+// `discovery.public_base_url` configured, its Agent Card rewrite is a pure
+// function of configuration and enrolls a static replay digest. Only the
+// request-derived mode — no configured base plus
+// `discovery.trust_forwarded_headers` — is unprovable, because the rewritten
+// origin then depends on forwarded headers and on whether the connection carried
+// a TLS SNI hostname, and the deduplication fingerprint binds neither. Admission
+// must therefore refuse per instance, never by name.
+
+fn a2a_gateway_plugin_config(
+    id: &str,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+    discovery: serde_json::Value,
+) -> PluginConfig {
+    PluginConfig {
+        id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "a2a_gateway".into(),
+        config: serde_json::json!({
+            "endpoint": {"path": "/a2a", "protocol_versions": ["0.3.0"]},
+            "discovery": discovery,
+        }),
+        scope,
+        proxy_id: proxy_id.map(str::to_string),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// One proxy, dedup plus a forwarded-derived `a2a_gateway`: refused, naming both
+/// instances and the actionable remedy.
+#[test]
+fn dedup_and_request_derived_a2a_gateway_are_rejected() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        a2a_gateway_plugin_config(
+            "a2a1",
+            PluginScope::Proxy,
+            Some("p1"),
+            serde_json::json!({"trust_forwarded_headers": true}),
+        ),
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1", "a2a1"]);
+    config.proxies = vec![proxy];
+
+    let errs = config
+        .validate_plugin_references()
+        .expect_err("dedup + a request-derived a2a_gateway must be refused");
+    let joined = errs.join("; ");
+    assert!(
+        joined.contains("request_deduplication cannot be composed with a2a_gateway"),
+        "unexpected errors: {joined}"
+    );
+    assert!(
+        joined.contains("derives its public base from the request"),
+        "the error must name the configuration that is actually unprovable: {joined}"
+    );
+    assert!(
+        joined.contains("Set discovery.public_base_url"),
+        "the error must name the remedy: {joined}"
+    );
+    assert!(
+        joined.contains("dedup1") && joined.contains("a2a1") && joined.contains("p1"),
+        "{joined}"
+    );
+}
+
+/// A global forwarded-derived instance is effective on every proxy without a
+/// local one, exactly like the `mcp_gateway` case.
+#[test]
+fn dedup_and_a_global_request_derived_a2a_gateway_are_rejected() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        a2a_gateway_plugin_config(
+            "a2a-global",
+            PluginScope::Global,
+            None,
+            serde_json::json!({"trust_forwarded_headers": true}),
+        ),
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1"]);
+    config.proxies = vec![proxy];
+
+    let errs = config
+        .validate_plugin_references()
+        .expect_err("a global request-derived a2a_gateway still composes with a scoped dedup");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("request_deduplication cannot be composed with a2a_gateway")),
+        "unexpected errors: {errs:?}"
+    );
+}
+
+/// The load-bearing negative: a configured public base is provable, enrolls a
+/// static digest, and must keep composing. Refusing `a2a_gateway` by name would
+/// break every ordinary deployment.
+#[test]
+fn dedup_and_a_configured_public_base_a2a_gateway_are_admitted() {
+    for discovery in [
+        serde_json::json!({"public_base_url": "https://agents.example.com"}),
+        // A configured base wins over forwarded headers, so trusting them
+        // alongside it is still provable.
+        serde_json::json!({
+            "public_base_url": "https://agents.example.com",
+            "trust_forwarded_headers": true,
+        }),
+        // Forwarded headers are not trusted, so no public base is derived at all.
+        serde_json::json!({}),
+        // Nothing is rewritten.
+        serde_json::json!({
+            "rewrite_agent_card_urls": false,
+            "trust_forwarded_headers": true,
+        }),
+    ] {
+        let mut config = empty_config();
+        config.plugin_configs = vec![
+            dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+            a2a_gateway_plugin_config("a2a1", PluginScope::Proxy, Some("p1"), discovery.clone()),
+        ];
+        let mut proxy = make_proxy("p1", "/api");
+        associate(&mut proxy, &["dedup1", "a2a1"]);
+        config.proxies = vec![proxy];
+
+        assert!(
+            config.validate_plugin_references().is_ok(),
+            "a provable a2a_gateway ({discovery}) must compose with deduplication"
+        );
+    }
+}
+
+#[test]
+fn a_disabled_request_derived_a2a_gateway_does_not_block_dedup() {
+    for disable in ["outer", "inner"] {
+        let mut config = empty_config();
+        let mut a2a = a2a_gateway_plugin_config(
+            "a2a1",
+            PluginScope::Proxy,
+            Some("p1"),
+            serde_json::json!({"trust_forwarded_headers": true}),
+        );
+        if disable == "outer" {
+            a2a.enabled = false;
+        } else {
+            a2a.config["enabled"] = serde_json::Value::Bool(false);
+        }
+        config.plugin_configs = vec![
+            dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+            a2a,
+        ];
+        let mut proxy = make_proxy("p1", "/api");
+        associate(&mut proxy, &["dedup1", "a2a1"]);
+        config.proxies = vec![proxy];
+
+        assert!(
+            config.validate_plugin_references().is_ok(),
+            "an {disable}-disabled a2a_gateway rewrites nothing and must not block deduplication"
+        );
+    }
+}
+
+/// Scope resolution mirrors the runtime merge here too: a provable local
+/// instance shadows a forwarded-derived global one, and the pair is admitted.
+#[test]
+fn a_provable_local_a2a_gateway_shadows_a_request_derived_global_one() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        a2a_gateway_plugin_config(
+            "a2a-global",
+            PluginScope::Global,
+            None,
+            serde_json::json!({"trust_forwarded_headers": true}),
+        ),
+        a2a_gateway_plugin_config(
+            "a2a-local",
+            PluginScope::Proxy,
+            Some("p1"),
+            serde_json::json!({"public_base_url": "https://agents.example.com"}),
+        ),
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1", "a2a-local"]);
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_plugin_references().is_ok(),
+        "the effective a2a_gateway on this proxy is the configured-public-base local instance"
+    );
+}

@@ -571,7 +571,15 @@ fn translator_emits_labels_carrier_when_slice_has_no_extension_configs() {
         .iter()
         .map(|r| r.name.as_str())
         .collect();
-    assert_eq!(names, vec!["ferrum-mesh-carrier/workload-labels"]);
+    // `MeshConfig::default()` carries Istio's default root namespace, so the
+    // root-namespace carrier (issue #2469) rides alongside the labels carrier.
+    assert_eq!(
+        names,
+        vec![
+            "ferrum-mesh-carrier/istio-root-namespace",
+            "ferrum-mesh-carrier/workload-labels",
+        ]
+    );
 }
 
 #[test]

@@ -373,6 +373,7 @@ fn wrr_counter_shard() -> usize {
 /// bouncing a single shared `AtomicU64` that sat adjacent to read-per-selection
 /// neighbors (`algorithm`, `target_indices`, `distribute_groups`, …).
 type SelectionCounterShards = [CachePadded<AtomicU64>; WRR_COUNTER_SHARDS];
+type CandidatePoolIndices<'a> = (Option<&'a [usize]>, Option<&'a [usize]>);
 
 /// Odd multiplicative stride (golden-ratio fraction of 2^64) giving each
 /// selection-counter shard a distinct starting phase at construction.
@@ -898,7 +899,7 @@ impl HashOnStrategy {
             None | Some("ip") | Some("") => Self::Ip,
             Some(s) if s.starts_with("header:") => {
                 let name = s["header:".len()..].trim();
-                if name.is_empty() {
+                if !crate::config::types::is_valid_http_token(name) {
                     Self::Ip
                 } else {
                     Self::Header(name.to_ascii_lowercase())
@@ -906,7 +907,7 @@ impl HashOnStrategy {
             }
             Some(s) if s.starts_with("cookie:") => {
                 let name = s["cookie:".len()..].trim();
-                if name.is_empty() {
+                if !crate::config::types::is_valid_http_token(name) {
                     Self::Ip
                 } else {
                     Self::Cookie(name.to_string())
@@ -1608,6 +1609,47 @@ impl LoadBalancerCache {
         balancer.select_passthrough(orig_dst, port, subset_name, health)
     }
 
+    /// Gateway API session persistence from a snapshot: resolve an opaque
+    /// sticky-session token to the exact target that minted it, scoped to the
+    /// same `(subset ∩ port)` candidate pool and health filtering ordinary
+    /// selection uses. `None` means the caller must fall back to ordinary
+    /// load-balanced selection and mint a fresh binding — see
+    /// [`LoadBalancer::select_sticky`].
+    #[inline]
+    pub fn select_sticky_from(
+        snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
+        upstream_id: &str,
+        token: &str,
+        port: Option<u16>,
+        subset_name: Option<&str>,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let balancer = snapshot.balancer(namespace, upstream_id)?;
+        balancer.select_sticky(token, port, subset_name, health)
+    }
+
+    /// Snapshot view of
+    /// [`LoadBalancer::configured_sticky_identity_target`]: the CONFIGURED
+    /// selection identity for a dialed/served `served_target` — used by sticky
+    /// cookie minting and by retry exclusion after a wildcard dial clone.
+    ///
+    /// Returns `served_target` unchanged when the upstream is unknown in this
+    /// snapshot or has no wildcard-hosted target, which is every ordinary
+    /// upstream and the whole of the pre-existing behavior.
+    #[inline]
+    pub fn configured_sticky_identity_target_from<'a>(
+        snapshot: &'a LoadBalancerCacheInner,
+        namespace: &str,
+        upstream_id: &str,
+        served_target: &'a UpstreamTarget,
+    ) -> &'a UpstreamTarget {
+        match snapshot.balancer(namespace, upstream_id) {
+            Some(balancer) => balancer.configured_sticky_identity_target(served_target),
+            None => served_target,
+        }
+    }
+
     /// Select next target, excluding a previously tried target (for retries).
     pub fn select_next_target(
         &self,
@@ -1633,6 +1675,22 @@ impl LoadBalancerCache {
         balancer.select_excluding(ctx_key, exclude, health)
     }
 
+    /// TCP/stream connect-retry variant of [`Self::select_next_target_from`].
+    ///
+    /// Excludes by effective `(host, dial port, policy lane)` — the only identity
+    /// stream retry retains — rather than full sticky/routing identity.
+    pub fn select_next_target_excluding_endpoint_lane_from(
+        snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
+        upstream_id: &str,
+        ctx_key: &str,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let balancer = snapshot.balancer(namespace, upstream_id)?;
+        balancer.select_excluding_endpoint_lane(ctx_key, exclude, health)
+    }
+
     pub fn select_next_target_for_port_from(
         snapshot: &LoadBalancerCacheInner,
         namespace: &str,
@@ -1644,6 +1702,20 @@ impl LoadBalancerCache {
     ) -> Option<Arc<UpstreamTarget>> {
         let balancer = snapshot.balancer(namespace, upstream_id)?;
         balancer.select_excluding_for_port(ctx_key, port, exclude, health)
+    }
+
+    /// TCP/stream connect-retry variant of [`Self::select_next_target_for_port_from`].
+    pub fn select_next_target_for_port_excluding_endpoint_lane_from(
+        snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
+        upstream_id: &str,
+        ctx_key: &str,
+        port: u16,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let balancer = snapshot.balancer(namespace, upstream_id)?;
+        balancer.select_excluding_for_port_endpoint_lane(ctx_key, port, exclude, health)
     }
 
     pub fn select_next_target_subset_from(
@@ -1659,6 +1731,20 @@ impl LoadBalancerCache {
         balancer.select_excluding_from_subset(ctx_key, subset_name, exclude, health)
     }
 
+    /// TCP/stream connect-retry variant of [`Self::select_next_target_subset_from`].
+    pub fn select_next_target_subset_excluding_endpoint_lane_from(
+        snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
+        upstream_id: &str,
+        ctx_key: &str,
+        subset_name: &str,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let balancer = snapshot.balancer(namespace, upstream_id)?;
+        balancer.select_excluding_from_subset_endpoint_lane(ctx_key, subset_name, exclude, health)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn select_next_target_for_port_subset_from(
         snapshot: &LoadBalancerCacheInner,
@@ -1672,6 +1758,29 @@ impl LoadBalancerCache {
     ) -> Option<Arc<UpstreamTarget>> {
         let balancer = snapshot.balancer(namespace, upstream_id)?;
         balancer.select_excluding_for_port_from_subset(ctx_key, port, subset_name, exclude, health)
+    }
+
+    /// TCP/stream connect-retry variant of
+    /// [`Self::select_next_target_for_port_subset_from`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn select_next_target_for_port_subset_excluding_endpoint_lane_from(
+        snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
+        upstream_id: &str,
+        ctx_key: &str,
+        port: u16,
+        subset_name: &str,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let balancer = snapshot.balancer(namespace, upstream_id)?;
+        balancer.select_excluding_for_port_from_subset_endpoint_lane(
+            ctx_key,
+            port,
+            subset_name,
+            exclude,
+            health,
+        )
     }
 
     #[inline]
@@ -1897,9 +2006,218 @@ pub fn target_key(upstream_id: &str, target: &UpstreamTarget) -> String {
     key
 }
 
+/// Domain-separation prefix for backend-bound sticky-session tokens. Bumping
+/// this string invalidates every outstanding token (clients transparently
+/// re-pin on their next request), so it doubles as a format version — `v2` is
+/// the full-target identity below, replacing a `v1` that digested only the
+/// health-check `host:port` key.
+const STICKY_SESSION_TOKEN_DOMAIN: &str = "ferrum-sticky-session-v2";
+
+/// A sticky-session token is a lowercase hex SHA-256 digest: 64 characters.
+pub const STICKY_SESSION_TOKEN_LEN: usize = 64;
+
+/// Derive the opaque sticky-session token that binds a client to one concrete
+/// backend target.
+///
+/// `upstream_runtime_key` must be the namespace-qualified upstream identity
+/// (`namespace|upstream_id`) — the SAME string
+/// [`LoadBalancerCache`] keys its balancers by. That is what scopes a token:
+/// Gateway API session persistence materializes a route-scoped upstream
+/// (`gwapi-route-upstream-<ns>-<route>-<rule>`), so a token minted for one
+/// route/service/namespace/policy cannot resolve inside another upstream's
+/// binding index even when both front the same pod IPs.
+///
+/// Inside that scope the token digests the target's full STICKY IDENTITY
+/// (see [`write_sticky_target_identity`]), not merely its `host:port`. One
+/// route Upstream can legitimately carry the same network endpoint more than
+/// once — Gateway API fans several `backendRefs` into one rule, so two entries
+/// can share a pod IP and port while naming different Services, different
+/// declared Service ports (`service_port_policy_key`, i.e. different
+/// `dispatch_policy_port()` policy lanes), different subset tags, localities,
+/// or backend path overrides. Reusing the deliberately `host:port`-only
+/// health-check key ([`target_key`]) here collapsed those into one index entry
+/// and silently resolved a later target's cookie onto the first one, crossing
+/// Service and per-port policy semantics inside the route.
+///
+/// The digest discloses no backend address, port, credential, or secret. It is
+/// unkeyed on purpose: stickiness must survive a gateway restart and must be
+/// identical across every replica of a horizontally scaled gateway, and there
+/// is no cluster-wide shared secret available in every operating mode. The
+/// value is therefore an obfuscated — not authenticated — binding: presenting
+/// a forged token can only steer a client to a target the same upstream would
+/// already have selected for some other client, never outside the
+/// health/subset/port-scoped candidate pool (see [`LoadBalancer::select_sticky`]).
+///
+/// `target` must be a CONFIGURED target of that upstream, not a per-request
+/// dial clone. Callers minting a response cookie resolve the served backend
+/// through [`LoadBalancer::configured_sticky_identity_target`] first; the
+/// binding index is built from the configured targets, so a token derived from
+/// anything else cannot resolve.
+pub fn sticky_session_token(upstream_runtime_key: &str, target: &UpstreamTarget) -> String {
+    let mut hasher = StickyHasher::new();
+    hasher.update(STICKY_SESSION_TOKEN_DOMAIN.as_bytes());
+    hasher.update([0x1fu8]);
+    write_sticky_target_identity(&mut hasher, upstream_runtime_key, target);
+    hex::encode(hasher.finalize())
+}
+
+/// The incremental hasher the sticky-identity encoder feeds.
+type StickyHasher = crate::fips::approved::Sha256;
+
+/// Absorb the canonical, unambiguous encoding of a target's sticky identity.
+///
+/// Every field of [`UpstreamTarget`] that can change how a request is routed,
+/// which policy/authorization lane governs it, which TLS material or subset
+/// overlay applies, or what the target *means* is covered:
+///
+/// - `host` / `port` — the dial destination *as configured*. For a
+///   wildcard-hosted upstream the configured `host` is the pattern
+///   (`*.example.com`), not the per-request authority the proxy actually dials;
+///   the mint site maps a served concretization back to its configured entry
+///   first (see [`LoadBalancer::configured_sticky_identity_target`]) so both
+///   sides of the index agree.
+/// - `service_port_policy_key` — selects the `dispatch_policy_port()` policy
+///   lane (its algorithm, `hashOn`, passive-health policy, TLS overlay) and
+///   records the declared Service port that owns the target.
+/// - `tags` — subset membership (`SubsetDefinition.labels`), Service identity
+///   (`_ferrum_service_*`), and mesh provenance / HBONE dial facts.
+/// - `locality` — locality-LB tier and cross-cluster provenance.
+/// - `path` — overrides the proxy's `backend_path` for this target.
+///
+/// `weight` is deliberately EXCLUDED. It only sizes a target's share of
+/// *unbound* selections; two targets differing solely in weight are
+/// interchangeable for an already-pinned session. Including it would mean an
+/// ordinary canary weight shift invalidated every outstanding cookie on the
+/// route — the opposite of what session persistence promises. Transient
+/// health/counter state is likewise excluded: it is not a property of the
+/// target and would make the binding non-deterministic.
+///
+/// Determinism requirements the encoding satisfies:
+///
+/// - no dependence on `HashMap` iteration order — `tags` are sorted by key
+///   (keys are unique in a map, so that is a total order) and prefixed with
+///   their count;
+/// - every variable-length field is length-prefixed and every optional field
+///   carries a presence byte, so no rearrangement of contents can produce the
+///   same byte stream (`host="a", path="/b"` cannot collide with
+///   `host="a/b", path=None`);
+/// - integers use fixed-width big-endian bytes.
+///
+/// Cost is paid at balancer construction (reload / discovery update) and at the
+/// cold cookie-mint site, never on the per-request lookup path.
+fn write_sticky_target_identity(
+    hasher: &mut StickyHasher,
+    upstream_runtime_key: &str,
+    target: &UpstreamTarget,
+) {
+    absorb_identity_field(hasher, upstream_runtime_key.as_bytes());
+    absorb_identity_field(hasher, target.host.as_bytes());
+    hasher.update(target.port.to_be_bytes());
+    // Fixed width (presence byte + 2 bytes) so `None` and `Some(0)` differ.
+    match target.service_port_policy_key {
+        Some(policy_port) => {
+            hasher.update([1u8]);
+            hasher.update(policy_port.to_be_bytes());
+        }
+        None => hasher.update([0u8, 0, 0]),
+    }
+    absorb_optional_identity_field(hasher, target.locality.as_deref());
+    absorb_optional_identity_field(hasher, target.path.as_deref());
+    hasher.update((target.tags.len() as u64).to_be_bytes());
+    if !target.tags.is_empty() {
+        let mut tags: Vec<(&str, &str)> = target
+            .tags
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        tags.sort_unstable_by_key(|(key, _)| *key);
+        for (key, value) in tags {
+            absorb_identity_field(hasher, key.as_bytes());
+            absorb_identity_field(hasher, value.as_bytes());
+        }
+    }
+}
+
+/// Absorb one variable-length identity field, length-prefixed so field
+/// boundaries cannot be shifted between neighbours.
+#[inline]
+fn absorb_identity_field(hasher: &mut StickyHasher, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+/// Absorb an optional identity field: a presence byte, then the value when set.
+/// `None` and `Some("")` are therefore distinct.
+#[inline]
+fn absorb_optional_identity_field(hasher: &mut StickyHasher, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update([1u8]);
+            absorb_identity_field(hasher, value.as_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
+}
+
+/// Whether two targets carry the same sticky identity — i.e. whether
+/// [`sticky_session_token`] would derive the same token for both inside one
+/// upstream scope.
+///
+/// This is the structural twin of [`write_sticky_target_identity`] and must
+/// cover exactly the same field set. The encoding is injective over those
+/// fields, so equality here is precisely token equality — which lets the reissue
+/// decision ([`crate::proxy::backend_dispatch::sticky_cookie_reissue_target`])
+/// answer "does the client already hold this backend's token?" with a structural
+/// compare instead of two digests and two allocations.
+///
+/// `weight` is excluded on both sides for the same reason it is excluded from
+/// the digest: it never changes which backend a pinned session reaches.
+#[inline]
+pub fn same_sticky_identity(a: &UpstreamTarget, b: &UpstreamTarget) -> bool {
+    std::ptr::eq(a, b) || (a.host == b.host && same_sticky_identity_except_host(a, b))
+}
+
+/// [`same_sticky_identity`] with the dial `host` left out.
+///
+/// Used to reconcile a per-request CONCRETIZED clone of a wildcard target with
+/// the configured entry it came from: concretization rewrites `host` and
+/// nothing else, so every other identity field must still match exactly before
+/// the two can be treated as one binding
+/// (see [`LoadBalancer::configured_sticky_identity_target`]).
+#[inline]
+fn same_sticky_identity_except_host(a: &UpstreamTarget, b: &UpstreamTarget) -> bool {
+    a.port == b.port
+        && a.service_port_policy_key == b.service_port_policy_key
+        && a.locality == b.locality
+        && a.path == b.path
+        && a.tags == b.tags
+}
+
+/// Cheap boundary validation for an untrusted cookie value before it is used as
+/// a sticky-session token.
+///
+/// Bounded work: an exact length check short-circuits any oversized value
+/// (a 64-byte comparison at most), then one pass over 64 ASCII bytes. Nothing
+/// is allocated and nothing is logged, so a client cannot spend gateway CPU or
+/// memory by sending large or high-cardinality cookie values.
+#[inline]
+pub fn is_sticky_session_token(value: &str) -> bool {
+    value.len() == STICKY_SESSION_TOKEN_LEN
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `true` when a resolved hash-on strategy is the cookie form that mints
+/// backend-bound session tokens.
+#[inline]
+fn strategy_mints_sticky_tokens(strategy: &HashOnStrategy) -> bool {
+    matches!(strategy, HashOnStrategy::Cookie(_))
+}
+
 /// Build a plain "host:port" key for a target (no upstream scoping).
-/// Used for sticky session cookies, active connection tracking, latency EWMA,
-/// and other contexts where the key is already scoped to a single LoadBalancer.
+/// Used for active connection tracking, latency EWMA, and other contexts where
+/// the key is already scoped to a single LoadBalancer.
 pub fn target_host_port_key(target: &UpstreamTarget) -> String {
     let mut key = String::with_capacity(target.host.len() + 6);
     write_target_host_port_key(&mut key, target);
@@ -1913,11 +2231,68 @@ pub(crate) fn write_target_host_port_key(buf: &mut String, target: &UpstreamTarg
     let _ = write!(buf, "{}:{}", target.host, target.port);
 }
 
+/// How retry selection identifies the just-tried backend to drop from the pool.
+///
+/// Two contracts exist because callers retain different information:
+///
+/// - [`RetryExcludeContract::ConfiguredStickyIdentity`] — HTTP/H3 (and the
+///   shared wildcard retry helper) pass a CONFIGURED sticky/routing identity
+///   after reconciling any dial clone via
+///   [`LoadBalancer::configured_sticky_identity_target`]. Siblings that share a
+///   network endpoint but differ by Service / subset / locality / path stay
+///   distinct and remain eligible.
+/// - [`RetryExcludeContract::EffectiveEndpointLane`] — TCP/stream connect-retry
+///   retains only the live `(host, dial port, policy lane)` tuple. Every
+///   configured entry on that effective endpoint/lane is excluded so a
+///   reconstructed empty-tags exclude cannot miss a `service_port_policy_key =
+///   None` target (whose `dispatch_policy_port()` equals the dial port) or
+///   reselect an ambiguous same-lane sibling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryExcludeContract {
+    ConfiguredStickyIdentity,
+    EffectiveEndpointLane,
+}
+
+/// Target identity and comparison contract used to remove an already-tried
+/// backend from a retry candidate lane.
+struct RetryExclusion<'a> {
+    target: &'a UpstreamTarget,
+    contract: RetryExcludeContract,
+}
+
+/// Whether `target` is covered by `exclude` under the active retry contract.
 #[inline]
-fn retry_exclude_target_matches(target: &UpstreamTarget, exclude: &UpstreamTarget) -> bool {
-    target.host == exclude.host
-        && target.port == exclude.port
-        && target.dispatch_policy_port() == exclude.dispatch_policy_port()
+fn retry_exclude_matches(
+    target: &UpstreamTarget,
+    exclude: &UpstreamTarget,
+    contract: RetryExcludeContract,
+) -> bool {
+    match contract {
+        RetryExcludeContract::ConfiguredStickyIdentity => same_sticky_identity(target, exclude),
+        RetryExcludeContract::EffectiveEndpointLane => {
+            target.host == exclude.host
+                && target.port == exclude.port
+                && target.dispatch_policy_port() == exclude.dispatch_policy_port()
+        }
+    }
+}
+
+/// Drop every pool entry matching `exclude` under `contract` from `candidate_mask`.
+///
+/// Retry-only and bounded by the configured target pool. The ordinary no-retry
+/// hot path never reaches this helper.
+#[inline]
+fn clear_retry_exclusions(
+    targets: &[Arc<UpstreamTarget>],
+    exclude: &UpstreamTarget,
+    contract: RetryExcludeContract,
+    candidate_mask: &mut HealthBitset,
+) {
+    for (idx, target) in targets.iter().enumerate() {
+        if retry_exclude_matches(target, exclude, contract) {
+            candidate_mask.clear(idx);
+        }
+    }
 }
 
 /// Build the pre-computed locality-LB state from an operator's
@@ -2405,6 +2780,44 @@ pub struct LoadBalancer {
     /// "host:port" format as `host_port_keys`, enabling zero-allocation lookup
     /// via `write!()` into a thread-local buffer.
     target_index: HashMap<String, usize>,
+    /// O(1) reverse lookup from an opaque sticky-session token to the index of
+    /// the target it was minted for. This is what makes Gateway API session
+    /// persistence *backend-bound*: a returning client resolves to the exact
+    /// target that produced its cookie instead of re-hashing an opaque value
+    /// through the consistent-hash ring (which has no reason to land on the
+    /// same target).
+    ///
+    /// Materialized at construction — i.e. rebuilt on config reload / service
+    /// discovery update alongside the hash ring — so the request path is one
+    /// hash-map probe, never an O(n) target scan. Empty (and therefore free)
+    /// unless some effective hash-on strategy on this upstream is `Cookie`,
+    /// which is the only configuration that mints tokens.
+    ///
+    /// Keys come from [`sticky_session_token`], which digests the target's full
+    /// sticky identity — NOT the `host:port`-only health key. Two entries that
+    /// share a pod IP and port but name different Services, per-port policy
+    /// lanes, subset tags, localities, or path overrides therefore keep
+    /// SEPARATE bindings. Only targets identical in every identity-bearing
+    /// field collapse to one entry, and because those are interchangeable the
+    /// FIRST index wins deterministically across rebuilds.
+    sticky_token_index: HashMap<String, usize>,
+    /// `true` when at least one CONFIGURED target carries a wildcard host
+    /// (`*.example.com`).
+    ///
+    /// Only such an upstream can serve or retry through a per-request
+    /// CONCRETIZED CLONE of a configured target
+    /// ([`crate::proxy::backend_dispatch::concretize_wildcard_target_for_request`]
+    /// rewrites `host` to the matched request authority so the dial, DNS
+    /// resolution, and SNI use the concrete name). That clone's identity is not
+    /// in the configured target set (nor in `sticky_token_index`), so sticky
+    /// minting and retry exclusion must map it back to its configured origin —
+    /// see [`Self::configured_sticky_identity_target`]. Independent of whether
+    /// the upstream mints sticky cookies: retry identity mapping needs the same
+    /// flag on non-sticky algorithms.
+    ///
+    /// `false` for every ordinary (all-concrete) upstream, which makes that
+    /// mapping a single boolean test with no scan and no allocation.
+    has_wildcard_host_target: bool,
     algorithm: LoadBalancerAlgorithm,
     /// Round-robin / random / least-latency warm-up selection counters.
     /// Sharded and cache-line padded; see [`SelectionCounterShards`].
@@ -2853,6 +3266,41 @@ impl LoadBalancer {
             "at most one destination port can cover every target in one upstream"
         );
 
+        // Materialize the sticky-session binding index only when this upstream
+        // can actually mint tokens — i.e. some effective hash-on strategy
+        // (upstream, subset, or per-port lane) is `Cookie`. Every other
+        // upstream keeps an empty map and pays nothing at reload or at request
+        // time. The index is built through the SAME public
+        // `sticky_session_token` the response cookie mint site calls, so read
+        // side and write side cannot drift. Only targets identical in every
+        // identity-bearing field share a token; `or_insert` keeps the first
+        // index for those, which is stable because they are interchangeable.
+        let mut mints_sticky_tokens = strategy_mints_sticky_tokens(&hash_on_strategy);
+        for strategy in subset_hash_on_strategies.values() {
+            mints_sticky_tokens |= strategy_mints_sticky_tokens(strategy);
+        }
+        for state in port_states.values() {
+            mints_sticky_tokens |= strategy_mints_sticky_tokens(&state.hash_on_strategy);
+            if let Some(ref overridden) = state.hash_on_override_strategy {
+                mints_sticky_tokens |= strategy_mints_sticky_tokens(overridden);
+            }
+        }
+        let mut sticky_token_index: HashMap<String, usize> = HashMap::new();
+        if mints_sticky_tokens {
+            sticky_token_index.reserve(targets.len());
+            for (i, target) in targets.iter().enumerate() {
+                let token = sticky_session_token(upstream_id, target);
+                sticky_token_index.entry(token).or_insert(i);
+            }
+        }
+        // A wildcard-hosted target is dialed through a per-request concretized
+        // clone, so its served/tried identity has to be mapped back to this
+        // configured entry for sticky minting AND for retry exclusion. Recorded
+        // once here — independent of whether the upstream mints sticky cookies —
+        // so every all-concrete upstream skips that mapping outright while
+        // non-sticky wildcard upstreams still get correct retry identity mapping.
+        let has_wildcard_host_target = targets.iter().any(|target| target.host.starts_with("*."));
+
         // Pre-compute per-target distribute weights and failover-region matches
         // against the source locality so the request path stays branch-light.
         // `enabled: false` disables every locality-aware path; `distribute`
@@ -2886,6 +3334,8 @@ impl LoadBalancer {
             host_port_keys,
             target_locality_ranks,
             target_index,
+            sticky_token_index,
+            has_wildcard_host_target,
             algorithm,
             rr_counter: new_selection_counters(),
             wrr_state: if algorithm == LoadBalancerAlgorithm::WeightedRoundRobin {
@@ -4737,6 +5187,224 @@ impl LoadBalancer {
         }
     }
 
+    /// Resolve the `(port, subset)` candidate-pool index slices a
+    /// direct-selection path must stay inside, mirroring the scoping the
+    /// `select*` family applies.
+    ///
+    /// Returns `(subset_indices, port_indices)`; `None` in a slot means "not
+    /// scoped by that dimension". Returns the outer `None` when a subset was
+    /// named but is unknown/empty — that pool has no candidates at all.
+    #[inline]
+    fn candidate_pool_indices(
+        &self,
+        port: Option<u16>,
+        subset_name: Option<&str>,
+    ) -> Option<CandidatePoolIndices<'_>> {
+        let port_indices = port
+            .and_then(|p| self.port_overrides.get(&p))
+            .map(|ps| ps.target_indices.as_slice());
+        let subset_indices = subset_name.and_then(|name| {
+            self.subset_indices
+                .get(name)
+                .filter(|indices| !indices.is_empty())
+                .map(Vec::as_slice)
+        });
+        if subset_name.is_some() && subset_indices.is_none() {
+            return None;
+        }
+        Some((subset_indices, port_indices))
+    }
+
+    /// Is `idx` currently healthy *within* the given candidate pool?
+    ///
+    /// Health (active + passive) is computed over the SAME pool the
+    /// load-balanced path would select from, so the passive
+    /// `max_ejection_percent` cap is sized against THAT pool — mirroring
+    /// `select_from_subset` / `select_for_port` / `select_for_port_from_subset`.
+    /// Scoping the match to the pool but the cap to the whole upstream would let
+    /// ejections OUTSIDE the pool dilute the cap and wrongly readmit (or keep
+    /// ejected) the matched target, contrary to the outlier policy. The Vec path
+    /// covers the rare >128-target pool the bitset can't represent.
+    fn index_healthy_in_pool(
+        &self,
+        idx: usize,
+        subset_indices: Option<&[usize]>,
+        port_indices: Option<&[usize]>,
+        health: Option<&HealthContext<'_>>,
+    ) -> bool {
+        if self.targets.len() > MAX_BITSET_TARGETS {
+            // >128 targets: cap against the candidate-pool index set.
+            match (subset_indices, port_indices) {
+                (Some(s), Some(p)) => {
+                    let intersection = self.subset_port_intersection_vec(s, p);
+                    self.healthy_targets_vec_for_indices(health, &intersection)
+                        .iter()
+                        .any(|(i, _)| *i == idx)
+                }
+                (Some(indices), None) | (None, Some(indices)) => self
+                    .healthy_targets_vec_for_indices(health, indices)
+                    .iter()
+                    .any(|(i, _)| *i == idx),
+                (None, None) => self
+                    .healthy_targets_vec(health)
+                    .iter()
+                    .any(|(i, _)| *i == idx),
+            }
+        } else {
+            // ≤128 targets: cap against the candidate-pool bitset/mask
+            // (alloc-free stack `u128`s, no per-request `Vec`).
+            match (subset_indices, port_indices) {
+                (Some(s), Some(p)) => {
+                    let intersection = self.subset_port_mask(s, p);
+                    self.compute_health_bitset_for_mask(health, &intersection)
+                        .contains(idx)
+                }
+                (Some(indices), None) | (None, Some(indices)) => self
+                    .compute_health_bitset_for_indices(health, indices)
+                    .contains(idx),
+                (None, None) => self.compute_health_bitset(health).contains(idx),
+            }
+        }
+    }
+
+    /// Gateway API session persistence: resolve an opaque sticky-session token
+    /// back to the EXACT backend target that minted it.
+    ///
+    /// This is the read side of [`sticky_session_token`]. The write side runs
+    /// once, on the initial response, against the target that actually served
+    /// it; this side must therefore never "re-derive" a target by hashing —
+    /// hashing an opaque token through the consistent-hash ring has no reason
+    /// to reproduce the selected backend, which is exactly the defect this
+    /// replaces.
+    ///
+    /// Every safety property of ordinary selection still applies:
+    ///
+    /// - the token is validated at the boundary ([`is_sticky_session_token`])
+    ///   with bounded work before it ever reaches the index;
+    /// - an unknown token — malformed, foreign-scope (minted for another
+    ///   route/service/namespace/policy, therefore another upstream identity),
+    ///   or stale after the backend was removed — simply misses the map;
+    /// - a resolved target is still gated on `(subset ∩ port)` pool membership
+    ///   and on active + passive health, so a pinned client can never be sent
+    ///   to an ejected, removed, out-of-subset, or wrong-port endpoint.
+    ///
+    /// `None` means "no usable binding": the caller falls back to ordinary
+    /// load-balanced selection and mints a fresh cookie. Nothing about
+    /// TLS, authorization, retry, or connection-limit handling is bypassed —
+    /// this only chooses which pool member to dial.
+    ///
+    /// Locality preference is deliberately not re-applied, exactly as in
+    /// [`Self::select_passthrough`]: an established session names one concrete
+    /// endpoint, and re-running locality weighting would either be a no-op or
+    /// break the persistence contract. The endpoint is still health- and
+    /// pool-gated, so an unreachable one falls back and re-selects with full
+    /// locality preference.
+    ///
+    /// Hot path: one hash-map probe plus the same pool/health validation
+    /// passthrough already performs. No allocation, no target scan.
+    pub fn select_sticky(
+        &self,
+        token: &str,
+        port: Option<u16>,
+        subset_name: Option<&str>,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if self.sticky_token_index.is_empty() || !is_sticky_session_token(token) {
+            return None;
+        }
+        let idx = *self.sticky_token_index.get(token)?;
+        let (subset_indices, port_indices) = self.candidate_pool_indices(port, subset_name)?;
+        if !port_indices.is_none_or(|p| p.contains(&idx))
+            || !subset_indices.is_none_or(|s| s.contains(&idx))
+        {
+            return None;
+        }
+        if !self.index_healthy_in_pool(idx, subset_indices, port_indices, health) {
+            return None;
+        }
+        Some(Arc::clone(&self.targets[idx]))
+    }
+
+    /// Map a DIALED / served target onto the CONFIGURED selection identity this
+    /// balancer was built from.
+    ///
+    /// Selection usually hands the dispatch path the configured entry itself.
+    /// For a WILDCARD-hosted upstream it does not: mesh egress wildcard
+    /// `ServiceEntry`s (and any wildcard-hosted upstream) configure
+    /// `host: "*.example.com"`, and
+    /// [`crate::proxy::backend_dispatch::concretize_wildcard_target_for_request`]
+    /// clones that entry per request with `host` replaced by the matched request
+    /// authority, because the dial, DNS resolution, and SNI must use the
+    /// concrete name.
+    ///
+    /// The dial target and the configured selection identity are therefore
+    /// different things. This seam is shared by:
+    ///
+    /// - sticky cookie minting: the cookie names the configured entry that
+    ///   [`Self::select_sticky`] can hand back on the next request (then
+    ///   re-concretized for its own dial);
+    /// - retry exclusion: `select_next_*` walks the configured target set, so a
+    ///   just-tried dial clone must be reconciled before exclusion or the
+    ///   wildcard entry is selected again.
+    ///
+    /// Correctness must not depend on whether the upstream mints sticky cookies;
+    /// [`Self::has_wildcard_host_target`] is independent of that.
+    ///
+    /// Resolution order inside one upstream scope:
+    ///
+    /// 1. A configured target with the SAME FULL identity, including `host`,
+    ///    wins. A concrete target that is genuinely configured keeps its own
+    ///    binding, so a session pinned to it stays pinned to that host no matter
+    ///    what authority the client sends later.
+    /// 2. Otherwise the first configured WILDCARD target that matches the served
+    ///    host and is identical in every other identity field
+    ///    (`port`, `service_port_policy_key`, `tags`, `locality`, `path`) is the
+    ///    origin. Matching on host alone would collapse two `backendRefs` that
+    ///    share a wildcard suffix but name different Services or policy lanes,
+    ///    so it is the full field set minus `host`, exactly as concretization
+    ///    rewrites `host` and nothing else. Ties (two configured wildcards that
+    ///    match the same authority and are otherwise identical) resolve to the
+    ///    first in config order — deterministic, and safe for the same reason
+    ///    the index collapses identical entries first-index-wins: such targets
+    ///    dial the same endpoint under the same policy.
+    /// 3. Otherwise the served target is returned unchanged. Sticky minting then
+    ///    uses it verbatim, so an authority that matched no configured wildcard
+    ///    is never handed another target's binding.
+    ///
+    /// Bounded and allocation-free on the ordinary path: an all-concrete
+    /// upstream returns immediately on a precomputed boolean. The small
+    /// configured-target scan runs only for wildcard upstreams, and only when
+    /// sticky minting or retry selection needs the mapping — never on the
+    /// no-retry hot path for all-concrete upstreams.
+    #[inline]
+    pub fn configured_sticky_identity_target<'a>(
+        &'a self,
+        served_target: &'a UpstreamTarget,
+    ) -> &'a UpstreamTarget {
+        // `*.` on the served host means concretization did NOT apply (the
+        // request authority did not match), so the served target is already the
+        // configured one.
+        if !self.has_wildcard_host_target || served_target.host.starts_with("*.") {
+            return served_target;
+        }
+        let mut wildcard_origin: Option<&'a UpstreamTarget> = None;
+        for configured in &self.targets {
+            if !same_sticky_identity_except_host(configured, served_target) {
+                continue;
+            }
+            if configured.host == served_target.host {
+                return configured.as_ref();
+            }
+            if wildcard_origin.is_none()
+                && configured.host.starts_with("*.")
+                && crate::config::types::wildcard_matches(&configured.host, &served_target.host)
+            {
+                wildcard_origin = Some(configured.as_ref());
+            }
+        }
+        wildcard_origin.unwrap_or(served_target)
+    }
+
     /// PASSTHROUGH selection: dial the target whose canonical `(IP, port)`
     /// equals the captured original destination, bypassing load balancing
     /// (Istio `loadBalancer.simple=PASSTHROUGH`).
@@ -4775,19 +5443,8 @@ impl LoadBalancer {
 
         // Restrict the candidate pool to the subset∩port the caller would have
         // load-balanced over, so passthrough never escapes subset/port scoping.
-        let port_indices = port
-            .and_then(|p| self.port_overrides.get(&p))
-            .map(|ps| ps.target_indices.as_slice());
-        let subset_indices = subset_name.and_then(|name| {
-            self.subset_indices
-                .get(name)
-                .filter(|indices| !indices.is_empty())
-                .map(Vec::as_slice)
-        });
         // A named-but-unknown/empty subset has no candidate pool at all.
-        if subset_name.is_some() && subset_indices.is_none() {
-            return None;
-        }
+        let (subset_indices, port_indices) = self.candidate_pool_indices(port, subset_name)?;
 
         let in_pool = |idx: usize| -> bool {
             port_indices.is_none_or(|p| p.contains(&idx))
@@ -4808,49 +5465,9 @@ impl LoadBalancer {
         })?;
 
         // Respect active + passive health: never dial an ejected orig-dst
-        // target. Compute health over the SAME candidate pool the load-balanced
-        // path would select from (subset / port / subset∩port), so the passive
-        // `max_ejection_percent` cap is sized against THAT pool — mirroring
-        // `select_from_subset` / `select_for_port` / `select_for_port_from_subset`.
-        // Scoping the match to the pool but the cap to the whole upstream would
-        // let ejections OUTSIDE the pool dilute the cap and wrongly readmit (or
-        // keep ejected) the matched orig-dst target, contrary to the outlier
-        // policy. The Vec path covers the rare >128-target pool the bitset
-        // can't represent.
-        let matched_healthy = if self.targets.len() > MAX_BITSET_TARGETS {
-            // >128 targets: cap against the candidate-pool index set.
-            match (subset_indices, port_indices) {
-                (Some(s), Some(p)) => {
-                    let intersection = self.subset_port_intersection_vec(s, p);
-                    self.healthy_targets_vec_for_indices(health, &intersection)
-                        .iter()
-                        .any(|(idx, _)| *idx == matched_idx)
-                }
-                (Some(indices), None) | (None, Some(indices)) => self
-                    .healthy_targets_vec_for_indices(health, indices)
-                    .iter()
-                    .any(|(idx, _)| *idx == matched_idx),
-                (None, None) => self
-                    .healthy_targets_vec(health)
-                    .iter()
-                    .any(|(idx, _)| *idx == matched_idx),
-            }
-        } else {
-            // ≤128 targets: cap against the candidate-pool bitset/mask
-            // (alloc-free stack `u128`s, no per-request `Vec`).
-            match (subset_indices, port_indices) {
-                (Some(s), Some(p)) => {
-                    let intersection = self.subset_port_mask(s, p);
-                    self.compute_health_bitset_for_mask(health, &intersection)
-                        .contains(matched_idx)
-                }
-                (Some(indices), None) | (None, Some(indices)) => self
-                    .compute_health_bitset_for_indices(health, indices)
-                    .contains(matched_idx),
-                (None, None) => self.compute_health_bitset(health).contains(matched_idx),
-            }
-        };
-        if !matched_healthy {
+        // target. See `index_healthy_in_pool` for why the cap is sized against
+        // the candidate pool rather than the whole upstream.
+        if !self.index_healthy_in_pool(matched_idx, subset_indices, port_indices, health) {
             return None;
         }
 
@@ -4863,31 +5480,54 @@ impl LoadBalancer {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
+        self.select_excluding_with(
+            ctx_key,
+            exclude,
+            health,
+            RetryExcludeContract::ConfiguredStickyIdentity,
+        )
+    }
+
+    /// TCP/stream connect-retry exclusion: drop every entry on the effective
+    /// `(host, dial port, policy lane)` rather than a single sticky identity.
+    pub fn select_excluding_endpoint_lane(
+        &self,
+        ctx_key: &str,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        self.select_excluding_with(
+            ctx_key,
+            exclude,
+            health,
+            RetryExcludeContract::EffectiveEndpointLane,
+        )
+    }
+
+    fn select_excluding_with(
+        &self,
+        ctx_key: &str,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+        contract: RetryExcludeContract,
+    ) -> Option<Arc<UpstreamTarget>> {
         let n = self.targets.len();
         if n == 0 {
             return None;
         }
 
-        // Find the exclude target's index via linear scan (avoids host.clone() allocation)
-        let exclude_idx = self
-            .targets
-            .iter()
-            .position(|t| retry_exclude_target_matches(t, exclude));
-
         // For >128 targets, fall back to Vec-based path.
         if n > MAX_BITSET_TARGETS {
-            return self.select_excluding_vec_fallback(ctx_key, exclude_idx, health);
+            return self.select_excluding_vec_fallback(ctx_key, exclude, health, contract);
         }
 
-        // Drop the excluded (previously tried) target from the candidate mask
+        // Drop excluded (previously tried) target(s) from the candidate mask
         // BEFORE sizing the passive ejection cap. Otherwise a readmission
-        // budget can be spent on the excluded target, and clearing it afterward
+        // budget can be spent on an excluded target, and clearing afterward
         // leaves viable retry candidates ejected.
         let scope = HealthBitset::all(n);
         let mut candidate_mask = scope;
-        if let Some(ei) = exclude_idx {
-            candidate_mask.clear(ei);
-        }
+        clear_retry_exclusions(&self.targets, exclude, contract, &mut candidate_mask);
         if candidate_mask.is_empty() {
             return None;
         }
@@ -4916,33 +5556,56 @@ impl LoadBalancer {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
+        self.select_excluding_for_port_with(
+            ctx_key,
+            port,
+            exclude,
+            health,
+            RetryExcludeContract::ConfiguredStickyIdentity,
+        )
+    }
+
+    pub fn select_excluding_for_port_endpoint_lane(
+        &self,
+        ctx_key: &str,
+        port: u16,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        self.select_excluding_for_port_with(
+            ctx_key,
+            port,
+            exclude,
+            health,
+            RetryExcludeContract::EffectiveEndpointLane,
+        )
+    }
+
+    fn select_excluding_for_port_with(
+        &self,
+        ctx_key: &str,
+        port: u16,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+        contract: RetryExcludeContract,
+    ) -> Option<Arc<UpstreamTarget>> {
         let Some(port_state) = self.port_overrides.get(&port) else {
-            return self.select_excluding(ctx_key, exclude, health);
+            return self.select_excluding_with(ctx_key, exclude, health, contract);
         };
         let n = self.targets.len();
         if n == 0 || port_state.target_indices.is_empty() {
             return None;
         }
 
-        let exclude_idx = self
-            .targets
-            .iter()
-            .position(|t| retry_exclude_target_matches(t, exclude));
-
         if n > MAX_BITSET_TARGETS {
             return self.select_excluding_port_vec_fallback(
-                ctx_key,
-                port_state,
-                exclude_idx,
-                health,
+                ctx_key, port_state, exclude, health, contract,
             );
         }
 
         let scope = bitset_for_indices(&port_state.target_indices);
         let mut candidate_mask = scope;
-        if let Some(ei) = exclude_idx {
-            candidate_mask.clear(ei);
-        }
+        clear_retry_exclusions(&self.targets, exclude, contract, &mut candidate_mask);
         if candidate_mask.is_empty() {
             return None;
         }
@@ -4982,6 +5645,39 @@ impl LoadBalancer {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
+        self.select_excluding_from_subset_with(
+            ctx_key,
+            subset_name,
+            exclude,
+            health,
+            RetryExcludeContract::ConfiguredStickyIdentity,
+        )
+    }
+
+    pub fn select_excluding_from_subset_endpoint_lane(
+        &self,
+        ctx_key: &str,
+        subset_name: &str,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        self.select_excluding_from_subset_with(
+            ctx_key,
+            subset_name,
+            exclude,
+            health,
+            RetryExcludeContract::EffectiveEndpointLane,
+        )
+    }
+
+    fn select_excluding_from_subset_with(
+        &self,
+        ctx_key: &str,
+        subset_name: &str,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+        contract: RetryExcludeContract,
+    ) -> Option<Arc<UpstreamTarget>> {
         let n = self.targets.len();
         if n == 0 {
             return None;
@@ -4992,33 +5688,27 @@ impl LoadBalancer {
             None => return None,
         };
 
-        let exclude_idx = self
-            .targets
-            .iter()
-            .position(|t| retry_exclude_target_matches(t, exclude));
-
         if n > MAX_BITSET_TARGETS {
             return self.select_excluding_subset_vec_fallback(
                 ctx_key,
                 subset_name,
                 subset_target_indices,
-                exclude_idx,
+                exclude,
                 health,
+                contract,
             );
         }
 
-        // Drop the excluded (previously tried) target from the candidate mask
+        // Drop excluded (previously tried) target(s) from the candidate mask
         // BEFORE sizing the ejection cap, so the cap's denominator and
-        // readmission budget evaluate over the actual retry candidates. If the
+        // readmission budget evaluate over the actual retry candidates. If an
         // excluded target were the earliest-ejected one, capping first would
         // spend the readmission on it and then clearing it would leave the
         // remaining candidate ejected — wrongly returning None. Building the
         // mask is an alloc-free stack `u128` (no per-request `Vec`).
         let strict_scope = bitset_for_indices(subset_target_indices);
         let mut candidate_mask = strict_scope;
-        if let Some(ei) = exclude_idx {
-            candidate_mask.clear(ei);
-        }
+        clear_retry_exclusions(&self.targets, exclude, contract, &mut candidate_mask);
         if candidate_mask.is_empty() {
             return None;
         }
@@ -5053,8 +5743,51 @@ impl LoadBalancer {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
+        self.select_excluding_for_port_from_subset_with(
+            ctx_key,
+            port,
+            subset_name,
+            exclude,
+            health,
+            RetryExcludeContract::ConfiguredStickyIdentity,
+        )
+    }
+
+    pub fn select_excluding_for_port_from_subset_endpoint_lane(
+        &self,
+        ctx_key: &str,
+        port: u16,
+        subset_name: &str,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        self.select_excluding_for_port_from_subset_with(
+            ctx_key,
+            port,
+            subset_name,
+            exclude,
+            health,
+            RetryExcludeContract::EffectiveEndpointLane,
+        )
+    }
+
+    fn select_excluding_for_port_from_subset_with(
+        &self,
+        ctx_key: &str,
+        port: u16,
+        subset_name: &str,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+        contract: RetryExcludeContract,
+    ) -> Option<Arc<UpstreamTarget>> {
         let Some(port_state) = self.port_overrides.get(&port) else {
-            return self.select_excluding_from_subset(ctx_key, subset_name, exclude, health);
+            return self.select_excluding_from_subset_with(
+                ctx_key,
+                subset_name,
+                exclude,
+                health,
+                contract,
+            );
         };
         let n = self.targets.len();
         if n == 0 || port_state.target_indices.is_empty() {
@@ -5066,32 +5799,28 @@ impl LoadBalancer {
             None => return None,
         };
 
-        let exclude_idx = self
-            .targets
-            .iter()
-            .position(|t| retry_exclude_target_matches(t, exclude));
-
         if n > MAX_BITSET_TARGETS {
             return self.select_excluding_port_subset_vec_fallback(
                 ctx_key,
                 port_state,
                 subset_name,
                 subset_target_indices,
-                exclude_idx,
+                RetryExclusion {
+                    target: exclude,
+                    contract,
+                },
                 health,
             );
         }
 
         // Build the subset∩port candidate mask alloc-free (stack `u128`) and
-        // drop the excluded (previously tried) target from it BEFORE sizing the
+        // drop excluded (previously tried) target(s) from it BEFORE sizing the
         // ejection cap, so the cap's denominator and readmission budget evaluate
         // over the actual retry candidates rather than spending the budget on
-        // the excluded target (see `select_excluding_from_subset`).
+        // an excluded target (see `select_excluding_from_subset`).
         let strict_scope = self.subset_port_mask(subset_target_indices, &port_state.target_indices);
         let mut candidate_mask = strict_scope;
-        if let Some(ei) = exclude_idx {
-            candidate_mask.clear(ei);
-        }
+        clear_retry_exclusions(&self.targets, exclude, contract, &mut candidate_mask);
         if candidate_mask.is_empty() {
             return None;
         }
@@ -5126,20 +5855,18 @@ impl LoadBalancer {
     fn select_excluding_vec_fallback(
         &self,
         ctx_key: &str,
-        exclude_idx: Option<usize>,
+        exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
+        contract: RetryExcludeContract,
     ) -> Option<Arc<UpstreamTarget>> {
         // Strict locality uses the unexcluded lane for local-presence decisions;
         // retry exclusion only applies to selectable candidates.
         let scope_indices: Vec<usize> = (0..self.targets.len()).collect();
-        let candidate_indices: Vec<usize> = match exclude_idx {
-            Some(ei) => scope_indices
-                .iter()
-                .copied()
-                .filter(|&idx| idx != ei)
-                .collect(),
-            None => scope_indices.clone(),
-        };
+        let candidate_indices: Vec<usize> = scope_indices
+            .iter()
+            .copied()
+            .filter(|&idx| !retry_exclude_matches(&self.targets[idx], exclude, contract))
+            .collect();
         if candidate_indices.is_empty() {
             return None;
         }
@@ -5161,21 +5888,19 @@ impl LoadBalancer {
         &self,
         ctx_key: &str,
         port_state: &PortLbState,
-        exclude_idx: Option<usize>,
+        exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
+        contract: RetryExcludeContract,
     ) -> Option<Arc<UpstreamTarget>> {
         // Strict locality uses the unexcluded port lane for local-presence
         // decisions; retry exclusion only applies to selectable candidates.
         let scope_indices: Vec<usize> = port_state.target_indices.clone();
-        let candidate_indices: Vec<usize> = match exclude_idx {
-            Some(ei) => port_state
-                .target_indices
-                .iter()
-                .copied()
-                .filter(|&idx| idx != ei)
-                .collect(),
-            None => scope_indices.clone(),
-        };
+        let candidate_indices: Vec<usize> = port_state
+            .target_indices
+            .iter()
+            .copied()
+            .filter(|&idx| !retry_exclude_matches(&self.targets[idx], exclude, contract))
+            .collect();
         if candidate_indices.is_empty() {
             return None;
         }
@@ -5211,20 +5936,23 @@ impl LoadBalancer {
         port_state: &PortLbState,
         subset_name: &str,
         subset_indices: &[usize],
-        exclude_idx: Option<usize>,
+        exclusion: RetryExclusion<'_>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        // Build subset∩port, then drop the excluded (previously tried) target
+        // Build subset∩port, then drop excluded (previously tried) target(s)
         // from the candidate list BEFORE sizing the ejection cap (mirrors the
         // bitset path), so the cap's denominator/budget evaluate over the actual
-        // retry candidates rather than spending the readmission on the excluded
+        // retry candidates rather than spending the readmission on an excluded
         // target. A `Vec` here is acceptable — this is the >128-target fallback.
         let strict_scope =
             self.subset_port_intersection_vec(subset_indices, &port_state.target_indices);
-        let mut intersection = strict_scope.clone();
-        if let Some(ei) = exclude_idx {
-            intersection.retain(|&idx| idx != ei);
-        }
+        let intersection: Vec<usize> = strict_scope
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                !retry_exclude_matches(&self.targets[idx], exclusion.target, exclusion.contract)
+            })
+            .collect();
         if intersection.is_empty() {
             return None;
         }
@@ -5259,23 +5987,21 @@ impl LoadBalancer {
         ctx_key: &str,
         subset_name: &str,
         subset_indices: &[usize],
-        exclude_idx: Option<usize>,
+        exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
+        contract: RetryExcludeContract,
     ) -> Option<Arc<UpstreamTarget>> {
-        // Drop the excluded (previously tried) target from the subset candidate
+        // Drop excluded (previously tried) target(s) from the subset candidate
         // list BEFORE sizing the ejection cap (mirrors the bitset path), so the
         // cap's denominator/budget evaluate over the actual retry candidates
-        // rather than spending the readmission on the excluded target. A `Vec`
+        // rather than spending the readmission on an excluded target. A `Vec`
         // here is acceptable — this is the >128-target fallback.
         let strict_scope = subset_indices.to_vec();
-        let candidate_indices: Vec<usize> = match exclude_idx {
-            Some(ei) => subset_indices
-                .iter()
-                .copied()
-                .filter(|&idx| idx != ei)
-                .collect(),
-            None => strict_scope.clone(),
-        };
+        let candidate_indices: Vec<usize> = subset_indices
+            .iter()
+            .copied()
+            .filter(|&idx| !retry_exclude_matches(&self.targets[idx], exclude, contract))
+            .collect();
         if candidate_indices.is_empty() {
             return None;
         }
