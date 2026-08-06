@@ -4488,108 +4488,106 @@ fn l4_route_proxies(
     acc: &mut K8sAccumulator,
     scheme: BackendScheme,
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
+    // Cross-namespace parentRefs use the same listener AllowedRoutes gates as
+    // HTTPRoute/GRPCRoute (`ensure_route_parent_refs_allowed` + materialization
+    // namespaces). ReferenceGrant authorizes backendRefs only, not parentRefs.
     ensure_route_parent_refs_allowed(object, acc)?;
-    ensure_l4_parent_refs_are_same_namespace(object)?;
-    let materialized_parent_refs = route_materialized_parent_ref_keys_for_namespace(
-        object,
-        acc,
-        Some(&object.metadata.namespace),
-    );
-    let materialized_listener_ports =
-        l4_route_listener_ports_for_namespace(object, acc, Some(&object.metadata.namespace));
+    let config_namespaces = route_materialization_namespaces(object, acc);
     let mut proxies = Vec::new();
-    for (rule_index, rule) in object
-        .spec
-        .get("rules")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let Some(backend_ref) = first_backend_ref(object, rule, acc)? else {
+    for config_namespace in &config_namespaces {
+        let allowed_parent_refs =
+            route_allowed_parent_ref_keys_for_namespace(object, acc, Some(config_namespace));
+        if allowed_parent_refs.is_empty() {
             continue;
-        };
-        let backend_name = string_field(backend_ref, "name")
-            .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
-        let backend_namespace =
-            checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
-        let raw_backend_port =
-            backend_ref
-                .get("port")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    invalid_resource(object, "TCPRoute/TLSRoute backendRefs[].port is required")
-                })?;
-        let backend_port = port_from_u64(
+        }
+        let materialized_parent_refs = route_materialized_parent_ref_keys_for_namespace(
             object,
-            raw_backend_port,
-            "TCPRoute/TLSRoute backendRefs[].port",
-        )?;
-
-        let listen_ports = if materialized_listener_ports.is_empty() {
-            vec![backend_port]
-        } else {
-            materialized_listener_ports.clone()
-        };
-        for (listen_port_index, listen_port) in listen_ports.iter().copied().enumerate() {
-            let suffix = if listen_ports.len() == 1 {
-                rule_index.to_string()
-            } else {
-                format!("{rule_index}-{listen_port_index}")
+            acc,
+            Some(config_namespace),
+        );
+        let materialized_listener_ports =
+            l4_route_listener_ports_for_namespace(object, acc, Some(config_namespace));
+        let route_namespace_suffix = (config_namespaces.len() > 1)
+            .then(|| format!("ns-{}", resource_suffix_component(config_namespace)));
+        let proxies_before_namespace = proxies.len();
+        for (rule_index, rule) in object
+            .spec
+            .get("rules")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let Some(backend_ref) = first_backend_ref(object, rule, acc)? else {
+                continue;
             };
-            proxies.push(proxy_for_route(RouteProxySpec {
-                id: resource_id(
-                    "gwapi-l4",
-                    &object.metadata.namespace,
-                    &object.metadata.name,
-                    &suffix,
-                ),
-                namespace: object.metadata.namespace.clone(),
-                hosts: string_array(&object.spec, "hostnames"),
-                listen_path: None,
-                strip_listen_path: false,
-                preserve_host_header: false,
-                backend_host: service_dns_name(
-                    backend_name,
-                    &backend_namespace,
-                    &acc.options.cluster_domain,
-                ),
-                backend_port,
-                upstream_id: None,
-                backend_scheme: scheme,
-                listen_port: Some(listen_port),
-                retry: None,
-                backend_read_timeout_ms: None,
-            }));
-        }
-    }
-    if !proxies.is_empty() {
-        for parent_ref in materialized_parent_refs {
-            acc.record_gateway_api_materialized_route_parent(object, parent_ref);
-        }
-    }
-    Ok(proxies)
-}
+            let backend_name = string_field(backend_ref, "name")
+                .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
+            let backend_namespace =
+                checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
+            let raw_backend_port =
+                backend_ref
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        invalid_resource(object, "TCPRoute/TLSRoute backendRefs[].port is required")
+                    })?;
+            let backend_port = port_from_u64(
+                object,
+                raw_backend_port,
+                "TCPRoute/TLSRoute backendRefs[].port",
+            )?;
 
-fn ensure_l4_parent_refs_are_same_namespace(object: &K8sObject) -> Result<(), K8sTranslateError> {
-    let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
-        return Ok(());
-    };
-    for parent_ref in parent_refs {
-        let group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
-        let kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
-        if group == "gateway.networking.k8s.io" && kind == "Gateway" {
-            let parent_namespace =
-                string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
-            if parent_namespace != object.metadata.namespace {
-                return Err(invalid_resource(
-                    object,
-                    "TCPRoute/TLSRoute cross-namespace parentRefs are not supported by Ferrum yet",
-                ));
+            let listen_ports = if materialized_listener_ports.is_empty() {
+                vec![backend_port]
+            } else {
+                materialized_listener_ports.clone()
+            };
+            for (listen_port_index, listen_port) in listen_ports.iter().copied().enumerate() {
+                let base_suffix = if listen_ports.len() == 1 {
+                    rule_index.to_string()
+                } else {
+                    format!("{rule_index}-{listen_port_index}")
+                };
+                let suffix = route_namespace_suffix.as_ref().map_or_else(
+                    || base_suffix.clone(),
+                    |ns_suffix| format!("{base_suffix}-{ns_suffix}"),
+                );
+                proxies.push(proxy_for_route(RouteProxySpec {
+                    id: resource_id(
+                        "gwapi-l4",
+                        &object.metadata.namespace,
+                        &object.metadata.name,
+                        &suffix,
+                    ),
+                    // Parent Gateway namespace owns the stream listen_port, matching
+                    // HTTPRoute materialization for cross-namespace parentRefs.
+                    namespace: config_namespace.clone(),
+                    hosts: string_array(&object.spec, "hostnames"),
+                    listen_path: None,
+                    strip_listen_path: false,
+                    preserve_host_header: false,
+                    backend_host: service_dns_name(
+                        backend_name,
+                        &backend_namespace,
+                        &acc.options.cluster_domain,
+                    ),
+                    backend_port,
+                    upstream_id: None,
+                    backend_scheme: scheme,
+                    listen_port: Some(listen_port),
+                    retry: None,
+                    backend_read_timeout_ms: None,
+                }));
+            }
+        }
+        if proxies.len() > proxies_before_namespace {
+            for parent_ref in materialized_parent_refs {
+                acc.record_gateway_api_materialized_route_parent(object, parent_ref);
             }
         }
     }
-    Ok(())
+    Ok(proxies)
 }
 
 fn checked_backend_namespace(
@@ -10139,9 +10137,10 @@ mod tests {
     }
 
     #[test]
-    fn tcp_route_rejects_cross_namespace_parent_ref_until_l4_parent_materialization_exists() {
-        let mut gateway = object(
+    fn tcp_route_accepts_cross_namespace_parent_ref_when_listener_allows_route_namespace() {
+        let gateway = object_in_namespace(
             "Gateway",
+            "infra",
             serde_json::json!({
                 "gatewayClassName": "ferrum",
                 "listeners": [{
@@ -10155,13 +10154,69 @@ mod tests {
                 }]
             }),
         );
-        gateway.metadata.namespace = "infra".to_string();
         let route = object(
             "TCPRoute",
             serde_json::json!({
                 "parentRefs": [{
                     "name": "sample",
-                    "namespace": "infra"
+                    "namespace": "infra",
+                    "sectionName": "tcp"
+                }],
+                "rules": [{
+                    "backendRefs": [{"name": "db", "port": 5432}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[gateway, route],
+            options().with_source_namespaces(vec!["default".to_string(), "infra".to_string()]),
+        )
+        .expect("listener-allowed cross-namespace L4 parentRef should materialize");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].namespace, "infra");
+        assert_eq!(result.config.proxies[0].listen_port, Some(5432));
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "db.default.svc.cluster.local"
+        );
+        assert_eq!(
+            result.config.proxies[0].backend_scheme,
+            Some(BackendScheme::Tcp)
+        );
+        assert!(result.materialized_route_parents.iter().any(|parent| {
+            parent.route.kind == "TCPRoute"
+                && parent.route.name == "sample"
+                && parent.parent_ref == "gateway.networking.k8s.io/Gateway/infra/sample/tcp/*"
+        }));
+    }
+
+    #[test]
+    fn tcp_route_rejects_cross_namespace_parent_ref_when_listener_does_not_allow_route_namespace() {
+        let gateway = object_in_namespace(
+            "Gateway",
+            "infra",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tcp",
+                    "port": 5432,
+                    "protocol": "TCP",
+                    "allowedRoutes": {
+                        "namespaces": {"from": "Same"},
+                        "kinds": [{"kind": "TCPRoute"}]
+                    }
+                }]
+            }),
+        );
+        let route = object(
+            "TCPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "namespace": "infra",
+                    "sectionName": "tcp"
                 }],
                 "rules": [{
                     "backendRefs": [{"name": "db", "port": 5432}]
@@ -10173,11 +10228,11 @@ mod tests {
             &[gateway, route],
             options().with_source_namespaces(vec!["default".to_string(), "infra".to_string()]),
         )
-        .expect_err("cross-namespace L4 parentRefs should fail closed");
+        .expect_err("Same-only listener must fail closed for cross-namespace L4 parentRefs");
 
         assert!(
             err.to_string()
-                .contains("cross-namespace parentRefs are not supported")
+                .contains("not permitted by the target Gateway listener")
         );
     }
 

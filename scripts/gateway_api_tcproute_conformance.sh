@@ -10,10 +10,12 @@ TCP_BLACKBOX_PORT_MAIN="${TCP_BLACKBOX_PORT_MAIN:-9001}"
 TCP_BLACKBOX_PORT_CROSS="${TCP_BLACKBOX_PORT_CROSS:-9002}"
 TCP_BLACKBOX_PORT_FAIL="${TCP_BLACKBOX_PORT_FAIL:-9003}"
 TCP_BLACKBOX_PORT_DELETE="${TCP_BLACKBOX_PORT_DELETE:-9004}"
+TCP_BLACKBOX_PORT_PARENT_CROSS="${TCP_BLACKBOX_PORT_PARENT_CROSS:-9005}"
 TCP_BLACKBOX_NODEPORT_MAIN="${TCP_BLACKBOX_NODEPORT_MAIN:-30901}"
 TCP_BLACKBOX_NODEPORT_CROSS="${TCP_BLACKBOX_NODEPORT_CROSS:-30902}"
 TCP_BLACKBOX_NODEPORT_FAIL="${TCP_BLACKBOX_NODEPORT_FAIL:-30903}"
 TCP_BLACKBOX_NODEPORT_DELETE="${TCP_BLACKBOX_NODEPORT_DELETE:-30904}"
+TCP_BLACKBOX_NODEPORT_PARENT_CROSS="${TCP_BLACKBOX_NODEPORT_PARENT_CROSS:-30905}"
 TCP_ECHO_BACKEND_PORT="${TCP_ECHO_BACKEND_PORT:-9090}"
 
 DP_GATEWAY_NAMESPACE="${DP_GATEWAY_NAMESPACE:-gateway-conformance-infra}"
@@ -255,6 +257,14 @@ spec:
           - kind: TCPRoute
         namespaces:
           from: Same
+    - name: tcp-parent-cross
+      port: ${TCP_BLACKBOX_PORT_PARENT_CROSS}
+      protocol: TCP
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+        namespaces:
+          from: All
 ---
 apiVersion: gateway.networking.k8s.io/v1alpha2
 kind: TCPRoute
@@ -327,6 +337,21 @@ spec:
     - backendRefs:
         - name: blackbox-tcp-a
           port: ${TCP_ECHO_BACKEND_PORT}
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: blackbox-tcp-parent-cross
+  namespace: ${BACKEND_NAMESPACE}
+spec:
+  parentRefs:
+    - name: ferrum-blackbox-tcp
+      namespace: ${DP_GATEWAY_NAMESPACE}
+      sectionName: tcp-parent-cross
+  rules:
+    - backendRefs:
+        - name: blackbox-tcp-cross
+          port: ${TCP_ECHO_BACKEND_PORT}
 YAML
 }
 
@@ -392,17 +417,18 @@ wait_for_tcproute_parent_condition() {
   local name="$1"
   local condition_type="$2"
   local expected_status="$3"
+  local namespace="${4:-$DP_GATEWAY_NAMESPACE}"
   local status=""
   for _ in $(seq 1 60); do
-    status="$(kubectl -n "$DP_GATEWAY_NAMESPACE" get tcproute "$name" -o jsonpath="{.status.parents[0].conditions[?(@.type==\"${condition_type}\")].status}" 2>/dev/null || true)"
+    status="$(kubectl -n "$namespace" get tcproute "$name" -o jsonpath="{.status.parents[0].conditions[?(@.type==\"${condition_type}\")].status}" 2>/dev/null || true)"
     if [ "$status" = "$expected_status" ]; then
-      echo "TCPRoute ${name} ${condition_type}=${status}"
+      echo "TCPRoute ${namespace}/${name} ${condition_type}=${status}"
       return 0
     fi
     sleep 2
   done
-  echo "TCPRoute ${name} did not reach ${condition_type}=${expected_status} (got '${status}')" >&2
-  kubectl -n "$DP_GATEWAY_NAMESPACE" get tcproute "$name" -o yaml >&2 || true
+  echo "TCPRoute ${namespace}/${name} did not reach ${condition_type}=${expected_status} (got '${status}')" >&2
+  kubectl -n "$namespace" get tcproute "$name" -o yaml >&2 || true
   return 1
 }
 
@@ -444,6 +470,131 @@ run_tcp_blackbox_tests() {
   wait_for_tcproute_parent_condition blackbox-tcp-cross Programmed True | tee -a "$report"
   wait_for_tcp_echo "$TCP_BLACKBOX_PORT_CROSS" "blackbox-tcp-cross" "cross-ping" | tee -a "$report"
   echo "TCPRoute cross-namespace backendRef with ReferenceGrant served echo on :${TCP_BLACKBOX_PORT_CROSS}" >> "$report"
+
+  wait_for_tcproute_parent_condition blackbox-tcp-parent-cross Accepted True "$BACKEND_NAMESPACE" | tee -a "$report"
+  wait_for_tcproute_parent_condition blackbox-tcp-parent-cross ResolvedRefs True "$BACKEND_NAMESPACE" | tee -a "$report"
+  wait_for_tcproute_parent_condition blackbox-tcp-parent-cross Programmed True "$BACKEND_NAMESPACE" | tee -a "$report"
+  wait_for_gateway_listener_attached_routes ferrum-blackbox-tcp tcp-parent-cross 1 | tee -a "$report"
+  wait_for_tcp_echo "$TCP_BLACKBOX_PORT_PARENT_CROSS" "blackbox-tcp-cross" "parent-cross-ping" | tee -a "$report"
+  echo "TCPRoute cross-namespace parentRef with AllowedRoutes=All served echo on :${TCP_BLACKBOX_PORT_PARENT_CROSS}" >> "$report"
+
+  # Tightening AllowedRoutes from All to Same must withdraw the live attachment.
+  cat <<YAML | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ferrum-blackbox-tcp
+  namespace: ${DP_GATEWAY_NAMESPACE}
+spec:
+  gatewayClassName: ferrum
+  listeners:
+    - name: tcp-main
+      port: ${TCP_BLACKBOX_PORT_MAIN}
+      protocol: TCP
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+        namespaces:
+          from: Same
+    - name: tcp-cross
+      port: ${TCP_BLACKBOX_PORT_CROSS}
+      protocol: TCP
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+        namespaces:
+          from: Same
+    - name: tcp-fail
+      port: ${TCP_BLACKBOX_PORT_FAIL}
+      protocol: TCP
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+        namespaces:
+          from: Same
+    - name: tcp-delete
+      port: ${TCP_BLACKBOX_PORT_DELETE}
+      protocol: TCP
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+        namespaces:
+          from: Same
+    - name: tcp-parent-cross
+      port: ${TCP_BLACKBOX_PORT_PARENT_CROSS}
+      protocol: TCP
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+        namespaces:
+          from: Same
+YAML
+  wait_for_tcproute_parent_condition blackbox-tcp-parent-cross Accepted False "$BACKEND_NAMESPACE" | tee -a "$report"
+  local parent_cross_withdrawn=0
+  for _ in $(seq 1 60); do
+    if ! tcp_exchange 127.0.0.1 "$TCP_BLACKBOX_PORT_PARENT_CROSS" "post-tighten" >/dev/null 2>&1; then
+      parent_cross_withdrawn=1
+      break
+    fi
+    sleep 2
+  done
+  if [ "$parent_cross_withdrawn" -ne 1 ]; then
+    echo "TCPRoute kept serving after AllowedRoutes tightened to Same on :${TCP_BLACKBOX_PORT_PARENT_CROSS}" >&2
+    return 1
+  fi
+  echo "TCPRoute cross-namespace parentRef withdrew after AllowedRoutes tightened to Same on :${TCP_BLACKBOX_PORT_PARENT_CROSS}" >> "$report"
+
+  # Restore All so later diagnostics still see the authorized shape if re-applied.
+  cat <<YAML | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ferrum-blackbox-tcp
+  namespace: ${DP_GATEWAY_NAMESPACE}
+spec:
+  gatewayClassName: ferrum
+  listeners:
+    - name: tcp-main
+      port: ${TCP_BLACKBOX_PORT_MAIN}
+      protocol: TCP
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+        namespaces:
+          from: Same
+    - name: tcp-cross
+      port: ${TCP_BLACKBOX_PORT_CROSS}
+      protocol: TCP
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+        namespaces:
+          from: Same
+    - name: tcp-fail
+      port: ${TCP_BLACKBOX_PORT_FAIL}
+      protocol: TCP
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+        namespaces:
+          from: Same
+    - name: tcp-delete
+      port: ${TCP_BLACKBOX_PORT_DELETE}
+      protocol: TCP
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+        namespaces:
+          from: Same
+    - name: tcp-parent-cross
+      port: ${TCP_BLACKBOX_PORT_PARENT_CROSS}
+      protocol: TCP
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+        namespaces:
+          from: All
+YAML
 
   # Empty Service endpoints must fail closed (no successful tagged echo).
   wait_for_tcproute_parent_condition blackbox-tcp-fail Accepted True | tee -a "$report"
@@ -546,7 +697,7 @@ collect_diagnostics() {
   kubectl -n "$BACKEND_NAMESPACE" logs deployment/blackbox-tcp-cross --all-containers --tail=1000 > "$RESULTS_DIR/blackbox-tcp-cross.log"
   {
     echo ""
-    echo "TCPRoute black-box ports: ${TCP_BLACKBOX_PORT_MAIN},${TCP_BLACKBOX_PORT_CROSS},${TCP_BLACKBOX_PORT_FAIL},${TCP_BLACKBOX_PORT_DELETE}"
+    echo "TCPRoute black-box ports: ${TCP_BLACKBOX_PORT_MAIN},${TCP_BLACKBOX_PORT_CROSS},${TCP_BLACKBOX_PORT_FAIL},${TCP_BLACKBOX_PORT_DELETE},${TCP_BLACKBOX_PORT_PARENT_CROSS}"
   } >> "$RESULTS_DIR/CONFORMANCE.md"
 }
 
