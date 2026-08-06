@@ -7,13 +7,15 @@
 //!
 //! Design invariants — each one is load bearing:
 //!
-//! * All session state lives behind ONE synchronous [`std::sync::Mutex`] whose
-//!   critical sections never await and never take a second lock. Attach,
-//!   publish, open, cancel, complete, reap and teardown are therefore
-//!   serialized against each other. That is what makes replay-then-live
-//!   ordering deterministic and what makes teardown reliable: there is no
-//!   `try_lock` best-effort path anywhere, so a contended reload, delete or
-//!   disconnect can never leave a listener alive.
+//! * Each session's state lives behind ONE synchronous [`std::sync::Mutex`]
+//!   whose critical sections never await and never take another session lock.
+//!   Attach, publish, open, cancel, complete, reap and teardown are therefore
+//!   serialized against each other. A separate broker admission gate orders
+//!   session insertion against generation retirement; it is never touched by
+//!   the per-request stream path. Together those gates make replay-then-live
+//!   ordering deterministic and teardown reliable: there is no `try_lock`
+//!   best-effort path anywhere, so a contended reload, delete or disconnect can
+//!   never leave a listener alive.
 //! * Retained event bytes have exactly ONE budget. Every event is retained
 //!   once, in a single ring that serves both pre-listener staging and
 //!   `Last-Event-ID` replay; delivery clones a `Bytes` handle, never the
@@ -792,6 +794,11 @@ pub struct AggregateSseBroker {
     bounds: Arc<AggregateSseBounds>,
     max_sessions: usize,
     retired: AtomicBool,
+    /// Serializes the only state-creating operation against retirement. Without
+    /// this gate, an `ensure_session` that observed `retired == false` could be
+    /// descheduled until after `retire_generation` swept the map, then insert a
+    /// live session into the already-retired generation.
+    admission: Mutex<()>,
     /// Reserved slot count. Reservation happens BEFORE insertion, so concurrent
     /// distinct sessions cannot race past `max_sessions` the way a `len()`
     /// probe followed by an insert can.
@@ -806,6 +813,7 @@ impl AggregateSseBroker {
             bounds: Arc::new(bounds),
             max_sessions: max_sessions.max(1),
             retired: AtomicBool::new(false),
+            admission: Mutex::new(()),
             reserved_sessions: AtomicUsize::new(0),
             sessions: DashMap::with_shard_amount(shard_amount.max(1)),
         }
@@ -835,6 +843,11 @@ impl AggregateSseBroker {
     /// session, and wake every attached body so its next poll ends the
     /// response. Blocking locks throughout — teardown is never best effort.
     pub fn retire_generation(&self) {
+        // Take the same gate as admission before publishing retirement or
+        // sweeping. When this function returns, no pre-retirement admission
+        // can still insert behind the sweep, and every later admission observes
+        // the retired flag while it owns the gate.
+        let _admission = self.lock_admission();
         self.retired.store(true, Ordering::Release);
         let mut wakers = Vec::new();
         self.sessions.retain(|_, state| {
@@ -854,6 +867,10 @@ impl AggregateSseBroker {
         if session_id.is_empty() {
             return Err(AggregateSseError::MissingSession);
         }
+        // This is a cold session-lifecycle operation, not a per-request stream
+        // operation. Hold the admission gate through insertion so retirement's
+        // sweep is a complete, linearizable boundary.
+        let _admission = self.lock_admission();
         if self.retired.load(Ordering::Acquire) {
             return Err(AggregateSseError::BrokerRetired);
         }
@@ -1099,6 +1116,12 @@ impl AggregateSseBroker {
         }
         self.session_state(session_id)
             .ok_or(AggregateSseError::UnknownSession)
+    }
+
+    fn lock_admission(&self) -> MutexGuard<'_, ()> {
+        self.admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn reserve_session_slot(&self) -> Result<(), AggregateSseError> {

@@ -782,6 +782,41 @@ async fn retiring_a_generation_ends_every_body_and_refuses_new_work() {
     assert_eq!(published.unwrap_err(), SseError::BrokerRetired);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retirement_is_a_complete_boundary_for_concurrent_session_admission() {
+    let broker = Arc::new(AggregateSseBroker::new(bounds(), 256, 8));
+    let start = Arc::new(tokio::sync::Barrier::new(65));
+    let mut admissions = Vec::new();
+    for index in 0..64 {
+        let broker = Arc::clone(&broker);
+        let start = Arc::clone(&start);
+        admissions.push(tokio::spawn(async move {
+            start.wait().await;
+            broker.ensure_session(&format!("retire-race-{index}"))
+        }));
+    }
+
+    start.wait().await;
+    broker.retire_generation();
+    for admission in admissions {
+        match admission.await.unwrap() {
+            Ok(()) | Err(SseError::BrokerRetired) => {}
+            Err(other) => panic!("unexpected admission result: {other:?}"),
+        }
+    }
+
+    assert!(broker.is_retired());
+    assert_eq!(
+        broker.session_count(),
+        0,
+        "retirement must drain every admission that linearized before it and reject every later one"
+    );
+    assert_eq!(
+        broker.ensure_session("post-retirement").unwrap_err(),
+        SseError::BrokerRetired
+    );
+}
+
 #[tokio::test]
 async fn dropping_the_broker_ends_in_flight_bodies() {
     let broker = broker();
