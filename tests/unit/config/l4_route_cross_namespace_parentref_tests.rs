@@ -88,6 +88,7 @@ fn tls_gateway(allowed_from: &str) -> K8sObject {
                 "name": "tls",
                 "port": 15443,
                 "protocol": "TLS",
+                "tls": {"mode": "Passthrough"},
                 "allowedRoutes": {
                     "namespaces": {"from": allowed_from},
                     "kinds": [{"kind": "TLSRoute"}]
