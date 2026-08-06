@@ -144,7 +144,10 @@ async fn serve_scripted_mcp_upstream(
                     "result": { "kind": kind }
                 }))
                 .expect("scripted upstream response serializes");
-                if write_http_response(&mut stream, 200, &payload).await.is_err() {
+                if write_http_response(&mut stream, 200, &payload)
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -450,7 +453,10 @@ impl SseCursor {
     }
 
     fn take_record(&mut self) -> Option<String> {
-        let position = self.decoded.windows(2).position(|window| window == b"\n\n")?;
+        let position = self
+            .decoded
+            .windows(2)
+            .position(|window| window == b"\n\n")?;
         let record =
             String::from_utf8(self.decoded[..position].to_vec()).expect("SSE record is UTF-8");
         self.decoded.drain(..position + 2);
@@ -610,7 +616,12 @@ impl RawSseListener {
                 return false;
             };
             let line = String::from_utf8_lossy(&self.raw[..position]).to_string();
-            let size_token = line.split(';').next().unwrap_or_default().trim().to_string();
+            let size_token = line
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             let size = usize::from_str_radix(&size_token, 16)
                 .unwrap_or_else(|_| panic!("malformed chunk size {size_token:?}"));
             let start = position + 2;
