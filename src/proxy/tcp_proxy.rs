@@ -578,6 +578,11 @@ fn pre_copy_disconnect_cause(
         ErrorClass::DispatchPolicyRejected
         | ErrorClass::GatewayBufferCapacity
         | ErrorClass::RequestError => DisconnectCause::RecvError,
+        // A `maxConnections` refusal is a backend-facing gateway decision: the
+        // stream-family producer is the typed
+        // `StreamSetupKind::BackendMaxConnectionsExceeded`, whose
+        // `is_client_side()` is false, so the untyped class fallback must agree.
+        ErrorClass::BackendConnectionLimit => DisconnectCause::BackendError,
     }
 }
 
@@ -609,7 +614,8 @@ fn pre_copy_disconnect_direction(error: &anyhow::Error, class: &ErrorClass) -> D
         | ErrorClass::ResponseBodyTooLarge
         | ErrorClass::ConnectionReset
         | ErrorClass::ConnectionClosed
-        | ErrorClass::GracefulRemoteClose => Direction::BackendToClient,
+        | ErrorClass::GracefulRemoteClose
+        | ErrorClass::BackendConnectionLimit => Direction::BackendToClient,
         // Client-facing classes attribute to the c2b half.
         ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge => {
             Direction::ClientToBackend
@@ -849,14 +855,55 @@ pub struct TcpProxyMetrics {
     /// When non-zero, indicates splice was used instead of userspace copy.
     pub splice_bytes_transferred: AtomicU64,
     /// Per-backend-target open-connection limiter used to enforce
-    /// DestinationRule `connectionPool.tcp.maxConnections`. Backed by the
-    /// shared lock-free `BackendConnectionLimiter` (`src/backend_conn_limit.rs`),
-    /// the same primitive the HTTP-family WebSocket dispatch path uses, so the
-    /// stream-family and WebSocket paths can never drift apart. Counters are
-    /// lazily created per `(host, port)` target and `CachePadded` so the
-    /// read-mostly inflight count doesn't false-share with the hotter
-    /// listener-level `active_backend_connections` field.
-    pub backend_inflight: BackendConnectionLimiter,
+    /// DestinationRule `connectionPool.tcp.maxConnections`.
+    ///
+    /// This is a HANDLE to the ONE gateway-wide
+    /// `BackendConnectionLimiter` (`src/backend_conn_limit.rs`) that
+    /// `ProxyState` builds — the same instance WebSocket, the pooled
+    /// multiplexed transports, and reqwest admit against. It is an `Arc` and
+    /// not an owned value precisely because these metrics are per stream
+    /// LISTENER: an owned limiter would give every raw-TCP listener its own
+    /// counter map, so a destination's ceiling would be `cap` per listener plus
+    /// another `cap` for the whole HTTP family, instead of one ceiling for the
+    /// destination.
+    ///
+    /// `StreamListenerManager::attach_backend_conn_limit` installs the shared
+    /// instance before the first reconcile; `TcpProxyMetrics::default()` falls
+    /// back to a private limiter so standalone/test constructors still enforce
+    /// caps within their own scope. Counters are lazily created per
+    /// `(host, policy port)` target and `CachePadded` so the read-mostly
+    /// inflight count doesn't false-share with the hotter listener-level
+    /// `active_backend_connections` field.
+    ///
+    /// Deliberately NOT merged with the listener-local observability counters
+    /// above (`active_connections`, `active_backend_connections`, byte
+    /// counters): those stay per listener so `/overload` and the stream metric
+    /// snapshot keep reporting per-listener activity.
+    pub backend_inflight: Arc<BackendConnectionLimiter>,
+}
+
+impl TcpProxyMetrics {
+    /// Build listener metrics whose `maxConnections` admission goes through the
+    /// gateway-wide limiter rather than a private one.
+    ///
+    /// Every spawned stream listener is constructed this way so raw TCP shares
+    /// the destination ceiling with WebSocket, the pooled transports, and
+    /// reqwest. Observability counters remain listener-local.
+    pub fn with_backend_conn_limit(backend_inflight: Arc<BackendConnectionLimiter>) -> Self {
+        // Fields are listed rather than filled from `..Self::default()`: the
+        // derived `Default` builds a whole private `BackendConnectionLimiter`
+        // (a `DashMap` with `max(64, cpus * 16)` shards) only to drop it
+        // immediately, once per spawned stream listener on every reconcile.
+        Self {
+            active_connections: AtomicU64::new(0),
+            active_backend_connections: AtomicU64::new(0),
+            total_connections: AtomicU64::new(0),
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
+            splice_bytes_transferred: AtomicU64::new(0),
+            backend_inflight,
+        }
+    }
 }
 
 struct TcpActiveConnectionGuard {
