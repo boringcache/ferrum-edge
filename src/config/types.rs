@@ -547,9 +547,10 @@ pub enum H2UpgradePolicy {
     /// Istio `DO_NOT_UPGRADE`: force the HTTP/1.1 path (reqwest). Skips the
     /// direct-H2 pool even when the capability registry marks the target
     /// `h2_tls` Supported, and restricts the reqwest client's ALPN to
-    /// `http/1.1` so the backend cannot ALPN-negotiate h2 either. (A
-    /// backend-TLS SNI override still requires direct-H2 because reqwest
-    /// cannot apply a per-request SNI — that case wins and is documented.)
+    /// `http/1.1` so the backend cannot ALPN-negotiate h2 either. A backend-TLS
+    /// SNI override remains representable on this path: the reqwest URL uses
+    /// the SNI authority while its resolver pins the socket to the selected
+    /// backend target.
     #[serde(alias = "do_not_upgrade")]
     DoNotUpgrade,
 }
