@@ -15,6 +15,9 @@ use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, Proxy, ResolvedPortOverride,
 };
+use ferrum_edge::backend_conn_limit::{
+    BackendConnectionLimiter, ReqwestConnectionAdmission, is_backend_connection_limit_error,
+};
 use ferrum_edge::config::{EnvConfig, PoolConfig};
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -157,16 +160,12 @@ async fn max_requests_per_connection_does_not_close_h1_backend_after_n_requests(
     );
 }
 
-/// The reqwest `Client` itself is still socket-unbounded — that is exactly why
-/// `connectionPool.tcp.maxConnections` cannot be enforced *inside* the shared
-/// client and is instead enforced at dispatch (issue #3290): `proxy_to_backend`
-/// holds one `BackendConnectionLimiter` slot per in-flight known-HTTP/1.1
-/// request, which bounds sockets because hyper-util only dials when checkout
-/// finds no idle socket. This test pins the client-level behavior the dispatch
-/// gate compensates for; the gate itself is covered by
-/// `mesh_destination_rule_max_connections_tests.rs`.
+/// A reqwest client built WITHOUT the admission hook is socket-unbounded. This
+/// is the control for the tests below: it proves the ceiling comes from the
+/// connector hook, not from pool keys or client configuration, and it pins the
+/// behavior that made a request-lifetime approximation wrong (issue #3290).
 #[tokio::test]
-async fn reqwest_client_alone_is_socket_unbounded_so_the_cap_lives_at_dispatch() {
+async fn reqwest_client_without_admission_hook_is_socket_unbounded() {
     let (backend, accepted, _backend_task) =
         start_counting_h1_backend(Duration::from_millis(150)).await;
     let mut proxy = proxy_for_backend(backend.port());
@@ -194,7 +193,293 @@ async fn reqwest_client_alone_is_socket_unbounded_so_the_cap_lives_at_dispatch()
 
     assert!(
         accepted.load(Ordering::SeqCst) >= 2,
-        "the shared reqwest client applies no per-destination socket ceiling of its own, so the maxConnections cap must stay enforced by the dispatch-layer in-flight gate rather than by client configuration"
+        "a client with no admission hook applies no per-destination socket ceiling of its own"
+    );
+}
+
+// ============================================================================
+// DestinationRule `connectionPool.tcp.maxConnections` on the reqwest transports
+// (issue #3290).
+//
+// Every assertion below is on sockets the BACKEND accepted, not on gateway
+// bookkeeping, so a limiter that merely counts requests cannot pass them.
+// ============================================================================
+
+/// Build a pool whose clients all share one admission hook, plus the limiter
+/// and hook so tests can publish lanes and read the live socket count.
+fn admitted_reqwest_pool() -> (
+    ConnectionPool,
+    Arc<BackendConnectionLimiter>,
+    Arc<ReqwestConnectionAdmission>,
+) {
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    let admission = Arc::new(ReqwestConnectionAdmission::new(Arc::clone(&limiter), 8));
+    let pool = reqwest_pool();
+    pool.attach_reqwest_connection_admission(Arc::clone(&admission));
+    (pool, limiter, admission)
+}
+
+fn capped_proxy(port: u16, cap: u32) -> Proxy {
+    let mut proxy = proxy_for_backend(port);
+    proxy.dispatch_port_overrides = Some(HashMap::from([(
+        port,
+        ResolvedPortOverride {
+            max_connections: Some(cap),
+            ..ResolvedPortOverride::default()
+        },
+    )]));
+    proxy
+}
+
+/// The defect a request-lifetime slot could not catch: after a request
+/// completes, reqwest keeps the socket OPEN and idle. A second, strictly
+/// sequential request must therefore either reuse that socket (no new slot) or
+/// be refused — never open a second socket past `maxConnections: 1`.
+#[tokio::test]
+async fn sequential_requests_never_exceed_the_cap_while_a_socket_sits_idle() {
+    let (backend, accepted, _backend_task) = start_counting_h1_backend(Duration::ZERO).await;
+    let (pool, limiter, admission) = admitted_reqwest_pool();
+    let proxy = capped_proxy(backend.port(), 1);
+    admission.publish_lane("127.0.0.1", backend.port(), backend.port(), 1);
+
+    let client = pool.get_client(&proxy).await.expect("reqwest client");
+    let url = format!("http://{}:{}/audit", backend.ip(), backend.port());
+
+    for _ in 0..5 {
+        let response = client.get(&url).send().await.expect("sequential response");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        // Drain so the socket returns to the idle pool.
+        let _ = response.bytes().await.expect("body");
+    }
+
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "sequential requests must reuse the one admitted socket"
+    );
+    assert_eq!(
+        limiter.current("127.0.0.1", backend.port()),
+        1,
+        "the slot must still be held while the socket sits idle in reqwest's pool — releasing it at request completion is exactly the bug this enforces against"
+    );
+}
+
+/// Cap exhaustion is decided before the second physical dial: with the one
+/// admitted socket busy, a concurrent request that needs a NEW socket is
+/// refused rather than opening one.
+#[tokio::test]
+async fn cap_exhaustion_refuses_the_second_physical_dial() {
+    let (backend, accepted, _backend_task) =
+        start_counting_h1_backend(Duration::from_millis(300)).await;
+    let (pool, limiter, admission) = admitted_reqwest_pool();
+    let proxy = capped_proxy(backend.port(), 1);
+    admission.publish_lane("127.0.0.1", backend.port(), backend.port(), 1);
+
+    let client = pool.get_client(&proxy).await.expect("reqwest client");
+    let url = format!("http://{}:{}/slow", backend.ip(), backend.port());
+
+    let (first, second) = tokio::join!(client.get(&url).send(), client.get(&url).send());
+    let outcomes = [first, second];
+    let refused = outcomes
+        .iter()
+        .filter(|outcome| match outcome {
+            Ok(_) => false,
+            Err(error) => is_backend_connection_limit_error(error),
+        })
+        .count();
+
+    assert_eq!(refused, 1, "one request must be refused at the ceiling");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "the refused request must not have opened a second backend socket"
+    );
+    drop(outcomes);
+    drop(client);
+    pool.clear();
+    // Dropping the client drops its pooled connection, which drops the token.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if limiter.current("127.0.0.1", backend.port()) == 0 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        limiter.current("127.0.0.1", backend.port()),
+        0,
+        "the slot must retire when the physical connection is dropped"
+    );
+}
+
+/// Divergent reqwest pool keys for the same destination each get their own
+/// `reqwest::Client` (and therefore their own socket pool). They must still
+/// share ONE ceiling, which is what a per-client counter could not do.
+#[tokio::test]
+async fn distinct_reqwest_pool_keys_share_one_destination_ceiling() {
+    let (backend, accepted, _backend_task) =
+        start_counting_h1_backend(Duration::from_millis(300)).await;
+    let (pool, _limiter, admission) = admitted_reqwest_pool();
+    admission.publish_lane("127.0.0.1", backend.port(), backend.port(), 1);
+
+    let first_proxy = capped_proxy(backend.port(), 1);
+    let mut second_proxy = capped_proxy(backend.port(), 1);
+    // A different `upstream_subset` is a pool-key partition, so this proxy gets
+    // a DIFFERENT client with its own connection pool.
+    second_proxy.upstream_subset = Some("v2".to_string());
+
+    let first_client = pool.get_client(&first_proxy).await.expect("first client");
+    let second_client = pool.get_client(&second_proxy).await.expect("second client");
+    assert_ne!(
+        pool.pool_key_for_warmup(&first_proxy),
+        pool.pool_key_for_warmup(&second_proxy),
+        "test precondition: the two proxies must land on distinct reqwest pool keys"
+    );
+
+    let url = format!("http://{}:{}/slow", backend.ip(), backend.port());
+    let (first, second) = tokio::join!(
+        first_client.get(&url).send(),
+        second_client.get(&url).send()
+    );
+    let refused = [first, second]
+        .iter()
+        .filter(|outcome| match outcome {
+            Ok(_) => false,
+            Err(error) => is_backend_connection_limit_error(error),
+        })
+        .count();
+
+    assert_eq!(refused, 1, "both clients share one slot");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "only one physical socket may exist across both clients"
+    );
+}
+
+/// HTTP/2 streams multiplex onto one physical connection and must take no
+/// additional slot, so `maxConnections: 1` never sheds an h2 backend.
+#[tokio::test]
+async fn h2_streams_multiplex_without_consuming_extra_slots() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind h2c backend");
+    let addr = listener.local_addr().expect("backend addr");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_for_task = Arc::clone(&accepted);
+    let _task = tokio::spawn(async move {
+        while let Ok((socket, _peer)) = listener.accept().await {
+            accepted_for_task.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let service = service_fn(|_req: Request<Incoming>| async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                });
+                let executor = hyper_util::rt::TokioExecutor::new();
+                let _ = hyper::server::conn::http2::Builder::new(executor)
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await;
+            });
+        }
+    });
+
+    let (_pool, limiter, admission) = admitted_reqwest_pool();
+    admission.publish_lane("127.0.0.1", addr.port(), addr.port(), 1);
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .connection_admission(Arc::clone(&admission) as Arc<dyn reqwest::ConnectionAdmission>)
+        .build()
+        .expect("h2c client");
+
+    let url = format!("http://{}:{}/h2", addr.ip(), addr.port());
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let client = client.clone();
+        let url = url.clone();
+        tasks.push(tokio::spawn(async move { client.get(url).send().await }));
+    }
+    for task in tasks {
+        let response = task
+            .await
+            .expect("join")
+            .expect("multiplexed h2 streams must not be shed by a CONNECTION cap");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "8 concurrent h2 requests must share one physical connection"
+    );
+    assert_eq!(
+        limiter.current("127.0.0.1", addr.port()),
+        1,
+        "multiplexed streams must not each consume a connection slot"
+    );
+}
+
+/// A lane published under a config epoch that has since been superseded must
+/// stop applying, so a `maxConnections` an operator REMOVED does not keep
+/// shedding traffic after the reload.
+#[tokio::test]
+async fn a_removed_cap_stops_applying_after_a_config_publication() {
+    let (backend, accepted, _backend_task) =
+        start_counting_h1_backend(Duration::from_millis(300)).await;
+    let (pool, _limiter, admission) = admitted_reqwest_pool();
+    let proxy = capped_proxy(backend.port(), 1);
+    admission.publish_lane("127.0.0.1", backend.port(), backend.port(), 1);
+
+    // Operator removes the cap; the config publish chokepoint invalidates every
+    // published lane and nothing re-publishes this one.
+    admission.bump_config_epoch();
+
+    let client = pool.get_client(&proxy).await.expect("reqwest client");
+    let url = format!("http://{}:{}/slow", backend.ip(), backend.port());
+    let (first, second) = tokio::join!(client.get(&url).send(), client.get(&url).send());
+    assert_eq!(
+        first.expect("first response").status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        second.expect("second response").status(),
+        reqwest::StatusCode::OK
+    );
+    assert!(
+        accepted.load(Ordering::SeqCst) >= 2,
+        "with the cap removed both requests must be free to open their own socket"
+    );
+}
+
+/// The lane is keyed by the DIAL port but counts on the DestinationRule POLICY
+/// port, so a `targetPort` remap shares one ceiling with every other transport
+/// to that destination instead of getting a second one.
+#[tokio::test]
+async fn target_port_remap_counts_on_the_policy_port() {
+    let (backend, _accepted, _backend_task) = start_counting_h1_backend(Duration::ZERO).await;
+    let (pool, limiter, admission) = admitted_reqwest_pool();
+    let proxy = capped_proxy(backend.port(), 2);
+
+    // Service port 8080 remapped onto the workload/dial port.
+    admission.publish_lane("127.0.0.1", backend.port(), 8080, 2);
+
+    let client = pool.get_client(&proxy).await.expect("reqwest client");
+    let url = format!("http://{}:{}/audit", backend.ip(), backend.port());
+    let response = client.get(&url).send().await.expect("response");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _ = response.bytes().await.expect("body");
+
+    assert_eq!(
+        limiter.current("127.0.0.1", 8080),
+        1,
+        "the socket must be counted on the policy port"
+    );
+    assert_eq!(
+        limiter.current("127.0.0.1", backend.port()),
+        0,
+        "the dial port must not become a second counter lane"
     );
 }
 

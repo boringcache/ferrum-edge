@@ -27,13 +27,17 @@
 //!   drain, or shutdown. Reuse of a pooled connection takes NO new slot, so
 //!   an arbitrary number of multiplexed streams still share one admitted
 //!   connection.
-//! * **reqwest HTTP/1.1** — reqwest owns its socket pool internally and
-//!   exposes no connection-lifetime hook, so the slot is instead held for the
-//!   in-flight request. On a known-HTTP/1.1 dispatch one in-flight request
-//!   occupies exactly one backend socket for its whole lifetime, and
-//!   hyper-util only dials when checkout finds no idle socket, so bounding
-//!   concurrent in-flight H1 requests bounds concurrently-open H1 sockets.
-//!   See `docs/mesh.md` for the derivation and the reqwest-h2 residual.
+//! * **reqwest HTTP/1.1 and HTTP/2** — admitted at reqwest's connector, the
+//!   one place a NEW physical socket is dialed (pooled reuse and multiplexed
+//!   H2 streams never reach it), via the vendored
+//!   `ClientBuilder::connection_admission` hook
+//!   (`docs/upstream-reqwest-patches/003-connection-admission-hook/`). The
+//!   token returned by [`ReqwestConnectionAdmission`] is owned by the
+//!   resulting connection object, so the slot retires exactly when that socket
+//!   dies — including an idle socket reqwest keeps after the request that
+//!   opened it finished. Because ONE admission hook is shared by every
+//!   `reqwest::Client` in the pool, all effective reqwest pool keys for a
+//!   destination share the one ceiling.
 //!
 //! Keying is per resolved `(host, DestinationRule policy port)` endpoint, not
 //! per logical cluster — a destination with N endpoint hosts sharing one port
@@ -335,6 +339,205 @@ impl<'a> PooledConnectionAdmission<'a> {
     pub fn cap(&self) -> u32 {
         self.cap
     }
+}
+
+/// One published reqwest admission lane: the DestinationRule policy port and
+/// cap that govern new sockets to a dial `(host, port)`, stamped with the
+/// config epoch that published it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ReqwestLane {
+    policy_port: u16,
+    cap: u32,
+    epoch: u64,
+}
+
+thread_local! {
+    /// Reused per-thread buffer for lane keys, mirroring
+    /// [`crate::backend_pending_limit`]: a repeat capped dispatch to a known
+    /// destination allocates nothing (`DashMap::get` takes `&str` through
+    /// `String: Borrow<str>`).
+    static LANE_KEY_BUF: std::cell::RefCell<String> =
+        std::cell::RefCell::new(String::with_capacity(96));
+}
+
+/// Normalize a host for lane keying: ASCII-lowercased and with IPv6 brackets
+/// stripped, so the dispatch-side `UpstreamTarget.host` and the bracketed,
+/// URL-normalized authority reqwest hands the connector land on one key.
+fn push_normalized_host(buf: &mut String, host: &str) {
+    let host = host.strip_prefix('[').unwrap_or(host);
+    let host = host.strip_suffix(']').unwrap_or(host);
+    for ch in host.chars() {
+        buf.extend(ch.to_lowercase());
+    }
+}
+
+fn write_lane_key(buf: &mut String, host: &str, dial_port: u16) {
+    use std::fmt::Write;
+    push_normalized_host(buf, host);
+    let _ = write!(buf, "|{dial_port}");
+}
+
+/// The `connectionPool.tcp.maxConnections` admission hook Ferrum installs on
+/// **every** pooled `reqwest::Client`.
+///
+/// # Why a connector hook and not a request counter
+///
+/// reqwest owns its socket pool internally: a request can reuse an idle socket
+/// (no new connection), and after a request finishes reqwest keeps the socket
+/// idle and reusable. A slot tied to a request's lifetime therefore reads zero
+/// while sockets are still open, and would admit past the cap on the next
+/// dispatch; it would also count HTTP/2 *streams* rather than connections. The
+/// vendored `ClientBuilder::connection_admission` hook is consulted at the one
+/// place a new physical connection is created, so:
+///
+/// * reuse and H2 multiplexing take **no** slot;
+/// * the slot is released when the socket actually closes (handshake failure,
+///   idle eviction, pool drain, reload, cancellation, shutdown), because the
+///   token is owned by the connection object handed to hyper;
+/// * one shared hook across all `reqwest::Client`s means divergent pool keys
+///   (TLS material, `rcfg`, forced-H1 ALPN, subset) for the same destination
+///   still share ONE ceiling.
+///
+/// # Lane publication
+///
+/// The connector only knows the dial `(host, port)` from the URI. The cap and
+/// the DestinationRule **policy** port live on the dispatching `Proxy`, so the
+/// dispatch path publishes the lane immediately before handing the request to
+/// reqwest — but only when a cap is actually configured, so an uncapped
+/// destination costs nothing anywhere. Publication is idempotent and
+/// allocation-free on repeat.
+///
+/// Lanes are stamped with a config epoch that [`Self::bump_config_epoch`]
+/// advances on every config publication. A lane whose epoch is stale is
+/// ignored, so a `maxConnections` an operator **removed** stops being enforced
+/// without needing a withdrawal pass over every host a proxy ever dialed; the
+/// dispatch that re-publishes runs before the dial it will cause, so a cap that
+/// still exists is re-stamped before it is next consulted.
+pub struct ReqwestConnectionAdmission {
+    limiter: SharedBackendConnectionLimiter,
+    lanes: DashMap<String, ReqwestLane>,
+    epoch: AtomicU64,
+}
+
+impl ReqwestConnectionAdmission {
+    /// Build a hook that admits against `limiter`.
+    pub fn new(limiter: SharedBackendConnectionLimiter, shards: usize) -> Self {
+        Self {
+            limiter,
+            lanes: DashMap::with_shard_amount(shards),
+            epoch: AtomicU64::new(0),
+        }
+    }
+
+    /// Invalidate every published lane. Called from the single config-publish
+    /// chokepoint so a removed cap cannot outlive its configuration.
+    pub fn bump_config_epoch(&self) {
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// Publish (or refresh) the lane governing new sockets to
+    /// `(dial_host, dial_port)`.
+    ///
+    /// Call ONLY when a cap is configured for the destination — the uncapped
+    /// path must not touch this map. `policy_port` is the DestinationRule
+    /// policy port ([`crate::proxy::dispatch_policy_port_for_target`]), which
+    /// is what the counter lane is keyed by, so a `targetPort` remap and a raw
+    /// TCP/WebSocket session to the same destination share one ceiling.
+    pub fn publish_lane(&self, dial_host: &str, dial_port: u16, policy_port: u16, cap: u32) {
+        let lane = ReqwestLane {
+            policy_port,
+            cap,
+            epoch: self.epoch.load(Ordering::Acquire),
+        };
+        LANE_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            write_lane_key(&mut buf, dial_host, dial_port);
+            // Hit path: an unchanged lane is a borrowed-`&str` read, no write
+            // and no allocation.
+            if let Some(existing) = self.lanes.get(buf.as_str())
+                && *existing == lane
+            {
+                return;
+            }
+            self.lanes.insert(buf.clone(), lane);
+        });
+    }
+
+    /// Resolve the live lane for a dial destination, if any.
+    fn lane_for(&self, host: &str, port: u16) -> Option<ReqwestLane> {
+        let current = self.epoch.load(Ordering::Acquire);
+        LANE_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            write_lane_key(&mut buf, host, port);
+            self.lanes
+                .get(buf.as_str())
+                .map(|lane| *lane)
+                .filter(|lane| lane.epoch == current)
+        })
+    }
+
+    /// Current open-socket count for a destination lane. Tests/diagnostics.
+    #[allow(dead_code)]
+    pub fn current(&self, host: &str, policy_port: u16) -> u64 {
+        self.limiter.current(host, policy_port)
+    }
+}
+
+impl reqwest::ConnectionAdmission for ReqwestConnectionAdmission {
+    fn admit(
+        &self,
+        dst: &http::Uri,
+    ) -> Result<reqwest::ConnectionAdmissionToken, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(host) = dst.host() else {
+            // No authority to key on: nothing to bound, and refusing here would
+            // break dials this limiter has no opinion about.
+            return Ok(reqwest::ConnectionAdmissionToken::unlimited());
+        };
+        let port = match dst.port_u16() {
+            Some(port) => port,
+            None => match dst.scheme_str() {
+                Some("https") => 443,
+                _ => 80,
+            },
+        };
+        // Normalize once (brackets stripped, ASCII-lowercased) so the counter
+        // key matches the one the WebSocket / raw-TCP / pooled transports use
+        // for the same destination. This is the cold new-connection path, so
+        // the small allocation never touches per-request work.
+        let mut normalized_host = String::with_capacity(host.len());
+        push_normalized_host(&mut normalized_host, host);
+        let Some(lane) = self.lane_for(&normalized_host, port) else {
+            return Ok(reqwest::ConnectionAdmissionToken::unlimited());
+        };
+        // Count on the POLICY port, never the dial port, so every transport to
+        // this destination shares one ceiling.
+        match self
+            .limiter
+            .try_acquire_shared(&normalized_host, lane.policy_port, lane.cap)
+        {
+            Ok(slot) => Ok(reqwest::ConnectionAdmissionToken::new(slot)),
+            Err(limit) => Err(Box::new(limit)),
+        }
+    }
+}
+
+/// Recognize a reqwest error caused by this limiter refusing a new socket.
+///
+/// Walks the error's source chain: reqwest wraps a connector error in its own
+/// `Error`, so the marker is never the top-level type. Used by the dispatch
+/// path to answer with a neutral 503 instead of a 502 that would charge the
+/// backend's health for a gateway-side ceiling.
+pub fn is_backend_connection_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(err);
+    while let Some(current) = source {
+        if current.is::<BackendConnectionLimitExceeded>() {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 /// Returned when a destination is already at its `maxConnections` cap. Carries
