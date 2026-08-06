@@ -5204,11 +5204,23 @@ mod tests {
         assert_eq!(result.config.frontend_tls_cert_path, None);
         assert_eq!(result.config.frontend_tls_key_path, None);
         assert!(result.config.frontend_tls_certificate_sources.is_empty());
+        // Multi-ref path uses a field-scoped diagnostic (no Secret bytes / digests);
+        // one unresolved ref still fails the whole listener closed.
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("unresolved TLS certificateRef"))
+            result.warnings.iter().any(|warning| {
+                warning.contains(
+                    "certificateRefs has at least one reference that is not an authorized, valid kubernetes.io/tls Secret",
+                )
+            }),
+            "expected authorized-Secret diagnostic, got: {:?}",
+            result.warnings
+        );
+        assert!(
+            result.warnings.iter().any(|warning| {
+                warning.contains("unresolved TLS material and will not be exposed")
+            }),
+            "expected exposure-skip diagnostic, got: {:?}",
+            result.warnings
         );
     }
 
@@ -5242,10 +5254,20 @@ mod tests {
             "invalid terminating TLS listener must not be exposed as a data-plane service"
         );
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("unresolved TLS certificateRef"))
+            result.warnings.iter().any(|warning| {
+                warning.contains(
+                    "certificateRefs is empty on a Terminate-mode listener; leaving this listener's frontend TLS unmaterialized",
+                )
+            }),
+            "expected empty-certificateRefs diagnostic, got: {:?}",
+            result.warnings
+        );
+        assert!(
+            result.warnings.iter().any(|warning| {
+                warning.contains("unresolved TLS material and will not be exposed")
+            }),
+            "expected exposure-skip diagnostic, got: {:?}",
+            result.warnings
         );
     }
 
@@ -5277,11 +5299,22 @@ mod tests {
                 .is_none_or(|mesh| mesh.services.is_empty()),
             "HTTPS listeners without TLS material must not be exposed as plaintext services"
         );
+        // Missing `tls` is treated as an empty certificateRefs set for Terminate.
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("unresolved TLS certificateRef"))
+            result.warnings.iter().any(|warning| {
+                warning.contains(
+                    "certificateRefs is empty on a Terminate-mode listener; leaving this listener's frontend TLS unmaterialized",
+                )
+            }),
+            "expected empty-certificateRefs diagnostic, got: {:?}",
+            result.warnings
+        );
+        assert!(
+            result.warnings.iter().any(|warning| {
+                warning.contains("unresolved TLS material and will not be exposed")
+            }),
+            "expected exposure-skip diagnostic, got: {:?}",
+            result.warnings
         );
     }
 

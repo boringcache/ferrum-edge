@@ -113,8 +113,8 @@ async fn presented_leaf(server_config: Arc<rustls::ServerConfig>, server_name: &
     leaf
 }
 
-/// The certificate set most cases here share. `_dir` keeps the temporary
-/// directory alive for the whole test.
+/// The certificate set most cases here share. Callers that destructure must
+/// bind `_dir` (not only `..`) so TempDir outlives path reads and handshakes.
 struct Fixture {
     _dir: TempDir,
     alpha: TestCertificate,
@@ -141,7 +141,9 @@ fn fixture() -> Fixture {
 #[tokio::test]
 async fn sni_selects_the_certificate_that_names_the_requested_host() {
     ensure_crypto_provider();
+    // Bind `_dir` explicitly: `..` would drop TempDir before path reads.
     let Fixture {
+        _dir,
         alpha,
         beta,
         fallback,
@@ -168,7 +170,12 @@ async fn sni_selects_the_certificate_that_names_the_requested_host() {
 #[tokio::test]
 async fn certificate_san_selects_even_without_a_listener_hostname() {
     ensure_crypto_provider();
-    let Fixture { alpha, beta, .. } = fixture();
+    let Fixture {
+        _dir,
+        alpha,
+        beta,
+        ..
+    } = fixture();
     // Both listeners are catch-all: selection has to come from each leaf's own
     // SANs, which is the shape a Gateway with no `hostname` produces.
     let config = server_config(&[
@@ -187,7 +194,10 @@ async fn certificate_san_selects_even_without_a_listener_hostname() {
 async fn wildcard_matches_one_label_only() {
     ensure_crypto_provider();
     let Fixture {
-        wildcard, fallback, ..
+        _dir,
+        wildcard,
+        fallback,
+        ..
     } = fixture();
     let config = server_config(&[
         input(&fallback, "ferrum/edge/catch-all", None, true),
@@ -238,6 +248,7 @@ async fn exact_match_beats_a_covering_wildcard() {
 async fn unmatched_sni_falls_back_to_the_marked_default() {
     ensure_crypto_provider();
     let Fixture {
+        _dir,
         alpha,
         beta,
         fallback,
@@ -305,7 +316,10 @@ async fn rotating_one_certificate_leaves_the_others_serving() {
 fn one_unloadable_certificate_fails_the_whole_set_closed() {
     ensure_crypto_provider();
     let Fixture {
-        alpha, fallback, ..
+        _dir,
+        alpha,
+        fallback,
+        ..
     } = fixture();
     let mut broken = input(&alpha, "ferrum/edge-a/https", Some("a.example.com"), false);
     broken.cert_source = "/nonexistent/gateway-cert.pem".to_string();
@@ -333,6 +347,7 @@ fn one_unloadable_certificate_fails_the_whole_set_closed() {
 fn a_mismatched_certificate_and_key_pair_is_refused() {
     ensure_crypto_provider();
     let Fixture {
+        _dir,
         alpha,
         beta,
         fallback,
@@ -366,7 +381,12 @@ fn an_empty_certificate_set_is_refused() {
 #[tokio::test]
 async fn an_unmarked_set_still_produces_a_fallback() {
     ensure_crypto_provider();
-    let Fixture { alpha, beta, .. } = fixture();
+    let Fixture {
+        _dir,
+        alpha,
+        beta,
+        ..
+    } = fixture();
     // No entry carries the default marker (an older control plane): the first
     // certificate in the delivered order must take the fallback slot rather
     // than leaving the listener without a credential.
