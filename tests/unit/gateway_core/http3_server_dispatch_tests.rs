@@ -2340,35 +2340,101 @@ fn h3_native_grpc_relay_is_full_duplex_not_drain_then_read() {
     );
 }
 
+/// Pump retirement must be true BY CONSTRUCTION, not by counting call sites.
+///
+/// Counting literal `retire(...)` calls cannot see the exits that matter most:
+/// a structural early return (the `?` on the response builder, or a new one
+/// added later) leaves no call to count, yet it is exactly the shape that would
+/// detach the spawned task and drop the only shutdown notifier. So this asserts
+/// the ownership invariant instead — the `JoinHandle` is moved into an RAII
+/// guard at the spawn site and never lives as a bare local, and the guard's
+/// `Drop` cancels and aborts it.
 #[test]
 fn h3_native_grpc_relay_retires_its_upload_pump_on_every_exit() {
     let relay = native_h3_grpc_relay_source();
-    // Oversized response, after_proxy reject, response-header write failure,
-    // response-header wait failure, and normal completion.
-    assert_eq!(
-        relay.matches("retire_h3_grpc_upload_pump(").count(),
-        5,
-        "every path that leaves the relay must retire the request pump so the \
-         spawned task cannot outlive the RPC"
+
+    // The handle is never bound to a local: it is constructed inside the guard's
+    // constructor, so there is no window in which an early return could drop it
+    // unretired.
+    assert!(
+        relay.contains("H3GrpcUploadPumpGuard::new(")
+            && relay.contains("tokio::spawn(run_h3_grpc_upload_pump("),
+        "the pump handle must be handed to the RAII guard at the spawn site"
+    );
+    let guard_at = relay
+        .find("H3GrpcUploadPumpGuard::new(")
+        .expect("pump guard construction");
+    let spawn_at = relay
+        .find("tokio::spawn(run_h3_grpc_upload_pump(")
+        .expect("pump spawn");
+    assert!(
+        guard_at < spawn_at,
+        "the spawn must be an argument of the guard constructor, so the handle \
+         is owned by the guard from the instant it exists"
+    );
+    assert!(
+        !relay.contains("let pump = tokio::spawn("),
+        "regression: a bare JoinHandle local can be leaked by a structural `?` \
+         early return, detaching the pump and dropping its shutdown notifier"
+    );
+
+    // Ordinary exits still retire explicitly, so the ORDERING contract holds:
+    // publish cancellation, join, and only then read the final byte count.
+    // A floor, not an exact count — adding another explicitly-retired exit must
+    // not require re-tuning this test.
+    assert!(
+        relay.matches("pump_guard.retire().await").count() >= 5,
+        "the ordinary exits (header-wait failure, oversized response, \
+         after_proxy reject, header-write failure, completion) must retire \
+         explicitly so the join happens before the RPC's bookkeeping"
+    );
+
+    // And the backstop itself: Drop must both cancel and abort, or a structural
+    // early return would leave the task running.
+    let src = include_str!("../../../src/http3/server.rs");
+    let guard_drop = src
+        .split("impl Drop for H3GrpcUploadPumpGuard {")
+        .nth(1)
+        .expect("pump guard Drop impl")
+        .split("\n}\n")
+        .next()
+        .expect("bounded pump guard Drop impl");
+    assert!(
+        guard_drop.contains("self.shutdown.notify_one()") && guard_drop.contains("pump.abort()"),
+        "Drop must publish cancellation AND abort, so no exit can leave the \
+         pump running: {guard_drop}"
+    );
+    let retire = src
+        .split("async fn retire(mut self)")
+        .nth(1)
+        .expect("pump guard retire")
+        .split("\n    }\n")
+        .next()
+        .expect("bounded pump guard retire");
+    assert!(
+        retire.contains("self.pump.take()"),
+        "retire must take the handle so Drop cannot retire it a second time"
     );
 }
 
-/// The cross-protocol H3→H2 gRPC upload pump has the SAME h3-quinn hazard as
-/// the native pump: `pump_shutdown` can cancel `recv_half.recv_data()` /
-/// `recv_half.recv_trailers()` mid-poll, and h3-quinn parks its
-/// `quinn::RecvStream` inside a `ReusableBoxFuture` while `poll_data` is
-/// `Pending`, leaving its own `Option` as `None`. The unconditional
-/// `halt_request_body(&mut recv_half)` that used to run after the loop then
-/// unwrapped that `None` — a process abort under `panic = "abort"`, reachable
-/// from an ordinary bidi RPC whose backend answers before the client
-/// half-closes.
+/// The cross-protocol H3→H2 gRPC upload pump ends the same way as the native
+/// one: `pump_shutdown` can cancel `recv_half.recv_data()` /
+/// `recv_half.recv_trailers()` mid-poll (the ordinary shape of a bidi RPC whose
+/// backend answers before the client half-closes), and the receive half must
+/// then be closed with `STOP_SENDING(H3_NO_ERROR)` — NOT by dropping it, which
+/// emits `STOP_SENDING(0)`, a code outside the HTTP/3 error space, and makes
+/// clients log a spurious remote reset on a successful RPC.
 ///
-/// Cancellation is NOT weakened to fix it and the request body stays bounded:
-/// every await still races `pump_shutdown`, the recv half is still closed (by
-/// `Drop`'s STOP_SENDING when it is parked), and the backend upload is still
-/// reset through `backend_upload_cancelled` rather than cleanly truncated.
+/// Reaching the parked `quinn::RecvStream` for that call is what the vendored
+/// `h3-quinn` patch provides; stock 0.0.10 would `unwrap` a `None` and abort the
+/// process under `panic = "abort"`. See
+/// `docs/upstream-h3-quinn-patches/001-stop-sending-during-in-flight-read/`.
+///
+/// Cancellation is NOT weakened and the request body stays bounded: every await
+/// still races `pump_shutdown`, and the backend upload is still reset through
+/// `backend_upload_cancelled` rather than cleanly truncated.
 #[test]
-fn h3_cross_protocol_grpc_upload_pump_halts_only_an_idle_recv_half() {
+fn h3_cross_protocol_grpc_upload_pump_halts_the_frontend_receive_half_gracefully() {
     let src = include_str!("../../../src/http3/cross_protocol.rs");
     let pump = src
         .split("pub(crate) async fn dispatch_grpc_streaming")
@@ -2379,41 +2445,32 @@ fn h3_cross_protocol_grpc_upload_pump_halts_only_an_idle_recv_half() {
         .expect("bounded cross-protocol request-upload pump");
 
     assert!(
-        pump.contains("halt_request_body_if_idle(&mut recv_half, recv_state)"),
-        "the post-loop STOP_SENDING must be gated on the receive-half state"
+        pump.contains("halt_request_body(&mut recv_half)"),
+        "the post-loop STOP_SENDING(H3_NO_ERROR) must be unconditional, \
+         including after a receive cancelled mid-poll"
     );
     assert!(
-        !pump.contains("halt_request_body(&mut recv_half)"),
-        "regression (process abort): halting a receive half that was cancelled \
-         mid-poll unwraps h3-quinn's parked `None` under panic = \"abort\""
+        !pump.contains("halt_request_body_if_idle("),
+        "regression: gating the halt on an idle receive half silently downgrades \
+         the headline bidi exit to quinn's STOP_SENDING(0)"
     );
-
-    // Exactly the two frontend receive awaits park the stream mid-poll. The
-    // channel sends (DATA, trailers, the Err marker) leave it idle and must keep
-    // the graceful STOP_SENDING(H3_NO_ERROR) rather than RESET_STREAM(0x0).
-    let parked = "recv_state = H3RequestRecvState::ParkedMidPoll;";
-    let parked_sites = pump.matches(parked).count();
-    assert_eq!(
-        parked_sites, 2,
-        "recv_data and recv_trailers are the only mid-poll cancellation points"
-    );
-    for parked_await in ["recv_half.recv_data()", "recv_half.recv_trailers()"] {
-        let Some(at) = pump.find(parked_await) else {
-            panic!("cross-protocol pump must forward {parked_await}");
-        };
-        let Some(arm_start) = pump[..at].rfind("tokio::select! {") else {
-            panic!("each frontend receive must sit in a shutdown select");
-        };
-        assert!(
-            pump[arm_start..at].contains(parked),
-            "the shutdown arm racing {parked_await} must record ParkedMidPoll"
-        );
-    }
 
     // Cancellation itself is untouched: every await still races the shutdown
     // signal, and a cancelled upload still RSTs the backend request direction.
     let cancellable = pump.matches("pump_shutdown_signal.notified()").count();
     assert_eq!(cancellable, 6, "every pump await must remain cancellable");
+    for cancellable_await in ["recv_half.recv_data()", "recv_half.recv_trailers()"] {
+        let Some(at) = pump.find(cancellable_await) else {
+            panic!("cross-protocol pump must forward {cancellable_await}");
+        };
+        let Some(arm_start) = pump[..at].rfind("tokio::select! {") else {
+            panic!("each frontend receive must sit in a shutdown select");
+        };
+        assert!(
+            pump[arm_start..at].contains("pump_shutdown_signal.notified()"),
+            "the select racing {cancellable_await} must carry the shutdown arm"
+        );
+    }
     assert!(
         pump.contains("pump_backend_cancelled.store(true, Ordering::Release)"),
         "a cancelled upload must still reset the backend request direction \
@@ -2421,16 +2478,70 @@ fn h3_cross_protocol_grpc_upload_pump_halts_only_an_idle_recv_half() {
     );
 }
 
+/// The vendored `h3-quinn` shape both request-upload pumps depend on.
+///
+/// Stock 0.0.10 moves its `quinn::RecvStream` into a `ReusableBoxFuture` while a
+/// read is pending and leaves its own field as `None`, so `stop_sending` unwraps
+/// that `None`. Every graceful `STOP_SENDING(H3_NO_ERROR)` after a cancelled
+/// frontend receive rests on the vendored crate keeping the stream reachable, so
+/// pin the shape here: a silent revert to the upstream form would turn the
+/// headline bidi path into a process abort.
 #[test]
-fn h3_native_grpc_upload_pump_awaits_are_all_cancellable() {
+fn h3_quinn_vendored_recv_stream_can_stop_sending_during_an_in_flight_read() {
+    let src = include_str!("../../../vendor/h3-quinn-0.0.10-ferrum-patched/src/lib.rs");
+    let recv_stream = src
+        .split("pub struct RecvStream {")
+        .nth(1)
+        .expect("vendored h3-quinn RecvStream")
+        .split("\nfn convert_read_error_to_stream_error(")
+        .next()
+        .expect("bounded vendored h3-quinn RecvStream");
+
+    assert!(
+        recv_stream.starts_with("\n    stream: quinn::RecvStream,\n}"),
+        "the quinn::RecvStream must be owned INLINE, not behind an Option that \
+         a pending read empties: {}",
+        &recv_stream[..recv_stream.len().min(120)]
+    );
+    assert!(
+        !recv_stream.contains("ReusableBoxFuture"),
+        "regression: parking the stream inside a reusable boxed future is what \
+         makes stop_sending unreachable mid-read"
+    );
+    let stop_sending = recv_stream
+        .split("fn stop_sending(&mut self, error_code: u64) {")
+        .nth(1)
+        .expect("vendored h3-quinn stop_sending")
+        .split("\n    }")
+        .next()
+        .expect("bounded vendored h3-quinn stop_sending");
+    assert!(
+        !stop_sending.contains("unwrap()"),
+        "stop_sending must be total — no Option::unwrap that a pending read can \
+         trip: {stop_sending}"
+    );
+    assert!(
+        recv_stream.contains("self.stream.read_chunk(usize::MAX, true)")
+            && recv_stream.contains("pin!("),
+        "poll_data must build the (cancel-safe) read_chunk future per poll so \
+         the stream stays borrowed rather than moved"
+    );
+}
+
+/// Bound the native-H3 gRPC request-upload pump's source region.
+fn native_h3_grpc_upload_pump_source() -> &'static str {
     let src = include_str!("../../../src/http3/server.rs");
-    let pump = src
-        .split("async fn run_h3_grpc_upload_pump(")
+    src.split("async fn run_h3_grpc_upload_pump(")
         .nth(1)
         .expect("native H3 gRPC upload pump")
-        .split("\n/// Retire the request-upload pump")
+        .split("\n/// Immutable per-request context")
         .next()
-        .expect("bounded native H3 gRPC upload pump");
+        .expect("bounded native H3 gRPC upload pump")
+}
+
+#[test]
+fn h3_native_grpc_upload_pump_awaits_are_all_cancellable() {
+    let pump = native_h3_grpc_upload_pump_source();
 
     // Every await the pump performs must sit in a `select!` against shutdown:
     // frontend DATA, backend DATA, frontend trailers, backend trailers, and the
@@ -2450,36 +2561,15 @@ fn h3_native_grpc_upload_pump_awaits_are_all_cancellable() {
     ] {
         assert!(pump.contains(awaited), "pump must forward {awaited}");
     }
-
-    // h3-quinn's `stop_sending` unwraps a `None` when a receive was cancelled
-    // mid-poll; under `panic = "abort"` that is a process abort, so the graceful
-    // halt must go through the typed receive-state gate rather than an
-    // unconditional call.
-    assert!(
-        pump.contains("halt_request_body_if_idle(&mut frontend_recv, exit.recv_state())"),
-        "the graceful STOP_SENDING must be gated on the pump's typed exit state \
-         (h3-quinn parks its RecvStream while poll_data is Pending)"
-    );
-    assert!(
-        !pump.contains("halt_request_body(&mut frontend_recv)"),
-        "regression: the pump must never call the ungated halt on its frontend \
-         receive half"
-    );
-    // Exactly the two frontend receive awaits may be cancelled mid-poll; every
-    // other cancellation leaves the receive half idle and must keep the
-    // graceful STOP_SENDING(H3_NO_ERROR).
-    let mid_recv = pump.matches("H3UploadPumpExit::CancelledMidRecv").count();
-    let cancelled = pump.matches("H3UploadPumpExit::Cancelled").count();
-    let idle_cancels = cancelled - mid_recv;
+    // Four of the five cancellation points record the exit; the fifth (the
+    // backend FIN) has nothing after it, and leaving the upload incomplete is
+    // precisely what makes teardown RESET the backend request direction.
     assert_eq!(
-        mid_recv, 2,
-        "only the frontend recv_data / recv_trailers cancellations park the \
-         quinn::RecvStream mid-poll"
-    );
-    assert_eq!(
-        idle_cancels, 3,
-        "the backend send_data / send_trailers / finish cancellations leave the \
-         receive half idle and must keep the graceful STOP_SENDING"
+        pump.matches("H3UploadPumpExit::Cancelled").count(),
+        4,
+        "every cancellation point that is followed by more backend work must \
+         record the Cancelled exit, so teardown never FINishes a backend whose \
+         RPC is already over"
     );
     assert!(
         pump.contains("stop_stream(h3::error::Code::H3_REQUEST_CANCELLED)"),
@@ -2494,6 +2584,88 @@ fn h3_native_grpc_upload_pump_awaits_are_all_cancellable() {
         pump.contains("max_request_body_size"),
         "the pump must enforce the effective gRPC receive ceiling incrementally"
     );
+}
+
+/// The headline bidi exit — the relay retires a pump parked in `recv_data`
+/// because the backend's terminal trailers arrived — must still close the
+/// client's request direction with `STOP_SENDING(H3_NO_ERROR)`.
+///
+/// Dropping the receive half instead falls through to
+/// `quinn::RecvStream::drop`, which emits `STOP_SENDING(0)`; `0x0` is not an
+/// HTTP/3 error code (RFC 9114 §8.1 defines `H3_NO_ERROR = 0x0100`), so clients
+/// log a spurious remote reset on an RPC that SUCCEEDED. Reaching the stream
+/// mid-read is what the vendored `h3-quinn` patch provides — pinned by
+/// `h3_quinn_vendored_recv_stream_can_stop_sending_during_an_in_flight_read`.
+#[test]
+fn h3_native_grpc_upload_pump_halts_the_frontend_receive_half_gracefully() {
+    let pump = native_h3_grpc_upload_pump_source();
+    assert!(
+        pump.contains("halt_request_body(&mut frontend_recv)"),
+        "the pump must always emit the graceful STOP_SENDING(H3_NO_ERROR)"
+    );
+    assert!(
+        !pump.contains("halt_request_body_if_idle("),
+        "regression: gating the halt on an idle receive half silently downgrades \
+         the headline bidi exit to quinn's STOP_SENDING(0)"
+    );
+}
+
+/// The pump publishes the signals the response-header wait needs to attribute
+/// an expiry, and publishes `blocked_on_backend` around the BACKEND awaits only.
+#[test]
+fn h3_native_grpc_upload_pump_publishes_progress_and_blocked_state() {
+    let pump = native_h3_grpc_upload_pump_source();
+
+    // One per client frame taken off the frontend (DATA and trailing metadata)
+    // and one per DATA frame the backend accepted.
+    assert_eq!(
+        pump.matches("upload.note_progress()").count(),
+        3,
+        "progress must be recorded when the client hands us a frame and when the \
+         backend accepts one, so a wait that saw neither is provably client-owned"
+    );
+
+    // `blocked_on_backend` must be set true only immediately before a backend
+    // await, and cleared on every path out of it — including the cancellation
+    // arm — so a stale `true` cannot blame the backend for a later expiry.
+    let set_true = pump.matches("upload.set_blocked_on_backend(true)").count();
+    let set_false = pump.matches("upload.set_blocked_on_backend(false)").count();
+    assert_eq!(
+        set_true, 3,
+        "the backend send_data / send_trailers / finish awaits are the only \
+         places the gateway is blocked on the backend"
+    );
+    let expected_clears = set_true + 1;
+    assert_eq!(
+        set_false, expected_clears,
+        "every backend await must clear the flag afterwards, plus once inside \
+         the send_data cancellation arm that breaks out of the loop"
+    );
+    for backend_await in [
+        "backend_send.send_data(data)",
+        "backend_send.send_trailers(trailers)",
+        "backend_send.finish()",
+    ] {
+        let at = pump
+            .find(backend_await)
+            .unwrap_or_else(|| panic!("pump must forward {backend_await}"));
+        let arm_start = pump[..at]
+            .rfind("tokio::select! {")
+            .unwrap_or_else(|| panic!("{backend_await} must sit in a shutdown select"));
+        let prefix = &pump[..arm_start];
+        let last_true = prefix
+            .rfind("upload.set_blocked_on_backend(true);")
+            .unwrap_or_else(|| {
+                panic!("{backend_await} must be preceded by the blocked-on-backend publish")
+            });
+        let last_false = prefix.rfind("upload.set_blocked_on_backend(false);");
+        assert!(
+            last_false.is_none_or(|false_at| false_at < last_true),
+            "the most recent blocked-on-backend publish before {backend_await} \
+             must be `true`, or an expiry while it is parked there would be \
+             charged to the client"
+        );
+    }
 }
 
 #[test]
@@ -2538,6 +2710,80 @@ fn h3_native_grpc_upload_fault_arm_cannot_lose_to_backend_data() {
     );
 }
 
+/// Every native-H3 gRPC failure/reject path writes the client's response BEFORE
+/// it tears anything down.
+///
+/// Pre-split (the backend stream never opened) the relay still owns the whole
+/// bidirectional stream, and its receive half has provably never been polled —
+/// the opener writes only request HEADERS — so the graceful
+/// `STOP_SENDING(H3_NO_ERROR)` belongs there, after the error write, exactly as
+/// the unsplit reject writers do it. Post-split the same ordering applies to
+/// pump retirement: halting or resetting the client's request direction ahead of
+/// the response lets a client observe the reset instead of the gRPC status.
+#[test]
+fn h3_native_grpc_failure_paths_write_the_response_before_tearing_down() {
+    let relay = native_h3_grpc_relay_source();
+
+    // Pre-split: response, then the graceful halt, then the bookkeeping.
+    let pre_split = relay
+        .split("let backend = match opened {")
+        .nth(1)
+        .expect("pre-split backend-open failure arm")
+        .split("// ── Phase 2")
+        .next()
+        .expect("bounded pre-split failure arm");
+    let send_at = pre_split
+        .find("send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut stream, error)")
+        .expect("pre-split failure must write the trailers-only gRPC error");
+    let halt_at = pre_split
+        .find("halt_request_body(&mut stream)")
+        .expect("pre-split failure must halt the unsplit receive half gracefully");
+    let record_at = pre_split
+        .find("record_failed_h3_grpc_dispatch(")
+        .expect("pre-split failure must record the outcome");
+    assert!(
+        send_at < halt_at && halt_at < record_at,
+        "pre-split ordering must be response -> STOP_SENDING(H3_NO_ERROR) -> record"
+    );
+
+    // Post-split: each ordinary failure/reject arm writes, then retires. Arms
+    // are bounded by the `return Ok(());` that closes the previous one, so a
+    // retire belonging to an earlier arm cannot satisfy (or break) the check.
+    let assert_writes_then_retires = |write: &str, what: &str| {
+        let at = relay
+            .find(write)
+            .unwrap_or_else(|| panic!("{what} must write a client response"));
+        let arm_start = relay[..at]
+            .rfind("return Ok(());")
+            .map_or(0, |i| i + "return Ok(());".len());
+        assert!(
+            !relay[arm_start..at].contains("pump_guard.retire().await"),
+            "{what} must not retire the pump before writing the client response \
+             — the client would see its request direction torn down first"
+        );
+        let tail = &relay[at..];
+        let retire_at = tail
+            .find("pump_guard.retire().await")
+            .unwrap_or_else(|| panic!("{what} must retire the upload pump"));
+        let return_at = tail
+            .find("return Ok(());")
+            .unwrap_or_else(|| panic!("{what} must return after recording"));
+        assert!(
+            retire_at < return_at,
+            "{what} must retire the pump within its own arm, after the write"
+        );
+    };
+    assert_writes_then_retires(
+        "send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut send_half, error)",
+        "response-header wait failure",
+    );
+    assert_writes_then_retires(
+        "\"Backend response exceeds maximum size\"",
+        "oversized backend response",
+    );
+    assert_writes_then_retires("send_h3_grpc_reject_trailers_only(", "after_proxy reject");
+}
+
 #[test]
 fn h3_native_grpc_bidi_open_is_pre_wire_and_splits() {
     let client = include_str!("../../../src/http3/client.rs");
@@ -2574,17 +2820,17 @@ fn h3_native_grpc_upload_fault_signalling_matches_the_h2_bridge() {
 
     assert_eq!(
         h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::Oversize),
-        (8, "Request body exceeds maximum size"),
+        Some((8, "Request body exceeds maximum size")),
         "an oversized client upload is RESOURCE_EXHAUSTED"
     );
     assert_eq!(
         h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::MalformedTrailers),
-        (3, "Malformed request trailers"),
+        Some((3, "Malformed request trailers")),
         "undecodable trailing metadata is INVALID_ARGUMENT, not a server outage"
     );
     assert_eq!(
         h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::ClientAbort),
-        (14, "Service unavailable"),
+        Some((14, "Service unavailable")),
     );
 
     for terminating in [
@@ -2601,6 +2847,33 @@ fn h3_native_grpc_upload_fault_signalling_matches_the_h2_bridge() {
         !h3_grpc_upload_fault_terminates_rpc_for_test(H3GrpcUploadFaultKind::BackendUploadHalted),
         "a gRPC server that stops reading the request once it has everything it \
          needs must NOT terminate a still-streaming response"
+    );
+    // A non-terminating fault has no client-visible signalling AT ALL, and the
+    // type system says so: only `terminating()` mints a value carrying one, so
+    // there is no dead `BackendUploadHalted` arm for a reader to mistake for a
+    // live signalling decision.
+    assert_eq!(
+        h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::BackendUploadHalted),
+        None,
+        "a fault the response direction survives must not carry a gRPC status"
+    );
+    let src = include_str!("../../../src/http3/server.rs");
+    let terminating_impl = src
+        .split("impl H3GrpcTerminatingUploadFault {")
+        .nth(1)
+        .expect("terminating-fault impl")
+        .split("\n}\n")
+        .next()
+        .expect("bounded terminating-fault impl");
+    assert!(
+        !terminating_impl.contains("BackendUploadHalted"),
+        "the terminating-fault mappings must have no arm for the \
+         non-terminating fault: {terminating_impl}"
+    );
+    assert!(
+        terminating_impl.contains("fn as_pool_error("),
+        "the pre-headers H3PoolError equivalence belongs to the proven-terminating \
+         type, so its every arm is reachable"
     );
 }
 
@@ -2642,5 +2915,122 @@ async fn h3_native_grpc_terminating_upload_fault_wakes_the_relay() {
         )
         .await,
         "a non-terminating fault must leave the response relay streaming"
+    );
+}
+
+/// A response-header wait that expires must be attributed by WHO the gateway was
+/// waiting on, not by whether the client upload happened to be complete.
+///
+/// On the duplex relay a healthy bidirectional client keeps its request
+/// direction open for the entire RPC, so `upload_complete == false` is the
+/// NORMAL steady state. Using completion alone as the discriminator would file
+/// every dead backend that accepts a stream and never sends HEADERS as a
+/// "stalled client", making it health-neutral: no circuit-breaker trip, no
+/// passive-health demotion, no adaptive-concurrency signal, no LB fallback.
+#[test]
+fn h3_native_grpc_header_wait_expiry_blames_the_party_it_waited_on() {
+    use ferrum_edge::_test_support::{
+        H3GrpcHeaderWaitScenario, H3GrpcUploadFaultKind,
+        h3_grpc_header_wait_expiry_blames_backend_for_test as blames_backend,
+    };
+
+    // The regression: a client actively streaming while the backend accepted the
+    // stream and never answered. Upload is NOT complete — and that is fine.
+    assert!(
+        blames_backend(H3GrpcHeaderWaitScenario {
+            progress_steps_during_wait: 4,
+            ..Default::default()
+        }),
+        "a client that made progress throughout the wait is healthy; the backend \
+         owes the response headers"
+    );
+
+    // The backend is not even draining the upload it asked for.
+    assert!(
+        blames_backend(H3GrpcHeaderWaitScenario {
+            blocked_on_backend: true,
+            ..Default::default()
+        }),
+        "a pump parked on a backend write is waiting on the BACKEND"
+    );
+
+    // The backend closed the request direction itself and then never answered.
+    assert!(
+        blames_backend(H3GrpcHeaderWaitScenario {
+            fault: Some(H3GrpcUploadFaultKind::BackendUploadHalted),
+            ..Default::default()
+        }),
+        "a backend that stopped accepting the upload and then never sent HEADERS \
+         is a dead backend, not a stalled client"
+    );
+
+    // The pre-duplex case still holds.
+    assert!(
+        blames_backend(H3GrpcHeaderWaitScenario {
+            upload_complete: true,
+            ..Default::default()
+        }),
+        "a completed upload leaves only the backend to wait on"
+    );
+
+    // Genuinely stalled client: parked on the frontend receive, nothing arrived
+    // for the whole wait. This is also the valid zero-message / trailers-only
+    // client-streaming RPC — the shape a forwarded-BYTE-count test would get
+    // wrong, since it forwards no body bytes at all.
+    assert!(
+        !blames_backend(H3GrpcHeaderWaitScenario::default()),
+        "a wait in which the client produced nothing is neutral for backend health"
+    );
+
+    // A terminating fault is client-caused even when the deadline ties with it.
+    for client_fault in [
+        H3GrpcUploadFaultKind::ClientAbort,
+        H3GrpcUploadFaultKind::MalformedTrailers,
+        H3GrpcUploadFaultKind::Oversize,
+    ] {
+        assert!(
+            !blames_backend(H3GrpcHeaderWaitScenario {
+                // Even with progress recorded, the latched client fault decides.
+                progress_steps_during_wait: 2,
+                fault: Some(client_fault),
+                ..Default::default()
+            }),
+            "{client_fault:?} is client-caused and must stay health-neutral"
+        );
+    }
+}
+
+/// The relay must snapshot upload progress at the START of the header wait and
+/// hand that snapshot to the classifier — a snapshot taken anywhere else would
+/// compare against the wrong baseline.
+#[test]
+fn h3_native_grpc_header_wait_snapshots_progress_before_waiting() {
+    let relay = native_h3_grpc_relay_source();
+    let snapshot_at = relay
+        .find("let upload_progress_before_wait = upload.progress();")
+        .expect("header-wait progress snapshot");
+    let timeout_at = relay
+        .find("tokio::time::timeout_at(at, header_fut)")
+        .expect("bounded header wait");
+    assert!(
+        snapshot_at < timeout_at,
+        "the progress snapshot must be taken before the wait begins"
+    );
+    let expiry = relay
+        .split("tokio::time::timeout_at(at, header_fut)")
+        .nth(1)
+        .expect("header-wait expiry arm")
+        .split("None => header_fut.await")
+        .next()
+        .expect("bounded header-wait expiry arm");
+    assert!(
+        expiry.contains("classify_h3_grpc_header_wait_expiry(")
+            && expiry.contains("upload_progress_before_wait"),
+        "the expiry must be attributed through the classifier with the snapshot"
+    );
+    assert!(
+        !expiry.contains("upload.is_complete()"),
+        "regression: completion alone cannot attribute a duplex header wait — a \
+         healthy bidi client is never complete while the RPC is live"
     );
 }

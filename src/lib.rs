@@ -5204,18 +5204,23 @@ pub mod _test_support {
         }
     }
 
-    /// Client-visible `(grpc-status, grpc-message)` for a terminating native-H3
-    /// gRPC request-upload fault.
+    /// Client-visible `(grpc-status, grpc-message)` for a native-H3 gRPC
+    /// request-upload fault, or `None` when the fault does not end the RPC and
+    /// therefore has no client-visible signalling at all — the type system
+    /// enforces that: only `H3GrpcUploadFault::terminating()` mints the value
+    /// that carries a signal.
     pub fn h3_grpc_upload_fault_signal_for_test(
         kind: H3GrpcUploadFaultKind,
-    ) -> (u32, &'static str) {
-        h3_grpc_upload_fault_for_test(kind).grpc_signal()
+    ) -> Option<(u32, &'static str)> {
+        h3_grpc_upload_fault_for_test(kind)
+            .terminating()
+            .map(|fault| fault.grpc_signal())
     }
 
     /// Whether observing this upload fault must END the RPC. A backend that
     /// stops accepting request DATA after it has everything it needs must NOT.
     pub fn h3_grpc_upload_fault_terminates_rpc_for_test(kind: H3GrpcUploadFaultKind) -> bool {
-        h3_grpc_upload_fault_for_test(kind).terminates_rpc()
+        h3_grpc_upload_fault_for_test(kind).terminating().is_some()
     }
 
     /// Return true when publishing `kind` on the shared upload state wakes the
@@ -5267,6 +5272,52 @@ pub mod _test_support {
             }
             None => unreachable!("a published fault must latch"),
         }
+    }
+
+    /// Shape of the native-H3 gRPC request upload at the instant the
+    /// response-header wait expires (issue #3283).
+    ///
+    /// Mirrors what the relay can observe on the shared upload state so unit
+    /// tests can pin the attribution contract without a live QUIC backend.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct H3GrpcHeaderWaitScenario {
+        /// Upload steps recorded WHILE the header wait was running: client
+        /// frames taken off the frontend and frames the backend accepted.
+        pub progress_steps_during_wait: u64,
+        /// The upload reached a clean FIN before the wait expired.
+        pub upload_complete: bool,
+        /// The pump is parked on a backend write / FIN, not on the client.
+        pub blocked_on_backend: bool,
+        /// A latched fault, if any.
+        pub fault: Option<H3GrpcUploadFaultKind>,
+    }
+
+    /// Whether a native-H3 gRPC response-header wait expiry with this shape is
+    /// charged to the BACKEND (a real read timeout that must reach CB / passive
+    /// health / adaptive concurrency / fallback) rather than to a stalled client.
+    pub fn h3_grpc_header_wait_expiry_blames_backend_for_test(
+        scenario: H3GrpcHeaderWaitScenario,
+    ) -> bool {
+        let state = crate::http3::server::H3GrpcUploadState::new();
+        // Snapshot exactly where the relay does: at the start of the wait.
+        let progress_at_wait_start = state.progress();
+        for _ in 0..scenario.progress_steps_during_wait {
+            state.note_progress();
+        }
+        if scenario.upload_complete {
+            state.mark_complete();
+        }
+        state.set_blocked_on_backend(scenario.blocked_on_backend);
+        if let Some(kind) = scenario.fault {
+            state.publish_fault(h3_grpc_upload_fault_for_test(kind));
+        }
+        matches!(
+            crate::http3::server::classify_h3_grpc_header_wait_expiry(
+                &state,
+                progress_at_wait_start,
+            ),
+            crate::http3::server::H3GrpcHeaderWaitExpiry::BackendStalled
+        )
     }
 
     /// Return true when an indefinitely stalled downstream H3 write is

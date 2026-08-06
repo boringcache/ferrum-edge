@@ -81,11 +81,11 @@ pub enum H3Step {
     /// Trailers-Only response and mirrors `H2Step::RespondHeadersEndStream`.
     RespondHeadersEndStream(Vec<(&'static str, String)>),
     /// Read ONE request DATA chunk from the current stream and append it to
-    /// this connection's recorded request body, WITHOUT waiting for request
-    /// EOF. Used by bidirectional-streaming tests: a following `RespondHeaders`
-    /// then provably answers a request message the client sent while its
-    /// request stream is still open. Fails the script if the client half-closes
-    /// (or resets) before sending any DATA.
+    /// THAT stream's recorded request body, WITHOUT waiting for request EOF.
+    /// Used by bidirectional-streaming tests: a following `RespondHeaders` then
+    /// provably answers a request message the client sent while its request
+    /// stream is still open. Fails the script if the client half-closes (or
+    /// resets) before sending any DATA.
     ReadRequestData,
     /// Send a chunk of response body.
     RespondData(Bytes),
@@ -386,9 +386,9 @@ pub struct H3RecordedRequest {
     pub path: String,
     pub authority: Option<String>,
     pub headers: Vec<(String, String)>,
-    /// Request DATA the script explicitly read via [`H3Step::ReadRequestData`].
-    /// Empty unless the script asked for it — the scripted backend otherwise
-    /// never consumes the request body.
+    /// Request DATA the script explicitly read via [`H3Step::ReadRequestData`]
+    /// **on this request's own stream**. Empty unless the script asked for it —
+    /// the scripted backend otherwise never consumes the request body.
     pub body: Vec<u8>,
 }
 
@@ -475,6 +475,12 @@ async fn run_h3_script(
 
     let mut response_stream: Option<h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>> =
         None;
+    // Index into `H3BackendState::requests` of the record produced by
+    // `response_stream`'s request. `ReadRequestData` attributes DATA through
+    // THIS, not through `requests.last_mut()`: the script owns one stream at a
+    // time today, but a future step that accepts a second stream before the
+    // first finishes would silently file its body under the wrong request.
+    let mut current_request_index: Option<usize> = None;
     // A response can finish before the peer has finished uploading its request
     // body. Keep finalized bidirectional stream handles alive until the script
     // ends so dropping the response side does not race the peer's final DATA /
@@ -526,7 +532,7 @@ async fn run_h3_script(
                     .resolve_request()
                     .await
                     .map_err(|e| format!("resolve_request failed: {e}"))?;
-                record_request(&state, &req).await;
+                current_request_index = Some(record_request(&state, &req).await);
                 response_stream = Some(stream);
             }
             step @ (H3Step::RespondHeaders(_) | H3Step::RespondHeadersEndStream(_)) => {
@@ -557,7 +563,7 @@ async fn run_h3_script(
                             .resolve_request()
                             .await
                             .map_err(|e| format!("resolve_request failed: {e}"))?;
-                        record_request(&state, &req).await;
+                        current_request_index = Some(record_request(&state, &req).await);
                         response_stream = Some(stream);
                         response_stream.as_mut().unwrap()
                     }
@@ -609,6 +615,12 @@ async fn run_h3_script(
                 let stream = response_stream
                     .as_mut()
                     .ok_or_else(|| "ReadRequestData without an accepted stream".to_string())?;
+                // Resolved BEFORE the read so the DATA is attributed to the
+                // request this stream carried, whatever else the script has
+                // recorded since.
+                let request_index = current_request_index.ok_or_else(|| {
+                    "ReadRequestData: no recorded request for the accepted stream".to_string()
+                })?;
                 let chunk = stream
                     .recv_data()
                     .await
@@ -623,7 +635,7 @@ async fn run_h3_script(
                     bytes.extend_from_slice(&take);
                     chunk.advance(take.len());
                 }
-                record_request_body(&state, &bytes).await;
+                record_request_body(&state, request_index, &bytes).await?;
             }
             H3Step::RespondData(bytes) => {
                 let stream = response_stream
@@ -754,7 +766,10 @@ async fn run_h3_script(
     Ok(())
 }
 
-async fn record_request(state: &Arc<H3BackendState>, req: &http::Request<()>) {
+/// Record a request prelude and return its index in
+/// [`H3BackendState::requests`], so later DATA can be attributed to THIS
+/// request rather than to whichever record happens to be last.
+async fn record_request(state: &Arc<H3BackendState>, req: &http::Request<()>) -> usize {
     let mut headers = Vec::new();
     for (name, value) in req.headers() {
         if let Ok(v) = value.to_str() {
@@ -768,14 +783,28 @@ async fn record_request(state: &Arc<H3BackendState>, req: &http::Request<()>) {
         headers,
         body: Vec::new(),
     };
-    state.requests.lock().await.push(recorded);
+    let mut requests = state.requests.lock().await;
+    requests.push(recorded);
+    requests.len() - 1
 }
 
-/// Append one request DATA chunk to the most recently recorded request.
-async fn record_request_body(state: &Arc<H3BackendState>, chunk: &[u8]) {
-    if let Some(last) = state.requests.lock().await.last_mut() {
-        last.body.extend_from_slice(chunk);
-    }
+/// Append one request DATA chunk to the request recorded at `index`.
+///
+/// Keyed by index rather than `last_mut()` so a script that accepts a second
+/// stream while the first is still uploading cannot misattribute its body. An
+/// unknown index is a scaffolding bug and fails the script loudly instead of
+/// silently discarding the bytes.
+async fn record_request_body(
+    state: &Arc<H3BackendState>,
+    index: usize,
+    chunk: &[u8],
+) -> Result<(), String> {
+    let mut requests = state.requests.lock().await;
+    let recorded = requests
+        .get_mut(index)
+        .ok_or_else(|| format!("record_request_body: no recorded request at index {index}"))?;
+    recorded.body.extend_from_slice(chunk);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -138,64 +138,34 @@ where
 /// no further body bytes are needed.
 ///
 /// Prefer calling this **after** response HEADERS/DATA/trailers/FIN are
-/// written. Do **not** call it after a drain cancelled mid-`recv_data` by
-/// timeout/deadline: h3-quinn keeps the `quinn::RecvStream` inside a
-/// `ReusableBoxFuture` while `poll_data` is `Pending`, leaving the outer
-/// `Option` as `None`, and `stop_sending` would `unwrap`-abort under
-/// `panic = "abort"`. Skip this helper in that case and let
-/// `quinn::RecvStream::drop` issue `STOP_SENDING(0)` when the
-/// `RequestStream` is released.
+/// written, so the client observes the response before its request direction is
+/// halted.
 ///
-/// Safe to call after `finish()` / `send_response()` when the recv half is
-/// idle. Subsequent calls after a successful halt are ignored by quinn
-/// (`ClosedStream`).
+/// **Total, including a receive cancelled mid-poll.** A long-lived
+/// request-upload pump is routinely cancelled while a `recv_data` /
+/// `recv_trailers` future is `Pending` — that is the ordinary shape of a
+/// bidirectional RPC whose backend answers before the client half-closes. Stock
+/// `h3-quinn` 0.0.10 moves its `quinn::RecvStream` into a `ReusableBoxFuture`
+/// for the duration of such a read and leaves its own `Option` as `None`, so
+/// `stop_sending` would `unwrap`-abort the process under `panic = "abort"`;
+/// avoiding the call instead would silently downgrade the wire signal to
+/// `quinn::RecvStream::drop`'s `STOP_SENDING(0)`, which is not an HTTP/3 error
+/// code and makes clients log a spurious "Remote reset" on a *successful* RPC.
+/// The vendored `h3-quinn` patch keeps the stream owned inline so this call is
+/// correct in both states — see
+/// `docs/upstream-h3-quinn-patches/001-stop-sending-during-in-flight-read/`.
+///
+/// Safe to call after `finish()` / `send_response()`. Subsequent calls after a
+/// successful halt are ignored by quinn (`ClosedStream`).
 #[inline]
 pub(crate) fn halt_request_body<S>(stream: &mut RequestStream<S, Bytes>)
 where
     S: RecvStream,
 {
-    // stop_sending is required here: otherwise dropping an idle recv half
-    // surfaces as RESET_STREAM(0x0) on the wire and clients log
+    // stop_sending is required here: otherwise dropping the recv half surfaces
+    // as RESET_STREAM(0x0) on the wire and clients log
     // "Remote reset: 0x0" + a truncated response.
     stream.stop_sending(Code::H3_NO_ERROR);
-}
-
-/// Ownership state of a frontend request-receive half at the moment the task
-/// that was reading it stops.
-///
-/// A long-lived request-upload pump can leave its loop from several places, and
-/// only some of them leave the receive half idle. `h3-quinn` parks its
-/// `quinn::RecvStream` inside a `ReusableBoxFuture` while `poll_data` /
-/// `poll_trailers` is `Pending`, leaving its own `Option` as `None`;
-/// [`halt_request_body`] then unwraps that `None` and aborts the process under
-/// `panic = "abort"`. Tracking the state explicitly — rather than reasoning
-/// about which `break` a given exit came from — is what keeps the graceful
-/// `STOP_SENDING` on the paths that provably own an idle receive half.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum H3RequestRecvState {
-    /// No receive future is outstanding; `STOP_SENDING` is safe.
-    Idle,
-    /// A `recv_data` / `recv_trailers` future was dropped while `Pending`, so
-    /// the inner `quinn::RecvStream` is parked and must be released by `Drop`.
-    ParkedMidPoll,
-}
-
-/// [`halt_request_body`], but only when the receive half is provably idle.
-///
-/// The `ParkedMidPoll` case is not a silent no-op with a lost signal: dropping
-/// the `RequestStream` still issues `STOP_SENDING` from
-/// `quinn::RecvStream::drop`, it just carries code `0` instead of
-/// `H3_NO_ERROR`. That is strictly better than a process abort.
-#[inline]
-pub(crate) fn halt_request_body_if_idle<S>(
-    stream: &mut RequestStream<S, Bytes>,
-    state: H3RequestRecvState,
-) where
-    S: RecvStream,
-{
-    if state == H3RequestRecvState::Idle {
-        halt_request_body(stream);
-    }
 }
 
 /// Abort the response send half for a gateway-originated streaming failure.

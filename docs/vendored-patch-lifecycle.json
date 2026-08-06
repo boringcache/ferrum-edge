@@ -196,6 +196,38 @@
       ]
     },
     {
+      "id": "h3-quinn-001-stop-sending-during-in-flight-read",
+      "label": "h3-quinn stop_sending during an in-flight read",
+      "crate": "h3-quinn",
+      "vendored_version": "0.0.10",
+      "vendor_path": "vendor/h3-quinn-0.0.10-ferrum-patched",
+      "docs_path": "docs/upstream-h3-quinn-patches/001-stop-sending-during-in-flight-read/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "RecvStream parks its quinn::RecvStream inside a ReusableBoxFuture while a read is pending, so stop_sending unwraps a None and aborts exactly when a full-duplex H3 server must send STOP_SENDING(H3_NO_ERROR) after its response completes.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/h3",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "h3-quinn ships a release whose stop_sending is correct while a read is in flight.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_quinn_vendored_recv_stream_can_stop_sending_during_an_in_flight_read",
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_native_grpc_upload_pump_halts_the_frontend_receive_half_gracefully",
+        "tests/functional/scripted_backend_h3_tests.rs::h3_native_grpc_bidi_server_responds_before_client_half_close"
+      ]
+    },
+    {
       "id": "tungstenite-001-lossless-takeover",
       "label": "tungstenite lossless raw takeover",
       "crate": "tungstenite",
