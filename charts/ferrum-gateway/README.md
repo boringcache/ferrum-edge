@@ -289,6 +289,9 @@ TCPRoute and TLSRoute paths with dedicated NodePorts; `UDPRoute` is covered by
 CI Unit Tests plus a live UDP data-path integration suite — see
 [`docs/gateway_api_conformance.md`](../../docs/gateway_api_conformance.md).
 
+Gateway API `GRPCRoute` attaches to HTTP/HTTPS listeners and is release-gated by
+the upstream `GATEWAY-GRPC` profile (same doc).
+
 ## TLS material
 
 Each surface under `tls.*` (`frontend`, `admin`, `backend`, `cpGrpc`, `dpGrpc`)

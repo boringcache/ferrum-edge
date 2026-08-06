@@ -15,13 +15,13 @@ on:
         required: false
         default: v1.5.1
       conformance_profile:
-        description: Upstream Gateway API conformance profile
+        description: Upstream Gateway API conformance profiles (comma-separated)
         required: false
-        default: GATEWAY-HTTP
+        default: GATEWAY-HTTP,GATEWAY-GRPC
       supported_features:
         description: Comma-separated Gateway API conformance features
         required: false
-        default: Gateway,ReferenceGrant,HTTPRoute
+        default: Gateway,ReferenceGrant,HTTPRoute,GRPCRoute
       skip_tests:
         description: Optional space-separated upstream conformance tests to skip
         required: false
@@ -152,10 +152,10 @@ jobs:
             gateway_api_version="v1.5.1"
           fi
           if [ -z "$conformance_profile" ]; then
-            conformance_profile="GATEWAY-HTTP"
+            conformance_profile="GATEWAY-HTTP,GATEWAY-GRPC"
           fi
           if [ -z "$supported_features" ]; then
-            supported_features="Gateway,ReferenceGrant,HTTPRoute"
+            supported_features="Gateway,ReferenceGrant,HTTPRoute,GRPCRoute"
           fi
           {
             echo "gateway_api_version=$gateway_api_version"
@@ -201,8 +201,8 @@ jobs:
         run: bash scripts/gateway_api_data_plane_conformance.sh upstream
 
       - name: Run Ferrum Gateway API black-box checks
-        # HTTPRoute black-box coverage. The following dedicated step owns live
-        # TCPRoute evidence; the upstream profile remains GATEWAY-HTTP.
+        # HTTPRoute black-box coverage. The upstream suite owns live GRPCRoute
+        # evidence; the dedicated step below owns live TCPRoute evidence.
         env:
           GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
           GATEWAY_API_PROFILE: ${{ steps.inputs.outputs.conformance_profile }}

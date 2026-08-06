@@ -3,8 +3,8 @@
 Ferrum's conformance story spans two surfaces, each with its own owner doc:
 
 1. **Upstream Gateway API conformance** — the `gateway.networking.k8s.io`
-   `GatewayClass` / `Gateway` / `HTTPRoute` surface (plus watched `GRPCRoute`,
-   live black-box `TCPRoute` / `TLSRoute`, and `UDPRoute`), validated by the
+   `GatewayClass` / `Gateway` / `HTTPRoute` / `GRPCRoute` surface (plus live
+   black-box `TCPRoute` / `TLSRoute`, and `UDPRoute`), validated by the
    standalone **`Gateway API Conformance`** GitHub Actions workflow
    (`.github/workflows/gateway-api-conformance.yml`) against a real
    `kind` data plane for HTTP/TCP/TLS. `UDPRoute` is gated inside the required
@@ -35,8 +35,9 @@ citations):
   (Mondays 07:00 UTC), and manual `workflow_dispatch`. A path-filter `changes`
   job skips the heavy lab when no routing / translation / chart / image / proto
   / CI surface changed.
-- **Profile & features.** Gateway API `v1.5.1`, profile `GATEWAY-HTTP`,
-  supported features `Gateway,ReferenceGrant,HTTPRoute`, GatewayClass `ferrum`,
+- **Profile & features.** Gateway API `v1.5.1`, profiles
+  `GATEWAY-HTTP,GATEWAY-GRPC`, supported features
+  `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`, GatewayClass `ferrum`,
   controller `ferrum.io/gateway-controller`. Live `TCPRoute` and `TLSRoute`
   data-plane behavior is release-gated by Ferrum black-box checks in the same
   workflow. `UDPRoute` is release-gated by the required `Tests` aggregate

@@ -48,8 +48,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UDPRoute`s on two UDP listeners do not cross-talk, that a weighted set is
   served from its generated upstream one leg per session, and that a leg naming
   an absent `Service` is dropped rather than answered. The Gateway API
-  conformance lab does not add a UDPRoute black-box step. The upstream profile
-  stays `GATEWAY-HTTP` and no `GATEWAY-UDP` profile is claimed.
+  conformance lab does not add a UDPRoute black-box step. The upstream profiles
+  stay `GATEWAY-HTTP,GATEWAY-GRPC` and no `GATEWAY-UDP` profile is claimed.
+- Gateway API live `GATEWAY-GRPC` conformance: CI advertises
+  `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`, runs the upstream
+  `GATEWAY-HTTP,GATEWAY-GRPC` profiles against a live Ferrum listener, with
+  exact-method, header, listener-hostname, weighted-backend, and core status
+  coverage owned by the pinned upstream suite (issue #3272).
+
 - NodeWaypoint captured TCP observability now exports the bounded-cardinality
   `ferrum_mesh_bpf_accept_to_first_byte_microseconds` histogram for IPv4 and
   IPv6. SOCK_OPS timestamps passive establishment and enrolls the exact accepted
@@ -660,6 +666,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address); a distinct backend TLS SNI override is unsupported.
 
 ### Changed
+
+- Native gRPC trailers-only mapping for Ferrum-authored HTTP 404 rejects
+  (route miss, GRPCRoute `reject_unmatched`) now emits `grpc-status`
+  `UNIMPLEMENTED` (12) instead of `NOT_FOUND` (5), matching the official gRPC
+  HTTP↔status table and Gateway API `GRPCExactMethodMatching` (issue #3272).
 
 - **Breaking (native/file/xDS mesh sources only):** an omitted or explicitly
   empty `destination_rules[].export_to` is now **namespace-local**, matching the
