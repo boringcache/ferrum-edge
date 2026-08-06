@@ -105,6 +105,244 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callback-lock recursion, raced handoff, stale state, and `ktime` wrap from
   fabricating samples. The metric has fixed microsecond buckets with saturating
   count/bucket counters, drops sum overflow, and adds no per-flow labels (#3309).
+- Istio `DestinationRule.spec.exportTo` is now honored, and DestinationRules
+  are resolved by Istio's lookup hierarchy — client namespace, then target
+  service namespace, then the configured `istio_root_namespace` (issues #2465
+  and #2469). Previously `exportTo` was discarded at translation, so a rule
+  declared namespace-local with `exportTo: ["."]` could be carried to and
+  applied by a client in another namespace, silently changing that client's
+  TLS/SNI/trust, subset, timeout, pool, load-balancing, locality, and outlier
+  behaviour; and the root namespace was dropped from slice construction while
+  every remaining match was layered in lexical `(namespace, name)` order, so
+  the alphabetically last rule won and renaming a namespace could reverse the
+  result. Visibility is now evaluated during slice construction — before
+  lookup selection and before a per-node slice is serialized — and the winning
+  tier is resolved per destination there and re-applied per upstream at
+  materialization, where visibility is defensively rechecked before lookup, so
+  `(namespace, name, normalized host spelling)` order is only ever an
+  intra-tier tiebreak. The two compose in that order: `exportTo` is absolute, so
+  root-namespace fallback cannot resurrect a rule a subscriber was never
+  allowed to see. Supported values are `*`, `.`, and explicit namespace names;
+  `~`, empty entries, non-RFC-1123 namespace names, lists over 64 entries, and
+  `*` combined with an explicit namespace are rejected fail-closed
+  (Kubernetes: `FerrumAccepted=False`/`Invalid`; native/file/xDS: the config is
+  refused and the previously accepted slice stays live), with diagnostics that
+  name the field and index and never echo the operator-supplied value. Focused
+  Rust integration and Istio conformance tests verify visibility, lookup tiers,
+  hostile-input rejection/redaction, and native/xDS carrier parity, and a
+  functional suite runs the shipped `ferrum-edge` binary against a real
+  multi-namespace destination to prove the decision ON THE WIRE: a rule
+  exported only to the destination's own namespace does not change a
+  subscriber in another namespace, the same rule exported mesh-wide from the
+  root namespace does, and a client-namespace rule wins outright over visible
+  service- and root-namespace rules. The `mesh-e2e-sidecar` kind/SPIRE
+  assertions for these two rows stay `live_deferred` because Trusted Cross
+  policy forbids changing that suite's executable and configuration surfaces
+  from this change.
+
+  The target-service tier is granted only on evidence of ownership: an
+  in-cluster Service confirmed by the service inventory or pinned by a
+  `.svc`-qualified host, a short host resolved in the rule's own namespace per
+  Istio, or an external host declared by exactly one visible `ServiceEntry` —
+  in which case that ServiceEntry's namespace is the owner. When ownership
+  cannot be established — an external host with no visible ServiceEntry, a
+  wildcard host, an unconfirmed two-label host, or a host claimed by visible
+  ServiceEntries in two different namespaces — the service tier is disabled
+  for that host and only the client and root namespaces may write policy for
+  it. Ferrum never falls back to treating a rule's own declaring namespace as
+  the owner, which would let a public DestinationRule from an unrelated
+  namespace nominate itself as the service tier for an external host it does
+  not own and reach the subscriber's materialized upstreams.
+
+  Per-destination lookups do not imply per-destination application: an
+  `Upstream` has one set of slots, and every field a rule projects (load
+  balancer and hash keys, backend TLS, outlier thresholds, connection-pool
+  caps, locality, subsets) is upstream-wide. An upstream whose targets span two
+  destinations that resolve to **different** winning rules is therefore refused
+  before any upstream is mutated — merging them would let `(namespace, name,
+  host)` sort order decide which service's policy governs the other. On a live
+  data plane the slice is rejected and the last good config is retained in
+  full; at startup the config fails to load with an error naming the upstream.
+  Single-destination upstreams, multi-port upstreams, and an upstream whose
+  second destination has no visible rule of its own are unaffected.
+
+  The process-global dedup map that keeps the "multiple DestinationRules target
+  one destination" warning from becoming per-reload × per-DP spam is now
+  bounded on both axes — at most 128 client-namespace keys, each holding at
+  most 32 distinct counts. The key is the subscriber's namespace, so without a
+  key budget a churning or hostile fleet of subscriber namespaces could grow it
+  without limit. Saturation degrades toward visibility (warn every time), never
+  toward silence, and namespaces admitted before saturation keep steady-state
+  dedup.
+
+- `virtual_service_cors_policies[].export_to` is now validated with the same
+  fail-closed boundary check `DestinationRule.exportTo` and, like ServiceEntry
+  and DestinationRule visibility, is evaluated through the one shared
+  `export_visibility_admits` helper. Malformed lists (`~`, empty entries,
+  non-RFC-1123 namespace names, over-long lists, `*` mixed with an explicit
+  namespace) on a native/file/xDS source are now a config rejection instead of
+  being interpreted at evaluation time. Visibility is enforced at the SAME
+  three points a DestinationRule's is — CP slice narrowing, the xDS ECDS
+  carrier fold on the data plane, and outbound `cors` plugin synthesis on the
+  data plane — so a producer that bypasses slice admission cannot inject
+  another namespace's CORS behaviour onto a workload's outbound routes.
+
+- The mesh root namespace (`meshConfig.rootNamespace`) now rides `MeshSlice`
+  (native field plus a dedicated `IstioRootNamespaceCarrier` ECDS carrier), so
+  the data plane can distinguish an admitted root-tier DestinationRule from one
+  declared in an arbitrary namespace and **refuse** the latter at
+  materialization. This closes the reverse-translated xDS path, where
+  carrier-recovered rules never pass slice admission. Missing, empty, or
+  whitespace-only root provenance fails closed: Unscoped rules are refused,
+  independently provable client/service tiers still apply, and a legitimate
+  root-tier default is unavailable rather than guessed. Blank root carriers are
+  ignored so they cannot clear trustworthy provenance. Non-blank values are
+  now validated as lowercase RFC 1123 namespace labels at both the native/file
+  config boundary and the xDS ACK boundary; a malformed xDS value is NACKed
+  while the last accepted slice remains live, and diagnostics never echo it.
+
+- That materialization-time refusal now resolves the matched destination host's
+  owning namespace with the SAME shared helper, in the same precedence order,
+  that slice admission uses — `.svc`-qualified syntax, then an
+  inventory-confirmed two-label `name.namespace`, then the declaring
+  `ServiceEntry`. When that owner is resolved it is authoritative for the
+  service tier; an upstream container namespace cannot widen it. Upstream
+  namespace is retained only as a narrow fallback when host ownership cannot be
+  resolved (for example a ServiceEntry-derived EgressGateway upstream whose
+  external host is owned by the visible ServiceEntry). This prevents an
+  operator-authored or multi-target upstream in an unrelated namespace from
+  manufacturing service-tier policy for a host owned elsewhere.
+
+- DestinationRule lookup-tier arbitration on the data plane is now per
+  destination HOST rather than per upstream, matching Istio's per-host
+  resolution. An upstream whose targets span two services previously collapsed
+  the two independent lookups into one upstream-wide minimum, silently skipping
+  the only rule the second host had.
+
+- xDS ACK-time carrier validation now covers every `exportTo`-bearing carrier
+  family, not just the reserved DestinationRule shape. A LEGACY (non-reserved
+  name) DestinationRule carrier — recognized by its inner `type_url`, so
+  genuinely unrelated ECDS extension configs are untouched — gets the same
+  fail-closed structural and `export_to` validation the reserved shape gets, and
+  the `VirtualServiceCorsPoliciesCarrier` entries' `export_to` lists are
+  validated at the ACK boundary too. Previously both were ACKed and normalized,
+  and a malformed value only surfaced later as a policy that was silently
+  dropped or matched nothing; now the response NACKs, the ECDS accumulator rolls
+  back, and the last accepted slice keeps serving. Rejection diagnostics name
+  the carrier field and the offending index, are capped at eight per rejected
+  carrier, and never echo the carrier-supplied value.
+
+- `exportTo` entries on the DestinationRule, ServiceEntry, and
+  VirtualService-CORS xDS carriers are canonicalized (trimmed) at decode. The
+  shared visibility evaluator deliberately never reinterprets padded input and
+  ACK-time validation checks a trimmed copy, so an un-normalized `[" beta "]`
+  was previously ACKed and then matched nothing.
+- **BREAKING (`a2a_gateway`)**: `endpoint.grpc_services` now defaults to the
+  canonical A2A 0.3 service `a2a.v1.A2AService` (package `a2a.v1`, from
+  `a2aproject/A2A` at tag `v0.3.0`) instead of A2A 1.0's
+  `lf.a2a.v1.A2AService`, and every configured entry now carries a declared
+  Agent Card wire layout (issue #3297). The default is the identity whose card
+  layout the default `endpoint.protocol_versions` (`0.3.0`) actually describes;
+  the previous pairing detected 1.0's service name while implementing 0.3's
+  payload, so canonical 0.3 traffic was missed by defaults and genuine 1.0
+  traffic was fed to a 0.3 decoder. Entries may still be plain service-name
+  strings — a published A2A name resolves to the layout the specification gives
+  it (`a2a.v1.A2AService` -> `a2a-0.3`, `lf.a2a.v1.A2AService` -> `a2a-1.0`) and
+  any custom name resolves to `none` — or the explicit
+  `{service, card_schema}` object form a custom deployment uses to declare
+  which published layout its own service serves. Declaring a `card_schema` that
+  contradicts a published A2A service name is rejected at admission; the layout
+  is a property of the protocol, not of the deployment. Detection, method
+  policy, and `a2a.*` metadata are unchanged for every schema, but Agent Card
+  protobuf rewriting is implemented only for `a2a-0.3` and fails closed with
+  `agent_card_grpc_schema_unsupported` (`a2a-1.0`) or
+  `agent_card_grpc_schema_undeclared` (`none`) before a byte of the reply is
+  decoded — a 1.0 card is never interpreted with 0.3 field numbers. Deployments
+  fronting a 1.0 or custom service should set
+  `discovery.rewrite_agent_card_urls: false` or declare
+  `card_schema: a2a-0.3`.
+- `a2a_gateway` rewrites unary gRPC Agent Card protobuf payloads (A2A 0.3.x
+  wire layout) with the same JSON-RPC endpoint URL policy as HTTP cards,
+  clears invalidated signatures, and fails closed on unsupported versions or
+  malformed/compressed frames (issue #3297). The rewritten frame is emitted
+  from its first byte through `BoundedResponseBodySink`: a bounded counting
+  pass supplies the gRPC frame prefix and every `AgentInterface` length
+  prefix, so no complete would-be replacement — and no interface submessage —
+  is ever materialised outside the reserved construction sink
+  (GHSA-pwcm-6rh8-f2gh). Only a proven-successful reply is inspected (HTTP
+  `200` plus a terminal `grpc-status` of exactly `0`, read from the merged
+  header+trailer view), so a non-OK upstream response is forwarded as written
+  instead of being mistaken for a card; refusals are trailers-only gRPC
+  `INTERNAL` under HTTP `200` with an empty body, never a synthetic 5xx or an
+  HTTP body on a native gRPC stream. The 0.3.x layout gate is positive AND
+  exact: the card must carry an explicit `protocol_version` (field 16) whose
+  value equals a configured `endpoint.protocol_versions` entry — that list has
+  no family or wildcard syntax, so `["0.3.0"]` refuses `0.3.99` — and the
+  matched version must belong to the implemented 0.3 family, so an exactly
+  configured `1.0.0` is refused too. An absent or empty `protocol_version`
+  fails closed with `unsupported_agent_card_protobuf_version` regardless of
+  configuration, because A2A renumbered `AgentCard` for 1.0 (field 3 became
+  `supported_interfaces`, `signatures` moved 17 -> 13, field 14 became
+  `icon_url`, `protocol_version` was removed) and proto3 cannot distinguish an
+  unset field from `""` — guessing would flatten each interface submessage
+  into a bare URL and re-serve the card under its now-invalid original
+  signature. All seventeen known 0.3 top-level fields are schema-validated
+  before any rewrite — the declared wire type (including a canonical `0`/`1`
+  varint for `supports_authenticated_extended_card`), at-most-once
+  multiplicity for every singular field, and UTF-8 for every known string that
+  gets re-emitted — so a malformed known field can no longer be preserved
+  verbatim beside rewritten siblings once the signature block is dropped. The
+  submessages the rewriter preserves rather than parses (`provider`,
+  `capabilities`, `security_schemes`, `security`, `skills`, `signatures`) are
+  checked for shape only and are not claimed to be deeply validated; the one
+  nested exception is every `AgentInterface`, whose `url` is required and
+  proven, because an interface without a usable URL would otherwise be the only
+  evidence a "rewritten" card advertised an endpoint at all. The protobuf
+  decoder rejects over-long / out-of-range / non-canonical varints, field
+  numbers outside `1..=2^29-1`, and unrepresentable length prefixes. Every
+  rewritable URL field must parse as a bounded absolute `http`/`https` URL with
+  a real host and no embedded credentials — a scheme prefix is not proof — and
+  anything else fails closed with
+  `agent_card_protobuf_url_layout_mismatch`. A card the plugin admitted whose
+  rewrite never reaches the client fails closed with
+  `agent_card_grpc_rewrite_not_applied`. Operators fronting a non-0.3 A2A
+  backend should set `discovery.rewrite_agent_card_urls: false`; leaving it
+  enabled refuses such cards rather than serving un-rewritten internal URLs.
+  The absolute-URL proof requires an explicit canonical authority spelling
+  before any path, query, or fragment; ambiguous recovery forms such as
+  `http:///a2a` fail closed because hostile wire input can be parsed differently
+  by downstream consumers.
+- `a2a_gateway` now enrolls in `request_deduplication` replay presentation
+  provenance, because its Agent Card rewrite is a client-facing transform that
+  a finalized replay deliberately skips (issue #3297). Every retained response
+  is stamped with a content digest of the plugin's whole accepted
+  configuration, so a change to `discovery.public_base_url`, `endpoint.path`,
+  `endpoint.agent_card_path`, `endpoint.protocol_versions`,
+  `discovery.rewrite_agent_card_urls`, or `enabled` retires representations
+  captured under the old settings instead of replaying a card that advertises
+  a superseded endpoint. The request-derived mode is the exception:
+  with `discovery.public_base_url` unset and
+  `discovery.trust_forwarded_headers` enabled, the rewritten origin comes from
+  per-request forwarded headers and from the connection's TLS SNI, neither of
+  which the deduplication fingerprint binds, so configuration admission now
+  rejects that pairing with HTTP 400 and the runtime retains and replays
+  nothing. The refusal is per instance — a configured-public-base
+  `a2a_gateway` composes with `request_deduplication` exactly as before.
+- The `a2a_gateway` gRPC Agent Card functional harness no longer converts
+  deterministic startup failures into retries or blocks without a bound
+  (issue #3297). The gateway child's stdout/stderr are captured to per-attempt
+  files, and a spawn attempt is retried ONLY when those diagnostics demonstrate
+  an address-in-use bind race — the one failure a fresh port pair can fix. A
+  config parse error, a child panic, a failed readiness/authentication check, or
+  any other deterministic fault now fails immediately with a bounded tail of the
+  child's output (the per-attempt bearer token redacted) instead of being
+  re-rolled into "did not start after 3 attempts". Every live gRPC call carries
+  a per-call timeout, and the reload poll loop hands each call the smaller of
+  that ceiling and its own remaining deadline while checking the child for death
+  on every iteration, so a wedged or dead gateway fails diagnostically rather
+  than hanging. Simultaneously-held proxy/admin port reservations and
+  owned-process readiness are unchanged, and no fixed sleep became a success
+  criterion.
 - `ai_transcript_audit` native gRPC payload capture via an explicit descriptor-based
   `grpc` enrollment block (issue #3304). Enrolled methods are framed, bounded,
   schema-decoded, and redacted under the same capture `mode` contract as HTTP;
@@ -476,7 +714,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persist a chain that only the runtime build would reject. A streaming instance
   additionally declares `enforces_finalized_request_policy()`, because its
   final request-body hook can refuse the backend-visible representation.
-- Reqwest backend TLS clients built via `use_preconfigured_tls` /
+- **Breaking (native/file/xDS mesh sources only):** an omitted or explicitly
+  empty `destination_rules[].export_to` is now **namespace-local**, matching the
+  fail-closed-by-omission convention `ServiceEntry.export_to` and
+  `virtual_service_cors_policies[].export_to` already use. Add
+  `export_to: ["*"]` to any native, file, or carrier-authored DestinationRule
+  that must stay visible outside its own namespace. Kubernetes translation is
+  unaffected: an omitted or empty `spec.exportTo` is materialized as an explicit
+  `["*"]`, preserving Istio's public default.
+- DestinationRules declared outside the client namespace, the target service's
+  namespace, and the configured `istio_root_namespace` are no longer admitted
+  to a subscriber's slice at all, and DestinationRules in the configured root
+  namespace are now admitted (they previously were not).
+ - Reqwest backend TLS clients built via `use_preconfigured_tls` /
   `BackendTlsConfigBuilder::build_rustls_for_reqwest` now advertise ALPN
   `[h2, http/1.1]` unless the proxy forces HTTP/1.1 (`h2UpgradePolicy:
   DO_NOT_UPGRADE` or `pool_enable_http2: false`). Previously the

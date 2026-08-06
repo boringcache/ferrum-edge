@@ -1992,6 +1992,59 @@ impl BoundedResponseBodyConstruction {
     }
 }
 
+/// Lifecycle of a unary gRPC Agent Card rewrite `a2a_gateway` claimed on the
+/// response path (issue #3297).
+///
+/// The point of a typed state rather than a bare error slot is that "the
+/// transform reported success", "the transform refused", and "the transform
+/// never ran" are three different facts, and only the first may publish the
+/// backend's frame. `on_response_body` admits a card by setting `Staged`; the
+/// transform phase must replace it; `on_final_response_body` refuses anything
+/// still `Staged`.
+///
+/// Kept private to the crate and out of metadata: a plugin-writable marker could
+/// otherwise suppress the fail-closed terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum A2aGrpcCardRewriteState {
+    /// Admitted in `on_response_body`; the transform phase has not reported.
+    Staged,
+    /// The transform phase completed — the frame was rewritten, or provably
+    /// needed no rewrite.
+    Applied,
+    /// The transform phase refused with this fixed diagnostic.
+    Failed(&'static str),
+    /// The rewrite did not fit the per-response retained ceiling. The shared
+    /// capacity terminal owns the client-visible outcome.
+    CapacityRefused,
+}
+
+/// The `AgentCard` protobuf wire layout the gRPC service a request was detected
+/// on is declared to carry (issue #3297).
+///
+/// A gRPC service NAME and an `AgentCard` wire LAYOUT are two different facts,
+/// and the A2A project has already published two of each: v0.3 defines package
+/// `a2a.v1` (service `a2a.v1.A2AService`) with `AgentCard` fields 1..17, while
+/// A2A 1.0 defines package `lf.a2a.v1` (service `lf.a2a.v1.A2AService`) with a
+/// RENUMBERED `AgentCard`. Nothing on the wire of a unary reply distinguishes
+/// them reliably, so the layout is resolved from the configured service entry
+/// rather than guessed from the bytes — `a2a_gateway`'s protobuf rewriter
+/// implements the 0.3 layout only, and every other value refuses.
+///
+/// Kept out of metadata for the same reason as [`A2aGrpcCardRewriteState`]: a
+/// plugin-writable marker could otherwise select a decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum A2aGrpcCardSchema {
+    /// Official A2A 0.3.x `AgentCard` layout (`a2a.v1` package). The only
+    /// layout this gateway decodes and rewrites.
+    A2a03,
+    /// A2A 1.0 `AgentCard` layout (`lf.a2a.v1` package). Recognized so 1.0
+    /// traffic can be detected and policed, never decoded as 0.3.
+    A2a10,
+    /// The configured service declares no Agent Card layout. Detection, method
+    /// policy, and metadata still apply; card rewriting fails closed.
+    Undeclared,
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -2622,6 +2675,16 @@ pub struct RequestContext {
     pub(crate) a2a_gateway_binding: Option<&'static str>,
     pub(crate) a2a_gateway_is_agent_card: bool,
     pub(crate) a2a_gateway_streaming: bool,
+    /// `AgentCard` wire layout the matched gRPC service is CONFIGURED to carry,
+    /// resolved once at detection so the response path never re-derives a
+    /// service identity from a `ctx.path` a route override may have rebased —
+    /// see [`A2aGrpcCardSchema`].
+    pub(crate) a2a_gateway_grpc_card_schema: Option<A2aGrpcCardSchema>,
+    /// Lifecycle of a unary gRPC Agent Card rewrite `a2a_gateway` admitted in
+    /// `on_response_body`. Consumed by `on_final_response_body`, which fails
+    /// closed unless the transform phase reported a completed outcome — see
+    /// [`A2aGrpcCardRewriteState`].
+    pub(crate) a2a_gateway_grpc_card_rewrite: Option<A2aGrpcCardRewriteState>,
     /// Exact upstream/public resource URI pair used to route an MCP
     /// `resources/read` request. Kept out of public metadata so upstream URI
     /// details cannot enter transaction logs, while the response hook can
@@ -3147,6 +3210,8 @@ impl RequestContext {
             a2a_gateway_binding: None,
             a2a_gateway_is_agent_card: false,
             a2a_gateway_streaming: false,
+            a2a_gateway_grpc_card_schema: None,
+            a2a_gateway_grpc_card_rewrite: None,
             mcp_response_resource_binding: None,
             mcp_trusted_tool_name_rewrite: None,
             mcp_validate_tool_result: None,
@@ -4256,6 +4321,8 @@ impl RequestContext {
             a2a_gateway_binding: self.a2a_gateway_binding,
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
             a2a_gateway_streaming: self.a2a_gateway_streaming,
+            a2a_gateway_grpc_card_schema: self.a2a_gateway_grpc_card_schema,
+            a2a_gateway_grpc_card_rewrite: None,
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
             mcp_validate_tool_result: self.mcp_validate_tool_result.clone(),
@@ -7357,7 +7424,7 @@ pub mod priority {
     /// overrides after generic admission/auth plugins but before final dispatch.
     pub const MCP_GATEWAY: u16 = 2992;
     /// `a2a_gateway`: detects A2A HTTP/REST/gRPC traffic, applies lightweight
-    /// method policy, rewrites HTTP Agent Cards, and emits `a2a.*` metadata.
+    /// method policy, rewrites HTTP and gRPC Agent Cards, and emits `a2a.*` metadata.
     pub const A2A_GATEWAY: u16 = 2993;
     /// `mesh_route_dispatch`: rewrites `route_override_*` on `RequestContext`
     /// based on Istio VirtualService method/header/query-param predicates.
@@ -8251,6 +8318,24 @@ pub trait Plugin: Send + Sync {
     /// rule. Enrolled `Static`: `response_transformer`, `sse` — both rewrite
     /// bodies purely from accepted configuration and hold no interior mutable
     /// presentation state. Enrolled `Dynamic`: `mcp_gateway`.
+    ///
+    /// `a2a_gateway` is enrolled in **both** arms, chosen per instance from its
+    /// accepted configuration. Its Agent Card rewrite is `Static` — a digest of
+    /// the whole accepted config, covering `discovery.public_base_url`,
+    /// `endpoint.path`, `endpoint.agent_card_path`,
+    /// `endpoint.protocol_versions`, and `discovery.rewrite_agent_card_urls` —
+    /// whenever a public base is configured, which is also the only arm that can
+    /// be composed with `request_deduplication`. With no configured base and
+    /// `discovery.trust_forwarded_headers` enabled it reports `Dynamic`: the
+    /// rewritten origin is then shaped by `X-Forwarded-*` / `Host` *and* by
+    /// whether the connection carried a TLS SNI hostname
+    /// (`RequestContext::frontend_sni_hostname`), and the deduplication
+    /// fingerprint binds neither, so no construction-time digest describes what
+    /// a replayed card would have advertised. Admission refuses that pairing
+    /// per instance
+    /// (`request_deduplication::CONDITIONALLY_DYNAMIC_RESPONSE_PRESENTATION_PLUGINS`),
+    /// leaving configured-public-base deployments replaying normally.
+    ///
     /// Deliberately not enrolled, and why the skip drops no live decision:
     ///
     /// - `compression` — content coding, not presentation. A replay is

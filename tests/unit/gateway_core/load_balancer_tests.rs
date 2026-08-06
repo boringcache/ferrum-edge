@@ -1137,6 +1137,14 @@ fn test_hash_on_strategy_parse_header() {
     // Empty header name falls back to IP
     assert_eq!(HashOnStrategy::parse(Some("header:")), HashOnStrategy::Ip);
     assert_eq!(HashOnStrategy::parse(Some("header:  ")), HashOnStrategy::Ip);
+    assert_eq!(
+        HashOnStrategy::parse(Some("header:x name")),
+        HashOnStrategy::Ip
+    );
+    assert_eq!(
+        HashOnStrategy::parse(Some("header:x:name")),
+        HashOnStrategy::Ip
+    );
 }
 
 #[test]
@@ -1151,6 +1159,14 @@ fn test_hash_on_strategy_parse_cookie() {
     );
     // Empty cookie name falls back to IP
     assert_eq!(HashOnStrategy::parse(Some("cookie:")), HashOnStrategy::Ip);
+    assert_eq!(
+        HashOnStrategy::parse(Some("cookie:sid; Secure")),
+        HashOnStrategy::Ip
+    );
+    assert_eq!(
+        HashOnStrategy::parse(Some("cookie:sid=other")),
+        HashOnStrategy::Ip
+    );
 }
 
 #[test]

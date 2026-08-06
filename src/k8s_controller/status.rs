@@ -11,8 +11,9 @@ use crate::config::types::GatewayConfig;
 use crate::config_sources::k8s::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiMaterializedRouteParent, GatewayApiRouteConflict,
     GatewayApiRouteConflictKey, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation,
-    K8sTranslationOptions, gateway_api_route_conflict_keys_with_acc,
-    gateway_api_status_conflict_context, namespace_selector_matches,
+    K8sTranslationOptions, backend_lb_policy_conflict_losers, backend_lb_policy_status,
+    gateway_api_route_conflict_keys_with_acc, gateway_api_status_conflict_context,
+    merge_backend_lb_policy_status, namespace_selector_matches,
     parse_gateway_listener_allowed_route_namespaces, parse_reference_grant_permissions,
     secret_object_is_valid_tls_certificate, translate_k8s_objects_collecting_skips,
     validate_gateway_listener_allowed_routes,
@@ -561,6 +562,7 @@ pub fn plan_gateway_api_status_updates_budgeted(
 ) -> GatewayApiStatusPlanOutcome {
     let indexes = GatewayApiStatusIndexes::build(objects, route_conflicts);
     let conflict_context = gateway_api_status_conflict_context(objects, options.clone());
+    let backend_lb_conflict_losers = backend_lb_policy_conflict_losers(objects, &options);
 
     let owned_reuse;
     let reuse = match translation_reuse {
@@ -642,6 +644,7 @@ pub fn plan_gateway_api_status_updates_budgeted(
                 route_conflicts: &object_conflicts,
                 route_keys: &route_keys,
                 managed_parent_refs: &managed_parent_refs,
+                backend_lb_conflict_losers: &backend_lb_conflict_losers,
             },
         );
         if status == object.status {
@@ -678,6 +681,7 @@ struct DesiredStatusForObject<'a> {
     route_conflicts: &'a [&'a GatewayApiRouteConflict],
     route_keys: &'a [GatewayApiRouteConflictKey],
     managed_parent_refs: &'a [&'a Value],
+    backend_lb_conflict_losers: &'a HashSet<K8sResourceKey>,
 }
 
 fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_>) -> Value {
@@ -700,6 +704,12 @@ fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_
             ctx.route_conflicts,
             ctx.route_keys,
         ),
+        "BackendLBPolicy" | "XBackendTrafficPolicy" => {
+            let conflicted = ctx
+                .backend_lb_conflict_losers
+                .contains(&K8sResourceKey::from_object(object));
+            backend_lb_policy_status(object, conflicted)
+        }
         _ => Value::Object(Default::default()),
     }
 }
@@ -1142,6 +1152,8 @@ fn gateway_listener_statuses(
             };
             let accepted_message = if !gateway_accepted {
                 "Ferrum rejected this Gateway"
+            } else if !listener_protocol_mode_is_supported(listener) {
+                "Ferrum supports protocol TLS only with spec.listeners[].tls.mode=Passthrough"
             } else if !route_kinds.protocol_supported {
                 "Ferrum does not support this listener protocol"
             } else {
@@ -1241,6 +1253,13 @@ fn existing_listener_status<'a>(gateway: &'a K8sObject, listener_name: &str) -> 
 }
 
 fn listener_route_kind_status(protocol: &str, listener: &Value) -> ListenerRouteKindStatus {
+    if !listener_protocol_mode_is_supported(listener) {
+        return ListenerRouteKindStatus {
+            protocol_supported: false,
+            route_kinds_valid: false,
+            supported_kinds: Vec::new(),
+        };
+    }
     let protocol_kinds = listener_protocol_route_kinds(protocol);
     if protocol_kinds.is_empty() {
         return ListenerRouteKindStatus {
@@ -1344,6 +1363,9 @@ fn attached_route_count(
 }
 
 fn route_kind_allowed_by_listener(route: &K8sObject, listener: &Value) -> bool {
+    if !listener_protocol_mode_is_supported(listener) {
+        return false;
+    }
     let protocol_kinds = listener_protocol_route_kinds(
         listener
             .get("protocol")
@@ -1366,6 +1388,19 @@ fn route_kind_allowed_by_listener(route: &K8sObject, listener: &Value) -> bool {
     kinds
         .iter()
         .any(|kind| listener_allowed_route_kind(kind, &protocol_kinds) == Some(route.kind.as_str()))
+}
+
+fn listener_protocol_mode_is_supported(listener: &Value) -> bool {
+    let is_tls = listener
+        .get("protocol")
+        .and_then(Value::as_str)
+        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("TLS"));
+    !is_tls
+        || listener
+            .get("tls")
+            .and_then(|tls| tls.get("mode"))
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("Passthrough"))
 }
 
 fn route_allowed_by_listener(
@@ -1822,6 +1857,17 @@ fn gateway_status_apply_patch_for_update(
                 }
             }
         }
+        "BackendLBPolicy" | "XBackendTrafficPolicy" => {
+            // `status.ancestors` is shared across implementations and applied as
+            // one atomic array, so the document must carry foreign ancestors
+            // from the FRESHLY read live status or SSA erases them. The merge is
+            // idempotent, so re-merging the planner's already-merged snapshot
+            // cannot duplicate an entry.
+            status_patch = merge_backend_lb_policy_status(&update.status, live_status)
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+        }
         _ => {
             status_patch = update.status.as_object().cloned().unwrap_or_default();
         }
@@ -2201,6 +2247,7 @@ fn status_candidate_is_eligible(object: &K8sObject, indexes: &GatewayApiStatusIn
             route_has_managed_parent_ref_indexed(object, indexes)
                 || has_ferrum_parent_status(&object.status)
         }
+        "BackendLBPolicy" | "XBackendTrafficPolicy" => true,
         _ => false,
     }
 }
@@ -2656,7 +2703,14 @@ fn error_is_parent_ref_no_matching(error: &K8sTranslateError) -> bool {
 fn is_status_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "GatewayClass" | "Gateway" | "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
+        "GatewayClass"
+            | "Gateway"
+            | "HTTPRoute"
+            | "GRPCRoute"
+            | "TCPRoute"
+            | "TLSRoute"
+            | "BackendLBPolicy"
+            | "XBackendTrafficPolicy"
     )
 }
 
@@ -2669,6 +2723,8 @@ fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResourc
         ("GRPCRoute", "v1") => "grpcroutes",
         ("TCPRoute", "v1alpha2") => "tcproutes",
         ("TLSRoute", "v1alpha2") => "tlsroutes",
+        ("BackendLBPolicy", "v1alpha2") => "backendlbpolicies",
+        ("XBackendTrafficPolicy", "v1alpha1") => "xbackendtrafficpolicies",
         _ => return None,
     };
 
@@ -3603,6 +3659,61 @@ mod tests {
             Some("InvalidCertificateRef")
         );
         assert_condition(conditions, "Programmed", "False");
+    }
+
+    #[test]
+    fn tls_terminate_listener_and_tlsroute_are_rejected_fail_closed() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls-terminate",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Terminate"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TLSRoute",
+            "db",
+            json!({
+                "parentRefs": [{"name": "edge", "sectionName": "tls-terminate"}],
+                "hostnames": ["db.example.com"],
+                "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
+            }),
+        );
+
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let listener = listener_status_by_name(
+            gateway_update.status["listeners"].as_array().unwrap(),
+            "tls-terminate",
+        );
+        assert_eq!(listener["attachedRoutes"].as_u64(), Some(0));
+        let listener_conditions = listener["conditions"].as_array().unwrap();
+        assert_condition(listener_conditions, "Accepted", "False");
+        assert_eq!(
+            find_condition(listener_conditions, "Accepted")["reason"].as_str(),
+            Some("UnsupportedProtocol")
+        );
+        assert_condition(listener_conditions, "Programmed", "False");
+
+        let route_update = update_for(&updates, "TLSRoute", "db");
+        let route_conditions = route_update.status["parents"][0]["conditions"]
+            .as_array()
+            .unwrap();
+        assert_condition(route_conditions, "Accepted", "False");
+        assert_eq!(
+            find_condition(route_conditions, "Accepted")["reason"].as_str(),
+            Some("NotAllowedByListeners")
+        );
+        assert_condition(route_conditions, "Programmed", "False");
     }
 
     #[test]
@@ -4555,6 +4666,51 @@ mod tests {
         assert_eq!(
             find_condition(conditions, "Accepted")["reason"].as_str(),
             Some("Conflicted")
+        );
+    }
+
+    #[test]
+    fn backend_lb_policy_status_planning_marks_newer_challenger_conflicted() {
+        let mut older = object(
+            "BackendLBPolicy",
+            "older",
+            json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "older"}
+            }),
+        );
+        older.api_version = "gateway.networking.k8s.io/v1alpha2".to_string();
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+
+        let mut newer = object(
+            "XBackendTrafficPolicy",
+            "newer",
+            json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "newer"}
+            }),
+        );
+        newer.api_version = "gateway.networking.x-k8s.io/v1alpha1".to_string();
+        newer.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        // Reversed input order must not change which policy is Conflicted.
+        let updates = plan_status_updates(&[newer.clone(), older.clone()], options());
+        let older_update = update_for(&updates, "BackendLBPolicy", "older");
+        let newer_update = update_for(&updates, "XBackendTrafficPolicy", "newer");
+
+        let older_condition = &older_update.status["ancestors"][0]["conditions"][0];
+        assert_eq!(older_condition["status"], "True");
+        assert_eq!(older_condition["reason"], "Accepted");
+
+        let newer_condition = &newer_update.status["ancestors"][0]["conditions"][0];
+        assert_eq!(newer_condition["status"], "False");
+        assert_eq!(newer_condition["reason"], "Conflicted");
+        assert!(
+            !newer_condition["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("api"),
+            "Conflicted message must not echo the Service name"
         );
     }
 

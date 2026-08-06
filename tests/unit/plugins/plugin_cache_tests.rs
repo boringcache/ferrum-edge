@@ -298,7 +298,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
             "endpoint": {
                 "path": "/a2a",
                 "agent_card_path": "/.well-known/agent-card.json",
-                "grpc_services": ["lf.a2a.v1.A2AService"]
+                "grpc_services": ["a2a.v1.A2AService"]
             }
         }),
         "ai_semantic_firewall" => json!({
