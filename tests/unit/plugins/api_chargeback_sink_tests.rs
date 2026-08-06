@@ -20,10 +20,11 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     pin_dead_letter_claim_identity_for_tests, probe_charge_body_materialization_for_tests,
     probe_charge_body_materialization_with_projection_for_tests,
     probe_compact_recovery_retry_for_tests, probe_dead_letter_handoff_interference_for_tests,
-    probe_empty_dead_letter_publish_for_tests,
+    probe_dead_letter_source_credit_bytes_for_tests, probe_empty_dead_letter_publish_for_tests,
     probe_empty_dead_letter_publish_with_identity_for_tests,
     probe_shared_spool_batch_clone_for_tests, probe_streaming_replay_batch_range_errors_for_tests,
-    probe_streaming_spool_reader_defensive_paths_for_tests, publish_dead_letter_payload_for_tests,
+    probe_streaming_spool_reader_defensive_paths_for_tests,
+    publish_dead_letter_payload_for_claim_for_tests, publish_dead_letter_payload_for_tests,
     publish_dead_letter_payload_replacing_prior_for_tests,
     publish_dead_letter_payload_with_identity_for_tests, reconcile_active_spool_usage_for_tests,
     render_prometheus, render_status_json, replay_spool_once_for_tests,
@@ -3471,19 +3472,46 @@ async fn dead_letter_payload_publish_refuses_symlink_and_restores_the_source_cla
     );
 }
 
+/// A compressed source cannot expand its uncompressed rejected copy past the
+/// hard on-disk quota, even with the namespace-wide source credit applied.
+///
+/// The credit only ever covers the bytes the terminal claim removal will free —
+/// here the *compressed* artifact — so a zstd source whose plaintext rows are
+/// larger than `spool.max_bytes + compressed_len` is still refused, and refused
+/// before the first rejected byte reaches the payload temp.
 #[tokio::test]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn dead_letter_payload_admits_each_append_before_exceeding_spool_quota() {
     let server = MockServer::start().await;
-    mount_status_sequence(&server, &[400]).await;
+    mount_rejecting_body_marker(&server, "evt-dead-letter-quota", 400).await;
 
-    let event = sample_event("evt-dead-letter-quota");
-    let encoded = serialize_json_each_row(std::slice::from_ref(&event)).unwrap();
-    let max_bytes = encoded.len() as u64;
+    let events: Vec<ChargeEvent> = (0..16)
+        .map(|index| sample_event(&format!("evt-dead-letter-quota-{index:02}")))
+        .collect();
+    let encoded = serialize_json_each_row(&events).unwrap();
+    // One byte below the uncompressed rejected copy: the compressed source's own
+    // credit is not enough to admit its plaintext expansion.
+    let max_bytes = encoded.len() as u64 - 1;
     let temp = tempfile::tempdir().unwrap();
-    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
-    let source = spool.write_events(&[event]).unwrap();
-    assert_eq!(fs::metadata(&source).unwrap().len(), max_bytes);
+    let spool = SpoolManager::for_tests(
+        SpoolSettings {
+            enabled: true,
+            dir: temp.path().to_path_buf(),
+            max_bytes,
+            replay_interval_secs: 60,
+            delivery_queue_capacity: 4096,
+            compression: SpoolCompression::Zstd,
+        },
+        "node-a",
+    )
+    .unwrap();
+    let source = spool.write_events(&events).unwrap();
+    let compressed_len = fs::metadata(&source).unwrap().len();
+    assert!(
+        compressed_len < max_bytes,
+        "the compressed source must fit the quota it is being replayed under: \
+         {compressed_len} >= {max_bytes}"
+    );
     let namespace_root = spool.namespace_root_for_tests().to_path_buf();
     let source_parent = source.parent().unwrap().to_path_buf();
     let payload_name = dead_letter_payload_path(&source)
@@ -3540,6 +3568,976 @@ async fn dead_letter_payload_admits_each_append_before_exceeding_spool_quota() {
         observed_temp_bytes.load(Ordering::SeqCst),
         0,
         "quota admission must run before the first rejected payload byte is written"
+    );
+}
+
+/// Plant one owner-tagged replayable artifact with exact bytes.
+fn plant_owned_spool_source(spool: &SpoolManager, ulid: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let path = day.join(owned_data_name(ulid));
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// A JSONEachRow-shaped row padded to `len` bytes.
+fn padded_dead_letter_row(id: &str, len: usize) -> Vec<u8> {
+    let prefix = format!("{{\"event_id\":\"{id}\",\"pad\":\"");
+    let suffix = "\"}";
+    let pad = len.saturating_sub(prefix.len() + suffix.len());
+    format!("{prefix}{}{suffix}", "p".repeat(pad)).into_bytes()
+}
+
+/// The head-of-line starvation this reservation exists to fix (issue #3583).
+///
+/// The authoritative source is 80% of `spool.max_bytes`, so it and its
+/// uncompressed rejected copy cannot coexist under the plain ceiling. The
+/// namespace-wide credit for the bytes the terminal claim removal will free lets
+/// the handoff complete, consumes the source, and leaves the namespace inside
+/// the documented steady-state quota — after which later replay work drains
+/// instead of being blocked behind the oversized artifact forever.
+#[tokio::test]
+async fn dead_letter_handoff_completes_for_a_source_above_half_the_spool_quota() {
+    let server = MockServer::start().await;
+    mount_rejecting_body_marker(&server, "evt-dl-oversized", 400).await;
+
+    let events: Vec<ChargeEvent> = (0..24)
+        .map(|index| sample_event(&format!("evt-dl-oversized-{index:02}")))
+        .collect();
+    let encoded = serialize_json_each_row(&events).unwrap();
+    let source_len = encoded.len() as u64;
+    let max_bytes = source_len + source_len / 4;
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = spool.write_events(&events).unwrap();
+    assert_eq!(fs::metadata(&source).unwrap().len(), source_len);
+    assert!(
+        source_len.saturating_mul(2) > max_bytes,
+        "the source must exceed half the spool quota for this regression to bite"
+    );
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect("an oversized source must complete its dead-letter handoff");
+
+    assert_rejected_sidecar(&source, 400, "permanent_http");
+    assert_eq!(
+        fs::read(dead_letter_payload_path(&source)).unwrap(),
+        encoded.as_bytes(),
+        "the rejected copy must be the exact original rows"
+    );
+    let stats = spool.scan_stats_for_tests().unwrap();
+    assert_eq!(
+        stats.files, 2,
+        "only the rejected payload and its metadata remain: {stats:?}"
+    );
+    assert!(
+        stats.bytes <= max_bytes,
+        "the completed handoff must leave the namespace inside spool.max_bytes: {stats:?}"
+    );
+
+    // Replay is no longer head-of-line blocked behind the oversized artifact.
+    let drain_server = MockServer::start().await;
+    mount_status_sequence(&drain_server, &[]).await;
+    let later = spool
+        .write_events(&[sample_event("evt-dl-after-handoff")])
+        .unwrap();
+    replay_spool_once_for_tests(&spool, &drain_server.uri())
+        .await
+        .expect("later replay work must drain after the handoff");
+    assert!(
+        !later.exists(),
+        "the handoff must not starve subsequent replay work"
+    );
+}
+
+/// The same excursion, driven through the production claim protocol so the
+/// credit under test is the one a real claim won.
+#[test]
+fn dead_letter_source_credit_admits_a_source_above_half_the_quota() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-credit", 4096);
+    let source_bytes = row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FE1", &row);
+
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("the planted source must be claimable");
+    assert!(
+        claim.holds_source_credit_for_tests(),
+        "the only claim in this namespace must win the source credit"
+    );
+    assert_eq!(claim.source_credit_bytes_for_tests(), source_bytes);
+
+    let published = publish_dead_letter_payload_for_claim_for_tests(&spool, &claim, &row)
+        .expect("the reserved source credit must admit the rejected copy");
+
+    assert_eq!(fs::metadata(&published).unwrap().len(), source_bytes);
+    let stats = spool.scan_stats_for_tests().unwrap();
+    assert_eq!(stats.files, 2, "the claim and its rejected copy: {stats:?}");
+    assert!(
+        stats.bytes <= max_bytes.saturating_add(source_bytes),
+        "the transient peak must stay within spool.max_bytes + the one reserved source: {stats:?}"
+    );
+}
+
+/// The credit is spent only when the durable record still witnesses this exact
+/// claim, so a same-UID rewrite of that record cannot manufacture capacity.
+#[test]
+fn tampered_dead_letter_source_credit_record_grants_no_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-tampered", 4096);
+    let source_bytes = row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FE2", &row);
+
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("the planted source must be claimable");
+    assert!(claim.holds_source_credit_for_tests());
+    fs::write(
+        spool.source_credit_record_path_for_tests(),
+        br#"{"format_version":1,"claim_base":"01OTHER.node.ndjson","reserved_bytes":4096,"reserved_at_unix":1,"process_tag":"other","generation":1}"#,
+    )
+    .unwrap();
+
+    let error = publish_dead_letter_payload_for_claim_for_tests(&spool, &claim, &row)
+        .expect_err("a credit no durable record witnesses must not be spent");
+
+    assert!(
+        error.contains("cannot fit within spool.max_bytes"),
+        "unexpected quota diagnostic: {error}"
+    );
+    assert!(
+        claim.claim_path_for_tests().exists(),
+        "the authoritative claim must be untouched"
+    );
+    assert!(
+        !dead_letter_payload_path(&source).exists(),
+        "a refused handoff must publish nothing"
+    );
+    let stats = spool.scan_stats_for_tests().unwrap();
+    assert_eq!(
+        stats.files, 1,
+        "the aborted handoff must leave only the claim behind: {stats:?}"
+    );
+    assert!(stats.bytes <= max_bytes, "{stats:?}");
+}
+
+/// Holding the old inode's advisory lock is insufficient after its pathname is
+/// replaced: another manager could lock the replacement as a second credit
+/// domain. Every spend must therefore prove the pathname still names the
+/// descriptor that carries this claim's lock.
+#[cfg(unix)]
+#[test]
+fn replaced_dead_letter_source_credit_path_grants_no_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-replaced-credit", 4096);
+    let source_bytes = row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FE3", &row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("the planted source must be claimable");
+    assert!(claim.holds_source_credit_for_tests());
+
+    let credit_path = spool.source_credit_record_path_for_tests();
+    fs::remove_file(&credit_path).unwrap();
+    fs::write(&credit_path, b"replacement credit domain").unwrap();
+
+    let error = publish_dead_letter_payload_for_claim_for_tests(&spool, &claim, &row)
+        .expect_err("a replaced credit pathname must invalidate the old locked descriptor");
+    assert!(
+        error.contains("cannot fit within spool.max_bytes"),
+        "unexpected quota diagnostic: {error}"
+    );
+    assert!(claim.claim_path_for_tests().exists());
+    assert!(!dead_letter_payload_path(&source).exists());
+    assert!(spool.scan_stats_for_tests().unwrap().bytes <= max_bytes);
+}
+
+/// The credit is the number of bytes terminal source removal will actually
+/// free. If a same-UID writer changes the pinned inode's length after claim
+/// time, the stale original length must grant no capacity.
+#[test]
+fn resized_pinned_source_invalidates_dead_letter_credit() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_row = padded_dead_letter_row("dl-resized-source", 4096);
+    let source_bytes = source_row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FE4", &source_row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("the planted source must be claimable");
+    assert!(claim.holds_source_credit_for_tests());
+
+    fs::OpenOptions::new()
+        .write(true)
+        .open(claim.claim_path_for_tests())
+        .unwrap()
+        .set_len(1024)
+        .unwrap();
+    let expanded_rejection = padded_dead_letter_row("dl-resized-rejection", 7000);
+    let error =
+        publish_dead_letter_payload_for_claim_for_tests(&spool, &claim, &expanded_rejection)
+            .expect_err("a stale source length must not raise the admission ceiling");
+
+    assert!(
+        error.contains("exceeds spool.max_bytes"),
+        "unexpected quota diagnostic: {error}"
+    );
+    assert!(claim.claim_path_for_tests().exists());
+    assert!(!dead_letter_payload_path(&source).exists());
+    assert!(spool.scan_stats_for_tests().unwrap().bytes <= max_bytes);
+}
+
+/// An owner-shaped artifact planted above the configured quota was never
+/// admitted by this sink and cannot enlarge the documented two-times bound.
+#[test]
+fn source_larger_than_spool_quota_receives_no_dead_letter_credit() {
+    let temp = tempfile::tempdir().unwrap();
+    let max_bytes = 4096;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let oversized = padded_dead_letter_row("dl-over-quota-source", 8192);
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FE5", &oversized);
+
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("the planted source must remain operator-recoverable");
+
+    assert!(
+        !claim.holds_source_credit_for_tests(),
+        "an over-quota source must not manufacture a larger transient ceiling"
+    );
+    assert_eq!(claim.source_credit_bytes_for_tests(), 0);
+}
+
+/// N managers sharing one namespace cannot jointly spend source-replacement
+/// capacity: exactly one claim holds the namespace-wide credit, and the others
+/// admit against the plain ceiling and fail closed.
+#[test]
+fn independent_managers_cannot_double_spend_the_dead_letter_source_credit() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-shared-credit", 512);
+    let source_bytes = row.len() as u64;
+    // Two claims plus one rejected copy do not fit; one credited handoff does.
+    let max_bytes = source_bytes.saturating_mul(5) / 2;
+    let settings = spool_settings(temp.path(), max_bytes);
+    let ceiling = leaked_chargeback_test_ceiling(16 * 1024 * 1024);
+    let first = SpoolManager::for_tests_with_owner_faults_ages_and_ceiling(
+        settings.clone(),
+        &test_owner_spec("node-a"),
+        301,
+        SpoolFsFault::None,
+        0,
+        3_600,
+        ceiling,
+    )
+    .unwrap();
+    let second = SpoolManager::for_tests_with_owner_faults_ages_and_ceiling(
+        settings,
+        &test_owner_spec("node-a"),
+        302,
+        SpoolFsFault::None,
+        0,
+        3_600,
+        ceiling,
+    )
+    .unwrap();
+    let source_a = plant_owned_spool_source(&first, "01ARZ3NDEKTSV4RRFFQ69G5FF1", &row);
+    let source_b = plant_owned_spool_source(&first, "01ARZ3NDEKTSV4RRFFQ69G5FF2", &row);
+
+    let claim_a = first
+        .hold_replay_claim_for_tests(&source_a)
+        .unwrap()
+        .expect("first claim");
+    let claim_b = second
+        .hold_replay_claim_for_tests(&source_b)
+        .unwrap()
+        .expect("second claim");
+    assert!(
+        claim_a.holds_source_credit_for_tests(),
+        "the first claim wins the one namespace credit"
+    );
+    assert!(
+        !claim_b.holds_source_credit_for_tests(),
+        "an independent manager must not obtain a second credit for the same namespace"
+    );
+
+    publish_dead_letter_payload_for_claim_for_tests(&first, &claim_a, &row)
+        .expect("the credited handoff must complete");
+    let error = publish_dead_letter_payload_for_claim_for_tests(&second, &claim_b, &row)
+        .expect_err("an uncredited concurrent handoff must fail closed");
+
+    assert!(
+        error.contains("cannot fit within spool.max_bytes"),
+        "unexpected quota diagnostic: {error}"
+    );
+    assert!(claim_a.claim_path_for_tests().exists());
+    assert!(claim_b.claim_path_for_tests().exists());
+    let stats = first.scan_stats_for_tests().unwrap();
+    assert_eq!(
+        stats.files, 3,
+        "two claims plus one rejected copy remain: {stats:?}"
+    );
+    assert!(
+        stats.bytes <= max_bytes.saturating_add(source_bytes),
+        "the peak must not grow with the number of concurrent handoffs: {stats:?}"
+    );
+    assert_eq!(ceiling.used(), 0);
+}
+
+/// Dropping a claim — an aborted tick, a released claim, a panicking handoff —
+/// returns the credit immediately. No lease horizon, no leaked capacity.
+#[test]
+fn dropping_a_claim_releases_the_dead_letter_source_credit() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-release", 512);
+    let source_bytes = row.len() as u64;
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let first =
+        SpoolManager::for_tests_with_owner(settings.clone(), &test_owner_spec("node-a"), 311)
+            .unwrap();
+    let second =
+        SpoolManager::for_tests_with_owner(settings, &test_owner_spec("node-a"), 312).unwrap();
+    let source_a = plant_owned_spool_source(&first, "01ARZ3NDEKTSV4RRFFQ69G5FH1", &row);
+    let source_b = plant_owned_spool_source(&first, "01ARZ3NDEKTSV4RRFFQ69G5FH2", &row);
+    let source_c = plant_owned_spool_source(&first, "01ARZ3NDEKTSV4RRFFQ69G5FH3", &row);
+
+    let claim_a = first
+        .hold_replay_claim_for_tests(&source_a)
+        .unwrap()
+        .expect("first claim");
+    let claim_b = second
+        .hold_replay_claim_for_tests(&source_b)
+        .unwrap()
+        .expect("second claim");
+    assert!(claim_a.holds_source_credit_for_tests());
+    assert!(!claim_b.holds_source_credit_for_tests());
+
+    drop(claim_a);
+
+    let claim_c = second
+        .hold_replay_claim_for_tests(&source_c)
+        .unwrap()
+        .expect("third claim");
+    assert!(
+        claim_c.holds_source_credit_for_tests(),
+        "an abandoned handoff must not leak the namespace credit"
+    );
+    assert_eq!(claim_c.source_credit_bytes_for_tests(), source_bytes);
+}
+
+/// A crashed handoff leaves its durable record behind with no OS lock. The
+/// capacity is already free — only the lock holder ever reads the record, and it
+/// rewrites it before spending — and restart reconciles the stale body so the
+/// state an operator inspects matches.
+#[test]
+fn stale_dead_letter_source_credit_record_is_reconciled_on_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let crashed =
+        SpoolManager::for_tests_with_owner(settings.clone(), &test_owner_spec("node-a"), 401)
+            .unwrap();
+    let credit_path = crashed.source_credit_record_path_for_tests();
+    fs::write(
+        &credit_path,
+        br#"{"format_version":1,"claim_base":"01CRASHED.node.ndjson","reserved_bytes":999999999,"reserved_at_unix":1,"process_tag":"crashed","generation":1}"#,
+    )
+    .unwrap();
+    drop(crashed);
+
+    let restarted = SpoolManager::for_tests_with_owner(settings, &test_owner_spec("node-a"), 402)
+        .expect("restart must reconstruct from on-disk state");
+
+    assert_eq!(
+        fs::metadata(&credit_path).unwrap().len(),
+        0,
+        "restart must clear a crashed handoff's stale credit record"
+    );
+    let row = padded_dead_letter_row("dl-restart", 512);
+    let source = plant_owned_spool_source(&restarted, "01ARZ3NDEKTSV4RRFFQ69G5FJ1", &row);
+    let claim = restarted
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim after restart");
+    assert!(
+        claim.holds_source_credit_for_tests(),
+        "a crashed handoff must not permanently withhold namespace capacity"
+    );
+    assert_eq!(claim.source_credit_bytes_for_tests(), row.len() as u64);
+    let record: Value = serde_json::from_slice(&fs::read(&credit_path).unwrap()).unwrap();
+    assert_eq!(record["reserved_bytes"].as_u64().unwrap(), row.len() as u64);
+    assert_eq!(
+        record["claim_base"].as_str().unwrap(),
+        source.file_name().unwrap().to_str().unwrap(),
+        "the durable record must name the claim it credits"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_dead_letter_source_credit_record_refuses_spool_prepare() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let first =
+        SpoolManager::for_tests_with_owner(settings.clone(), &test_owner_spec("node-a"), 411)
+            .unwrap();
+    let credit_path = first.source_credit_record_path_for_tests();
+    let outside = temp.path().join("outside-credit-target");
+    fs::write(&outside, b"do-not-touch").unwrap();
+    fs::remove_file(&credit_path).unwrap();
+    symlink(&outside, &credit_path).unwrap();
+
+    let error = SpoolManager::for_tests_with_owner(settings, &test_owner_spec("node-a"), 412)
+        .err()
+        .expect("a symlinked credit record must fail closed");
+
+    assert!(
+        error.contains("symlinked spool path"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"do-not-touch");
+}
+
+#[cfg(unix)]
+#[test]
+fn hard_linked_dead_letter_source_credit_record_refuses_spool_prepare() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let first =
+        SpoolManager::for_tests_with_owner(settings.clone(), &test_owner_spec("node-a"), 421)
+            .unwrap();
+    let credit_path = first.source_credit_record_path_for_tests();
+    let alias = first
+        .namespace_root_for_tests()
+        .join("dead-letter-credit-alias");
+    fs::hard_link(&credit_path, &alias).unwrap();
+
+    let error = SpoolManager::for_tests_with_owner(settings, &test_owner_spec("node-a"), 422)
+        .err()
+        .expect("a hard-linked credit record must fail closed");
+
+    assert!(error.contains("hard link"), "unexpected error: {error}");
+}
+
+/// A same-UID chmod of the durable credit record must not leave it world-readable:
+/// the next open re-proves and repairs the mode before any spend.
+#[cfg(unix)]
+#[test]
+fn dead_letter_source_credit_record_repairs_insecure_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-credit-mode", 512);
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a").unwrap();
+    let credit_path = spool.source_credit_record_path_for_tests();
+    let mut perms = fs::metadata(&credit_path).unwrap().permissions();
+    perms.set_mode(0o644);
+    fs::set_permissions(&credit_path, perms).unwrap();
+
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FM1", &row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("an insecure but otherwise valid credit record must be repaired and claimable");
+    assert!(claim.holds_source_credit_for_tests());
+    assert_eq!(
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
+        row.len() as u64,
+        "a repaired credit record must still spend for its live claim"
+    );
+    let repaired = fs::metadata(&credit_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        repaired, 0o600,
+        "claim must restore private credit-record mode"
+    );
+}
+
+/// A directory planted as the credit record is substitution of shared coordination
+/// state and must refuse prepare closed — never become a second lock domain.
+#[cfg(unix)]
+#[test]
+fn directory_dead_letter_source_credit_record_refuses_spool_prepare() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let first =
+        SpoolManager::for_tests_with_owner(settings.clone(), &test_owner_spec("node-a"), 431)
+            .unwrap();
+    let credit_path = first.source_credit_record_path_for_tests();
+    fs::remove_file(&credit_path).unwrap();
+    fs::create_dir(&credit_path).unwrap();
+    drop(first);
+
+    let error = SpoolManager::for_tests_with_owner(settings, &test_owner_spec("node-a"), 432)
+        .err()
+        .expect("a directory credit record must fail closed");
+    assert!(
+        error.contains("securely open")
+            || error.contains("directory")
+            || error.contains("Is a directory"),
+        "unexpected directory-credit diagnostic: {error}"
+    );
+}
+
+/// A FIFO planted as the credit record must never become the namespace credit inode.
+#[cfg(unix)]
+#[test]
+fn fifo_dead_letter_source_credit_record_refuses_spool_prepare() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let namespace_root =
+        SpoolManager::namespace_root_path_for_tests(temp.path(), &test_owner_spec("node-a"))
+            .unwrap();
+    fs::create_dir_all(&namespace_root).unwrap();
+    let credit_path = namespace_root.join(".spool-dead-letter-credit");
+    let credit_c = CString::new(credit_path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(credit_c.as_ptr(), 0o600) }, 0);
+
+    let error = match SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a") {
+        Ok(_) => panic!("a FIFO must never become the dead-letter source credit record"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("not a regular file") || error.contains("securely open"),
+        "unexpected FIFO credit refusal: {error}"
+    );
+}
+
+/// A live credit holder keeps the exclusive OS lock. Restart reconcile must observe
+/// `WouldBlock`, leave that holder's durable body untouched, and still bring the
+/// peer manager up — never clear a live reservation out from under the holder.
+#[test]
+fn live_dead_letter_source_credit_blocks_reconcile_without_clearing() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-live-reconcile", 512);
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let holder =
+        SpoolManager::for_tests_with_owner(settings.clone(), &test_owner_spec("node-a"), 441)
+            .unwrap();
+    let source = plant_owned_spool_source(&holder, "01ARZ3NDEKTSV4RRFFQ69G5FM2", &row);
+    let claim = holder
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("holder claim");
+    assert!(claim.holds_source_credit_for_tests());
+    let credit_path = holder.source_credit_record_path_for_tests();
+    let before = fs::read(&credit_path).unwrap();
+    assert!(
+        !before.is_empty(),
+        "the live holder must publish a durable body"
+    );
+
+    let peer = SpoolManager::for_tests_with_owner(settings, &test_owner_spec("node-a"), 442)
+        .expect("a peer prepare must tolerate a live credit lock without failing");
+    assert_eq!(
+        fs::read(&credit_path).unwrap(),
+        before,
+        "reconcile must not clear a live holder's credit record"
+    );
+    let peer_source = plant_owned_spool_source(&peer, "01ARZ3NDEKTSV4RRFFQ69G5FM3", &row);
+    let peer_claim = peer
+        .hold_replay_claim_for_tests(&peer_source)
+        .unwrap()
+        .expect("peer claim");
+    assert!(
+        !peer_claim.holds_source_credit_for_tests(),
+        "the live holder must keep the one namespace credit"
+    );
+    assert_eq!(
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &holder,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
+        row.len() as u64,
+        "the holder must still spend its own credit after a peer prepare"
+    );
+}
+
+/// Unlinking the credit pathname drops the held inode's link count. Renaming it
+/// aside and planting a replacement keeps the locked descriptor intact while the
+/// pathname names a different coordination inode — every spend must then grant
+/// nothing, otherwise a second manager could lock the replacement as another credit.
+#[cfg(unix)]
+#[test]
+fn renamed_aside_dead_letter_source_credit_path_grants_no_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-credit-renamed", 4096);
+    let source_bytes = row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FM4", &row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim");
+    assert!(claim.holds_source_credit_for_tests());
+
+    let credit_path = spool.source_credit_record_path_for_tests();
+    let aside = spool
+        .namespace_root_for_tests()
+        .join("dead-letter-credit.aside");
+    fs::rename(&credit_path, &aside).unwrap();
+    fs::write(&credit_path, b"replacement credit domain").unwrap();
+
+    assert_eq!(
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
+        0,
+        "a replaced credit pathname must invalidate the old locked descriptor"
+    );
+    let error = publish_dead_letter_payload_for_claim_for_tests(&spool, &claim, &row)
+        .expect_err("capacity without a live coordination inode must fail closed");
+    assert!(
+        error.contains("cannot fit within spool.max_bytes"),
+        "unexpected quota diagnostic: {error}"
+    );
+    assert!(claim.claim_path_for_tests().exists());
+    assert!(!dead_letter_payload_path(&source).exists());
+    assert!(spool.scan_stats_for_tests().unwrap().bytes <= max_bytes);
+}
+
+/// After the locked inode is moved aside, a hard-linked replacement at the credit
+/// path is still shared coordination state and must grant no capacity.
+#[cfg(unix)]
+#[test]
+fn hardlinked_replacement_dead_letter_source_credit_path_grants_no_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-credit-hl-replace", 4096);
+    let source_bytes = row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FM5", &row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim");
+    assert!(claim.holds_source_credit_for_tests());
+
+    let credit_path = spool.source_credit_record_path_for_tests();
+    let aside = spool
+        .namespace_root_for_tests()
+        .join("dead-letter-credit.aside");
+    let alias = spool
+        .namespace_root_for_tests()
+        .join("dead-letter-credit.alias");
+    fs::rename(&credit_path, &aside).unwrap();
+    fs::write(&credit_path, b"shared replacement").unwrap();
+    fs::hard_link(&credit_path, &alias).unwrap();
+
+    assert_eq!(
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
+        0,
+        "a hard-linked replacement credit path must grant no capacity"
+    );
+    assert!(claim.holds_source_credit_for_tests());
+    assert!(claim.claim_path_for_tests().exists());
+}
+
+/// A directory planted at the credit pathname after the locked inode is moved
+/// aside must fail the path-vs-descriptor proof closed.
+#[cfg(unix)]
+#[test]
+fn directory_replacement_dead_letter_source_credit_path_grants_no_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-credit-dir-replace", 4096);
+    let source_bytes = row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FM6", &row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim");
+    assert!(claim.holds_source_credit_for_tests());
+
+    let credit_path = spool.source_credit_record_path_for_tests();
+    let aside = spool
+        .namespace_root_for_tests()
+        .join("dead-letter-credit.aside");
+    fs::rename(&credit_path, &aside).unwrap();
+    fs::create_dir(&credit_path).unwrap();
+
+    assert_eq!(
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
+        0,
+        "a directory at the credit pathname must grant no capacity"
+    );
+}
+
+/// Removing the credit pathname entirely (no replacement) must also fail the
+/// path proof: the locked descriptor alone is not enough to spend.
+#[cfg(unix)]
+#[test]
+fn missing_dead_letter_source_credit_path_grants_no_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-credit-missing-path", 4096);
+    let source_bytes = row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FM7", &row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim");
+    assert!(claim.holds_source_credit_for_tests());
+
+    let credit_path = spool.source_credit_record_path_for_tests();
+    let aside = spool
+        .namespace_root_for_tests()
+        .join("dead-letter-credit.aside");
+    fs::rename(&credit_path, &aside).unwrap();
+
+    assert_eq!(
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
+        0,
+        "a missing credit pathname must grant no capacity"
+    );
+}
+
+/// Same-UID rewrite of the locked credit inode's body past the hard bound must
+/// not manufacture capacity: spend re-reads through the descriptor and refuses.
+#[test]
+fn oversized_dead_letter_source_credit_record_grants_no_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-credit-oversized", 4096);
+    let source_bytes = row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FM8", &row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim");
+    assert!(claim.holds_source_credit_for_tests());
+
+    // 1 KiB is the durable hard bound; one extra byte forces the descriptor read
+    // to refuse before JSON parsing can invent a larger reservation.
+    let oversized = vec![b'x'; 1025];
+    fs::write(spool.source_credit_record_path_for_tests(), &oversized).unwrap();
+
+    assert_eq!(
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
+        0,
+        "an over-bound credit body must grant no capacity"
+    );
+    let error = publish_dead_letter_payload_for_claim_for_tests(&spool, &claim, &row)
+        .expect_err("oversized credit body must not admit the rejected copy");
+    assert!(
+        error.contains("cannot fit within spool.max_bytes"),
+        "unexpected quota diagnostic: {error}"
+    );
+    assert!(claim.claim_path_for_tests().exists());
+    assert!(!dead_letter_payload_path(&source).exists());
+    assert!(spool.scan_stats_for_tests().unwrap().bytes <= max_bytes);
+}
+
+/// Corrupt JSON through the locked inode must fail closed the same way: capacity
+/// requires a format-versioned witness, not merely an exclusive lock.
+#[test]
+fn invalid_json_dead_letter_source_credit_record_grants_no_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-credit-bad-json", 4096);
+    let source_bytes = row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FM9", &row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim");
+    assert!(claim.holds_source_credit_for_tests());
+
+    fs::write(
+        spool.source_credit_record_path_for_tests(),
+        br#"{"format_version":1,not-json"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
+        0,
+        "an unparseable credit body must grant no capacity"
+    );
+    assert!(claim.claim_path_for_tests().exists());
+    assert!(spool.scan_stats_for_tests().unwrap().bytes <= max_bytes);
+}
+
+/// An extra hard link on the pinned source would survive terminal unlink, so the
+/// reserved length is no longer the bytes removal will free. Capacity must drop
+/// to zero even while the claim handle still holds the reservation in memory.
+#[cfg(unix)]
+#[test]
+fn hardlinked_pinned_source_grants_no_dead_letter_credit() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-hardlinked-source", 4096);
+    let source_bytes = row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FMA", &row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim");
+    assert!(claim.holds_source_credit_for_tests());
+    assert_eq!(claim.source_credit_bytes_for_tests(), source_bytes);
+
+    let alias = spool
+        .namespace_root_for_tests()
+        .join("pinned-source-hardlink-alias");
+    fs::hard_link(claim.claim_path_for_tests(), &alias).unwrap();
+
+    assert_eq!(
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
+        0,
+        "a hard-linked pinned source must not spend source-replacement capacity"
+    );
+    assert!(
+        claim.holds_source_credit_for_tests(),
+        "the reservation handle remains; only spendable capacity is zero"
+    );
+    assert!(claim.claim_path_for_tests().exists());
+    assert!(alias.exists());
+}
+
+/// Spend binds capacity to the claim pathname's durable base. A different path
+/// must not inherit another claim's reservation.
+#[test]
+fn source_credit_bytes_refuse_mismatched_claim_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-credit-mismatch-path", 512);
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FMB", &row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim");
+    assert!(claim.holds_source_credit_for_tests());
+
+    let other = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FMC", &row);
+    assert_eq!(
+        probe_dead_letter_source_credit_bytes_for_tests(&spool, &other, &claim),
+        0,
+        "a reservation must not spend against a different claim pathname"
+    );
+    assert_eq!(
+        probe_dead_letter_source_credit_bytes_for_tests(
+            &spool,
+            claim.claim_path_for_tests(),
+            &claim
+        ),
+        row.len() as u64,
+        "the live claim path must still spend"
+    );
+}
+
+/// Non-UTF8 claim pathnames cannot derive a durable base name, so capacity fails
+/// closed rather than inventing an unbound credit key.
+#[cfg(unix)]
+#[test]
+fn source_credit_bytes_refuse_non_utf8_claim_path() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-credit-non-utf8", 512);
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FMD", &row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim");
+    assert!(claim.holds_source_credit_for_tests());
+
+    let bad = claim
+        .claim_path_for_tests()
+        .with_file_name(OsStr::from_bytes(b"bad\xffclaim.ndjson"));
+    assert_eq!(
+        probe_dead_letter_source_credit_bytes_for_tests(&spool, &bad, &claim),
+        0,
+        "a non-UTF8 claim pathname must grant no capacity"
+    );
+}
+
+/// Same-UID substitution of the claim pathname with a different regular file
+/// means the reservation no longer names bytes the terminal removal will free.
+#[cfg(unix)]
+#[test]
+fn replaced_pinned_source_grants_no_dead_letter_credit() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = padded_dead_letter_row("dl-replaced-source-credit", 4096);
+    let source_bytes = row.len() as u64;
+    let max_bytes = source_bytes + source_bytes / 2;
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let source = plant_owned_spool_source(&spool, "01ARZ3NDEKTSV4RRFFQ69G5FME", &row);
+    let claim = spool
+        .hold_replay_claim_for_tests(&source)
+        .unwrap()
+        .expect("claim");
+    assert!(claim.holds_source_credit_for_tests());
+
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+    let aside = spool.namespace_root_for_tests().join("pinned-source.aside");
+    fs::rename(&claim_path, &aside).unwrap();
+    fs::write(&claim_path, padded_dead_letter_row("dl-substitute", 4096)).unwrap();
+
+    assert_eq!(
+        probe_dead_letter_source_credit_bytes_for_tests(&spool, &claim_path, &claim),
+        0,
+        "a replaced claim pathname must grant no source-credit capacity"
+    );
+    assert!(
+        claim.holds_source_credit_for_tests(),
+        "memory still holds the reservation; spendable capacity is what fails closed"
     );
 }
 

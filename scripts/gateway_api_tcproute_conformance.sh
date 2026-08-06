@@ -691,7 +691,7 @@ run_blackbox() {
 
 collect_diagnostics() {
   set +e
-  kubectl get gatewayclasses,gateways,httproutes,grpcroutes,tcproutes,referencegrants -A -o yaml > "$RESULTS_DIR/gateway-api-resources.yaml"
+  kubectl get gatewayclasses,gateways,httproutes,grpcroutes,tcproutes,tlsroutes,referencegrants -A -o yaml > "$RESULTS_DIR/gateway-api-resources.yaml"
   kubectl -n "$DP_GATEWAY_NAMESPACE" logs deployment/blackbox-tcp-a --all-containers --tail=1000 > "$RESULTS_DIR/blackbox-tcp-a.log"
   kubectl -n "$DP_GATEWAY_NAMESPACE" logs deployment/blackbox-tcp-b --all-containers --tail=1000 > "$RESULTS_DIR/blackbox-tcp-b.log"
   kubectl -n "$BACKEND_NAMESPACE" logs deployment/blackbox-tcp-cross --all-containers --tail=1000 > "$RESULTS_DIR/blackbox-tcp-cross.log"
