@@ -58,14 +58,6 @@ On dual-stack clusters it also requires the IPv6 pod-netns ready
 markers, IPv6 Service allow/deny behavior, and an IPv6 direct Pod-IP bypass
 guard.
 
-`src-a` also carries a readiness-gated `python:3.12-alpine` sidecar that serves
-excluded port `15020` and emits bounded (~2 Hz) successful loopback connects to
-that port. The frozen workflow job cannot be edited under Trusted Cross Build
-Policy, so this fixture surface is what makes the post-harness
-`exclude_port_hit` metric assertion observe real enrolled-workload traffic even
-when the SOCK_OPS ring buffer is lossy. `run.sh` statically checks that
-listener/stimulus contract before applying workloads.
-
 The chart render preflight and live install both verify the production identity
 profile: `ambient.spire.enabled=true` must mount the SPIRE Agent Workload API
 socket into the NodeWaypoint proxy and render
