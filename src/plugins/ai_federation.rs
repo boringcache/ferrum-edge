@@ -5713,7 +5713,9 @@ enum SseEventKind {
 /// while smuggling a further payload past the post-terminal check.
 fn classify_sse_event(event: &[u8]) -> Option<SseEventKind> {
     let text = std::str::from_utf8(event).ok()?;
-    let mut data = String::new();
+    let terminal = SSE_DONE_PAYLOAD.as_bytes();
+    let mut data_len = 0usize;
+    let mut matches_terminal = true;
     let mut saw_data_field = false;
     for line in split_sse_lines(text) {
         if line.is_empty() || line.starts_with(':') {
@@ -5733,15 +5735,19 @@ fn classify_sse_event(event: &[u8]) -> Option<SseEventKind> {
         // terminal marker.
         let value = raw_value.strip_prefix(' ').unwrap_or(raw_value);
         if saw_data_field {
-            data.push('\n');
+            matches_terminal &= terminal.get(data_len) == Some(&b'\n');
+            data_len = data_len.saturating_add(1);
         }
         saw_data_field = true;
-        data.push_str(value);
+        for byte in value.bytes() {
+            matches_terminal &= terminal.get(data_len) == Some(&byte);
+            data_len = data_len.saturating_add(1);
+        }
     }
-    if !saw_data_field || data.is_empty() {
+    if !saw_data_field || data_len == 0 {
         return Some(SseEventKind::NonData);
     }
-    if data == SSE_DONE_PAYLOAD {
+    if matches_terminal && data_len == terminal.len() {
         return Some(SseEventKind::Terminal);
     }
     Some(SseEventKind::Data)
