@@ -1373,12 +1373,22 @@ fn workload_entry_status(
 ///
 /// `spec.outboundTrafficPolicy` (issue #3262) is reported the same way: the
 /// translated mode lands on `outbound_traffic_policy`, and
-/// `outbound_traffic_policy_enforced` is that SAME gate — the slice builder
+/// `outbound_traffic_policy_enforced` reports that SAME gate — the slice builder
 /// resolves the workload-scoped policy under the identical predicate, so an
-/// operator reading this status can tell a translated-but-inert policy from a
-/// live one. A present-but-unrepresentable block is reported in `deferred_fields`
-/// with the enforced fail-closed outcome (`REGISTRY_ONLY`) named explicitly; the
+/// operator reading this status can tell a translated-but-inert policy from an
+/// eligible one. Its meaning is deliberately NARROW and resource-local: `true`
+/// means only that (a) this Sidecar carries a translatable workload-scoped policy
+/// and (b) the rollout gate is on. It does NOT mean this Sidecar was SELECTED for
+/// any workload — selection is per-workload, happens later at slice build
+/// (`select_applicable_sidecar` tier precedence over the workload's own
+/// namespace/labels), and the status writer has no workload in hand. A Sidecar
+/// whose `workloadSelector` matches nothing still reports `true`. A
+/// present-but-unrepresentable block is reported in `deferred_fields` with the
+/// enforced fail-closed outcome (`REGISTRY_ONLY`) named explicitly; the
 /// classification comes from the same shared predicate the translator applies.
+/// A REJECTED Sidecar reports the classified mode with an explicit
+/// `outbound_traffic_policy_enforced: false` — a dropped resource enforces
+/// nothing, and an absent qualifier could read as "enforced".
 fn sidecar_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -1445,13 +1455,17 @@ fn sidecar_status(
                      {ingress_modelable} modelable when enabled)"
                 )
             };
-            // Same gate-honest framing as `ingress_clause`: an operator must be
-            // able to distinguish "translated and live" from "translated but
-            // inert because the rollout gate is off".
+            // Same gate-honest framing as `ingress_clause`, and deliberately no
+            // stronger: the writer knows the resource and the gate, never which
+            // workloads (if any) this Sidecar is selected for, so it claims
+            // eligibility rather than live enforcement on a specific workload.
             let outbound_clause = if outbound_policy.policy.is_none() {
                 "outboundTrafficPolicy inherited from the mesh-wide policy".to_string()
             } else if ingress_enforced {
-                format!("outboundTrafficPolicy {outbound_mode} enforced")
+                format!(
+                    "outboundTrafficPolicy {outbound_mode} enforced for the workloads this \
+                     Sidecar is selected for"
+                )
             } else {
                 format!(
                     "outboundTrafficPolicy {outbound_mode} not applied \
@@ -1470,6 +1484,9 @@ fn sidecar_status(
                     deferred.join(", ")
                 )
             };
+            // Resource-local eligibility, NOT per-workload selection: "this
+            // Sidecar carries a translatable policy AND the rollout gate is on".
+            // Which workloads it actually governs is decided at slice build.
             let outbound_enforced = outbound_policy.policy.is_some() && ingress_enforced;
             let detail = json!({
                 "translation": {
@@ -1485,11 +1502,17 @@ fn sidecar_status(
         }
         Err(error) => {
             let message = format!("Ferrum rejected this Sidecar: {error}");
+            // A rejected Sidecar is dropped from the translation entirely, so it
+            // enforces nothing regardless of the rollout gate. State that
+            // explicitly: an `outbound_traffic_policy` with no
+            // `outbound_traffic_policy_enforced` sibling reads as enforced to
+            // anyone (or anything) diffing the two Sidecar detail shapes.
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "egress_entries": egress_entry_count,
                     "outbound_traffic_policy": outbound_mode,
+                    "outbound_traffic_policy_enforced": false,
                     "error": format!("{error}"),
                 }
             });
@@ -1527,7 +1550,7 @@ fn sidecar_outbound_policy_label(classified: &SidecarOutboundPolicy) -> &'static
 /// and DUPLICATE listener ports are deferred (the translator still accepts the
 /// resource; only the unmodeled entries surface here).
 ///
-/// The duplicate-port dedup mirrors `resolve_applicable_sidecar_ingress` in
+/// The duplicate-port dedup mirrors `resolve_selected_sidecar_ingress` in
 /// `src/modes/mesh/slice.rs`, which reserves a listener port only for the FIRST
 /// successfully resolved entry on that port and warns + drops later entries with
 /// the same port. Counting each supported entry would over-report `ingress_modeled`

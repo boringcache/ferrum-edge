@@ -736,10 +736,22 @@ impl MeshSlice {
     /// This is the ONE place the precedence lives. Both consumers — HTTP-family
     /// `mesh_outbound_registry` plugin injection and the stream-family
     /// `MeshOutboundEnforcement` slot — call it, so the two transport families
-    /// can never disagree about whether the registry gate is armed. It runs at
+    /// can never disagree about whether the registry gate is ARMED. It runs at
     /// slice apply only (cold path): the result is materialized into the injected
     /// plugin config and the `ArcSwap` enforcement slot, never re-derived or
     /// re-parsed per request.
+    ///
+    /// Scope note: the shared input is the armed/disarmed DECISION, not the
+    /// admitted registry CONTENTS. The two lanes build their registries from
+    /// different slice values on the multicluster path — HTTP-family injection
+    /// runs against the merged materialization slice (`merged_slice`, which
+    /// unions poller-discovered remote workloads/services into
+    /// `workloads`/`services`), while `refresh_mesh_outbound_enforcement` runs
+    /// against the un-merged base slice — so a remote-cluster destination can be
+    /// admitted on HTTP while a stream connect to the same destination is
+    /// refused. That asymmetry is a registry-membership property, and it fails
+    /// CLOSED on the stream side; do not restate it as "the two lanes are
+    /// identical".
     pub fn effective_outbound_traffic_policy(
         &self,
         runtime_default: OutboundTrafficPolicy,
@@ -1152,30 +1164,38 @@ impl MeshSlice {
             resolved_sidecar
         };
 
-        // Resolve the local workload's custom inbound listeners from the
-        // applicable Sidecar's `ingress[]`. Gated like egress narrowing: only
-        // under enforcement (NOT dry-run, which reports but changes nothing —
-        // materializing inbound listeners is a behavior change). Resolution
-        // follows the SAME tier precedence as egress, then keeps only the
-        // routable entries (loopback host:port HTTP listeners); unsupported
-        // shapes are dropped here and reported as deferred by the K8s status
-        // writer. Carried on the slice so the DP materializer never re-resolves
-        // raw `MeshSidecar` records (they do not ride the slice), mirroring the
-        // `local_inbound_services` pattern.
-        let (
-            mut local_ingress_listeners,
-            sidecar_ingress_declared,
-            mut declared_ingress_http_ports,
-        ): (Vec<ResolvedIngressListener>, bool, usize) = if sidecar_enforced && !sidecar_dry_run {
-            resolve_applicable_sidecar_ingress(
+        // ONE `select_applicable_sidecar` scan, shared by the two consumers that
+        // need the workload's single applicable Sidecar under the SAME gate and
+        // the SAME tier precedence: `ingress[]` materialization and the
+        // workload-scoped `outboundTrafficPolicy` below. Gated like ingress
+        // materialization, NOT like egress narrowing: only under enforcement and
+        // NOT under dry-run, which reports but changes nothing. (Egress keeps its
+        // own scan — `resolve_applicable_sidecar_egress` walks the
+        // `inherits_defaults` chain under the looser `enforced || dry_run` gate,
+        // so its result is not interchangeable with this one.)
+        let selected_sidecar: Option<&MeshSidecar> = if sidecar_enforced && !sidecar_dry_run {
+            select_applicable_sidecar(
                 &mesh.sidecars,
                 effective_namespace,
                 &effective_labels,
                 mesh.istio_root_namespace.as_str(),
             )
         } else {
-            (Vec::new(), false, 0)
+            None
         };
+
+        // Resolve the local workload's custom inbound listeners from the selected
+        // Sidecar's `ingress[]`, keeping only the routable entries (loopback
+        // host:port HTTP listeners); unsupported shapes are dropped here and
+        // reported as deferred by the K8s status writer. Carried on the slice so
+        // the DP materializer never re-resolves raw `MeshSidecar` records (they
+        // do not ride the slice), mirroring the `local_inbound_services` pattern.
+        let (
+            mut local_ingress_listeners,
+            sidecar_ingress_declared,
+            mut declared_ingress_http_ports,
+        ): (Vec<ResolvedIngressListener>, bool, usize) =
+            resolve_selected_sidecar_ingress(selected_sidecar);
 
         // Workload-scoped `Sidecar.outboundTrafficPolicy` (issue #3262). Gated
         // exactly like ingress materialization — NOT like egress narrowing, which
@@ -1185,12 +1205,26 @@ impl MeshSlice {
         // both "no Sidecar declared one" and "the gate is off", and both fall
         // back to the mesh-wide policy in
         // `effective_outbound_traffic_policy` — never to a weaker one.
+        //
+        // SECURITY: on a `labels_ambiguous` slice `effective_labels` is only the
+        // INTERSECTION of several same-SPIFFE workloads' divergent label sets, so
+        // a workload-scoped Sidecar that really does select one of them can fail
+        // to match it — which would silently fall through to a laxer namespace
+        // default. The extra candidate label sets are therefore passed in (empty
+        // unless ambiguous) and the resolution folds them fail-closed. See
+        // `resolve_applicable_sidecar_outbound_policy`.
+        let ambiguous_policy_candidates: &[&BTreeMap<String, String>] = if labels_ambiguous {
+            &policy_candidate_labels
+        } else {
+            &[]
+        };
         let sidecar_outbound_traffic_policy = if sidecar_enforced && !sidecar_dry_run {
             resolve_applicable_sidecar_outbound_policy(
                 &mesh.sidecars,
                 effective_namespace,
-                &effective_labels,
                 mesh.istio_root_namespace.as_str(),
+                selected_sidecar,
+                ambiguous_policy_candidates,
             )
         } else {
             None
@@ -2501,6 +2535,32 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
 /// redirects which Sidecar's *egress scope* applies, while *ingress* listeners
 /// are always taken from the selected Sidecar's own `ingress[]` (an omitted
 /// `ingress` simply means "no custom listeners").
+///
+/// # Divergence from Istio: root workload-scoped outranks a namespace default
+///
+/// Istio resolves a workload's Sidecar as "a selector-bearing Sidecar in the
+/// workload's own namespace, else any Sidecar in the workload's own namespace,
+/// else the root-namespace Sidecar" — the workload's namespace wins the whole
+/// comparison before the root namespace is consulted at all. Ferrum instead
+/// interleaves by SPECIFICITY: a root-namespace Sidecar that carries an explicit
+/// `workloadSelector` matching this workload outranks a selector-less default in
+/// the workload's own namespace.
+///
+/// This is intentional and security-oriented. The root namespace is the mesh
+/// operator's namespace; a tenant cannot write there. Ordering the root
+/// *targeted* rule above the tenant-namespace *catch-all* means a mesh-wide
+/// operator policy aimed at specific workloads cannot be displaced by a tenant
+/// dropping a permissive namespace default into their own namespace. A tenant
+/// can still override with an equally specific rule — a `workloadSelector`
+/// Sidecar in their own namespace still wins the top tier.
+///
+/// Since issue #3262 this ordering also decides the workload-scoped
+/// `outboundTrafficPolicy` (via
+/// [`resolve_applicable_sidecar_outbound_policy`]), i.e. whether the outbound
+/// registry gate is armed — so the divergence is load-bearing for egress
+/// enforcement, not only for scoping. It is documented for operators in
+/// `docs/mesh.md` ("Sidecar Outbound Traffic Policy" → precedence). Do not
+/// "align with Istio" here without re-deciding that trade-off.
 fn select_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
     sidecars: &'a [MeshSidecar],
     workload_namespace: &str,
@@ -2559,46 +2619,126 @@ fn select_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
         .or(root_namespace_default)
 }
 
+/// Conservative strictness rank used to fold candidate-resolved outbound
+/// policies under label ambiguity (issue #3262). Higher is stricter, so a fold
+/// takes the MAXIMUM and can only ever tighten.
+///
+/// `None` sits BETWEEN the two concrete modes on purpose: it means "inherit the
+/// mesh-wide / env tier", which may itself be `RegistryOnly`, so it must not be
+/// collapsed with the definitely-permissive `AllowAny`.
+fn outbound_policy_strictness(policy: Option<OutboundTrafficPolicy>) -> u8 {
+    match policy {
+        Some(OutboundTrafficPolicy::RegistryOnly) => 2,
+        None => 1,
+        Some(OutboundTrafficPolicy::AllowAny) => 0,
+    }
+}
+
 /// Resolve the workload-scoped outbound traffic policy from the applicable
 /// `Sidecar.outboundTrafficPolicy` (issue #3262).
 ///
-/// Uses [`select_applicable_sidecar`] — the SAME tier precedence as ingress
-/// (workload-scoped → root workload-scoped → namespace default → root-namespace
-/// default, ASCII-smallest `name` tiebreak) — and deliberately does NOT walk the
-/// egress `inherits_defaults` chain. That walk exists because Istio's `egress`
-/// has an explicit "omitted means inherit the namespace scope" rule; the outbound
-/// traffic policy has no such rule. Istio resolves exactly ONE Sidecar per
-/// workload, and a Sidecar that omits `outboundTrafficPolicy` simply leaves the
-/// mesh-wide `MeshConfig` value in force — it does not consult a less-specific
-/// Sidecar. Returning `None` here expresses precisely that inheritance.
+/// `selected` is the Sidecar [`select_applicable_sidecar`] chose for the slice's
+/// `effective_labels` — the SAME tier precedence as ingress (workload-scoped →
+/// root workload-scoped → namespace default → root-namespace default,
+/// ASCII-smallest `name` tiebreak), reusing that one scan rather than repeating
+/// it. It deliberately does NOT walk the egress `inherits_defaults` chain. That
+/// walk exists because Istio's `egress` has an explicit "omitted means inherit
+/// the namespace scope" rule; the outbound traffic policy has no such rule. Istio
+/// resolves exactly ONE Sidecar per workload, and a Sidecar that omits
+/// `outboundTrafficPolicy` simply leaves the mesh-wide `MeshConfig` value in
+/// force — it does not consult a less-specific Sidecar. Returning `None` here
+/// expresses precisely that inheritance.
 ///
-/// Cold path: runs once per slice build, alongside the ingress resolution that
-/// already performs the same selection scan.
-fn resolve_applicable_sidecar_outbound_policy<L: WorkloadLabels + ?Sized>(
+/// # Ambiguous workload labels resolve fail-closed (security)
+///
+/// `ambiguous_candidate_labels` is EMPTY on an unambiguous slice, and then this
+/// is exactly `selected`'s own policy. It is non-empty only when the slice is
+/// `labels_ambiguous`: several workloads share the request's SPIFFE id with
+/// DIVERGENT label sets, so `effective_labels` is merely their INTERSECTION and
+/// is not any real workload's labels. A `workloadSelector` Sidecar that genuinely
+/// selects one of those workloads can then fail to match the intersection, and
+/// selection would silently fall through to a less specific tier — turning a
+/// tenant's `REGISTRY_ONLY` into a namespace-default `ALLOW_ANY` and DISARMING
+/// the outbound registry gate.
+///
+/// So under ambiguity every candidate label set is resolved on its own and the
+/// results are folded by [`outbound_policy_strictness`], keeping the strictest.
+/// Properties this buys:
+///   - **Never relaxes.** The fold includes the intersection-derived answer, so
+///     the result is always at least as strict as the unambiguous resolution.
+///   - **Deterministic.** `max` is order-independent, so the outcome does not
+///     depend on workload or Sidecar emission order.
+///   - **Bounded.** Cold path, once per slice build: `candidates × sidecars`,
+///     where candidates are only the workloads sharing this request's SPIFFE id.
+///     Nothing is re-derived per request — the result is materialized into the
+///     injected plugin config and the enforcement slot.
+///
+/// The right long-term fix is unambiguous labels (explicit
+/// `FERRUM_MESH_WORKLOAD_LABELS` / distinct SPIFFE ids); the fold is what keeps
+/// the gate safe until then, and it warns when ambiguity actually changed the
+/// outcome.
+fn resolve_applicable_sidecar_outbound_policy(
     sidecars: &[MeshSidecar],
     workload_namespace: &str,
-    workload_labels: &L,
     istio_root_namespace: &str,
+    selected: Option<&MeshSidecar>,
+    ambiguous_candidate_labels: &[&BTreeMap<String, String>],
 ) -> Option<OutboundTrafficPolicy> {
-    let sidecar = select_applicable_sidecar(
-        sidecars,
-        workload_namespace,
-        workload_labels,
-        istio_root_namespace,
-    )?;
-    let policy = sidecar.outbound_traffic_policy?;
-    debug!(
-        sidecar = %sidecar.name,
-        namespace = %sidecar.namespace,
-        policy = ?policy,
-        "Applying Sidecar-scoped outboundTrafficPolicy to the mesh slice"
-    );
-    Some(policy)
+    let selected_policy = selected.and_then(|sidecar| sidecar.outbound_traffic_policy);
+
+    if ambiguous_candidate_labels.is_empty() {
+        if let Some(sidecar) = selected
+            && let Some(policy) = selected_policy
+        {
+            debug!(
+                sidecar = %sidecar.name,
+                namespace = %sidecar.namespace,
+                policy = ?policy,
+                "Applying Sidecar-scoped outboundTrafficPolicy to the mesh slice"
+            );
+        }
+        return selected_policy;
+    }
+
+    let mut resolved = selected_policy;
+    for labels in ambiguous_candidate_labels {
+        let chosen =
+            select_applicable_sidecar(sidecars, workload_namespace, *labels, istio_root_namespace);
+        let policy = chosen.and_then(|sidecar| sidecar.outbound_traffic_policy);
+        if outbound_policy_strictness(policy) > outbound_policy_strictness(resolved) {
+            resolved = policy;
+        }
+    }
+
+    if resolved == selected_policy {
+        debug!(
+            candidates = ambiguous_candidate_labels.len(),
+            policy = ?resolved,
+            "Ambiguous workload labels did not change the Sidecar-scoped outboundTrafficPolicy"
+        );
+    } else {
+        warn!(
+            namespace = %workload_namespace,
+            candidates = ambiguous_candidate_labels.len(),
+            intersection_policy = ?selected_policy,
+            resolved_policy = ?resolved,
+            "Workload labels are ambiguous (several workloads share this SPIFFE id with divergent \
+             labels); resolving the Sidecar-scoped outboundTrafficPolicy to the strictest policy \
+             any candidate could select. Set explicit workload labels to resolve it exactly"
+        );
+    }
+    resolved
 }
 
-/// Resolve the routable custom inbound listeners from a workload's applicable
-/// `Sidecar.ingress[]`, returning `(resolved_listeners, ingress_declared,
+/// Resolve the routable custom inbound listeners from the workload's applicable
+/// `Sidecar`'s `ingress[]`, returning `(resolved_listeners, ingress_declared,
 /// declared_http_ports)`.
+///
+/// `selected` is the Sidecar [`select_applicable_sidecar`] already chose for this
+/// workload — the caller performs that scan ONCE and shares it with the
+/// workload-scoped `outboundTrafficPolicy` resolution, which uses the identical
+/// tier precedence under the identical enforcement gate. `None` (no applicable
+/// Sidecar, or the gate is off) resolves to "no custom listeners declared".
 ///
 /// Unsupported entries (Unix-socket / non-loopback `defaultEndpoint`,
 /// non-HTTP-family protocol, zero port) are dropped fail-closed and warned; only
@@ -2626,18 +2766,10 @@ fn resolve_applicable_sidecar_outbound_policy<L: WorkloadLabels + ?Sized>(
 /// resolved would collapse to a single-listener no-signal pass-through and route
 /// the skipped port's traffic to the surviving sibling. Deduped by port to match
 /// the resolved-set dedup below.
-fn resolve_applicable_sidecar_ingress<L: WorkloadLabels + ?Sized>(
-    sidecars: &[MeshSidecar],
-    workload_namespace: &str,
-    workload_labels: &L,
-    istio_root_namespace: &str,
+fn resolve_selected_sidecar_ingress(
+    selected: Option<&MeshSidecar>,
 ) -> (Vec<ResolvedIngressListener>, bool, usize) {
-    let Some(sidecar) = select_applicable_sidecar(
-        sidecars,
-        workload_namespace,
-        workload_labels,
-        istio_root_namespace,
-    ) else {
+    let Some(sidecar) = selected else {
         return (Vec::new(), false, 0);
     };
     // Per Istio, declaring `ingress[]` REPLACES the default per-service-port

@@ -809,16 +809,13 @@ fn sidecar(
     // `spec.outboundTrafficPolicy` (issue #3262). A present-but-unrepresentable
     // block resolves to REGISTRY_ONLY rather than rejecting the resource — see
     // `classify_sidecar_outbound_traffic_policy` for why dropping the Sidecar
-    // would WIDEN egress instead of failing closed. Warn once per translation so
-    // the degradation is visible in gateway logs as well as in CRD status.
+    // would WIDEN egress instead of failing closed.
     let outbound_policy = classify_sidecar_outbound_traffic_policy(&object.spec);
     if let Some(reason) = outbound_policy.deferred {
-        tracing::warn!(
-            namespace = %object.metadata.namespace,
-            sidecar = %object.metadata.name,
-            reason = %reason,
-            "Istio Sidecar outboundTrafficPolicy is not exactly representable; \
-             enforcing REGISTRY_ONLY for the selected workloads",
+        report_sidecar_outbound_policy_degradation(
+            &object.metadata.namespace,
+            &object.metadata.name,
+            reason,
         );
     }
 
@@ -5336,11 +5333,19 @@ pub(crate) struct SidecarOutboundPolicy {
 ///   - **`mode` unrecognized or not a string** (an `ALOW_ANY` typo, the numeric
 ///     proto form, …) — the intent is ambiguous, so the restrictive mode applies.
 ///     The raw value is never echoed into the status.
-///   - **the block is not an object** — malformed shape.
-///   - **`egressProxy` present** — Ferrum cannot funnel unmatched egress through
-///     a named `Destination`. Ignoring it would send traffic the operator scoped
-///     to an egress gateway straight out instead, so the registry gate stays on
-///     regardless of the declared `mode`.
+///   - **the block is not an object** — malformed shape. An explicit top-level
+///     `outboundTrafficPolicy: null` is deliberately NOT normalized to "absent":
+///     unlike the inner fields below, the top level is what decides whether a
+///     workload-scoped policy exists AT ALL, and an operator who wrote the key
+///     asked for one, so the ambiguity fails closed instead of silently
+///     inheriting the (possibly laxer) mesh-wide value.
+///   - **`egressProxy` present and non-null** — Ferrum cannot funnel unmatched
+///     egress through a named `Destination`. Ignoring it would send traffic the
+///     operator scoped to an egress gateway straight out instead, so the registry
+///     gate stays on regardless of the declared `mode`. An explicit
+///     `egressProxy: null` IS normalized to absent, matching proto-JSON (and the
+///     `mode: null` handling below): the operator declared no egress proxy, so
+///     the declared `mode` is honored.
 ///
 /// The resource is never REJECTED over this field. A rejected Sidecar is dropped
 /// from the translation entirely (`translate_k8s_objects_collecting_skips` skips
@@ -5365,8 +5370,12 @@ pub(crate) fn classify_sidecar_outbound_traffic_policy(spec: &Value) -> SidecarO
     };
     // `egressProxy` changes what the mode MEANS in Istio (unmatched egress is
     // routed THROUGH the named destination rather than out directly), so it is
-    // checked before the mode and wins over an explicit `ALLOW_ANY`.
-    if block.contains_key("egressProxy") {
+    // checked before the mode and wins over an explicit `ALLOW_ANY`. An explicit
+    // JSON `null` is proto-JSON for "unset" — normalized to absent here exactly
+    // as `mode: null` is below, so `egressProxy: null` does not silently force
+    // REGISTRY_ONLY onto an operator who declared no egress proxy.
+    let egress_proxy = block.get("egressProxy");
+    if egress_proxy.is_some_and(|value| !value.is_null()) {
         return fail_closed(SIDECAR_OUTBOUND_POLICY_EGRESS_PROXY);
     }
     match block.get("mode") {
@@ -5383,6 +5392,49 @@ pub(crate) fn classify_sidecar_outbound_traffic_policy(spec: &Value) -> SidecarO
             _ => fail_closed(SIDECAR_OUTBOUND_POLICY_MODE_UNSUPPORTED),
         },
         Some(_) => fail_closed(SIDECAR_OUTBOUND_POLICY_MODE_UNSUPPORTED),
+    }
+}
+
+/// Whether this process has already emitted the `warn!` for a fail-closed
+/// `Sidecar.outboundTrafficPolicy` degradation. One process-wide bool, never a
+/// per-resource map: translation re-runs on every reconcile and every full sync,
+/// so a per-resource `warn!` would re-fire for the lifetime of a Sidecar that is
+/// *permanently* unrepresentable and drown the log in a message whose content
+/// never changes.
+static SIDECAR_OUTBOUND_POLICY_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Report a fail-closed `Sidecar.outboundTrafficPolicy` degradation (issue
+/// #3262) without steady-state log noise.
+///
+/// The authoritative, always-current surface is the resource's own
+/// `FerrumAccepted` status (`deferred_fields`), which carries the same
+/// field-specific reason and is rewritten on every reconcile. So this emits:
+///   - one `debug!` per occurrence, carrying namespace + name + the `&'static`
+///     reason (never the operator-supplied raw value), for operators who turned
+///     debug logging on to chase a specific resource; and
+///   - exactly ONE process-lifetime `warn!` pointing at that status surface, so
+///     the degradation is still discoverable at the default log level.
+fn report_sidecar_outbound_policy_degradation(namespace: &str, name: &str, reason: &'static str) {
+    use std::sync::atomic::Ordering;
+
+    tracing::debug!(
+        namespace = %namespace,
+        sidecar = %name,
+        reason = %reason,
+        "Istio Sidecar outboundTrafficPolicy is not exactly representable; \
+         enforcing REGISTRY_ONLY for the selected workloads",
+    );
+    let first_in_process = SIDECAR_OUTBOUND_POLICY_WARNED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok();
+    if first_in_process {
+        tracing::warn!(
+            "At least one Istio Sidecar declares an outboundTrafficPolicy Ferrum cannot represent \
+             exactly; REGISTRY_ONLY is enforced for the workloads it selects. Per-resource reasons \
+             are in each Sidecar's status.ferrum.translation.deferred_fields (this warning is \
+             emitted once per process; enable debug logging for per-resource detail)",
+        );
     }
 }
 

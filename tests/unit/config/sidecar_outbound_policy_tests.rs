@@ -10,6 +10,10 @@
 //!   - **Selection**: which `Sidecar` supplies the policy for a workload, and
 //!     that an omitted block inherits rather than walking to a less-specific
 //!     `Sidecar`.
+//!   - **Ambiguous labels (security)**: when several workloads share one SPIFFE
+//!     id with divergent labels the slice carries only their intersection, so
+//!     resolution folds every candidate strictest-wins and can never relax a
+//!     stricter possibly-applicable workload policy.
 //!   - **Gate**: the policy applies only under
 //!     `enforce_sidecar_egress && !sidecar_egress_dry_run`.
 //!   - **Effective precedence**: Sidecar → mesh-wide → runtime default.
@@ -18,6 +22,9 @@
 //!   - **Update / delete**: editing only the mode, or deleting the `Sidecar`,
 //!     changes the slice AND is visible to `content_eq` (so MeshSubscribe
 //!     dedupe cannot keep a stale gate live).
+//!   - **Canonical docs parity**: `docs/configuration.md` and `ferrum.conf`
+//!     describe every application `FERRUM_MESH_SIDECAR_ENFORCED` now gates,
+//!     including a workload-scoped `ALLOW_ANY` overriding a stricter default.
 //!
 //! Live request-path enforcement is covered by
 //! `tests/integration/mesh_sidecar_e2e_tests.rs`; CRD status reporting by
@@ -29,9 +36,10 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
-use ferrum_edge::identity::spiffe::TrustDomain;
+use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    MeshConfig, MeshSidecar, MeshSidecarEgress, OutboundTrafficPolicy, WorkloadSelector,
+    AppProtocol, MeshConfig, MeshSidecar, MeshSidecarEgress, OutboundTrafficPolicy, Workload,
+    WorkloadPort, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::xds::carrier::{MeshSliceCarrier, apply_carrier, build_slice_carriers};
@@ -191,6 +199,77 @@ fn surrounding_whitespace_on_allow_any_fails_closed() {
         sidecar.outbound_traffic_policy,
         Some(OutboundTrafficPolicy::RegistryOnly),
         "a padded ALLOW_ANY token is not an exact Istio enum and must fail closed"
+    );
+}
+
+/// An explicit `egressProxy: null` is proto-JSON for "unset" and gets the same
+/// null-is-absent normalization `mode: null` gets — so it must NOT force
+/// REGISTRY_ONLY onto an operator who declared no egress proxy.
+#[test]
+fn explicit_null_egress_proxy_is_treated_as_absent() {
+    let sidecar = translate_one(spec_with_egress_and_policy(Some(json!({
+        "mode": "ALLOW_ANY",
+        "egressProxy": null,
+    }))));
+    assert_eq!(
+        sidecar.outbound_traffic_policy,
+        Some(OutboundTrafficPolicy::AllowAny),
+        "egressProxy: null is unset, so the declared mode must be honored"
+    );
+
+    let sidecar = translate_one(spec_with_egress_and_policy(Some(json!({
+        "mode": "REGISTRY_ONLY",
+        "egressProxy": null,
+    }))));
+    assert_eq!(
+        sidecar.outbound_traffic_policy,
+        Some(OutboundTrafficPolicy::RegistryOnly)
+    );
+
+    // Still fail-closed when the block carries neither a usable mode nor a
+    // proxy: the mode is what is missing, not the (absent) egressProxy.
+    let sidecar = translate_one(spec_with_egress_and_policy(Some(
+        json!({ "egressProxy": null }),
+    )));
+    assert_eq!(
+        sidecar.outbound_traffic_policy,
+        Some(OutboundTrafficPolicy::RegistryOnly),
+        "an omitted mode still resolves to the REGISTRY_ONLY proto default"
+    );
+}
+
+/// A NON-null `egressProxy` still wins over an explicit `ALLOW_ANY`; the null
+/// normalization above must not become a bypass.
+#[test]
+fn non_null_egress_proxy_still_overrides_an_explicit_allow_any() {
+    for proxy in [
+        json!({ "host": "istio-egressgateway.istio-system.svc.cluster.local" }),
+        json!({}),
+        json!("istio-egressgateway"),
+    ] {
+        let sidecar = translate_one(spec_with_egress_and_policy(Some(json!({
+            "mode": "ALLOW_ANY",
+            "egressProxy": proxy,
+        }))));
+        assert_eq!(
+            sidecar.outbound_traffic_policy,
+            Some(OutboundTrafficPolicy::RegistryOnly),
+            "a present, non-null egressProxy must keep the registry gate armed"
+        );
+    }
+}
+
+/// The TOP-LEVEL block is deliberately NOT null-normalized: it is what decides
+/// whether a workload-scoped policy exists at all, so an explicit `null` there
+/// fails closed rather than silently inheriting a possibly-laxer mesh-wide
+/// value.
+#[test]
+fn explicit_null_outbound_traffic_policy_block_still_fails_closed() {
+    let sidecar = translate_one(spec_with_egress_and_policy(Some(Value::Null)));
+    assert_eq!(
+        sidecar.outbound_traffic_policy,
+        Some(OutboundTrafficPolicy::RegistryOnly),
+        "an explicit top-level null must not be read as 'inherit'"
     );
 }
 
@@ -750,4 +829,388 @@ fn kubernetes_translated_sidecar_policy_reaches_the_slice() {
         OutboundTrafficPolicy::RegistryOnly,
         "and override an otherwise-permissive runtime default"
     );
+}
+
+// ── Ambiguous workload labels must not relax the gate ─────────────────────
+//
+// When several workloads share one SPIFFE id with DIVERGENT label sets and the
+// request carries no explicit labels, the slice's labels are only their
+// INTERSECTION. A `workloadSelector` Sidecar that genuinely selects one of those
+// workloads can miss that intersection, so selection would fall through to a
+// less-specific — possibly `ALLOW_ANY` — tier and silently disarm the outbound
+// registry gate. Resolution therefore folds every candidate label set,
+// strictest-wins (`REGISTRY_ONLY` > inherit > `ALLOW_ANY`).
+
+const SHARED_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/shared";
+
+fn shared_spiffe_workload(service: &str, labels: &[(&str, &str)]) -> Workload {
+    Workload {
+        spiffe_id: SpiffeId::new(SHARED_SPIFFE).expect("spiffe"),
+        selector: WorkloadSelector {
+            labels: labels
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            namespace: Some("default".to_string()),
+        },
+        service_name: service.to_string(),
+        service_namespace: None,
+        addresses: vec!["10.0.0.1".to_string()],
+        ports: vec![WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }],
+        trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+        namespace: "default".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: None,
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    }
+}
+
+/// A request with NO explicit labels, pinned to the shared SPIFFE id — the shape
+/// that makes the slice `labels_ambiguous` when the candidates diverge.
+fn ambiguous_request() -> MeshSliceRequest {
+    MeshSliceRequest {
+        node_id: "node-a".to_string(),
+        namespace: "default".to_string(),
+        workload_spiffe_id: Some(SHARED_SPIFFE.to_string()),
+        enforce_sidecar_egress: true,
+        ..MeshSliceRequest::default()
+    }
+}
+
+fn ambiguous_slice(sidecars: Vec<MeshSidecar>, workloads: Vec<Workload>) -> MeshSlice {
+    let config = config_with_mesh(MeshConfig {
+        sidecars,
+        workloads,
+        ..MeshConfig::default()
+    });
+    let slice = slice_for(&config, ambiguous_request());
+    assert!(
+        slice.labels_ambiguous,
+        "the fixture must actually produce an ambiguous slice, or the fold is not under test"
+    );
+    slice
+}
+
+/// The finding's exact scenario: the label intersection matches only a
+/// permissive namespace default, while a real candidate is selected by a
+/// stricter `workloadSelector` Sidecar. The strict policy must win.
+#[test]
+fn ambiguous_labels_do_not_relax_a_stricter_workload_scoped_policy() {
+    let slice = ambiguous_slice(
+        vec![
+            sidecar(
+                "ns-default-open",
+                "default",
+                None,
+                Some(OutboundTrafficPolicy::AllowAny),
+            ),
+            sidecar(
+                "reviews-strict",
+                "default",
+                Some(selector_for("reviews", "default")),
+                Some(OutboundTrafficPolicy::RegistryOnly),
+            ),
+        ],
+        vec![
+            shared_spiffe_workload("reviews", &[("app", "reviews")]),
+            shared_spiffe_workload("ratings", &[("app", "ratings")]),
+        ],
+    );
+    assert!(
+        slice.labels.is_empty(),
+        "the two candidates share no labels, so the intersection is empty and \
+         would select only the permissive namespace default"
+    );
+    assert_eq!(
+        slice.sidecar_outbound_traffic_policy,
+        Some(OutboundTrafficPolicy::RegistryOnly),
+        "a stricter possibly-applicable workload policy must not be relaxed by ambiguity"
+    );
+    assert_eq!(
+        slice.effective_outbound_traffic_policy(OutboundTrafficPolicy::AllowAny),
+        OutboundTrafficPolicy::RegistryOnly,
+        "and the registry gate stays armed end to end"
+    );
+}
+
+/// A non-empty intersection is just as unsafe: it can match a BROAD permissive
+/// selector while a narrower, stricter selector applies to one real candidate.
+/// The per-tier ASCII-smallest-name tiebreak still resolves each candidate.
+#[test]
+fn ambiguous_labels_do_not_relax_when_the_intersection_matches_a_broad_open_sidecar() {
+    let slice = ambiguous_slice(
+        vec![
+            // Same tier as the broad Sidecar below; the ASCII-smaller name wins
+            // for the canary candidate that matches both.
+            MeshSidecar {
+                workload_selector: Some(WorkloadSelector {
+                    labels: HashMap::from([
+                        ("app".to_string(), "reviews".to_string()),
+                        ("tier".to_string(), "canary".to_string()),
+                    ]),
+                    namespace: Some("default".to_string()),
+                }),
+                ..sidecar(
+                    "a-canary-strict",
+                    "default",
+                    None,
+                    Some(OutboundTrafficPolicy::RegistryOnly),
+                )
+            },
+            sidecar(
+                "z-reviews-open",
+                "default",
+                Some(selector_for("reviews", "default")),
+                Some(OutboundTrafficPolicy::AllowAny),
+            ),
+        ],
+        vec![
+            shared_spiffe_workload("reviews", &[("app", "reviews"), ("tier", "web")]),
+            shared_spiffe_workload("reviews-canary", &[("app", "reviews"), ("tier", "canary")]),
+        ],
+    );
+    assert_eq!(
+        slice.labels.get("app"),
+        Some(&"reviews".to_string()),
+        "the intersection keeps app=reviews and therefore matches the OPEN selector"
+    );
+    assert_eq!(
+        slice.sidecar_outbound_traffic_policy,
+        Some(OutboundTrafficPolicy::RegistryOnly),
+        "the canary candidate's stricter selector must win over the broad ALLOW_ANY"
+    );
+}
+
+/// Inherit outranks `ALLOW_ANY`: a candidate with no applicable Sidecar defers
+/// to the mesh-wide tier, which may itself be `REGISTRY_ONLY`, so the fold must
+/// not adopt another candidate's `ALLOW_ANY`.
+#[test]
+fn ambiguous_labels_prefer_inherit_over_a_candidate_allow_any() {
+    let slice = ambiguous_slice(
+        vec![sidecar(
+            "reviews-open",
+            "default",
+            Some(selector_for("reviews", "default")),
+            Some(OutboundTrafficPolicy::AllowAny),
+        )],
+        vec![
+            shared_spiffe_workload("reviews", &[("app", "reviews")]),
+            shared_spiffe_workload("ratings", &[("app", "ratings")]),
+        ],
+    );
+    assert_eq!(
+        slice.sidecar_outbound_traffic_policy, None,
+        "the ratings candidate has no applicable Sidecar, so the workload tier \
+         must defer to the mesh-wide policy rather than adopting ALLOW_ANY"
+    );
+    assert_eq!(
+        slice.effective_outbound_traffic_policy(OutboundTrafficPolicy::RegistryOnly),
+        OutboundTrafficPolicy::RegistryOnly,
+        "so a strict mesh-wide/runtime default stays in force"
+    );
+}
+
+/// The fold must not OVER-tighten either: when every candidate resolves to the
+/// same permissive policy, that policy is honored.
+#[test]
+fn ambiguous_labels_keep_allow_any_when_every_candidate_agrees() {
+    let slice = ambiguous_slice(
+        vec![sidecar(
+            "ns-default-open",
+            "default",
+            None,
+            Some(OutboundTrafficPolicy::AllowAny),
+        )],
+        vec![
+            shared_spiffe_workload("reviews", &[("app", "reviews")]),
+            shared_spiffe_workload("ratings", &[("app", "ratings")]),
+        ],
+    );
+    assert_eq!(
+        slice.sidecar_outbound_traffic_policy,
+        Some(OutboundTrafficPolicy::AllowAny),
+        "unanimous candidates must not be tightened; the fold keeps precedence honest"
+    );
+}
+
+/// The fold is order-independent, so precedence stays deterministic across
+/// pods, reconciles, and translator emission order.
+#[test]
+fn ambiguous_label_resolution_is_order_independent() {
+    let sidecars = || {
+        vec![
+            sidecar(
+                "ns-default-open",
+                "default",
+                None,
+                Some(OutboundTrafficPolicy::AllowAny),
+            ),
+            sidecar(
+                "reviews-strict",
+                "default",
+                Some(selector_for("reviews", "default")),
+                Some(OutboundTrafficPolicy::RegistryOnly),
+            ),
+        ]
+    };
+    let workloads = || {
+        vec![
+            shared_spiffe_workload("reviews", &[("app", "reviews")]),
+            shared_spiffe_workload("ratings", &[("app", "ratings")]),
+        ]
+    };
+    let forward = ambiguous_slice(sidecars(), workloads());
+    let mut reversed_sidecars = sidecars();
+    reversed_sidecars.reverse();
+    let mut reversed_workloads = workloads();
+    reversed_workloads.reverse();
+    let reversed = ambiguous_slice(reversed_sidecars, reversed_workloads);
+    assert_eq!(
+        forward.sidecar_outbound_traffic_policy,
+        reversed.sidecar_outbound_traffic_policy
+    );
+    assert_eq!(
+        forward.sidecar_outbound_traffic_policy,
+        Some(OutboundTrafficPolicy::RegistryOnly)
+    );
+}
+
+/// Ambiguity does not bypass the rollout gate: with enforcement off, the
+/// workload tier stays absent and the mesh-wide policy remains in force.
+#[test]
+fn ambiguous_labels_still_respect_the_enforcement_gate() {
+    let config = config_with_mesh(MeshConfig {
+        sidecars: vec![sidecar(
+            "reviews-strict",
+            "default",
+            Some(selector_for("reviews", "default")),
+            Some(OutboundTrafficPolicy::RegistryOnly),
+        )],
+        workloads: vec![
+            shared_spiffe_workload("reviews", &[("app", "reviews")]),
+            shared_spiffe_workload("ratings", &[("app", "ratings")]),
+        ],
+        ..MeshConfig::default()
+    });
+    let request = MeshSliceRequest {
+        enforce_sidecar_egress: false,
+        ..ambiguous_request()
+    };
+    let slice = slice_for(&config, request);
+    assert!(slice.labels_ambiguous);
+    assert_eq!(
+        slice.sidecar_outbound_traffic_policy, None,
+        "the workload-scoped tier is gated by FERRUM_MESH_SIDECAR_ENFORCED"
+    );
+
+    let dry_run = MeshSliceRequest {
+        sidecar_egress_dry_run: true,
+        ..ambiguous_request()
+    };
+    let slice = slice_for(&config, dry_run);
+    assert_eq!(
+        slice.sidecar_outbound_traffic_policy, None,
+        "dry-run reports but never arms or disarms the registry gate"
+    );
+}
+
+// ── Canonical env docs / template parity ──────────────────────────────────
+
+const CONFIGURATION_MD: &str = include_str!("../../../docs/configuration.md");
+const FERRUM_CONF: &str = include_str!("../../../ferrum.conf");
+
+/// The pre-#3262 wording that presented the flag as narrowing-only.
+const STALE_NARROWING_ONLY_CLAIM: &str = "only gates the slice-";
+
+/// The canonical `docs/configuration.md` table row for a `FERRUM_*` setting.
+fn configuration_md_row(key: &str) -> &'static str {
+    let prefix = format!("| `{key}` |");
+    CONFIGURATION_MD
+        .lines()
+        .find(|line| line.starts_with(prefix.as_str()))
+        .unwrap_or_else(|| panic!("docs/configuration.md must document {key}"))
+}
+
+/// The `ferrum.conf` comment block immediately above a setting's commented
+/// assignment, plus the assignment line itself.
+fn ferrum_conf_block(key: &str) -> String {
+    let assignment = format!("# {key} = ");
+    let lines: Vec<&str> = FERRUM_CONF.lines().collect();
+    let idx = lines
+        .iter()
+        .position(|line| line.starts_with(assignment.as_str()))
+        .unwrap_or_else(|| panic!("ferrum.conf must template {key}"));
+    let mut start = idx;
+    while start > 0 && lines[start - 1].starts_with('#') {
+        start -= 1;
+    }
+    lines[start..=idx].join("\n")
+}
+
+/// `FERRUM_MESH_SIDECAR_ENFORCED` no longer gates slice narrowing alone: it also
+/// gates `ingress[]` materialization and the workload-scoped
+/// `outboundTrafficPolicy`, where an operator- or tenant-authored `ALLOW_ANY`
+/// can override a stricter mesh-wide / env default. The canonical docs and the
+/// template must say so, or operators enable the flag without seeing that
+/// consequence.
+#[test]
+fn sidecar_enforced_docs_describe_every_gated_application() {
+    let row = configuration_md_row("FERRUM_MESH_SIDECAR_ENFORCED");
+    let conf = ferrum_conf_block("FERRUM_MESH_SIDECAR_ENFORCED");
+    for (surface, block) in [
+        ("docs/configuration.md", row),
+        ("ferrum.conf", conf.as_str()),
+    ] {
+        for needle in [
+            "outboundTrafficPolicy",
+            "ingress[]",
+            "ALLOW_ANY",
+            "registry_only",
+            "dry-run",
+        ] {
+            assert!(
+                block.contains(needle),
+                "{surface} FERRUM_MESH_SIDECAR_ENFORCED docs must mention {needle:?}"
+            );
+        }
+    }
+    assert!(
+        !CONFIGURATION_MD.contains(STALE_NARROWING_ONLY_CLAIM),
+        "docs/configuration.md must not retain the stale slice-narrowing-only claim"
+    );
+    assert!(
+        !FERRUM_CONF.contains(STALE_NARROWING_ONLY_CLAIM),
+        "ferrum.conf must not retain the stale slice-narrowing-only claim"
+    );
+}
+
+/// Dry-run deliberately does NOT apply the workload-scoped policy (arming or
+/// disarming the registry gate is a live behavior change), so both canonical
+/// surfaces must say so next to the flag operators actually set.
+#[test]
+fn sidecar_dry_run_docs_disclaim_the_workload_scoped_policy() {
+    let row = configuration_md_row("FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN");
+    let conf = ferrum_conf_block("FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN");
+    for (surface, block) in [
+        ("docs/configuration.md", row),
+        ("ferrum.conf", conf.as_str()),
+    ] {
+        assert!(
+            block.contains("outboundTrafficPolicy"),
+            "{surface} dry-run docs must name the workload-scoped policy it skips"
+        );
+        assert!(
+            block.contains("ingress[]"),
+            "{surface} dry-run docs must name the ingress[] materialization it skips"
+        );
+    }
 }

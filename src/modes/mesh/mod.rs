@@ -9432,9 +9432,14 @@ fn inject_mesh_global_plugins(
     // (no plugin) so non-mesh and permissive deployments pay zero per-request
     // cost. `effective_outbound_traffic_policy` is the single source of that
     // precedence — `refresh_mesh_outbound_enforcement` reads the same one for
-    // the stream-family lane, so HTTP and stream can never disagree.
-    let runtime_default = runtime.outbound_traffic_policy;
-    let effective_outbound_policy = mesh_slice.effective_outbound_traffic_policy(runtime_default);
+    // the stream-family lane, so the two families can never disagree about
+    // whether the gate is ARMED. Their registry CONTENTS can still differ: this
+    // lane is handed the merged materialization slice (remote-cluster endpoints
+    // unioned in) while the stream lane reads the un-merged base slice, so a
+    // multicluster remote destination can be admitted here and refused there
+    // (fail-closed on the stream side).
+    let effective_outbound_policy =
+        mesh_slice.effective_outbound_traffic_policy(runtime.outbound_traffic_policy);
     if matches!(
         effective_outbound_policy,
         crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly
@@ -9638,16 +9643,22 @@ fn mesh_outbound_registry_listen_ports(runtime: &MeshRuntimeConfig) -> Vec<u16> 
 ///
 /// "Effective" is resolved by the shared `MeshSlice::effective_outbound_traffic_policy`
 /// (workload-scoped Sidecar → mesh-wide slice → env default, issue #3262), the
-/// same call `inject_mesh_global_plugins` makes for the HTTP-family lane. Clearing
-/// the slot on an `AllowAny` slice is what makes an update/delete that RELAXES the
-/// policy take effect immediately instead of leaving a stale gate armed.
+/// same call `inject_mesh_global_plugins` makes for the HTTP-family lane, so the
+/// two families can never disagree about whether the gate is ARMED. The admitted
+/// registry CONTENTS are NOT shared: this lane builds from the `slice` it is
+/// handed (the un-merged base slice at the apply site), while HTTP-family
+/// injection builds from the merged materialization slice, so on the multicluster
+/// path a poller-discovered remote destination can be in the HTTP registry and
+/// absent here — a stream connect to it is then refused, which is the
+/// fail-closed direction. Clearing the slot on an `AllowAny` slice is what makes
+/// an update/delete that RELAXES the policy take effect immediately instead of
+/// leaving a stale gate armed.
 fn refresh_mesh_outbound_enforcement(
     proxy_state: &ProxyState,
     runtime: &MeshRuntimeConfig,
     slice: &MeshSlice,
 ) {
-    let runtime_default = runtime.outbound_traffic_policy;
-    let effective_policy = slice.effective_outbound_traffic_policy(runtime_default);
+    let effective_policy = slice.effective_outbound_traffic_policy(runtime.outbound_traffic_policy);
     let next = if matches!(
         effective_policy,
         crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly

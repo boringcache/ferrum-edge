@@ -1428,6 +1428,8 @@ Stream decisions are exported via a sibling counter `ferrum_mesh_outbound_regist
 
 Enforcement is keyed on the runtime's mesh outbound capture listener port set. Stream proxies bound to other ports (inbound, admin, HBONE, east-west gateway, egress gateway) flow through unchanged — outbound policy never gates inbound traffic.
 
+Both lanes decide **whether the gate is armed** from the same resolved effective policy, so HTTP-family and stream-family enforcement can never disagree about that. They do not necessarily share the same admitted **registry contents**: on the multicluster path the HTTP-family registry is built from the merged materialization view (poller-discovered remote-cluster workloads and services unioned in), while the stream-family enforcement slot is built from the un-merged slice. A remote-cluster destination learned only through multi-cluster endpoint discovery can therefore be admitted for an HTTP request and refused for a raw stream connect to the same destination — asymmetric, but in the fail-closed direction. Embedding the remote clusters in the slice itself (rather than discovering them via `RemoteCluster.control_plane_url` polling) makes both lanes see the same set.
+
 ## Sidecar Outbound Traffic Policy
 
 Istio's `Sidecar` resource carries an `outboundTrafficPolicy` block that **overrides the mesh-wide `MeshConfig.outboundTrafficPolicy`** for exactly the workloads that `Sidecar` selects. Ferrum translates it into `MeshSidecar.outbound_traffic_policy`, resolves the applicable `Sidecar` at slice build, and carries the result on `MeshSlice.sidecar_outbound_traffic_policy`.
@@ -1456,7 +1458,21 @@ The effective policy for a workload is resolved once per slice apply, most speci
 
 Both directions of the override are honored, matching Istio: a `Sidecar` set to `REGISTRY_ONLY` tightens an otherwise-`ALLOW_ANY` mesh, and a `Sidecar` set to `ALLOW_ANY` relaxes the registry gate for its selected workloads only. A `Sidecar` that **omits** `outboundTrafficPolicy` inherits the mesh-wide value; unlike `egress`, there is no inheritance walk to a less-specific `Sidecar`, because Istio resolves exactly one `Sidecar` per workload.
 
-The applicable `Sidecar` is selected with the same tier precedence as [`ingress[]`](#sidecar-ingress-listeners) — workload-scoped → root workload-scoped → namespace-default → root-namespace-default, ASCII-smallest `name` as the tiebreak.
+The applicable `Sidecar` is selected with the same tier precedence as [`ingress[]`](#sidecar-ingress-listeners) — workload-scoped → root workload-scoped → namespace-default → root-namespace-default, ASCII-smallest `name` as the tiebreak. Ferrum performs that selection **once** per slice build and shares it with `ingress[]` materialization; the two run under the same gate over the same labels.
+
+#### A root-namespace `workloadSelector` outranks the workload namespace's default (differs from Istio)
+
+In the `Sidecar`-selection order just above, the **root workload-scoped** tier — a `Sidecar` in the Istio root namespace (`FERRUM_K8S_ISTIO_ROOT_NAMESPACE`, default `istio-system`) carrying an explicit `workloadSelector` that matches this workload — is ranked **above** the **namespace-default** tier, a selector-less `Sidecar` in the workload's *own* namespace. Istio orders these the other way: it resolves the workload's own namespace completely before consulting the root namespace at all.
+
+The divergence is deliberate and security-oriented. The root namespace belongs to the mesh operator and a tenant cannot write to it, so ranking the operator's **targeted** rule above a tenant's **catch-all** means a namespace-wide default dropped into a tenant namespace cannot displace a mesh-wide rule aimed at specific workloads. A tenant can still override with an equally specific rule: a `workloadSelector` `Sidecar` in their own namespace still wins the top (workload-scoped) tier.
+
+Since this ordering now also decides the workload-scoped `outboundTrafficPolicy`, it controls whether the outbound registry gate is armed — not just egress scoping. Concretely: a root-namespace `Sidecar` selecting `app: payments` with `mode: REGISTRY_ONLY` keeps the gate armed for those pods even if the `payments` namespace also holds a selector-less `Sidecar` with `mode: ALLOW_ANY`.
+
+#### Ambiguous workload labels resolve to the strictest applicable policy
+
+When several workloads share one SPIFFE id with **divergent** label sets and the data plane supplied no explicit `FERRUM_MESH_WORKLOAD_LABELS`, the slice's labels are only the *intersection* of those sets (the slice is marked `labels_ambiguous`). A `workloadSelector` `Sidecar` that really does select one of those workloads can then fail to match that intersection.
+
+Rather than let that silently fall through to a laxer tier, Ferrum resolves the policy against **each** candidate label set and keeps the strictest result, ranked `REGISTRY_ONLY` > *inherit* > `ALLOW_ANY` (*inherit* outranks `ALLOW_ANY` because the mesh-wide tier it defers to may itself be `REGISTRY_ONLY`). The fold includes the intersection-derived answer, so ambiguity can only ever **tighten** the gate, never relax it; the result is order-independent, so precedence stays deterministic. When ambiguity actually changes the outcome, the control plane emits a `warn!` naming both the intersection result and the resolved one. Supplying explicit workload labels — or distinct SPIFFE ids — resolves it exactly.
 
 ### What `ALLOW_ANY` does and does not relax
 
@@ -1484,8 +1500,9 @@ The workload-scoped policy is applied **only** under `FERRUM_MESH_SIDECAR_ENFORC
 | `mode: REGISTRY_ONLY` | `REGISTRY_ONLY` for the selected workloads. |
 | Present, `mode` omitted | **`REGISTRY_ONLY`** — the Istio proto zero value of `OutboundTrafficPolicy.Mode`, which is also the conservative reading. Reported in `deferred_fields` so the implicit mode is never silent. |
 | `mode` unrecognized or not a string (`ALOW_ANY`, a whitespace-padded token, the numeric proto form, …) | **`REGISTRY_ONLY` (fail closed)** — the intent is ambiguous. The raw value is never echoed into the status. |
-| Block is not an object | **`REGISTRY_ONLY` (fail closed)** — malformed shape. |
-| `egressProxy` set | **`REGISTRY_ONLY` (fail closed)**, regardless of the declared `mode`. Ferrum cannot funnel unmatched egress through a named `Destination`; ignoring the field would send traffic the operator scoped to an egress gateway straight out instead. |
+| Block is not an object — including an explicit `outboundTrafficPolicy: null` | **`REGISTRY_ONLY` (fail closed)** — malformed shape. An explicit top-level `null` is *not* normalized to "omitted": the top level is what decides whether a workload-scoped policy exists at all, and an operator who wrote the key asked for one, so the ambiguity fails closed instead of inheriting a possibly-laxer mesh-wide value. |
+| `egressProxy` set to a non-null value | **`REGISTRY_ONLY` (fail closed)**, regardless of the declared `mode`. Ferrum cannot funnel unmatched egress through a named `Destination`; ignoring the field would send traffic the operator scoped to an egress gateway straight out instead. |
+| `egressProxy: null` | Treated as **absent** (proto-JSON for "unset", the same normalization `mode: null` gets), so the declared `mode` is honored. |
 
 The resource is **never rejected** over this field. A rejected `Sidecar` is dropped from the translation entirely, which would also drop its `egress` narrowing and thereby *widen* both the workload's service view and the registry derived from it — the opposite of failing closed. On the native/file source the field is a closed enum (`allow_any` / `registry_only`), so an invalid value fails deserialization and the whole document is rejected, keeping the last good config.
 
@@ -1494,10 +1511,10 @@ The resource is **never rejected** over this field. A rejected `Sidecar` is drop
 The `Sidecar` `status.ferrum.translation` block reports:
 
 - `outbound_traffic_policy` — the classified workload-scoped outcome: `ALLOW_ANY`, `REGISTRY_ONLY`, or `Inherit`. `Inherit` means the effective mode still comes from the mesh-wide/runtime tier; a fail-closed degradation reads `REGISTRY_ONLY`.
-- `outbound_traffic_policy_enforced` — whether the enforcement gate above is on. A translated-but-inert policy is distinguishable from a live one.
+- `outbound_traffic_policy_enforced` — **resource-local eligibility**, deliberately narrow: `true` means only that this `Sidecar` carries a translatable workload-scoped policy *and* the enforcement gate above is on. It does **not** mean this `Sidecar` was selected for any workload — selection is per-workload and happens later, at slice build, against that workload's own namespace and labels. A `Sidecar` whose `workloadSelector` matches nothing still reports `true`. Use it to tell a translated-but-inert policy from an eligible one, not as proof that a given pod is gated. A **rejected** `Sidecar` reports `false` explicitly (a dropped resource enforces nothing).
 - `deferred_fields` — the field-specific reason for any fail-closed degradation.
 
-The translator and the status writer share one classification predicate, so a degradation can never be enforced without being reported (or reported without being enforced). Each degradation also emits one `warn!` at translation time.
+The translator and the status writer share one classification predicate, so a degradation can never be enforced without being reported (or reported without being enforced). Because the status is rewritten on every reconcile it is the always-current surface; logging is deliberately quieter, since a permanently unrepresentable `Sidecar` is re-translated on every reconcile and full sync. Each degradation emits a `debug!` carrying the namespace, name, and reason (never the operator-supplied raw value), plus exactly **one** `warn!` per process pointing at this status block.
 
 ### xDS / file / native parity
 

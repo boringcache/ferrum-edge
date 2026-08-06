@@ -1111,3 +1111,125 @@ fn sidecar_outbound_traffic_policy_status_does_not_echo_the_raw_mode_value() {
         json!("REGISTRY_ONLY")
     );
 }
+
+/// An explicit `egressProxy: null` is proto-JSON for "unset": the declared mode
+/// is honored and no `egressProxy` reason is deferred. A NON-null value still
+/// fails closed.
+#[test]
+fn sidecar_null_egress_proxy_is_reported_as_absent() {
+    let enforced = options().with_mesh_sidecar_ingress_enforced(true);
+    let obj = object(
+        "networking.istio.io/v1",
+        "Sidecar",
+        "sc-null-proxy",
+        json!({
+            "outboundTrafficPolicy": { "mode": "ALLOW_ANY", "egressProxy": null },
+        }),
+    );
+    let updates = plan_istio_status_updates(&[obj], enforced.clone());
+    let translation = sidecar_translation(&updates, "sc-null-proxy");
+    assert_eq!(translation["outbound_traffic_policy"], json!("ALLOW_ANY"));
+    assert_eq!(
+        translation["deferred_fields"],
+        json!([]),
+        "a null egressProxy is unset, so nothing is deferred"
+    );
+
+    let obj = object(
+        "networking.istio.io/v1",
+        "Sidecar",
+        "sc-real-proxy",
+        json!({
+            "outboundTrafficPolicy": {
+                "mode": "ALLOW_ANY",
+                "egressProxy": { "host": "istio-egressgateway.istio-system.svc.cluster.local" },
+            },
+        }),
+    );
+    let updates = plan_istio_status_updates(&[obj], enforced);
+    let translation = sidecar_translation(&updates, "sc-real-proxy");
+    assert_eq!(
+        translation["outbound_traffic_policy"],
+        json!("REGISTRY_ONLY")
+    );
+    let deferred = translation["deferred_fields"]
+        .as_array()
+        .expect("deferred_fields array");
+    assert!(
+        deferred
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|entry| entry.contains("egressProxy is not supported")),
+        "a real egressProxy must still defer its own reason, got {deferred:?}"
+    );
+}
+
+/// `outbound_traffic_policy_enforced` is deliberately RESOURCE-LOCAL: it means
+/// "this Sidecar carries a translatable policy AND the rollout gate is on", not
+/// "this Sidecar was selected for some workload". A `workloadSelector` matching
+/// nothing still reports `true`, and the condition message must not overclaim
+/// live per-workload enforcement.
+#[test]
+fn sidecar_outbound_policy_enforced_flag_is_resource_local_not_workload_selection() {
+    let obj = object(
+        "networking.istio.io/v1",
+        "Sidecar",
+        "sc-selects-nothing",
+        json!({
+            "workloadSelector": { "labels": { "app": "no-such-workload" } },
+            "outboundTrafficPolicy": { "mode": "REGISTRY_ONLY" },
+        }),
+    );
+    let updates =
+        plan_istio_status_updates(&[obj], options().with_mesh_sidecar_ingress_enforced(true));
+    let translation = sidecar_translation(&updates, "sc-selects-nothing");
+    assert_eq!(
+        translation["outbound_traffic_policy_enforced"],
+        json!(true),
+        "the flag reports the gate + a translatable policy, not per-workload selection"
+    );
+    let message = sidecar_condition(&updates, "sc-selects-nothing")["message"]
+        .as_str()
+        .expect("condition message");
+    assert!(
+        message.contains("for the workloads this Sidecar is selected for"),
+        "the message must scope enforcement to the selected workloads rather than \
+         claiming it is live everywhere, got {message}"
+    );
+}
+
+/// A REJECTED Sidecar is dropped from the translation entirely, so it enforces
+/// nothing. Its detail block must carry the explicit `false` qualifier — an
+/// `outbound_traffic_policy` with no sibling flag reads as enforced.
+#[test]
+fn rejected_sidecar_reports_outbound_policy_as_not_enforced() {
+    let obj = object(
+        "networking.istio.io/v1",
+        "Sidecar",
+        "sc-rejected",
+        json!({
+            // `ingress` must be an array — this rejects the whole resource.
+            "ingress": "not-an-array",
+            "outboundTrafficPolicy": { "mode": "REGISTRY_ONLY" },
+        }),
+    );
+    let updates =
+        plan_istio_status_updates(&[obj], options().with_mesh_sidecar_ingress_enforced(true));
+    let condition = sidecar_condition(&updates, "sc-rejected");
+    assert_eq!(
+        condition["status"].as_str(),
+        Some("False"),
+        "the fixture must actually be rejected, or the assertion below is vacuous"
+    );
+    let translation = sidecar_translation(&updates, "sc-rejected");
+    assert_eq!(
+        translation["outbound_traffic_policy"],
+        json!("REGISTRY_ONLY"),
+        "the classified mode is still reported for diagnosis"
+    );
+    assert_eq!(
+        translation["outbound_traffic_policy_enforced"],
+        json!(false),
+        "a dropped resource enforces nothing; the qualifier must be explicit"
+    );
+}
