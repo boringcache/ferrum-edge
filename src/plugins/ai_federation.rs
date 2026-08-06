@@ -6606,6 +6606,24 @@ impl Plugin for AiFederation {
         true
     }
 
+    /// A claimed stream decides on the exact backend-visible representation in
+    /// `on_final_request_body_with_context` and can REFUSE it (destination drift,
+    /// ambiguous duplicate JSON members, a model that no longer satisfies the
+    /// routed policy, a request that no longer asks for a stream). That promise
+    /// is only real if nothing egressed the body earlier, so composition
+    /// admission must refuse a chain in which a plugin still declares
+    /// `egresses_request_body_before_finalization()`.
+    ///
+    /// Deliberately conditional rather than the unconditional `true` the source
+    /// scan in `plugin_cache_tests` inventories: with `streaming` absent this
+    /// plugin has no rejecting final request-body hook at all. The value is
+    /// authoritative at candidate admission too, because `ai_federation` is fully
+    /// constructed there (`SECURITY_COMPOSITION_PLUGIN_NAMES`) rather than
+    /// admitted through a static capability view.
+    fn enforces_finalized_request_policy(&self) -> bool {
+        self.streaming.enabled
+    }
+
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         if ctx.method != "POST" {
             return false;

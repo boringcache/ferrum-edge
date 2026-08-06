@@ -457,7 +457,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer be composed with `request_deduplication` or `response_caching` on the
   same proxy; instances without the block are unaffected. The `streaming` block
   accepts `enabled`, `max_event_bytes`, and `read_timeout_seconds` and rejects
-  every other key.
+  every other key. Those refusals (and the `hmac_auth` request-body-transformer
+  refusal) are now enforced at candidate/admin-write admission as well as at
+  runtime plugin-cache construction: `ai_federation` joined the
+  security-composition candidate inventory, so an admin write can no longer
+  persist a chain that only the runtime build would reject. A streaming instance
+  additionally declares `enforces_finalized_request_policy()`, because its
+  final request-body hook can refuse the backend-visible representation.
 - Reqwest backend TLS clients built via `use_preconfigured_tls` /
   `BackendTlsConfigBuilder::build_rustls_for_reqwest` now advertise ALPN
   `[h2, http/1.1]` unless the proxy forces HTTP/1.1 (`h2UpgradePolicy:

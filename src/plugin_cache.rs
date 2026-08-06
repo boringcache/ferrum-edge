@@ -3408,6 +3408,13 @@ struct ProxyGroupPluginInstance {
 /// fully constructed.
 const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "a2a_gateway",
+    // A streaming-enabled `ai_federation` reports request header/body/destination
+    // mutation and a backend-boundary header policy, so candidate admission must
+    // construct it: otherwise the documented `request_deduplication` /
+    // `response_caching` / `hmac_auth` refusals would only appear at runtime cache
+    // construction, letting an admin write persist a config that then rejects
+    // every subsequent reload. Construction is pure config parsing.
+    "ai_federation",
     "ai_prompt_compressor",
     "ai_prompt_shield",
     "ai_rate_limiter",
