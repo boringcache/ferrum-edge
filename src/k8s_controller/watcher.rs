@@ -200,6 +200,27 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
         plural: "referencegrants",
         namespaced: true,
     },
+    // BackendLBPolicy was removed from the Gateway API experimental channel in
+    // v1.3+ (replaced by XBackendTrafficPolicy). Keep watching the historical
+    // v1alpha2 shape so clusters that still install the older CRD get sticky
+    // session translation; discovery skips cleanly when the CRD is absent.
+    CrdSpec {
+        group: "gateway.networking.k8s.io",
+        version: "v1alpha2",
+        kind: "BackendLBPolicy",
+        plural: "backendlbpolicies",
+        namespaced: true,
+    },
+    // Successor to BackendLBPolicy on the pinned v1.5.1 experimental channel
+    // (gateway.networking.x-k8s.io). Representable cookie session persistence
+    // is translated; unsupported retry budgets reject the whole policy.
+    CrdSpec {
+        group: "gateway.networking.x-k8s.io",
+        version: "v1alpha1",
+        kind: "XBackendTrafficPolicy",
+        plural: "xbackendtrafficpolicies",
+        namespaced: true,
+    },
 ];
 
 pub const K8S_CORE_RESOURCES: &[CoreResourceSpec] = &[
@@ -1426,6 +1447,17 @@ mod tests {
         }));
         assert!(GATEWAY_API_CRDS.iter().any(|resource| {
             resource.kind == "ReferenceGrant" && resource.version == "v1" && resource.namespaced
+        }));
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "BackendLBPolicy"
+                && resource.version == "v1alpha2"
+                && resource.namespaced
+        }));
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "XBackendTrafficPolicy"
+                && resource.group == "gateway.networking.x-k8s.io"
+                && resource.version == "v1alpha1"
+                && resource.namespaced
         }));
     }
 

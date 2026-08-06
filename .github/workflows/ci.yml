@@ -1058,6 +1058,7 @@ jobs:
               functional_admin_observability_test
               functional_admin_operations_test
               functional_auth_acl_test
+              functional_backend_lb_session_persistence_test
               functional_credential_rotation_test
               functional_file_mode_test
               functional_host_only_routing_test
@@ -1067,6 +1068,7 @@ jobs:
               functional_router_cache_test
               functional_secrets_test
               functional_ai_plugins_test
+              functional_a2a_gateway_grpc_card_test
               functional_ai_response_guard_grpc_test
               functional_ai_stream_router_test
               functional_ai_transcript_audit_grpc_test

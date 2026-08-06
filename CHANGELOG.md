@@ -21,6 +21,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callback-lock recursion, raced handoff, stale state, and `ktime` wrap from
   fabricating samples. The metric has fixed microsecond buckets with saturating
   count/bucket counters, drops sum overflow, and adds no per-flow labels (#3309).
+- **BREAKING (`a2a_gateway`)**: `endpoint.grpc_services` now defaults to the
+  canonical A2A 0.3 service `a2a.v1.A2AService` (package `a2a.v1`, from
+  `a2aproject/A2A` at tag `v0.3.0`) instead of A2A 1.0's
+  `lf.a2a.v1.A2AService`, and every configured entry now carries a declared
+  Agent Card wire layout (issue #3297). The default is the identity whose card
+  layout the default `endpoint.protocol_versions` (`0.3.0`) actually describes;
+  the previous pairing detected 1.0's service name while implementing 0.3's
+  payload, so canonical 0.3 traffic was missed by defaults and genuine 1.0
+  traffic was fed to a 0.3 decoder. Entries may still be plain service-name
+  strings — a published A2A name resolves to the layout the specification gives
+  it (`a2a.v1.A2AService` -> `a2a-0.3`, `lf.a2a.v1.A2AService` -> `a2a-1.0`) and
+  any custom name resolves to `none` — or the explicit
+  `{service, card_schema}` object form a custom deployment uses to declare
+  which published layout its own service serves. Declaring a `card_schema` that
+  contradicts a published A2A service name is rejected at admission; the layout
+  is a property of the protocol, not of the deployment. Detection, method
+  policy, and `a2a.*` metadata are unchanged for every schema, but Agent Card
+  protobuf rewriting is implemented only for `a2a-0.3` and fails closed with
+  `agent_card_grpc_schema_unsupported` (`a2a-1.0`) or
+  `agent_card_grpc_schema_undeclared` (`none`) before a byte of the reply is
+  decoded — a 1.0 card is never interpreted with 0.3 field numbers. Deployments
+  fronting a 1.0 or custom service should set
+  `discovery.rewrite_agent_card_urls: false` or declare
+  `card_schema: a2a-0.3`.
+- `a2a_gateway` rewrites unary gRPC Agent Card protobuf payloads (A2A 0.3.x
+  wire layout) with the same JSON-RPC endpoint URL policy as HTTP cards,
+  clears invalidated signatures, and fails closed on unsupported versions or
+  malformed/compressed frames (issue #3297). The rewritten frame is emitted
+  from its first byte through `BoundedResponseBodySink`: a bounded counting
+  pass supplies the gRPC frame prefix and every `AgentInterface` length
+  prefix, so no complete would-be replacement — and no interface submessage —
+  is ever materialised outside the reserved construction sink
+  (GHSA-pwcm-6rh8-f2gh). Only a proven-successful reply is inspected (HTTP
+  `200` plus a terminal `grpc-status` of exactly `0`, read from the merged
+  header+trailer view), so a non-OK upstream response is forwarded as written
+  instead of being mistaken for a card; refusals are trailers-only gRPC
+  `INTERNAL` under HTTP `200` with an empty body, never a synthetic 5xx or an
+  HTTP body on a native gRPC stream. The 0.3.x layout gate is positive AND
+  exact: the card must carry an explicit `protocol_version` (field 16) whose
+  value equals a configured `endpoint.protocol_versions` entry — that list has
+  no family or wildcard syntax, so `["0.3.0"]` refuses `0.3.99` — and the
+  matched version must belong to the implemented 0.3 family, so an exactly
+  configured `1.0.0` is refused too. An absent or empty `protocol_version`
+  fails closed with `unsupported_agent_card_protobuf_version` regardless of
+  configuration, because A2A renumbered `AgentCard` for 1.0 (field 3 became
+  `supported_interfaces`, `signatures` moved 17 -> 13, field 14 became
+  `icon_url`, `protocol_version` was removed) and proto3 cannot distinguish an
+  unset field from `""` — guessing would flatten each interface submessage
+  into a bare URL and re-serve the card under its now-invalid original
+  signature. All seventeen known 0.3 top-level fields are schema-validated
+  before any rewrite — the declared wire type (including a canonical `0`/`1`
+  varint for `supports_authenticated_extended_card`), at-most-once
+  multiplicity for every singular field, and UTF-8 for every known string that
+  gets re-emitted — so a malformed known field can no longer be preserved
+  verbatim beside rewritten siblings once the signature block is dropped. The
+  submessages the rewriter preserves rather than parses (`provider`,
+  `capabilities`, `security_schemes`, `security`, `skills`, `signatures`) are
+  checked for shape only and are not claimed to be deeply validated; the one
+  nested exception is every `AgentInterface`, whose `url` is required and
+  proven, because an interface without a usable URL would otherwise be the only
+  evidence a "rewritten" card advertised an endpoint at all. The protobuf
+  decoder rejects over-long / out-of-range / non-canonical varints, field
+  numbers outside `1..=2^29-1`, and unrepresentable length prefixes. Every
+  rewritable URL field must parse as a bounded absolute `http`/`https` URL with
+  a real host and no embedded credentials — a scheme prefix is not proof — and
+  anything else fails closed with
+  `agent_card_protobuf_url_layout_mismatch`. A card the plugin admitted whose
+  rewrite never reaches the client fails closed with
+  `agent_card_grpc_rewrite_not_applied`. Operators fronting a non-0.3 A2A
+  backend should set `discovery.rewrite_agent_card_urls: false`; leaving it
+  enabled refuses such cards rather than serving un-rewritten internal URLs.
+  The absolute-URL proof requires an explicit canonical authority spelling
+  before any path, query, or fragment; ambiguous recovery forms such as
+  `http:///a2a` fail closed because hostile wire input can be parsed differently
+  by downstream consumers.
+- `a2a_gateway` now enrolls in `request_deduplication` replay presentation
+  provenance, because its Agent Card rewrite is a client-facing transform that
+  a finalized replay deliberately skips (issue #3297). Every retained response
+  is stamped with a content digest of the plugin's whole accepted
+  configuration, so a change to `discovery.public_base_url`, `endpoint.path`,
+  `endpoint.agent_card_path`, `endpoint.protocol_versions`,
+  `discovery.rewrite_agent_card_urls`, or `enabled` retires representations
+  captured under the old settings instead of replaying a card that advertises
+  a superseded endpoint. The request-derived mode is the exception:
+  with `discovery.public_base_url` unset and
+  `discovery.trust_forwarded_headers` enabled, the rewritten origin comes from
+  per-request forwarded headers and from the connection's TLS SNI, neither of
+  which the deduplication fingerprint binds, so configuration admission now
+  rejects that pairing with HTTP 400 and the runtime retains and replays
+  nothing. The refusal is per instance — a configured-public-base
+  `a2a_gateway` composes with `request_deduplication` exactly as before.
+- The `a2a_gateway` gRPC Agent Card functional harness no longer converts
+  deterministic startup failures into retries or blocks without a bound
+  (issue #3297). The gateway child's stdout/stderr are captured to per-attempt
+  files, and a spawn attempt is retried ONLY when those diagnostics demonstrate
+  an address-in-use bind race — the one failure a fresh port pair can fix. A
+  config parse error, a child panic, a failed readiness/authentication check, or
+  any other deterministic fault now fails immediately with a bounded tail of the
+  child's output (the per-attempt bearer token redacted) instead of being
+  re-rolled into "did not start after 3 attempts". Every live gRPC call carries
+  a per-call timeout, and the reload poll loop hands each call the smaller of
+  that ceiling and its own remaining deadline while checking the child for death
+  on every iteration, so a wedged or dead gateway fails diagnostically rather
+  than hanging. Simultaneously-held proxy/admin port reservations and
+  owned-process readiness are unchanged, and no fixed sleep became a success
+  criterion.
 - `ai_transcript_audit` native gRPC payload capture via an explicit descriptor-based
   `grpc` enrollment block (issue #3304). Enrolled methods are framed, bounded,
   schema-decoded, and redacted under the same capture `mode` contract as HTTP;

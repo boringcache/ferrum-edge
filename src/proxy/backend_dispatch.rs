@@ -272,23 +272,88 @@ pub(crate) fn select_upstream_target(
         port_scope,
         subset_name,
     );
-    let (hash_key, needs_set) = resolve_hash_key(&strategy, client_ip, proxy_headers);
+    let (mut hash_key, mut needs_set) = resolve_hash_key(&strategy, client_ip, proxy_headers);
 
     let selected_balancer = balancers.get_balancer(&proxy.namespace, upstream_id);
+
+    let effective_algorithm = LoadBalancerCache::effective_algorithm_from(
+        balancers,
+        &proxy.namespace,
+        upstream_id,
+        port_scope,
+        subset_name,
+    );
+
+    // Gateway API session persistence (BackendLBPolicy / XBackendTrafficPolicy
+    // `sessionPersistence: Cookie`): a request that presents the affinity
+    // cookie must return to the EXACT backend that produced the initial
+    // response, not merely to a deterministic one. `resolve_hash_key` has
+    // already extracted the cookie value; resolve it through the balancer's
+    // precomputed token→target binding index instead of feeding an opaque token
+    // into the consistent-hash ring (which has no reason to land back on the
+    // minting target).
+    //
+    // Fallback contract — documented because Gateway API only requires
+    // persistence for a *valid* session and explicitly permits re-selection
+    // once the pinned endpoint is no longer eligible: when the token is
+    // missing, malformed/oversized, scoped to another route/service/namespace/
+    // policy, stale after the backend was removed, outside the current
+    // subset/port pool, or currently unhealthy, the request falls through to
+    // ordinary load-balanced selection (hashing on client IP, exactly as a
+    // first-ever request does) and a fresh, correctly bound cookie is minted on
+    // the response. This never dials an ineligible target and never bypasses
+    // health, subset, port, TLS, authorization, retry, or connection-limit
+    // semantics — it only decides which pool member to prefer.
+    //
+    // Restricted to consistent-hashing lanes so PASSTHROUGH and the other
+    // algorithms keep their existing behavior unchanged.
+    let mut sticky_rebind_needed = false;
+    if !needs_set
+        && effective_algorithm == Some(LoadBalancerAlgorithm::ConsistentHashing)
+        && let HashOnStrategy::Cookie(ref presented_cookie_name) = strategy
+    {
+        match resolve_sticky_binding(
+            proxy,
+            balancers,
+            upstream_id,
+            &hash_key,
+            presented_cookie_name,
+            port_scope,
+            subset_name,
+            Some(&health_ctx),
+        ) {
+            Some(target) => {
+                return UpstreamSelection {
+                    lb_hash_key: Some(hash_key),
+                    target: Some(target),
+                    balancer: selected_balancer,
+                    is_fallback: false,
+                    sticky_cookie_needed: false,
+                };
+            }
+            None => {
+                // Never log or echo the presented token. This arm also covers a
+                // binding whose target sits in a per-port policy lane that no
+                // longer elects this cookie — see `resolve_sticky_binding`.
+                debug!(
+                    proxy_id = %proxy.id,
+                    upstream_id = %upstream_id,
+                    "Session persistence: presented affinity cookie has no usable \
+                     backend binding, re-selecting and re-issuing"
+                );
+                hash_key = client_ip.to_owned();
+                needs_set = true;
+                sticky_rebind_needed = true;
+            }
+        }
+    }
 
     // PASSTHROUGH (Istio `loadBalancer.simple=PASSTHROUGH`): when this upstream's
     // effective algorithm is Passthrough, dial the captured original destination
     // if it matches a healthy target in the (subset∩port-scoped) candidate pool,
     // bypassing load balancing. Absent or unmatched orig-dst falls through to the
     // normal selection below, which treats Passthrough as round-robin.
-    if LoadBalancerCache::effective_algorithm_from(
-        balancers,
-        &proxy.namespace,
-        upstream_id,
-        port_scope,
-        subset_name,
-    ) == Some(LoadBalancerAlgorithm::Passthrough)
-    {
+    if effective_algorithm == Some(LoadBalancerAlgorithm::Passthrough) {
         match orig_dst {
             Some(dst) => {
                 if let Some(target) = LoadBalancerCache::select_passthrough_from(
@@ -408,7 +473,10 @@ pub(crate) fn select_upstream_target(
                     tp_override.then_some(tp),
                     subset_name,
                 );
-                resolve_hash_key(&tp_strategy, client_ip, proxy_headers).1
+                // A stale/foreign binding still has to be re-issued even when
+                // the landing port lane would consider the presented cookie
+                // "already set" — that cookie no longer binds a usable target.
+                resolve_hash_key(&tp_strategy, client_ip, proxy_headers).1 || sticky_rebind_needed
             } else {
                 needs_set
             };
@@ -515,10 +583,177 @@ pub(crate) fn hash_on_strategy_for_selected_target(
     )
 }
 
+/// Resolve a presented Gateway API session-persistence cookie to the backend it
+/// binds, or `None` when the caller must fall back to ordinary load-balanced
+/// selection and mint a fresh binding.
+///
+/// Two gates, both fail-closed:
+///
+/// 1. [`LoadBalancer::select_sticky`] resolves the opaque token inside the
+///    `(subset ∩ port)` candidate pool the caller would have load-balanced over,
+///    with the same active/passive health filtering.
+/// 2. The resolved target's OWN per-port policy lane must still elect this
+///    cookie. The lookup necessarily runs before the target is known, so gate 1
+///    is validated against the INITIAL dispatch port's lane — and when that port
+///    carries no per-port override the pool is the whole upstream, so a resolved
+///    target may sit in a *different* `dispatch_policy_port()` lane whose
+///    effective algorithm is not consistent hashing, or whose `hashOn` names a
+///    different cookie. Honoring a binding there would let a token reach past
+///    the per-port policy that actually governs the target — the precedence
+///    every other path applies through
+///    [`hash_on_strategy_for_selected_target`] and the post-selection
+///    recomputation in [`select_upstream_target`].
+///
+/// Cold path: reached only when a syntactically valid token was presented, and
+/// gate 2 costs two snapshot map lookups only when the target lands in a
+/// different lane than selection was scoped to. No allocation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_sticky_binding(
+    proxy: &Proxy,
+    balancers: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    presented_token: &str,
+    presented_cookie_name: &str,
+    selection_port_scope: Option<u16>,
+    subset_name: Option<&str>,
+    health: Option<&HealthContext<'_>>,
+) -> Option<Arc<UpstreamTarget>> {
+    let target = LoadBalancerCache::select_sticky_from(
+        balancers,
+        &proxy.namespace,
+        upstream_id,
+        presented_token,
+        selection_port_scope,
+        subset_name,
+        health,
+    )?;
+
+    let target_port = target.dispatch_policy_port();
+    let target_has_override =
+        has_effective_port_override(proxy, balancers, upstream_id, target_port);
+    let target_scope = target_has_override.then_some(target_port);
+    if target_scope == selection_port_scope {
+        // The binding landed in the very lane it was validated against.
+        return Some(target);
+    }
+
+    if LoadBalancerCache::effective_algorithm_from(
+        balancers,
+        &proxy.namespace,
+        upstream_id,
+        target_scope,
+        subset_name,
+    ) != Some(LoadBalancerAlgorithm::ConsistentHashing)
+    {
+        return None;
+    }
+    match LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+        balancers,
+        &proxy.namespace,
+        upstream_id,
+        target_scope,
+        subset_name,
+    ) {
+        HashOnStrategy::Cookie(name) if name == presented_cookie_name => Some(target),
+        _ => None,
+    }
+}
+
+/// Resolve the target a response must mint a fresh backend-bound affinity
+/// cookie for, or `None` when the response must leave the client's session
+/// cookie alone.
+///
+/// `selection_needs_set` is [`select_upstream_target`]'s decision, taken BEFORE
+/// any backend was dialed: `true` when the request presented no usable binding
+/// (a fresh one has to be minted), `false` when a valid binding was honored.
+/// That flag alone is not the answer, because every retry-capable dispatch path
+/// may rotate off the selected target after selection returned. A client left
+/// holding the honored cookie would be steered straight back to the backend
+/// that just failed — exactly what Gateway API session persistence must stop
+/// doing once the pinned endpoint is no longer usable, and retry rotation does
+/// not necessarily eject that endpoint. So a rotation is itself a reissue
+/// trigger, and the reissued cookie names the FINAL successful target.
+///
+/// `served_target` must be the target that ACTUALLY produced the response.
+/// Gateway-synthesized refusals that dialed nothing (mesh-transport and egress
+/// denials screened on a rotated candidate) pass `None`, so a rejected response
+/// never pins a client to a backend that did not serve it.
+///
+/// Callers still mint only when the returned target's own lane resolves to
+/// [`HashOnStrategy::Cookie`] (via [`hash_on_strategy_for_selected_target`]), so
+/// a rotation into a non-cookie port lane writes nothing.
+///
+/// Hot path: one pointer comparison in the common no-rotation case, at worst a
+/// structural compare of the target's sticky-identity fields (port, host, the
+/// per-port policy key, locality, path, and the small tag map). No allocation,
+/// no digest.
+#[inline]
+pub(crate) fn sticky_cookie_reissue_target<'a>(
+    selection_needs_set: bool,
+    selected_target: Option<&UpstreamTarget>,
+    served_target: Option<&'a UpstreamTarget>,
+) -> Option<&'a UpstreamTarget> {
+    let served = served_target?;
+    if selection_needs_set {
+        return Some(served);
+    }
+    match selected_target {
+        // The honored binding still names the backend that served the
+        // response: re-minting the identical token would be pure wire noise.
+        Some(selected) if same_affinity_endpoint(selected, served) => None,
+        _ => Some(served),
+    }
+}
+
+/// Whether two targets carry the same sticky identity, i.e. whether the token
+/// already held by the client also names the backend that served the response.
+///
+/// Delegates to [`crate::load_balancer::same_sticky_identity`], which lives
+/// beside the digest encoder (`write_sticky_target_identity`) so the two can no
+/// longer drift apart field by field. Comparing only `host:port` would skip
+/// reissue after a rotation onto a *different* target that happens to share a
+/// pod IP and port — a different Service, per-port policy lane, subset overlay,
+/// locality, or backend path override — leaving the client pinned to a backend
+/// that did not serve it. `weight` is excluded on both sides for the same reason
+/// it is excluded from the digest: it never changes which backend a pinned
+/// session reaches.
+///
+/// Both sides are compared as DIALED, i.e. after
+/// [`concretize_wildcard_target_for_request`] has replaced a wildcard host with
+/// the request authority. That is deliberate: this predicate only asks whether
+/// the response came from the endpoint the request was bound to, and two
+/// entries that concretize onto the same authority with every other identity
+/// field equal reach the same backend under the same policy. Which CONFIGURED
+/// identity a reissued cookie then names is a separate question, answered at the
+/// mint site by
+/// [`crate::load_balancer::LoadBalancer::configured_sticky_identity_target`].
+///
+/// Structural comparison rather than re-deriving two digests keeps this
+/// allocation-free; the encoding is injective over these fields, so equality
+/// here is exactly token equality.
+#[inline]
+fn same_affinity_endpoint(a: &UpstreamTarget, b: &UpstreamTarget) -> bool {
+    crate::load_balancer::same_sticky_identity(a, b)
+}
+
 /// Replace a wildcard upstream target host (for example `*.example.com`) with
 /// the concrete request authority that matched the route. This is used by mesh
 /// egress wildcard ServiceEntries with DNS/None resolution: the proxy route is
 /// wildcard-hosted, but the backend dial target must be the concrete authority.
+///
+/// The returned clone is a DIAL target: it drives connection, DNS resolution,
+/// SNI, pool keying, and circuit-breaker attribution for this request only. It
+/// is NOT the upstream's configured selection identity — `host` no longer
+/// matches any entry the load balancer was built from, so it is absent from the
+/// sticky-session binding index and from retry exclusion. Anything that must
+/// persist or exclude across attempts (sticky cookies; retry rotation) has to
+/// be expressed in the configured identity instead, via
+/// [`crate::load_balancer::LoadBalancer::configured_sticky_identity_target`].
+/// Retry selection then re-applies this same concretization before returning a
+/// dial-ready candidate (see [`select_next_retry_target`]).
+///
+/// A request authority that does not match the wildcard leaves the configured
+/// target untouched, so no concretization — and no binding — is invented for it.
 pub(crate) fn concretize_wildcard_target_for_request(
     target: Option<Arc<UpstreamTarget>>,
     request_host: Option<&str>,
@@ -1099,50 +1334,81 @@ pub(crate) fn resolve_hash_key(
     }
 }
 
-/// Select the next retry target with per-port DestinationRule awareness.
+/// Request-derived inputs shared by every retry-target selection path.
+pub(crate) struct RetryTargetRequest<'a> {
+    pub(crate) base_hash_key: &'a str,
+    pub(crate) client_ip: &'a str,
+    pub(crate) proxy_headers: &'a HashMap<String, String>,
+    pub(crate) request_authority: Option<&'a str>,
+}
+
+/// Select the next retry DIAL target with per-port DestinationRule awareness.
 ///
 /// Six retry sites (HTTP/H2, gRPC, and WebSocket in `src/proxy/mod.rs` plus
 /// the three H3 paths in `src/http3/{cross_protocol,server,websocket}.rs`)
-/// previously open-coded the same five-step sequence:
+/// previously open-coded the same five-step sequence. This helper owns the
+/// full retry-selection contract:
 ///
-/// 1. Compute the per-port override port that covers `prev_target` (if any).
-/// 2. If the failed target sits in an override lane, recompute the retry hash
+/// 1. Reconcile a concretized `prev_target` (wildcard dial clone) back to the
+///    exact CONFIGURED selection identity it came from, via
+///    [`LoadBalancerCache::configured_sticky_identity_target_from`]. Exclusion
+///    walks the configured target set; comparing a concrete dial host to a
+///    configured `*.example.com` entry would miss the just-tried backend.
+/// 2. Compute the per-port override port that covers that configured identity
+///    (if any).
+/// 3. If the failed target sits in an override lane, recompute the retry hash
 ///    key from the same effective selection strategy used by initial dispatch
 ///    (per-port, subset, then upstream) so consistent-hash buckets stay
 ///    consistent on the retry attempt; otherwise reuse the steady-state
 ///    `base_hash_key`.
-/// 3. Build a `HealthContext` whose `max_ejection_percent` honours the
+/// 4. Build a `HealthContext` whose `max_ejection_percent` honours the
 ///    per-port `passive_health_check` override when one is configured.
-/// 4. Dispatch to the appropriate `select_next_target_*_from` variant —
-///    subset-vs-no-subset crossed with port-vs-no-port (four variants).
-/// 5. Hand the next `Arc<UpstreamTarget>` back to the caller, which still
-///    owns its own URL building, circuit-breaker key updates, and per-protocol
-///    plumbing.
+/// 5. Dispatch to the appropriate `select_next_target_*_from` variant —
+///    subset-vs-no-subset crossed with port-vs-no-port (four variants) —
+///    excluding the exact configured identity (full routing/policy field set).
+/// 6. Re-concretize the selected CONFIGURED candidate with `request_authority`
+///    before returning, so callers receive a DIAL target ready for URL / DNS /
+///    SNI / pool / circuit-breaker use. A selected wildcard with missing or
+///    non-matching authority fails closed (`None`) rather than dialing the
+///    literal `*.example.com`.
 ///
-/// Drift between the open-coded copies of step 2 is what produced the H3
+/// `request_authority` must be the same validated inbound routing host already
+/// used for the initial
+/// [`concretize_wildcard_target_for_request`] call — never backend-controlled.
+///
+/// Drift between the open-coded copies of step 3 is what produced the H3
 /// retry hash-key bug fixed in commit `a8d62bd1`. Centralising the sequence
 /// here keeps future per-port LB additions from re-introducing that drift.
 ///
 /// # Performance
 ///
-/// Hot-path safe: `epoch.load_balancer` is an already-cloned `Arc` snapshot,
-/// `HealthContext` is borrowed, and the only allocation is the optional
-/// `String` produced by `resolve_hash_key()` when the override-lane branch
-/// fires. Steady-state retries with no port override reuse the borrowed
-/// `base_hash_key` with zero allocations.
+/// The ordinary no-retry path does not call this helper. On retry, all-concrete
+/// upstreams pay only the existing selection work (identity mapping is a
+/// precomputed boolean). Wildcard upstreams may scan the small configured
+/// target set for identity reconciliation; that cost is retry-only.
+/// `epoch.load_balancer` is an already-cloned `Arc` snapshot, `HealthContext`
+/// is borrowed, and the only steady-state allocation is the optional `String`
+/// from `resolve_hash_key()` on the override-lane branch (plus a dial clone
+/// when a wildcard candidate is selected).
 pub(crate) fn select_next_retry_target(
     state: &ProxyState,
     epoch: &RequestEpoch,
     proxy: &Proxy,
     prev_target: &UpstreamTarget,
-    base_hash_key: &str,
-    client_ip: &str,
-    proxy_headers: &HashMap<String, String>,
+    request: RetryTargetRequest<'_>,
 ) -> Option<Arc<UpstreamTarget>> {
     let upstream_id = proxy.upstream_id.as_deref()?;
 
-    let retry_override_port = crate::proxy::retry_port_override_dispatch_port(proxy, prev_target)
-        .filter(|port| {
+    // Configured selection identity for exclusion — not the dial clone.
+    let exclude_target = LoadBalancerCache::configured_sticky_identity_target_from(
+        &epoch.load_balancer,
+        &proxy.namespace,
+        upstream_id,
+        prev_target,
+    );
+
+    let retry_override_port =
+        crate::proxy::retry_port_override_dispatch_port(proxy, exclude_target).filter(|port| {
             LoadBalancerCache::has_port_override_state_from(
                 &epoch.load_balancer,
                 &proxy.namespace,
@@ -1163,10 +1429,10 @@ pub(crate) fn select_next_retry_target(
             Some(port),
             proxy.upstream_subset.as_deref(),
         );
-        rehashed = resolve_hash_key(&strategy, client_ip, proxy_headers).0;
+        rehashed = resolve_hash_key(&strategy, request.client_ip, request.proxy_headers).0;
         &rehashed
     } else {
-        base_hash_key
+        request.base_hash_key
     };
 
     let health_ctx = HealthContext {
@@ -1186,7 +1452,7 @@ pub(crate) fn select_next_retry_target(
         ),
     };
 
-    if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+    let selected = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
         if let Some(port) = retry_override_port {
             LoadBalancerCache::select_next_target_for_port_subset_from(
                 &epoch.load_balancer,
@@ -1195,7 +1461,7 @@ pub(crate) fn select_next_retry_target(
                 retry_key,
                 port,
                 subset_name,
-                prev_target,
+                exclude_target,
                 Some(&health_ctx),
             )
         } else {
@@ -1205,7 +1471,7 @@ pub(crate) fn select_next_retry_target(
                 upstream_id,
                 retry_key,
                 subset_name,
-                prev_target,
+                exclude_target,
                 Some(&health_ctx),
             )
         }
@@ -1216,7 +1482,7 @@ pub(crate) fn select_next_retry_target(
             upstream_id,
             retry_key,
             port,
-            prev_target,
+            exclude_target,
             Some(&health_ctx),
         )
     } else {
@@ -1225,10 +1491,37 @@ pub(crate) fn select_next_retry_target(
             &proxy.namespace,
             upstream_id,
             retry_key,
-            prev_target,
+            exclude_target,
             Some(&health_ctx),
         )
+    }?;
+
+    // Return a DIAL target. Never hand callers a literal wildcard host.
+    concretize_retry_dial_target(selected, request.request_authority)
+}
+
+/// Concretize a CONFIGURED retry candidate into a DIAL target.
+///
+/// Concrete hosts pass through unchanged. Wildcard hosts require a matching
+/// `request_authority`; missing or non-matching authority fails closed with
+/// `None` rather than returning the literal `*.example.com` for dial / DNS /
+/// SNI / pool use. This is intentionally stricter than
+/// [`concretize_wildcard_target_for_request`], which leaves an unmatched
+/// wildcard untouched for the initial-selection path.
+fn concretize_retry_dial_target(
+    configured: Arc<UpstreamTarget>,
+    request_authority: Option<&str>,
+) -> Option<Arc<UpstreamTarget>> {
+    if !configured.host.starts_with("*.") {
+        return Some(configured);
     }
+    let request_host = request_authority?;
+    if !crate::config::types::wildcard_matches(&configured.host, request_host) {
+        return None;
+    }
+    let mut concrete = configured.as_ref().clone();
+    concrete.host = request_host.to_string();
+    Some(Arc::new(concrete))
 }
 
 #[cfg(test)]
@@ -1633,9 +1926,12 @@ mod tests {
             &epoch,
             proxy,
             prev_target,
-            client_ip,
-            client_ip,
-            &headers,
+            RetryTargetRequest {
+                base_hash_key: client_ip,
+                client_ip,
+                proxy_headers: &headers,
+                request_authority: None,
+            },
         )
         .expect("retry target should be selected");
 
