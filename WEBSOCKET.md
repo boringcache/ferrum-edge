@@ -4,14 +4,23 @@ Ferrum Edge supports bidirectional WebSocket proxying for `ws://` and `wss://` b
 
 ## Architecture
 
-WebSocket requests are detected via the `Upgrade: websocket` header and routed separately from normal HTTP:
+WebSocket requests are classified once by `detect_http_flavor()` and routed separately from ordinary HTTP. Three client-facing frontends are supported; all share the same plugin pipeline (`on_ws_frame`, `on_ws_disconnect`, sticky-session cookies) and the same backend relay:
 
-1. **Upgrade detection** - `is_websocket_upgrade()` checks for WebSocket upgrade headers
-2. **Route matching** - Uses the same router cache as HTTP for O(1) lookups
-3. **Authentication & Authorization** - All WebSocket connections go through the full plugin authentication and authorization pipeline, the same pipeline used for HTTP requests
-4. **Handshake** - Gateway returns HTTP 101 Switching Protocols with the `sec-websocket-accept` key
-5. **Connection takeover** - `OnUpgrade` is extracted from the request; a spawned task awaits the upgrade and begins proxying
-6. **Bidirectional forwarding** - `handle_websocket_proxying()` splits both client and backend streams, forwarding messages in both directions via `tokio::select!`
+| Frontend | Mechanism | Client response |
+|----------|-----------|-----------------|
+| HTTP/1.1 | `Upgrade: websocket` (RFC 6455) | `101 Switching Protocols` with `Sec-WebSocket-Accept` |
+| HTTP/2 | Extended CONNECT with `:protocol=websocket` (RFC 8441) | `200 OK` (no H1 upgrade headers) |
+| HTTP/3 | Extended CONNECT with `:protocol=websocket` (RFC 9220) | `200 OK` over QUIC DATA frames |
+
+The H3 frontend is gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default: `true`). When disabled, the H3 listener does not advertise Extended CONNECT support and returns `501` to WebSocket CONNECT requests. See [FEATURES.md](FEATURES.md) and [docs/http3.md](docs/http3.md).
+
+Common path after classification:
+
+1. **Route matching** - Uses the same router cache as HTTP for O(1) lookups
+2. **Authentication & Authorization** - All WebSocket connections go through the full plugin authentication and authorization pipeline, the same pipeline used for HTTP requests
+3. **Handshake** - H1 returns `101 Switching Protocols`; H2/H3 Extended CONNECT returns `200 OK`
+4. **Connection takeover** - H1 extracts `OnUpgrade` and spawns the relay task; H2/H3 open the tunneled stream directly
+5. **Bidirectional forwarding** - `handle_websocket_proxying()` splits both client and backend streams, forwarding messages in both directions via `tokio::select!`
 
 ```
 Client <--ws--> Gateway <--ws/wss--> Backend
@@ -21,12 +30,16 @@ The gateway terminates the client WebSocket connection and opens a separate conn
 
 ## TLS for `wss://` Backends
 
-Backend WebSocket connections use `tokio_tungstenite::connect_async_tls_with_config()` with a custom `rustls` TLS connector that respects both proxy-level and global TLS settings:
+Backend `wss://` dials build a `rustls` client config through `build_websocket_tls_connector()` (same `BackendTlsConfigBuilder` / `build_root_cert_store` path as HTTP/HTTPS backends) and connect via Ferrum's own dial path: TCP is opened first, the byte-level `WsActivityIo` idle adapter is installed under TLS, then `client_async_tls_with_config()` completes the handshake on that stream. Ferrum deliberately does **not** use `connect_async_tls_with_config()` — that helper dials TCP internally and cannot install the idle adapter beneath the TLS layer.
 
 - **TLS library**: rustls (not native-tls/OpenSSL)
-- **Root CA store**: `webpki-roots` (Mozilla's root certificates compiled into the binary), plus any custom CA bundles
+- **Root CA store (exclusive, first match wins)**:
+  1. Per-proxy `backend_tls_server_ca_cert_path` — when set, **only** certificates from this bundle are trusted
+  2. Global `FERRUM_TLS_CA_BUNDLE_PATH` — when no per-proxy CA is set but this is set, **only** certificates from this bundle are trusted
+  3. Built-in `webpki-roots` — used only when neither custom CA path is configured
+
+  Custom CAs **replace** public roots; they are not additive. If you need both an internal CA and publicly-signed backends, concatenate the public roots into your custom PEM bundle (see [docs/backend_mtls.md](docs/backend_mtls.md)).
 - **Server certificate verification**: Controlled by proxy-level `backend_tls_verify_server_cert` (default: `true`) and global `FERRUM_TLS_NO_VERIFY`
-- **Custom CA bundles**: Proxy-level `backend_tls_server_ca_cert_path` takes priority; falls back to global `FERRUM_TLS_CA_BUNDLE_PATH`
 - **Client certificates (mTLS)**: Proxy-level `backend_tls_client_cert_path`/`backend_tls_client_key_path` take priority; falls back to global `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH`/`FERRUM_BACKEND_TLS_CLIENT_KEY_PATH`
 
 This matches the same TLS configuration hierarchy used by HTTP/HTTPS backends in `connection_pool.rs`.
@@ -45,8 +58,8 @@ All other headers (including `authorization`, `cookie`, `sec-websocket-protocol`
 
 - **Connect timeout**: Uses the proxy's `backend_connect_timeout_ms` setting (default: 5000ms) for the backend WebSocket connection
 - **Active connection cap**: `FERRUM_WEBSOCKET_MAX_CONNECTIONS` limits concurrently upgraded WebSocket connections (default: 20,000). Upgrades beyond the cap are rejected with `503 Service Unavailable`
-- **Max frame size**: 16 MiB per WebSocket frame
-- **Max message size**: 64 MiB per WebSocket message (a message can span multiple frames)
+- **Max frame size**: `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` (default: 16 MiB / 16,777,216 bytes) per WebSocket frame
+- **Max message size**: 4× the frame limit (default: 64 MiB / 67,108,864 bytes); a message can span multiple frames. Plugins with tighter `ws_message_size_limiting` rules may lower the effective ceiling
 - **Upgrade flood protection**: WebSocket requests go through the normal plugin pipeline before upgrade, so `rate_limiting` and `ip_restriction` can throttle abusive upgrade bursts
 
 ## Tunnel Mode
@@ -81,7 +94,8 @@ WebSocket backend URLs are built using the same path logic as HTTP proxying:
 
 | File | Purpose |
 |------|---------|
-| `src/proxy/mod.rs` | WebSocket upgrade handling, TLS connector, and bidirectional proxying |
+| `src/proxy/mod.rs` | H1/H2 WebSocket upgrade handling, backend TLS connector, and bidirectional proxying |
+| `src/http3/websocket.rs` | H3 Extended CONNECT (RFC 9220) frontend and bridge to the shared relay |
 | `tests/functional/functional_websocket_test.rs` | Functional tests |
 | `tests/unit/gateway_core/websocket_auth_tests.rs` | Auth integration tests |
 | `tests/helpers/bin/websocket_echo_server.rs` | Echo server for testing |
