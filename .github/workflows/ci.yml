@@ -694,7 +694,7 @@ jobs:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external
     # binary), so they ALSO don't need redis/mongo services. The shard split
-    # below keeps all 110 test-file filters visible to the grep-based coverage
+    # below keeps all 111 test-file filters visible to the grep-based coverage
     # contract while balancing them across two runners. Two-hundred-plus
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
     # make elapsed time, not CPU utilisation, the useful balancing signal.
@@ -789,6 +789,7 @@ jobs:
               integration::mesh_destination_rule_max_connections_tests
               integration::mesh_destination_rule_connection_pool_audit_tests
               integration::mesh_destination_rule_route_rebuild_tests
+              integration::mesh_destination_rule_visibility_tests
               integration::mesh_dr_service_entry_e2e_tests
               integration::mesh_sidecar_e2e_tests
               integration::mesh_config_revision_tests

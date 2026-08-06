@@ -18,6 +18,68 @@ capabilities:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
       - Cross-cluster endpoint discovery is Beta and remains excluded from this sidecar GA contract.
 
+  - id: mesh.destination_rule.export_to_visibility
+    display_name: DestinationRule exportTo visibility
+    maturity: ga
+    topology: sidecar
+    config_protocol: istio
+    semantic_assertions:
+      - category: istio_destination_rule
+        feature: exportTo
+      - category: istio_destination_rule
+        feature: exportTo (unsupported values)
+    live_suite: mesh-e2e-sidecar
+    # Issue #2465. Visibility is enforced BEFORE DestinationRule lookup and
+    # before a per-node slice is serialized, so a namespace-local rule never
+    # reaches a subscriber outside its declared visibility.
+    live_assertions:
+      - sidecar.destination_rule.export_to_namespace_visibility
+    live_deferred: >-
+      Deferred for THIS suite only: Trusted Cross policy forbids PR-authored
+      mesh-e2e-sidecar executable and configuration changes, so the kind/SPIRE
+      assertion above is not emitted yet. A real multi-namespace datapath
+      acceptance DOES run the shipped binary: the namespace-local-rule case and
+      its visible-rule control in
+      tests/functional/functional_mesh_mode_test.rs, alongside semantic
+      enforcement in tests/conformance/istio_destination_rule.rs and
+      tests/integration/mesh_destination_rule_visibility_tests.rs (#2465).
+    platform_profile: kind-spire-sidecar
+    docs_anchor: docs/mesh.md#destinationrule
+    owner: mesh
+    exclusions:
+      - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+
+  - id: mesh.destination_rule.lookup_hierarchy
+    display_name: DestinationRule lookup hierarchy
+    maturity: ga
+    topology: sidecar
+    config_protocol: istio
+    semantic_assertions:
+      - category: istio_destination_rule
+        feature: "DestinationRule lookup hierarchy (client → service → root namespace)"
+    live_suite: mesh-e2e-sidecar
+    # Issue #2469. Client namespace, then target service namespace, then the
+    # configured istio_root_namespace; the first tier with a visible rule wins
+    # outright, independent of lexical namespace ordering.
+    live_assertions:
+      - sidecar.destination_rule.lookup_tier_client_wins
+    live_deferred: >-
+      Deferred for THIS suite only: Trusted Cross policy forbids PR-authored
+      mesh-e2e-sidecar executable and configuration changes, so the kind/SPIRE
+      assertion above is not emitted yet. A real datapath acceptance DOES run
+      the shipped binary: the client-tier-wins case in
+      tests/functional/functional_mesh_mode_test.rs, alongside semantic
+      enforcement in
+      tests/conformance/istio_destination_rule.rs and
+      tests/integration/mesh_destination_rule_visibility_tests.rs (#2469).
+    platform_profile: kind-spire-sidecar
+    docs_anchor: docs/mesh.md#destinationrule
+    owner: mesh
+    exclusions:
+      - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+
   - id: mesh.destination_rule.tcp_max_connections
     display_name: DestinationRule TCP max connections
     maturity: ga

@@ -16,9 +16,10 @@ controlPlane:
   rbac:
     create: true
     # Grants get/list/watch (+ status patch) for GatewayClass/Gateway/HTTPRoute/
-    # GRPCRoute/TCPRoute/TLSRoute/UDPRoute/ReferenceGrant. TCPRoute live
-    # data-plane conformance is gated by
-    # scripts/gateway_api_tcproute_conformance.sh; UDPRoute translation/status
+    # GRPCRoute/TCPRoute/TLSRoute/UDPRoute/ReferenceGrant. TCPRoute/TLSRoute
+    # live data-plane conformance is gated by
+    # scripts/gateway_api_tcproute_conformance.sh and
+    # scripts/gateway_api_tlsroute_conformance.sh; UDPRoute translation/status
     # evidence is gated by CI Unit Tests and its live UDP data path by CI
     # Integration Tests.
     gatewayApi: true

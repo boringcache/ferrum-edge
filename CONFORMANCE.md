@@ -4,10 +4,10 @@ Ferrum's conformance story spans two surfaces, each with its own owner doc:
 
 1. **Upstream Gateway API conformance** — the `gateway.networking.k8s.io`
    `GatewayClass` / `Gateway` / `HTTPRoute` surface (plus watched `GRPCRoute`,
-   live black-box `TCPRoute`, and `UDPRoute`), validated by the standalone
-   **`Gateway API Conformance`** GitHub Actions workflow
+   live black-box `TCPRoute` / `TLSRoute`, and `UDPRoute`), validated by the
+   standalone **`Gateway API Conformance`** GitHub Actions workflow
    (`.github/workflows/gateway-api-conformance.yml`) against a real
-   `kind` data plane for HTTP/TCP. `UDPRoute` is gated inside the required
+   `kind` data plane for HTTP/TCP/TLS. `UDPRoute` is gated inside the required
    `Tests` aggregate instead: CI Unit Tests for translation/status/lifecycle,
    plus a live UDP **data-path** integration suite that runs a translated
    `UDPRoute` through the real `start_udp_listener` runtime.
@@ -37,31 +37,33 @@ citations):
   / CI surface changed.
 - **Profile & features.** Gateway API `v1.5.1`, profile `GATEWAY-HTTP`,
   supported features `Gateway,ReferenceGrant,HTTPRoute`, GatewayClass `ferrum`,
-  controller `ferrum.io/gateway-controller`. Live `TCPRoute` data-plane behavior
-  is release-gated by Ferrum black-box checks in the same workflow.
-  `UDPRoute` is release-gated by the required `Tests` aggregate rather than by
-  a black-box step in this workflow: translation/status/update/delete by CI
-  Unit Tests (`tests/unit/gateway_core/k8s_udproute_translation_tests.rs`), and
-  the **live UDP data path** by CI Integration Tests
+  controller `ferrum.io/gateway-controller`. Live `TCPRoute` and `TLSRoute`
+  data-plane behavior is release-gated by Ferrum black-box checks in the same
+  workflow. `UDPRoute` is release-gated by the required `Tests` aggregate
+  rather than by a black-box step in this workflow:
+  translation/status/update/delete by CI Unit Tests
+  (`tests/unit/gateway_core/k8s_udproute_translation_tests.rs`), and the
+  **live UDP data path** by CI Integration Tests
   (`tests/integration/gateway_api_udproute_datapath_tests.rs`), which serve a
   translated `UDPRoute` on the real UDP runtime and assert a datagram reaches
-  the backend the route named. Neither an upstream `GATEWAY-TCP` nor
+  the backend the route named. No upstream `GATEWAY-TCP` / `GATEWAY-TLS` /
   `GATEWAY-UDP` profile is advertised on this pin.
 - **Data plane.** The lab deploys a routable Ferrum **data plane** (NodePort
-  mapped to host ports 80/443 plus TCPRoute stream ports) plus HTTP/TCP echo
-  backends, then runs the upstream suite **and** direct black-box traffic
-  checks — it is not a control-plane-only status run.
+  mapped to host ports 80/443 plus TCPRoute and TLSRoute stream ports) plus
+  HTTP/TCP/TLS echo backends, then runs the upstream suite **and** direct
+  black-box traffic checks — it is not a control-plane-only status run.
 - **Status.** GatewayClass, Gateway top-level, **per-listener**
   (`status.listeners[]` conditions / `attachedRoutes` / `supportedKinds`), and
-  HTTPRoute/GRPCRoute/TCPRoute/UDPRoute parent status are all emitted. The
-  canonical doc
-  records the reason-string divergences from the upstream constants table.
+  HTTPRoute/GRPCRoute/TCPRoute/TLSRoute/UDPRoute parent status are all
+  emitted. The canonical doc records the reason-string divergences from the
+  upstream constants table.
 - **Artifacts.** A `gateway-api-conformance-<version>` bundle
   (`conformance-results/`, 90-day retention). The **run-local `CONFORMANCE.md`**
   inside that bundle is generated per run by
-  `scripts/gateway_api_data_plane_conformance.sh` (with TCPRoute ports and
-  resources appended by `scripts/gateway_api_tcproute_conformance.sh`) and is a
-  different file from this repo-root page.
+  `scripts/gateway_api_data_plane_conformance.sh` (with TCPRoute/TLSRoute ports
+  and resources appended by `scripts/gateway_api_tcproute_conformance.sh` and
+  `scripts/gateway_api_tlsroute_conformance.sh`) and is a different file from
+  this repo-root page.
 
 # Istio + xDS Conformance Suite
 

@@ -23,6 +23,18 @@ TCP_BLACKBOX_NODEPORT_FAIL="${TCP_BLACKBOX_NODEPORT_FAIL:-30903}"
 TCP_BLACKBOX_NODEPORT_DELETE="${TCP_BLACKBOX_NODEPORT_DELETE:-30904}"
 TCP_ECHO_BACKEND_PORT="${TCP_ECHO_BACKEND_PORT:-9090}"
 
+# Live TLSRoute black-box listeners (TLS Passthrough + SNI). Distinct from TCPRoute
+# ports so the two L4 labs do not share stream listen_port identity.
+TLS_BLACKBOX_PORT_SNI="${TLS_BLACKBOX_PORT_SNI:-9011}"
+TLS_BLACKBOX_PORT_CROSS="${TLS_BLACKBOX_PORT_CROSS:-9012}"
+TLS_BLACKBOX_PORT_FAIL="${TLS_BLACKBOX_PORT_FAIL:-9013}"
+TLS_BLACKBOX_PORT_DELETE="${TLS_BLACKBOX_PORT_DELETE:-9014}"
+TLS_BLACKBOX_NODEPORT_SNI="${TLS_BLACKBOX_NODEPORT_SNI:-30911}"
+TLS_BLACKBOX_NODEPORT_CROSS="${TLS_BLACKBOX_NODEPORT_CROSS:-30912}"
+TLS_BLACKBOX_NODEPORT_FAIL="${TLS_BLACKBOX_NODEPORT_FAIL:-30913}"
+TLS_BLACKBOX_NODEPORT_DELETE="${TLS_BLACKBOX_NODEPORT_DELETE:-30914}"
+TLS_ECHO_BACKEND_PORT="${TLS_ECHO_BACKEND_PORT:-9443}"
+
 CP_NAMESPACE="${CP_NAMESPACE:-ferrum}"
 DP_SERVICE_NAME="${DP_SERVICE_NAME:-ferrum-gateway-data-plane}"
 DP_GATEWAY_NAMESPACE="${DP_GATEWAY_NAMESPACE:-gateway-conformance-infra}"
@@ -65,6 +77,18 @@ nodes:
       - containerPort: ${TCP_BLACKBOX_NODEPORT_DELETE}
         hostPort: ${TCP_BLACKBOX_PORT_DELETE}
         protocol: TCP
+      - containerPort: ${TLS_BLACKBOX_NODEPORT_SNI}
+        hostPort: ${TLS_BLACKBOX_PORT_SNI}
+        protocol: TCP
+      - containerPort: ${TLS_BLACKBOX_NODEPORT_CROSS}
+        hostPort: ${TLS_BLACKBOX_PORT_CROSS}
+        protocol: TCP
+      - containerPort: ${TLS_BLACKBOX_NODEPORT_FAIL}
+        hostPort: ${TLS_BLACKBOX_PORT_FAIL}
+        protocol: TCP
+      - containerPort: ${TLS_BLACKBOX_NODEPORT_DELETE}
+        hostPort: ${TLS_BLACKBOX_PORT_DELETE}
+        protocol: TCP
 YAML
   kind create cluster --name "$KIND_CLUSTER_NAME" --config "$(kind_config_path)" --wait 120s
   kind load docker-image "$FERRUM_IMAGE" --name "$KIND_CLUSTER_NAME"
@@ -72,10 +96,10 @@ YAML
 
 install_gateway_api_crds() {
   # Install the experimental-channel bundle (includes standard resources plus
-  # TCPRoute). Mixing standard-install with a standalone experimental TCPRoute
-  # CRD fails upstream init with "multiple gateway API CRDs channels detected".
+  # TCPRoute/TLSRoute). Mixing standard-install with a standalone experimental
+  # L4 CRD fails upstream init with "multiple gateway API CRDs channels detected".
   # Profile/features stay GATEWAY-HTTP / Gateway,ReferenceGrant,HTTPRoute;
-  # TCPRoute coverage remains Ferrum black-box only.
+  # TCPRoute/TLSRoute coverage remains Ferrum black-box only.
   kubectl apply --server-side=true \
     -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml"
   for crd in \
@@ -84,6 +108,7 @@ install_gateway_api_crds() {
     httproutes.gateway.networking.k8s.io \
     grpcroutes.gateway.networking.k8s.io \
     tcproutes.gateway.networking.k8s.io \
+    tlsroutes.gateway.networking.k8s.io \
     referencegrants.gateway.networking.k8s.io; do
     kubectl wait --for=condition=Established "crd/${crd}" --timeout=120s
   done
@@ -199,6 +224,14 @@ spec:
               containerPort: ${TCP_BLACKBOX_PORT_FAIL}
             - name: tcp-delete
               containerPort: ${TCP_BLACKBOX_PORT_DELETE}
+            - name: tls-sni
+              containerPort: ${TLS_BLACKBOX_PORT_SNI}
+            - name: tls-cross
+              containerPort: ${TLS_BLACKBOX_PORT_CROSS}
+            - name: tls-fail
+              containerPort: ${TLS_BLACKBOX_PORT_FAIL}
+            - name: tls-delete
+              containerPort: ${TLS_BLACKBOX_PORT_DELETE}
           env:
             - name: FERRUM_MODE
               value: dp
@@ -275,6 +308,22 @@ spec:
       port: ${TCP_BLACKBOX_PORT_DELETE}
       targetPort: ${TCP_BLACKBOX_PORT_DELETE}
       nodePort: ${TCP_BLACKBOX_NODEPORT_DELETE}
+    - name: tls-sni
+      port: ${TLS_BLACKBOX_PORT_SNI}
+      targetPort: ${TLS_BLACKBOX_PORT_SNI}
+      nodePort: ${TLS_BLACKBOX_NODEPORT_SNI}
+    - name: tls-cross
+      port: ${TLS_BLACKBOX_PORT_CROSS}
+      targetPort: ${TLS_BLACKBOX_PORT_CROSS}
+      nodePort: ${TLS_BLACKBOX_NODEPORT_CROSS}
+    - name: tls-fail
+      port: ${TLS_BLACKBOX_PORT_FAIL}
+      targetPort: ${TLS_BLACKBOX_PORT_FAIL}
+      nodePort: ${TLS_BLACKBOX_NODEPORT_FAIL}
+    - name: tls-delete
+      port: ${TLS_BLACKBOX_PORT_DELETE}
+      targetPort: ${TLS_BLACKBOX_PORT_DELETE}
+      nodePort: ${TLS_BLACKBOX_NODEPORT_DELETE}
 YAML
   kubectl -n "$CP_NAMESPACE" rollout status "deployment/${DP_SERVICE_NAME}" --timeout=240s
 }
@@ -314,9 +363,9 @@ setup() {
   wait_for_gateway_class
 }
 
-# Gateway API lab setup with TCPRoute listener ports and experimental CRDs.
-# Kept separate from scripts/gateway_api_data_plane_conformance.sh because that
-# file is a Trusted Cross Build Policy frozen automation surface on main.
+# Gateway API lab setup with TCPRoute/TLSRoute listener ports and experimental
+# CRDs. Kept separate from scripts/gateway_api_data_plane_conformance.sh because
+# that file is a Trusted Cross Build Policy frozen automation surface on main.
 
 case "${1:-}" in
   setup)
