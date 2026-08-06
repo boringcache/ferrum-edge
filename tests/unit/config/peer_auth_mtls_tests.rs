@@ -37,7 +37,9 @@ fn peer_auth_with_scope(
 ) -> PeerAuthentication {
     let selector = match &scope {
         PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
-        PolicyScope::MeshWide | PolicyScope::Namespace { .. } => None,
+        PolicyScope::MeshWide
+        | PolicyScope::Namespace { .. }
+        | PolicyScope::TargetRefs { .. } => None,
     };
     PeerAuthentication {
         name: name.to_string(),

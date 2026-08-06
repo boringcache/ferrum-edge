@@ -53,10 +53,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::config::types::Proxy;
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
-    MeshPolicy, PolicyAction, PolicyScope, is_mesh_condition_ip_key,
+    MeshPolicy, PolicyAction, PolicyScope, PolicyTargetAttachment, is_mesh_condition_ip_key,
     is_supported_mesh_condition_key, mesh_condition_has_values,
-    normalize_request_match_host_pattern, policy_scope_applies_to_workload, resolve_target_port,
-    validate_mesh_condition_ip_block, workload_selector_matches,
+    normalize_request_match_host_pattern, policy_scope_applies_to_workload,
+    policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
+    resolve_target_port, validate_mesh_condition_ip_block, workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -810,7 +811,7 @@ fn evaluate_destination_policy_scopes(
         let decision = evaluate_mesh_authorization_policies(
             policies
                 .iter()
-                .filter(|policy| scope.policy_applies(policy)),
+                .filter(|policy| scope.policy_applies_for_destination(policy)),
             request,
         );
         match decision {
@@ -1144,8 +1145,15 @@ impl MeshAuthz {
             // pod-scoped cache set on RequestContext.
             let proxy_namespace = slice.namespace.clone();
             let proxy_labels = slice.labels.clone();
+            let waypoint_name = slice.waypoint_name.clone();
             slice.mesh_policies.retain(|policy| {
-                policy_scope_applies_to_workload(policy, &proxy_namespace, &proxy_labels)
+                policy_scope_applies_with_waypoint(
+                    policy,
+                    &proxy_namespace,
+                    &proxy_labels,
+                    waypoint_name.as_deref(),
+                    None,
+                ) || target_refs_attach_to_slice_services(policy, &slice.services)
             });
         }
 
@@ -1614,6 +1622,27 @@ fn policy_has_enforcing_rule(policy: &MeshPolicy) -> bool {
         .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
 }
 
+/// Keep Service/ServiceEntry `targetRefs` policies whose named service is in
+/// this slice even when the waypoint pod labels would not satisfy the
+/// captured selector — destination scope evaluation still needs them.
+fn target_refs_attach_to_slice_services(
+    policy: &MeshPolicy,
+    services: &[crate::modes::mesh::config::MeshService],
+) -> bool {
+    let PolicyScope::TargetRefs { attachments } = &policy.scope else {
+        return false;
+    };
+    attachments.iter().any(|attachment| {
+        services.iter().any(|service| {
+            policy_target_attachment_applies_to_service(
+                attachment,
+                &service.namespace,
+                &service.name,
+            )
+        })
+    })
+}
+
 fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result<(), String> {
     let has_proxy_namespace = !slice.namespace.trim().is_empty();
     let has_proxy_labels = !slice.labels.is_empty();
@@ -1625,6 +1654,35 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                 if !has_proxy_namespace {
                     return Err(format!(
                         "mesh_authz: policy '{}' uses namespace scope but no proxy namespace is configured; set mesh_slice.namespace or namespace",
+                        policy.name
+                    ));
+                }
+            }
+            PolicyScope::TargetRefs { attachments } => {
+                // Gateway / GatewayClass attachments are waypoint-scoped and
+                // do not require proxy labels. Service / ServiceEntry
+                // attachments with selector labels follow the same
+                // fail-closed rules as WorkloadSelector when this proxy is
+                // not a waypoint carrying the named services.
+                let needs_labels = attachments.iter().any(|attachment| match attachment {
+                    PolicyTargetAttachment::Service {
+                        selector_labels, ..
+                    }
+                    | PolicyTargetAttachment::ServiceEntry {
+                        selector_labels, ..
+                    } => !selector_labels.is_empty(),
+                    PolicyTargetAttachment::Gateway { .. }
+                    | PolicyTargetAttachment::GatewayClass { .. } => false,
+                });
+                if needs_labels
+                    && !has_proxy_labels
+                    && slice.waypoint_name.is_none()
+                    && !from_slice
+                    && policy_has_enforcing_rule(policy)
+                {
+                    return Err(format!(
+                        "mesh_authz: policy '{}' uses targetRefs with service selector labels but \
+                         no proxy labels are configured; set `labels` so the policy can be scoped",
                         policy.name
                     ));
                 }
@@ -2046,7 +2104,7 @@ impl Plugin for MeshAuthz {
                     self.relay_policy_superset.iter().filter(|policy| {
                         let destination_applies = destination_scopes
                             .iter()
-                            .any(|scope| scope.policy_applies(policy));
+                            .any(|scope| scope.policy_applies_for_destination(policy));
                         let source_applies = source_scope.map_or_else(
                             || matches!(policy.scope, PolicyScope::MeshWide),
                             |scope| scope.policy_applies(policy),

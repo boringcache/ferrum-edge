@@ -9,11 +9,12 @@ use crate::modes::mesh::config::{
     MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
     MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress, MeshTelemetryResource,
     MeshVirtualServiceCorsPolicy, MtlsMode, MultiClusterConfig, OutboundTrafficPolicy,
-    PeerAuthentication, PolicyScope, ResolvedIngressListener, ServiceEntry, SidecarHostPattern,
-    TrustBundleSet, Workload, WorkloadLabels, is_false, is_zero_usize,
-    policy_scope_applies_to_workload, proxy_config_applies_to_workload, scope_applies_to_workload,
-    service_entry_applies_to_workload, virtual_service_cors_policy_exported_to_namespace,
-    workload_selector_matches,
+    PeerAuthentication, PolicyScope, PolicyTargetAttachment, ResolvedIngressListener, ServiceEntry,
+    SidecarHostPattern, TrustBundleSet, Workload, WorkloadLabels, is_false, is_zero_usize,
+    policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
+    policy_target_attachment_applies_to_service, proxy_config_applies_to_workload,
+    scope_applies_to_workload, service_entry_applies_to_workload,
+    virtual_service_cors_policy_exported_to_namespace, workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
 
@@ -1303,7 +1304,16 @@ impl MeshSlice {
             .mesh_policies
             .iter()
             .filter(|policy| {
-                (!ambient_udp_policy_candidates.is_empty()
+                let waypoint = request.waypoint_name.as_deref();
+                let waypoint_match = policy_scope_applies_with_waypoint(
+                    policy,
+                    effective_namespace,
+                    &effective_labels,
+                    waypoint,
+                    None,
+                ) || (waypoint.is_some()
+                    && matches!(policy.scope, PolicyScope::TargetRefs { .. }));
+                let candidate_match = (!ambient_udp_policy_candidates.is_empty()
                     && ambient_udp_policy_candidates
                         .iter()
                         .any(|(candidate_namespace, labels)| {
@@ -1311,7 +1321,8 @@ impl MeshSlice {
                         }))
                     || policy_candidate_labels.iter().any(|labels| {
                         policy_scope_applies_to_workload(policy, effective_namespace, *labels)
-                    })
+                    });
+                waypoint_match || candidate_match
             })
             .cloned()
             .collect();
@@ -1702,7 +1713,35 @@ fn narrow_for_service_waypoint(
         service_entries: admitted_service_entries,
         destination_rules: admitted_destination_rules,
         workloads: admitted_workloads,
-        mesh_policies: resources.mesh_policies,
+        mesh_policies: resources
+            .mesh_policies
+            .into_iter()
+            .filter(|policy| {
+                match &policy.scope {
+                    PolicyScope::TargetRefs { attachments } => attachments.iter().any(|attachment| {
+                        match attachment {
+                            PolicyTargetAttachment::Gateway { namespace, name } => {
+                                name == waypoint_name && namespace == waypoint_namespace
+                            }
+                            PolicyTargetAttachment::GatewayClass { .. } => true,
+                            PolicyTargetAttachment::Service { .. }
+                            | PolicyTargetAttachment::ServiceEntry { .. } => bound
+                                .iter()
+                                .any(|(ns, svc)| {
+                                    policy_target_attachment_applies_to_service(
+                                        attachment, ns, svc,
+                                    )
+                                }),
+                        }
+                    }),
+                    // Selector / namespace / mesh-wide policies stay; Istio
+                    // ambient ignores selector policies at waypoints, but
+                    // Ferrum continues to evaluate them for Sidecar-parity
+                    // source scoping already applied above.
+                    _ => true,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -2997,7 +3036,9 @@ fn proxy_config_scope_tier(pc: &MeshProxyConfig) -> u8 {
     match pc.scope {
         PolicyScope::MeshWide => 0,
         PolicyScope::Namespace { .. } => 1,
-        PolicyScope::WorkloadSelector { .. } => 2,
+        // TargetRefs is AuthorizationPolicy-only; treat as workload-specific
+        // so a mis-authored native ProxyConfig cannot outrank selectors.
+        PolicyScope::WorkloadSelector { .. } | PolicyScope::TargetRefs { .. } => 2,
     }
 }
 
@@ -3017,6 +3058,8 @@ fn classify_peer_auth_scope(pa: &PeerAuthentication) -> PeerAuthScope {
                 PeerAuthScope::MeshWide
             }
             PolicyScope::WorkloadSelector { .. } => PeerAuthScope::Namespace,
+            // TargetRefs is AuthorizationPolicy-only; never classify PeerAuth.
+            PolicyScope::TargetRefs { .. } => PeerAuthScope::Namespace,
         };
     }
 
@@ -3314,6 +3357,7 @@ mod tests {
                 name: "waypoint".into(),
                 namespace: "infra".into(),
                 waypoint_for: "service".into(),
+                gateway_class_name: None,
                 services: vec![MeshWaypointServiceRef {
                     namespace: "default".into(),
                     name: "reviews".into(),
@@ -3374,6 +3418,7 @@ mod tests {
                 name: "waypoint".into(),
                 namespace: "infra".into(),
                 waypoint_for: "service".into(),
+                gateway_class_name: None,
                 services: vec![MeshWaypointServiceRef {
                     namespace: "default".into(),
                     name: "reviews".into(),
@@ -5110,7 +5155,9 @@ mod tests {
     ) -> PeerAuthentication {
         let selector = match &scope {
             PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
-            PolicyScope::MeshWide | PolicyScope::Namespace { .. } => None,
+            PolicyScope::MeshWide
+            | PolicyScope::Namespace { .. }
+            | PolicyScope::TargetRefs { .. } => None,
         };
         PeerAuthentication {
             name: name.to_string(),

@@ -2525,6 +2525,7 @@ mod tests {
                     name: "waypoint".to_string(),
                     namespace: "infra".to_string(),
                     waypoint_for: "service".to_string(),
+                    gateway_class_name: None,
                     services: vec![MeshWaypointServiceRef {
                         namespace: "default".to_string(),
                         name: service_name.to_string(),

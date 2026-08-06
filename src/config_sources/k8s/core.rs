@@ -47,6 +47,10 @@ impl PodKey {
 struct CoreService {
     ports: Vec<ServicePort>,
     has_selector: bool,
+    /// Captured `Service.spec.selector` labels for AuthorizationPolicy
+    /// `targetRefs` → Service attachment resolution. Empty when the Service
+    /// has no selector (ExternalName / selectorless).
+    selector_labels: HashMap<String, String>,
     /// `spec.clusterIPs` (fallback `spec.clusterIP`), excluding the headless
     /// sentinel `"None"` and empty strings. Raw-TCP egress maps captured
     /// original destinations to services through these VIPs.
@@ -294,6 +298,19 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
                 .get("selector")
                 .and_then(Value::as_object)
                 .is_some_and(|selector| !selector.is_empty()),
+            selector_labels: object
+                .spec
+                .get("selector")
+                .and_then(Value::as_object)
+                .map(|selector| {
+                    selector
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            v.as_str().map(|value| (k.clone(), value.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             cluster_ips,
         },
     );
@@ -440,6 +457,18 @@ pub(super) fn secret_tls_material_digest<'a>(
     K8sServiceKey::new(namespace.to_string(), name.to_string())
         .and_then(|key| acc.core.secrets.get(&key))
         .and_then(|secret| secret.tls_material_digest.as_deref())
+}
+
+/// Return the captured `Service.spec.selector` labels for AuthorizationPolicy
+/// `targetRefs` resolution. `None` when the Service was never collected.
+pub(super) fn service_selector_labels<'a>(
+    acc: &'a K8sAccumulator,
+    namespace: &str,
+    name: &str,
+) -> Option<&'a HashMap<String, String>> {
+    K8sServiceKey::new(namespace.to_string(), name.to_string())
+        .and_then(|key| acc.core.services.get(&key))
+        .map(|service| &service.selector_labels)
 }
 
 fn collect_secret(acc: &mut K8sAccumulator, object: &K8sObject) {

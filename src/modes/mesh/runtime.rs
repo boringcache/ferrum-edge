@@ -141,6 +141,11 @@ pub struct PolicyScopeCache {
     pub spiffe_id: SpiffeId,
     pub namespace: String,
     pub labels: HashMap<String, String>,
+    /// Attached MeshService name when known. Used so Service `targetRefs`
+    /// without selector labels can still match destination membership
+    /// without broadening onto unrelated workloads in the namespace.
+    pub service_name: String,
+    pub service_namespace: String,
 }
 
 impl PolicyScopeCache {
@@ -149,10 +154,13 @@ impl PolicyScopeCache {
         namespace: impl Into<String>,
         labels: HashMap<String, String>,
     ) -> Self {
+        let namespace = namespace.into();
         Self {
             spiffe_id,
-            namespace: namespace.into(),
+            service_namespace: namespace.clone(),
+            namespace,
             labels,
+            service_name: String::new(),
         }
     }
 
@@ -161,11 +169,53 @@ impl PolicyScopeCache {
             spiffe_id: workload.spiffe_id.clone(),
             namespace: workload.namespace.clone(),
             labels: workload.selector.labels.clone(),
+            service_name: workload.service_name.clone(),
+            service_namespace: workload.attached_service_namespace().to_string(),
         }
     }
 
     pub fn policy_applies(&self, policy: &MeshPolicy) -> bool {
         policy_scope_applies_to_workload(policy, &self.namespace, &self.labels)
+    }
+
+    /// Destination-scope applicability inside a waypoint / node-waypoint path.
+    ///
+    /// Service and ServiceEntry `targetRefs` match backing-workload labels or
+    /// exact service membership; Gateway / GatewayClass attachments apply to
+    /// every destination processed by the waypoint (they must not broaden onto
+    /// ordinary Sidecar source filtering via [`Self::policy_applies`]).
+    pub fn policy_applies_for_destination(&self, policy: &MeshPolicy) -> bool {
+        match &policy.scope {
+            crate::modes::mesh::config::PolicyScope::TargetRefs { attachments } => {
+                use crate::modes::mesh::config::PolicyTargetAttachment;
+                attachments.iter().any(|attachment| match attachment {
+                    PolicyTargetAttachment::Gateway { .. }
+                    | PolicyTargetAttachment::GatewayClass { .. } => true,
+                    PolicyTargetAttachment::Service {
+                        namespace,
+                        name,
+                        selector_labels,
+                    }
+                    | PolicyTargetAttachment::ServiceEntry {
+                        namespace,
+                        name,
+                        selector_labels,
+                    } => {
+                        if !selector_labels.is_empty() {
+                            return namespace == &self.namespace
+                                && selector_labels.iter().all(|(key, value)| {
+                                    self.labels.get(key).map(String::as_str) == Some(value.as_str())
+                                });
+                        }
+                        // Selectorless attachment: exact service membership only.
+                        !self.service_name.is_empty()
+                            && namespace == &self.service_namespace
+                            && name == &self.service_name
+                    }
+                })
+            }
+            _ => self.policy_applies(policy),
+        }
     }
 }
 

@@ -317,8 +317,48 @@ pub enum PolicyScope {
     Namespace {
         namespace: String,
     },
+    /// Istio `AuthorizationPolicy.spec.targetRefs` attachment scope.
+    ///
+    /// A policy matches when **any** attachment applies (OR). Attachments are
+    /// resolved at translation time against the resource graph; unsupported
+    /// group/kind combinations and selector+targetRefs exclusivity fail closed
+    /// before a `MeshPolicy` is emitted. Do not broaden these into namespace
+    /// or mesh-wide scope when a target is missing — omit/reject instead.
+    TargetRefs {
+        attachments: Vec<PolicyTargetAttachment>,
+    },
     #[default]
     MeshWide,
+}
+
+/// One resolved `AuthorizationPolicy` / policy `targetRefs[]` attachment.
+///
+/// Captures the concrete resource the policy attaches to plus any selector
+/// labels needed for destination-workload matching (Service / ServiceEntry).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PolicyTargetAttachment {
+    /// `group: ""` / `core`, `kind: Service` — waypoint destination attachment.
+    Service {
+        namespace: String,
+        name: String,
+        /// Captured `Service.spec.selector` labels. Empty when the Service has
+        /// no selector; matching then requires exact service membership via
+        /// [`policy_target_attachment_applies_to_service`].
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        selector_labels: HashMap<String, String>,
+    },
+    /// `group: gateway.networking.k8s.io`, `kind: Gateway` — waypoint Gateway.
+    Gateway { namespace: String, name: String },
+    /// `group: gateway.networking.k8s.io`, `kind: GatewayClass` (root ns only).
+    GatewayClass { name: String },
+    /// `group: networking.istio.io`, `kind: ServiceEntry`.
+    ServiceEntry {
+        namespace: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        selector_labels: HashMap<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -764,20 +804,20 @@ impl WorkloadLabels for ::std::collections::BTreeMap<String, String> {
 ///   `(key, value)` in `selector.labels` is present in `proxy_labels` with the
 ///   same value (subset match — empty selector labels means "any workload in
 ///   the optional namespace").
+/// - [`PolicyScope::TargetRefs`] — never matches via bare namespace/labels alone.
+///   Waypoint Gateway / GatewayClass attachments require
+///   [`policy_scope_applies_with_waypoint`]; Service / ServiceEntry attachments
+///   match destination workloads through
+///   [`crate::modes::mesh::runtime::PolicyScopeCache::policy_applies_for_destination`]
+///   or ServiceWaypoint service-membership narrowing. This prevents targeted
+///   waypoint policies from broadening onto Sidecar workloads that happen to
+///   share Service selector labels.
 pub fn policy_scope_applies_to_workload<L: WorkloadLabels + ?Sized>(
     policy: &MeshPolicy,
     proxy_namespace: &str,
     proxy_labels: &L,
 ) -> bool {
-    match &policy.scope {
-        PolicyScope::MeshWide => true,
-        PolicyScope::Namespace {
-            namespace: policy_namespace,
-        } => policy_namespace == proxy_namespace,
-        PolicyScope::WorkloadSelector { selector } => {
-            workload_selector_matches(selector, proxy_namespace, proxy_labels)
-        }
-    }
+    scope_applies_to_workload(&policy.scope, proxy_namespace, proxy_labels)
 }
 
 /// Returns `true` when a [`PolicyScope`] applies to a workload whose
@@ -798,6 +838,102 @@ pub fn scope_applies_to_workload<L: WorkloadLabels + ?Sized>(
         } => policy_namespace == proxy_namespace,
         PolicyScope::WorkloadSelector { selector } => {
             workload_selector_matches(selector, proxy_namespace, proxy_labels)
+        }
+        // AuthorizationPolicy targetRefs are waypoint/attachment scoped; bare
+        // label matching would broaden them onto Sidecar workloads.
+        PolicyScope::TargetRefs { .. } => false,
+    }
+}
+
+/// Waypoint-aware policy scope predicate.
+///
+/// Extends [`policy_scope_applies_to_workload`] so Gateway / GatewayClass
+/// `targetRefs` attachments apply inside the matching ServiceWaypoint slice
+/// without broadening onto Sidecar / Ambient workloads.
+pub fn policy_scope_applies_with_waypoint<L: WorkloadLabels + ?Sized>(
+    policy: &MeshPolicy,
+    proxy_namespace: &str,
+    proxy_labels: &L,
+    waypoint_name: Option<&str>,
+    _waypoint_gateway_class: Option<&str>,
+) -> bool {
+    match &policy.scope {
+        PolicyScope::TargetRefs { attachments } => attachments.iter().any(|attachment| {
+            match attachment {
+                PolicyTargetAttachment::Gateway { namespace, name } => {
+                    waypoint_name == Some(name.as_str()) && namespace == proxy_namespace
+                }
+                PolicyTargetAttachment::GatewayClass { .. } => waypoint_name.is_some(),
+                PolicyTargetAttachment::Service { .. }
+                | PolicyTargetAttachment::ServiceEntry { .. } => {
+                    // Service/ServiceEntry attachments are waypoint destination
+                    // scopes. Do not match Sidecar workloads that happen to
+                    // share selector labels — that would broaden the policy.
+                    waypoint_name.is_some()
+                        && policy_target_attachment_matches_labels(
+                            attachment,
+                            proxy_namespace,
+                            proxy_labels,
+                        )
+                }
+            }
+        }),
+        _ => policy_scope_applies_to_workload(policy, proxy_namespace, proxy_labels),
+    }
+}
+
+/// Returns `true` when a Service-targeted attachment names this exact service.
+///
+/// Used by ServiceWaypoint narrowing so a policy attached to Service `reviews`
+/// is kept when that service is bound to the waypoint, even when the waypoint
+/// pod's own labels would not satisfy the captured Service selector.
+pub fn policy_target_attachment_applies_to_service(
+    attachment: &PolicyTargetAttachment,
+    service_namespace: &str,
+    service_name: &str,
+) -> bool {
+    match attachment {
+        PolicyTargetAttachment::Service { namespace, name, .. } => {
+            namespace == service_namespace && name == service_name
+        }
+        PolicyTargetAttachment::ServiceEntry { namespace, name, .. } => {
+            namespace == service_namespace && name == service_name
+        }
+        PolicyTargetAttachment::Gateway { .. } | PolicyTargetAttachment::GatewayClass { .. } => {
+            false
+        }
+    }
+}
+
+fn policy_target_attachment_matches_labels<L: WorkloadLabels + ?Sized>(
+    attachment: &PolicyTargetAttachment,
+    proxy_namespace: &str,
+    proxy_labels: &L,
+) -> bool {
+    match attachment {
+        PolicyTargetAttachment::Service {
+            namespace,
+            selector_labels,
+            ..
+        }
+        | PolicyTargetAttachment::ServiceEntry {
+            namespace,
+            selector_labels,
+            ..
+        } => {
+            if namespace != proxy_namespace {
+                return false;
+            }
+            // Empty selector labels would match every workload in the
+            // namespace — that broadens a targeted policy. Fail closed unless
+            // the caller uses service-membership narrowing instead.
+            if selector_labels.is_empty() {
+                return false;
+            }
+            labels_match_subset(selector_labels, proxy_labels)
+        }
+        PolicyTargetAttachment::Gateway { .. } | PolicyTargetAttachment::GatewayClass { .. } => {
+            false
         }
     }
 }
@@ -1256,7 +1392,11 @@ impl PeerAuthentication {
     pub fn has_workload_selector(&self) -> bool {
         match self.scope.as_ref() {
             Some(PolicyScope::WorkloadSelector { selector }) => selector.has_labels(),
-            Some(PolicyScope::MeshWide | PolicyScope::Namespace { .. }) => false,
+            Some(
+                PolicyScope::MeshWide
+                | PolicyScope::Namespace { .. }
+                | PolicyScope::TargetRefs { .. },
+            ) => false,
             None => self
                 .selector
                 .as_ref()
@@ -2664,11 +2804,17 @@ pub struct MeshWaypointBinding {
     /// `istio.io/use-waypoint-namespace` can override, in which case the
     /// translator emits the cross-namespace ref directly.
     pub namespace: String,
-    /// `service` (default), `workload`, `all`, or `none`. Persisted as a
+    /// `Service` (default), `workload`, `all`, or `none`. Persisted as a
     /// string to keep the schema forward-compatible with future Istio
     /// enum values without requiring a Ferrum-side migration.
     #[serde(default = "default_waypoint_for")]
     pub waypoint_for: String,
+    /// Gateway API `spec.gatewayClassName` when this binding came from a
+    /// waypoint `Gateway`. Used to resolve AuthorizationPolicy
+    /// `targetRefs` to `GatewayClass`. Absent for Service-only binding
+    /// shells created before the Gateway is observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_class_name: Option<String>,
     /// Bound services. Empty when the Gateway resource exists but no
     /// `Service` annotation references it; the slice builder treats an
     /// empty binding as "no services pass through this waypoint" and

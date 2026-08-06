@@ -467,6 +467,7 @@ fn slice_filter_narrows_services_to_waypoint_binding() {
             name: "api-waypoint".to_string(),
             namespace: "default".to_string(),
             waypoint_for: "service".to_string(),
+            gateway_class_name: None,
             services: vec![
                 MeshWaypointServiceRef {
                     namespace: "default".to_string(),
@@ -524,6 +525,7 @@ fn slice_filter_matches_waypoint_binding_in_request_namespace() {
                 name: "shared-name".to_string(),
                 namespace: "other".to_string(),
                 waypoint_for: "service".to_string(),
+                gateway_class_name: None,
                 services: vec![MeshWaypointServiceRef {
                     namespace: "default".to_string(),
                     name: "billing".to_string(),
@@ -533,6 +535,7 @@ fn slice_filter_matches_waypoint_binding_in_request_namespace() {
                 name: "shared-name".to_string(),
                 namespace: "default".to_string(),
                 waypoint_for: "service".to_string(),
+                gateway_class_name: None,
                 services: vec![MeshWaypointServiceRef {
                     namespace: "default".to_string(),
                     name: "reviews".to_string(),
@@ -593,6 +596,7 @@ fn slice_filter_cross_namespace_waypoint_binding_admits_bound_services() {
             name: "shared-waypoint".to_string(),
             namespace: "infra".to_string(),
             waypoint_for: "service".to_string(),
+            gateway_class_name: None,
             services: vec![MeshWaypointServiceRef {
                 namespace: "default".to_string(),
                 name: "reviews".to_string(),
@@ -642,6 +646,7 @@ fn slice_filter_cross_namespace_waypoint_resolves_short_destination_rule_hosts_b
             name: "shared-waypoint".to_string(),
             namespace: "infra".to_string(),
             waypoint_for: "service".to_string(),
+            gateway_class_name: None,
             services: vec![MeshWaypointServiceRef {
                 namespace: "default".to_string(),
                 name: "reviews".to_string(),
@@ -691,6 +696,7 @@ fn slice_filter_cross_namespace_waypoint_rejects_peer_namespace_destination_rule
             name: "shared-waypoint".to_string(),
             namespace: "infra".to_string(),
             waypoint_for: "service".to_string(),
+            gateway_class_name: None,
             services: vec![
                 MeshWaypointServiceRef {
                     namespace: "default".to_string(),
@@ -735,6 +741,7 @@ fn slice_filter_does_not_prefix_match_unrelated_destination_rule_hosts() {
             name: "api-waypoint".to_string(),
             namespace: "default".to_string(),
             waypoint_for: "service".to_string(),
+            gateway_class_name: None,
             services: vec![MeshWaypointServiceRef {
                 namespace: "default".to_string(),
                 name: "reviews".to_string(),
@@ -774,6 +781,7 @@ fn slice_filter_without_waypoint_name_preserves_full_visibility() {
             name: "api-waypoint".to_string(),
             namespace: "default".to_string(),
             waypoint_for: "service".to_string(),
+            gateway_class_name: None,
             services: vec![MeshWaypointServiceRef {
                 namespace: "default".to_string(),
                 name: "reviews".to_string(),
@@ -859,6 +867,7 @@ fn slice_filter_honors_waypoint_for_none_as_opt_out() {
             name: "api-waypoint".to_string(),
             namespace: "default".to_string(),
             waypoint_for: "none".to_string(),
+            gateway_class_name: None,
             services: vec![MeshWaypointServiceRef {
                 namespace: "default".to_string(),
                 name: "reviews".to_string(),

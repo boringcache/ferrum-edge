@@ -761,10 +761,11 @@ Every `MeshPolicy` carries a `PolicyScope`:
 | `MeshWide` | Always |
 | `Namespace { namespace }` | `proxy_namespace == policy_namespace` |
 | `WorkloadSelector { selector }` | Selector namespace matches (or is unset) AND all selector labels are present on the proxy with matching values (subset match) |
+| `TargetRefs { attachments }` | Istio `AuthorizationPolicy.spec.targetRefs` attachment scope. Supported attachments are same-namespace (or ReferenceGrant-authorized) `Service` / `ServiceEntry`, same-namespace waypoint `Gateway` (`istio-waypoint` / `ferrum-waypoint`), and root-namespace `GatewayClass`. Service/ServiceEntry attachments match destination workloads by captured selector labels or exact service membership at waypoints; Gateway/GatewayClass attachments apply to traffic processed by the matching ServiceWaypoint. Missing targets, unsupported group/kind, and `selector`+`targetRefs` together fail closed at translation — targeted policies are never broadened into namespace or mesh-wide scope. |
 
 An empty `WorkloadSelector` (`labels: {}`, `namespace: None`) intentionally matches any workload.
 
-The canonical matching helper `policy_scope_applies_to_workload()` is shared between the slice builder and the plugin filter so scope semantics stay byte-identical across both surfaces.
+The canonical matching helper `policy_scope_applies_to_workload()` is shared between the slice builder and the plugin filter so scope semantics stay byte-identical across both surfaces. Waypoint `targetRefs` matching uses `policy_scope_applies_with_waypoint()` / destination `PolicyScopeCache::policy_applies_for_destination()` so Gateway attachments do not broaden onto Sidecar workloads.
 
 **Selector policy without proxy labels.** A `WorkloadSelector`-scoped policy whose selector carries labels cannot be evaluated when no proxy labels are resolved, and the cold-path filter would drop it (leaving an empty policy set that evaluates to `Allow`). The plugin distinguishes three cases at construction:
 

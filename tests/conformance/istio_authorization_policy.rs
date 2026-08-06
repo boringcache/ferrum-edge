@@ -428,3 +428,71 @@ fn authz_rejects_malformed_not_ports_wildcard_patterns() {
         "notPorts diagnostic must not echo the operator-supplied value: {message}"
     );
 }
+
+#[test]
+fn authz_target_refs_service_attachment_is_preserved() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "targetRefs → Service attachment scope",
+        status = Status::Supported,
+        notes = "AuthorizationPolicy targetRefs to a same-namespace Service resolve into \
+                 PolicyScope::TargetRefs with captured Service.spec.selector labels. \
+                 selector + targetRefs exclusivity and unsupported group/kind fail closed.",
+    );
+
+    use ferrum_edge::modes::mesh::config::PolicyTargetAttachment;
+
+    let service = K8sObject {
+        api_version: "v1".to_string(),
+        kind: "Service".to_string(),
+        metadata: K8sMetadata {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ..K8sMetadata::default()
+        },
+        spec: json!({
+            "selector": {"app": "reviews"},
+            "ports": [{"port": 9080, "name": "http"}]
+        }),
+        status: Value::Object(serde_json::Map::new()),
+    };
+    let policy = authz_policy(json!({
+        "targetRefs": [{
+            "group": "",
+            "kind": "Service",
+            "name": "reviews"
+        }],
+        "action": "DENY",
+        "rules": [{
+            "from": [{"source": {"namespaces": ["evil"]}}]
+        }]
+    }));
+    let result =
+        translate_k8s_objects(&[service, policy], options()).expect("targetRefs Service translates");
+    let mesh = result.config.mesh.expect("mesh");
+    match &mesh.mesh_policies[0].scope {
+        PolicyScope::TargetRefs { attachments } => match &attachments[0] {
+            PolicyTargetAttachment::Service {
+                name,
+                selector_labels,
+                ..
+            } => {
+                assert_eq!(name, "reviews");
+                assert_eq!(selector_labels.get("app").map(String::as_str), Some("reviews"));
+            }
+            other => panic!("expected Service attachment, got {other:?}"),
+        },
+        other => panic!("expected TargetRefs scope, got {other:?}"),
+    }
+
+    let err = translate_k8s_objects(
+        &[authz_policy(json!({
+            "selector": {"matchLabels": {"app": "reviews"}},
+            "targetRefs": [{"kind": "Service", "name": "reviews"}],
+            "rules": [{}]
+        }))],
+        options(),
+    )
+    .expect_err("selector + targetRefs must fail closed");
+    assert!(err.to_string().contains("at most one of selector or targetRefs"));
+}

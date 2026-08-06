@@ -1339,6 +1339,26 @@ impl CpGrpcServer {
             PolicyScope::WorkloadSelector { selector } => {
                 Self::selector_can_apply_to_namespace(selector, namespace)
             }
+            PolicyScope::TargetRefs { attachments } => attachments.iter().any(|attachment| {
+                use crate::modes::mesh::config::PolicyTargetAttachment;
+                match attachment {
+                    PolicyTargetAttachment::Service {
+                        namespace: target_ns,
+                        ..
+                    }
+                    | PolicyTargetAttachment::ServiceEntry {
+                        namespace: target_ns,
+                        ..
+                    }
+                    | PolicyTargetAttachment::Gateway {
+                        namespace: target_ns,
+                        ..
+                    } => target_ns == namespace,
+                    // GatewayClass attachments apply at every waypoint in the
+                    // mesh once translation has already constrained the class.
+                    PolicyTargetAttachment::GatewayClass { .. } => true,
+                }
+            }),
         }
     }
 
@@ -2908,6 +2928,7 @@ mod tests {
                     name: "waypoint".to_string(),
                     namespace: "infra".to_string(),
                     waypoint_for: "service".to_string(),
+                    gateway_class_name: None,
                     services: vec![MeshWaypointServiceRef {
                         namespace: "default".to_string(),
                         name: "reviews".to_string(),
