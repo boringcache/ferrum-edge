@@ -198,7 +198,13 @@ jobs:
           # the Service ClusterIP directly (no DNS), require a successful HTTP
           # body from src-a (exclude_port bypasses capture so plaintext reaches
           # the python server), then require the same-node ambient counter to
-          # advance. Do not weaken the metric assertion.
+          # advance. The failed artifact also proves this consumer was in an
+          # overrun regime while draining millions of SOCK_OPS events, where any
+          # one ring-buffer event may be lost. Emit one independently successful
+          # excluded-port connection per bounded observation attempt instead of
+          # assuming a single event is lossless. Do not weaken the metric
+          # assertion: every stimulus must succeed and at least one resulting
+          # counter event must be observed.
 
           source_pod="$(kubectl -n ferrum-ebpf-live get pod -l app=src-a -o jsonpath='{.items[0].metadata.name}')"
           source_node="$(kubectl -n ferrum-ebpf-live get "pod/$source_pod" -o jsonpath='{.spec.nodeName}')"
@@ -293,14 +299,18 @@ jobs:
             exit 1
           fi
 
-          # Fail closed on the stimulus: require a successful HTTP response from
-          # dst-a via excluded Service port 15020 (ClusterIP literal, no DNS).
-          kubectl -n ferrum-ebpf-live exec "pod/$source_pod" -- \
-            curl -fsS --connect-timeout 5 --max-time 5 \
-            "http://${probe_ip}:15020/" | tee "$results/probe.body" | grep -q 'ok-a'
-
           after="$before"
+          probe_attempts=0
           for _ in $(seq 1 30); do
+            probe_attempts=$((probe_attempts + 1))
+            # Fail closed on every stimulus: require a successful HTTP response
+            # from dst-a via excluded Service port 15020 (ClusterIP literal, no
+            # DNS). Repeating the proven stimulus is necessary because the BPF
+            # ring buffer is explicitly lossy while its overrun gauge is set.
+            kubectl -n ferrum-ebpf-live exec "pod/$source_pod" -- \
+              curl -fsS --connect-timeout 5 --max-time 5 \
+              "http://${probe_ip}:15020/" | tee "$results/probe.body" | grep -q 'ok-a'
+
             if curl -fsS http://127.0.0.1:19450/metrics >"$results/after.prom"; then
               candidate="$(awk -v metric="$metric" '$1 == metric { value = $2 } END { print value }' "$results/after.prom")"
               if [[ "$candidate" =~ ^[0-9]+$ ]]; then
@@ -314,14 +324,14 @@ jobs:
           done
 
           if ((after <= before)); then
-            echo "expected $metric to increase after a real excluded-port connection; before=$before after=$after probe_ip=$probe_ip" >&2
-            grep 'ferrum_mesh_bpf_drops_total' "$results/after.prom" >&2 || true
+            echo "expected $metric to increase after $probe_attempts successful excluded-port connections; before=$before after=$after probe_ip=$probe_ip" >&2
+            grep -E 'ferrum_mesh_bpf_(drops_total|ringbuf_)' "$results/after.prom" >&2 || true
             cat "$results/probe.body" >&2 || true
             exit 1
           fi
 
-          printf 'source_pod=%s\nsource_node=%s\nambient_pod=%s\nprobe_svc=%s\nprobe_ip=%s\nmetric=%s\nbefore=%s\nafter=%s\n' \
-            "$source_pod" "$source_node" "$ambient_pod" "$probe_svc" "$probe_ip" "$metric" "$before" "$after" \
+          printf 'source_pod=%s\nsource_node=%s\nambient_pod=%s\nprobe_svc=%s\nprobe_ip=%s\nprobe_attempts=%s\nmetric=%s\nbefore=%s\nafter=%s\n' \
+            "$source_pod" "$source_node" "$ambient_pod" "$probe_svc" "$probe_ip" "$probe_attempts" "$metric" "$before" "$after" \
             >"$results/assertion.txt"
 
       - name: Collect diagnostics
