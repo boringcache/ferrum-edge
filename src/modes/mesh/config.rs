@@ -3851,9 +3851,11 @@ fn validate_mesh_config_internal(
             &mut errors,
         );
         validate_mesh_policy_target_refs_scope(
-            "MeshPolicy",
-            &policy.name,
-            &policy.namespace,
+            &MeshPolicyTargetRefsIdentity {
+                resource_kind: "MeshPolicy",
+                resource_name: &policy.name,
+                policy_namespace: &policy.namespace,
+            },
             &policy.scope,
             services,
             waypoint_bindings,
@@ -4380,6 +4382,13 @@ fn reject_unsupported_target_refs_scope(
     }
 }
 
+/// Immutable resource/policy identity used by targetRefs scope diagnostics.
+struct MeshPolicyTargetRefsIdentity<'a> {
+    resource_kind: &'a str,
+    resource_name: &'a str,
+    policy_namespace: &'a str,
+}
+
 /// Fail-closed validation for AuthorizationPolicy / MeshPolicy `targetRefs`.
 ///
 /// Mirrors the Istio AuthorizationPolicy support contract at the native/file
@@ -4395,9 +4404,7 @@ fn reject_unsupported_target_refs_scope(
 ///   own such a policy.
 /// * Missing targets fail closed rather than silently widening.
 fn validate_mesh_policy_target_refs_scope(
-    resource_kind: &str,
-    resource_name: &str,
-    policy_namespace: &str,
+    identity: &MeshPolicyTargetRefsIdentity<'_>,
     scope: &PolicyScope,
     services: &[MeshService],
     waypoint_bindings: &[MeshWaypointBinding],
@@ -4407,7 +4414,11 @@ fn validate_mesh_policy_target_refs_scope(
     let PolicyScope::TargetRefs { attachments } = scope else {
         return;
     };
-    let context = format!("{resource_kind} '{resource_name}'.scope.target_refs");
+    let context = format!(
+        "{} '{}'.scope.target_refs",
+        identity.resource_kind, identity.resource_name
+    );
+    let policy_namespace = identity.policy_namespace;
     if attachments.is_empty() {
         errors.push(format!(
             "{context}: attachments must not be empty (targeted policies fail closed)"
