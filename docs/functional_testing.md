@@ -325,6 +325,16 @@ startup as complete only once the admin port answers `/health` in the
   proxy HTTP listener, so an identified ready child is also proof that it
   — not a squatter — owns the proxy port for its whole lifetime.
 
+That last claim requires an exclusive proxy bind. Production defaults
+`FERRUM_ACCEPT_THREADS` to `available_parallelism()`, which enables
+`SO_REUSEPORT` whenever the value is greater than one. Two parallel
+harness children can then bind the same ephemeral proxy port after the
+bind-drop-rebind race, keep distinct admin ports (so identity still
+succeeds), and leave client traffic load-balanced onto a foreign gateway
+that returns 404 for this test's routes. The harness therefore pins
+`FERRUM_ACCEPT_THREADS=1` unless the caller overrides it, so a colliding
+bind fails closed and the spawn retry picks a fresh port.
+
 `wait_for_proxy_port` re-proves that ownership before trusting a TCP
 accept, and the spawn wait polls the child so a process that dies after a
 partial bind fails fast instead of burning the health timeout against

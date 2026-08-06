@@ -848,7 +848,7 @@ run_blackbox_tests() {
     --resolve "tls.blackbox.example:443:${GATEWAY_API_STATUS_ADDRESS}" \
     https://tls.blackbox.example/tls | tee -a "$report"
 
-  echo "GRPCRoute resource applied but request traffic is not run because Ferrum does not claim GATEWAY-GRPC support in this job." >> "$report"
+  echo "HTTPRoute black-box checks complete; live GRPCRoute evidence is owned by the upstream GATEWAY-GRPC conformance report from this job." >> "$report"
 }
 
 collect_diagnostics() {

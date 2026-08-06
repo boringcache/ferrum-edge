@@ -209,22 +209,19 @@ jobs:
           GATEWAY_API_SUPPORTED_FEATURES: ${{ steps.inputs.outputs.supported_features }}
         run: bash scripts/gateway_api_data_plane_conformance.sh blackbox
 
-      - name: Align black-box report ownership
-        run: |
-          set -euo pipefail
-          report="conformance-results/gateway-api-blackbox.md"
-          legacy="GRPCRoute resource applied but request traffic is not run because Ferrum does not claim GATEWAY-GRPC support in this job."
-          replacement="HTTPRoute black-box checks complete; live GRPCRoute evidence is owned by the upstream GATEWAY-GRPC conformance report from this job."
-          grep -Fqx "$legacy" "$report"
-          sed -i "s|$legacy|$replacement|" "$report"
-          grep -Fqx "$replacement" "$report"
-
       - name: Run Ferrum Gateway API TCPRoute black-box checks
         # Ferrum-specific echo/status/update/delete coverage; this does not claim
         # an upstream GATEWAY-TCP profile on the pinned Gateway API version.
         env:
           GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
         run: bash scripts/gateway_api_tcproute_conformance.sh blackbox
+
+      - name: Run Ferrum Gateway API TLSRoute black-box checks
+        # Ferrum-specific SNI passthrough/status/update/delete coverage; this does
+        # not claim an upstream GATEWAY-TLS profile on the pinned Gateway API version.
+        env:
+          GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
+        run: bash scripts/gateway_api_tlsroute_conformance.sh blackbox
 
       - name: Collect diagnostics
         if: always()
@@ -237,6 +234,10 @@ jobs:
       - name: Collect TCPRoute diagnostics
         if: always()
         run: bash scripts/gateway_api_tcproute_conformance.sh diagnostics
+
+      - name: Collect TLSRoute diagnostics
+        if: always()
+        run: bash scripts/gateway_api_tlsroute_conformance.sh diagnostics
 
       - name: Upload conformance artifacts
         if: always()
