@@ -148,9 +148,21 @@ fn virtual_service_tcp_weighted_split_skips_zero_weight_and_fails_closed_on_inva
         options(),
     )
     .expect("zero-weight leg is skipped");
-    let upstream = &skipped.config.upstreams[0];
-    assert_eq!(upstream.targets.len(), 1);
-    assert_eq!(upstream.targets[0].host, "stable.default.svc.cluster.local");
+    let proxy = skipped
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_port == Some(3306))
+        .expect("one positive-weight destination remains");
+    assert_eq!(proxy.backend_host, "stable.default.svc.cluster.local");
+    assert_eq!(
+        proxy.upstream_id, None,
+        "one remaining leg needs no upstream"
+    );
+    assert!(
+        skipped.config.upstreams.is_empty(),
+        "a split collapsed to one active destination must not leave an orphan upstream"
+    );
     assert!(
         skipped
             .warnings
