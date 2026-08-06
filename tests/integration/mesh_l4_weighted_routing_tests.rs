@@ -84,9 +84,16 @@ fn virtual_service_tcp_weighted_split_uses_generated_upstream_weights() {
         .iter()
         .find(|upstream| proxy.upstream_id.as_deref() == Some(upstream.id.as_str()))
         .expect("weighted L4 upstream");
-    assert_eq!(upstream.algorithm, LoadBalancerAlgorithm::WeightedRoundRobin);
     assert_eq!(
-        upstream.targets.iter().map(|t| t.weight).collect::<Vec<_>>(),
+        upstream.algorithm,
+        LoadBalancerAlgorithm::WeightedRoundRobin
+    );
+    assert_eq!(
+        upstream
+            .targets
+            .iter()
+            .map(|t| t.weight)
+            .collect::<Vec<_>>(),
         vec![900, 90, 10]
     );
 

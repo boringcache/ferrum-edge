@@ -2864,8 +2864,15 @@ fn l4_route_backend_binding(
     kind: &str,
     block_index: usize,
     backends: Vec<RouteBackend>,
-) -> Result<(String, u16, Option<String>, Option<crate::config::types::Upstream>), K8sTranslateError>
-{
+) -> Result<
+    (
+        String,
+        u16,
+        Option<String>,
+        Option<crate::config::types::Upstream>,
+    ),
+    K8sTranslateError,
+> {
     match backends.len() {
         0 => Err(invalid_resource(
             object,

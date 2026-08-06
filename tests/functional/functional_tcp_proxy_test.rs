@@ -1269,10 +1269,7 @@ plugin_configs: []
             .await
             .expect("send payload");
         let mut buf = vec![0u8; 2 + payload.len()];
-        stream
-            .read_exact(&mut buf)
-            .await
-            .expect("read tagged echo");
+        stream.read_exact(&mut buf).await.expect("read tagged echo");
         if buf.starts_with(b"H:") {
             heavy_hits += 1;
         } else if buf.starts_with(b"L:") {
