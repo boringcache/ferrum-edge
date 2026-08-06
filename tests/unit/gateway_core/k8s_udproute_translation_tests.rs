@@ -251,7 +251,10 @@ fn udp_route_cross_namespace_backend_ref_requires_reference_grant() {
     let translated = translate_k8s_objects(&ungranted, multi_namespace_options());
     let err = translated.expect_err("an ungranted cross-namespace ref fails");
 
-    assert!(err.to_string().contains("requires a matching ReferenceGrant"));
+    assert!(
+        err.to_string()
+            .contains("requires a matching ReferenceGrant")
+    );
 
     let grant = reference_grant("allow-udproute", "UDPRoute");
     let granted = [udp_route("dns", spec), grant];
@@ -274,7 +277,10 @@ fn udp_route_reference_grant_for_another_kind_does_not_authorize() {
     let translated = translate_k8s_objects(&objects, multi_namespace_options());
     let err = translated.expect_err("a TCPRoute grant is not a UDPRoute grant");
 
-    assert!(err.to_string().contains("requires a matching ReferenceGrant"));
+    assert!(
+        err.to_string()
+            .contains("requires a matching ReferenceGrant")
+    );
 }
 
 #[test]
