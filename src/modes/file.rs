@@ -426,7 +426,7 @@ pub(crate) async fn await_fallible_listener_handles(
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
-                error!("Gateway listener task '{}' failed: {}", name, err);
+                error!("Gateway listener task '{}' failed: {:#}", name, err);
                 if first_error.is_none() {
                     first_error = Some(err.context(format!("{name} failed")));
                     if let Some(trigger) = shutdown_on_failure.take() {
@@ -435,7 +435,7 @@ pub(crate) async fn await_fallible_listener_handles(
                 }
             }
             Err(err) => {
-                error!("Gateway listener task '{}' failed: {}", name, err);
+                error!("Gateway listener task '{}' failed: {:#}", name, err);
                 if first_error.is_none() {
                     first_error = Some(if err.is_panic() {
                         anyhow::anyhow!("{name} panicked: {err}")
