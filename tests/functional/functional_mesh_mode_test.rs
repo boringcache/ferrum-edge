@@ -9297,7 +9297,9 @@ fn sidecar_ingress_client_config(
 ) -> Result<Arc<rustls::ClientConfig>, String> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut peers.ca_pem.as_bytes()).filter_map(|c| c.ok()) {
-        roots.add(cert).map_err(|e| format!("add mesh CA root: {e}"))?;
+        roots
+            .add(cert)
+            .map_err(|e| format!("add mesh CA root: {e}"))?;
     }
     let provider = rustls::crypto::ring::default_provider();
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
