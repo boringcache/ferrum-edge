@@ -2101,6 +2101,12 @@ async fn capped_h3_backend(
                 ("content-length", "0".to_string()),
             ]));
     }
+    // Keep the QUIC connection alive after the final response. End-of-script
+    // drops the connection with ApplicationClose(H3_NO_ERROR); without a stall
+    // that teardown races the client's last recv_response and fails request N-1
+    // even though the headers were already sent. Same pattern as the trailered
+    // H3 fixtures in functional_scripted_backend_h3_tests.
+    builder = builder.step(H3Step::StallFor(std::time::Duration::from_secs(1)));
     let backend = builder.spawn().expect("spawn scripted H3 backend");
 
     let provider = rustls::crypto::ring::default_provider();

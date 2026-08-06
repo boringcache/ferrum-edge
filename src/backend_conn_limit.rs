@@ -708,10 +708,11 @@ impl reqwest::ConnectionAdmission for ReqwestConnectionAdmission {
         };
         // Count on the POLICY port, never the dial port, so every transport to
         // this destination shares one ceiling.
-        match self
-            .limiter
-            .try_acquire_shared(&normalized_host, lane.policy_port, lane.cap)
-        {
+        match self.limiter.try_acquire_shared(
+            &normalized_host,
+            lane.policy_port(),
+            lane.cap(),
+        ) {
             Ok(slot) => Ok(reqwest::ConnectionAdmissionToken::new(slot)),
             Err(limit) => Err(Box::new(limit)),
         }
