@@ -560,13 +560,24 @@ fn mixed_valid_and_missing_gateway_target_refs_do_not_reject_config() {
     );
 }
 
-/// Same mixed-acceptance boundary for a GatewayClass arm owned outside the
-/// Istio root namespace: the Service arm keeps the policy valid.
+/// A non-root `GatewayClass` arm is an OWNERSHIP refusal, not an inventory
+/// miss, so it must hard-fail even when a valid sibling Service arm would
+/// otherwise keep the policy alive.
+///
+/// Unlike a missing Service/Gateway — which names an exact `(namespace, name)`
+/// that nothing can match — a `GatewayClass` arm is matched by class name
+/// ALONE (`WaypointAttachment::matches`): no namespace, no Gateway name. If it
+/// were deferred and dropped, any namespace could buy cluster-wide reach over
+/// every waypoint of that class simply by pairing it with one valid
+/// same-namespace Service arm. The K8s translator rejects this
+/// unconditionally; the native/file/`MeshSubscribe` boundary must match.
 #[test]
-fn mixed_valid_service_and_non_root_gateway_class_do_not_reject_config() {
+fn non_root_gateway_class_hard_fails_even_beside_a_valid_service_arm() {
     let errors = MeshConfig {
         istio_root_namespace: "istio-system".to_string(),
         services: vec![mesh_service(WAYPOINT_NS, "reviews")],
+        // The Service arm is valid and applicable; it must NOT launder the
+        // class-wide arm into an accepted policy.
         mesh_policies: vec![policy(
             "deny",
             PolicyAction::Deny,
@@ -578,8 +589,28 @@ fn mixed_valid_service_and_non_root_gateway_class_do_not_reject_config() {
     assert!(
         errors
             .iter()
+            .any(|error| error.contains("GatewayClass") && error.contains("root namespace")),
+        "a non-root GatewayClass arm must reject even beside a valid Service arm: {errors:?}"
+    );
+
+    // Control: the same policy owned BY the root namespace is accepted, so the
+    // rejection above is the ownership rule and not blanket mixed-arm refusal.
+    let root_owned = MeshConfig {
+        istio_root_namespace: WAYPOINT_NS.to_string(),
+        services: vec![mesh_service(WAYPOINT_NS, "reviews")],
+        mesh_policies: vec![policy(
+            "deny",
+            PolicyAction::Deny,
+            target_refs(vec![service_ref("reviews"), class_ref(CLASS_FERRUM)]),
+        )],
+        ..MeshConfig::default()
+    }
+    .validate();
+    assert!(
+        root_owned
+            .iter()
             .all(|error| !error.contains("GatewayClass") && !error.contains("root namespace")),
-        "mixed valid Service + non-root GatewayClass must validate: {errors:?}"
+        "a root-owned Service + GatewayClass policy must validate: {root_owned:?}"
     );
 }
 

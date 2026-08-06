@@ -4401,12 +4401,19 @@ struct MeshPolicyTargetRefsIdentity<'a> {
 ///   cross-namespace attachment before it ever reached the target DP slice —
 ///   an accepted-but-inert security policy.
 /// * `GatewayClass` is cluster-scoped and only the Istio **root namespace** may
-///   own such a policy.
+///   own such a policy. This is an **ownership** rule, so it hard-fails even
+///   alongside a valid sibling attachment (see below).
 /// * A missing / inapplicable sibling attachment must **not** invalidate the
 ///   whole policy when another attachment is still valid and applicable —
 ///   retention is OR and runtime matching stays exact, so an unmatched arm
 ///   never becomes a wildcard. A policy whose *every* attachment is
 ///   unresolved still fails closed rather than silently broadening.
+///   Deferral covers **inventory** misses only (an absent Service / Gateway
+///   named by exact `(namespace, name)`, which nothing can match). Structural
+///   and ownership refusals — malformed fields, cross-namespace
+///   Service/Gateway, unsupported class names, and non-root `GatewayClass`
+///   ownership — are always hard errors, because those arms stay live and
+///   matchable in the retained scope.
 /// * Gateway presence is checked only when `waypoint_bindings` is a real
 ///   inventory. DP slices reconstruct `MeshConfig` without bindings (matching
 ///   uses the live `waypoint_name` / class stamp), so an empty bindings list
@@ -4439,10 +4446,11 @@ fn validate_mesh_policy_target_refs_scope(
         ));
     }
 
-    // Soft (inventory / ownership) failures are deferred: one unresolved arm
-    // must not reject a mixed policy that still has a valid applicable target.
-    // Emit them only when *no* attachment remains valid, so an all-invalid
-    // policy cannot silently broaden.
+    // Inventory-miss failures are deferred: one unresolved arm must not reject
+    // a mixed policy that still has a valid applicable target. Emit them only
+    // when *no* attachment remains valid, so an all-invalid policy cannot
+    // silently broaden. Structural and ownership refusals are NOT deferred —
+    // those arms remain live and matchable in the retained scope.
     let mut valid_attachments = 0usize;
     let mut unresolved: Vec<String> = Vec::new();
 
@@ -4530,8 +4538,18 @@ fn validate_mesh_policy_target_refs_scope(
                 // means the caller has no root-namespace concept (the
                 // trust-bundle-only `validate_mesh_config` entrypoint), so the
                 // ownership rule is not evaluated there.
+                //
+                // This is an ownership refusal, NOT an inventory miss, so it is
+                // never deferred: the class exists and is supported, and
+                // `WaypointAttachment::matches` compares the class name ALONE
+                // (no namespace, no Gateway name). A retained non-root arm is
+                // therefore a live cluster-wide wildcard over every waypoint of
+                // that class, not an arm that simply fails to resolve. Deferring
+                // it would let any namespace buy class-wide reach by pairing it
+                // with one valid same-namespace Service arm — exactly what the
+                // K8s translator rejects unconditionally (`istio.rs`).
                 if !istio_root_namespace.is_empty() && policy_namespace != istio_root_namespace {
-                    unresolved.push(format!(
+                    errors.push(format!(
                         "{path}: GatewayClass attachments must be owned by a policy in the Istio \
                          root namespace ('{istio_root_namespace}'), not '{policy_namespace}'"
                     ));

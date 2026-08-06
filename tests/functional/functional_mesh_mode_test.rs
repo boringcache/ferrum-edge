@@ -9751,6 +9751,18 @@ fn target_refs_waypoint_slice(
         node_id: node_id.to_string(),
         namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
         version: Utc::now().to_rfc3339(),
+        // The DENY policy below is owned by this namespace, and one caller
+        // attaches a `GatewayClass` arm. GatewayClass is cluster-scoped, so
+        // only the Istio root namespace may own such a policy — declare this
+        // namespace as root so the fixture is a VALID config and the property
+        // under test stays "a non-matching class arm must not broaden", not
+        // "an unowned class arm is accepted". Blank root provenance would be
+        // normalized to `istio-system` and reject the policy.
+        //
+        // Inert otherwise on this DP path: the reconstructed root namespace is
+        // read only by GatewayClass ownership validation and DestinationRule
+        // tier arbitration, and this slice carries no DestinationRules.
+        istio_root_namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
         waypoint_gateway_class: Some("istio-waypoint".to_string()),
         workloads: vec![
             waypoint_destination_workload("reviews", reviews_port),
