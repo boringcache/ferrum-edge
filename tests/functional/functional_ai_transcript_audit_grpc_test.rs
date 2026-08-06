@@ -252,7 +252,8 @@ fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
 /// Fragments of a GATEWAY-authored listener bind failure. Every one is a
 /// literal piece of a message this binary emits when a listener cannot take its
 /// port — `Stream listener bind failed: …`, `Stream listener(s) failed to
-/// bind:…`, `Stream listener failed to bind on config reload: …`.
+/// bind:…`, `Stream listener failed to bind on config reload: …`, or `Proxy
+/// listener bind failed: …` chained through a listener task's outer context.
 const LISTENER_BIND_FAILURE_MARKERS: [&str; 2] = ["bind failed", "failed to bind"];
 
 /// Fragments naming the kernel condition a lost bind race actually produces.
@@ -432,6 +433,17 @@ mod gateway_startup_classifier_tests {
         )));
     }
 
+    /// File mode logs the full gateway-authored anyhow chain for a fallible
+    /// listener task. The explicit bind context plus the OS cause is enough to
+    /// classify the ephemeral-port race without broadening retry eligibility to
+    /// arbitrary task failures that merely mention address-in-use text.
+    #[test]
+    fn accepts_gateway_listener_task_bind_race_with_full_error_chain() {
+        assert!(gateway_startup_failure_is_bind_race(&diagnostic_with(
+            r#"{"level":"ERROR","fields":{"message":"Gateway listener task 'HTTP proxy listener' failed: HTTP proxy listener failed: Proxy listener bind failed: Address already in use (os error 98)"},"target":"ferrum_edge::modes::file"}"#
+        )));
+    }
+
     /// A listener message that is not an address-in-use bind failure, and an
     /// address-in-use string with nothing tying it to a listener bind, are both
     /// unclassified — and an unclassified failure is never rerun.
@@ -442,6 +454,9 @@ mod gateway_startup_classifier_tests {
         )));
         assert!(!gateway_startup_failure_is_bind_race(&diagnostic_with(
             r#"{"level":"ERROR","fields":{"message":"Fatal error: Gateway startup failed: HTTP proxy listener exited before completing startup"},"target":"ferrum_edge"}"#
+        )));
+        assert!(!gateway_startup_failure_is_bind_race(&diagnostic_with(
+            r#"{"level":"ERROR","fields":{"message":"Gateway listener task 'HTTP proxy listener' failed: task panicked with message 'Address already in use'"},"target":"ferrum_edge::modes::file"}"#
         )));
         assert!(!gateway_startup_failure_is_bind_race(
             "Address already in use (os error 48)"

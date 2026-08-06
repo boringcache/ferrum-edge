@@ -17,6 +17,7 @@ use crate::modes::mesh::config::{
     TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
     WorkloadSelector, admit_request_match_port_pattern, is_mesh_condition_ip_key,
     is_supported_mesh_condition_key, mesh_condition_has_values, validate_mesh_condition_ip_block,
+    validate_mesh_export_to,
 };
 
 use super::{
@@ -37,7 +38,8 @@ use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, MAX_RETRIES, MAX_TARGET_WEIGHT, MAX_TIMEOUT_MS,
     PluginConfig, Proxy, RetryConfig, validate_backend_tls_san_allow_list_entry,
-    validate_backend_tls_sni,
+    validate_backend_tls_sni, validate_system_trust_roots_skip_verify_pairing,
+    validate_tls_material_source_field,
 };
 use crate::plugins::mesh::workload_metrics::{
     is_recognized_unsupported_istio_metric_family, validate_istio_telemetry_config,
@@ -657,9 +659,11 @@ fn peer_authentication(
 ///     `defaultEndpoint`s and unrecognized/`Udp` protocols are parsed but
 ///     cannot be modeled and stay in the `deferred_fields` report (resolved
 ///     fail-closed downstream).
-///
-/// `outboundTrafficPolicy` is still not translated here — it stays in the
-/// documented "deferred" table until a separate PR lands it.
+///   - `spec.outboundTrafficPolicy.mode` → [`MeshSidecar::outbound_traffic_policy`]
+///     (issue #3262), the workload-scoped override of the mesh-wide policy.
+///     Classification is delegated to the shared, fail-closed
+///     [`classify_sidecar_outbound_traffic_policy`] so the status writer's
+///     `deferred_fields` report can never disagree with what is enforced.
 fn sidecar(
     _acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -807,6 +811,19 @@ fn sidecar(
         }
     }
 
+    // `spec.outboundTrafficPolicy` (issue #3262). A present-but-unrepresentable
+    // block resolves to REGISTRY_ONLY rather than rejecting the resource — see
+    // `classify_sidecar_outbound_traffic_policy` for why dropping the Sidecar
+    // would WIDEN egress instead of failing closed.
+    let outbound_policy = classify_sidecar_outbound_traffic_policy(&object.spec);
+    if let Some(reason) = outbound_policy.deferred {
+        report_sidecar_outbound_policy_degradation(
+            &object.metadata.namespace,
+            &object.metadata.name,
+            reason,
+        );
+    }
+
     Ok(MeshSidecar {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
@@ -815,6 +832,7 @@ fn sidecar(
         egress,
         ingress_declared,
         ingress,
+        outbound_traffic_policy: outbound_policy.policy,
     })
 }
 
@@ -1019,6 +1037,38 @@ fn destination_rule(
         .map(|subset| translate_subset(acc, object, subset))
         .collect::<Result<Vec<_>, _>>()?;
 
+    // `spec.exportTo` visibility (issue #2465). Istio's default for an
+    // omitted — or explicitly empty — list is PUBLIC, so it is materialized as
+    // an explicit `["*"]`: the mesh model's EMPTY `export_to` means
+    // namespace-local on the native/file sources, exactly like ServiceEntry and
+    // the VirtualService CORS carrier, and leaving the list empty here would
+    // silently make every Kubernetes DestinationRule namespace-local.
+    //
+    // `optional_string_array` (not the lossy `string_array`) is deliberate: a
+    // non-array `exportTo`, or a non-string entry, is a REJECTION rather than a
+    // silently dropped visibility constraint. The declaring namespace travels
+    // on the rule itself, which is what lets `.` expand later.
+    let export_to = {
+        let declared = optional_string_array(
+            object,
+            &object.spec,
+            "exportTo",
+            "DestinationRule spec.exportTo",
+        )?;
+        let mut errors = Vec::new();
+        validate_mesh_export_to("DestinationRule spec", &declared, &mut errors);
+        if let Some(first) = errors.first() {
+            return Err(invalid_resource(object, first.clone()));
+        }
+        if declared.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            let mut entries = declared;
+            crate::modes::mesh::config::normalize_mesh_export_to(&mut entries);
+            entries
+        }
+    };
+
     Ok(MeshDestinationRule {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
@@ -1026,6 +1076,7 @@ fn destination_rule(
         traffic_policy,
         port_level_settings,
         subsets,
+        export_to,
     })
 }
 
@@ -1932,6 +1983,24 @@ fn translate_client_tls_settings(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    if let Some(ca_certificates) = ca_certificates.as_deref()
+        && let Err(error) = validate_tls_material_source_field(
+            "trafficPolicy.tls.caCertificates",
+            ca_certificates,
+            crate::tls::source::MaterialKind::CaBundle,
+        )
+    {
+        return Err(invalid_resource(object, error));
+    }
+    if let Some(error) = validate_system_trust_roots_skip_verify_pairing(
+        "trafficPolicy.tls.caCertificates",
+        "trafficPolicy.tls.insecureSkipVerify",
+        ca_certificates.as_deref(),
+        insecure_skip_verify,
+    ) {
+        return Err(invalid_resource(object, error));
+    }
+
     match mode {
         MtlsMode::IstioMutual => {
             if client_certificate.is_some() || private_key.is_some() || ca_certificates.is_some() {
@@ -2158,6 +2227,33 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
         return Err(invalid_resource(object, "ServiceEntry requires spec.hosts"));
     }
 
+    // Istio's omitted or explicitly empty `spec.exportTo` is public. Preserve
+    // that at the Kubernetes boundary as an explicit `["*"]`, because the native
+    // mesh model intentionally interprets an empty list as namespace-local.
+    // Parse strictly: silently dropping a malformed visibility constraint and
+    // then substituting a default would either hide or expose the resource for
+    // the wrong tenants.
+    let export_to = {
+        let declared = optional_string_array(
+            object,
+            &object.spec,
+            "exportTo",
+            "ServiceEntry spec.exportTo",
+        )?;
+        let mut errors = Vec::new();
+        validate_mesh_export_to("ServiceEntry spec", &declared, &mut errors);
+        if let Some(first) = errors.first() {
+            return Err(invalid_resource(object, first.clone()));
+        }
+        if declared.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            let mut entries = declared;
+            crate::modes::mesh::config::normalize_mesh_export_to(&mut entries);
+            entries
+        }
+    };
+
     let mut endpoints = Vec::new();
     for endpoint in object
         .spec
@@ -2206,7 +2302,7 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
             _ => ServiceEntryLocation::MeshExternal,
         },
         ports: service_ports(object)?,
-        export_to: string_array(&object.spec, "exportTo"),
+        export_to,
         workload_selector: object
             .spec
             .get("workloadSelector")
@@ -3433,12 +3529,38 @@ fn virtual_service_routes(
         .and_then(|http| http.get("corsPolicy"))
         .and_then(mesh_cors_policy_from_value)
     {
+        // Same fail-closed boundary the DestinationRule path applies: this
+        // list is the only thing keeping a namespace-local CORS policy off
+        // another tenant's outbound routes, and
+        // `virtual_service_cors_policy_exported_to_namespace` interprets it
+        // through the shared `export_visibility_admits` evaluator rather than
+        // re-validating it. Rejecting HERE keeps a malformed VirtualService a
+        // per-resource `FerrumAccepted=False` instead of letting it reach the
+        // mesh-config backstop and refuse the whole config.
+        //
+        // `optional_string_array` (not the lossy `string_array`) for the same
+        // reason the DestinationRule path uses it: a non-array `exportTo`, or
+        // a non-string entry, would otherwise be silently dropped and the
+        // policy would default to Istio's PUBLIC `["*"]` — a fail-open on the
+        // one field that bounds the policy's blast radius.
         let export_to = {
-            let declared = string_array(&object.spec, "exportTo");
+            let declared = optional_string_array(
+                object,
+                &object.spec,
+                "exportTo",
+                "VirtualService spec.exportTo",
+            )?;
+            let mut errors = Vec::new();
+            validate_mesh_export_to("VirtualService spec", &declared, &mut errors);
+            if let Some(first) = errors.first() {
+                return Err(invalid_resource(object, first.clone()));
+            }
             if declared.is_empty() {
                 vec!["*".to_string()]
             } else {
-                declared
+                let mut entries = declared;
+                crate::modes::mesh::config::normalize_mesh_export_to(&mut entries);
+                entries
             }
         };
         for host in &hosts {
@@ -5287,6 +5409,161 @@ pub(crate) fn sidecar_ingress_protocol_is_modeled(protocol: Option<&str>) -> boo
         || sidecar_ingress_protocol_is_stream_family(protocol)
 }
 
+/// Fail-closed deferral reason: `outboundTrafficPolicy` was present but is not a
+/// JSON object.
+pub(crate) const SIDECAR_OUTBOUND_POLICY_MALFORMED: &str =
+    "outboundTrafficPolicy is not an object (enforcing REGISTRY_ONLY)";
+/// Fail-closed deferral reason: `outboundTrafficPolicy.egressProxy` is set and
+/// Ferrum cannot redirect unmatched egress through a named destination.
+pub(crate) const SIDECAR_OUTBOUND_POLICY_EGRESS_PROXY: &str =
+    "outboundTrafficPolicy.egressProxy is not supported (enforcing REGISTRY_ONLY)";
+/// Fail-closed deferral reason: `outboundTrafficPolicy.mode` is not one of the
+/// two supported tokens, or is not a string at all.
+pub(crate) const SIDECAR_OUTBOUND_POLICY_MODE_UNSUPPORTED: &str =
+    "outboundTrafficPolicy.mode is not ALLOW_ANY or REGISTRY_ONLY (enforcing REGISTRY_ONLY)";
+
+/// Outcome of classifying a `Sidecar`'s `spec.outboundTrafficPolicy` block
+/// (issue #3262).
+///
+/// Shared by the translator ([`sidecar`]) and the Istio status writer
+/// (`istio_status::sidecar_status`) — like
+/// [`sidecar_ingress_protocol_is_http_family`] — so what Ferrum ENFORCES and what
+/// the `FerrumAccepted` status REPORTS can never diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SidecarOutboundPolicy {
+    /// The resolved workload-scoped policy, or `None` when the Sidecar OMITTED
+    /// `outboundTrafficPolicy` entirely (inherit the mesh-wide value).
+    pub policy: Option<crate::modes::mesh::config::OutboundTrafficPolicy>,
+    /// Fail-closed degradation reason when a PRESENT block could not be
+    /// represented exactly. `Some` implies `policy == Some(RegistryOnly)`.
+    /// Reported verbatim in `status.ferrum.translation.deferred_fields`; every
+    /// value is a `&'static str`, so no attacker-controlled input is echoed.
+    pub deferred: Option<&'static str>,
+}
+
+/// Classify `Sidecar.spec.outboundTrafficPolicy` into the workload-scoped
+/// outbound traffic policy Ferrum enforces (issue #3262).
+///
+/// Supported, exactly: `mode: ALLOW_ANY` and `mode: REGISTRY_ONLY`.
+///
+/// A present object with **`mode` omitted or null** resolves to `ALLOW_ANY`, the
+/// documented Istio Sidecar API default. This is distinct from omitting the
+/// entire `outboundTrafficPolicy` block, which inherits Ferrum's mesh-wide tier.
+/// The enum's protobuf zero value does not override the API-level default.
+///
+/// Every other unrepresentable PRESENT block **fails closed to `REGISTRY_ONLY`**
+/// and records a field-specific deferral reason:
+///   - **`mode` unrecognized or not a string** (an `ALOW_ANY` typo, the numeric
+///     proto form, …) — the intent is ambiguous, so the restrictive mode applies.
+///     The raw value is never echoed into the status.
+///   - **the block is not an object** — malformed shape. An explicit top-level
+///     `outboundTrafficPolicy: null` is deliberately NOT normalized to "absent":
+///     unlike the inner fields below, the top level is what decides whether a
+///     workload-scoped policy exists AT ALL, and an operator who wrote the key
+///     asked for one, so the ambiguity fails closed instead of silently
+///     inheriting the (possibly laxer) mesh-wide value.
+///   - **`egressProxy` present and non-null** — Ferrum cannot funnel unmatched
+///     egress through a named `Destination`. Ignoring it would send traffic the
+///     operator scoped to an egress gateway straight out instead, so the registry
+///     gate stays on regardless of the declared `mode`. An explicit
+///     `egressProxy: null` IS normalized to absent, matching proto-JSON (and the
+///     `mode: null` handling below): the operator declared no egress proxy, so
+///     the declared `mode` is honored.
+///
+/// The resource is never REJECTED over this field. A rejected Sidecar is dropped
+/// from the translation entirely (`translate_k8s_objects_collecting_skips` skips
+/// it and retries), which would also drop its `egress` narrowing and thereby
+/// WIDEN both the workload's slice service view and the `REGISTRY_ONLY` registry
+/// derived from it — the opposite of failing closed.
+pub(crate) fn classify_sidecar_outbound_traffic_policy(spec: &Value) -> SidecarOutboundPolicy {
+    use crate::modes::mesh::config::OutboundTrafficPolicy;
+
+    let Some(raw) = spec.get("outboundTrafficPolicy") else {
+        return SidecarOutboundPolicy {
+            policy: None,
+            deferred: None,
+        };
+    };
+    let fail_closed = |reason: &'static str| SidecarOutboundPolicy {
+        policy: Some(OutboundTrafficPolicy::RegistryOnly),
+        deferred: Some(reason),
+    };
+    let Some(block) = raw.as_object() else {
+        return fail_closed(SIDECAR_OUTBOUND_POLICY_MALFORMED);
+    };
+    // `egressProxy` changes what the mode MEANS in Istio (unmatched egress is
+    // routed THROUGH the named destination rather than out directly), so it is
+    // checked before the mode and wins over an explicit `ALLOW_ANY`. An explicit
+    // JSON `null` is proto-JSON for "unset" — normalized to absent here exactly
+    // as `mode: null` is below, so `egressProxy: null` does not silently force
+    // REGISTRY_ONLY onto an operator who declared no egress proxy.
+    let egress_proxy = block.get("egressProxy");
+    if egress_proxy.is_some_and(|value| !value.is_null()) {
+        return fail_closed(SIDECAR_OUTBOUND_POLICY_EGRESS_PROXY);
+    }
+    match block.get("mode") {
+        None | Some(Value::Null) => SidecarOutboundPolicy {
+            policy: Some(OutboundTrafficPolicy::AllowAny),
+            deferred: None,
+        },
+        Some(Value::String(mode)) => match mode.as_str() {
+            "ALLOW_ANY" => SidecarOutboundPolicy {
+                policy: Some(OutboundTrafficPolicy::AllowAny),
+                deferred: None,
+            },
+            "REGISTRY_ONLY" => SidecarOutboundPolicy {
+                policy: Some(OutboundTrafficPolicy::RegistryOnly),
+                deferred: None,
+            },
+            _ => fail_closed(SIDECAR_OUTBOUND_POLICY_MODE_UNSUPPORTED),
+        },
+        Some(_) => fail_closed(SIDECAR_OUTBOUND_POLICY_MODE_UNSUPPORTED),
+    }
+}
+
+/// Whether this process has already emitted the `warn!` for a fail-closed
+/// `Sidecar.outboundTrafficPolicy` degradation. One process-wide bool, never a
+/// per-resource map: translation re-runs on every reconcile and every full sync,
+/// so a per-resource `warn!` would re-fire for the lifetime of a Sidecar that is
+/// *permanently* unrepresentable and drown the log in a message whose content
+/// never changes.
+static SIDECAR_OUTBOUND_POLICY_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Report a fail-closed `Sidecar.outboundTrafficPolicy` degradation (issue
+/// #3262) without steady-state log noise.
+///
+/// The authoritative, always-current surface is the resource's own
+/// `FerrumAccepted` status (`deferred_fields`), which carries the same
+/// field-specific reason and is rewritten on every reconcile. So this emits:
+///   - one `debug!` per occurrence, carrying namespace + name + the `&'static`
+///     reason (never the operator-supplied raw value), for operators who turned
+///     debug logging on to chase a specific resource; and
+///   - exactly ONE process-lifetime `warn!` pointing at that status surface, so
+///     the degradation is still discoverable at the default log level.
+fn report_sidecar_outbound_policy_degradation(namespace: &str, name: &str, reason: &'static str) {
+    use std::sync::atomic::Ordering;
+
+    tracing::debug!(
+        namespace = %namespace,
+        sidecar = %name,
+        reason = %reason,
+        "Istio Sidecar outboundTrafficPolicy is not exactly representable; \
+         enforcing REGISTRY_ONLY for the selected workloads",
+    );
+    let first_in_process = SIDECAR_OUTBOUND_POLICY_WARNED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok();
+    if first_in_process {
+        tracing::warn!(
+            "At least one Istio Sidecar declares an outboundTrafficPolicy Ferrum cannot represent \
+             exactly; REGISTRY_ONLY is enforced for the workloads it selects. Per-resource reasons \
+             are in each Sidecar's status.ferrum.translation.deferred_fields (this warning is \
+             emitted once per process; enable debug logging for per-resource detail)",
+        );
+    }
+}
+
 fn telemetry(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -6255,6 +6532,51 @@ mod tests {
         let mesh = result.config.mesh.expect("mesh config");
         assert_eq!(mesh.service_entries[0].hosts, vec!["api.example.com"]);
         assert_eq!(mesh.service_entries[0].ports[0].protocol, AppProtocol::Tls);
+        assert_eq!(
+            mesh.service_entries[0].export_to,
+            vec!["*"],
+            "Istio's omitted ServiceEntry exportTo must remain public"
+        );
+    }
+
+    #[test]
+    fn service_entry_export_to_is_strict_and_preserves_istio_public_default() {
+        let translate = |export_to: Option<Value>| {
+            let mut spec = serde_json::json!({
+                "hosts": ["api.example.com"],
+                "ports": [{"number": 443, "name": "https", "protocol": "TLS"}]
+            });
+            if let Some(export_to) = export_to {
+                spec["exportTo"] = export_to;
+            }
+            translate_k8s_objects(&[object("ServiceEntry", spec)], options())
+        };
+
+        for declared in [None, Some(serde_json::json!([]))] {
+            let result = translate(declared).expect("public default must translate");
+            let mesh = result.config.mesh.expect("mesh config");
+            assert_eq!(mesh.service_entries[0].export_to, vec!["*"]);
+        }
+
+        let result = translate(Some(serde_json::json!([".", " beta "])))
+            .expect("valid explicit visibility must translate");
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.service_entries[0].export_to, vec![".", "beta"]);
+
+        for invalid in [
+            serde_json::json!("*"),
+            serde_json::json!([7]),
+            serde_json::json!(["*", "beta"]),
+            serde_json::json!(["~"]),
+            serde_json::json!([""]),
+        ] {
+            let error = translate(Some(invalid))
+                .expect_err("malformed ServiceEntry exportTo must fail closed");
+            assert!(
+                error.to_string().contains("ServiceEntry spec.exportTo"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -16910,6 +17232,57 @@ extensionProviders:
             .as_ref()
             .expect("tls block");
         assert!(tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn destination_rule_rejects_system_roots_with_insecure_skip_verify() {
+        let error = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "caCertificates": "system://",
+                            "insecureSkipVerify": true
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("system roots with verification disabled must fail translation");
+
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("caCertificates"), "{diagnostic}");
+        assert!(diagnostic.contains("insecureSkipVerify"), "{diagnostic}");
+        assert!(diagnostic.contains("system://"), "{diagnostic}");
+    }
+
+    #[test]
+    fn destination_rule_rejects_noncanonical_system_roots_source() {
+        let error = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "caCertificates": "system://corp-ca.pem"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("a system trust source with a path suffix must fail translation");
+
+        assert!(
+            error.to_string().contains("must be exactly 'system://'"),
+            "{error}"
+        );
     }
 
     #[test]

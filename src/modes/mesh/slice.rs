@@ -1,16 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::{Mutex, OnceLock};
 use tracing::{debug, warn};
 
 use crate::config::types::{GatewayConfig, Proxy};
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
-    MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
-    MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress, MeshTelemetryResource,
-    MeshVirtualServiceCorsPolicy, MtlsMode, MultiClusterConfig, OutboundTrafficPolicy,
-    PeerAuthentication, PolicyScope, ResolvedIngressListener, ServiceEntry, SidecarHostPattern,
-    TrustBundleSet, Workload, WorkloadLabels, is_false, is_zero_usize,
+    DestinationRuleLookupTier, MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig,
+    MeshRequestAuthentication, MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress,
+    MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MtlsMode, MultiClusterConfig,
+    OutboundTrafficPolicy, PeerAuthentication, PolicyScope, ResolvedIngressListener, ServiceEntry,
+    SidecarHostPattern, TrustBundleSet, Workload, WorkloadLabels,
+    destination_rule_exported_to_namespace, destination_rule_lookup_tier, is_false, is_zero_usize,
     policy_scope_applies_to_workload, proxy_config_applies_to_workload, scope_applies_to_workload,
     service_entry_applies_to_workload, virtual_service_cors_policy_exported_to_namespace,
     workload_selector_matches,
@@ -203,6 +205,26 @@ impl MeshSliceRequest {
 pub struct MeshSlice {
     pub node_id: String,
     pub namespace: String,
+    /// The mesh's configured `meshConfig.rootNamespace`
+    /// (`FERRUM_K8S_ISTIO_ROOT_NAMESPACE`), carried so the data plane can
+    /// classify Istio's THIRD DestinationRule lookup tier (issue #2469).
+    ///
+    /// Without trustworthy root provenance the materializer cannot tell an
+    /// admitted root-namespace default apart from a rule declared in an
+    /// arbitrary namespace: both would land in the lowest bucket. Missing,
+    /// empty, or whitespace-only provenance therefore fails closed — Unscoped
+    /// rules are refused, independently provable client/service tiers still
+    /// apply, and a legitimate root-tier default is unavailable rather than
+    /// guessed. It is a SCOPING input, not a policy: it only ever decides
+    /// which of two buckets a rule lands in, never whether the rule was
+    /// visible (that is `exportTo`, evaluated strictly earlier).
+    ///
+    /// EMPTY means "this producer did not carry a trustworthy root
+    /// namespace". Every Ferrum-built slice carries one
+    /// (`MeshConfig::istio_root_namespace` defaults to `istio-system`), so
+    /// real deployments always get the root tier.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub istio_root_namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_spiffe_id: Option<String>,
     /// GAMMA Waypoint identity for this slice. `Some` only when the DP
@@ -404,6 +426,27 @@ pub struct MeshSlice {
     /// `workloads.addresses`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
+    /// Workload-scoped outbound traffic policy resolved from the local
+    /// workload's applicable Istio `Sidecar.outboundTrafficPolicy` (issue #3262).
+    ///
+    /// Resolved CP-side at slice build (raw `MeshSidecar` records do not ride the
+    /// slice — only this resolved view does, mirroring `local_ingress_listeners`)
+    /// under the SAME gate as ingress materialization,
+    /// `sidecar_enforced && !sidecar_dry_run`: applying a workload-scoped policy
+    /// changes data-plane behavior, so dry-run must not.
+    ///
+    /// `Some` OVERRIDES the mesh-wide [`Self::outbound_traffic_policy`]; `None`
+    /// inherits it (and then the `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY` default).
+    /// Both directions of the override are honored — a Sidecar `REGISTRY_ONLY`
+    /// tightens a mesh that is `ALLOW_ANY`, and a Sidecar `ALLOW_ANY` relaxes the
+    /// registry gate for exactly the workloads that Sidecar selects, matching
+    /// Istio. Relaxing the registry gate does NOT relax anything else: Sidecar
+    /// `egress` narrowing, `mesh_authz`, PeerAuthentication/mTLS posture, the
+    /// HBONE open-relay guard, and topology transport gates are independent and
+    /// still apply. Resolve the effective value through
+    /// [`Self::effective_outbound_traffic_policy`] — never read this field alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_outbound_traffic_policy: Option<OutboundTrafficPolicy>,
     /// Cold-path operator view of the Sidecar egress scope that was applied,
     /// or would have been applied when dry-run is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -631,6 +674,13 @@ impl MeshSlice {
     pub fn content_eq(&self, other: &Self) -> bool {
         self.node_id == other.node_id
             && self.namespace == other.namespace
+            // Changing `meshConfig.rootNamespace` re-buckets every
+            // DestinationRule the DP holds: a rule that was the winning Root
+            // default becomes Unscoped (refused) and vice versa. It MUST be
+            // compared so the slice is re-broadcast and the materializer
+            // re-runs tier resolution; omitting it would keep serving the
+            // policy resolved against the OLD root namespace.
+            && self.istio_root_namespace == other.istio_root_namespace
             && self.workload_spiffe_id == other.workload_spiffe_id
             && self.waypoint_name == other.waypoint_name
             && self.labels == other.labels
@@ -685,9 +735,59 @@ impl MeshSlice {
             && self.trust_bundles == other.trust_bundles
             && self.multi_cluster == other.multi_cluster
             && self.outbound_traffic_policy == other.outbound_traffic_policy
+            // The workload-scoped Sidecar policy (issue #3262) flips independently
+            // of every other field: an operator editing ONLY
+            // `Sidecar.outboundTrafficPolicy.mode` (or deleting the Sidecar that
+            // carried it) leaves services/egress scope byte-identical. Omitting it
+            // from slice equality would let MeshSubscribe/update dedupe suppress
+            // the frame, so the DP would keep the stale registry gate — serving
+            // `ALLOW_ANY` passthrough after the operator moved to REGISTRY_ONLY.
+            && self.sidecar_outbound_traffic_policy == other.sidecar_outbound_traffic_policy
             && self.sidecar_egress_scope == other.sidecar_egress_scope
             && self.extension_configs == other.extension_configs
             && self.runtime_overlay == other.runtime_overlay
+    }
+
+    /// Resolve the EFFECTIVE outbound traffic policy for this slice's workload
+    /// (issue #3262).
+    ///
+    /// Precedence, most specific first — this mirrors Istio, where a `Sidecar`
+    /// resource's `outboundTrafficPolicy` replaces `MeshConfig`'s for exactly the
+    /// workloads it selects:
+    ///
+    /// 1. [`Self::sidecar_outbound_traffic_policy`] — the applicable Istio
+    ///    `Sidecar.outboundTrafficPolicy.mode` (only ever populated under
+    ///    `FERRUM_MESH_SIDECAR_ENFORCED` without dry-run).
+    /// 2. [`Self::outbound_traffic_policy`] — the mesh-wide
+    ///    `MeshConfig.outboundTrafficPolicy.mode` carried on the slice.
+    /// 3. `runtime_default` — `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY` (`allow_any`).
+    ///
+    /// This is the ONE place the precedence lives. Both consumers — HTTP-family
+    /// `mesh_outbound_registry` plugin injection and the stream-family
+    /// `MeshOutboundEnforcement` slot — call it, so the two transport families
+    /// can never disagree about whether the registry gate is ARMED. It runs at
+    /// slice apply only (cold path): the result is materialized into the injected
+    /// plugin config and the `ArcSwap` enforcement slot, never re-derived or
+    /// re-parsed per request.
+    ///
+    /// Scope note: the shared input is the armed/disarmed DECISION, not the
+    /// admitted registry CONTENTS. The two lanes build their registries from
+    /// different slice values on the multicluster path — HTTP-family injection
+    /// runs against the merged materialization slice (`merged_slice`, which
+    /// unions poller-discovered remote workloads/services into
+    /// `workloads`/`services`), while `refresh_mesh_outbound_enforcement` runs
+    /// against the un-merged base slice — so a remote-cluster destination can be
+    /// admitted on HTTP while a stream connect to the same destination is
+    /// refused. That asymmetry is a registry-membership property, and it fails
+    /// CLOSED on the stream side; do not restate it as "the two lanes are
+    /// identical".
+    pub fn effective_outbound_traffic_policy(
+        &self,
+        runtime_default: OutboundTrafficPolicy,
+    ) -> OutboundTrafficPolicy {
+        self.sidecar_outbound_traffic_policy
+            .or(self.outbound_traffic_policy)
+            .unwrap_or(runtime_default)
     }
 
     /// Build the set of known mesh destinations from this slice. Used by
@@ -1093,48 +1193,100 @@ impl MeshSlice {
             resolved_sidecar
         };
 
-        // Resolve the local workload's custom inbound listeners from the
-        // applicable Sidecar's `ingress[]`. Gated like egress narrowing: only
-        // under enforcement (NOT dry-run, which reports but changes nothing —
-        // materializing inbound listeners is a behavior change). Resolution
-        // follows the SAME tier precedence as egress, then keeps only the
-        // routable entries (loopback host:port HTTP listeners); unsupported
-        // shapes are dropped here and reported as deferred by the K8s status
-        // writer. Carried on the slice so the DP materializer never re-resolves
-        // raw `MeshSidecar` records (they do not ride the slice), mirroring the
-        // `local_inbound_services` pattern.
-        let (
-            mut local_ingress_listeners,
-            sidecar_ingress_declared,
-            mut declared_ingress_http_ports,
-        ): (Vec<ResolvedIngressListener>, bool, usize) = if sidecar_enforced && !sidecar_dry_run {
-            resolve_applicable_sidecar_ingress(
+        // ONE `select_applicable_sidecar` scan, shared by the two consumers that
+        // need the workload's single applicable Sidecar under the SAME gate and
+        // the SAME tier precedence: `ingress[]` materialization and the
+        // workload-scoped `outboundTrafficPolicy` below. Gated like ingress
+        // materialization, NOT like egress narrowing: only under enforcement and
+        // NOT under dry-run, which reports but changes nothing. (Egress keeps its
+        // own scan — `resolve_applicable_sidecar_egress` walks the
+        // `inherits_defaults` chain under the looser `enforced || dry_run` gate,
+        // so its result is not interchangeable with this one.)
+        let selected_sidecar: Option<&MeshSidecar> = if sidecar_enforced && !sidecar_dry_run {
+            select_applicable_sidecar(
                 &mesh.sidecars,
                 effective_namespace,
                 &effective_labels,
                 mesh.istio_root_namespace.as_str(),
             )
         } else {
-            (Vec::new(), false, 0)
+            None
         };
 
-        // Sidecar-only indexes: skip the full scan over `mesh.services` and
-        // `mesh.service_entries` when no Sidecar applies (default-off feature,
-        // or an enforced workload that no Sidecar resource targets). The
-        // destination-rules filter and the VirtualService L4 proxy filter are
-        // the only consumers, and both short-circuit before reading these when
-        // `applicable_sidecar` is `None`. That short-circuit is what makes the
-        // empty sets safe: `applicable_sidecar` is `resolved_sidecar` except
-        // under dry-run (where it is `None`), so a consumer can only reach
-        // these sets on a path where `resolved_sidecar` was `Some` and they
-        // were therefore populated.
-        let (mesh_service_identities, service_entry_hosts) = if resolved_sidecar.is_some() {
+        // Resolve the local workload's custom inbound listeners from the selected
+        // Sidecar's `ingress[]`, keeping only the routable entries (loopback
+        // host:port HTTP listeners); unsupported shapes are dropped here and
+        // reported as deferred by the K8s status writer. Carried on the slice so
+        // the DP materializer never re-resolves raw `MeshSidecar` records (they
+        // do not ride the slice), mirroring the `local_inbound_services` pattern.
+        let (
+            mut local_ingress_listeners,
+            sidecar_ingress_declared,
+            mut declared_ingress_http_ports,
+        ): (Vec<ResolvedIngressListener>, bool, usize) =
+            resolve_selected_sidecar_ingress(selected_sidecar);
+
+        // Workload-scoped `Sidecar.outboundTrafficPolicy` (issue #3262). Gated
+        // exactly like ingress materialization — NOT like egress narrowing, which
+        // also runs under dry-run: dry-run is defined as "report the scope that
+        // WOULD apply, change nothing", and arming (or disarming) the outbound
+        // registry gate is a live behavior change. `None` here therefore means
+        // both "no Sidecar declared one" and "the gate is off", and both fall
+        // back to the mesh-wide policy in
+        // `effective_outbound_traffic_policy` — never to a weaker one.
+        //
+        // SECURITY: on a `labels_ambiguous` slice `effective_labels` is only the
+        // INTERSECTION of several same-SPIFFE workloads' divergent label sets, so
+        // a workload-scoped Sidecar that really does select one of them can fail
+        // to match it — which would silently fall through to a laxer namespace
+        // default. The extra candidate label sets are therefore passed in (empty
+        // unless ambiguous) and the resolution folds them fail-closed. See
+        // `resolve_applicable_sidecar_outbound_policy`.
+        let ambiguous_policy_candidates: &[&BTreeMap<String, String>] = if labels_ambiguous {
+            &policy_candidate_labels
+        } else {
+            &[]
+        };
+        let sidecar_outbound_traffic_policy = if sidecar_enforced && !sidecar_dry_run {
+            resolve_applicable_sidecar_outbound_policy(
+                &mesh.sidecars,
+                effective_namespace,
+                mesh.istio_root_namespace.as_str(),
+                selected_sidecar,
+                ambiguous_policy_candidates,
+            )
+        } else {
+            None
+        };
+
+        // Host-scoping indexes for policy narrowing. These two indexes are the
+        // EVIDENCE that establishes who owns a policy's target host
+        // (`beta/reviews` in the service inventory, `api.example.com` in a
+        // visible ServiceEntry), and ownership is what makes Istio's
+        // client -> service -> root lookup tiers (#2469) a security boundary
+        // rather than a naming convention. They are therefore built whenever a
+        // DestinationRule or a VirtualService CORS policy exists, not only when
+        // a Sidecar applies — without them every host would fall back to
+        // "unowned", which is fail-closed but would drop legitimate
+        // service-tier policy.
+        //
+        // When none of those hold the sets stay empty, which is still safe:
+        // the remaining consumers are the destination-rules filter and the
+        // VirtualService L4 proxy filter, and both short-circuit before reading
+        // them when `applicable_sidecar` is `None`. `applicable_sidecar` is
+        // `resolved_sidecar` except under dry-run (where it is `None`), so a
+        // consumer can only reach these sets on a path where `resolved_sidecar`
+        // was `Some` and they were therefore populated.
+        let (mesh_service_identities, service_entry_hosts) = if resolved_sidecar.is_some()
+            || !mesh.destination_rules.is_empty()
+            || !mesh.virtual_service_cors_policies.is_empty()
+        {
             (
-                mesh_service_identities(mesh),
+                mesh_service_identities(&mesh.services),
                 visible_service_entry_hosts(mesh, effective_namespace, &effective_labels),
             )
         } else {
-            (BTreeSet::new(), BTreeSet::new())
+            (BTreeSet::new(), BTreeMap::new())
         };
 
         let virtual_service_l4_proxies = serialize_virtual_service_l4_proxies(
@@ -1144,18 +1296,28 @@ impl MeshSlice {
                     let Some(sidecar) = applicable_sidecar else {
                         return true;
                     };
-                    let (resource_namespace, host_candidates) = policy_host_scope(
+                    let host_scope = policy_host_scope(
                         &proxy.backend_host,
                         &proxy.namespace,
                         &cluster_domain,
                         &mesh_service_identities,
                         &service_entry_hosts,
                     );
-                    let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+                    // Egress scope matching needs a concrete namespace, so this
+                    // uses `scope_namespace` (which falls back to the proxy's
+                    // own namespace) rather than the evidence-backed
+                    // `service_namespace`. Sidecar egress is a reachability
+                    // filter, not an ownership decision — ownership only gates
+                    // the DestinationRule / CORS lookup tiers.
+                    let host_refs: Vec<&str> = host_scope
+                        .host_candidates
+                        .iter()
+                        .map(String::as_str)
+                        .collect();
                     sidecar_egress_includes_service(
                         sidecar.namespace,
                         sidecar.egress,
-                        &resource_namespace,
+                        &host_scope.scope_namespace,
                         &host_refs,
                         Some(&[proxy.backend_port]),
                     )
@@ -1358,56 +1520,57 @@ impl MeshSlice {
             })
             .cloned()
             .collect();
-        let destination_rules: Vec<MeshDestinationRule> = mesh
-            .destination_rules
-            .iter()
-            .filter(|dr| {
+        // DestinationRule admission is centralized in `admit_destination_rules`:
+        // `exportTo` visibility (#2465) first, then Istio's client → target
+        // service → root lookup tiers (#2469), then this path's own scope gate,
+        // then per-destination tier resolution. The root namespace is resolved
+        // HERE, at slice build, so the data plane never has to know it.
+        let destination_rule_scope = DestinationRuleScope {
+            client_namespace: effective_namespace,
+            root_namespace: mesh.istio_root_namespace.as_str(),
+            cluster_domain: &cluster_domain,
+            mesh_service_identities: &mesh_service_identities,
+            service_entry_hosts: &service_entry_hosts,
+        };
+        let destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
+            mesh.destination_rules.iter(),
+            &destination_rule_scope,
+            |dr, resource_namespace, host_candidates| {
                 let Some(sidecar) = applicable_sidecar else {
+                    // No applicable Sidecar: the rest of this slice is already
+                    // namespace-local (or waypoint-bound), so keep the same
+                    // resource-namespace visibility rule — but never drop a
+                    // root-namespace rule, which is Istio's mesh-wide default
+                    // tier and applies with or without a Sidecar resource.
                     return resource_namespace_visible(
                         &service_waypoint_namespaces,
                         &dr.namespace,
                         &namespace,
-                    );
+                    ) || dr.namespace.trim() == mesh.istio_root_namespace.trim();
                 };
-                let (resource_namespace, host_candidates) = destination_rule_host_scope(
-                    dr,
-                    &cluster_domain,
-                    &mesh_service_identities,
-                    &service_entry_hosts,
-                );
-                // Istio DestinationRule lookup namespaces are {client (the
-                // workload's own namespace), target service namespace, root
-                // namespace}. Root-namespace plumbing is deferred (see
-                // docs/mesh.md "Known Limitations"), so admit only DRs
-                // declared in the client or the target service namespace.
-                // Without this guard a DR in an unrelated namespace
-                // targeting `reviews.beta` could be imported into an
-                // `alpha` workload's slice merely because the Sidecar
-                // admits `beta/*`, letting a third-party namespace override
-                // client traffic policy.
-                let dr_namespace = dr.namespace.as_str();
-                if dr_namespace != effective_namespace
-                    && dr_namespace != resource_namespace.as_str()
-                {
-                    return false;
-                }
                 let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
                 sidecar_egress_includes_service(
                     sidecar.namespace,
                     sidecar.egress,
-                    &resource_namespace,
+                    resource_namespace,
                     &host_refs,
                     None,
                 )
-            })
-            .cloned()
-            .collect();
+            },
+        );
         // VirtualService-derived CORS policies narrow EXACTLY like
         // DestinationRules: same namespace-visibility default, same
         // client-or-target-namespace guard, same Sidecar egress-scope check —
         // both are host-targeting client-side traffic policy, so a namespace
         // that cannot override a workload's DRs must not be able to inject
         // CORS behavior onto its routes either.
+        //
+        // The symmetry is enforced at the same THREE points a DR's visibility
+        // is: here, at the xDS carrier fold (`retain_visible_cors_policies` in
+        // `config_consumer/xds_client.rs`), and again on the DP at outbound
+        // `cors` synthesis (`synthesize_mesh_outbound_cors_plugins`). Adding a
+        // gate to one without the others reopens cross-tenant CORS injection
+        // over any producer that bypasses slice admission.
         let virtual_service_cors_policies: Vec<MeshVirtualServiceCorsPolicy> = mesh
             .virtual_service_cors_policies
             .iter()
@@ -1425,24 +1588,34 @@ impl MeshSlice {
                 let Some(sidecar) = applicable_sidecar else {
                     return true;
                 };
-                let (resource_namespace, host_candidates) = policy_host_scope(
+                let host_scope = policy_host_scope(
                     &policy.host,
                     &policy.namespace,
                     &cluster_domain,
                     &mesh_service_identities,
                     &service_entry_hosts,
                 );
-                let policy_namespace = policy.namespace.as_str();
-                if policy_namespace != effective_namespace
-                    && policy_namespace != resource_namespace.as_str()
+                // Client-or-OWNER guard. The owner comes from
+                // `service_namespace` (evidence-backed), never from
+                // `scope_namespace` (which falls back to the policy's own
+                // namespace and would let any namespace vouch for itself):
+                // when ownership is unresolved or ambiguous only the client
+                // namespace's own CORS policy survives.
+                let policy_namespace = policy.namespace.trim();
+                if policy_namespace != effective_namespace.trim()
+                    && host_scope.service_namespace.as_deref() != Some(policy_namespace)
                 {
                     return false;
                 }
-                let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+                let host_refs: Vec<&str> = host_scope
+                    .host_candidates
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
                 sidecar_egress_includes_service(
                     sidecar.namespace,
                     sidecar.egress,
-                    &resource_namespace,
+                    &host_scope.scope_namespace,
                     &host_refs,
                     None,
                 )
@@ -1508,6 +1681,7 @@ impl MeshSlice {
                 waypoint,
                 &request.namespace,
                 &request.cluster_domain,
+                mesh.istio_root_namespace.as_str(),
                 &mesh.waypoint_bindings,
                 waypoint_resources,
             )
@@ -1524,6 +1698,11 @@ impl MeshSlice {
         Self {
             node_id: request.node_id,
             namespace: request_namespace.clone(),
+            // Issue #2469: the DP needs the mesh root namespace to distinguish
+            // an admitted root-tier default from a rule in an arbitrary
+            // namespace. The CP resolves the tier at admission; carrying the
+            // namespace lets the DP's defence-in-depth pass do the same.
+            istio_root_namespace: mesh.istio_root_namespace.clone(),
             workload_spiffe_id: request.workload_spiffe_id,
             waypoint_name: request.waypoint_name,
             labels: effective_labels,
@@ -1559,6 +1738,7 @@ impl MeshSlice {
                 scoped
             }),
             outbound_traffic_policy: mesh.outbound_traffic_policy,
+            sidecar_outbound_traffic_policy,
             sidecar_egress_scope,
             extension_configs,
             // The canonical GatewayConfig has no declarative RTDS surface.
@@ -1623,6 +1803,7 @@ fn narrow_for_service_waypoint(
     waypoint_name: &str,
     waypoint_namespace: &str,
     cluster_domain: &str,
+    root_namespace: &str,
     bindings: &[crate::modes::mesh::config::MeshWaypointBinding],
     resources: ServiceWaypointNarrowingResources,
 ) -> ServiceWaypointNarrowingResources {
@@ -1664,6 +1845,7 @@ fn narrow_for_service_waypoint(
             destination_rule_matches_admitted_service(
                 dr,
                 waypoint_namespace,
+                root_namespace,
                 cluster_domain,
                 &admitted_services,
                 &admitted_hosts,
@@ -1725,6 +1907,7 @@ fn admitted_service_hosts(services: &[MeshService], cluster_domain: &str) -> BTr
 fn destination_rule_matches_admitted_service(
     dr: &MeshDestinationRule,
     waypoint_namespace: &str,
+    root_namespace: &str,
     cluster_domain: &str,
     admitted_services: &[MeshService],
     admitted_hosts: &BTreeSet<String>,
@@ -1734,6 +1917,7 @@ fn destination_rule_matches_admitted_service(
         && destination_rule_namespace_allowed_for_admitted_service(
             dr,
             waypoint_namespace,
+            root_namespace,
             cluster_domain,
             admitted_services,
             host,
@@ -1743,14 +1927,26 @@ fn destination_rule_matches_admitted_service(
             .any(|service| host == service.name && dr.namespace == service.namespace)
 }
 
+/// Which namespaces may own a DestinationRule for a service-waypoint-admitted
+/// service.
+///
+/// This mirrors Istio's lookup path for the waypoint's client position: the
+/// waypoint's own namespace (client tier), the target Service's namespace
+/// (service tier), and the configured `istio_root_namespace` (root tier,
+/// issue #2469 — omitting it dropped the mesh-wide default entirely). Export
+/// visibility and cross-tier precedence have already been resolved by
+/// `admit_destination_rules`; this pass only re-checks ownership against the
+/// waypoint's narrowed service set.
 fn destination_rule_namespace_allowed_for_admitted_service(
     dr: &MeshDestinationRule,
     waypoint_namespace: &str,
+    root_namespace: &str,
     cluster_domain: &str,
     admitted_services: &[MeshService],
     host: &str,
 ) -> bool {
     let cluster_domain = cluster_domain.trim().trim_end_matches('.');
+    let root_namespace = root_namespace.trim();
     admitted_services.iter().any(|service| {
         let host_matches = host == format!("{}.{}", service.name, service.namespace)
             || host == format!("{}.{}.svc", service.name, service.namespace)
@@ -1760,7 +1956,10 @@ fn destination_rule_namespace_allowed_for_admitted_service(
                         "{}.{}.svc.{}",
                         service.name, service.namespace, cluster_domain
                     ));
-        host_matches && (dr.namespace == service.namespace || dr.namespace == waypoint_namespace)
+        host_matches
+            && (dr.namespace == service.namespace
+                || dr.namespace == waypoint_namespace
+                || (!root_namespace.is_empty() && dr.namespace.trim() == root_namespace))
     })
 }
 
@@ -1926,7 +2125,7 @@ struct EgressScopeBuildContext<'a, L: WorkloadLabels + ?Sized> {
     workload_labels: &'a L,
     cluster_domain: &'a str,
     mesh_service_identities: &'a BTreeSet<(String, String)>,
-    service_entry_hosts: &'a BTreeSet<String>,
+    service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
     sidecar_enforced: bool,
     dry_run: bool,
 }
@@ -1964,31 +2163,31 @@ fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
         .filter(|workload| workload.namespace == workload_namespace)
         .cloned()
         .collect();
-    let scoped_destination_rules: Vec<MeshDestinationRule> = mesh
-        .destination_rules
-        .iter()
-        .filter(|dr| {
-            let (resource_namespace, host_candidates) = destination_rule_host_scope(
-                dr,
-                cluster_domain,
-                mesh_service_identities,
-                service_entry_hosts,
-            );
-            let dr_namespace = dr.namespace.as_str();
-            if dr_namespace != workload_namespace && dr_namespace != resource_namespace.as_str() {
-                return false;
-            }
+    // The operator-facing egress-scope snapshot must report the SAME admitted
+    // set the live slice serves, so it runs the one shared admission pass
+    // (`exportTo` visibility → lookup tier → egress scope → tier resolution)
+    // rather than its own copy of the namespace rule (issues #2465, #2469).
+    let destination_rule_scope = DestinationRuleScope {
+        client_namespace: workload_namespace,
+        root_namespace: mesh.istio_root_namespace.as_str(),
+        cluster_domain,
+        mesh_service_identities,
+        service_entry_hosts,
+    };
+    let scoped_destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
+        mesh.destination_rules.iter(),
+        &destination_rule_scope,
+        |_dr, resource_namespace, host_candidates| {
             let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
             sidecar_egress_includes_service(
                 sidecar.namespace,
                 sidecar.egress,
-                &resource_namespace,
+                resource_namespace,
                 &host_refs,
                 None,
             )
-        })
-        .cloned()
-        .collect();
+        },
+    );
 
     let baseline_local_services = mesh
         .services
@@ -2086,9 +2285,12 @@ fn service_entry_scope_resource(entry: &ServiceEntry) -> MeshEgressScopeResource
     }
 }
 
-fn mesh_service_identities(mesh: &MeshConfig) -> BTreeSet<(String, String)> {
+/// The `(namespace, name)` inventory a two-label policy host is confirmed
+/// against. `pub(crate)` because the data-plane materialization tier pass builds
+/// the same index from its slice's `services` — see [`destination_host_owner`].
+pub(crate) fn mesh_service_identities(services: &[MeshService]) -> BTreeSet<(String, String)> {
     let mut identities = BTreeSet::new();
-    for service in &mesh.services {
+    for service in services {
         let namespace = service
             .namespace
             .trim()
@@ -2106,24 +2308,120 @@ fn mesh_service_identities(mesh: &MeshConfig) -> BTreeSet<(String, String)> {
     identities
 }
 
+/// Which namespace owns an external host declared by a visible ServiceEntry.
+///
+/// A ServiceEntry host has no Kubernetes `name.namespace` structure to read a
+/// namespace out of, so the DECLARING ServiceEntry is the only evidence of who
+/// owns it — and that ownership is what makes it the Istio service tier for
+/// DestinationRule lookup (issue #2469). Carrying the host without the owner
+/// (the pre-repair `BTreeSet<String>`) forced every rule for such a host to
+/// fall back to its OWN declaring namespace, which let a rule from an
+/// unrelated namespace nominate itself as the service tier for a host it does
+/// not own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ServiceEntryHostOwner {
+    /// Exactly one namespace declares this host across every visible
+    /// ServiceEntry.
+    Owned(String),
+    /// Two or more namespaces declare it. There is no single owner, so the
+    /// service tier is refused outright for this host — see
+    /// [`PolicyHostScope`].
+    Ambiguous,
+}
+
+/// Index the hosts of every ServiceEntry visible to this workload by their
+/// owning (declaring) namespace. Narrowing only; the ownership rules live in
+/// [`index_service_entry_host_owners`].
 fn visible_service_entry_hosts<L: WorkloadLabels + ?Sized>(
     mesh: &MeshConfig,
     workload_namespace: &str,
     workload_labels: &L,
-) -> BTreeSet<String> {
-    let mut hosts = BTreeSet::new();
-    for entry in &mesh.service_entries {
-        if !service_entry_applies_to_workload(entry, workload_namespace, workload_labels) {
-            continue;
-        }
+) -> BTreeMap<String, ServiceEntryHostOwner> {
+    let visible: Vec<&ServiceEntry> = mesh
+        .service_entries
+        .iter()
+        .filter(|entry| {
+            service_entry_applies_to_workload(entry, workload_namespace, workload_labels)
+        })
+        .collect();
+    index_service_entry_host_owners(visible)
+}
+
+/// Index an ALREADY-VISIBLE set of ServiceEntries by the namespace that
+/// declares each host.
+///
+/// Duplicate declarations WITHIN one namespace are still a single owner —
+/// Istio merges those. Duplicates ACROSS namespaces are
+/// [`Ambiguous`](ServiceEntryHostOwner::Ambiguous): picking either owner would
+/// hand one of two mutually untrusting namespaces a policy tier over the
+/// other's clients, and picking by iteration order would make the winner
+/// depend on resource spelling — the exact defect #2469 exists to remove.
+///
+/// Split out from [`visible_service_entry_hosts`] so the data-plane
+/// materialization pass — which consumes `MeshSlice.service_entries`, a set the
+/// control plane already narrowed by `exportTo` — reuses these exact ownership
+/// semantics instead of reimplementing them. CP and DP must agree on who owns
+/// an external host by construction, not by two parallel implementations.
+pub(crate) fn index_service_entry_host_owners<'a>(
+    service_entries: impl IntoIterator<Item = &'a ServiceEntry>,
+) -> BTreeMap<String, ServiceEntryHostOwner> {
+    let mut hosts: BTreeMap<String, ServiceEntryHostOwner> = BTreeMap::new();
+    for entry in service_entries {
+        let owner = entry
+            .namespace
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
         for host in &entry.hosts {
             let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-            if !host.is_empty() {
-                hosts.insert(host);
+            if host.is_empty() {
+                continue;
+            }
+            // A ServiceEntry with no declaring namespace cannot vouch for an
+            // owner, so it poisons the host rather than claiming it.
+            if owner.is_empty() {
+                hosts.insert(host, ServiceEntryHostOwner::Ambiguous);
+                continue;
+            }
+            match hosts.entry(host) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(ServiceEntryHostOwner::Owned(owner.clone()));
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    let same_owner = matches!(
+                        slot.get(),
+                        ServiceEntryHostOwner::Owned(existing) if *existing == owner
+                    );
+                    if !same_owner {
+                        slot.insert(ServiceEntryHostOwner::Ambiguous);
+                    }
+                }
             }
         }
     }
     hosts
+}
+
+/// The namespace that OWNS `host`, per a ServiceEntry-host ownership index —
+/// the LAST-resort arm of [`destination_host_owner`], reached only after
+/// `.svc`-qualified syntax and the service inventory have both declined, so a
+/// ServiceEntry can never claim a Kubernetes host by declaring the same string.
+///
+/// `None` for a host no visible ServiceEntry declares and for a contested one
+/// ([`Ambiguous`](ServiceEntryHostOwner::Ambiguous)): with no single owner the
+/// service tier is REFUSED for that host, never guessed. Host normalization
+/// lives here so every caller keys the index the same way — the index is built
+/// from trimmed, lowercased hosts, while callers hold anything from a rule's
+/// declared host to an upstream target's host.
+fn service_entry_host_owner<'a>(
+    service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
+    host: &str,
+) -> Option<&'a str> {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    match service_entry_hosts.get(&host) {
+        Some(ServiceEntryHostOwner::Owned(namespace)) => Some(namespace.as_str()),
+        Some(ServiceEntryHostOwner::Ambiguous) | None => None,
+    }
 }
 
 fn mesh_service_host_candidates(service: &MeshService, cluster_domain: &str) -> Vec<String> {
@@ -2168,12 +2466,249 @@ fn service_host_aliases(name: &str, namespace: &str, cluster_domain: &str) -> Ve
     candidates
 }
 
+/// Scoping inputs shared by every DestinationRule narrowing pass.
+///
+/// Bundled so the two Sidecar narrowing paths and the no-Sidecar path cannot
+/// drift apart on which namespace is the client, which is the mesh root, or
+/// how a rule host resolves to its target service.
+pub(crate) struct DestinationRuleScope<'a> {
+    /// The subscribing workload's own namespace — Istio's first lookup tier.
+    pub client_namespace: &'a str,
+    /// `MeshConfig.istio_root_namespace` — Istio's last lookup tier.
+    pub root_namespace: &'a str,
+    pub cluster_domain: &'a str,
+    pub mesh_service_identities: &'a BTreeSet<(String, String)>,
+    pub service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
+}
+
+/// Groups admitted DestinationRules by the destination they RESOLVE to, not by
+/// how they are spelled: the owning namespace (`None` when ownership could not
+/// be established) plus the canonical host.
+///
+/// Grouping on the resolved owner is what makes tier resolution meaningful —
+/// a client-namespace rule, the owning namespace's rule, and a root-namespace
+/// rule for one destination all land in the SAME group and are ranked, instead
+/// of each becoming its own single-member group that trivially "wins".
+type DestinationRuleGroupKey = (Option<String>, String);
+
+/// THE DestinationRule admission pass: export visibility, then Istio's
+/// client → service → root lookup tier, then the caller's own scope gate,
+/// then per-host tier resolution (issues #2465 + #2469).
+///
+/// Composition order is load-bearing. `exportTo` is evaluated FIRST and is
+/// absolute, so root-namespace fallback can never resurrect a rule the
+/// subscriber was never allowed to see — that is what stops #2469's fallback
+/// from re-opening #2465. A rule outside all three lookup namespaces is
+/// refused outright rather than kept as a low-priority extra.
+///
+/// `extra_admits(rule, host_scope_namespace, host_aliases)` carries the
+/// caller-specific gate (Sidecar egress scope, service-waypoint namespace
+/// visibility). It runs after visibility so a hidden rule is never even
+/// offered to it. Its namespace argument is
+/// `PolicyHostScope::scope_namespace` — a SCOPE input, deliberately distinct
+/// from the ownership claim tiering reads.
+///
+/// The service tier is granted only on EVIDENCE of ownership (see
+/// `policy_target_service_ref`). A host whose owner cannot be established —
+/// an external host with no visible ServiceEntry, one claimed by ServiceEntries
+/// in two different namespaces, or an unqualified two-label host absent from
+/// the service inventory — has NO service tier, so only the client namespace
+/// and the configured root namespace may write policy for it. That is the
+/// fail-closed direction: it narrows admission, and an unrelated namespace can
+/// never nominate itself as the owner of a host it does not own.
+///
+/// Tier resolution groups by the RESOLVED destination — owning namespace plus
+/// canonical host — and keeps only the most specific tier present in each
+/// group. Ordering therefore comes from ownership, never from how
+/// `(namespace, name)` sorts, so renaming a namespace cannot flip which policy
+/// wins. Within one surviving tier every rule is same-namespace by construction
+/// (one owner), so those merge in the materializer's deterministic order; a
+/// group with more than one is reported once, bounded, with no
+/// operator-supplied host or value in the message.
+pub(crate) fn admit_destination_rules<'a, F>(
+    candidates: impl Iterator<Item = &'a MeshDestinationRule>,
+    scope: &DestinationRuleScope<'_>,
+    mut extra_admits: F,
+) -> Vec<MeshDestinationRule>
+where
+    F: FnMut(&MeshDestinationRule, &str, &[String]) -> bool,
+{
+    // (group key, tier, rule)
+    let mut visible: Vec<(
+        DestinationRuleGroupKey,
+        DestinationRuleLookupTier,
+        &MeshDestinationRule,
+    )> = Vec::new();
+    for rule in candidates {
+        if !destination_rule_exported_to_namespace(rule, scope.client_namespace) {
+            continue;
+        }
+        let host_scope = destination_rule_host_scope(
+            rule,
+            scope.cluster_domain,
+            scope.mesh_service_identities,
+            scope.service_entry_hosts,
+        );
+        let tier = destination_rule_lookup_tier(
+            &rule.namespace,
+            scope.client_namespace,
+            host_scope.service_namespace.as_deref(),
+            scope.root_namespace,
+        );
+        if !tier.is_in_lookup_path() {
+            continue;
+        }
+        if !extra_admits(
+            rule,
+            &host_scope.scope_namespace,
+            &host_scope.host_candidates,
+        ) {
+            continue;
+        }
+        let group_host = host_scope
+            .host_candidates
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        visible.push(((host_scope.service_namespace, group_host), tier, rule));
+    }
+
+    let mut winning_tier: BTreeMap<&DestinationRuleGroupKey, DestinationRuleLookupTier> =
+        BTreeMap::new();
+    for (key, tier, _) in &visible {
+        let slot = winning_tier.entry(key).or_insert(*tier);
+        if *tier < *slot {
+            *slot = *tier;
+        }
+    }
+
+    let mut admitted: Vec<MeshDestinationRule> = Vec::new();
+    let mut per_group_kept: BTreeMap<&DestinationRuleGroupKey, usize> = BTreeMap::new();
+    for (key, tier, rule) in &visible {
+        if winning_tier.get(key) != Some(tier) {
+            continue;
+        }
+        *per_group_kept.entry(key).or_insert(0) += 1;
+        admitted.push((**rule).clone());
+    }
+    let ambiguous_groups = per_group_kept.values().filter(|count| **count > 1).count();
+    if ambiguous_groups > 0
+        && record_destination_rule_ambiguity(scope.client_namespace, ambiguous_groups)
+    {
+        warn!(
+            client_namespace = %scope.client_namespace,
+            ambiguous_destinations = ambiguous_groups,
+            "Multiple DestinationRules from the same namespace target one destination; \
+             they merge in deterministic (namespace, name, normalized host) order"
+        );
+    }
+    admitted
+}
+
+/// Ambiguous-destination counts ALREADY REPORTED for each client namespace, as
+/// a SET of counts per namespace rather than a single last-seen value.
+///
+/// `admit_destination_rules` runs once per SUBSCRIBER (and again per subscriber
+/// for the operator-facing egress-scope snapshot), not once per namespace, and
+/// one namespace legitimately splitting a host's policy across two
+/// DestinationRules is a common Istio pattern — warning unconditionally is
+/// per-reload × per-DP log spam.
+///
+/// Set semantics, not last-value semantics, is what makes the dedup hold at a
+/// STEADY STATE. Two workloads in one namespace whose Sidecar scopes admit
+/// different rule sets legitimately produce different counts (W1's scope admits
+/// a host with two same-namespace rules, W2's excludes it), so a single
+/// last-seen slot flips 1 → 0 → 1 on every config generation and reports a
+/// "change" that never happened. A count this namespace has already been warned
+/// about is a steady state however many subscribers observe it; a count it has
+/// not is genuinely new and is reported once.
+///
+/// Growth is bounded on BOTH axes — at most
+/// [`DESTINATION_RULE_AMBIGUITY_NAMESPACE_BUDGET`] keys, each holding at most
+/// [`DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE`] counts — and touched only
+/// on the cold slice-build path, never per request. The key axis needs its own
+/// budget because the key is the SUBSCRIBER's namespace: a CP serves whichever
+/// namespaces subscribe to it, so a churning or hostile fleet of subscriber
+/// namespaces would otherwise grow this process-global map without limit.
+static DESTINATION_RULE_AMBIGUITY_REPORTED: OnceLock<Mutex<HashMap<String, HashSet<usize>>>> =
+    OnceLock::new();
+
+/// Distinct ambiguous-destination counts retained per namespace. A namespace
+/// churning through more than this many distinct counts keeps reporting (fail
+/// toward visibility — that churn is itself worth surfacing) instead of growing
+/// the map without bound.
+const DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE: usize = 32;
+
+/// Client namespaces retained in [`DESTINATION_RULE_AMBIGUITY_REPORTED`]. Once
+/// this many namespaces have been recorded, a namespace with no entry keeps
+/// reporting instead of taking a new key — the same fail-toward-visibility
+/// direction as the per-namespace budget, so saturation degrades to "warn every
+/// time" rather than to silence. Sized well above any realistic mesh's
+/// subscribing-namespace count so ordinary deployments never leave steady-state
+/// dedup; the whole map is bounded by
+/// `128 * 32` counts plus namespace keys of at most
+/// [`DESTINATION_RULE_AMBIGUITY_NAMESPACE_KEY_MAX_BYTES`] bytes.
+const DESTINATION_RULE_AMBIGUITY_NAMESPACE_BUDGET: usize = 128;
+
+/// Kubernetes namespaces are RFC 1123 labels and therefore at most 63 bytes.
+/// Native/xDS inputs are validated separately, but the warning deduplicator is
+/// process-global and must remain byte-bounded even if a hostile or cross-wired
+/// producer presents an oversized subscriber namespace. Oversized keys are
+/// never retained; their warnings remain visible on every observation.
+const DESTINATION_RULE_AMBIGUITY_NAMESPACE_KEY_MAX_BYTES: usize = 63;
+
+/// Record this namespace's ambiguous-destination count, returning `true` when
+/// that count has NOT been reported for this namespace before (so the caller
+/// reports something new rather than a steady state). A poisoned lock reports —
+/// fail toward visibility, never panic on a config-apply path.
+fn record_destination_rule_ambiguity(client_namespace: &str, ambiguous: usize) -> bool {
+    let reported = DESTINATION_RULE_AMBIGUITY_REPORTED.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut reported) = reported.lock() else {
+        return true;
+    };
+    record_destination_rule_ambiguity_in(&mut reported, client_namespace, ambiguous)
+}
+
+/// Budget-enforcing half of [`record_destination_rule_ambiguity`], split out
+/// from the process-global slot so the bounds are provable against a local map
+/// instead of against unresettable global state.
+fn record_destination_rule_ambiguity_in(
+    reported: &mut HashMap<String, HashSet<usize>>,
+    client_namespace: &str,
+    ambiguous: usize,
+) -> bool {
+    if client_namespace.len() > DESTINATION_RULE_AMBIGUITY_NAMESPACE_KEY_MAX_BYTES {
+        // Do not let a bounded key COUNT hide unbounded retained key BYTES.
+        // Re-report rather than hash/truncate: collisions must never silence a
+        // different subscriber's ambiguity warning.
+        return true;
+    }
+    // Steady state is the common case, so it must not allocate a key.
+    if let Some(counts) = reported.get(client_namespace) {
+        if counts.contains(&ambiguous) {
+            return false;
+        }
+        if counts.len() >= DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE {
+            return true;
+        }
+    } else if reported.len() >= DESTINATION_RULE_AMBIGUITY_NAMESPACE_BUDGET {
+        // Every key is spoken for and this namespace has none. Report rather
+        // than retain — saturation degrades toward visibility, never silence.
+        return true;
+    }
+    reported
+        .entry(client_namespace.to_string())
+        .or_default()
+        .insert(ambiguous);
+    true
+}
+
 fn destination_rule_host_scope(
     rule: &MeshDestinationRule,
     cluster_domain: &str,
     mesh_service_identities: &BTreeSet<(String, String)>,
-    service_entry_hosts: &BTreeSet<String>,
-) -> (String, Vec<String>) {
+    service_entry_hosts: &BTreeMap<String, ServiceEntryHostOwner>,
+) -> PolicyHostScope {
     policy_host_scope(
         &rule.host,
         &rule.namespace,
@@ -2183,17 +2718,49 @@ fn destination_rule_host_scope(
     )
 }
 
-/// Resolve a host-targeting policy's `(host, namespace)` pair to the target
-/// service's namespace plus the host alias set. Shared by DestinationRule
-/// narrowing and VirtualService-CORS narrowing so a policy host is scoped
-/// with ONE set of semantics.
+/// A host-targeting policy's resolved destination.
+///
+/// Splitting the two namespaces apart is the core of the #2469 repair. Before
+/// it, ONE namespace served as both "who owns the target service" (a
+/// SECURITY decision — it decides which third parties may write policy for
+/// this destination) and "which namespace the Sidecar egress patterns
+/// `./host` and `ns/host` resolve against" (a SCOPE decision). Collapsing them
+/// meant an unresolvable host silently promoted the POLICY'S OWN namespace to
+/// service owner.
+pub(crate) struct PolicyHostScope {
+    /// The namespace that owns the target service, when it is established by
+    /// evidence: the service inventory, the host's own `*.svc[.domain]`
+    /// structure, an unambiguously-declared visible ServiceEntry, or Istio
+    /// short-name resolution against the policy's own namespace.
+    ///
+    /// `None` means ownership is UNKNOWN or AMBIGUOUS, which disables the
+    /// service tier entirely — only the client namespace and the configured
+    /// root namespace may then write policy for this host. It is never
+    /// back-filled with the policy's own namespace: that is precisely how an
+    /// unrelated namespace used to invent a service tier for a host it does
+    /// not own.
+    pub service_namespace: Option<String>,
+    /// The namespace the CALLER's own host-scope gate resolves `.`/`ns`
+    /// Sidecar egress patterns against. Equals the resolved owner where one
+    /// exists (so a DestinationRule for a ServiceEntry host is egress-scoped
+    /// exactly like that ServiceEntry itself) and falls back to the policy's
+    /// declaring namespace otherwise. This is a scope gate, NOT a policy
+    /// ownership claim — the two must not be conflated again.
+    pub scope_namespace: String,
+    /// Host aliases matched against Sidecar egress patterns.
+    pub host_candidates: Vec<String>,
+}
+
+/// Resolve a host-targeting policy's `(host, namespace)` pair to its target
+/// destination. Shared by DestinationRule narrowing and VirtualService-CORS
+/// narrowing so a policy host is scoped with ONE set of semantics.
 fn policy_host_scope(
     policy_host: &str,
     policy_namespace: &str,
     cluster_domain: &str,
     mesh_service_identities: &BTreeSet<(String, String)>,
-    service_entry_hosts: &BTreeSet<String>,
-) -> (String, Vec<String>) {
+    service_entry_hosts: &BTreeMap<String, ServiceEntryHostOwner>,
+) -> PolicyHostScope {
     let host = policy_host
         .trim()
         .trim_end_matches('.')
@@ -2207,59 +2774,189 @@ fn policy_host_scope(
         .trim_end_matches('.')
         .to_ascii_lowercase();
 
-    destination_rule_service_ref_from_host(
+    match policy_target_service_ref(
         &host,
         &rule_namespace,
         &cluster_domain,
         mesh_service_identities,
         service_entry_hosts,
-    )
-    .map(|(service_name, service_namespace)| {
-        let candidates = service_host_aliases(&service_name, &service_namespace, &cluster_domain);
-        (service_namespace, candidates)
-    })
-    .unwrap_or_else(|| (rule_namespace, vec![host]))
+    ) {
+        PolicyTargetRef::ClusterService { name, namespace } => {
+            let host_candidates = service_host_aliases(&name, &namespace, &cluster_domain);
+            PolicyHostScope {
+                service_namespace: Some(namespace.clone()),
+                scope_namespace: namespace,
+                host_candidates,
+            }
+        }
+        // An external ServiceEntry host has no Kubernetes alias family — it is
+        // matched verbatim, and egress-scoped against its DECLARING namespace
+        // exactly like the ServiceEntry that owns it.
+        PolicyTargetRef::ExternalHost { namespace } => PolicyHostScope {
+            service_namespace: Some(namespace.clone()),
+            scope_namespace: namespace,
+            host_candidates: vec![host],
+        },
+        PolicyTargetRef::Unresolved => PolicyHostScope {
+            service_namespace: None,
+            scope_namespace: rule_namespace,
+            host_candidates: vec![host],
+        },
+    }
 }
 
-fn destination_rule_service_ref_from_host(
+/// What a policy host resolves to.
+enum PolicyTargetRef {
+    /// An in-cluster Kubernetes Service.
+    ClusterService { name: String, namespace: String },
+    /// An external host owned by a visible ServiceEntry.
+    ExternalHost { namespace: String },
+    /// No owning namespace could be established from evidence.
+    Unresolved,
+}
+
+/// Resolve a policy host to its owning namespace, in strict
+/// most-authoritative-evidence-first order. Every arm below either reads the
+/// namespace out of the host's own structure or proves it against an
+/// inventory; nothing here infers ownership from the POLICY's namespace except
+/// Istio's own short-name rule, which is definitionally self-scoped.
+fn policy_target_service_ref(
     host: &str,
     rule_namespace: &str,
     cluster_domain: &str,
     mesh_service_identities: &BTreeSet<(String, String)>,
-    service_entry_hosts: &BTreeSet<String>,
-) -> Option<(String, String)> {
+    service_entry_hosts: &BTreeMap<String, ServiceEntryHostOwner>,
+) -> PolicyTargetRef {
     if host.is_empty() || rule_namespace.is_empty() || host.contains('*') {
-        return None;
-    }
-    if service_entry_hosts.contains(host) {
-        return None;
-    }
-    if !host.contains('.') {
-        return Some((host.to_string(), rule_namespace.to_string()));
+        return PolicyTargetRef::Unresolved;
     }
 
-    if let Some((name, namespace)) = split_canonical_service_host(host)
-        && mesh_service_identity_exists(mesh_service_identities, namespace, name)
-    {
-        return Some((name.to_string(), namespace.to_string()));
+    // 1. Istio short-name resolution: a bare `reviews` in namespace `beta`
+    //    IS `reviews.beta`. Self-scoped by definition, so it can only ever
+    //    make a namespace the owner of its OWN service.
+    if !host.contains('.') {
+        return PolicyTargetRef::ClusterService {
+            name: host.to_string(),
+            namespace: rule_namespace.to_string(),
+        };
+    }
+
+    // 2-4. Everything else is a CONCRETE destination host, resolved by the
+    //      shared helper the data-plane materialization tier pass also uses so
+    //      the two cannot rank one destination's owners differently.
+    match destination_host_owner(
+        host,
+        cluster_domain,
+        mesh_service_identities,
+        service_entry_hosts,
+    ) {
+        Some(DestinationHostOwner::ClusterService { name, namespace }) => {
+            PolicyTargetRef::ClusterService { name, namespace }
+        }
+        Some(DestinationHostOwner::ExternalHost { namespace }) => {
+            PolicyTargetRef::ExternalHost { namespace }
+        }
+        None => PolicyTargetRef::Unresolved,
+    }
+}
+
+/// Who owns a CONCRETE destination host, and what kind of destination it is.
+pub(crate) enum DestinationHostOwner {
+    /// An in-cluster Kubernetes Service.
+    ClusterService { name: String, namespace: String },
+    /// An external host owned by exactly one visible ServiceEntry.
+    ExternalHost { namespace: String },
+}
+
+impl DestinationHostOwner {
+    /// The owning namespace, whichever kind of destination this is.
+    pub(crate) fn namespace(&self) -> &str {
+        match self {
+            Self::ClusterService { namespace, .. } | Self::ExternalHost { namespace } => namespace,
+        }
+    }
+}
+
+/// Resolve a CONCRETE destination host to its owner, in strict
+/// most-authoritative-evidence-first order. `None` when nothing establishes an
+/// owner, which DISABLES the service tier for that host.
+///
+/// 1. `name.namespace.svc`, `name.namespace.svc.<cluster domain>` — the
+///    namespace is pinned by the host SYNTAX, so no inventory evidence is
+///    needed and no ServiceEntry can claim ownership of one of these by
+///    declaring the same string. A host carrying a DIFFERENT cluster's DNS
+///    domain pins nothing.
+/// 2. the two-label `name.namespace` shorthand, honored ONLY when the service
+///    inventory confirms the pair exists: the shape is INDISTINGUISHABLE from a
+///    two-label external DNS name (`example.com` must not nominate a namespace
+///    `com`), and a cluster Service outranks any ServiceEntry declaring the
+///    same string.
+/// 3. an external host declared by a ServiceEntry the consumer can see.
+///    Contested ownership resolves to `None`, NOT to a guess — refusing narrows
+///    admission, guessing would widen it.
+///
+/// Istio's short-name self-scoping (`reviews` authored in `beta` IS
+/// `beta/reviews`) is deliberately NOT here: it reads the POLICY's own
+/// namespace, so it is a property of how a policy spells its host rather than
+/// of a concrete destination. It lives in [`policy_target_service_ref`] alone.
+///
+/// Shared by DestinationRule admission (control plane) and
+/// `MaterializationTierScope::eligible_tier` (data plane) so neither the
+/// SOURCES of ownership evidence nor their ORDER can drift between the two
+/// (issue #2469). The one input that legitimately differs is
+/// `mesh_service_identities`: the control plane builds it from the full mesh
+/// inventory, the data plane from its slice's already-narrowed `services`. A
+/// service narrowed out of the slice therefore cannot claim step 2 there and
+/// the host falls through to step 3 — the same answer the control plane gives a
+/// consumer that cannot see the service either.
+pub(crate) fn destination_host_owner(
+    host: &str,
+    cluster_domain: &str,
+    mesh_service_identities: &BTreeSet<(String, String)>,
+    service_entry_hosts: &BTreeMap<String, ServiceEntryHostOwner>,
+) -> Option<DestinationHostOwner> {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let cluster_domain = cluster_domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host.is_empty() || host.contains('*') {
+        return None;
     }
 
     if let Some((name, namespace)) = host
         .strip_suffix(".svc")
         .and_then(split_canonical_service_host)
     {
-        return Some((name.to_string(), namespace.to_string()));
+        return Some(DestinationHostOwner::ClusterService {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+        });
     }
-
     if !cluster_domain.is_empty()
         && let Some((name, namespace)) = host
             .strip_suffix(&format!(".svc.{cluster_domain}"))
             .and_then(split_canonical_service_host)
     {
-        return Some((name.to_string(), namespace.to_string()));
+        return Some(DestinationHostOwner::ClusterService {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+        });
     }
 
-    None
+    if let Some((name, namespace)) = split_canonical_service_host(&host)
+        && mesh_service_identity_exists(mesh_service_identities, namespace, name)
+    {
+        return Some(DestinationHostOwner::ClusterService {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+        });
+    }
+
+    let declared_owner = service_entry_host_owner(service_entry_hosts, &host)?;
+    Some(DestinationHostOwner::ExternalHost {
+        namespace: declared_owner.to_string(),
+    })
 }
 
 fn mesh_service_identity_exists(
@@ -2422,6 +3119,32 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
 /// redirects which Sidecar's *egress scope* applies, while *ingress* listeners
 /// are always taken from the selected Sidecar's own `ingress[]` (an omitted
 /// `ingress` simply means "no custom listeners").
+///
+/// # Divergence from Istio: root workload-scoped outranks a namespace default
+///
+/// Istio resolves a workload's Sidecar as "a selector-bearing Sidecar in the
+/// workload's own namespace, else any Sidecar in the workload's own namespace,
+/// else the root-namespace Sidecar" — the workload's namespace wins the whole
+/// comparison before the root namespace is consulted at all. Ferrum instead
+/// interleaves by SPECIFICITY: a root-namespace Sidecar that carries an explicit
+/// `workloadSelector` matching this workload outranks a selector-less default in
+/// the workload's own namespace.
+///
+/// This is intentional and security-oriented. The root namespace is the mesh
+/// operator's namespace; a tenant cannot write there. Ordering the root
+/// *targeted* rule above the tenant-namespace *catch-all* means a mesh-wide
+/// operator policy aimed at specific workloads cannot be displaced by a tenant
+/// dropping a permissive namespace default into their own namespace. A tenant
+/// can still override with an equally specific rule — a `workloadSelector`
+/// Sidecar in their own namespace still wins the top tier.
+///
+/// Since issue #3262 this ordering also decides the workload-scoped
+/// `outboundTrafficPolicy` (via
+/// [`resolve_applicable_sidecar_outbound_policy`]), i.e. whether the outbound
+/// registry gate is armed — so the divergence is load-bearing for egress
+/// enforcement, not only for scoping. It is documented for operators in
+/// `docs/mesh.md` ("Sidecar Outbound Traffic Policy" → precedence). Do not
+/// "align with Istio" here without re-deciding that trade-off.
 fn select_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
     sidecars: &'a [MeshSidecar],
     workload_namespace: &str,
@@ -2480,9 +3203,126 @@ fn select_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
         .or(root_namespace_default)
 }
 
-/// Resolve the routable custom inbound listeners from a workload's applicable
-/// `Sidecar.ingress[]`, returning `(resolved_listeners, ingress_declared,
+/// Conservative strictness rank used to fold candidate-resolved outbound
+/// policies under label ambiguity (issue #3262). Higher is stricter, so a fold
+/// takes the MAXIMUM and can only ever tighten.
+///
+/// `None` sits BETWEEN the two concrete modes on purpose: it means "inherit the
+/// mesh-wide / env tier", which may itself be `RegistryOnly`, so it must not be
+/// collapsed with the definitely-permissive `AllowAny`.
+fn outbound_policy_strictness(policy: Option<OutboundTrafficPolicy>) -> u8 {
+    match policy {
+        Some(OutboundTrafficPolicy::RegistryOnly) => 2,
+        None => 1,
+        Some(OutboundTrafficPolicy::AllowAny) => 0,
+    }
+}
+
+/// Resolve the workload-scoped outbound traffic policy from the applicable
+/// `Sidecar.outboundTrafficPolicy` (issue #3262).
+///
+/// `selected` is the Sidecar [`select_applicable_sidecar`] chose for the slice's
+/// `effective_labels` — the SAME tier precedence as ingress (workload-scoped →
+/// root workload-scoped → namespace default → root-namespace default,
+/// ASCII-smallest `name` tiebreak), reusing that one scan rather than repeating
+/// it. It deliberately does NOT walk the egress `inherits_defaults` chain. That
+/// walk exists because Istio's `egress` has an explicit "omitted means inherit
+/// the namespace scope" rule; the outbound traffic policy has no such rule. Istio
+/// resolves exactly ONE Sidecar per workload, and a Sidecar that omits
+/// `outboundTrafficPolicy` simply leaves the mesh-wide `MeshConfig` value in
+/// force — it does not consult a less-specific Sidecar. Returning `None` here
+/// expresses precisely that inheritance.
+///
+/// # Ambiguous workload labels resolve fail-closed (security)
+///
+/// `ambiguous_candidate_labels` is EMPTY on an unambiguous slice, and then this
+/// is exactly `selected`'s own policy. It is non-empty only when the slice is
+/// `labels_ambiguous`: several workloads share the request's SPIFFE id with
+/// DIVERGENT label sets, so `effective_labels` is merely their INTERSECTION and
+/// is not any real workload's labels. A `workloadSelector` Sidecar that genuinely
+/// selects one of those workloads can then fail to match the intersection, and
+/// selection would silently fall through to a less specific tier — turning a
+/// tenant's `REGISTRY_ONLY` into a namespace-default `ALLOW_ANY` and DISARMING
+/// the outbound registry gate.
+///
+/// So under ambiguity every candidate label set is resolved on its own and the
+/// results are folded by [`outbound_policy_strictness`], keeping the strictest.
+/// Properties this buys:
+///   - **Never relaxes.** The fold includes the intersection-derived answer, so
+///     the result is always at least as strict as the unambiguous resolution.
+///   - **Deterministic.** `max` is order-independent, so the outcome does not
+///     depend on workload or Sidecar emission order.
+///   - **Bounded.** Cold path, once per slice build: `candidates × sidecars`,
+///     where candidates are only the workloads sharing this request's SPIFFE id.
+///     Nothing is re-derived per request — the result is materialized into the
+///     injected plugin config and the enforcement slot.
+///
+/// The right long-term fix is unambiguous labels (explicit
+/// `FERRUM_MESH_WORKLOAD_LABELS` / distinct SPIFFE ids); the fold is what keeps
+/// the gate safe until then, and it warns when ambiguity actually changed the
+/// outcome.
+fn resolve_applicable_sidecar_outbound_policy(
+    sidecars: &[MeshSidecar],
+    workload_namespace: &str,
+    istio_root_namespace: &str,
+    selected: Option<&MeshSidecar>,
+    ambiguous_candidate_labels: &[&BTreeMap<String, String>],
+) -> Option<OutboundTrafficPolicy> {
+    let selected_policy = selected.and_then(|sidecar| sidecar.outbound_traffic_policy);
+
+    if ambiguous_candidate_labels.is_empty() {
+        if let Some(sidecar) = selected
+            && let Some(policy) = selected_policy
+        {
+            debug!(
+                sidecar = %sidecar.name,
+                namespace = %sidecar.namespace,
+                policy = ?policy,
+                "Applying Sidecar-scoped outboundTrafficPolicy to the mesh slice"
+            );
+        }
+        return selected_policy;
+    }
+
+    let mut resolved = selected_policy;
+    for labels in ambiguous_candidate_labels {
+        let chosen =
+            select_applicable_sidecar(sidecars, workload_namespace, *labels, istio_root_namespace);
+        let policy = chosen.and_then(|sidecar| sidecar.outbound_traffic_policy);
+        if outbound_policy_strictness(policy) > outbound_policy_strictness(resolved) {
+            resolved = policy;
+        }
+    }
+
+    if resolved == selected_policy {
+        debug!(
+            candidates = ambiguous_candidate_labels.len(),
+            policy = ?resolved,
+            "Ambiguous workload labels did not change the Sidecar-scoped outboundTrafficPolicy"
+        );
+    } else {
+        warn!(
+            namespace = %workload_namespace,
+            candidates = ambiguous_candidate_labels.len(),
+            intersection_policy = ?selected_policy,
+            resolved_policy = ?resolved,
+            "Workload labels are ambiguous (several workloads share this SPIFFE id with divergent \
+             labels); resolving the Sidecar-scoped outboundTrafficPolicy to the strictest policy \
+             any candidate could select. Set explicit workload labels to resolve it exactly"
+        );
+    }
+    resolved
+}
+
+/// Resolve the routable custom inbound listeners from the workload's applicable
+/// `Sidecar`'s `ingress[]`, returning `(resolved_listeners, ingress_declared,
 /// declared_http_ports)`.
+///
+/// `selected` is the Sidecar [`select_applicable_sidecar`] already chose for this
+/// workload — the caller performs that scan ONCE and shares it with the
+/// workload-scoped `outboundTrafficPolicy` resolution, which uses the identical
+/// tier precedence under the identical enforcement gate. `None` (no applicable
+/// Sidecar, or the gate is off) resolves to "no custom listeners declared".
 ///
 /// Unsupported entries (Unix-socket / non-loopback `defaultEndpoint`,
 /// non-HTTP-family protocol, zero port) are dropped fail-closed and warned; only
@@ -2510,18 +3350,10 @@ fn select_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
 /// resolved would collapse to a single-listener no-signal pass-through and route
 /// the skipped port's traffic to the surviving sibling. Deduped by port to match
 /// the resolved-set dedup below.
-fn resolve_applicable_sidecar_ingress<L: WorkloadLabels + ?Sized>(
-    sidecars: &[MeshSidecar],
-    workload_namespace: &str,
-    workload_labels: &L,
-    istio_root_namespace: &str,
+fn resolve_selected_sidecar_ingress(
+    selected: Option<&MeshSidecar>,
 ) -> (Vec<ResolvedIngressListener>, bool, usize) {
-    let Some(sidecar) = select_applicable_sidecar(
-        sidecars,
-        workload_namespace,
-        workload_labels,
-        istio_root_namespace,
-    ) else {
+    let Some(sidecar) = selected else {
         return (Vec::new(), false, 0);
     };
     // Per Istio, declaring `ingress[]` REPLACES the default per-service-port
@@ -3594,10 +4426,12 @@ mod tests {
             trust_bundles: Some(make_trust_bundle_set()),
             multi_cluster: Some(make_multi_cluster()),
             outbound_traffic_policy: None,
+            sidecar_outbound_traffic_policy: None,
             sidecar_egress_scope: None,
             extension_configs: Vec::new(),
             runtime_overlay: MeshRuntimeOverlay::default(),
             waypoint_name: None,
+            istio_root_namespace: "istio-system".into(),
         };
         assert!(slice.content_eq(&slice.clone()));
     }
@@ -5065,6 +5899,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "other-ns".into(),
@@ -5073,6 +5908,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -5083,6 +5919,159 @@ mod tests {
         assert_eq!(slice.destination_rules.len(), 1);
         assert_eq!(slice.destination_rules[0].namespace, "ns");
         assert_eq!(slice.destination_rules[0].name, "in-ns");
+    }
+
+    /// The ambiguity warn-dedup must survive the fact that
+    /// `admit_destination_rules` runs once per SUBSCRIBER, not once per
+    /// namespace.
+    ///
+    /// Two workloads in one namespace whose Sidecar scopes admit different rule
+    /// sets legitimately report different counts, and every config generation
+    /// rebuilds both slices (plus an egress-scope snapshot per subscriber). A
+    /// last-seen-value slot flips 1 → 2 → 1 on every build and calls each flip a
+    /// "change", which is exactly the per-reload × per-DP spam the dedup exists
+    /// to prevent. Set semantics reports each count once and then stays quiet.
+    ///
+    /// This is private, process-global state reachable only from inside the
+    /// module, and the namespaces are unique to this test so a parallel test
+    /// sharing the static cannot perturb it.
+    #[test]
+    fn ambiguity_warn_dedup_is_quiet_when_subscribers_alternate_counts() {
+        let ns = "dedup-alternating-counts-ns";
+        assert!(
+            record_destination_rule_ambiguity(ns, 1),
+            "the first count for a namespace is new"
+        );
+        assert!(
+            record_destination_rule_ambiguity(ns, 2),
+            "a second subscriber's different count is also new"
+        );
+        for generation in 0..4 {
+            assert!(
+                !record_destination_rule_ambiguity(ns, 1),
+                "generation {generation}: this count was already reported"
+            );
+            assert!(
+                !record_destination_rule_ambiguity(ns, 2),
+                "generation {generation}: so was this one"
+            );
+        }
+        assert!(
+            record_destination_rule_ambiguity(ns, 3),
+            "a genuinely new count is still reported"
+        );
+
+        let other = "dedup-alternating-counts-other-ns";
+        assert!(
+            record_destination_rule_ambiguity(other, 1),
+            "counts are tracked per namespace, not globally"
+        );
+    }
+
+    /// Retention per namespace is capped, and a namespace past the cap keeps
+    /// reporting rather than growing the map without bound.
+    #[test]
+    fn ambiguity_warn_dedup_growth_is_bounded_per_namespace() {
+        let ns = "dedup-bounded-growth-ns";
+        for count in 1..=DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE {
+            assert!(
+                record_destination_rule_ambiguity(ns, count),
+                "count {count} is new and is retained"
+            );
+        }
+        let past_cap = DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE + 1;
+        assert!(
+            record_destination_rule_ambiguity(ns, past_cap),
+            "past the cap the dedup fails toward visibility"
+        );
+        assert!(
+            record_destination_rule_ambiguity(ns, past_cap),
+            "and it stays that way rather than retaining the new count"
+        );
+        assert!(
+            !record_destination_rule_ambiguity(ns, 1),
+            "already-retained counts are still deduped"
+        );
+    }
+
+    /// The KEY axis is bounded too. The map is keyed by the SUBSCRIBER's
+    /// namespace, so without a global budget a churning or hostile fleet of
+    /// subscriber namespaces grows this process-global map forever.
+    ///
+    /// Asserted against a LOCAL map through the budget-enforcing helper: the
+    /// process-global slot is never reset, so a global-state test could neither
+    /// start from an empty map nor prove a total size.
+    #[test]
+    fn ambiguity_warn_dedup_growth_is_globally_bounded() {
+        let mut reported: HashMap<String, HashSet<usize>> = HashMap::new();
+
+        // Steady-state dedup survives inside the budget.
+        assert!(record_destination_rule_ambiguity_in(&mut reported, "a", 1));
+        assert!(!record_destination_rule_ambiguity_in(&mut reported, "a", 1));
+
+        // Far more distinct namespaces than the budget, each with far more
+        // distinct counts than the per-namespace cap.
+        for ns in 0..(DESTINATION_RULE_AMBIGUITY_NAMESPACE_BUDGET * 8) {
+            let key = format!("ns-{ns}");
+            for count in 0..(DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE * 2) {
+                record_destination_rule_ambiguity_in(&mut reported, &key, count);
+            }
+        }
+
+        assert_eq!(
+            reported.len(),
+            DESTINATION_RULE_AMBIGUITY_NAMESPACE_BUDGET,
+            "the namespace key axis is capped"
+        );
+        assert!(
+            reported
+                .values()
+                .all(|counts| counts.len() <= DESTINATION_RULE_AMBIGUITY_COUNTS_PER_NAMESPACE),
+            "the per-namespace count axis stays capped as well"
+        );
+
+        // Saturated: an unseen namespace takes no key and fails toward
+        // visibility rather than going silent.
+        let before = reported.len();
+        assert!(record_destination_rule_ambiguity_in(
+            &mut reported,
+            "late",
+            7
+        ));
+        assert!(record_destination_rule_ambiguity_in(
+            &mut reported,
+            "late",
+            7
+        ));
+        assert_eq!(reported.len(), before, "and it retains no new key");
+
+        // A namespace admitted before saturation keeps its steady-state dedup.
+        assert!(!record_destination_rule_ambiguity_in(&mut reported, "a", 1));
+    }
+
+    /// A key-count budget is not a byte budget when the key comes from a
+    /// native/xDS subscriber. Oversized namespace strings must never be
+    /// retained in the process-global dedup map; repeated observations keep
+    /// reporting rather than colliding through hashing or truncation.
+    #[test]
+    fn ambiguity_warn_dedup_does_not_retain_oversized_namespace_keys() {
+        let mut reported: HashMap<String, HashSet<usize>> = HashMap::new();
+        let oversized = "n".repeat(DESTINATION_RULE_AMBIGUITY_NAMESPACE_KEY_MAX_BYTES + 1);
+
+        assert!(record_destination_rule_ambiguity_in(
+            &mut reported,
+            &oversized,
+            1
+        ));
+        assert!(record_destination_rule_ambiguity_in(
+            &mut reported,
+            &oversized,
+            1
+        ));
+        assert!(
+            reported.is_empty(),
+            "an oversized subscriber namespace must consume no retained key bytes"
+        );
     }
 
     fn pa(
@@ -6154,6 +7143,7 @@ mod tests {
                 .collect(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }
     }
 
@@ -6170,6 +7160,7 @@ mod tests {
             egress: Vec::new(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }
     }
 
@@ -6729,6 +7720,7 @@ mod tests {
             egress: Vec::new(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         };
         sidecar.ingress = vec![MeshSidecarIngress {
             port: 8443,
@@ -6950,6 +7942,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "checkout-dr".into(),
@@ -6958,6 +7951,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -7485,6 +8479,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -7558,6 +8553,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "checkout-dr".into(),
@@ -7566,6 +8562,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -7597,6 +8594,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "checkout-dr".into(),
@@ -7605,6 +8603,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -7633,6 +8632,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "gamma-checkout-dr".into(),
@@ -7641,6 +8641,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -7667,6 +8668,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -7694,6 +8696,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "gamma-checkout-dr".into(),
@@ -7702,6 +8705,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -7729,6 +8733,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -7755,6 +8760,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -7765,7 +8771,10 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_narrowing_keeps_external_dot_svc_destination_rule_literal() {
+    fn sidecar_narrowing_does_not_treat_dot_svc_host_as_external_literal() {
+        // `api.foo.svc` structurally names the in-cluster Service `foo/api`.
+        // A ServiceEntry in `alpha` cannot claim that host and make `alpha`
+        // its owner; the Sidecar's `./...` scope therefore does not admit it.
         let mesh = MeshConfig {
             sidecars: vec![make_sidecar(
                 "default-sc",
@@ -7787,13 +8796,13 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
         let config = config_with_mesh(mesh);
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
-        assert_eq!(slice.destination_rules.len(), 1);
-        assert_eq!(slice.destination_rules[0].name, "external-dr");
+        assert!(slice.destination_rules.is_empty());
     }
 
     #[test]
@@ -7818,6 +8827,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -7849,6 +8859,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -7858,11 +8869,10 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_narrowing_admits_destination_rule_from_target_service_namespace() {
-        // A DR declared in the target service's namespace (`beta`) must
-        // still be admitted alongside one declared in the client
-        // namespace (`alpha`); a DR declared in an unrelated namespace
-        // (`gamma`) targeting the same host must be filtered out.
+    fn sidecar_narrowing_keeps_only_the_winning_client_namespace_tier() {
+        // The client namespace (`alpha`) is the first matching lookup tier,
+        // so the target-service (`beta`) and unrelated (`gamma`) rules are
+        // both excluded from the resolved slice for this destination.
         let mesh = MeshConfig {
             sidecars: vec![make_sidecar(
                 "default-sc",
@@ -7879,6 +8889,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "from-target-ns".into(),
@@ -7887,6 +8898,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "from-unrelated-ns".into(),
@@ -7895,6 +8907,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -7906,9 +8919,10 @@ mod tests {
             .iter()
             .map(|dr| dr.name.as_str())
             .collect();
-        assert_eq!(names.len(), 2);
+        assert_eq!(names.len(), 1);
         assert!(names.contains("from-client-ns"));
-        assert!(names.contains("from-target-ns"));
+        assert!(!names.contains("from-target-ns"));
+        assert!(!names.contains("from-unrelated-ns"));
     }
 
     #[test]
@@ -8228,6 +9242,7 @@ mod tests {
                     egress: Vec::new(),
                     ingress_declared: false,
                     ingress: Vec::new(),
+                    outbound_traffic_policy: None,
                 },
             ],
             service_entries: vec![
@@ -8308,6 +9323,7 @@ mod tests {
                     egress: Vec::new(),
                     ingress_declared: false,
                     ingress: Vec::new(),
+                    outbound_traffic_policy: None,
                 },
                 make_inheriting_sidecar(
                     "frontend-ingress-only",
@@ -8423,6 +9439,7 @@ mod tests {
                 egress: Vec::new(),
                 ingress_declared: false,
                 ingress: Vec::new(),
+                outbound_traffic_policy: None,
             }],
             service_entries: vec![make_se_with_host(
                 "reviews",
@@ -8755,6 +9772,7 @@ mod tests {
                 ],
                 ingress_declared: false,
                 ingress: Vec::new(),
+                outbound_traffic_policy: None,
             }],
             services: vec![
                 make_service("alpha", "reviews"),
@@ -8767,6 +9785,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -8803,6 +9822,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "beta-checkout-dr".into(),
@@ -8811,6 +9831,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "gamma-payments-dr".into(),
@@ -8819,6 +9840,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()

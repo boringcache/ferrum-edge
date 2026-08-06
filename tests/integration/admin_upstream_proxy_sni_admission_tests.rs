@@ -2,10 +2,15 @@
 //! destinations when an effective request-body-buffering plugin is already
 //! persisted in the DB.
 //!
-//! `finish_write_success` does not synchronously refresh `AdminState.cached_config`,
-//! so these gates must load plugin configs from the DB rather than trusting a
-//! missing or deliberately stale GatewayConfig cache (which previously failed
-//! open to `&[]` and admitted a direct-H2-impossible configuration).
+//! An SNI override no longer requires the direct-H2 pool: the reqwest HTTP/1.1
+//! dial carries the server name in the URL authority with the real target
+//! pinned on the resolver, so a buffering (or retrying, or `pool_enable_http2:
+//! false`) association beside an SNI override is a representable configuration
+//! and must be **admitted**. These tests pin that the reverse-write gate stays
+//! removed — including with a missing or deliberately stale `cached_config`,
+//! which is where a resurrected screener would take its plugin view from.
+//! Genuinely unrepresentable dials still fail closed at runtime (the `502`
+//! `backend_tls_sni_requires_direct_h2`), not at admission.
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
@@ -68,8 +73,9 @@ fn make_token(config: &TestConfig) -> String {
 }
 
 fn stale_empty_cached_config() -> Option<Arc<ArcSwap<GatewayConfig>>> {
-    // Deliberately empty plugin list: if admission trusted this cache it would
-    // miss the DB-persisted buffering plugin and fail open.
+    // Deliberately empty plugin list: the cache a resurrected SNI screener
+    // would read from disagrees with the DB-persisted buffering plugin, so a
+    // write admitted here is admitted on policy rather than on a cache miss.
     Some(Arc::new(ArcSwap::from_pointee(GatewayConfig {
         version: "1".to_string(),
         loaded_at: Utc::now(),
@@ -225,17 +231,18 @@ fn https_proxy_with_plugins(id: &str, upstream_id: &str, plugin_ids: &[&str]) ->
     })
 }
 
-fn assert_sni_buffering_rejection(status: u16, body: &Value, plugin_id: &str) {
-    assert_eq!(
-        status, 400,
-        "SNI + effective buffering must reject: {body:?}"
-    );
+/// A write that combines an SNI override with an effective request-body
+/// buffering association must be admitted, and must not be refused with the
+/// retired direct-H2 diagnostic.
+fn assert_sni_buffering_admitted(status: u16, body: &Value) {
     let err = err_string(body);
     assert!(
-        err.contains("request-body-buffering")
-            && err.contains("backend TLS SNI")
-            && err.contains(plugin_id),
-        "rejection must name the buffering plugin; got: {err}"
+        !err.contains("backend TLS SNI"),
+        "the retired direct-H2 SNI admission gate must not reject this write: {err}"
+    );
+    assert_eq!(
+        status, 200,
+        "SNI + buffering is representable on the HTTP/1.1 dial: {body:?}"
     );
 }
 
@@ -271,7 +278,7 @@ async fn seed_plain_upstream_with_associated_buffering(
 }
 
 #[tokio::test]
-async fn upstream_write_rejects_sni_when_associated_buffering_and_cached_config_none() {
+async fn upstream_write_admits_sni_when_associated_buffering_and_cached_config_none() {
     let tc = TestConfig::default();
     let (state, _tmp) = build_admin_state(&tc, None).await;
     let (base_url, _shutdown) = start_admin(state).await;
@@ -293,11 +300,11 @@ async fn upstream_write_rejects_sni_when_associated_buffering_and_cached_config_
         &sni_upstream("plain-up"),
     )
     .await;
-    assert_sni_buffering_rejection(status, &body, "grpc-web-1");
+    assert_sni_buffering_admitted(status, &body);
 }
 
 #[tokio::test]
-async fn upstream_write_rejects_sni_when_associated_buffering_and_cached_config_stale() {
+async fn upstream_write_admits_sni_when_associated_buffering_and_cached_config_stale() {
     let tc = TestConfig::default();
     let (state, _tmp) = build_admin_state(&tc, stale_empty_cached_config()).await;
     let (base_url, _shutdown) = start_admin(state).await;
@@ -319,11 +326,11 @@ async fn upstream_write_rejects_sni_when_associated_buffering_and_cached_config_
         &sni_upstream("plain-up"),
     )
     .await;
-    assert_sni_buffering_rejection(status, &body, "grpc-web-1");
+    assert_sni_buffering_admitted(status, &body);
 }
 
 #[tokio::test]
-async fn proxy_write_rejects_sni_upstream_when_associated_buffering_and_cached_config_none() {
+async fn proxy_write_admits_sni_upstream_when_associated_buffering_and_cached_config_none() {
     let tc = TestConfig::default();
     let (state, _tmp) = build_admin_state(&tc, None).await;
     let (base_url, _shutdown) = start_admin(state).await;
@@ -350,11 +357,11 @@ async fn proxy_write_rejects_sni_upstream_when_associated_buffering_and_cached_c
         &https_proxy_with_plugins("p-sni", "sni-up", &["grpc-web-1"]),
     )
     .await;
-    assert_sni_buffering_rejection(status, &body, "grpc-web-1");
+    assert_sni_buffering_admitted(status, &body);
 }
 
 #[tokio::test]
-async fn proxy_write_rejects_sni_upstream_when_associated_buffering_and_cached_config_stale() {
+async fn proxy_write_admits_sni_upstream_when_associated_buffering_and_cached_config_stale() {
     let tc = TestConfig::default();
     let (state, _tmp) = build_admin_state(&tc, stale_empty_cached_config()).await;
     let (base_url, _shutdown) = start_admin(state).await;
@@ -379,7 +386,7 @@ async fn proxy_write_rejects_sni_upstream_when_associated_buffering_and_cached_c
         &https_proxy_with_plugins("p-sni", "sni-up", &["grpc-web-1"]),
     )
     .await;
-    assert_sni_buffering_rejection(status, &body, "grpc-web-1");
+    assert_sni_buffering_admitted(status, &body);
 }
 
 #[tokio::test]

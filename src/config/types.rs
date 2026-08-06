@@ -13,7 +13,6 @@
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
@@ -548,9 +547,10 @@ pub enum H2UpgradePolicy {
     /// Istio `DO_NOT_UPGRADE`: force the HTTP/1.1 path (reqwest). Skips the
     /// direct-H2 pool even when the capability registry marks the target
     /// `h2_tls` Supported, and restricts the reqwest client's ALPN to
-    /// `http/1.1` so the backend cannot ALPN-negotiate h2 either. (A
-    /// backend-TLS SNI override still requires direct-H2 because reqwest
-    /// cannot apply a per-request SNI — that case wins and is documented.)
+    /// `http/1.1` so the backend cannot ALPN-negotiate h2 either. A backend-TLS
+    /// SNI override remains representable on this path: the reqwest URL uses
+    /// the SNI authority while its resolver pins the socket to the selected
+    /// backend target.
     #[serde(alias = "do_not_upgrade")]
     DoNotUpgrade,
 }
@@ -1510,6 +1510,38 @@ impl BackendTlsConfig {
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
         }
+    }
+
+    /// True when this backend explicitly selected the built-in system/webpki
+    /// trust anchors (`system://`) instead of a CA bundle.
+    ///
+    /// This is a *stronger* statement than "no CA path configured": it pins the
+    /// trust anchors to the platform roots and must bypass the cluster-global
+    /// `FERRUM_TLS_CA_BUNDLE_PATH` override and `FERRUM_TLS_NO_VERIFY`.
+    pub fn uses_system_trust_roots(&self) -> bool {
+        self.server_ca_cert_path
+            .as_deref()
+            .is_some_and(crate::tls::source::is_system_trust_roots_source)
+    }
+
+    /// The CA source that should actually be loaded for this backend, applying
+    /// the documented chain: backend CA, else global CA, else built-in roots.
+    ///
+    /// Returns `None` both when nothing is configured and when the backend
+    /// selected `system://` — in the latter case the global bundle is
+    /// deliberately NOT consulted, so a cluster-wide private CA cannot silently
+    /// become the trust anchor for a backend that asked for system roots.
+    pub fn effective_ca_source<'a>(&'a self, global_ca_path: Option<&'a str>) -> Option<&'a str> {
+        if self.uses_system_trust_roots() {
+            return None;
+        }
+        self.server_ca_cert_path.as_deref().or(global_ca_path)
+    }
+
+    /// Whether the global `FERRUM_TLS_NO_VERIFY` opt-out may apply to this
+    /// backend. An explicit `system://` trust selection never inherits it.
+    pub fn allows_global_no_verify(&self) -> bool {
+        !self.uses_system_trust_roots()
     }
 
     pub fn recompute_san_digest(&mut self) {
@@ -3043,489 +3075,6 @@ fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether a proxy's retry policy can actually trigger for at least one request
-/// the proxy can admit.
-///
-/// Mirrors the runtime gates so config validation does not reject combinations
-/// that can never retry:
-/// - `max_retries == 0` never retries.
-/// - `retry_on_connect_failure` is method-agnostic (a connect failure never
-///   reaches the HTTP layer), so it makes retry effective for *any* admitted
-///   method.
-/// - Status-code retries only fire for methods listed in `retryable_methods`,
-///   and method admission (`allowed_methods`) runs before backend dispatch. So
-///   status retries are only effective when `retryable_methods` overlaps the
-///   methods the proxy is allowed to serve.
-pub(crate) fn proxy_retry_is_effective(
-    retry: Option<&RetryConfig>,
-    allowed_methods: Option<&[String]>,
-) -> bool {
-    let Some(retry) = retry else {
-        return false;
-    };
-    if retry.max_retries == 0 {
-        return false;
-    }
-    if retry.retry_on_connect_failure {
-        return true;
-    }
-    if retry.retryable_status_codes.is_empty() || retry.retryable_methods.is_empty() {
-        return false;
-    }
-    match allowed_methods {
-        // `allowed_methods == None` means "allow all", so any retryable method
-        // can be admitted.
-        None => true,
-        Some(allowed) => retry.retryable_methods.iter().any(|retryable| {
-            allowed
-                .iter()
-                .any(|served| served.eq_ignore_ascii_case(retryable))
-        }),
-    }
-}
-
-/// Whether `target` is selectable for the named upstream subset. Admission
-/// paths use the same label containment rule as the load balancer so a policy
-/// attached only to a sibling subset cannot affect the selected destination.
-/// An unknown subset remains unfiltered here because reference validation
-/// reports that independent error; retaining every target also keeps the
-/// remaining admission checks fail-closed while errors are accumulated.
-fn upstream_target_selected_by_subset(
-    upstream: &Upstream,
-    selected_subset: Option<&str>,
-    target: &UpstreamTarget,
-) -> bool {
-    let subset = selected_subset.and_then(|subset_name| {
-        upstream
-            .subsets
-            .as_ref()
-            .and_then(|subsets| subsets.iter().find(|subset| subset.name == subset_name))
-    });
-    match subset {
-        Some(subset) => subset
-            .labels
-            .iter()
-            .all(|(key, value)| target.tags.get(key).is_some_and(|tag| tag == value)),
-        None => true,
-    }
-}
-
-/// Project a single referenced upstream's per-port / top-level connection
-/// policy onto a throwaway proxy clone for per-resource admission paths.
-///
-/// `Proxy.dispatch_port_overrides` / `Proxy.dispatch_port_override_fallback` are
-/// `#[serde(skip)]` DR-derived projections that only
-/// [`GatewayConfig::resolve_dispatch_port_overrides`] populates over a full
-/// config. A proxy that arrives straight off the admin request body therefore has
-/// both fields `None`. This projection is still used by the backend-TLS SNI
-/// direct-H2 compatibility validation and mirrors the full-config resolution,
-/// including the exact effective selected subset (which may differ from
-/// `proxy.upstream_subset` on a route-override destination).
-pub(crate) fn proxy_with_resolved_port_caps(
-    proxy: &Proxy,
-    upstream: &Upstream,
-    selected_subset: Option<&str>,
-) -> Proxy {
-    let mut resolved = proxy.clone();
-    resolved.dispatch_port_overrides = if upstream.port_overrides.is_empty() {
-        None
-    } else {
-        let ports: HashMap<u16, ResolvedPortOverride> = upstream
-            .port_overrides
-            .iter()
-            .filter_map(|(port, ovr)| {
-                ResolvedPortOverride::from_upstream_override(ovr).map(|r| (*port, r))
-            })
-            .collect();
-        (!ports.is_empty()).then_some(ports)
-    };
-    resolved.dispatch_port_override_fallback =
-        dispatch_port_override_fallback_for_selected_subset(upstream, selected_subset);
-    resolved
-}
-
-/// Outcome of screening one enabled plugin config for backend-TLS SNI
-/// request-body-buffering admission.
-///
-/// `shadows_same_named_global` mirrors `PluginCache` merge rules: a disabled
-/// config never shadows; a successfully constructed local (or a
-/// custom/unknown/`Ok(None)` name) does; a built-in whose configuration fails
-/// to construct does not — the cache's `Err` arm leaves the global in place.
-struct SniBufferingScreenEffect {
-    forces_buffering: bool,
-    shadows_same_named_global: bool,
-}
-
-/// Screen one plugin config for SNI buffering admission.
-///
-/// The buffering answer comes from the authoritative
-/// [`crate::plugins::Plugin::requires_request_body_buffering`] implementation
-/// on an instance built from the SAME parsed configuration the runtime
-/// `PluginCache` builds — there is no second, config-shaped re-implementation
-/// of the predicate to drift out of sync. See
-/// [`crate::plugins::RequestBodyBufferingScreener`] for the side-effect
-/// guarantees of that construction.
-///
-/// A plugin the screen cannot evaluate (custom / unknown plugin, or a
-/// configuration that does not construct) is admitted with a value-redacted
-/// warning, preserving the documented residual: those requests still fail
-/// closed at runtime with a `502` and
-/// `gateway-error-reason: backend_tls_sni_requires_direct_h2`.
-fn screen_plugin_config_for_sni_buffering(
-    proxy_id: &str,
-    pc: &PluginConfig,
-    screener: &OnceCell<crate::plugins::RequestBodyBufferingScreener>,
-) -> SniBufferingScreenEffect {
-    if !pc.enabled {
-        return SniBufferingScreenEffect {
-            forces_buffering: false,
-            shadows_same_named_global: false,
-        };
-    }
-    // Built on first use: a proxy whose effective plugin configs are all
-    // disabled (or absent) never constructs the screener's HTTP client.
-    let screener = screener.get_or_init(crate::plugins::RequestBodyBufferingScreener::new);
-    match screener.screen(&pc.plugin_name, &pc.config) {
-        crate::plugins::RequestBodyBufferingScreen::Buffers => SniBufferingScreenEffect {
-            forces_buffering: true,
-            shadows_same_named_global: true,
-        },
-        crate::plugins::RequestBodyBufferingScreen::Streams => SniBufferingScreenEffect {
-            forces_buffering: false,
-            shadows_same_named_global: true,
-        },
-        crate::plugins::RequestBodyBufferingScreen::Indeterminate(gap) => {
-            tracing::warn!(
-                proxy_id = %proxy_id,
-                plugin_config_id = %pc.id,
-                plugin_name = %pc.plugin_name,
-                reason = gap.as_str(),
-                "Backend TLS SNI admission could not evaluate request-body buffering for this \
-                 plugin; admitting the proxy. Direct HTTP/2 SNI dispatch still fails closed at \
-                 runtime (502, gateway-error-reason: backend_tls_sni_requires_direct_h2) if the \
-                 plugin buffers request bodies"
-            );
-            // `NotBuiltin` covers custom/unknown names and retired aliases
-            // (`Ok(None)`): PluginCache still removes the same-named global in
-            // those arms. Prefer shadowing (and the documented admit residual)
-            // over a false SNI rejection. `ConstructionFailed` mirrors the
-            // cache's `Err` arm and must not shadow.
-            let shadows_same_named_global = matches!(
-                gap,
-                crate::plugins::RequestBodyBufferingScreenGap::NotBuiltin
-            );
-            SniBufferingScreenEffect {
-                forces_buffering: false,
-                shadows_same_named_global,
-            }
-        }
-    }
-}
-
-/// Whether a backend TLS SNI override applies proxy-wide or only on one
-/// DestinationRule policy port.
-#[derive(Debug, Clone, Copy)]
-enum SniPolicyScope {
-    ProxyWide,
-    Port(u16),
-}
-
-/// Source description for a backend TLS SNI override that forces direct-H2.
-fn proxy_plain_https_sni_sources<'a>(
-    proxy: &'a Proxy,
-    upstream: Option<&'a Upstream>,
-) -> Vec<(&'a str, String, SniPolicyScope)> {
-    let mut sources = Vec::new();
-    if let Some(sni) = proxy.resolved_tls.sni.as_deref() {
-        sources.push((
-            sni,
-            "resolved backend TLS SNI".to_string(),
-            SniPolicyScope::ProxyWide,
-        ));
-    }
-    if let Some(overrides) = proxy.dispatch_port_overrides.as_ref() {
-        for (port, ovr) in overrides {
-            if let Some(sni) = ovr.tls.as_ref().and_then(|tls| tls.sni.as_deref()) {
-                sources.push((
-                    sni,
-                    format!("DestinationRule per-port TLS SNI on port {port}"),
-                    SniPolicyScope::Port(*port),
-                ));
-            }
-        }
-    } else if let Some(upstream) = upstream {
-        // Admin/single-resource paths may not have projected
-        // `dispatch_port_overrides` yet; still catch Upstream.port_overrides.
-        for (port, ovr) in &upstream.port_overrides {
-            if let Some(sni) = ovr.tls.as_ref().and_then(|tls| tls.sni.as_deref()) {
-                sources.push((
-                    sni,
-                    format!("DestinationRule per-port TLS SNI on port {port}"),
-                    SniPolicyScope::Port(*port),
-                ));
-            }
-        }
-        if let Some(sni) = upstream.backend_tls_sni.as_deref()
-            && proxy.resolved_tls.sni.is_none()
-        {
-            sources.push((
-                sni,
-                "upstream backend_tls_sni".to_string(),
-                SniPolicyScope::ProxyWide,
-            ));
-        }
-    }
-    sources
-}
-
-/// Effective `h2UpgradePolicy` for one policy port, mirroring
-/// [`crate::proxy::resolve_effective_proxy_for_target`] field precedence:
-/// explicit per-port (including `DEFAULT` clearing an inherited value) >
-/// selected-subset/top-level fallback > `Proxy.h2_upgrade_policy`.
-fn effective_h2_upgrade_policy_for_sni(
-    proxy: &Proxy,
-    upstream: Option<&Upstream>,
-    port: Option<u16>,
-) -> Option<H2UpgradePolicy> {
-    let per_port = port.and_then(|policy_port| {
-        proxy
-            .dispatch_port_overrides
-            .as_ref()
-            .and_then(|overrides| overrides.get(&policy_port))
-            .and_then(|ovr| ovr.h2_upgrade_policy)
-            .or_else(|| {
-                upstream
-                    .and_then(|u| u.port_overrides.get(&policy_port))
-                    .and_then(|ovr| ovr.h2_upgrade_policy)
-            })
-    });
-    let inherited = proxy
-        .dispatch_port_override_fallback
-        .as_ref()
-        .and_then(|fallback| fallback.h2_upgrade_policy)
-        .or(proxy.h2_upgrade_policy);
-    per_port.or(inherited)
-}
-
-/// Policy ports a proxy-wide backend TLS SNI override can dial through.
-/// Prefer concrete upstream targets so a more-specific per-port
-/// `UPGRADE`/`DEFAULT` clearing an inherited `DO_NOT_UPGRADE` does not
-/// false-reject when no selectable target still inherits force-H1.
-fn policy_ports_for_proxy_wide_sni(proxy: &Proxy, upstream: Option<&Upstream>) -> Vec<u16> {
-    if let Some(upstream) = upstream
-        && !upstream.targets.is_empty()
-    {
-        let mut ports: Vec<u16> = upstream
-            .targets
-            .iter()
-            .filter(|target| {
-                upstream_target_selected_by_subset(
-                    upstream,
-                    proxy.upstream_subset.as_deref(),
-                    target,
-                )
-            })
-            .map(UpstreamTarget::dispatch_policy_port)
-            .collect();
-        ports.sort_unstable();
-        ports.dedup();
-        return ports;
-    }
-    let mut ports = Vec::new();
-    if let Some(overrides) = proxy.dispatch_port_overrides.as_ref() {
-        ports.extend(overrides.keys().copied());
-    } else if let Some(upstream) = upstream {
-        ports.extend(upstream.port_overrides.keys().copied());
-    }
-    if ports.is_empty() {
-        ports.push(proxy.backend_port);
-    } else {
-        ports.sort_unstable();
-        ports.dedup();
-    }
-    ports
-}
-
-fn h2_upgrade_policy_forces_http1(policy: Option<H2UpgradePolicy>) -> bool {
-    matches!(policy, Some(H2UpgradePolicy::DoNotUpgrade))
-}
-
-/// Whether the effective `h2UpgradePolicy` for this SNI scope forces HTTP/1.1
-/// and therefore makes the direct-H2 SNI route impossible.
-fn sni_scope_conflicts_with_h2_upgrade_policy(
-    proxy: &Proxy,
-    upstream: Option<&Upstream>,
-    scope: SniPolicyScope,
-) -> bool {
-    match scope {
-        SniPolicyScope::Port(port) => h2_upgrade_policy_forces_http1(
-            effective_h2_upgrade_policy_for_sni(proxy, upstream, Some(port)),
-        ),
-        SniPolicyScope::ProxyWide => {
-            let ports = policy_ports_for_proxy_wide_sni(proxy, upstream);
-            ports.iter().any(|port| {
-                h2_upgrade_policy_forces_http1(effective_h2_upgrade_policy_for_sni(
-                    proxy,
-                    upstream,
-                    Some(*port),
-                ))
-            })
-        }
-    }
-}
-
-/// Build a throwaway proxy for backend-TLS-SNI / direct-H2 admission against
-/// one exact `(upstream, selected_subset)` destination. Projects the same
-/// dispatch-port / subset HTTP fallback and resolved TLS the runtime uses
-/// before the SNI gate, and installs the effective retry for that destination.
-pub(crate) fn proxy_for_sni_direct_h2_admission(
-    proxy: &Proxy,
-    upstream: &Upstream,
-    selected_subset: Option<&str>,
-    effective_retry: Option<RetryConfig>,
-) -> Proxy {
-    let mut admission = proxy_with_resolved_port_caps(proxy, upstream, selected_subset);
-    admission.upstream_subset = selected_subset.map(str::to_owned);
-    admission.retry = effective_retry;
-    admission.resolved_tls = BackendTlsConfig::from_upstream(upstream);
-    if let Some(subset_name) = selected_subset
-        && let Some(subset_tls) = upstream
-            .resolved_subset_tls
-            .get(subset_name)
-            .and_then(|resolved| resolved.tls.clone())
-    {
-        admission.resolved_tls = subset_tls;
-    }
-    admission.dispatch_kind = DispatchKind::from(admission.effective_scheme());
-    admission
-}
-
-/// Reject plain-HTTPS proxies whose backend TLS SNI override cannot dispatch
-/// on the direct-H2 pool (retry body replay, request-body buffering plugins,
-/// `pool_enable_http2: false`, or effective `h2UpgradePolicy: DO_NOT_UPGRADE`).
-/// Covers proxy-level and DestinationRule per-port TLS overlays so `validate`
-/// catches guaranteed total outages.
-///
-/// Effective `h2UpgradePolicy` mirrors
-/// [`crate::proxy::resolve_effective_proxy_for_target`]: explicit per-port >
-/// selected subset > top-level. Only scopes whose effective policy forces H1
-/// are rejected; a more-specific `UPGRADE`/`DEFAULT` port is not false-rejected
-/// by an inherited `DO_NOT_UPGRADE`.
-///
-/// The buffering leg is derived from the runtime
-/// [`crate::plugins::Plugin::requires_request_body_buffering`] answer of a
-/// plugin built from the same parsed config (see
-/// [`screen_plugin_config_for_sni_buffering`]), so it tracks every
-/// conditional buffering plugin exactly and needs no per-plugin maintenance.
-/// Plugin construction happens only for proxies that actually carry a plain
-/// HTTPS SNI override, and only for that proxy's effective plugin configs.
-pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
-    proxy: &Proxy,
-    upstream: Option<&Upstream>,
-    plugin_configs: &[PluginConfig],
-) -> Vec<String> {
-    // gRPC / native H3 own the TLS handshake and support SNI on their pools;
-    // the reqwest incompatibility is specific to plain HTTPS (HttpsPool).
-    if proxy.dispatch_kind != DispatchKind::HttpsPool {
-        return Vec::new();
-    }
-    let sources = proxy_plain_https_sni_sources(proxy, upstream);
-    if sources.is_empty() {
-        return Vec::new();
-    }
-    let sni_desc = sources
-        .iter()
-        .map(|(sni, source, _)| format!("'{sni}' ({source})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut errors = Vec::new();
-    if proxy.pool_enable_http2 == Some(false) {
-        errors.push(format!(
-            "Proxy '{}' sets backend TLS SNI override ({sni_desc}) but pool_enable_http2 is false; \
-             plain HTTPS SNI overrides require the direct HTTP/2 backend pool",
-            proxy.id
-        ));
-    }
-    let h2_policy_conflict_desc = sources
-        .iter()
-        .filter(|(_, _, scope)| sni_scope_conflicts_with_h2_upgrade_policy(proxy, upstream, *scope))
-        .map(|(sni, source, _)| format!("'{sni}' ({source})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if !h2_policy_conflict_desc.is_empty() {
-        errors.push(format!(
-            "Proxy '{}' sets backend TLS SNI override ({h2_policy_conflict_desc}) but \
-             h2UpgradePolicy is DO_NOT_UPGRADE; plain HTTPS SNI overrides require the \
-             direct HTTP/2 backend pool",
-            proxy.id
-        ));
-    }
-    if proxy_retry_is_effective(proxy.retry.as_ref(), proxy.allowed_methods.as_deref()) {
-        errors.push(format!(
-            "Proxy '{}' enables retry with backend TLS SNI override ({sni_desc}); \
-             request-body replay for retries is incompatible with direct HTTP/2 SNI dispatch",
-            proxy.id
-        ));
-    }
-
-    // Effective plugins for this proxy: associations + globals in the proxy's
-    // namespace (unless a local instance shadows that plugin name — mirror
-    // PluginCache tenancy and merge rules for the buffering screen only).
-    // Associations resolve by `(namespace, id)` so reused plugin ids in other
-    // tenants cannot false-reject this proxy.
-    //
-    // The screener owns an HTTP client, so build it lazily: proxies without an
-    // effective plugin config never pay for one, and non-SNI proxies already
-    // returned above.
-    let screener: OnceCell<crate::plugins::RequestBodyBufferingScreener> = OnceCell::new();
-    let mut local_names: HashSet<&str> = HashSet::new();
-    for assoc in &proxy.plugins {
-        let Some(pc) = plugin_configs
-            .iter()
-            .find(|pc| pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id)
-        else {
-            continue;
-        };
-        match pc.scope {
-            PluginScope::Global => continue,
-            PluginScope::Proxy if pc.proxy_id.as_deref() != Some(proxy.id.as_str()) => continue,
-            PluginScope::Proxy | PluginScope::ProxyGroup => {}
-        }
-        let effect = screen_plugin_config_for_sni_buffering(&proxy.id, pc, &screener);
-        // Mirror PluginCache: only locals that would enter (or deliberately
-        // clear) the merge list shadow a same-named global. Disabled
-        // configs and construction failures do not.
-        if effect.shadows_same_named_global {
-            local_names.insert(pc.plugin_name.as_str());
-        }
-        if effect.forces_buffering {
-            errors.push(format!(
-                "Proxy '{}' attaches request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
-                 request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
-                proxy.id, pc.id
-            ));
-        }
-    }
-    for pc in plugin_configs {
-        if pc.scope != PluginScope::Global || pc.namespace != proxy.namespace {
-            continue;
-        }
-        if local_names.contains(pc.plugin_name.as_str()) {
-            continue;
-        }
-        let effect = screen_plugin_config_for_sni_buffering(&proxy.id, pc, &screener);
-        if effect.forces_buffering {
-            errors.push(format!(
-                "Proxy '{}' inherits global request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
-                 request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
-                proxy.id, pc.id
-            ));
-        }
-    }
-    errors
-}
-
 impl GatewayConfig {
     /// Validate that all proxy (host, listen_path) combinations are unique.
     ///
@@ -4504,11 +4053,16 @@ impl GatewayConfig {
     /// In file mode there's no DB, so this catches dangling references
     /// at config load time.
     ///
-    /// Plain-HTTPS proxies with a backend TLS SNI override are likewise screened
-    /// for combinations that cannot use the direct-H2 pool (effective retry,
-    /// request-body-buffering plugins, `pool_enable_http2: false`, effective
-    /// `h2UpgradePolicy: DO_NOT_UPGRADE`), including DestinationRule per-port
-    /// TLS overlays and `mesh_route_dispatch` override destinations (issue #2954).
+    /// A backend TLS SNI override is deliberately NOT screened here. It once
+    /// rejected effective retry, request-body-buffering plugins, and
+    /// `pool_enable_http2: false` because only the direct-H2 pool could carry a
+    /// server name (issue #2954). The reqwest/HTTP-1.1 SNI dial serves all
+    /// three, so those rejections refused working Gateway API `BackendTLSPolicy`
+    /// shapes (issue #3276). The remaining fail-closed answers are runtime
+    /// decisions that config cannot make: the `502` /
+    /// `backend_tls_sni_requires_direct_h2` when a dial genuinely cannot be
+    /// constructed, and the WebSocket transport's own pre-dial refusal
+    /// (`crate::proxy::websocket_backend_tls_sni_unsupported`).
     pub fn validate_upstream_references(&self) -> Result<(), Vec<String>> {
         // Upstream references are namespace-local. A bare-id index would accept
         // a dangling same-namespace reference whenever another tenant owns
@@ -4545,21 +4099,6 @@ impl GatewayConfig {
                     }
                 }
             }
-
-            // Backend TLS SNI on plain HTTPS requires direct-H2; reject
-            // combinations that cannot dispatch (retry / body-buffering /
-            // pool_enable_http2=false / effective DO_NOT_UPGRADE), including
-            // DestinationRule per-port TLS overlays projected onto this proxy.
-            let upstream = proxy.upstream_id.as_deref().and_then(|uid| {
-                upstreams_by_key
-                    .get(&(proxy.namespace.as_str(), uid))
-                    .copied()
-            });
-            errors.extend(backend_tls_sni_direct_h2_conflict_messages(
-                proxy,
-                upstream,
-                &self.plugin_configs,
-            ));
         }
 
         if errors.is_empty() {
@@ -5386,17 +4925,88 @@ fn valid_hash_on_cookie_domain(domain: &str) -> bool {
         })
 }
 
-fn validate_tls_material_source_field(
+pub(crate) fn validate_tls_material_source_field(
     field_name: &str,
     value: &str,
     kind: crate::tls::source::MaterialKind,
 ) -> Result<(), String> {
-    match crate::tls::source::CertSource::parse(value, kind) {
+    let source = crate::tls::source::CertSource::parse(value, kind);
+    if source.is_system_trust_roots() {
+        return validate_system_trust_roots_source_field(field_name, value, kind);
+    }
+    match source {
         crate::tls::source::CertSource::InlinePem(_) => {
             validate_string_field(field_name, value, MAX_TLS_INLINE_PEM_LENGTH)
         }
         _ => validate_string_field(field_name, value, MAX_FILE_PATH_LENGTH),
     }
+}
+
+/// Admit `system://` only in its exact canonical spelling, and only where
+/// selecting a *trust store* is meaningful.
+///
+/// The value is a security decision, not a path, so a near-miss must not be
+/// accepted and silently reinterpreted: `system://corp-ca.pem` looks like it
+/// pins a bundle but would select the built-in roots, and `system://` on a
+/// client cert/key field selects nothing at all.
+fn validate_system_trust_roots_source_field(
+    field_name: &str,
+    value: &str,
+    kind: crate::tls::source::MaterialKind,
+) -> Result<(), String> {
+    if kind != crate::tls::source::MaterialKind::CaBundle {
+        return Err(format!(
+            "{field_name} must not be '{}': the system trust-roots source selects CA trust anchors and is only valid on a CA bundle field",
+            crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
+        ));
+    }
+    if value != crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE {
+        return Err(format!(
+            "{field_name} system trust-roots source must be exactly '{}' with no path or query options (got '{value}')",
+            crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
+        ));
+    }
+    Ok(())
+}
+
+/// Reject an explicit system-trust-roots selection paired with the verification
+/// opt-out. `system://` means "verify against the platform roots"; combining it
+/// with `verify_server_cert: false` is a contradiction that would otherwise
+/// silently resolve in favour of not verifying at all.
+pub(crate) fn validate_system_trust_roots_verify_pairing(
+    ca_field: &str,
+    verify_field: &str,
+    ca_value: Option<&str>,
+    verify_server_cert: bool,
+) -> Option<String> {
+    let selects_system = ca_value.is_some_and(crate::tls::source::is_system_trust_roots_source);
+    if selects_system && !verify_server_cert {
+        return Some(format!(
+            "{verify_field} cannot be false when {ca_field} is '{}' — the system trust-roots source requires server certificate verification",
+            crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
+        ));
+    }
+    None
+}
+
+/// Reject an explicit system-trust-roots selection paired with Istio's
+/// `insecureSkipVerify` opt-out. This is the same trust invariant as
+/// [`validate_system_trust_roots_verify_pairing`], expressed in the polarity
+/// used by `DestinationRule.trafficPolicy.tls`.
+pub(crate) fn validate_system_trust_roots_skip_verify_pairing(
+    ca_field: &str,
+    skip_verify_field: &str,
+    ca_value: Option<&str>,
+    insecure_skip_verify: bool,
+) -> Option<String> {
+    let selects_system = ca_value.is_some_and(crate::tls::source::is_system_trust_roots_source);
+    if selects_system && insecure_skip_verify {
+        return Some(format!(
+            "{skip_verify_field} cannot be true when {ca_field} is '{}' — the system trust-roots source requires server certificate verification",
+            crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
+        ));
+    }
+    None
 }
 
 /// Validate that a PEM certificate source is readable and every declared
@@ -7379,6 +6989,14 @@ impl Proxy {
         {
             errors.push(e);
         }
+        if let Some(e) = validate_system_trust_roots_verify_pairing(
+            "backend_tls_server_ca_cert_path",
+            "backend_tls_verify_server_cert",
+            self.backend_tls_server_ca_cert_path.as_deref(),
+            self.backend_tls_verify_server_cert,
+        ) {
+            errors.push(e);
+        }
 
         // TLS cert/key pairing: both must be set or neither
         match (
@@ -8522,6 +8140,14 @@ impl Upstream {
                 crate::tls::source::MaterialKind::CaBundle,
             )
         {
+            errors.push(e);
+        }
+        if let Some(e) = validate_system_trust_roots_verify_pairing(
+            "backend_tls_server_ca_cert_path",
+            "backend_tls_verify_server_cert",
+            self.backend_tls_server_ca_cert_path.as_deref(),
+            self.backend_tls_verify_server_cert,
+        ) {
             errors.push(e);
         }
         if let Some(ref sni) = self.backend_tls_sni

@@ -9,6 +9,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ai_federation` incremental provider response streaming behind a new root
+  `streaming` block (issue #3298). With `streaming.enabled`, an OpenAI Chat
+  Completions request carrying `"stream": true` is claimed in `before_proxy`,
+  bound to exactly ONE provider, and routed through `RequestContext.route_override_*`
+  so the ordinary proxy dispatch path relays provider SSE incrementally — time
+  to first token, client-disconnect cancellation, byte budgets, and shutdown
+  accounting all come from the shared streaming response machinery, and the
+  plugin adds no queues, channels, or detached tasks of its own. The provider
+  commit boundary is fail-closed: fallback across providers happens only during
+  pre-commit selection (open circuit, streaming-ineligible provider, unusable
+  endpoint), and after the claim no second provider is ever spliced into the
+  same logical stream — a post-commit failure truncates with one
+  gateway-authored terminal SSE `error` event. Streaming eligibility is limited
+  to providers whose native streaming wire format already is the OpenAI SSE
+  contract (`openai`, `mistral`, `xai`, `deepseek`, `meta_llama`,
+  `hugging_face`, `azure_openai`) with a static header credential; `anthropic`,
+  `google_gemini`, `google_vertex`, `aws_bedrock`, `cohere`, and any AWS
+  SigV4 / Google OAuth2 provider fail closed with a field-specific `501` and
+  belong to `ai_stream_router`. A claimed stream retains at most one SSE event —
+  the partial event being assembled, or the terminal event once the provider has
+  framed its completion (`streaming.max_event_bytes`, 4 KiB–1 MiB, default
+  256 KiB) — and the
+  ceiling is enforced on every complete AND partial event before any of its
+  bytes are retained or released, so retained state grows with neither stream
+  length nor transport chunk size. Ordinary events are released as soon as they
+  are complete, but the terminal `data: [DONE]` event is HELD back until the
+  provider's body ends: a client following the OpenAI contract may stop reading
+  at `[DONE]`, so releasing one before upstream EOF would let it accept a
+  successful completion the gateway went on to refuse. At a clean EOF with
+  nothing else outstanding the provider's own terminal event is released
+  verbatim; ANY provider byte after the retained marker — a second terminal, a
+  data event, a comment / `id` / `retry` line, an oversized or non-UTF-8 block,
+  or a trailing partial line — fails the stream closed and DROPS the marker, so
+  the client receives the gateway-authored `error` event and no completion
+  marker at all. Terminal detection follows the SSE field
+  grammar — an event is terminal only when the CONCATENATION of its `data` lines
+  is exactly `[DONE]`, and `CR`/`LF`/`CRLF` plus their legal mixed blank-line
+  forms are all recognized — so `data: [DONE]\ndata: …` is ordinary data and
+  cannot pass as completion. Oversized events, data after the terminal marker, a
+  duplicated terminal marker, a non-UTF-8 or otherwise undecidable event, a
+  truncated stream, a content-coded stream, and a non-`text/event-stream` 2xx
+  all fail closed with fixed-cardinality reasons that never echo a provider
+  byte, header, model, or URL. A claimed stream is accounted like a buffered
+  call: it holds one non-queuing `max_concurrent_requests` permit and one real
+  `ProviderCircuit` admission (so a half-open circuit still grants exactly one
+  concurrent probe) in a clone-safe reservation that is released exactly once on
+  completion, non-2xx body termination, client disconnect, downstream policy cut,
+  backend error, pre-header cancellation, or a fail-closed final-body rejection
+  — including while a slow non-2xx error body is still streaming after headers;
+  a non-2xx circuit verdict is staged at headers and applied at body end/drop so
+  a disconnect after those headers keeps the provider score; a 2xx is scored a
+  circuit success only after a valid terminal marker. `model_mapping` /
+  `default_model` apply to streams through an owner-scoped request transform
+  that rewrites the provider-visible top-level `model` and re-asserts
+  `stream: true` (a body with duplicate JSON members is deliberately left
+  unrewritten and still fails closed). The committed provider's
+  `connect_timeout_seconds` / `read_timeout_seconds` become the streaming
+  route's dispatch budgets instead of the matched proxy's; on this path
+  `read_timeout_seconds` is a WHOLE-EXCHANGE bound (connect through last body
+  byte), and the new `streaming.read_timeout_seconds` (0–86400, `0` =
+  unbounded) overrides it for streams only. Provider response headers are
+  reduced to the bounded safe allowlist the buffered path already publishes,
+  plus a gateway-authored `Content-Type: text/event-stream` and
+  `Cache-Control: no-cache`; provider cookies, redirects, auth
+  challenges, validators/digests, and unknown metadata never reach the client.
+  The claim mints the same private provider claim
+  `ai_stream_router` uses, so `request_mirror`, `serverless_function`,
+  `mcp_gateway`, and `mesh_route_dispatch` stand down identically, and
+  `enforce_final_backend_header_policy` plus `on_final_request_body_with_context`
+  re-assert the credential, destination, committed model, and committed dispatch
+  budgets over the finalized backend-visible request (GHSA-xhp5-hqj8-3mwg).
+- New non-rejecting `origin response-header boundary` plugin phase, run once per
+  response at the top of `run_after_proxy_hooks` (the shared funnel for H1/H2,
+  native gRPC, gRPC-Web, and both H3 paths) before any `after_proxy` hook.
+  A plugin that routed a request to a third-party destination opts in with
+  `enforces_origin_response_header_policy` and bounds what that destination
+  contributed in `enforce_origin_response_header_policy`, without discarding the
+  gateway decorations later hooks add. `ai_federation`'s streaming path is the
+  only owner today.
+- New `RequestContext.route_override_backend_connect_timeout_ms`, the connect
+  counterpart to the existing read-timeout route override, so a plugin that
+  repoints a request at a direct third-party destination can apply that
+  destination's own connect budget instead of silently inheriting the matched
+  proxy's.
+- Gateway API live `GATEWAY-GRPC` conformance: CI advertises
+  `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`, runs the upstream
+  `GATEWAY-HTTP,GATEWAY-GRPC` profiles against a live Ferrum listener, with
+  exact-method, header, listener-hostname, weighted-backend, and core status
+  coverage owned by the pinned upstream suite (issue #3272).
 - NodeWaypoint captured TCP observability now exports the bounded-cardinality
   `ferrum_mesh_bpf_accept_to_first_byte_microseconds` histogram for IPv4 and
   IPv6. SOCK_OPS timestamps passive establishment and enrolls the exact accepted
@@ -21,6 +110,308 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callback-lock recursion, raced handoff, stale state, and `ktime` wrap from
   fabricating samples. The metric has fixed microsecond buckets with saturating
   count/bucket counters, drops sum overflow, and adds no per-flow labels (#3309).
+- Gateway API `BackendTLSPolicy` is watched and translated for Service-backed
+  `HTTPRoute`/`GRPCRoute` backends (issue #3276). `validation.hostname` projects
+  to upstream `backend_tls_sni`, optional `subjectAltNames` to
+  `backend_tls_san_allow_list`, and ConfigMap/Secret `caCertificateRefs` to the
+  upstream CA trust posture with `backend_scheme: https`. Policy
+  `status.ancestors` names the targeted Service as Ferrum's single ancestor,
+  with `Accepted` / `ResolvedRefs` conditions using the portable
+  `PolicyConditionReason` vocabulary, preserving third-party controllers'
+  ancestors and stable condition transition times. The ancestor is the Service
+  and not the routing Gateways because nothing on Ferrum's overlay or verdict
+  path takes a Gateway as input, so the verdict cannot vary per Gateway; that
+  also bounds Ferrum's own contribution at one entry, so no number of Gateways
+  can approach the CRD's hard `MaxItems=16` ancestor limit. Ferrum writes policy
+  status only where a managed Gateway *effectively* routes to the targeted
+  Service — a route that materialized on an accepted parentRef, not merely one
+  naming a Gateway. When third-party controllers have filled all 16 ancestor
+  slots, Gateway API forbids adding another entry, so Ferrum publishes none and
+  the same shared predicate makes translation reject the policy: covered
+  backends fail closed with the HTTP 500 fault instead of silently originating
+  backend TLS that no status can report.
+- `wellKnownCACertificates: System` now projects the new first-class
+  `system://` backend TLS trust source rather than an unset CA path. `system://`
+  pins the built-in system/webpki trust anchors for every HTTP/H2/H3/gRPC
+  backend client, health probe, and DTLS/stream backend: unlike an unset CA it
+  deliberately does NOT fall back to the cluster-global
+  `FERRUM_TLS_CA_BUNDLE_PATH`, and it never inherits `FERRUM_TLS_NO_VERIFY`, so
+  a cluster-wide private CA can no longer silently replace the public roots a
+  policy explicitly requested. It partitions backend connection pools, is
+  reported in the TLS material inventory, is rejected on client cert/key fields,
+  is rejected with any path or query options, and is rejected alongside
+  `backend_tls_verify_server_cert: false` on every config surface that builds a
+  backend TLS identity — Proxy, Upstream, the `mesh_route_dispatch`
+  route-local destination override, and Istio `DestinationRule` TLS overlays.
+- A Gateway API route rule whose `backendRefs` mix `BackendTLSPolicy`-covered
+  and uncovered backends now fails closed with a field-specific sanitized
+  warning and an HTTP 500 fault abort. Ferrum folds a rule's backends into one
+  upstream carrying one backend scheme and one TLS identity, so the previous
+  behavior originated TLS — with the covered Service's SNI and trust anchors —
+  to Services no policy covered.
+- `BackendTLSPolicy` `targetRefs[].sectionName` is now resolved against the
+  target Service's real `spec.ports[].name`. A `sectionName` that names no port
+  reports `Accepted=False, reason=TargetNotFound` with a field-specific message
+  and fails to attach, instead of being reported `Accepted=True` on Service
+  existence alone while applying nowhere; it deliberately does not spill onto,
+  or fail closed, the Service's other valid ports.
+- `BackendTLSPolicy` now enforces the Gateway API GEP-1897 transport contract on
+  an explicitly modeled port transport. Translation retains a bounded,
+  deterministic per-Service port index recording each port's classified
+  transport, and a port is eligible only when its `spec.ports[].protocol` is
+  proven `TCP` (omitted counts as TCP, matching the Kubernetes default;
+  comparison is case-insensitive). `UDP`, `SCTP`, and any unrecognized protocol
+  value are all ineligible — the previous `udp: bool` predicate treated SCTP and
+  unrecognized values as "not UDP" and therefore silently admitted them to
+  backend TLS. A policy that explicitly attaches to an ineligible port reports
+  `Accepted=False, reason=Invalid` scoped to that port, leaving sibling TCP ports
+  alone; a Service-wide policy on a Service with no TCP port is rejected the same
+  way because it would govern nothing. Route traffic selecting a rejected policy
+  fails closed with the HTTP 500 fault rather than originating TLS over a non-TCP
+  transport or dropping to plaintext. A Service mixing TCP and non-TCP ports is
+  accepted with a warning in the `Accepted` condition message and takes effect
+  only on its TCP ports. A Service declaring more than 64 ports cannot have its
+  port transport proven and is rejected fail closed. Condition messages name the
+  transport from a fixed set and never echo the raw cluster-supplied `protocol`
+  string. A Service-wide policy
+  that is fully shadowed by section-specific winners now reports
+  `Accepted=False, reason=Conflicted` instead of claiming success while governing
+  no port; it remains accepted when it still wins at least one eligible port.
+- Health probes now fail closed on **any** explicitly configured backend TLS
+  material that cannot be used, in both verified and no-verify modes and on both
+  the HTTP and gRPC probe paths. Previously a configured CA was only enforced
+  when verification was enabled, and a configured mTLS client identity was never
+  enforced at all.
+  - A configured backend CA is the sole trust anchor, so an unloadable or
+    unparseable CA fails the probe instead of silently verifying against the
+    public webpki roots — reachable through a `BackendTLSPolicy`
+    `caCertificateRefs` Secret whose `k8s://…#ca.crt` source becomes unreadable
+    after translation accepted it. Multi-certificate CA bundles are parsed as
+    bundles, the ordinary shape of a Kubernetes `ca.crt`.
+  - A configured backend mTLS client certificate/key pair that cannot be loaded
+    or parsed now fails the probe rather than downgrading it to an anonymous
+    handshake, which measures something real requests never perform: a backend
+    that merely *prefers* client certificates answers the anonymous probe while
+    refusing proxy traffic, marking a target healthy that no request can use. A
+    half-configured pair (certificate without key, or key without certificate)
+    fails for the same reason instead of being ignored.
+  - Disabling verification is a statement about whether the peer certificate is
+    checked, not a licence to ignore material the operator named, so neither rule
+    is relaxed by `backend_tls_verify_server_cert: false` or
+    `FERRUM_TLS_NO_VERIFY=true`. Probe diagnostics carry the material's source
+    identifier and a failure class only, never certificate or key bytes.
+- Backend TLS SNI overrides (`backend_tls_sni` — the projection target of both
+  DestinationRule `trafficPolicy.tls.sni` and `BackendTLSPolicy`
+  `validation.hostname`) are now honored on the reqwest **HTTP/1.1** transport,
+  not only on the direct-H2, gRPC, and native-H3 pools. An HTTP/1.1-only TLS
+  backend — the ordinary `BackendTLSPolicy` case — previously returned a terminal
+  `502` with `gateway-error-reason: backend_tls_sni_requires_direct_h2`, and the
+  reqwest retry path and the H3→HTTP cross-protocol bridge rejected the override
+  outright. reqwest exposes no per-request server-name hook (its connector
+  derives the rustls server name from the request URL host), so the dial carries
+  the override in the URL **authority** while pinning the pooled client's
+  resolver to the selected target's already-resolved, already-egress-screened
+  address; because that resolver answers every name with the pinned address, the
+  override hostname is never itself resolved and the selected backend target
+  stays authoritative for where the socket connects. ALPN is restricted to
+  `http/1.1` on that client so HTTP/2 cannot derive `:authority` from the server
+  name — the backend reads the authority from the explicit `Host` header instead
+  — and both the pinned address and the force-H1 discriminator join the existing
+  SNI/CA/SAN/mTLS/verification components of the reqwest pool key, so an SNI dial
+  shares a client with neither a default h2-capable client nor another target's
+  pin. Retries, timeouts, and streaming bodies are unchanged because the dial
+  reuses the ordinary reqwest path, and the retry path rebuilds the dial against
+  the newly selected target so an LB rotation between attempts still dials the
+  rotated target. The `502` remains the fail-closed answer only where the dial
+  genuinely cannot be constructed (no resolved target address to pin, or a
+  backend URL whose authority does not carry the selected target host). On the
+  H3→HTTP cross-protocol bridge that decision is taken as a **local
+  dispatch-policy** check — before backend admission, before the
+  least-connections connection-start record, and before any client is fetched —
+  so an override that cannot be expressed terminates with the same sanitized
+  `502` and `gateway-error-reason`, halting the H3 request body and dialing no
+  backend, on the buffered and streaming legs alike. A stray override on a
+  plaintext backend has no server name to override and is ignored uniformly —
+  on the H3 bridge, on the HTTP/1.1 and HTTP/2 first attempt, and on the reqwest
+  retry path, which previously answered it with the terminal, non-retryable
+  `502` even though the first attempt dispatched it normally. The `dns_override`
+  literal-target guard on that retry path is likewise waived only for a dial
+  that actually carries the server name in its URL authority, never for a bare
+  `sni` field that will not be applied.
+- Config admission no longer rejects a backend TLS SNI override combined with
+  effective retry, a request-body-buffering plugin, or `pool_enable_http2:
+  false`, for proxy-level overrides and for DestinationRule / `BackendTLSPolicy`
+  per-port TLS overlays alike. Those rejections existed because only the
+  direct-H2 pool could carry a server name; the reqwest/HTTP-1.1 SNI dial above
+  serves all three, so `ferrum-edge validate` and the Admin API were refusing
+  Gateway API `BackendTLSPolicy` shapes that work. The request-body-buffering
+  admission screener that derived the third leg is retired with them. Nothing
+  that is genuinely unrepresentable becomes admissible: the runtime `502` /
+  `gateway-error-reason: backend_tls_sni_requires_direct_h2` still fires when a
+  dial cannot be constructed, and a `wss://` upgrade whose effective backend TLS
+  carries an `sni` value is still refused before dialing, because the WebSocket
+  transport derives both `Host` and the TLS server name from the request URI and
+  cannot apply a distinct server name at all.
+- Active HTTP health probes that carry a backend TLS SNI override are now
+  restricted to **HTTP/1.1**. The probe puts the server name in the URL
+  authority and the real target authority in an explicit `Host` header; HTTP/2
+  rebuilds `:authority` from the URI, so an h2-negotiated probe presented the
+  override to the backend instead of the target it was probing. The client's
+  ALPN advertises `http/1.1` alone, so an h2-capable backend cannot select h2 on
+  it. The same client keeps its resolver pinned to the real target, and a probe
+  whose dial cannot be pinned now fails closed in every case rather than
+  degrading to the unpinned minimal fallback client.
+- Active **HTTP and gRPC** health probes now verify against the same effective
+  backend TLS server name as request traffic. A backend covered by
+  `backend_tls_sni` (`BackendTLSPolicy` `validation.hostname` or a
+  DestinationRule `trafficPolicy.tls.sni`) presents a certificate for the
+  override, not for the target host, so probes previously failed name
+  verification and ejected a target that served requests normally. The probe
+  still dials only the already-resolved, egress-screened target candidate and
+  the backend still sees its own authority: the HTTP probe carries the override
+  in the probe URL while pinning that client's resolver to the real target host
+  and sending an explicit `Host` (so the override hostname is never resolved),
+  and the gRPC probe sets it as the TLS `domain_name` / rustls `ServerName`
+  while tonic's `origin` keeps the target authority. An HTTPS probe with an
+  override is built per target rather than per upstream, and fails closed when
+  the dial cannot be pinned. TCP and UDP probes are unaffected.
+- The authority-host rewrite used by cross-cluster HBONE dispatch and by the
+  backend TLS SNI dial now requires a **host boundary**: a source host of
+  `foo.example` no longer matches the authority `foo.example.evil`. Callers
+  construct exact authorities, so this is defence in depth; bracketed IPv6
+  behaviour is unchanged.
+- Istio `DestinationRule.spec.exportTo` is now honored, and DestinationRules
+  are resolved by Istio's lookup hierarchy — client namespace, then target
+  service namespace, then the configured `istio_root_namespace` (issues #2465
+  and #2469). Previously `exportTo` was discarded at translation, so a rule
+  declared namespace-local with `exportTo: ["."]` could be carried to and
+  applied by a client in another namespace, silently changing that client's
+  TLS/SNI/trust, subset, timeout, pool, load-balancing, locality, and outlier
+  behaviour; and the root namespace was dropped from slice construction while
+  every remaining match was layered in lexical `(namespace, name)` order, so
+  the alphabetically last rule won and renaming a namespace could reverse the
+  result. Visibility is now evaluated during slice construction — before
+  lookup selection and before a per-node slice is serialized — and the winning
+  tier is resolved per destination there and re-applied per upstream at
+  materialization, where visibility is defensively rechecked before lookup, so
+  `(namespace, name, normalized host spelling)` order is only ever an
+  intra-tier tiebreak. The two compose in that order: `exportTo` is absolute, so
+  root-namespace fallback cannot resurrect a rule a subscriber was never
+  allowed to see. Supported values are `*`, `.`, and explicit namespace names;
+  `~`, empty entries, non-RFC-1123 namespace names, lists over 64 entries, and
+  `*` combined with an explicit namespace are rejected fail-closed
+  (Kubernetes: `FerrumAccepted=False`/`Invalid`; native/file/xDS: the config is
+  refused and the previously accepted slice stays live), with diagnostics that
+  name the field and index and never echo the operator-supplied value. Focused
+  Rust integration and Istio conformance tests verify visibility, lookup tiers,
+  hostile-input rejection/redaction, and native/xDS carrier parity, and a
+  functional suite runs the shipped `ferrum-edge` binary against a real
+  multi-namespace destination to prove the decision ON THE WIRE: a rule
+  exported only to the destination's own namespace does not change a
+  subscriber in another namespace, the same rule exported mesh-wide from the
+  root namespace does, and a client-namespace rule wins outright over visible
+  service- and root-namespace rules. The `mesh-e2e-sidecar` kind/SPIRE
+  assertions for these two rows stay `live_deferred` because Trusted Cross
+  policy forbids changing that suite's executable and configuration surfaces
+  from this change.
+
+  The target-service tier is granted only on evidence of ownership: an
+  in-cluster Service confirmed by the service inventory or pinned by a
+  `.svc`-qualified host, a short host resolved in the rule's own namespace per
+  Istio, or an external host declared by exactly one visible `ServiceEntry` —
+  in which case that ServiceEntry's namespace is the owner. When ownership
+  cannot be established — an external host with no visible ServiceEntry, a
+  wildcard host, an unconfirmed two-label host, or a host claimed by visible
+  ServiceEntries in two different namespaces — the service tier is disabled
+  for that host and only the client and root namespaces may write policy for
+  it. Ferrum never falls back to treating a rule's own declaring namespace as
+  the owner, which would let a public DestinationRule from an unrelated
+  namespace nominate itself as the service tier for an external host it does
+  not own and reach the subscriber's materialized upstreams.
+
+  Per-destination lookups do not imply per-destination application: an
+  `Upstream` has one set of slots, and every field a rule projects (load
+  balancer and hash keys, backend TLS, outlier thresholds, connection-pool
+  caps, locality, subsets) is upstream-wide. An upstream whose targets span two
+  destinations that resolve to **different** winning rules is therefore refused
+  before any upstream is mutated — merging them would let `(namespace, name,
+  host)` sort order decide which service's policy governs the other. On a live
+  data plane the slice is rejected and the last good config is retained in
+  full; at startup the config fails to load with an error naming the upstream.
+  Single-destination upstreams, multi-port upstreams, and an upstream whose
+  second destination has no visible rule of its own are unaffected.
+
+  The process-global dedup map that keeps the "multiple DestinationRules target
+  one destination" warning from becoming per-reload × per-DP spam is now
+  bounded on both axes — at most 128 client-namespace keys, each holding at
+  most 32 distinct counts. The key is the subscriber's namespace, so without a
+  key budget a churning or hostile fleet of subscriber namespaces could grow it
+  without limit. Saturation degrades toward visibility (warn every time), never
+  toward silence, and namespaces admitted before saturation keep steady-state
+  dedup.
+
+- `virtual_service_cors_policies[].export_to` is now validated with the same
+  fail-closed boundary check `DestinationRule.exportTo` and, like ServiceEntry
+  and DestinationRule visibility, is evaluated through the one shared
+  `export_visibility_admits` helper. Malformed lists (`~`, empty entries,
+  non-RFC-1123 namespace names, over-long lists, `*` mixed with an explicit
+  namespace) on a native/file/xDS source are now a config rejection instead of
+  being interpreted at evaluation time. Visibility is enforced at the SAME
+  three points a DestinationRule's is — CP slice narrowing, the xDS ECDS
+  carrier fold on the data plane, and outbound `cors` plugin synthesis on the
+  data plane — so a producer that bypasses slice admission cannot inject
+  another namespace's CORS behaviour onto a workload's outbound routes.
+
+- The mesh root namespace (`meshConfig.rootNamespace`) now rides `MeshSlice`
+  (native field plus a dedicated `IstioRootNamespaceCarrier` ECDS carrier), so
+  the data plane can distinguish an admitted root-tier DestinationRule from one
+  declared in an arbitrary namespace and **refuse** the latter at
+  materialization. This closes the reverse-translated xDS path, where
+  carrier-recovered rules never pass slice admission. Missing, empty, or
+  whitespace-only root provenance fails closed: Unscoped rules are refused,
+  independently provable client/service tiers still apply, and a legitimate
+  root-tier default is unavailable rather than guessed. Blank root carriers are
+  ignored so they cannot clear trustworthy provenance. Non-blank values are
+  now validated as lowercase RFC 1123 namespace labels at both the native/file
+  config boundary and the xDS ACK boundary; a malformed xDS value is NACKed
+  while the last accepted slice remains live, and diagnostics never echo it.
+
+- That materialization-time refusal now resolves the matched destination host's
+  owning namespace with the SAME shared helper, in the same precedence order,
+  that slice admission uses — `.svc`-qualified syntax, then an
+  inventory-confirmed two-label `name.namespace`, then the declaring
+  `ServiceEntry`. When that owner is resolved it is authoritative for the
+  service tier; an upstream container namespace cannot widen it. Upstream
+  namespace is retained only as a narrow fallback when host ownership cannot be
+  resolved (for example a ServiceEntry-derived EgressGateway upstream whose
+  external host is owned by the visible ServiceEntry). This prevents an
+  operator-authored or multi-target upstream in an unrelated namespace from
+  manufacturing service-tier policy for a host owned elsewhere.
+
+- DestinationRule lookup-tier arbitration on the data plane is now per
+  destination HOST rather than per upstream, matching Istio's per-host
+  resolution. An upstream whose targets span two services previously collapsed
+  the two independent lookups into one upstream-wide minimum, silently skipping
+  the only rule the second host had.
+
+- xDS ACK-time carrier validation now covers every `exportTo`-bearing carrier
+  family, not just the reserved DestinationRule shape. A LEGACY (non-reserved
+  name) DestinationRule carrier — recognized by its inner `type_url`, so
+  genuinely unrelated ECDS extension configs are untouched — gets the same
+  fail-closed structural and `export_to` validation the reserved shape gets, and
+  the `VirtualServiceCorsPoliciesCarrier` entries' `export_to` lists are
+  validated at the ACK boundary too. Previously both were ACKed and normalized,
+  and a malformed value only surfaced later as a policy that was silently
+  dropped or matched nothing; now the response NACKs, the ECDS accumulator rolls
+  back, and the last accepted slice keeps serving. Rejection diagnostics name
+  the carrier field and the offending index, are capped at eight per rejected
+  carrier, and never echo the carrier-supplied value.
+
+- `exportTo` entries on the DestinationRule, ServiceEntry, and
+  VirtualService-CORS xDS carriers are canonicalized (trimmed) at decode. The
+  shared visibility evaluator deliberately never reinterprets padded input and
+  ACK-time validation checks a trimmed copy, so an un-normalized `[" beta "]`
+  was previously ACKed and then matched nothing.
 - **BREAKING (`a2a_gateway`)**: `endpoint.grpc_services` now defaults to the
   canonical A2A 0.3 service `a2a.v1.A2AService` (package `a2a.v1`, from
   `a2aproject/A2A` at tag `v0.3.0`) instead of A2A 1.0's
@@ -481,6 +872,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `ai_federation` config admission: a root `streaming` key is now the supported
+  streaming opt-in and must be an object (issue #3298). `stream`,
+  `streaming_enabled`, and `enable_streaming` are still rejected at every scope,
+  and a per-provider `streaming` key is rejected with a scope-specific
+  diagnostic. Enabling `streaming` makes the plugin declare a backend-boundary
+  header policy plus request header/destination mutation AND a request-body
+  transform (the provider-visible `model` rewrite), so such an instance can
+  no longer be composed with `request_deduplication` or `response_caching` on the
+  same proxy; instances without the block are unaffected. The `streaming` block
+  accepts `enabled`, `max_event_bytes`, and `read_timeout_seconds` and rejects
+  every other key. Those refusals (and the `hmac_auth` request-body-transformer
+  refusal) are now enforced at candidate/admin-write admission as well as at
+  runtime plugin-cache construction: `ai_federation` joined the
+  security-composition candidate inventory, so an admin write can no longer
+  persist a chain that only the runtime build would reject. A streaming instance
+  additionally declares `enforces_finalized_request_policy()`, because its
+  final request-body hook can refuse the backend-visible representation.
+- Native gRPC trailers-only mapping for Ferrum-authored HTTP 404 rejects
+  (route miss, GRPCRoute `reject_unmatched`) now emits `grpc-status`
+  `UNIMPLEMENTED` (12) instead of `NOT_FOUND` (5), matching the official gRPC
+  HTTP↔status table and Gateway API `GRPCExactMethodMatching` (issue #3272).
+- **Breaking (native/file/xDS mesh sources only):** an omitted or explicitly
+  empty `destination_rules[].export_to` is now **namespace-local**, matching the
+  fail-closed-by-omission convention `ServiceEntry.export_to` and
+  `virtual_service_cors_policies[].export_to` already use. Add
+  `export_to: ["*"]` to any native, file, or carrier-authored DestinationRule
+  that must stay visible outside its own namespace. Kubernetes translation is
+  unaffected: an omitted or empty `spec.exportTo` is materialized as an explicit
+  `["*"]`, preserving Istio's public default.
+- DestinationRules declared outside the client namespace, the target service's
+  namespace, and the configured `istio_root_namespace` are no longer admitted
+  to a subscriber's slice at all, and DestinationRules in the configured root
+  namespace are now admitted (they previously were not).
 - Reqwest backend TLS clients built via `use_preconfigured_tls` /
   `BackendTlsConfigBuilder::build_rustls_for_reqwest` now advertise ALPN
   `[h2, http/1.1]` unless the proxy forces HTTP/1.1 (`h2UpgradePolicy:

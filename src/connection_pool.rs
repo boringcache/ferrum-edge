@@ -200,7 +200,9 @@ impl PoolManager for ReqwestPoolManager {
         // byte-identical. Empty when the proxy has no `upstream_subset`.
         append_optional_pool_key_component(buf, proxy.upstream_subset.as_deref());
         buf.push('|');
-        let verify = proxy.resolved_tls.verify_server_cert && !self.global_env_config.tls_no_verify;
+        let verify = proxy.resolved_tls.verify_server_cert
+            && (!self.global_env_config.tls_no_verify
+                || !proxy.resolved_tls.allows_global_no_verify());
         let effective_client_cert_path = proxy.resolved_tls.client_cert_path.as_deref().or(self
             .global_env_config
             .backend_tls_client_cert_path

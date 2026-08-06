@@ -1757,13 +1757,21 @@ pub mod grpc_status {
 
 /// Map an HTTP rejection status to the closest gRPC status code for
 /// gateway-generated trailers-only errors.
+///
+/// HTTP 404 maps to [`grpc_status::UNIMPLEMENTED`], matching the official
+/// gRPC HTTP↔status table
+/// (<https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md>)
+/// and Gateway API `GRPCExactMethodMatching` (unmatched methods must surface
+/// `codes.Unimplemented`, not `NotFound`). Route misses, GRPCRoute
+/// `reject_unmatched`, and other Ferrum-authored 404 refusals therefore stay
+/// client-parseable as "this method is not routed/implemented here."
 pub(crate) fn http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     match status {
         StatusCode::BAD_REQUEST => grpc_status::INVALID_ARGUMENT,
         StatusCode::METHOD_NOT_ALLOWED => grpc_status::UNIMPLEMENTED,
         StatusCode::UNAUTHORIZED => grpc_status::UNAUTHENTICATED,
         StatusCode::FORBIDDEN => grpc_status::PERMISSION_DENIED,
-        StatusCode::NOT_FOUND => grpc_status::NOT_FOUND,
+        StatusCode::NOT_FOUND => grpc_status::UNIMPLEMENTED,
         StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => grpc_status::DEADLINE_EXCEEDED,
         StatusCode::CONFLICT => grpc_status::ABORTED,
         StatusCode::PRECONDITION_FAILED => grpc_status::FAILED_PRECONDITION,

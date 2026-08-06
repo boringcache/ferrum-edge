@@ -54,6 +54,15 @@
 //!   ready child is proof that the child, not a squatter, owns the proxy port.
 //!   The child holds that socket for its whole lifetime, so the proof stays
 //!   valid while it runs.
+//! - That ownership claim requires an **exclusive** proxy bind. Production
+//!   defaults `FERRUM_ACCEPT_THREADS` to `available_parallelism()`, which
+//!   enables `SO_REUSEPORT` whenever the value is greater than one. Two
+//!   parallel harness children can then bind the same ephemeral proxy port
+//!   after the classic bind-drop-rebind race, keep distinct admin ports (so
+//!   identity still succeeds), and leave client traffic load-balanced onto a
+//!   foreign gateway that returns 404 for this test's routes. The harness
+//!   therefore pins `FERRUM_ACCEPT_THREADS=1` unless the caller overrides it,
+//!   so a colliding bind fails closed and the spawn retry picks a fresh port.
 //!
 //! The spawn wait also polls `Child::try_wait`, so a child that dies after a
 //! partial bind fails fast instead of letting the retry loop burn the full
@@ -715,6 +724,30 @@ impl TestGatewayBuilder {
         Err(last_err.unwrap_or_else(|| "spawn failed with no recorded error".into()))
     }
 
+    /// Spawn once and classify a failure, instead of retrying every error.
+    ///
+    /// `spawn`'s blanket `max_attempts` loop is right for suites that only care
+    /// that a gateway came up, but it also silently re-rolls deterministic
+    /// failures — a rejected config, a bad JWT secret, a parse error, a child
+    /// that died on its own fault — and reports them, three attempts later, as
+    /// "gateway failed to start". A caller that needs a flake budget bounded to
+    /// the one race that a fresh port set can fix uses this instead: it makes
+    /// exactly one attempt and hands back
+    /// [`GatewaySpawnFailure::listener_addr_in_use`], which is `true` only when
+    /// THIS child reported a listener bind that failed because the address was
+    /// already in use.
+    pub async fn spawn_classified(mut self) -> Result<TestGateway, GatewaySpawnFailure> {
+        if self.auto_build
+            && let Err(error) = ensure_gateway_built()
+        {
+            return GatewaySpawnFailure::from_detail(error.to_string());
+        }
+        match self.try_spawn().await {
+            Ok(gateway) => Ok(gateway),
+            Err(error) => GatewaySpawnFailure::from_detail(error.to_string()),
+        }
+    }
+
     /// Spawn the gateway and assert it exits non-zero within `timeout`.
     ///
     /// This is useful for conflict-detection / missing-required-env tests where
@@ -990,6 +1023,90 @@ impl TestGatewayBuilder {
     }
 }
 
+/// A classified `TestGateway` spawn failure.
+///
+/// The classification exists so a suite can bound its retries to the ONE
+/// failure a fresh port set can fix. Anything else — a rejected config, a JWT
+/// or auth failure, a parse error, a missing binary, a readiness timeout, a
+/// child that died on its own fault — must surface immediately with evidence
+/// rather than being re-rolled until the attempt budget runs out.
+#[derive(Debug)]
+pub struct GatewaySpawnFailure {
+    /// `true` only when the spawned child itself reported a listener bind that
+    /// failed because the address was already in use.
+    pub listener_addr_in_use: bool,
+    /// Harness observation plus the child's captured (secret-scrubbed) output.
+    pub detail: String,
+}
+
+impl GatewaySpawnFailure {
+    fn from_detail<T>(detail: String) -> Result<T, Self> {
+        Err(Self {
+            listener_addr_in_use: captured_output_reports_listener_addr_in_use(&detail),
+            detail,
+        })
+    }
+}
+
+impl std::fmt::Display for GatewaySpawnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "listener_addr_in_use={}: {}",
+            self.listener_addr_in_use, self.detail
+        )
+    }
+}
+
+/// The gateway's own listener-failure messages. A record must carry one of
+/// these AND an address-in-use indication to be classified retryable.
+const LISTENER_BIND_MARKERS: [&str; 2] =
+    ["Gateway listener task", "Stream listener(s) failed to bind"];
+
+/// Spellings of `std::io::ErrorKind::AddrInUse`. The gateway interpolates the
+/// OS error string (Linux and macOS both render "Address already in use"), and
+/// a `std::io::Error` constructed from the kind alone renders "address in use".
+const ADDR_IN_USE_MARKERS: [&str; 2] = ["address already in use", "address in use"];
+
+/// Decide whether captured gateway output proves a listener bind lost an
+/// address race.
+///
+/// Deliberately **structural**, not a substring scan of the whole capture. The
+/// gateway's stdout is the JSON tracing stream, so each line is parsed and only
+/// the record's own message (`fields.message`, or a flattened root `message`)
+/// is examined. Config values, request bodies, header names, and every other
+/// operator- or fixture-supplied string live in different fields and can never
+/// satisfy this, so a test whose config happens to contain the phrase is not
+/// misclassified as a port race. Non-JSON lines (the pre-subscriber bootstrap
+/// error path) are matched as a whole line but still require BOTH a
+/// gateway-authored listener marker and an address-in-use marker.
+pub fn captured_output_reports_listener_addr_in_use(captured: &str) -> bool {
+    captured.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() {
+            return false;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(record) => {
+                let message = record
+                    .get("fields")
+                    .and_then(|fields| fields.get("message"))
+                    .or_else(|| record.get("message"))
+                    .and_then(serde_json::Value::as_str);
+                message.is_some_and(message_reports_listener_addr_in_use)
+            }
+            Err(_) => message_reports_listener_addr_in_use(line),
+        }
+    })
+}
+
+fn message_reports_listener_addr_in_use(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    let names_listener = LISTENER_BIND_MARKERS.iter().any(|m| message.contains(m));
+    let names_addr_in_use = ADDR_IN_USE_MARKERS.iter().any(|m| lowered.contains(m));
+    names_listener && names_addr_in_use
+}
+
 #[derive(Debug)]
 pub struct FailedGatewayStart {
     pub status: Option<ExitStatus>,
@@ -1035,6 +1152,7 @@ const SCRUB_DEFAULTS: &[&str] = &[
     "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP",
     "FERRUM_LOG_LEVEL",
     "FERRUM_POOL_WARMUP_ENABLED",
+    "FERRUM_ACCEPT_THREADS",
     "FERRUM_BASIC_AUTH_HMAC_SECRET",
     "FERRUM_NAMESPACE",
     "FERRUM_DB_TYPE",
@@ -1762,5 +1880,46 @@ mod port_allocation_tests {
             .env("FERRUM_PROXY_HTTPS_PORT", "3443");
         let pinned = collect_builder_pinned_ports(&builder);
         assert_eq!(pinned, HashSet::from([3443, 7443, 9443]));
+    }
+
+    /// Deterministic classification: only the gateway's own listener-bind
+    /// failure counts as a retryable port race.
+    #[test]
+    fn listener_addr_in_use_classification_is_structural() {
+        // Real shape: a JSON tracing record whose `fields.message` is the
+        // gateway's listener-task failure carrying the OS error.
+        let record = r#"{"timestamp":"2026-08-05T00:00:00Z","level":"ERROR","fields":{"message":"Gateway listener task 'proxy_https' failed: Address already in use (os error 98)"},"target":"ferrum_edge::modes::file"}"#;
+        assert!(captured_output_reports_listener_addr_in_use(record));
+
+        // Stream-listener bind failures are the same class.
+        let stream = r#"{"level":"ERROR","fields":{"message":"Stream listener(s) failed to bind:\n  tcp 9000: Address already in use (os error 48)"}}"#;
+        assert!(captured_output_reports_listener_addr_in_use(stream));
+
+        // A DIFFERENT deterministic failure must not be retried.
+        let config_error = r#"{"level":"ERROR","fields":{"message":"Configuration validation failed: 1 invalid upstream reference(s) found"}}"#;
+        assert!(!captured_output_reports_listener_addr_in_use(config_error));
+
+        // A listener message without the address-in-use cause is not a port race.
+        let other_bind = r#"{"level":"ERROR","fields":{"message":"Gateway listener task 'proxy_https' failed: Permission denied (os error 13)"}}"#;
+        assert!(!captured_output_reports_listener_addr_in_use(other_bind));
+
+        // The phrase appearing in operator-controlled DATA must not classify:
+        // it is not the record's own message.
+        let data_only = r#"{"level":"INFO","fields":{"message":"Configuration loaded"},"config":"Gateway listener task Address already in use"}"#;
+        assert!(!captured_output_reports_listener_addr_in_use(data_only));
+
+        // ...and neither must a body/echo field that merely quotes it.
+        let echoed = r#"{"level":"INFO","fields":{"message":"proxy response","body":"Gateway listener task 'x' failed: Address already in use"}}"#;
+        assert!(!captured_output_reports_listener_addr_in_use(echoed));
+
+        // The pre-subscriber bootstrap path is plain text, and still needs BOTH
+        // markers on the same line.
+        assert!(captured_output_reports_listener_addr_in_use(
+            "Gateway listener task failed: Address already in use (os error 98)"
+        ));
+        assert!(!captured_output_reports_listener_addr_in_use(
+            "Address already in use"
+        ));
+        assert!(!captured_output_reports_listener_addr_in_use(""));
     }
 }
