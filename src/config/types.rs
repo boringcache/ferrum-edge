@@ -2680,12 +2680,18 @@ pub struct GatewayConfig {
     /// source URI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontend_tls_source_namespace: Option<String>,
-    /// Gateway-managed frontend TLS material indexed by owning Gateway
-    /// namespace. Multi-namespace CPs keep all Gateway TLS entries here until
-    /// the per-DP namespace filter projects the matching entry into
-    /// `frontend_tls_*`.
+    /// Every Gateway-managed frontend TLS certificate, keyed by owning
+    /// **listener** identity (issues #3267 / #3268).
+    ///
+    /// This is deliberately NOT a per-namespace singleton: one listener may
+    /// carry several `certificateRefs`, and several Gateways in one namespace
+    /// may each own their own certificate. A multi-namespace CP keeps every
+    /// namespace's entries here; the per-DP namespace filter retains only the
+    /// subscribing namespace's entries and projects the deterministic default
+    /// one into `frontend_tls_*` (which stays the fallback certificate served
+    /// when a ClientHello carries no usable SNI).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub frontend_tls_namespace_sources: Vec<FrontendTlsNamespaceSource>,
+    pub frontend_tls_certificate_sources: Vec<FrontendTlsCertificateSource>,
     /// Gateway-consumable mesh trust material delivered by CPs to DPs.
     ///
     /// This mirrors the mesh config trust-bundle shape, but sits at the
@@ -2801,13 +2807,64 @@ impl K8sMeshOverlay {
     }
 }
 
+/// One Gateway-listener-owned frontend TLS certificate.
+///
+/// Identity is `(namespace, gateway, listener, cert_path)`. The owning
+/// **Gateway** namespace is what CP/DP tenancy filters on — the Secret itself
+/// may live in another namespace when a ReferenceGrant authorizes it, so the
+/// `k8s://secret-ns/...` source URI must never be read as ownership.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct FrontendTlsNamespaceSource {
+pub struct FrontendTlsCertificateSource {
+    /// Owning Gateway namespace.
     pub namespace: String,
+    /// Owning Gateway name.
+    #[serde(default)]
+    pub gateway: String,
+    /// Owning listener name.
+    #[serde(default)]
+    pub listener: String,
+    /// The listener `hostname`, ASCII-lowercased. `None` is a catch-all
+    /// listener, which contributes SNI names from the certificate itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     pub cert_path: String,
     pub key_path: String,
+    /// Whether this is the deterministic fallback certificate for its
+    /// namespace — the one served when a ClientHello carries no SNI, or an SNI
+    /// no certificate covers.
+    #[serde(default)]
+    pub default_certificate: bool,
 }
+
+impl FrontendTlsCertificateSource {
+    /// `namespace/gateway/listener` — public Kubernetes metadata, safe to put
+    /// in diagnostics. Never derived from certificate or key material.
+    pub fn listener_identity(&self) -> String {
+        format!("{}/{}/{}", self.namespace, self.gateway, self.listener)
+    }
+
+    /// Stable ordering / dedup key. `cert_path` participates because one
+    /// listener legitimately serves several certificates (for example an RSA
+    /// and an ECDSA leaf for the same hostname).
+    pub fn identity_key(&self) -> (&str, &str, &str, &str, &str) {
+        (
+            self.namespace.as_str(),
+            self.gateway.as_str(),
+            self.listener.as_str(),
+            self.cert_path.as_str(),
+            self.key_path.as_str(),
+        )
+    }
+}
+
+/// Upper bound on Gateway-delivered frontend TLS certificates in one snapshot.
+///
+/// The data plane materializes every entry into a resident rustls
+/// `CertifiedKey` and an SNI index, so the set has to be bounded by config
+/// admission rather than by cluster size. Translation drops the excess with a
+/// field-specific warning and leaves those listeners unserved (fail closed).
+pub const MAX_FRONTEND_TLS_CERTIFICATE_SOURCES: usize = 256;
 
 /// The current config schema version. Increment this when adding config migrations.
 pub const CURRENT_CONFIG_VERSION: &str = "1";
@@ -3846,6 +3903,74 @@ impl GatewayConfig {
         }
     }
 
+    /// Project Gateway-delivered frontend TLS onto one namespace's view.
+    ///
+    /// Called by BOTH the CP's per-subscriber filter and the DP's
+    /// defense-in-depth filter, so a data plane can never observe another
+    /// namespace's certificate no matter which side runs first. Retains every
+    /// certificate this namespace owns — a namespace may legitimately own many
+    /// (#3267 / #3268) — re-marks exactly one of them as the fallback, and
+    /// projects that one into the legacy `frontend_tls_*` fields.
+    ///
+    /// Ownership is the *Gateway's* namespace, never the Secret's: a
+    /// ReferenceGrant may authorize a Secret from elsewhere, so reading tenancy
+    /// off a `k8s://secret-ns/...` source URI would leak across namespaces.
+    ///
+    /// Returns how many entries this namespace was not entitled to see.
+    pub fn filter_frontend_tls_to_namespace(&mut self, namespace: &str) -> usize {
+        let before = self.frontend_tls_certificate_sources.len();
+        self.frontend_tls_certificate_sources
+            .retain(|source| source.namespace == namespace);
+        let mut removed = before - self.frontend_tls_certificate_sources.len();
+
+        // Exactly one fallback within the retained set. The CP's marker was
+        // chosen over every namespace, so re-deriving it here is what keeps a
+        // DP that filtered a multi-namespace snapshot from ending up with
+        // zero (or two) fallback certificates.
+        let default_index = self
+            .frontend_tls_certificate_sources
+            .iter()
+            .position(|source| source.default_certificate)
+            .or_else(|| {
+                self.frontend_tls_certificate_sources
+                    .iter()
+                    .position(|source| source.hostname.is_none())
+            })
+            .or(if self.frontend_tls_certificate_sources.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
+        for (index, source) in self.frontend_tls_certificate_sources.iter_mut().enumerate() {
+            source.default_certificate = Some(index) == default_index;
+        }
+
+        if let Some(default_source) = default_index
+            .and_then(|index| self.frontend_tls_certificate_sources.get(index))
+            .cloned()
+        {
+            self.frontend_tls_cert_path = Some(default_source.cert_path);
+            self.frontend_tls_key_path = Some(default_source.key_path);
+            self.frontend_tls_source_namespace = Some(default_source.namespace);
+            return removed;
+        }
+
+        // No Gateway certificate for this namespace. Material owned by another
+        // namespace is withdrawn; operator/env material (no owning namespace)
+        // is left alone.
+        if self
+            .frontend_tls_source_namespace
+            .as_deref()
+            .is_some_and(|source_namespace| source_namespace != namespace)
+        {
+            self.frontend_tls_cert_path = None;
+            self.frontend_tls_key_path = None;
+            self.frontend_tls_source_namespace = None;
+            removed += 1;
+        }
+        removed
+    }
+
     /// Normalize all proxy host entries to lowercase.
     pub fn normalize_hosts(&mut self) {
         for proxy in &mut self.proxies {
@@ -3856,10 +3981,16 @@ impl GatewayConfig {
     /// Normalize all resource fields that have canonical in-memory forms and
     /// refresh derived runtime projections skipped by serde.
     pub fn normalize_fields(&mut self) {
-        self.frontend_tls_namespace_sources
-            .sort_by(|left, right| left.namespace.cmp(&right.namespace));
-        self.frontend_tls_namespace_sources
-            .dedup_by(|left, right| left.namespace == right.namespace);
+        // Certificate sources are keyed by owning listener, NOT by namespace:
+        // one listener may serve several certificateRefs and one namespace may
+        // hold several independently owned Gateways (#3267 / #3268). Deduping
+        // by namespace here would silently collapse them back into a singleton.
+        self.frontend_tls_certificate_sources
+            .sort_by(|left, right| left.identity_key().cmp(&right.identity_key()));
+        self.frontend_tls_certificate_sources
+            .dedup_by(|left, right| left.identity_key() == right.identity_key());
+        self.frontend_tls_certificate_sources
+            .truncate(MAX_FRONTEND_TLS_CERTIFICATE_SOURCES);
         self.normalize_hosts();
         for consumer in &mut self.consumers {
             consumer.normalize_fields();

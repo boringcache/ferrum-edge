@@ -74,7 +74,7 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 |---|---:|---|
 | `GatewayClass` | Yes | Watched and status-patched for `ferrum.io/gateway-controller` |
 | `Gateway` HTTP listeners | Yes | Translated into Ferrum HTTP listener materialization; listener status and `Programmed` are patched |
-| `Gateway` HTTPS listeners | Yes, as part of `GATEWAY-HTTP` | Terminating listeners materialize `certificateRefs` into namespace-scoped DP frontend TLS sources and the DP rejects snapshots if the referenced serving cert/key cannot be loaded |
+| `Gateway` HTTPS listeners | Yes, as part of `GATEWAY-HTTP` | Terminating listeners materialize every authorized `certificateRefs` entry into per-listener DP frontend TLS sources; the DP serves them all from one SNI-aware resolver (several refs per listener and several Gateways per namespace are both supported) and rejects snapshots if any referenced serving cert/key cannot be loaded. Two listeners claiming one hostname with different certificates fail the loser closed as `Conflicted=True`/`HostnameConflict`. See [frontend_tls.md](frontend_tls.md#gateway-api-multi-certificate-serving-sni). |
 | `HTTPRoute` hostname, path, method, header, and query matching | Yes | Translated into proxies plus ordered `mesh_route_dispatch` rules where predicate matching is needed |
 | `HTTPRoute` `RequestHeaderModifier` | Yes | Route-level set/add/remove header filters are projected into request-transform rules and verified by black-box backend echo |
 | `HTTPRoute` `RequestRedirect` | Yes | Redirect filters materialize action-only dispatch rules with status, hostname, scheme, port, and path replacement support |

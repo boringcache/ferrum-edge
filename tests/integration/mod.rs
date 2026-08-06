@@ -51,6 +51,7 @@ mod file_mode_reload_observability_tests;
 mod frontend_tls_live_reload_tests;
 mod gateway_allowed_routes_selector_tests;
 mod gateway_hbone_pool_tests;
+mod gateway_multi_cert_sni_tests;
 mod gateway_svid_identity_tests;
 mod graceful_shutdown_tests;
 mod grpc_proxy_tests;

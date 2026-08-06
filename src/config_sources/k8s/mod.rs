@@ -14,6 +14,15 @@ pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
     namespace_selector_matches, parse_reference_grant_permissions,
 };
+// Shared with the Gateway status writer (`crate::k8s_controller::status`) so
+// the translator's "which listener owns this SNI hostname" decision and the
+// status writer's `Conflicted`/`ResolvedRefs` reporting are one predicate
+// (#3267 / #3268). A listener the translator withdrew must not be reported as
+// serving, and one it kept must not be reported as conflicted.
+pub(crate) use gateway_api::{
+    FrontendTlsHostnameClaim, frontend_tls_hostname_conflict_losers, normalize_gateway_hostname,
+    parse_k8s_timestamp, sort_frontend_tls_hostname_claims,
+};
 // Re-exported for the integration suite's at-cap/over-cap L4 candidate and
 // projection assertions (`tests/integration/mesh_l7_routing_tests.rs`), which
 // must observe the same constants the translator enforces rather than
@@ -527,6 +536,11 @@ pub(crate) struct K8sAccumulator {
     pub(crate) gateway_api_route_proxy_kinds: HashMap<NamespacedResourceId, String>,
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
+    /// Terminating-TLS listeners whose `certificateRefs` all resolved, awaiting
+    /// snapshot-wide finalization in `finish()`. Collision winners, the default
+    /// certificate, and the snapshot cap are decided over the whole set so the
+    /// result never depends on informer/list order (#3267 / #3268).
+    pub(crate) gateway_api_frontend_tls_listeners: Vec<gateway_api::PendingFrontendTlsListener>,
     gateway_api_gateway_classes: HashMap<String, bool>,
     pub(crate) namespace_labels: HashMap<String, HashMap<String, String>>,
     /// Flat copy of the Gateway API route conflicts computed over the
@@ -560,6 +574,7 @@ impl K8sAccumulator {
             gateway_api_conflict_losers: HashMap::new(),
             gateway_api_route_proxy_kinds: HashMap::new(),
             gateway_api_listener_policies: HashMap::new(),
+            gateway_api_frontend_tls_listeners: Vec::new(),
             gateway_api_gateway_classes: HashMap::new(),
             namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
@@ -907,6 +922,7 @@ fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumu
             let _ = gateway_api::collect_gateway_listener_policy(acc, object);
         }
     }
+    gateway_api::finalize_frontend_tls_certificates(acc);
 }
 
 /// Build the Gateway API status-context accumulator once per reconcile/plan.
@@ -995,6 +1011,12 @@ where
             gateway_api::collect_gateway_listener_policy(&mut acc, object)?;
         }
     }
+    // Resolve Gateway frontend TLS over the WHOLE snapshot before any route is
+    // translated. A hostname-collision loser withdraws its listener's route
+    // traffic, so that decision has to be final before route materialization
+    // consults `routes_materializable` — and it must not depend on whether a
+    // route object happened to be listed before its Gateway.
+    gateway_api::finalize_frontend_tls_certificates(&mut acc);
 
     let gateway_api_route_conflicts =
         gateway_api::route_conflicts(included_objects.iter().copied(), &acc.options, Some(&acc));
