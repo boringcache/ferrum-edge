@@ -19304,6 +19304,17 @@ pub(crate) async fn run_after_proxy_hooks(
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
 ) -> Option<AfterProxyReject> {
+    // ORIGIN response-header boundary. Runs before every other response hook so
+    // a plugin that routed this request to a third-party destination can bound
+    // what that destination contributed WITHOUT discarding the gateway
+    // decorations (CORS at 100, tracing, correlation, rate-limit headers) that
+    // the `after_proxy` chain adds afterwards. Synchronous, non-rejecting, and
+    // idempotent by contract.
+    for plugin in plugins {
+        if plugin.enforces_origin_response_header_policy(ctx) {
+            plugin.enforce_origin_response_header_policy(ctx, response_status, response_headers);
+        }
+    }
     // Establish backend provenance before the first trusted response hook can
     // mutate the map. A later deadline or representation-error replacement
     // retains only mutations from hooks that completed, never backend fields

@@ -2933,7 +2933,24 @@ pub struct RequestContext {
     /// Used by mesh L7 route dispatch so route-local policy follows the
     /// matched predicate even when the hot router selected a later fallback
     /// proxy for the same public path.
+    ///
+    /// On the reqwest dispatch path this is the vendored `RequestBuilder::timeout()`
+    /// budget, which reqwest applies from connect through **response body
+    /// completion** — it is a whole-exchange bound, not a per-chunk inactivity
+    /// bound. `Some(0)` deliberately means "no gateway-imposed whole-exchange
+    /// bound" (dispatch only installs a timeout when the effective value is
+    /// non-zero), which is how a long-running streamed generation opts out of the
+    /// placeholder proxy's default.
     pub route_override_backend_read_timeout_ms: Option<u64>,
+    /// Plugin-set override for the proxy's backend connect timeout.
+    ///
+    /// Counterpart to [`Self::route_override_backend_read_timeout_ms`] for
+    /// plugins that repoint a request at a direct third-party destination whose
+    /// operator-configured connect budget differs from the placeholder proxy's.
+    /// Without it, a direct provider claim silently inherits the matched proxy's
+    /// `backend_connect_timeout_ms` and the plugin's own configured connect
+    /// budget is never applied.
+    pub route_override_backend_connect_timeout_ms: Option<u64>,
     /// Plugin-set override for the proxy's retry policy. Outer `None` means
     /// no override; `Some(None)` intentionally clears the selected proxy's
     /// retry policy for this route.
@@ -3231,6 +3248,7 @@ impl RequestContext {
             route_override_backend_port: None,
             route_override_resolved_tls: None,
             route_override_backend_read_timeout_ms: None,
+            route_override_backend_connect_timeout_ms: None,
             route_override_retry: None,
             route_override_request_transform: None,
             route_override_response_transform: None,
@@ -4352,6 +4370,8 @@ impl RequestContext {
             route_override_backend_port: self.route_override_backend_port,
             route_override_resolved_tls: self.route_override_resolved_tls.clone(),
             route_override_backend_read_timeout_ms: self.route_override_backend_read_timeout_ms,
+            route_override_backend_connect_timeout_ms: self
+                .route_override_backend_connect_timeout_ms,
             route_override_retry: self.route_override_retry.clone(),
             route_override_request_transform: self.route_override_request_transform.clone(),
             route_override_response_transform: self.route_override_response_transform.clone(),
@@ -4636,6 +4656,7 @@ impl RequestContext {
             || self.route_override_backend_port.is_some()
             || self.route_override_resolved_tls.is_some()
             || self.route_override_backend_read_timeout_ms.is_some()
+            || self.route_override_backend_connect_timeout_ms.is_some()
             || self.route_override_retry.is_some()
     }
 
@@ -4794,6 +4815,9 @@ impl RequestContext {
         let backend_read_timeout_changed = self
             .route_override_backend_read_timeout_ms
             .is_some_and(|timeout| timeout != proxy.backend_read_timeout_ms);
+        let backend_connect_timeout_changed = self
+            .route_override_backend_connect_timeout_ms
+            .is_some_and(|timeout| timeout != proxy.backend_connect_timeout_ms);
         let retry_changed = self
             .route_override_retry
             .as_ref()
@@ -4820,6 +4844,7 @@ impl RequestContext {
             && !dispatch_port_overrides_changed
             && !dispatch_port_override_fallback_changed
             && !backend_read_timeout_changed
+            && !backend_connect_timeout_changed
             && !retry_changed
             && !preserve_host_changed
             && !strip_listen_path_changed
@@ -4862,6 +4887,9 @@ impl RequestContext {
         }
         if let Some(timeout) = self.route_override_backend_read_timeout_ms {
             overridden.backend_read_timeout_ms = timeout;
+        }
+        if let Some(timeout) = self.route_override_backend_connect_timeout_ms {
+            overridden.backend_connect_timeout_ms = timeout;
         }
         if let Some(retry) = &self.route_override_retry {
             overridden.retry = retry.clone();
@@ -8569,6 +8597,36 @@ pub trait Plugin: Send + Sync {
     /// must not depend on later hooks presenting the origin status to the
     /// client (for example cache invalidation) override this.
     fn observe_origin_http_response_status(&self, _ctx: &mut RequestContext, _status: u16) {}
+
+    /// Returns `true` when this plugin bounds what the ORIGIN contributed to the
+    /// response header map for this request.
+    ///
+    /// Checked once per response before the first `after_proxy` hook runs, so a
+    /// plugin that repointed the request at a third-party destination can reduce
+    /// that destination's metadata without also discarding gateway decorations
+    /// (CORS, tracing, correlation, rate-limit headers) that later hooks add.
+    /// Keep this narrow: it must be `false` for every request the plugin did not
+    /// itself route to a foreign origin.
+    fn enforces_origin_response_header_policy(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    /// Reduce the pristine ORIGIN response header map at the backend → gateway
+    /// boundary, before any `after_proxy` hook has decorated it.
+    ///
+    /// This is the response-side counterpart to
+    /// [`Self::enforce_final_backend_header_policy`]. It is synchronous,
+    /// non-rejecting, and must be idempotent; it must never log a header value.
+    /// Only invoked for plugins whose
+    /// [`Self::enforces_origin_response_header_policy`] returned `true` for this
+    /// request.
+    fn enforce_origin_response_header_policy(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
+    }
 
     /// Returns `true` when a [`PluginResult::Reject`] from this plugin's
     /// reject-path [`Self::after_proxy`] hook must replace the still-uncommitted
