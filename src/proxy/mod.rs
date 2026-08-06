@@ -31619,17 +31619,14 @@ async fn handle_proxy_request_inner(
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();
-        if enforce_buffered_final_client_visible_response_header_policy(
+        let _ = enforce_buffered_final_client_visible_response_header_policy(
             &plugins,
             &mut ctx,
             &mut response_status,
             &mut response_headers,
             data,
         )
-        .await
-        {
-            response_trailers = None;
-        }
+        .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
