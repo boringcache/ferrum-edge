@@ -106,10 +106,10 @@ impl SniCertResolver {
         let wildcard_parent = server_name.split_once('.').and_then(|(label, parent)| {
             (!label.is_empty() && !parent.is_empty()).then_some(parent)
         });
-        if let Some(parent) = wildcard_parent {
-            if let Some(certified_keys) = self.declared_wildcard.get(parent) {
-                return Some(certified_keys);
-            }
+        if let Some(parent) = wildcard_parent
+            && let Some(certified_keys) = self.declared_wildcard.get(parent)
+        {
+            return Some(certified_keys);
         }
         if let Some(certified_keys) = self.san_exact.get(server_name) {
             return Some(certified_keys);
