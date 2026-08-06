@@ -923,6 +923,20 @@ fn mesh_authz_destination_port(
     .or_else(|| matched_proxy.and_then(|proxy| proxy.listen_port))
 }
 
+/// Whether an inbound Sidecar `ingress[]` route has lost the declared listener
+/// port that must drive authorization. This is a hard refusal, not a cue to
+/// fall back to the shared mesh listener port: evaluating a listener-scoped
+/// DENY against `:15006` would make the rule miss and fail open.
+fn mesh_ingress_authz_port_missing(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    matched_proxy_id: Option<&str>,
+    ingress_listener_authz_port: Option<u16>,
+) -> bool {
+    mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+        && matched_proxy_id.is_some_and(crate::modes::mesh::is_mesh_ingress_route_id)
+        && ingress_listener_authz_port.is_none()
+}
+
 fn mesh_authz_authorization_path(path: &str) -> String {
     crate::router_cache::normalize_encoded_slashes(path).into_owned()
 }
@@ -945,9 +959,8 @@ fn mesh_inbound_app_port(
         // Ingress listener routes authorize on the DECLARED listener port, not
         // the `defaultEndpoint` backend port the route forwards to (F6 §6.2
         // security). The handler stamps the listener port for ingress routes;
-        // if it is somehow absent for an ingress id, fail closed by keeping the
-        // backend port out of the authz decision (return `None` → fall back to
-        // the listener-socket port) rather than authorizing on the wrong port.
+        // `authorize()` explicitly refuses an ingress id whose stamp is absent,
+        // before this helper can fall back to the listener-socket derivation.
         if crate::modes::mesh::is_mesh_ingress_route_id(id) {
             return ingress_listener_authz_port;
         }
@@ -1888,6 +1901,31 @@ impl Plugin for MeshAuthz {
                 );
             }
         }
+        // The router / CONNECT synthesizer must stamp the declared listener
+        // port on every Sidecar ingress route. If that invariant is ever lost,
+        // reject before policy evaluation: falling back to the shared `:15006`
+        // listener would let a DENY scoped to the declared port fail open.
+        if mesh_ingress_authz_port_missing(
+            ctx.mesh_direction,
+            ctx.matched_proxy.as_ref().map(|proxy| proxy.id.as_str()),
+            ctx.mesh_inbound_listener_authz_port,
+        ) {
+            ctx.metadata.insert(
+                "mesh_authz.ingress_listener_port_missing".to_string(),
+                "true".to_string(),
+            );
+            ctx.metadata.insert(
+                "mesh_authz.deny_policy".to_string(),
+                "ingress_listener_port_missing".to_string(),
+            );
+            self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+            return PluginResult::Reject {
+                status_code: 403,
+                body: r#"{"error":"Mesh authorization denied: missing ingress listener port"}"#
+                    .into(),
+                headers: HashMap::new(),
+            };
+        }
         let mut host = ctx
             .raw_header_get("host")
             .or_else(|| ctx.raw_header_get(":authority"))
@@ -2667,7 +2705,8 @@ fn default_trusted_hbone_assertors() -> Vec<TrustedAssertor> {
 #[cfg(test)]
 mod tests {
     use super::{
-        mesh_authz_authorization_path, mesh_authz_destination_port, mesh_inbound_app_port,
+        mesh_authz_authorization_path, mesh_authz_destination_port,
+        mesh_ingress_authz_port_missing, mesh_inbound_app_port,
     };
     use crate::modes::mesh::{
         MESH_INBOUND_PROXY_ID_PREFIX, MESH_INGRESS_PROXY_ID_PREFIX, MeshTrafficDirection,
@@ -2722,6 +2761,16 @@ mod tests {
             None,
             "ingress route with no stamped listener port must not authorize on the backend port"
         );
+        assert!(mesh_ingress_authz_port_missing(
+            Some(MeshTrafficDirection::Inbound),
+            Some(id.as_str()),
+            None,
+        ));
+        assert!(!mesh_ingress_authz_port_missing(
+            Some(MeshTrafficDirection::Inbound),
+            Some(id.as_str()),
+            Some(8443),
+        ));
     }
 
     #[test]
