@@ -2652,6 +2652,16 @@ pub struct MeshConfig {
     /// operator-settable, never serialized.
     #[serde(skip)]
     pub local_ingress_listeners: Vec<ResolvedIngressListener>,
+    /// Runtime-only back-projection of `MeshSlice.sidecar_ingress_declared`.
+    /// This is deliberately separate from `local_ingress_listeners`: an
+    /// explicit empty block, an all-unsupported block, or a carrier whose
+    /// entries all fail re-validation still replaces the ordinary Sidecar
+    /// inbound surface. The authenticated CONNECT boundary reads this marker
+    /// so those cases deny rather than falling through to the transparent
+    /// relay and dialing a port the operator removed. `serde(skip)`: never
+    /// operator-settable, never serialized.
+    #[serde(skip)]
+    pub sidecar_ingress_declared: bool,
     /// Runtime-only back-projection of `MeshSlice.declared_ingress_http_ports`
     /// (F6 §6.2), set by mesh preparation. The count of DISTINCT HTTP-family
     /// `ingress[]` listener ports the workload DECLARED — which can EXCEED
@@ -2670,27 +2680,28 @@ pub struct MeshConfig {
     /// operator-settable, never serialized.
     #[serde(skip)]
     pub local_inbound_tcp_routes: Vec<MeshInboundTcpRoute>,
-    /// Runtime-only back-projection of THIS workload's own addresses, taken
+    /// Runtime-only back-projection of the unambiguously resolved local
+    /// service workload set's addresses, taken
     /// from `MeshSlice.local_inbound_workloads` (the un-narrowed local-inbound
     /// view) and canonicalized for comparison (IPv4-mapped IPv6 folded, DNS
     /// names ASCII-lowercased).
     ///
     /// Deliberately NOT `workloads`: that is the subscription-NAMESPACE view
-    /// and contains sibling replicas and unrelated pods. The authenticated
-    /// inbound CONNECT boundary needs to prove the peer addressed **this**
-    /// workload before it may remap the dial onto a local `ingress[]`
-    /// `defaultEndpoint` (issue #3260), and "some in-mesh workload declares
-    /// this address" is not that proof. Empty ⇒ no local identity resolved,
-    /// and the remap is refused. `serde(skip)`: never operator-settable,
-    /// never serialized.
+    /// and contains unrelated pods. This set can include sibling replicas of
+    /// the one resolved service, so the authenticated CONNECT boundary also
+    /// requires the authority host to equal the accepted socket's actual local
+    /// IP. Together those checks prove the peer reached the pod it named before
+    /// the dial may be remapped onto a local `ingress[]` `defaultEndpoint`
+    /// (issue #3260). Empty ⇒ no local identity resolved, and the remap is
+    /// refused. `serde(skip)`: never operator-settable, never serialized.
     #[serde(skip)]
     pub local_workload_addresses: Vec<String>,
 }
 
 /// Canonical comparison form for a mesh host: IP literals fold IPv4-mapped
 /// IPv6 to their IPv4 form, everything else is ASCII-lowercased. Used to key
-/// [`MeshConfig::local_workload_addresses`] so a captured/asserted address and
-/// a slice-declared address describe one host exactly once.
+/// [`MeshConfig::local_workload_addresses`] so an accepted/authority address
+/// and a slice-declared address describe one host exactly once.
 pub fn canonical_mesh_host(host: &str) -> String {
     match host.parse::<std::net::IpAddr>() {
         Ok(ip) => ip.to_canonical().to_string(),
@@ -2709,15 +2720,15 @@ pub fn canonical_mesh_host(host: &str) -> String {
 /// `defaultEndpoint` the operator pointed it at (`127.0.0.1:6379`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidecarIngressConnectRelay {
-    /// The authority port matches no declared ingress listener. The ordinary
+    /// This workload has no declared Sidecar ingress block. The ordinary
     /// transparent-relay open-relay guard decides this CONNECT unchanged; this
     /// resolution must never widen ordinary HBONE/Ambient relay destinations.
     NotDeclared,
-    /// The authority port DOES match a declared ingress listener, but the pair
-    /// does not resolve to exactly one valid, owner-stamped, stream-family
-    /// loopback mapping owned by THIS workload. Fail closed: the caller must
-    /// refuse the CONNECT rather than fall back to dialing the authority, which
-    /// would be the very destination the operator replaced.
+    /// A Sidecar ingress block is declared, but the authority does not resolve
+    /// to exactly one valid, owner-stamped, stream-family loopback mapping for
+    /// this accepted local address. Fail closed: the caller must refuse the
+    /// CONNECT rather than fall back to dialing the authority, including for a
+    /// port absent from an explicit-empty/all-invalid replacement surface.
     Deny,
     /// Relay to the listener's validated loopback `defaultEndpoint`, while
     /// AuthorizationPolicy evaluation stays keyed to `listener_port`.
@@ -2734,9 +2745,11 @@ pub enum SidecarIngressConnectRelay {
 }
 
 impl MeshConfig {
-    /// Whether `host` is an address of THIS workload (see
-    /// [`Self::local_workload_addresses`]). Empty inventory ⇒ `false`.
-    pub fn host_is_local_workload_address(&self, host: &str) -> bool {
+    /// Whether `host` belongs to the unambiguously resolved local service's
+    /// workload set (see [`Self::local_workload_addresses`]). This membership
+    /// check is not pod-unique; callers that need the exact replica must also
+    /// compare the accepted socket's local IP. Empty inventory ⇒ `false`.
+    pub fn host_is_local_service_workload_address(&self, host: &str) -> bool {
         if self.local_workload_addresses.is_empty() || host.is_empty() {
             return false;
         }
@@ -2750,13 +2763,18 @@ impl MeshConfig {
     /// `host` must already be unbracketed (the CONNECT boundary normalizes an
     /// `[::1]`-style authority before calling). Fail-closed rules, in order:
     ///
-    /// 1. No declared listener on `port` ⇒ [`SidecarIngressConnectRelay::NotDeclared`]
-    ///    (ordinary relay guard decides; behavior unchanged).
+    /// 1. No Sidecar `ingress` block declared ⇒
+    ///    [`SidecarIngressConnectRelay::NotDeclared`] (ordinary relay guard
+    ///    decides; behavior unchanged). Once an ingress block is declared,
+    ///    any port without one valid modeled listener is denied: explicit
+    ///    empty/all-invalid declarations replace the ordinary inbound surface.
     /// 2. MORE than one declared listener on `port` ⇒ `Deny`. A hostile or
     ///    duplicated carrier must not pick a mapping by iteration order.
-    /// 3. `host` is not an address of THIS workload ⇒ `Deny`. Sharing a port
-    ///    number with a local listener is not permission to remap another
-    ///    workload's (or a bare loopback) destination onto our application.
+    /// 3. `host` is not in the resolved local-service workload set, does not
+    ///    equal the accepted connection's actual local IP, or the local IP is
+    ///    unavailable ⇒ `Deny`. Sharing a port number with a local listener
+    ///    is not permission to remap a sibling replica's (or a bare loopback)
+    ///    destination onto our application.
     /// 4. Malformed endpoint / unmodeled protocol / zero port, or a missing
     ///    owner stamp ⇒ `Deny` (same pair of guards the back-projection
     ///    chokepoint and the materializer apply).
@@ -2768,18 +2786,27 @@ impl MeshConfig {
         &self,
         host: &str,
         port: u16,
+        accepted_local_ip: Option<std::net::IpAddr>,
     ) -> SidecarIngressConnectRelay {
-        if port == 0 {
+        if !self.sidecar_ingress_declared {
             return SidecarIngressConnectRelay::NotDeclared;
+        }
+        if port == 0 {
+            return SidecarIngressConnectRelay::Deny;
         }
         let mut rest = self.local_ingress_listeners.iter();
         let Some(listener) = rest.find(|entry| entry.port == port) else {
-            return SidecarIngressConnectRelay::NotDeclared;
+            return SidecarIngressConnectRelay::Deny;
         };
         if rest.any(|entry| entry.port == port) {
             return SidecarIngressConnectRelay::Deny;
         }
-        if !self.host_is_local_workload_address(host) {
+        let authority_host = canonical_mesh_host(host);
+        if !self.host_is_local_service_workload_address(host)
+            || accepted_local_ip
+                .map(|ip| canonical_mesh_host(&ip.to_string()))
+                .is_none_or(|local| local != authority_host)
+        {
             return SidecarIngressConnectRelay::Deny;
         }
         if !listener.endpoint_is_valid()
@@ -2861,6 +2888,7 @@ impl Default for MeshConfig {
             node_waypoint_capture_peer_authentications: Vec::new(),
             local_inbound_services: None,
             local_ingress_listeners: Vec::new(),
+            sidecar_ingress_declared: false,
             declared_ingress_http_ports: 0,
             local_inbound_tcp_routes: Vec::new(),
             local_workload_addresses: Vec::new(),

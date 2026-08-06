@@ -2310,13 +2310,15 @@ pub(crate) struct InboundConnectRelay {
 /// 1. **Sidecar `ingress[]` stream remap (issue #3260).** The identity-protected
 ///    Sidecar inbound path is a fresh mesh-mTLS H2 CONNECT to `:15006`, so it
 ///    never reaches the REDIRECT-captured `local_inbound_tcp_routes` table that
-///    serves direct plaintext. When the authority names THIS workload on a
+///    serves direct plaintext. When the authority names the concrete local IP
+///    of THIS accepted connection on a
 ///    DECLARED stream-family ingress listener port, relay to that listener's
 ///    validated loopback `defaultEndpoint` — `pod-ip:16379` → `127.0.0.1:6379`
 ///    — and report the DECLARED listener port so `mesh_authz` authorizes on it.
-///    A declared port that does not resolve to exactly one valid, owner-stamped,
-///    stream-family mapping owned by this workload returns `None` (caller 404s)
-///    instead of falling through to dial the port the operator replaced.
+///    A declared ingress block that does not resolve to exactly one valid,
+///    owner-stamped, stream-family mapping for that exact local IP returns
+///    `None` (caller 404s) instead of falling through to dial an unlisted or
+///    invalid port the operator replaced.
 /// 2. **Ordinary transparent relay** (Ambient / Waypoint terminators, which
 ///    materialize NO inbound routes): dial the CONNECT `:authority` itself, the
 ///    original destination the peer asked for. Unchanged, and unreachable for a
@@ -2333,6 +2335,7 @@ fn build_inbound_hbone_relay_proxy(
     authority: Option<&http::uri::Authority>,
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
     allow_sidecar_ingress_remap: bool,
+    accepted_local_ip: Option<std::net::IpAddr>,
 ) -> Option<InboundConnectRelay> {
     use crate::modes::mesh::config::SidecarIngressConnectRelay;
 
@@ -2345,7 +2348,7 @@ fn build_inbound_hbone_relay_proxy(
 
     let ingress_remap = match mesh {
         Some(mesh) if allow_sidecar_ingress_remap => {
-            mesh.resolve_sidecar_ingress_connect_relay(host, port)
+            mesh.resolve_sidecar_ingress_connect_relay(host, port, accepted_local_ip)
         }
         _ => SidecarIngressConnectRelay::NotDeclared,
     };
@@ -2354,9 +2357,9 @@ fn build_inbound_hbone_relay_proxy(
         SidecarIngressConnectRelay::Deny => {
             warn!(
                 listener_port = port,
-                "Refusing authenticated inbound CONNECT for a declared Sidecar ingress[] \
-                 listener that does not resolve to a single valid, owner-stamped, \
-                 stream-family loopback endpoint owned by this workload"
+                "Refusing authenticated inbound CONNECT after a Sidecar ingress block was \
+                 declared: the authority does not resolve to one valid, owner-stamped, \
+                 stream-family loopback endpoint for this accepted local address"
             );
             return None;
         }
@@ -5855,6 +5858,10 @@ fn via_header_for_backend_response_body<'a>(
 #[derive(Clone, Default)]
 struct RequestConnectionMetadata {
     frontend_listen_port: Option<u16>,
+    /// Concrete local address of the accepted TCP connection. Unlike the
+    /// listener's wildcard bind address, this identifies the pod IP the peer
+    /// actually reached and binds a Sidecar ingress CONNECT to this replica.
+    accepted_local_addr: Option<SocketAddr>,
     frontend_sni_hostname: Option<String>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     /// Direction stamped at listener-spawn time for mesh listeners.
@@ -10949,6 +10956,7 @@ async fn handle_connection(
     state: Arc<ProxyState>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     frontend_listen_port: Option<u16>,
+    accepted_local_addr: Option<SocketAddr>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     orig_dst: Option<SocketAddr>,
@@ -11003,6 +11011,7 @@ async fn handle_connection(
         let addr = remote_addr;
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
+            accepted_local_addr,
             frontend_sni_hostname: None,
             node_waypoint_identity: node_waypoint_identity.clone(),
             mesh_direction,
@@ -16282,6 +16291,8 @@ async fn reject_mesh_inbound_peer_auth_transport_mismatch(
 
 struct TlsConnectionMetadata {
     frontend_listen_port: Option<u16>,
+    /// See [`RequestConnectionMetadata::accepted_local_addr`].
+    accepted_local_addr: Option<SocketAddr>,
     record_mesh_mtls_metric: bool,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
@@ -16592,6 +16603,11 @@ async fn run_accept_loop(
             result = listener.accept() => {
                 match result {
                     Ok((stream, remote_addr)) => {
+                        // Capture the concrete destination before the stream is
+                        // wrapped or moved. An accepted stream identifies the
+                        // pod IP the peer reached even when the listener itself
+                        // is bound to a wildcard address.
+                        let accepted_local_addr = stream.local_addr().ok();
                         let restored = source_ip_override.current();
                         let remote_addr = resolve_accept_peer_identity(remote_addr, restored);
                         accept_backoff.on_success();
@@ -16933,6 +16949,7 @@ async fn run_accept_loop(
                             let result = if let Some(tls_config) = tls_config {
                                 let tls_connection_metadata = TlsConnectionMetadata {
                                     frontend_listen_port,
+                                    accepted_local_addr,
                                     record_mesh_mtls_metric,
                                     node_waypoint_identity,
                                     mesh_direction,
@@ -16955,6 +16972,7 @@ async fn run_accept_loop(
                                     state,
                                     conn_shutdown_rx,
                                     frontend_listen_port,
+                                    accepted_local_addr,
                                     node_waypoint_identity,
                                     mesh_direction,
                                     orig_dst,
@@ -17106,6 +17124,7 @@ async fn handle_tls_connection(
         let frontend_sni_hostname = frontend_sni_hostname.clone();
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
+            accepted_local_addr: tls_connection_metadata.accepted_local_addr,
             frontend_sni_hostname,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
             mesh_direction: tls_connection_metadata.mesh_direction,
@@ -23523,6 +23542,7 @@ async fn handle_proxy_request_inner(
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
+    let accepted_local_ip = connection_metadata.accepted_local_addr.map(|addr| addr.ip());
 
     let method = req.method().as_str().to_owned();
     let inbound_version = req.version();
@@ -24316,6 +24336,7 @@ async fn handle_proxy_request_inner(
                     req.uri().authority(),
                     epoch.config.mesh.as_deref(),
                     !is_udp_hbone_connect,
+                    accepted_local_ip,
                 )
             } else {
                 None
@@ -50704,7 +50725,7 @@ mod tests {
         });
         let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();
 
-        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), true)
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), true, None)
             .expect("bracketed IPv6 authority should build relay");
 
         assert_eq!(relay.proxy.backend_host, "fd00:10:244:1::4");

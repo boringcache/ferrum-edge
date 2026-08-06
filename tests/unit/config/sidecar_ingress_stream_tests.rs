@@ -60,6 +60,7 @@ fn expected_relay() -> Remap {
 fn local_mesh(listeners: Vec<ResolvedIngressListener>) -> MeshConfig {
     MeshConfig {
         local_ingress_listeners: listeners,
+        sidecar_ingress_declared: true,
         local_workload_addresses: vec![POD_IP.to_string()],
         ..MeshConfig::default()
     }
@@ -67,7 +68,11 @@ fn local_mesh(listeners: Vec<ResolvedIngressListener>) -> MeshConfig {
 
 /// The authenticated inbound CONNECT boundary's resolution.
 fn remap(mesh: &MeshConfig, host: &str, port: u16) -> Remap {
-    mesh.resolve_sidecar_ingress_connect_relay(host, port)
+    mesh.resolve_sidecar_ingress_connect_relay(
+        host,
+        port,
+        Some(POD_IP.parse().expect("test pod IP")),
+    )
 }
 
 /// The post-plugin effective-destination re-check for a remapped relay.
@@ -242,13 +247,13 @@ fn authenticated_connect_maps_declared_listener_port_to_default_endpoint() {
     );
     // The backend port alone selects nothing: only the DECLARED listener port
     // is the match key, mirroring the direct-capture `mesh_tcp_inbound` table.
-    assert_eq!(remap(&mesh, POD_IP, 6379), Remap::NotDeclared);
+    assert_eq!(remap(&mesh, POD_IP, 6379), Remap::Deny);
 }
 
 #[test]
 fn connect_remap_folds_ipv4_mapped_local_addresses() {
     let mesh = local_mesh(vec![redis_listener()]);
-    assert!(mesh.host_is_local_workload_address("::ffff:10.244.1.7"));
+    assert!(mesh.host_is_local_service_workload_address("::ffff:10.244.1.7"));
     let mapped = remap(&mesh, "::ffff:10.244.1.7", 16379);
     assert_eq!(mapped, expected_relay());
 }
@@ -258,7 +263,11 @@ fn connect_remap_folds_ipv4_mapped_local_addresses() {
 /// a bare loopback, destination onto our application.
 #[test]
 fn connect_remap_refuses_foreign_and_loopback_authorities() {
-    let mesh = local_mesh(vec![redis_listener()]);
+    let mut mesh = local_mesh(vec![redis_listener()]);
+    // Local-service resolution can include sibling replicas. Reaching this
+    // pod's socket does not authorize an authority naming the sibling.
+    mesh.local_workload_addresses
+        .push("10.244.1.9".to_string());
 
     for hostile in ["10.244.1.9", "127.0.0.1", "redis.default.svc"] {
         assert_eq!(
@@ -271,6 +280,7 @@ fn connect_remap_refuses_foreign_and_loopback_authorities() {
     // No local identity resolved at all ⇒ nothing can be remapped.
     let anonymous = MeshConfig {
         local_ingress_listeners: vec![redis_listener()],
+        sidecar_ingress_declared: true,
         ..MeshConfig::default()
     };
     assert_eq!(remap(&anonymous, POD_IP, 16379), Remap::Deny);
@@ -316,25 +326,31 @@ fn connect_remap_refuses_ambiguous_ownerless_and_non_stream_listeners() {
     }
 }
 
-/// Ports this workload never declared stay on the ordinary transparent-relay
-/// guard: the remap must not widen ordinary HBONE/Ambient relay destinations.
+/// Once Sidecar ingress is declared, it replaces the ordinary inbound surface.
+/// Unlisted ports must not fall through to the transparent relay, including
+/// explicit-empty and all-invalid listener sets.
 #[test]
-fn connect_remap_leaves_undeclared_ports_to_the_ordinary_relay_guard() {
+fn connect_remap_declared_block_denies_unlisted_and_unresolved_ports() {
     let mesh = local_mesh(vec![redis_listener()]);
     for port in [8080u16, 15008, 1] {
-        assert_eq!(remap(&mesh, POD_IP, port), Remap::NotDeclared);
+        assert_eq!(remap(&mesh, POD_IP, port), Remap::Deny);
     }
+    assert_eq!(remap(&local_mesh(Vec::new()), POD_IP, 16379), Remap::Deny);
 }
 
 /// Withdrawal (reload / update / delete / xDS carrier removal) must not leave a
-/// stale mapping behind: the resolution AND the post-plugin re-check both read
-/// the live listener set, so the next CONNECT falls back to the ordinary guard.
+/// stale mapping or declaration behind: the resolution AND the post-plugin
+/// re-check both read the live prepared view, so removing the Sidecar block
+/// restores ordinary relay behavior without preserving the old endpoint.
 #[test]
 fn connect_remap_withdrawal_leaves_no_stale_routing() {
     let declared = local_mesh(vec![redis_listener()]);
     assert_eq!(remap(&declared, POD_IP, 16379), expected_relay());
 
-    let withdrawn = local_mesh(Vec::new());
+    let withdrawn = MeshConfig {
+        local_workload_addresses: vec![POD_IP.to_string()],
+        ..MeshConfig::default()
+    };
     assert_eq!(remap(&withdrawn, POD_IP, 16379), Remap::NotDeclared);
     assert!(
         !endpoint_ok(&withdrawn, 16379, "127.0.0.1", 6379),

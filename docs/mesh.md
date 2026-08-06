@@ -1481,9 +1481,12 @@ The CONNECT remap is deliberately narrow and fails closed before any dial:
 - Only for a **byte-stream** CONNECT. A datagram-over-CONNECT (`connect-udp`)
   is excluded — `ingress[]` stream listeners are TCP and UDP behavior is
   unchanged.
-- The `:authority` host must **positively identify this workload** (one of its
-  own slice-declared addresses). A sibling replica's IP, a bare loopback
-  authority, or a service FQDN sharing the port number is refused.
+- The `:authority` host must belong to the unambiguously resolved local-service
+  workload set **and equal the accepted connection's concrete local IP**. The
+  second check is what distinguishes this pod from sibling replicas that share
+  the same service identity. A sibling replica's IP, a bare loopback authority,
+  or a service FQDN sharing the port number is refused; an unavailable accepted
+  local address also fails closed.
 - Exactly **one** valid, owner-stamped, **stream-family** listener must be
   declared on that port. Ambiguity (two entries on one port), a missing owner
   stamp, an off-box/`:0`/unmodeled-protocol endpoint, and an HTTP-family
@@ -1494,8 +1497,12 @@ The CONNECT remap is deliberately narrow and fails closed before any dial:
   the same declared mapping, so a `mesh_route_dispatch` route override or an
   upstream selection cannot widen it (and a listener withdrawn between
   synthesis and dial fails closed).
-- Ports this workload never declared as `ingress[]` listeners are untouched and
-  stay on the ordinary transparent-relay open-relay guard.
+- Once an `ingress` block is declared, it replaces the workload's ordinary
+  inbound CONNECT surface as well as its materialized service-port routes.
+  Unlisted ports and explicit-empty, all-unsupported, or carrier-rejected
+  listener sets are refused rather than falling through to the transparent
+  relay. With no declared `ingress` block, ordinary Ambient/Waypoint relay
+  behavior is unchanged.
 
 ### Precedence vs. the default inbound listeners (fail-closed)
 

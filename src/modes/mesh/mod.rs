@@ -1272,6 +1272,12 @@ fn prepare_normalized_gateway_config_for_mesh(
             })
             .cloned()
             .collect();
+        // Preserve the declaration signal independently of the surviving
+        // listener set. Explicit-empty, all-unsupported, and carrier-rejected
+        // ingress blocks still replace the ordinary inbound CONNECT surface;
+        // without this marker those cases could fall through to the transparent
+        // relay and dial a port the operator removed.
+        mesh.sidecar_ingress_declared = mesh_slice.sidecar_ingress_declared;
         // Back-project the DECLARED HTTP-family ingress port count untouched by
         // the re-validation drops above (F6 §6.2). The drops reduce the
         // materialized `local_ingress_listeners` (siblings), but the declared
@@ -1280,19 +1286,20 @@ fn prepare_normalized_gateway_config_for_mesh(
         // floors it at the surviving sibling count, so a hostile carrier can
         // never push it BELOW what materialized.
         mesh.declared_ingress_http_ports = mesh_slice.declared_ingress_http_ports;
-        // Back-project THIS workload's own addresses from the un-narrowed
-        // local-inbound workload view (which rides its own
+        // Back-project the unambiguously resolved local service workload set's
+        // addresses from the un-narrowed local-inbound workload view (which rides its own
         // `LocalInboundWorkloads` ECDS carrier on xDS, so native/file/xDS stay
         // in lock-step). Canonicalized once here so the authenticated inbound
-        // CONNECT boundary can prove the peer addressed THIS pod before
+        // CONNECT boundary can establish local-service membership before
         // remapping the dial onto a declared `ingress[]` `defaultEndpoint`
-        // (issue #3260) with a plain slice comparison.
+        // (issue #3260). That set may contain sibling replicas; the request
+        // boundary separately requires the authority to match the accepted
+        // socket's actual local IP, proving the peer reached the pod it named.
         //
         // Deliberately NOT derived from `mesh.workloads`: that is the
-        // subscription-NAMESPACE view and includes sibling replicas, so it
-        // proves nothing about which pod the CONNECT named. `None` (no local
-        // narrowing) and an empty local view both leave this empty, and the
-        // remap is refused.
+        // subscription-NAMESPACE view and includes unrelated pods. `None` (no
+        // local narrowing) and an empty local view both leave this empty, and
+        // the remap is refused.
         let mut local_addresses: Vec<String> = Vec::new();
         if let Some(local) = mesh_slice.local_inbound_workloads.as_deref() {
             for workload in local {
@@ -4471,6 +4478,33 @@ fn materialize_sidecar_ingress_listener_proxies(
         })
         .collect();
 
+    // A declared listener port is the dispatch key on BOTH lanes. If two valid
+    // carried entries claim it, choosing either endpoint or protocol by vector
+    // order would make an untrusted carrier control the route nondeterministically.
+    // Drop every valid claimant for that port instead. This also keeps the
+    // plaintext/orig-dst materializer aligned with the authenticated CONNECT
+    // resolver, which rejects duplicate declared ports before remapping.
+    let mut listener_port_counts = std::collections::BTreeMap::<u16, usize>::new();
+    for listener in &listeners {
+        *listener_port_counts.entry(listener.port).or_default() += 1;
+    }
+    let ambiguous_listener_ports: std::collections::BTreeSet<u16> = listener_port_counts
+        .into_iter()
+        .filter_map(|(port, count)| (count > 1).then_some(port))
+        .collect();
+    for port in &ambiguous_listener_ports {
+        warn!(
+            local_spiffe,
+            listener_port = *port,
+            "Duplicate Sidecar ingress[] listener port after carrier re-validation; dropping all \
+             entries for that port rather than selecting by carrier order"
+        );
+    }
+    let listeners: Vec<_> = listeners
+        .into_iter()
+        .filter(|listener| !ambiguous_listener_ports.contains(&listener.port))
+        .collect();
+
     let http_listeners: Vec<_> = listeners
         .iter()
         .copied()
@@ -4488,21 +4522,11 @@ fn materialize_sidecar_ingress_listener_proxies(
     // stream-only ingress still installs its TCP table even when no HTTP host
     // identity can be built.
     let mut tcp_routes = Vec::with_capacity(stream_listeners.len());
-    let mut claimed_tcp_ports: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
     for listener in &stream_listeners {
         let Ok(backend_ip) = listener.endpoint_host.parse::<std::net::IpAddr>() else {
             // endpoint_is_valid already required a loopback IP literal.
             continue;
         };
-        if !claimed_tcp_ports.insert(listener.port) {
-            warn!(
-                local_spiffe,
-                listener_port = listener.port,
-                "Duplicate Sidecar ingress[] stream listener port after carrier re-validation; \
-                 keeping the first entry"
-            );
-            continue;
-        }
         let tls_inspect = matches!(listener.protocol, AppProtocol::Tls);
         tcp_routes.push(MeshInboundTcpRoute {
             // Match the DECLARED listener port (captured orig-dst), not the
@@ -32443,6 +32467,60 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_ingress_duplicate_port_drops_every_plaintext_lane_claimant() {
+        // A carrier can duplicate a declared port with two stream endpoints or
+        // with mixed HTTP/stream protocols. Neither the orig-dst TCP table nor
+        // the HTTP router may select a winner by carrier order.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        for listeners in [
+            vec![
+                ingress_stream_listener(9000, "127.0.0.1", 6000, AppProtocol::Tcp),
+                ingress_stream_listener(9000, "127.0.0.1", 7000, AppProtocol::Redis),
+            ],
+            vec![
+                ingress_listener(9000, "127.0.0.1", 6000),
+                ingress_stream_listener(9000, "127.0.0.1", 7000, AppProtocol::Tcp),
+            ],
+        ] {
+            let slice = MeshSlice {
+                node_id: "node-a".to_string(),
+                namespace: "default".to_string(),
+                version: "test".to_string(),
+                workloads: vec![workload("reviews", "reviews")],
+                services: vec![http_mesh_service("reviews", 80, spiffe)],
+                local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+                local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+                local_ingress_listeners: listeners,
+                sidecar_ingress_declared: true,
+                declared_ingress_http_ports: 1,
+                ..MeshSlice::default()
+            };
+            let config = gateway_config_from_mesh_slice(&slice, &runtime, None, None)
+                .expect("slice to config");
+            assert!(
+                config
+                    .mesh
+                    .as_ref()
+                    .unwrap()
+                    .local_inbound_tcp_routes
+                    .is_empty(),
+                "duplicate declared port must not select a raw-TCP endpoint"
+            );
+            assert!(
+                !config
+                    .proxies
+                    .iter()
+                    .any(|proxy| proxy.id.starts_with("__mesh-ingress-")),
+                "duplicate declared port must not select an HTTP endpoint"
+            );
+        }
+    }
+
+    #[test]
     fn sidecar_ingress_stream_withdrawal_clears_tcp_routes_on_undeclare() {
         // Reload/update/delete: when ingress is no longer declared, stream
         // ingress relays must not linger — the service-port default path owns
@@ -32562,10 +32640,9 @@ mod tests {
         );
     }
 
-    /// The authenticated-CONNECT remap needs proof that the peer addressed THIS
-    /// workload, so mesh preparation back-projects the local workload's own
-    /// addresses (canonicalized) — never the subscription-namespace
-    /// `workloads` view, which carries sibling replicas.
+    /// The authenticated-CONNECT remap first narrows authority membership to the
+    /// resolved local-service workload set. The accepted socket's concrete
+    /// local IP then disambiguates the exact replica at the request boundary.
     #[test]
     fn local_workload_addresses_are_back_projected_for_the_connect_remap() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
@@ -32601,12 +32678,16 @@ mod tests {
             vec!["10.244.1.7".to_string()],
             "IPv4-mapped duplicates must canonicalize + dedup to one address"
         );
-        assert!(mesh.host_is_local_workload_address("10.244.1.7"));
-        assert!(!mesh.host_is_local_workload_address("10.244.1.9"));
+        assert!(mesh.host_is_local_service_workload_address("10.244.1.7"));
+        assert!(!mesh.host_is_local_service_workload_address("10.244.1.9"));
         // The declared 16379 listener therefore remaps to its defaultEndpoint
         // for an authenticated CONNECT naming this pod (mapping semantics are
         // pinned in `tests/unit/config/sidecar_ingress_stream_tests.rs`).
-        let remap = mesh.resolve_sidecar_ingress_connect_relay("10.244.1.7", 16379);
+        let remap = mesh.resolve_sidecar_ingress_connect_relay(
+            "10.244.1.7",
+            16379,
+            Some("10.244.1.7".parse().expect("test pod IP")),
+        );
         assert_eq!(remap, expected_redis_remap());
 
         // Withdrawal clears the back-projection too, so a stale address can
@@ -32622,7 +32703,11 @@ mod tests {
             gateway_config_from_mesh_slice(&withdrawn, &runtime, None, None).expect("v2");
         let mesh_v2 = config_v2.mesh.as_deref().expect("prepared mesh");
         assert!(mesh_v2.local_workload_addresses.is_empty());
-        let stale = mesh_v2.resolve_sidecar_ingress_connect_relay("10.244.1.7", 16379);
+        let stale = mesh_v2.resolve_sidecar_ingress_connect_relay(
+            "10.244.1.7",
+            16379,
+            Some("10.244.1.7".parse().expect("test pod IP")),
+        );
         assert_eq!(stale, config::SidecarIngressConnectRelay::NotDeclared);
     }
 
