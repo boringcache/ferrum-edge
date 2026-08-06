@@ -444,9 +444,16 @@ Stream proxies can also be produced by the Kubernetes controller instead of
 being written by hand. A Gateway API `TCPRoute` attached to a `protocol: TCP`
 listener and a `UDPRoute` attached to a `protocol: UDP` listener each
 materialize one stream proxy per rule on the Gateway listener port. Everything
-on this page — session management, idle timeout, the amplification guard,
-stream plugins, metrics — applies unchanged to those generated proxies; the
-route only decides the listen port and the backend.
+on this page — session management, idle timeout, stream plugins, metrics —
+applies unchanged to those generated proxies; the route only decides the listen
+port and the backend.
+
+The one exception is the response amplification guard. It is opt-in through the
+per-proxy `udp_max_response_amplification_factor` above, Gateway API defines no
+field that maps onto it, and the translator leaves it unset — so a generated
+`UDPRoute` proxy runs without a response-size ceiling, and a hand-applied
+override cannot survive, because the proxy is regenerated from the route on
+every reconcile.
 
 For a `UDPRoute` the rule's `backendRefs` is a weighted **set**. A single
 serviceable leg becomes a direct backend

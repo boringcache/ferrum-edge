@@ -188,8 +188,14 @@ pub(super) fn translate(
         // weighted datagram peer set (see `udp_rule_backends`).
         // The stream scheme is what makes the materialized proxy a UDP
         // listener/relay rather than a TCP one; datagram semantics (no
-        // connection state, per-session idle expiry, amplification limits) are
-        // preserved by the existing UDP data path.
+        // connection state, per-session idle expiry) are preserved by the
+        // existing UDP data path.
+        //
+        // The response-amplification guard is NOT engaged here: it is the
+        // opt-in per-proxy `udp_max_response_amplification_factor`, Gateway
+        // API defines no field that maps onto it, and `proxy_for_route`
+        // leaves it unset — the same default a hand-authored UDP proxy gets.
+        // Do not describe it as in force for a generated UDPRoute proxy.
         "UDPRoute" => {
             for proxy in l4_route_proxies(object, acc, BackendScheme::Udp)? {
                 acc.upsert_proxy(proxy, SourceKind::GatewayApi);

@@ -2962,7 +2962,7 @@ materialization. Listener status reports `Accepted=False` and
 path. Valid `All`, `Same`, empty-selector, and well-formed selector behavior is
 unchanged, and valid sibling listeners reconcile independently.
 
-Gateway API status writing requires `get/list/watch` on `gatewayclasses`, `gateways`, `httproutes`, `grpcroutes`, `tcproutes`, `tlsroutes`, and `referencegrants`, plus `patch` on their `status` subresources. `GatewayClass` is cluster-scoped; route and Gateway watches are namespaced when `FERRUM_K8S_WATCH_NAMESPACES` is set. The Helm chart grants these verbs through `controlPlane.rbac.*`; disable unused watches there when installing a narrower controller.
+Gateway API status writing requires `get/list/watch` on `gatewayclasses`, `gateways`, `httproutes`, `grpcroutes`, `tcproutes`, `tlsroutes`, `udproutes`, and `referencegrants`, plus `patch` on their `status` subresources. `GatewayClass` is cluster-scoped; route and Gateway watches are namespaced when `FERRUM_K8S_WATCH_NAMESPACES` is set. The Helm chart grants these verbs through `controlPlane.rbac.*`; disable unused watches there when installing a narrower controller.
 
 ## Istio CRD Status
 
@@ -3273,7 +3273,7 @@ These configure the in-cluster Istio / Gateway API translation controller and na
 | `FERRUM_K8S_CONTROLLER_ENABLED` | auto (true in-pod, false outside) | Enable the in-cluster Istio/Gateway-API translation controller. Detected from `KUBERNETES_SERVICE_HOST`; explicit operator value wins |
 | `FERRUM_K8S_POD_DISCOVERY_ENABLED` | auto (true in-pod, false outside) | Watch Pod/Service/EndpointSlice/Node for native service-registry discovery |
 | `FERRUM_K8S_WATCH_ISTIO_CRDS` | `true` | Watch and translate Istio CRDs (and write `status.conditions[]`) |
-| `FERRUM_K8S_WATCH_GATEWAY_API_CRDS` | `true` | Watch and translate Gateway API CRDs (GatewayClass/Gateway/HTTPRoute/GRPCRoute/TCPRoute/TLSRoute) and write their status |
+| `FERRUM_K8S_WATCH_GATEWAY_API_CRDS` | `true` | Watch and translate Gateway API CRDs (GatewayClass/Gateway/HTTPRoute/GRPCRoute/TCPRoute/TLSRoute/UDPRoute) and write their status |
 | `FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAMESPACE` | (none) | Namespace of the routable Ferrum data-plane Service used to gate Gateway API `Gateway.status.conditions[Programmed]` |
 | `FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAME` | (none) | Name of the routable Ferrum data-plane Service used to gate Gateway API `Gateway.status.conditions[Programmed]` |
 | `FERRUM_GATEWAY_API_STATUS_ADDRESS` | (none) | Optional address advertised in `Gateway.status.addresses` |
