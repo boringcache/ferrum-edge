@@ -403,7 +403,10 @@ async fn try_serve_translated_config(
     let deadline = Instant::now() + LISTENER_STARTED_TIMEOUT;
     let mut ready = false;
     while Instant::now() <= deadline {
-        if started_flags.iter().all(|flag| flag.load(Ordering::Acquire)) {
+        if started_flags
+            .iter()
+            .all(|flag| flag.load(Ordering::Acquire))
+        {
             ready = true;
             break;
         }
