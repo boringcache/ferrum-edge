@@ -283,7 +283,7 @@ Separate HTTP and HTTPS listeners for the Admin API with enhanced TLS support:
 - **Admin HTTPS**: Enabled when admin TLS certificates are configured on port 9443 (configurable)
 - **Safe-by-default bind**: In writable `database`/`cp` modes, a non-loopback plaintext admin bind without `FERRUM_ADMIN_ALLOWED_CIDRS` is a hard startup error unless `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true` (dev only)
 - **Admin mTLS**: Client certificate verification for admin access
-- **JWT Authentication**: Required on both HTTP and HTTPS endpoints
+- **JWT Authentication**: Required for management routes on both HTTP and HTTPS. `/live` is minimal and unauthenticated; `/health`, `/status`, and `/overload` expose only coarse unauthenticated state, while `/metrics` and detailed diagnostics require observability authorization
 - **No-Verify Mode**: Testing mode for admin API TLS
 
 **Admin Listener Architecture**:
@@ -430,7 +430,7 @@ Admin API read endpoints (GET proxies, consumers, plugin configs) use a two-tier
 
 Fallback responses include an `X-Data-Source: cached` header so callers can detect stale data. Write operations (POST/PUT/DELETE) require a live database and will return `503 Service Unavailable` if the database is offline — there is no way to safely write without a data store.
 
-The `/health` endpoint reports `cached_config` status including availability, `loaded_at` timestamp, and proxy/consumer counts, providing operational visibility during outages.
+Authenticated `/health` detail reports `cached_config` status including availability, `loaded_at` timestamp, and proxy/consumer counts, providing operational visibility during outages. Unauthenticated probes receive only `status` and `ready`.
 
 ### **8. DNS System (`src/dns/`)**
 
