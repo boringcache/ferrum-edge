@@ -943,6 +943,7 @@ fn admitted_names_with_entries(
             }],
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }],
         destination_rules,
         ..MeshConfig::default()

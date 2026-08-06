@@ -282,6 +282,7 @@ fn mesh_config_validate_rejects_zero_ports_on_full_mesh_resources() {
             }],
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }],
         ..MeshConfig::default()
     };
@@ -333,6 +334,7 @@ fn mesh_config_validate_rejects_empty_destination_rule_and_sidecar_fields() {
             ],
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }],
         ..MeshConfig::default()
     };
@@ -1732,6 +1734,7 @@ fn sidecar_host_pattern_accepts_valid_patterns() {
                 }],
                 ingress_declared: false,
                 ingress: Vec::new(),
+                outbound_traffic_policy: None,
             }],
             ..MeshConfig::default()
         };
@@ -2101,6 +2104,7 @@ fn validate_rejects_zero_ingress_port() {
                 ingress_entry(0, AppProtocol::Http, "127.0.0.1:8080"),
                 ingress_entry(8443, AppProtocol::Http, ""),
             ],
+            outbound_traffic_policy: None,
         }],
         ..MeshConfig::default()
     };
@@ -2132,6 +2136,7 @@ fn validate_accepts_unsupported_ingress_shapes_for_deferral() {
                 ingress_entry(8443, AppProtocol::Http, "unix:///var/run/app.sock"),
                 ingress_entry(9000, AppProtocol::Tcp, "127.0.0.1:9000"),
             ],
+            outbound_traffic_policy: None,
         }],
         ..MeshConfig::default()
     };
@@ -2296,6 +2301,40 @@ fn mesh_config_validate_rejects_destination_rule_tls_inconsistency() {
                 && e.contains("must be absent")
         }),
         "expected ISTIO_MUTUAL explicit-CA error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn mesh_config_validate_rejects_destination_rule_system_roots_without_verification() {
+    let mesh = MeshConfig {
+        destination_rules: vec![MeshDestinationRule {
+            name: "dr".into(),
+            namespace: "default".into(),
+            host: "reviews.default.svc.cluster.local".into(),
+            traffic_policy: Some(MeshTrafficPolicy {
+                tls: Some(MeshTrafficPolicyTls {
+                    mode: MtlsMode::Simple,
+                    ca_certificates: Some("system://".into()),
+                    insecure_skip_verify: true,
+                    ..MeshTrafficPolicyTls::default()
+                }),
+                ..MeshTrafficPolicy::default()
+            }),
+            port_level_settings: HashMap::new(),
+            subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
+        }],
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("ca_certificates")
+                && error.contains("insecure_skip_verify")
+                && error.contains("system://")
+        }),
+        "native/file/xDS validation must reject the contradictory trust policy: {errors:?}"
     );
 }
 

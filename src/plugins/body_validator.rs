@@ -278,9 +278,7 @@ impl BodyValidator {
     /// protobuf request/response *targets* come from the parsed config shape,
     /// not from the descriptor file, and only the resolved descriptors differ.
     /// `Plugin::requires_request_body_buffering()` on this instance is
-    /// therefore the authoritative runtime answer, which is what the
-    /// backend-TLS SNI buffering screen
-    /// (`plugins::RequestBodyBufferingScreener`) needs.
+    /// therefore the authoritative runtime answer.
     pub fn new_shape_only(config: &Value) -> Result<Self, String> {
         Self::new_inner(config, DescriptorLoadMode::ShapeOnly)
     }

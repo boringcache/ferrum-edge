@@ -89,6 +89,7 @@ enum BackendRefFaultReason {
     BackendNotFound,
     RefNotPermitted,
     NoServiceableBackend,
+    InvalidBackendTlsPolicy,
 }
 
 #[derive(Default)]
@@ -182,7 +183,7 @@ pub(super) fn translate(
             }
             Ok(true)
         }
-        "ReferenceGrant" => Ok(true),
+        "ReferenceGrant" | "BackendTLSPolicy" => Ok(true),
         // Collected in the pre-pass; acknowledged here so the main translate
         // loop does not warn about an "unsupported" kind.
         "BackendLBPolicy" | "XBackendTrafficPolicy" => Ok(true),
@@ -4381,7 +4382,32 @@ fn http_route_resources(
 
             let request_transform = gateway_request_header_modifier_rules(rule);
             let redirect = gateway_request_redirect_value(object, rule, default_redirect_port)?;
-            let backend_resolution = route_backends(object, rule, acc)?;
+            let mut backend_resolution = route_backends(object, rule, acc)?;
+            let backend_tls_policy = super::backend_tls_policy::resolve_backends_tls_policy(
+                acc,
+                &backend_resolution.backends,
+            );
+            let backend_tls_overlay = match backend_tls_policy {
+                super::backend_tls_policy::BackendTlsPolicyLookup::None => None,
+                super::backend_tls_policy::BackendTlsPolicyLookup::Apply(overlay) => Some(overlay),
+                super::backend_tls_policy::BackendTlsPolicyLookup::Fault { .. } => {
+                    // Fail closed: drop backends and force an HTTP 500 fault so
+                    // traffic never reaches a Service under a broken TLS policy.
+                    let fault_weight = backend_resolution
+                        .backends
+                        .iter()
+                        .fold(0u32, |sum, backend| sum.saturating_add(backend.weight));
+                    backend_resolution.invalid_weight = backend_resolution
+                        .invalid_weight
+                        .saturating_add(fault_weight);
+                    backend_resolution.valid_weight = 0;
+                    backend_resolution.backends.clear();
+                    backend_resolution
+                        .fault_reason
+                        .get_or_insert(BackendRefFaultReason::InvalidBackendTlsPolicy);
+                    None
+                }
+            };
             let session_persistence = resolve_rule_session_persistence(
                 object,
                 rule,
@@ -4407,6 +4433,7 @@ fn http_route_resources(
                 upstream_id,
                 mut pending_upstream,
                 requires_node_waypoint_authz,
+                backend_scheme,
             ) = if backend_resolution.backends.is_empty() {
                 if !has_only_zero_weight_backend_refs(rule) && !has_route_actions {
                     continue;
@@ -4417,8 +4444,12 @@ fn http_route_resources(
                     None,
                     None,
                     false,
+                    BackendScheme::Http,
                 )
-            } else if backend_resolution.backends.len() == 1 && session_persistence.is_none() {
+            } else if backend_resolution.backends.len() == 1
+                && backend_tls_overlay.is_none()
+                && session_persistence.is_none()
+            {
                 let Some(backend) = backend_resolution.backends.into_iter().next() else {
                     continue;
                 };
@@ -4430,8 +4461,13 @@ fn http_route_resources(
                     None,
                     None,
                     requires_node_waypoint_authz,
+                    BackendScheme::Http,
                 )
             } else {
+                // Multi-backend rules, BackendTLSPolicy overlays, and session
+                // persistence use an Upstream so SNI/SAN/CA and sticky cookies
+                // can be projected (direct proxies have no serialized
+                // backend_tls_sni field).
                 let requires_node_waypoint_authz =
                     route_backends_require_node_waypoint_authz(&backend_resolution.backends);
                 let route_suffix = route_scoped_suffix(
@@ -4446,18 +4482,25 @@ fn http_route_resources(
                     &object.metadata.name,
                     &route_suffix,
                 );
-                let upstream = upstream_for_route_with_session(
+                let mut upstream = upstream_for_route_with_session(
                     upstream_id.clone(),
                     config_namespace.clone(),
                     backend_resolution.backends,
                     session_persistence.as_ref(),
                 );
+                let backend_scheme = if let Some(overlay) = backend_tls_overlay.as_ref() {
+                    super::backend_tls_policy::apply_to_upstream(&mut upstream, overlay);
+                    BackendScheme::Https
+                } else {
+                    BackendScheme::Http
+                };
                 (
                     String::new(),
                     0,
                     Some(upstream_id),
                     Some(upstream),
                     requires_node_waypoint_authz,
+                    backend_scheme,
                 )
             };
 
@@ -4517,7 +4560,7 @@ fn http_route_resources(
                         backend_host: backend_host.clone(),
                         backend_port,
                         upstream_id: upstream_id.clone(),
-                        backend_scheme: BackendScheme::Http,
+                        backend_scheme,
                         listen_port: None,
                         retry: None,
                         backend_read_timeout_ms: None,
@@ -5218,6 +5261,9 @@ fn backend_ref_fault_value_with_percentage(
         }
         BackendRefFaultReason::NoServiceableBackend => {
             "Gateway API rule has no serviceable backendRefs"
+        }
+        BackendRefFaultReason::InvalidBackendTlsPolicy => {
+            "Gateway API BackendTLSPolicy for backend Service is invalid or conflicting"
         }
     };
     serde_json::json!({

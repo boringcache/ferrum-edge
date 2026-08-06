@@ -19,6 +19,7 @@ use ferrum_edge::proxy::backend_capabilities::{
 };
 use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
 use ferrum_edge::proxy::http2_pool::Http2ConnectionPool;
+use ferrum_edge::tls::source::SYSTEM_TRUST_ROOTS_SOURCE;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -468,6 +469,18 @@ async fn connection_pool_key_global_no_verify_overrides_proxy() {
     assert!(
         key.contains("|0|svidg=static|rcfg="),
         "global no_verify should override proxy verify=true: {key}"
+    );
+}
+
+#[tokio::test]
+async fn connection_pool_key_system_roots_ignore_global_no_verify() {
+    let pool = pool_with_global_tls(None, None, None, true);
+    let mut proxy = minimal_proxy();
+    proxy.resolved_tls.server_ca_cert_path = Some(SYSTEM_TRUST_ROOTS_SOURCE.to_string());
+    let key = pool.pool_key_for_warmup(&proxy);
+    assert!(
+        key.contains("|1|svidg=static|rcfg="),
+        "system:// must retain effective verification in the inspectable pool key: {key}"
     );
 }
 

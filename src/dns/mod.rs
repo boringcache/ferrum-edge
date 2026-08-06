@@ -2567,6 +2567,15 @@ pub struct DnsCacheResolver {
     /// the requested name. The immutable snapshot is reference-counted so a
     /// resolver call does not allocate a fresh override string.
     dns_override: Option<Arc<str>>,
+    /// Name this resolver answers with, regardless of the name it is asked for.
+    ///
+    /// Used where the URL authority is deliberately NOT the dial target — the
+    /// backend TLS server-name override on the active HTTP health probe, whose
+    /// URL host is the overridden server name so reqwest presents it as SNI.
+    /// Pinning the *name* rather than a single address keeps the probe's full
+    /// candidate set, rotation, and egress screening identical to an ordinary
+    /// probe, while guaranteeing the server name itself is never resolved.
+    hostname_pin: Option<Arc<str>>,
 }
 
 impl DnsCacheResolver {
@@ -2574,6 +2583,7 @@ impl DnsCacheResolver {
         Self {
             cache,
             dns_override: None,
+            hostname_pin: None,
         }
     }
 
@@ -2587,6 +2597,17 @@ impl DnsCacheResolver {
         Self {
             cache,
             dns_override: dns_override.map(Arc::from),
+            hostname_pin: None,
+        }
+    }
+
+    /// Build a resolver that answers EVERY requested name by resolving
+    /// `hostname_pin` instead. See the field docs for why this exists.
+    pub fn with_hostname_pin(cache: DnsCache, hostname_pin: &str) -> Self {
+        Self {
+            cache,
+            dns_override: None,
+            hostname_pin: Some(Arc::from(hostname_pin)),
         }
     }
 }
@@ -2594,7 +2615,10 @@ impl DnsCacheResolver {
 impl reqwest::dns::Resolve for DnsCacheResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let cache = self.cache.clone();
-        let hostname = name.as_str().to_string();
+        let hostname = match self.hostname_pin.as_deref() {
+            Some(pin) => pin.to_string(),
+            None => name.as_str().to_string(),
+        };
         let dns_override = self.dns_override.clone();
 
         Box::pin(async move {

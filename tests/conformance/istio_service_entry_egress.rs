@@ -379,3 +379,131 @@ fn se_host_normalization() {
     let se = config.mesh.unwrap().service_entries[0].clone();
     assert_eq!(se.hosts, vec!["api.example.com".to_string()]);
 }
+
+/// Istio `Sidecar.outboundTrafficPolicy` overrides the mesh-wide policy for the
+/// workloads that `Sidecar` selects — issue #3262.
+///
+/// Both directions are exercised: a workload-scoped `REGISTRY_ONLY` arms the
+/// registry gate over an `ALLOW_ANY` mesh, and a workload-scoped `ALLOW_ANY`
+/// disarms it over a `REGISTRY_ONLY` mesh.
+#[test]
+fn sidecar_outbound_traffic_policy_overrides_the_mesh_wide_policy() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Sidecar.outboundTrafficPolicy overrides MeshConfig.outboundTrafficPolicy",
+        status = Status::Supported,
+        notes = "Issue #3262: the applicable Sidecar's mode wins for its selected workloads, in both directions, under FERRUM_MESH_SIDECAR_ENFORCED (dry-run excluded).",
+    );
+
+    for (mesh_wide, sidecar_mode, expect_plugin) in [
+        (
+            OutboundTrafficPolicy::AllowAny,
+            OutboundTrafficPolicy::RegistryOnly,
+            true,
+        ),
+        (
+            OutboundTrafficPolicy::RegistryOnly,
+            OutboundTrafficPolicy::AllowAny,
+            false,
+        ),
+    ] {
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                sidecars: vec![ferrum_edge::modes::mesh::config::MeshSidecar {
+                    name: "default-sidecar".to_string(),
+                    namespace: "default".to_string(),
+                    workload_selector: None,
+                    egress_inherits_defaults: false,
+                    egress: vec![ferrum_edge::modes::mesh::config::MeshSidecarEgress {
+                        hosts: vec!["*/*".to_string()],
+                        port: None,
+                    }],
+                    ingress_declared: false,
+                    ingress: Vec::new(),
+                    outbound_traffic_policy: Some(sidecar_mode),
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let mut runtime = sidecar_runtime_with_policy(mesh_wide);
+        runtime.namespace = "default".to_string();
+        runtime.sidecar_enforced = true;
+        let prepared =
+            prepare_gateway_config_for_mesh(config, &runtime).expect("mesh apply succeeds");
+        let injected = prepared
+            .plugin_configs
+            .iter()
+            .any(|p| p.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID);
+        assert_eq!(
+            injected,
+            expect_plugin,
+            "mesh-wide {mesh_wide:?} + Sidecar {sidecar_mode:?} must \
+             {} the registry gate",
+            if expect_plugin { "arm" } else { "disarm" }
+        );
+    }
+}
+
+/// A present-but-unrepresentable `Sidecar.outboundTrafficPolicy` is accepted and
+/// enforced as `REGISTRY_ONLY` rather than rejected — issue #3262.
+///
+/// Rejecting the resource would drop its `egress` narrowing as well, widening
+/// both the workload's service view and the registry derived from it.
+#[test]
+fn sidecar_unrepresentable_outbound_traffic_policy_fails_closed() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Sidecar.outboundTrafficPolicy unsupported variants fail closed to REGISTRY_ONLY",
+        status = Status::Supported,
+        notes = "Issue #3262: unknown/non-string mode, non-object block, and egressProxy all enforce REGISTRY_ONLY with a field-specific deferred_fields entry; the Sidecar itself stays accepted. An omitted mode uses Istio's documented ALLOW_ANY default.",
+    );
+
+    let cases = [
+        json!({ "mode": "ALOW_ANY" }),
+        json!({ "mode": 1 }),
+        json!("REGISTRY_ONLY"),
+        json!({
+            "mode": "ALLOW_ANY",
+            "egressProxy": { "host": "istio-egressgateway.istio-system.svc.cluster.local" },
+        }),
+    ];
+    for policy in cases {
+        let object = K8sObject {
+            api_version: "networking.istio.io/v1".to_string(),
+            kind: "Sidecar".to_string(),
+            metadata: K8sMetadata {
+                name: "degraded".to_string(),
+                uid: String::new(),
+                namespace: "default".to_string(),
+                generation: Some(1),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                creation_timestamp: None,
+                deletion_timestamp: None,
+            },
+            spec: json!({
+                "egress": [{ "hosts": ["*/*"] }],
+                "outboundTrafficPolicy": policy,
+            }),
+            status: Value::Object(serde_json::Map::new()),
+        };
+        let translation = translate_k8s_objects(&[object], options()).expect("translation");
+        let mesh = translation.config.mesh.as_deref().expect("mesh block");
+        assert_eq!(
+            mesh.sidecars.len(),
+            1,
+            "the Sidecar must survive translation for {policy}"
+        );
+        assert_eq!(
+            mesh.sidecars[0].outbound_traffic_policy,
+            Some(OutboundTrafficPolicy::RegistryOnly),
+            "{policy} must fail closed to REGISTRY_ONLY"
+        );
+        assert_eq!(
+            mesh.sidecars[0].egress.len(),
+            1,
+            "{policy} must not cost the Sidecar its egress narrowing"
+        );
+    }
+}

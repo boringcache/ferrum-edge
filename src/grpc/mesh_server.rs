@@ -1411,6 +1411,7 @@ mod tests {
             }],
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }];
         let config = GatewayConfig {
             mesh: Some(Box::new(mesh)),

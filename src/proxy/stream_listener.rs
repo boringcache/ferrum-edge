@@ -227,6 +227,11 @@ impl BackendTlsReloadKey {
         global_tls_ca_bundle_path: Option<&str>,
         crl_fingerprint: Option<&str>,
     ) -> Self {
+        // Deliberately the RAW configured value, not `effective_ca_source`: this
+        // key is a source *identity*, and `system://` must stay distinguishable
+        // from "no CA configured" (which falls back to the global bundle). The
+        // sentinel has no loadable material, so its fingerprint is a stable
+        // unsupported-scheme marker rather than file content.
         let server_ca_cert_source = proxy
             .resolved_tls
             .server_ca_cert_path
