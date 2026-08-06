@@ -216,6 +216,13 @@ jobs:
           GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
         run: bash scripts/gateway_api_tcproute_conformance.sh blackbox
 
+      - name: Run Ferrum Gateway API TLSRoute black-box checks
+        # Ferrum-specific SNI passthrough/status/update/delete coverage; this does
+        # not claim an upstream GATEWAY-TLS profile on the pinned Gateway API version.
+        env:
+          GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
+        run: bash scripts/gateway_api_tlsroute_conformance.sh blackbox
+
       - name: Collect diagnostics
         if: always()
         env:
@@ -227,6 +234,10 @@ jobs:
       - name: Collect TCPRoute diagnostics
         if: always()
         run: bash scripts/gateway_api_tcproute_conformance.sh diagnostics
+
+      - name: Collect TLSRoute diagnostics
+        if: always()
+        run: bash scripts/gateway_api_tlsroute_conformance.sh diagnostics
 
       - name: Upload conformance artifacts
         if: always()

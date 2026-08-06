@@ -265,7 +265,15 @@ pub(super) fn translate(
             Ok(true)
         }
         "TLSRoute" => {
-            for proxy in l4_route_proxies(object, acc, BackendScheme::Tcps)? {
+            // Gateway API TLSRoute is SNI-matched TLS passthrough on TLS
+            // listeners (typically `tls.mode: Passthrough`): peek ClientHello
+            // SNI against route hostnames and forward encrypted bytes with no
+            // termination — same stream+SNI machinery as VirtualService tls[]
+            // and east-west passthrough. BackendScheme::Tcp + passthrough is
+            // required; Tcps without passthrough would terminate or originate
+            // TLS and ignore hostname SNI selection.
+            for mut proxy in l4_route_proxies(object, acc, BackendScheme::Tcp)? {
+                proxy.passthrough = true;
                 acc.upsert_proxy(proxy, SourceKind::GatewayApi);
             }
             Ok(true)
@@ -1472,7 +1480,7 @@ pub(super) fn collect_gateway_listener_policy(
     };
     for listener in listeners {
         let listener_name = string_field(listener, "name").unwrap_or("listener");
-        let requires_frontend_tls = listener_is_terminating_tls(listener);
+        let requires_frontend_tls = listener_requires_frontend_tls(listener);
         let (namespaces, validation_error) = match allowed_route_namespaces(listener) {
             Ok(namespaces) => (namespaces, None),
             Err(error) => {
@@ -1483,8 +1491,15 @@ pub(super) fn collect_gateway_listener_policy(
                 (GatewayApiAllowedRoutesNamespaces::Invalid, Some(error))
             }
         };
-        let materializable =
-            validation_error.is_none() && listener_is_materializable(acc, object, listener);
+        if !listener_protocol_mode_is_supported(listener) {
+            acc.warnings.push(format!(
+                "Gateway API Gateway {}/{} listener {} rejected: spec.listeners[].tls.mode must be Passthrough for protocol TLS",
+                object.metadata.namespace, object.metadata.name, listener_name
+            ));
+        }
+        let materializable = validation_error.is_none()
+            && listener_protocol_mode_is_supported(listener)
+            && listener_is_materializable(acc, object, listener);
         let policy = GatewayApiListenerPolicy {
             namespaces,
             validation_error,
@@ -1517,7 +1532,10 @@ pub(super) fn collect_gateway_listener_policy(
 /// unresolved or unauthorized reference still fails the whole listener closed,
 /// so a listener never serves a partially-resolved certificate set.
 fn listener_is_materializable(acc: &K8sAccumulator, object: &K8sObject, listener: &Value) -> bool {
-    if !listener_is_terminating_tls(listener) {
+    if !listener_protocol_mode_is_supported(listener) {
+        return false;
+    }
+    if !listener_requires_frontend_tls(listener) {
         return true;
     }
     listener_frontend_tls_sources(acc, object, listener).is_some_and(|sources| !sources.is_empty())
@@ -1537,7 +1555,7 @@ fn collect_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject) {
     let mut warnings = Vec::new();
     for listener in listeners
         .iter()
-        .filter(|listener| listener_is_terminating_tls(listener))
+        .filter(|listener| listener_requires_frontend_tls(listener))
     {
         let listener_name = string_field(listener, "name").unwrap_or("listener");
         let Some(certificates) = listener_frontend_tls_sources(acc, object, listener) else {
@@ -1719,6 +1737,26 @@ fn listener_is_terminating_tls(listener: &Value) -> bool {
     string_field(tls, "mode")
         .unwrap_or("Terminate")
         .eq_ignore_ascii_case("Terminate")
+}
+
+fn listener_is_tls_protocol(listener: &Value) -> bool {
+    string_field(listener, "protocol").is_some_and(|protocol| protocol.eq_ignore_ascii_case("TLS"))
+}
+
+/// Ferrum implements the Gateway API TLSRoute core behavior: encrypted SNI
+/// passthrough. The separate TLSRouteModeTerminate feature is not advertised
+/// and must not be materialized as passthrough or poison the HTTPS certificate
+/// slot until its decrypt-and-forward semantics are implemented end to end.
+fn listener_protocol_mode_is_supported(listener: &Value) -> bool {
+    !listener_is_tls_protocol(listener)
+        || listener
+            .get("tls")
+            .and_then(|tls| string_field(tls, "mode"))
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("Passthrough"))
+}
+
+fn listener_requires_frontend_tls(listener: &Value) -> bool {
+    listener_is_terminating_tls(listener) && !listener_is_tls_protocol(listener)
 }
 
 /// Every `(cert_source, key_source)` pair a listener's `certificateRefs` name,
@@ -3819,10 +3857,20 @@ fn mesh_services_from_gateway(
             {
                 return Ok(());
             }
+            if !listener_protocol_mode_is_supported(listener) {
+                acc.warnings.push(format!(
+                    "Gateway API Gateway {}/{} listener {} uses unsupported protocol TLS with a non-Passthrough mode and will not be exposed",
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    listener_name
+                ));
+                return Ok(());
+            }
             // Readiness is now per listener, not per namespace: one Gateway's
             // unresolved certificateRef no longer withdraws a sibling
             // listener's TLS material (#3268).
-            if listener_is_terminating_tls(listener) && !tls_ready_listeners.contains(listener_name)
+            if listener_requires_frontend_tls(listener)
+                && !tls_ready_listeners.contains(listener_name)
             {
                 acc.warnings.push(format!(
                     "Gateway API Gateway {}/{} listener {} has unresolved TLS material and will not be exposed",
@@ -5683,6 +5731,17 @@ fn l4_route_proxies(
     );
     let materialized_listener_ports =
         l4_route_listener_ports_for_namespace(object, acc, Some(&object.metadata.namespace));
+    let has_gateway_parent_ref = object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .is_some_and(|parent_refs| parent_refs.iter().any(parent_ref_is_gateway));
+    if has_gateway_parent_ref && materialized_listener_ports.is_empty() {
+        // A parented L4 route has no standalone/default listener semantics.
+        // Falling back to backend_port here would expose traffic after its
+        // named Gateway listener was rejected or left unmaterialized.
+        return Ok(Vec::new());
+    }
     let mut proxies = Vec::new();
     for (rule_index, rule) in object
         .spec
@@ -5911,6 +5970,9 @@ fn listener_route_kinds_for_protocol(protocol: Option<&str>) -> Vec<&'static str
 }
 
 fn listener_allowed_route_kinds(listener: &Value) -> HashSet<String> {
+    if !listener_protocol_mode_is_supported(listener) {
+        return HashSet::new();
+    }
     let protocol_kinds = listener_route_kinds_for_protocol(string_field(listener, "protocol"));
     if protocol_kinds.is_empty() {
         return HashSet::new();
@@ -11494,6 +11556,107 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("only zero-weight backendRefs"))
+        );
+    }
+
+    #[test]
+    fn tls_route_materializes_sni_passthrough_on_gateway_tls_listener_port() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Passthrough"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TLSRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "tls"}],
+                "hostnames": ["db.example.com"],
+                "rules": [{
+                    "backendRefs": [{"name": "db", "port": 5432}]
+                }]
+            }),
+        );
+
+        let result =
+            translate_k8s_objects(&[gateway, route], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        let proxy = &result.config.proxies[0];
+        assert_eq!(proxy.listen_port, Some(15443));
+        assert_eq!(proxy.backend_port, 5432);
+        assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
+        assert!(
+            proxy.passthrough,
+            "TLSRoute must be SNI passthrough (encrypted bytes, no termination)"
+        );
+        assert_eq!(proxy.hosts, vec!["db.example.com".to_string()]);
+        assert!(
+            !proxy.frontend_tls,
+            "passthrough and frontend_tls are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn tls_route_rejects_terminate_listener_without_backend_port_fallback() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls-terminate",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Terminate"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TLSRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "tls-terminate"}],
+                "hostnames": ["db.example.com"],
+                "rules": [{
+                    "backendRefs": [{"name": "db", "port": 5432}]
+                }]
+            }),
+        );
+
+        let error = translate_k8s_objects(&[gateway, route], options())
+            .expect_err("TLSRouteModeTerminate must fail closed until implemented");
+
+        assert!(error.to_string().contains("not permitted"));
+        assert!(error.to_string().contains("Gateway listener"));
+    }
+
+    #[test]
+    fn parented_l4_route_without_materialized_listener_never_uses_backend_port() {
+        let result = translate_k8s_objects(
+            &[object(
+                "TLSRoute",
+                serde_json::json!({
+                    "parentRefs": [{"name": "missing-gateway"}],
+                    "hostnames": ["db.example.com"],
+                    "rules": [{
+                        "backendRefs": [{"name": "db", "port": 5432}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("unknown parent is represented as an unmaterialized route");
+
+        assert!(
+            result.config.proxies.is_empty(),
+            "a parented route must not expose the backend port as a listener"
         );
     }
 

@@ -16320,7 +16320,8 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     // exactly one listener — the NodeWaypoint inbound capture socket, which
     // opts in explicitly in `proxy::node_waypoint_ingress_capture` — and never
     // to a whole class of listeners on the strength of a process-wide env var.
-    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)?;
+    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)
+        .map_err(|err| err.context("Proxy listener bind failed"))?;
 
     // Optional connection limit. Shared across all accept threads so the global
     // max_connections limit is enforced regardless of which thread accepted.
@@ -16346,7 +16347,8 @@ async fn start_proxy_listener_with_tls_source_and_signal(
 
         // Spawn additional listeners (threads 1..N-1)
         for i in 1..accept_threads {
-            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)?;
+            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)
+                .map_err(|err| err.context("Proxy listener bind failed"))?;
             let state = Arc::clone(&state);
             let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();
