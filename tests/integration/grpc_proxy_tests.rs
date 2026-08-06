@@ -1590,7 +1590,7 @@ async fn grpc_web_early_rejects_are_browser_safe_on_h1_and_h2() {
             Method::POST,
             "/missing/pkg.Service/Call",
             "route miss",
-            5u32,
+            12u32,
         ),
         (
             Method::PUT,

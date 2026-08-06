@@ -203,7 +203,11 @@ metadata:
   name: blackbox-grpc-exact
   namespace: ${DP_GATEWAY_NAMESPACE}
 spec:
-  hostnames: ["grpc.blackbox.example"]
+  # Keep this authority distinct from the legacy declared-unsupported fixture
+  # in gateway_api_data_plane_conformance.sh. Both suites share host port 80,
+  # so reusing that fixture's authority would make its catch-all GRPCRoute
+  # compete with these exact-method routes.
+  hostnames: ["grpc-live.blackbox.example"]
   parentRefs:
     - name: ferrum-blackbox-grpc
       sectionName: http
@@ -346,25 +350,33 @@ YAML
 grpc_call() {
   local authority="$1"
   local method="$2"
-  shift 2
+  local metadata="${3:-}"
   # Plaintext h2c prior-knowledge against the kind NodePort mapped to host :80.
   # Reflection is enabled on echo-basic, so no local .proto is required.
-  grpcurl -plaintext \
-    -authority "$authority" \
-    -emit-defaults \
-    "$@" \
-    "${GATEWAY_API_STATUS_ADDRESS}:80" \
-    "$method"
+  if [ -n "$metadata" ]; then
+    grpcurl -plaintext \
+      -authority "$authority" \
+      -emit-defaults \
+      -H "$metadata" \
+      "${GATEWAY_API_STATUS_ADDRESS}:80" \
+      "$method"
+  else
+    grpcurl -plaintext \
+      -authority "$authority" \
+      -emit-defaults \
+      "${GATEWAY_API_STATUS_ADDRESS}:80" \
+      "$method"
+  fi
 }
 
 wait_for_grpc_backend() {
   local authority="$1"
   local method="$2"
   local expected_backend="$3"
-  shift 3
+  local metadata="${4:-}"
   local body=""
   for _ in $(seq 1 60); do
-    if body="$(grpc_call "$authority" "$method" "$@" 2>/dev/null)" \
+    if body="$(grpc_call "$authority" "$method" "$metadata" 2>/dev/null)" \
       && grep -q "$expected_backend" <<<"$body"; then
       printf '%s\n' "$body"
       return 0
@@ -379,10 +391,9 @@ wait_for_grpc_status() {
   local authority="$1"
   local method="$2"
   local expected_code="$3"
-  shift 3
   local err=""
   for _ in $(seq 1 60); do
-    if err="$(grpc_call "$authority" "$method" "$@" 2>&1 >/dev/null)"; then
+    if err="$(grpc_call "$authority" "$method" 2>&1 >/dev/null)"; then
       echo "expected non-OK gRPC status ${expected_code} for ${authority} ${method}, but call succeeded" >&2
       return 1
     fi
@@ -447,17 +458,17 @@ run_grpc_blackbox_tests() {
   wait_for_grpcroute_parent_condition blackbox-grpc-exact ResolvedRefs True | tee -a "$report"
   wait_for_grpcroute_parent_condition blackbox-grpc-exact Programmed True | tee -a "$report"
 
-  wait_for_grpc_backend grpc.blackbox.example "$GRPC_METHOD_ECHO" "blackbox-grpc-a" | tee -a "$report"
-  wait_for_grpc_backend grpc.blackbox.example "$GRPC_METHOD_ECHO_TWO" "blackbox-grpc-b" | tee -a "$report"
+  wait_for_grpc_backend grpc-live.blackbox.example "$GRPC_METHOD_ECHO" "blackbox-grpc-a" | tee -a "$report"
+  wait_for_grpc_backend grpc-live.blackbox.example "$GRPC_METHOD_ECHO_TWO" "blackbox-grpc-b" | tee -a "$report"
   echo "GRPCRoute exact method matching served Echo→a and EchoTwo→b" >> "$report"
 
-  wait_for_grpc_status grpc.blackbox.example "$GRPC_METHOD_ECHO_THREE" Unimplemented | tee -a "$report"
+  wait_for_grpc_status grpc-live.blackbox.example "$GRPC_METHOD_ECHO_THREE" Unimplemented | tee -a "$report"
   echo "GRPCRoute unmatched method failed closed with Unimplemented (trailers-only)" >> "$report"
 
   wait_for_grpc_backend grpc-header.blackbox.example "$GRPC_METHOD_ECHO" "blackbox-grpc-a" \
-    -H 'version: one' | tee -a "$report"
+    'version: one' | tee -a "$report"
   wait_for_grpc_backend grpc-header.blackbox.example "$GRPC_METHOD_ECHO" "blackbox-grpc-b" \
-    -H 'version: two' | tee -a "$report"
+    'version: two' | tee -a "$report"
   echo "GRPCRoute header matching selected backends by version metadata" >> "$report"
 
   wait_for_grpcroute_parent_condition blackbox-grpc-cross Accepted True | tee -a "$report"
