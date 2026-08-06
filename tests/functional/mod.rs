@@ -1,3 +1,4 @@
+mod functional_a2a_gateway_grpc_card_test;
 mod functional_admin_connection_limit_test;
 mod functional_admin_crud_resources_test;
 mod functional_admin_observability_test;
