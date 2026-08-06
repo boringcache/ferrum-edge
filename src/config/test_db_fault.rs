@@ -50,7 +50,7 @@ mod active {
     static CONTROL: RwLock<Option<Arc<Control>>> = RwLock::new(None);
 
     /// Arm the injector from `FERRUM_TEST_DB_FAULT_CONTROL` if set.
-    pub async fn arm_from_env() {
+    pub(super) async fn arm_from_env() {
         let path = match std::env::var(CONTROL_ENV) {
             Ok(value) => {
                 let trimmed = value.trim();
@@ -65,7 +65,7 @@ mod active {
     }
 
     /// Test/harness helper: arm against an explicit control path.
-    pub async fn arm_path(path: PathBuf) {
+    pub(super) async fn arm_path(path: PathBuf) {
         sqlx::any::install_default_drivers();
         let fault_pool = sqlx::any::AnyPoolOptions::new()
             .max_connections(1)
@@ -89,7 +89,7 @@ mod active {
     }
 
     /// Clear any armed control (unit tests). Production callers never need this.
-    pub fn disarm_for_tests() {
+    pub(super) fn disarm_for_tests() {
         let mut guard = CONTROL
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -97,7 +97,7 @@ mod active {
     }
 
     /// When armed and the control file exists, return the closed fault pool.
-    pub fn tripped_fault_pool() -> Option<AnyPool> {
+    pub(super) fn tripped_fault_pool() -> Option<AnyPool> {
         let guard = CONTROL
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -110,7 +110,7 @@ mod active {
     }
 
     /// Whether the injector is armed (control path configured), regardless of trip.
-    pub fn is_armed() -> bool {
+    pub(super) fn is_armed() -> bool {
         CONTROL
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -119,27 +119,45 @@ mod active {
 }
 
 #[cfg(debug_assertions)]
-pub use active::{arm_from_env, arm_path, disarm_for_tests, is_armed, tripped_fault_pool};
-
-#[cfg(not(debug_assertions))]
-mod release_stubs {
-    use sqlx::AnyPool;
-    use std::path::PathBuf;
-
-    pub async fn arm_from_env() {}
-
-    pub async fn arm_path(_path: PathBuf) {}
-
-    pub fn disarm_for_tests() {}
-
-    pub fn tripped_fault_pool() -> Option<AnyPool> {
-        None
-    }
-
-    pub fn is_armed() -> bool {
-        false
-    }
+pub async fn arm_from_env() {
+    active::arm_from_env().await;
 }
 
 #[cfg(not(debug_assertions))]
-pub use release_stubs::{arm_from_env, arm_path, disarm_for_tests, is_armed, tripped_fault_pool};
+pub async fn arm_from_env() {}
+
+#[cfg(debug_assertions)]
+pub async fn arm_path(path: std::path::PathBuf) {
+    active::arm_path(path).await;
+}
+
+#[cfg(not(debug_assertions))]
+pub async fn arm_path(_path: std::path::PathBuf) {}
+
+#[cfg(debug_assertions)]
+pub fn disarm_for_tests() {
+    active::disarm_for_tests();
+}
+
+#[cfg(not(debug_assertions))]
+pub fn disarm_for_tests() {}
+
+#[cfg(debug_assertions)]
+pub fn tripped_fault_pool() -> Option<sqlx::AnyPool> {
+    active::tripped_fault_pool()
+}
+
+#[cfg(not(debug_assertions))]
+pub fn tripped_fault_pool() -> Option<sqlx::AnyPool> {
+    None
+}
+
+#[cfg(debug_assertions)]
+pub fn is_armed() -> bool {
+    active::is_armed()
+}
+
+#[cfg(not(debug_assertions))]
+pub fn is_armed() -> bool {
+    false
+}

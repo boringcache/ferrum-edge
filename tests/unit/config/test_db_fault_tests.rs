@@ -4,15 +4,21 @@
 //! (ordinary `PoolClosed` connectivity failure) and clears cleanly — without
 //! mutating live SQLite/WAL/SHM files.
 
-use crate::unit::env_lock::{ENV_LOCK, EnvGuard};
+use std::sync::OnceLock;
+
+use crate::unit::env_lock::EnvGuard;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::test_db_fault::{self, CONTROL_ENV};
+use futures_util::FutureExt as _;
+
+fn fault_control_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 #[tokio::test]
 async fn fault_control_trips_pool_to_closed_and_restores() {
-    let _guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _fault_guard = fault_control_lock().lock().await;
 
     test_db_fault::disarm_for_tests();
 
@@ -82,11 +88,14 @@ async fn fault_control_trips_pool_to_closed_and_restores() {
 
 #[tokio::test]
 async fn arm_from_env_requires_control_path() {
+    let _fault_guard = fault_control_lock().lock().await;
     let env = EnvGuard::new(&[CONTROL_ENV]);
 
     test_db_fault::disarm_for_tests();
     env.unset(CONTROL_ENV);
-    test_db_fault::arm_from_env().await;
+    test_db_fault::arm_from_env()
+        .now_or_never()
+        .expect("unset control env must not suspend");
     assert!(
         !test_db_fault::is_armed(),
         "unset {CONTROL_ENV} must leave injector inert"
