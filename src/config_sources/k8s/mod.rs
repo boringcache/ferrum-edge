@@ -649,15 +649,6 @@ impl K8sAccumulator {
             .any(|binding| binding.namespace == namespace && binding.name == name)
     }
 
-    /// Gateway class name recorded on a waypoint binding, when known.
-    pub(crate) fn waypoint_gateway_class(&self, namespace: &str, name: &str) -> Option<&str> {
-        self.mesh
-            .waypoint_bindings
-            .iter()
-            .find(|binding| binding.namespace == namespace && binding.name == name)
-            .and_then(|binding| binding.gateway_class_name.as_deref())
-    }
-
     pub(crate) fn record_service_entry_selector(
         &mut self,
         namespace: String,

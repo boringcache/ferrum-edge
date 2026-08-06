@@ -3674,6 +3674,7 @@ mod tests {
         let slice = MeshSlice {
             node_id: "n1".into(),
             namespace: "ns".into(),
+            waypoint_gateway_class: None,
             workload_spiffe_id: Some("spiffe://td/ns/x/sa/y".into()),
             labels: BTreeMap::from([("app".into(), "web".into())]),
             labels_ambiguous: false,

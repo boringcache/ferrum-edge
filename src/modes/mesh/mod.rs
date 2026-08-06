@@ -22486,6 +22486,7 @@ mod tests {
         let mesh_slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
+            waypoint_gateway_class: None,
             workload_spiffe_id: None,
             waypoint_name: None,
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
