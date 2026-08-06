@@ -2849,7 +2849,6 @@ impl FrontendTlsCertificateSource {
     pub fn listener_identity(&self) -> String {
         format!("{}/{}/{}", self.namespace, self.gateway, self.listener)
     }
-
 }
 
 /// Upper bound on Gateway-delivered frontend TLS certificates in one snapshot.
@@ -3981,9 +3980,9 @@ impl GatewayConfig {
             .as_deref()
             .zip(self.frontend_tls_key_path.as_deref())
             .is_some_and(|(cert_path, key_path)| {
-                self.frontend_tls_certificate_sources.iter().any(|source| {
-                    source.cert_path == cert_path && source.key_path == key_path
-                })
+                self.frontend_tls_certificate_sources
+                    .iter()
+                    .any(|source| source.cert_path == cert_path && source.key_path == key_path)
             });
         // Certificate sources are keyed by owning listener, NOT by namespace:
         // one listener may serve several certificateRefs and one namespace may
@@ -3993,18 +3992,19 @@ impl GatewayConfig {
         // certificateRefs order *within* each listener. Candidate order is the
         // resolver's tie-break when several keys support the same signature
         // schemes, so sorting by certificate path would silently rewrite it.
-        self.frontend_tls_certificate_sources.sort_by(|left, right| {
-            (
-                left.namespace.as_str(),
-                left.gateway.as_str(),
-                left.listener.as_str(),
-            )
-                .cmp(&(
-                    right.namespace.as_str(),
-                    right.gateway.as_str(),
-                    right.listener.as_str(),
-                ))
-        });
+        self.frontend_tls_certificate_sources
+            .sort_by(|left, right| {
+                (
+                    left.namespace.as_str(),
+                    left.gateway.as_str(),
+                    left.listener.as_str(),
+                )
+                    .cmp(&(
+                        right.namespace.as_str(),
+                        right.gateway.as_str(),
+                        right.listener.as_str(),
+                    ))
+            });
         let mut seen_certificate_sources = HashSet::new();
         self.frontend_tls_certificate_sources.retain(|source| {
             seen_certificate_sources.insert((
@@ -4021,8 +4021,8 @@ impl GatewayConfig {
             // the same atomicity the Kubernetes translator enforces and could
             // answer the listener with a different certificate set than the
             // operator declared.
-            let overflow = &self.frontend_tls_certificate_sources
-                [MAX_FRONTEND_TLS_CERTIFICATE_SOURCES];
+            let overflow =
+                &self.frontend_tls_certificate_sources[MAX_FRONTEND_TLS_CERTIFICATE_SOURCES];
             let overflow_listener = (
                 overflow.namespace.clone(),
                 overflow.gateway.clone(),
@@ -4061,11 +4061,7 @@ impl GatewayConfig {
                     }
                 }
             }
-            for (index, source) in self
-                .frontend_tls_certificate_sources
-                .iter_mut()
-                .enumerate()
-            {
+            for (index, source) in self.frontend_tls_certificate_sources.iter_mut().enumerate() {
                 source.default_certificate =
                     default_indexes.get(&source.namespace).copied() == Some(index);
             }

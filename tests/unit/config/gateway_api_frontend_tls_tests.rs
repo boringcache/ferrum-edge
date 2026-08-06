@@ -699,18 +699,18 @@ fn native_normalization_truncates_certificate_sources_on_listener_boundaries() {
         "normalization must preserve certificateRefs order within a listener"
     );
 
-    let mut sources: Vec<FrontendTlsCertificateSource> =
-        (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES - 1)
-            .map(|index| FrontendTlsCertificateSource {
-                namespace: "ferrum".to_string(),
-                gateway: "edge".to_string(),
-                listener: format!("a-{index:03}"),
-                hostname: Some(format!("host-{index}.example.com")),
-                cert_path: format!("/certs/{index}.crt"),
-                key_path: format!("/certs/{index}.key"),
-                default_certificate: false,
-            })
-            .collect();
+    let mut sources: Vec<FrontendTlsCertificateSource> = (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
+        - 1)
+        .map(|index| FrontendTlsCertificateSource {
+            namespace: "ferrum".to_string(),
+            gateway: "edge".to_string(),
+            listener: format!("a-{index:03}"),
+            hostname: Some(format!("host-{index}.example.com")),
+            cert_path: format!("/certs/{index}.crt"),
+            key_path: format!("/certs/{index}.key"),
+            default_certificate: false,
+        })
+        .collect();
     for suffix in ["rsa", "ecdsa"] {
         sources.push(FrontendTlsCertificateSource {
             namespace: "ferrum".to_string(),
@@ -756,17 +756,17 @@ fn native_normalization_truncates_certificate_sources_on_listener_boundaries() {
         "the legacy fallback projection must not point at the withdrawn listener"
     );
 
-    let oversized_group: Vec<FrontendTlsCertificateSource> =
-        (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1)
-            .map(|index| FrontendTlsCertificateSource {
-                namespace: "ferrum".to_string(),
-                gateway: "edge".to_string(),
-                listener: "only-listener".to_string(),
-                cert_path: format!("/certs/oversized-{index}.crt"),
-                key_path: format!("/certs/oversized-{index}.key"),
-                ..Default::default()
-            })
-            .collect();
+    let oversized_group: Vec<FrontendTlsCertificateSource> = (0
+        ..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1)
+        .map(|index| FrontendTlsCertificateSource {
+            namespace: "ferrum".to_string(),
+            gateway: "edge".to_string(),
+            listener: "only-listener".to_string(),
+            cert_path: format!("/certs/oversized-{index}.crt"),
+            key_path: format!("/certs/oversized-{index}.key"),
+            ..Default::default()
+        })
+        .collect();
     let mut only_oversized = GatewayConfig {
         frontend_tls_cert_path: Some("/certs/oversized-0.crt".to_string()),
         frontend_tls_key_path: Some("/certs/oversized-0.key".to_string()),
@@ -802,11 +802,15 @@ fn native_normalization_truncates_certificate_sources_on_listener_boundaries() {
             .is_empty()
     );
     assert_eq!(
-        oversized_with_operator_fallback.frontend_tls_cert_path.as_deref(),
+        oversized_with_operator_fallback
+            .frontend_tls_cert_path
+            .as_deref(),
         Some("/operator/fallback.crt")
     );
     assert_eq!(
-        oversized_with_operator_fallback.frontend_tls_key_path.as_deref(),
+        oversized_with_operator_fallback
+            .frontend_tls_key_path
+            .as_deref(),
         Some("/operator/fallback.key")
     );
 }

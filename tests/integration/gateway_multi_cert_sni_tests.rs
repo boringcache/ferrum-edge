@@ -398,7 +398,11 @@ fn an_invalid_explicit_listener_hostname_fails_the_whole_set_closed() {
     )
     .expect_err("a malformed declared hostname must reject the whole snapshot");
 
-    assert!(error.to_string().contains("invalid explicit listener hostname"));
+    assert!(
+        error
+            .to_string()
+            .contains("invalid explicit listener hostname")
+    );
     assert!(!error.to_string().contains("bad host.example.com"));
 }
 
@@ -459,25 +463,19 @@ async fn an_unmarked_set_still_produces_a_fallback() {
 
 #[test]
 fn runtime_refuses_a_hand_built_certificate_set_over_the_admission_bound() {
-    let certificates: Vec<GatewayCertificateInput> =
-        (0..ferrum_edge::config::types::MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1)
-            .map(|index| GatewayCertificateInput {
-                cert_source: format!("/not-loaded/{index}.crt"),
-                key_source: format!("/not-loaded/{index}.key"),
-                hostname: None,
-                identity: format!("ferrum/edge/listener-{index}"),
-                is_default: index == 0,
-            })
-            .collect();
+    let certificates: Vec<GatewayCertificateInput> = (0
+        ..ferrum_edge::config::types::MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1)
+        .map(|index| GatewayCertificateInput {
+            cert_source: format!("/not-loaded/{index}.crt"),
+            key_source: format!("/not-loaded/{index}.key"),
+            hostname: None,
+            identity: format!("ferrum/edge/listener-{index}"),
+            is_default: index == 0,
+        })
+        .collect();
 
-    let error = load_gateway_multi_cert_tls_config(
-        &certificates,
-        None,
-        None,
-        &tls_policy(),
-        30,
-        &[],
-    )
-    .expect_err("the runtime must enforce the same resident certificate bound");
+    let error =
+        load_gateway_multi_cert_tls_config(&certificates, None, None, &tls_policy(), 30, &[])
+            .expect_err("the runtime must enforce the same resident certificate bound");
     assert!(error.to_string().contains("certificate set exceeds"));
 }

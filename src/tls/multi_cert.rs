@@ -555,11 +555,9 @@ mod tests {
         let candidates = exact.get("api.example.com").expect("SNI candidates");
         assert_eq!(indexed_names, 1, "the bound counts names, not algorithms");
         assert_eq!(candidates.len(), 2);
-        let selected = select_compatible_certified_key(
-            candidates,
-            &[rustls::SignatureScheme::ED25519],
-        )
-        .expect("Ed25519 candidate");
+        let selected =
+            select_compatible_certified_key(candidates, &[rustls::SignatureScheme::ED25519])
+                .expect("Ed25519 candidate");
         assert!(Arc::ptr_eq(&selected, &ed25519));
         assert!(
             select_compatible_certified_key(

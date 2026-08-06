@@ -1668,9 +1668,7 @@ pub(crate) fn finalize_frontend_tls_certificates(acc: &mut K8sAccumulator) {
         // set could select one certificate for the SNI name while the routes
         // are withdrawn, or answer with a different key algorithm than the
         // operator declared. Reserve the whole group before adding any entry.
-        if sources
-            .len()
-            .saturating_add(listener.certificates.len())
+        if sources.len().saturating_add(listener.certificates.len())
             > MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
         {
             acc.warnings.push(format!(
