@@ -2861,6 +2861,19 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Bare probe builder for tests that exercise `apply_probe_dial_identity`
+    /// directly.
+    ///
+    /// The policy-governed builder guard in
+    /// `tests/unit/plugins/plugin_http_client_tests.rs` reads this file as
+    /// source text, so every `reqwest::Client::builder()` chain in it — test
+    /// chains included — must carry the ambient-proxy opt-out the production
+    /// constructors install. Constructing it here keeps that true in one place
+    /// instead of relying on each call site to remember.
+    fn probe_test_builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder().no_proxy()
+    }
+
     struct ProxyEnvGuard {
         saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
@@ -3517,7 +3530,7 @@ mod tests {
         let dns_cache = DnsCache::new(DnsConfig::default());
 
         let pinned = apply_probe_dial_identity(
-            reqwest::Client::builder(),
+            probe_test_builder(),
             Some(dns_cache.clone()),
             Some("pod-a.internal"),
         )
@@ -3529,7 +3542,7 @@ mod tests {
 
         // A probe without an override keeps the ordinary h2-capable client: its
         // URL already names the real target, so there is no authority to lose.
-        let unpinned = apply_probe_dial_identity(reqwest::Client::builder(), Some(dns_cache), None)
+        let unpinned = apply_probe_dial_identity(probe_test_builder(), Some(dns_cache), None)
             .expect("ordinary probe builder");
         assert!(
             !format!("{unpinned:?}").contains("http1_only"),
@@ -3538,7 +3551,7 @@ mod tests {
 
         // And the pin itself stays mandatory: no cache, no client.
         let unpinnable =
-            apply_probe_dial_identity(reqwest::Client::builder(), None, Some("pod-a.internal"));
+            apply_probe_dial_identity(probe_test_builder(), None, Some("pod-a.internal"));
         assert!(
             matches!(unpinnable, Err(HealthCheckClientError::DialPinUnavailable)),
             "an unpinnable SNI probe must not build a builder at all"

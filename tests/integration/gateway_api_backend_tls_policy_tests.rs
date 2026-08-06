@@ -484,9 +484,13 @@ fn fault_body_mentions(translated: &ferrum_edge::config_sources::k8s::K8sTransla
                 .into_iter()
                 .flatten()
                 .any(|rule| {
+                    // `mesh_route_dispatch`'s `FaultAbortConfig` spells this
+                    // `status_code` and is `deny_unknown_fields`; matching on
+                    // `status` would never fire and would make every
+                    // fail-closed assertion below vacuous.
                     rule.get("fault")
                         .and_then(|fault| fault.get("abort"))
-                        .and_then(|abort| abort.get("status"))
+                        .and_then(|abort| abort.get("status_code"))
                         .and_then(serde_json::Value::as_u64)
                         == Some(500)
                         && rule

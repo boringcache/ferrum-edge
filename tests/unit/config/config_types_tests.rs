@@ -2983,8 +2983,13 @@ fn subset_sni_upstream(
     upstream
 }
 
+/// A DestinationRule subset that forces HTTP/1.1 (`DO_NOT_UPGRADE`) beside an
+/// applicable SNI override is an ordinary shape, not an unrepresentable one:
+/// the reqwest HTTP/1.1 dial carries the server name in the URL authority with
+/// the real target pinned on the resolver. Admission used to reject it on the
+/// premise that only the direct-H2 pool could present an SNI override.
 #[test]
-fn backend_tls_sni_with_subset_do_not_upgrade_fails_validate() {
+fn backend_tls_sni_with_subset_do_not_upgrade_is_admitted() {
     let upstream = subset_sni_upstream(
         ResolvedSubsetTrafficPolicy {
             tls: None,
@@ -3011,14 +3016,10 @@ fn backend_tls_sni_with_subset_do_not_upgrade_fails_validate() {
     config.proxies = vec![proxy];
     config.normalize_fields();
 
-    let err = config.validate_upstream_references().unwrap_err();
+    let errors = sni_admission_errors(&config);
     assert!(
-        err.iter().any(|msg| {
-            msg.contains("h2UpgradePolicy is DO_NOT_UPGRADE")
-                && msg.contains("backend TLS SNI")
-                && msg.contains("direct HTTP/2")
-        }),
-        "selected subset DO_NOT_UPGRADE + applicable SNI must reject, got {err:?}"
+        errors.is_empty(),
+        "selected subset DO_NOT_UPGRADE + applicable SNI must be admitted; got {errors:?}"
     );
 }
 
@@ -3189,8 +3190,11 @@ fn backend_tls_sni_per_port_default_clears_inherited_do_not_upgrade() {
     );
 }
 
+/// Per-port `DO_NOT_UPGRADE` beside a per-port SNI override is admitted for the
+/// same reason as the subset shape above: the HTTP/1.1 dial can present the
+/// server name, so neither the SNI-bearing port nor its sibling is rejected.
 #[test]
-fn backend_tls_sni_per_port_do_not_upgrade_rejects_only_that_port() {
+fn backend_tls_sni_per_port_do_not_upgrade_is_admitted() {
     let mut upstream = make_upstream("sni-mixed-ports");
     let mut port_sni = BackendTlsConfig::default_verify();
     port_sni.sni = Some("reviews.mesh.internal".into());
@@ -3218,15 +3222,10 @@ fn backend_tls_sni_per_port_do_not_upgrade_rejects_only_that_port() {
     config.proxies = vec![proxy];
     config.normalize_fields();
 
-    let err = config.validate_upstream_references().unwrap_err();
+    let errors = sni_admission_errors(&config);
     assert!(
-        err.iter().any(|msg| {
-            msg.contains("h2UpgradePolicy is DO_NOT_UPGRADE")
-                && msg.contains("per-port TLS SNI")
-                && msg.contains("8443")
-                && msg.contains("reviews.mesh.internal")
-        }),
-        "only the DO_NOT_UPGRADE SNI port must reject, got {err:?}"
+        errors.is_empty(),
+        "a per-port DO_NOT_UPGRADE SNI overlay must be admitted; got {errors:?}"
     );
 }
 

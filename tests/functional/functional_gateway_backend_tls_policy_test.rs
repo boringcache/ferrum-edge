@@ -47,6 +47,11 @@ use tokio::time::sleep;
 
 const BACKEND_SNI: &str = "backend.example.com";
 const ROUTE_HOST: &str = "app.example.com";
+/// Kubernetes namespace every fixture object lives in. It is also the
+/// translation namespace, so every emitted resource is stamped with it — which
+/// makes it the namespace the gateway subprocess must be told to load
+/// (`FERRUM_NAMESPACE`), since file mode filters the document by namespace.
+const K8S_NAMESPACE: &str = "default";
 /// Cluster DNS name the translator emits for the `reviews` Service in
 /// `default`. This is the authority the BACKEND must see, and it is distinct
 /// from `BACKEND_SNI` — which is the whole point of the Host assertion.
@@ -194,7 +199,7 @@ fn k8s_object(api_version: &str, kind: &str, name: &str, spec: Value) -> K8sObje
         metadata: K8sMetadata {
             name: name.to_string(),
             uid: String::new(),
-            namespace: "default".to_string(),
+            namespace: K8S_NAMESPACE.to_string(),
             generation: Some(1),
             labels: Default::default(),
             creation_timestamp: None,
@@ -334,7 +339,7 @@ fn k8s_objects(
 /// suite exercises).
 fn translated_config_yaml(objects: &[K8sObject]) -> String {
     let options = K8sTranslationOptions::new(
-        "default".to_string(),
+        K8S_NAMESPACE.to_string(),
         TrustDomain::new("cluster.local").expect("trust domain"),
     );
     let mut translated = translate_k8s_objects(objects, options).expect("translate");
@@ -443,6 +448,12 @@ async fn start_gateway(config_yaml: &str, extra_env: Vec<(String, String)>) -> (
         let proxy_http = ports.port(PROXY_HTTP);
         let mut builder = TestGateway::builder()
             .mode_file(config_yaml.to_string())
+            // The translator stamps every resource with the Kubernetes
+            // namespace (`default`), and file mode filters the loaded document
+            // down to `FERRUM_NAMESPACE` — whose default is `ferrum`. Without
+            // this the child starts cleanly on an empty config and answers
+            // every probe with 404 instead of exercising backend TLS.
+            .namespace(K8S_NAMESPACE)
             // The outer loop owns retries so each attempt gets a fresh
             // reservation set; an inner retry would reuse these ports.
             .max_attempts(1)
