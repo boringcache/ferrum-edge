@@ -388,3 +388,26 @@ fn workload_selector_still_matches_without_target_refs() {
     );
     assert!(matching.policy_applies(&policy));
 }
+
+#[test]
+fn same_source_attestation_ignores_service_projection_membership() {
+    let labels = HashMap::from([("app".to_string(), "api".to_string())]);
+    let via_api = cache_with_service(labels.clone(), "default", "api");
+    let via_alias = cache_with_service(labels, "default", "api-alias");
+
+    assert!(
+        via_api.same_source_attestation(&via_alias),
+        "one pod projected through multiple Services retains one source attestation"
+    );
+    assert_ne!(
+        via_api, via_alias,
+        "destination membership still differs for Service targetRefs matching"
+    );
+
+    let mut conflicting = via_api.clone();
+    conflicting.labels = HashMap::from([("app".to_string(), "other".to_string())]);
+    assert!(
+        !via_api.same_source_attestation(&conflicting),
+        "divergent labels remain a genuine source-scope conflict"
+    );
+}

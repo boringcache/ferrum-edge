@@ -768,7 +768,7 @@ Every `MeshPolicy` carries a `PolicyScope`:
 
 An empty `WorkloadSelector` (`labels: {}`, `namespace: None`) intentionally matches any workload.
 
-The canonical matching helper `policy_scope_applies_to_workload()` is shared between the slice builder and the plugin filter so scope semantics stay byte-identical across both surfaces. Waypoint `targetRefs` matching uses `policy_scope_applies_with_waypoint()` / destination `PolicyScopeCache::policy_applies_for_destination()` so Gateway attachments do not broaden onto Sidecar workloads.
+The canonical matching helper `policy_scope_applies_to_workload()` is shared between the slice builder and the plugin filter so scope semantics stay byte-identical across both surfaces. Waypoint `targetRefs` matching uses `policy_scope_applies_with_waypoint()` / destination `PolicyScopeCache::policy_applies_for_destination()` so Gateway attachments do not broaden onto Sidecar workloads. `PolicyScopeCache` may carry destination Service membership (`service_name` / `service_namespace`) for exact Service/ServiceEntry `targetRefs` matching; ambient UDP source-scope indexing treats duplicate pod projections as one scope when SPIFFE/namespace/labels match (`same_source_attestation`), and only drops authorization for genuinely conflicting labels — differing Service projections alone must not become an ambiguous scope.
 
 **Selector policy without proxy labels.** A `WorkloadSelector`-scoped policy whose selector carries labels cannot be evaluated when no proxy labels are resolved, and the cold-path filter would drop it (leaving an empty policy set that evaluates to `Allow`). The plugin distinguishes three cases at construction:
 

@@ -1020,9 +1020,14 @@ fn ambient_udp_source_scope_index(
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(candidate);
             }
-            std::collections::hash_map::Entry::Occupied(entry) if entry.get() == &candidate => {
+            std::collections::hash_map::Entry::Occupied(entry)
+                if entry.get().same_source_attestation(&candidate) =>
+            {
                 // Kubernetes may project one pod through multiple Services.
-                // Identical attestations are one scope, not an ambiguity.
+                // Identical SPIFFE/namespace/labels are one source scope even
+                // when service_name differs (destination membership only).
+                // Full PolicyScopeCache Eq would false-conflict those
+                // projections and drop authorization.
             }
             std::collections::hash_map::Entry::Occupied(entry) => {
                 entry.remove();

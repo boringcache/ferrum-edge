@@ -144,6 +144,11 @@ pub struct PolicyScopeCache {
     /// Attached MeshService name when known. Used so Service `targetRefs`
     /// without selector labels can still match destination membership
     /// without broadening onto unrelated workloads in the namespace.
+    ///
+    /// Destination membership only — **not** part of source-pod attestation.
+    /// Kubernetes may project one pod through multiple Services; those
+    /// projections share SPIFFE/namespace/labels and must not be treated as
+    /// conflicting source scopes merely because `service_name` differs.
     pub service_name: String,
     pub service_namespace: String,
 }
@@ -172,6 +177,18 @@ impl PolicyScopeCache {
             service_name: workload.service_name.clone(),
             service_namespace: workload.attached_service_namespace().to_string(),
         }
+    }
+
+    /// Source-pod attestation identity used by ambient UDP / node-waypoint
+    /// source scoping: SPIFFE + workload namespace + labels.
+    ///
+    /// Ignores [`Self::service_name`] / [`Self::service_namespace`], which are
+    /// destination-resource membership for `targetRefs` and may differ when
+    /// one pod is projected through multiple Services.
+    pub fn same_source_attestation(&self, other: &Self) -> bool {
+        self.spiffe_id == other.spiffe_id
+            && self.namespace == other.namespace
+            && self.labels == other.labels
     }
 
     pub fn policy_applies(&self, policy: &MeshPolicy) -> bool {
