@@ -1330,6 +1330,7 @@ required = (
     ("loopback excluded-port stimulus", '"127.0.0.1"'),
     ("bounded stimulus interval", "time.sleep(0.5)"),
     ("listener bind on excluded port", '("0.0.0.0", PORT)'),
+    ("complete HTTP response length", 'b"content-length: 13\\r\\n"'),
     ("HTTP exclude-port response body", "exclude-port"),
 )
 missing = [label for label, needle in required if needle not in block]
