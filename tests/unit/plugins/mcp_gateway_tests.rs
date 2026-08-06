@@ -10024,18 +10024,24 @@ async fn aggregate_sse_config_bounds_fail_closed_without_echoing_values() {
         "sse_max_event_bytes": 100,
         "sse_max_retained_bytes": 50
     });
-    let err = create_plugin("mcp_gateway", &config).unwrap_err();
+    let err = create_plugin("mcp_gateway", &config)
+        .err()
+        .expect("invalid SSE retention bounds must be rejected");
     assert!(err.contains("sessions.sse_max_event_bytes"));
     assert!(!err.contains("100"));
 
     let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
     config["sessions"] = json!({ "sse_max_streams_per_session": 0 });
-    let err = create_plugin("mcp_gateway", &config).unwrap_err();
+    let err = create_plugin("mcp_gateway", &config)
+        .err()
+        .expect("zero SSE stream capacity must be rejected");
     assert!(err.contains("sessions.sse_max_streams_per_session"));
 
     let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
     config["sessions"] = json!({ "sse_keepalive_seconds": 4000 });
-    let err = create_plugin("mcp_gateway", &config).unwrap_err();
+    let err = create_plugin("mcp_gateway", &config)
+        .err()
+        .expect("excessive SSE keepalive interval must be rejected");
     assert!(err.contains("sessions.sse_keepalive_seconds"));
 }
 
