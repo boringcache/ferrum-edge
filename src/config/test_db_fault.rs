@@ -98,7 +98,9 @@ mod active {
 
     /// When armed and the control file exists, return the closed fault pool.
     pub fn tripped_fault_pool() -> Option<AnyPool> {
-        let guard = CONTROL.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = CONTROL
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let control = guard.as_ref()?;
         if control.path.exists() {
             Some(control.fault_pool.clone())
