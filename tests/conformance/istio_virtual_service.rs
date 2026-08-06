@@ -433,7 +433,7 @@ fn vs_tcp_l4_weighted_multi_destination() {
         category = CATEGORY,
         feature = "spec.tcp[]/tls[] weighted multi-destination",
         status = Status::Supported,
-        notes = "Weighted L4 routes materialize istio-vs-l4-upstream-* with WRR; zero-weight legs skipped; invalid weights/subset/missing ports fail closed; upstreams ride MeshSlice for reload/delete.",
+        notes = "Weighted L4 routes materialize istio-vs-l4-upstream-* with WRR; zero-weight legs skipped; all-zero splits materialize a fail-closed blackhole backend; invalid weights/subset/missing ports fail closed; upstreams ride MeshSlice for reload/delete.",
     );
     let result = translate_k8s_objects(
         &[virtual_service(json!({

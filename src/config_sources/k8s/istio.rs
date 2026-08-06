@@ -35,15 +35,23 @@ use super::{
 };
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
-    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, MAX_RETRIES, MAX_TARGET_WEIGHT, MAX_TIMEOUT_MS,
-    PluginConfig, Proxy, RetryConfig, validate_backend_tls_san_allow_list_entry,
-    validate_backend_tls_sni,
+    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, MAX_RETRIES, MAX_TARGET_WEIGHT,
+    MAX_TARGETS_PER_UPSTREAM, MAX_TIMEOUT_MS, PluginConfig, Proxy, RetryConfig,
+    validate_backend_tls_san_allow_list_entry, validate_backend_tls_sni,
 };
 use crate::plugins::mesh::workload_metrics::{
     is_recognized_unsupported_istio_metric_family, validate_istio_telemetry_config,
 };
 
 const URI_LESS_MATCH_LISTEN_PATH: &str = "~.*";
+
+/// Reserved unreachable hostname for all-zero L4 weighted splits.
+///
+/// Mirrors Gateway API's fail-closed zero-weight blackhole host. The backend
+/// port is taken from the original destination(s) so omitted `match.port` keeps
+/// correct listen-port inference (Gateway API can use a fixed sentinel port
+/// because listener ports come from the Gateway, not destinations).
+const L4_ZERO_WEIGHT_BACKEND_HOST: &str = "ferrum-zero-weight.invalid.";
 
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
@@ -2722,10 +2730,12 @@ fn attach_l4_stream_match(
 /// Single-destination routes keep a direct `backend_host`/`backend_port` on the
 /// stream proxy. Multi-destination weighted splits materialize an upstream-backed
 /// stream proxy (same WRR/health/locality selection path HTTP uses). Zero-weight
-/// legs in a multi-destination split are skipped with a translator warning;
-/// an all-zero multi-destination split materializes nothing. Invalid weights,
-/// missing ports, and `destination.subset` (unrepresentable on L4 weighted
-/// upstreams) fail closed with field-specific diagnostics.
+/// legs in a multi-destination split are skipped with a translator warning; an
+/// all-zero multi-destination split materializes a fail-closed blackhole backend
+/// so the L4 match remains traffic-capturing (a disappeared block would let a
+/// later broader rule/proxy capture the same traffic). Invalid weights, missing
+/// ports, and `destination.subset` (unrepresentable on L4 weighted upstreams)
+/// fail closed with field-specific diagnostics.
 fn l4_route_backends(
     object: &K8sObject,
     block: &Value,
@@ -2746,6 +2756,19 @@ fn l4_route_backends(
         return Err(invalid_resource(
             object,
             format!("VirtualService {kind}[] block requires a route destination"),
+        ));
+    }
+    // Bound the CRD-controlled route array before capacity allocation / iteration.
+    // Weighted L4 materializes one upstream target per active destination, so the
+    // shared upstream target ceiling is the authoritative limit.
+    if routes.len() > MAX_TARGETS_PER_UPSTREAM {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService {kind}[].route has {} destinations; at most {} are allowed",
+                routes.len(),
+                MAX_TARGETS_PER_UPSTREAM
+            ),
         ));
     }
     let preserve_single_destination = routes.len() == 1;
@@ -2834,18 +2857,99 @@ fn l4_route_backends(
     }
     if skipped_zero > 0 {
         if backends.is_empty() {
+            // All-zero multi-destination split: keep the match traffic-capturing
+            // with a deterministic unreachable backend (Gateway API parity).
+            let blackhole = l4_all_zero_blackhole_backends(object, routes, kind, acc)?;
             acc.warnings.push(format!(
-                "VirtualService '{}' {kind}[] route {block_index} has only zero-weight split destinations; no stream proxy was materialized",
+                "VirtualService '{}' {kind}[] route {block_index} has only zero-weight split destinations; materializing blackhole backend",
                 object.metadata.name
             ));
-        } else {
-            acc.warnings.push(format!(
-                "VirtualService '{}' {kind}[] route {block_index} skipped {skipped_zero} zero-weight split destination(s)",
-                object.metadata.name
-            ));
+            return Ok(blackhole);
         }
+        acc.warnings.push(format!(
+            "VirtualService '{}' {kind}[] route {block_index} skipped {skipped_zero} zero-weight split destination(s)",
+            object.metadata.name
+        ));
     }
     Ok(backends)
+}
+
+/// Build fail-closed blackhole backends for an all-zero L4 weighted split.
+///
+/// Retains each destination's resolved port so omitted `match.port` listen-port
+/// inference stays honest: agreeing ports collapse to one blackhole backend on
+/// that port; disagreeing ports keep one blackhole leg per destination port so
+/// `l4_destination_port_agreement` still requires an explicit `match.port`.
+fn l4_all_zero_blackhole_backends(
+    object: &K8sObject,
+    routes: &[Value],
+    kind: &str,
+    acc: &mut K8sAccumulator,
+) -> Result<Vec<RouteBackend>, K8sTranslateError> {
+    let mut ports = Vec::with_capacity(routes.len());
+    for (route_index, route) in routes.iter().enumerate() {
+        let dest = route.get("destination").ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!("VirtualService {kind}[] route[{route_index}] requires a destination"),
+            )
+        })?;
+        if dest.get("subset").is_some() {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[].route[{route_index}].destination.subset is not supported for L4 routing; \
+                     model subset selection with DestinationRule subsets on a single destination host"
+                ),
+            ));
+        }
+        let host = string_field(dest, "host").ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[].route[{route_index}].destination.host is required"
+                ),
+            )
+        })?;
+        let port = resolve_destination_port(object, dest, host, acc)?.ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[].route[{route_index}].destination.port is required for stream routing"
+                ),
+            )
+        })?;
+        ports.push(port);
+    }
+    let Some(first) = ports.first().copied() else {
+        return Err(invalid_resource(
+            object,
+            format!("VirtualService {kind}[] block requires a route destination"),
+        ));
+    };
+    if ports.iter().all(|port| *port == first) {
+        return Ok(vec![RouteBackend {
+            host: L4_ZERO_WEIGHT_BACKEND_HOST.to_string(),
+            port: first,
+            weight: 0,
+            service_namespace: None,
+            service_name: None,
+            service_port: None,
+        }]);
+    }
+    Ok(ports
+        .into_iter()
+        .map(|port| RouteBackend {
+            host: L4_ZERO_WEIGHT_BACKEND_HOST.to_string(),
+            port,
+            // Non-zero so a multi-port blackhole upstream remains schedulable;
+            // every dial still targets the reserved unreachable hostname.
+            weight: 1,
+            service_namespace: None,
+            service_name: None,
+            service_port: None,
+        })
+        .collect())
 }
 
 /// Listen-port fallback when `match.port` is omitted: prefer a unanimous

@@ -186,19 +186,32 @@ fn virtual_service_tcp_weighted_split_skips_zero_weight_and_fails_closed_on_inva
         )],
         options(),
     )
-    .expect("all-zero split translates without a proxy");
+    .expect("all-zero split remains traffic-capturing");
+    let all_zero_proxy = all_zero
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_port == Some(3306))
+        .expect("all-zero tcp[] block must still materialize on match.port");
+    assert_eq!(
+        all_zero_proxy.backend_host, "ferrum-zero-weight.invalid.",
+        "all-zero split must fail closed to the reserved blackhole host"
+    );
+    assert_eq!(
+        all_zero_proxy.backend_port, 3306,
+        "blackhole backend port must retain the destination port for listen inference"
+    );
     assert!(
-        !all_zero
-            .config
-            .proxies
-            .iter()
-            .any(|proxy| proxy.listen_port == Some(3306))
+        all_zero_proxy.upstream_id.is_none(),
+        "agreeing all-zero destinations collapse to a direct blackhole binding"
     );
     assert!(
         all_zero
             .warnings
             .iter()
-            .any(|warning| warning.contains("only zero-weight"))
+            .any(|warning| {
+                warning.contains("only zero-weight") && warning.contains("blackhole")
+            })
     );
 
     let invalid = translate_k8s_objects(
@@ -461,6 +474,182 @@ fn virtual_service_tls_weighted_split_preserves_passthrough_and_service_identity
             Some("443")
         );
     }
+}
+
+#[test]
+fn virtual_service_tcp_all_zero_weight_remains_fail_closed_and_does_not_fall_through() {
+    // An earlier all-zero block must still own the match; dropping it would let
+    // the later positive-weight block capture the same port.
+    let result = translate_k8s_objects(
+        &[vs(
+            "db-all-zero-order",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [
+                    {
+                        "match": [{"port": 3306}],
+                        "route": [
+                            {"destination": {"host": "a.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 0},
+                            {"destination": {"host": "b.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 0}
+                        ]
+                    },
+                    {
+                        "match": [{"port": 3306}],
+                        "route": [
+                            {"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 100}
+                        ]
+                    }
+                ]
+            }),
+        )],
+        options(),
+    )
+    .expect("ordered tcp[] with leading all-zero translates");
+    let on_port: Vec<_> = result
+        .config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.listen_port == Some(3306))
+        .collect();
+    assert_eq!(
+        on_port.len(),
+        2,
+        "both tcp[] blocks must materialize: {on_port:?}"
+    );
+    assert!(
+        on_port
+            .iter()
+            .any(|proxy| proxy.backend_host == "ferrum-zero-weight.invalid."),
+        "first (all-zero) block must remain present as blackhole, not disappear: {on_port:?}"
+    );
+    assert!(
+        on_port
+            .iter()
+            .any(|proxy| proxy.backend_host == "stable.default.svc.cluster.local"),
+        "later positive-weight block must still exist alongside the blackhole: {on_port:?}"
+    );
+    let blackhole = on_port
+        .iter()
+        .find(|proxy| proxy.backend_host == "ferrum-zero-weight.invalid.")
+        .expect("blackhole");
+    assert!(
+        blackhole.id.contains("__0-"),
+        "all-zero block must keep declaration-order proxy id, got {}",
+        blackhole.id
+    );
+}
+
+#[test]
+fn virtual_service_tls_all_zero_weight_remains_fail_closed_blackhole() {
+    let result = translate_k8s_objects(
+        &[vs(
+            "secure-all-zero",
+            serde_json::json!({
+                "hosts": ["secure.example.com"],
+                "tls": [{
+                    "match": [{"sniHosts": ["secure.example.com"], "port": 443}],
+                    "route": [
+                        {"destination": {"host": "a.default.svc.cluster.local", "port": {"number": 443}}, "weight": 0},
+                        {"destination": {"host": "b.default.svc.cluster.local", "port": {"number": 443}}, "weight": 0}
+                    ]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("all-zero tls[] remains traffic-capturing");
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_port == Some(443))
+        .expect("all-zero tls[] block must still materialize");
+    assert!(proxy.passthrough);
+    assert_eq!(proxy.backend_host, "ferrum-zero-weight.invalid.");
+    assert_eq!(proxy.backend_port, 443);
+    assert_eq!(proxy.hosts, vec!["secure.example.com".to_string()]);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| {
+                warning.contains("only zero-weight") && warning.contains("blackhole")
+            })
+    );
+}
+
+#[test]
+fn virtual_service_tcp_all_zero_without_match_port_keeps_destination_listen_port() {
+    // Omitted match.port must infer listen from destination ports, not from a
+    // sentinel blackhole port like Gateway API's 65535.
+    let result = translate_k8s_objects(
+        &[vs(
+            "db-all-zero-inferred-port",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "route": [
+                        {"destination": {"host": "a.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 0},
+                        {"destination": {"host": "b.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 0}
+                    ]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("all-zero without match.port still translates");
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.backend_host == "ferrum-zero-weight.invalid.")
+        .expect("blackhole proxy");
+    assert_eq!(
+        proxy.listen_port,
+        Some(3306),
+        "listen port must follow destination agreement, not a sentinel"
+    );
+    assert_eq!(proxy.backend_port, 3306);
+}
+
+#[test]
+fn virtual_service_l4_route_rejects_more_than_max_targets_per_upstream() {
+    let routes: Vec<Value> = (0..=ferrum_edge::config::types::MAX_TARGETS_PER_UPSTREAM)
+        .map(|i| {
+            serde_json::json!({
+                "destination": {
+                    "host": format!("mysql-{i}.default.svc.cluster.local"),
+                    "port": {"number": 3306}
+                },
+                "weight": 1
+            })
+        })
+        .collect();
+    assert_eq!(
+        routes.len(),
+        ferrum_edge::config::types::MAX_TARGETS_PER_UPSTREAM + 1
+    );
+    let err = translate_k8s_objects(
+        &[vs(
+            "db-too-many",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "match": [{"port": 3306}],
+                    "route": routes
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect_err("MAX_TARGETS_PER_UPSTREAM + 1 destinations must fail closed");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("VirtualService tcp[].route")
+            && msg.contains("at most")
+            && msg.contains(&ferrum_edge::config::types::MAX_TARGETS_PER_UPSTREAM.to_string()),
+        "{msg}"
+    );
 }
 
 #[test]
