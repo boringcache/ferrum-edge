@@ -308,7 +308,7 @@ impl WorkloadMetrics {
         let ParsedMetricConfig {
             tag_override_plans,
             disabled_metrics_marker,
-        } = parse_metric_config(config.get("metrics"), true)?;
+        } = parse_metric_config(config.get("metrics"))?;
         let tracing_providers = parse_tracing_providers(config)?;
         let span_reporting_disabled = config
             .get("span_reporting_disabled")
@@ -1208,10 +1208,7 @@ fn parse_tag_operation<'a>(
     }
 }
 
-fn parse_metric_config(
-    value: Option<&Value>,
-    _emit_unsupported_family_warning: bool,
-) -> Result<ParsedMetricConfig, String> {
+fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, String> {
     let Some(metrics) = value else {
         return Ok(ParsedMetricConfig {
             tag_override_plans: Vec::new(),
@@ -1363,7 +1360,7 @@ pub(crate) fn validate_istio_telemetry_config(
     if let Some(metrics) = metrics {
         let metrics = serde_json::to_value(metrics)
             .map_err(|error| format!("workload_metrics: invalid translated metrics: {error}"))?;
-        parse_metric_config(Some(&metrics), false)?;
+        parse_metric_config(Some(&metrics))?;
     }
     Ok(())
 }

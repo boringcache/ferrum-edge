@@ -2271,12 +2271,12 @@ impl MetricsRegistry {
             (
                 &self.mesh_tcp_sent_bytes_counter,
                 "ferrum_mesh_tcp_sent_bytes_total",
-                "Mesh TCP bytes sent on closed connections.",
+                "Mesh TCP bytes the gateway sent client->backend on closed connections.",
             ),
             (
                 &self.mesh_tcp_received_bytes_counter,
                 "ferrum_mesh_tcp_received_bytes_total",
-                "Mesh TCP bytes received on closed connections.",
+                "Mesh TCP bytes the gateway received backend->client on closed connections.",
             ),
             (
                 &self.mesh_grpc_request_messages_counter,

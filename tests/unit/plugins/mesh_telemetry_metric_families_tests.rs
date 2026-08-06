@@ -239,19 +239,34 @@ fn tcp_opened_closed_and_bytes_follow_connect_disconnect_lifecycle() {
             && line.ends_with(" 1")),
         "closed must increment on disconnect:\n{after_close}"
     );
+    // Direction contract: Ferrum's gateway-perspective convention, matching
+    // `StreamTransactionSummary.bytes_sent` / `bytes_received` and
+    // `ferrum_api_bytes_{sent,received}_total`. `sent` is client->backend and
+    // `received` is backend->client. Istio names `istio_tcp_sent_bytes_total`
+    // the other way round, so do not "fix" this by swapping the two arms —
+    // that would contradict every other Ferrum byte counter. The rendered HELP
+    // text states the direction and is pinned by the metric-contract test.
     assert!(
         after_close
             .lines()
             .any(|line| line.starts_with("ferrum_mesh_tcp_sent_bytes_total{")
                 && line.ends_with(" 700")),
-        "sent bytes must equal stream bytes_sent:\n{after_close}"
+        "sent bytes must equal stream bytes_sent (client->backend):\n{after_close}"
     );
     assert!(
         after_close.lines().any(
             |line| line.starts_with("ferrum_mesh_tcp_received_bytes_total{")
                 && line.ends_with(" 900")
         ),
-        "received bytes must equal stream bytes_received:\n{after_close}"
+        "received bytes must equal stream bytes_received (backend->client):\n{after_close}"
+    );
+    assert!(
+        after_close.contains("sent client->backend on closed connections."),
+        "sent-bytes HELP must state the gateway-perspective direction:\n{after_close}"
+    );
+    assert!(
+        after_close.contains("received backend->client on closed connections."),
+        "received-bytes HELP must state the gateway-perspective direction:\n{after_close}"
     );
 }
 
