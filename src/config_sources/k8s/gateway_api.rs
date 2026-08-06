@@ -4647,6 +4647,10 @@ fn l4_rule_suffix(scheme: BackendScheme, rule_index: usize) -> String {
 /// the cold path enforces the same ceiling rather than expanding an unbounded
 /// hostile fan-out.
 const MAX_UDP_ROUTE_BACKEND_REFS: usize = 16;
+/// Gateway API v1.5.1 `BackendRef.weight` upper bound. Ferrum stores target
+/// weights under [`MAX_TARGET_WEIGHT`], so accepted UDPRoute weights are
+/// normalized proportionally after the whole backend set is resolved.
+const GATEWAY_API_MAX_BACKEND_WEIGHT: u64 = 1_000_000;
 
 /// A `UDPRouteRule` carries no match predicate (pinned v1.5.1
 /// `udproute_types.go`: the rule has only `name` and `backendRefs`), so two
@@ -4789,9 +4793,10 @@ fn udp_rule_backends(
             ));
         };
         let backend_port = port_from_u64(object, raw_backend_port, &backend_port_field)?;
-        // `backend_weight` bounds the declared weight to 0..=65535 and rejects
-        // any non-integer shape, so hostile weights cannot reach the LB.
-        let weight = backend_weight(object, backend_ref)?;
+        // Gateway API permits 0..=1,000,000. Parse that public boundary here;
+        // the complete set is normalized below to Ferrum's smaller target
+        // weight representation without changing relative proportions.
+        let weight = udp_backend_weight(object, backend_ref)?;
         if weight == 0 {
             skipped_zero += 1;
             continue;
@@ -4846,6 +4851,7 @@ fn udp_rule_backends(
         }
         return Ok(None);
     }
+    normalize_backend_weights_to_target_limit(&mut backends);
     if skipped_zero > 0 {
         acc.warnings.push(format!(
             "{} skipped {} zero-weight backendRef(s)",
@@ -4867,6 +4873,38 @@ fn udp_rule_backends(
         fallback_listen_port,
         backends,
     }))
+}
+
+/// Parse the Gateway API `BackendRef.weight` contract for UDPRoute.
+///
+/// The shared Ferrum target parser intentionally caps weights at 65,535, but
+/// Gateway API's public schema accepts values through 1,000,000. Rejecting the
+/// upper part of that range would make a CRD-valid UDPRoute inert. The caller
+/// normalizes the resolved set proportionally before it reaches an Upstream.
+fn udp_backend_weight(
+    object: &K8sObject,
+    backend_ref: &Value,
+) -> Result<u32, K8sTranslateError> {
+    let Some(value) = backend_ref.get("weight") else {
+        return Ok(1);
+    };
+    let Some(weight) = value.as_u64() else {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "backendRefs[].weight must be between 0 and {GATEWAY_API_MAX_BACKEND_WEIGHT}"
+            ),
+        ));
+    };
+    if weight > GATEWAY_API_MAX_BACKEND_WEIGHT {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "backendRefs[].weight must be between 0 and {GATEWAY_API_MAX_BACKEND_WEIGHT}"
+            ),
+        ));
+    }
+    Ok(weight as u32)
 }
 
 /// Route-level hostnames an L4 route may carry.

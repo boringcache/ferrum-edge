@@ -921,7 +921,7 @@ fn udp_route_zero_weight_leg_still_has_its_port_validated() {
 
 #[test]
 fn udp_route_hostile_weight_shapes_fail_closed() {
-    for weight in [json!(1_000_000), json!(-1), json!("high"), json!(1.5)] {
+    for weight in [json!(1_000_001), json!(-1), json!("high"), json!(1.5)] {
         let spec = weighted_rule(json!([
             {"name": "coredns-a", "port": 5353, "weight": 1},
             {"name": "coredns-b", "port": 5353, "weight": weight}
@@ -933,6 +933,21 @@ fn udp_route_hostile_weight_shapes_fail_closed() {
 
         assert!(err.to_string().contains("weight must be between 0 and"));
     }
+}
+
+#[test]
+fn udp_route_accepts_and_normalizes_gateway_api_max_weight() {
+    let spec = weighted_rule(json!([
+        {"name": "coredns-a", "port": 5353, "weight": 1},
+        {"name": "coredns-b", "port": 5353, "weight": 1_000_000}
+    ]));
+    let objects = udp_lab(spec);
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    let (_, upstream) = sole_proxy_and_upstream(&result);
+    let weights: Vec<u32> = upstream.targets.iter().map(|target| target.weight).collect();
+
+    assert_eq!(weights, vec![1, 65_535]);
 }
 
 #[test]
