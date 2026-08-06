@@ -10056,14 +10056,13 @@ where
     // here would leak it on a client disconnect during the error write. Capture
     // whether the gRPC error actually reached the client so the transaction log's
     // `client_disconnected` stays accurate when the client already reset.
-    let error_sent =
-        await_h3_grpc_terminal_write_with_grace(send_h3_grpc_error_send(
-            stream,
-            grpc_status,
-            grpc_message,
-            initial_response_header_policy_plugins,
-        ))
-        .await;
+    let error_sent = await_h3_grpc_terminal_write_with_grace(send_h3_grpc_error_send(
+        stream,
+        grpc_status,
+        grpc_message,
+        initial_response_header_policy_plugins,
+    ))
+    .await;
     if !error_sent {
         crate::http3::stream_util::abort_response_stream(stream);
     }
@@ -10699,14 +10698,13 @@ async fn dispatch_grpc_native_h3(
         // error before its request direction is halted. Retiring the pump
         // afterwards closes the backend request direction and finalizes the
         // forwarded-byte count read below.
-        let error_sent =
-            await_h3_grpc_terminal_write_with_grace(send_h3_grpc_error_send(
-                &mut send_half,
-                crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-                "Backend response exceeds maximum size",
-                initial_response_header_policy_plugins,
-            ))
-            .await;
+        let error_sent = await_h3_grpc_terminal_write_with_grace(send_h3_grpc_error_send(
+            &mut send_half,
+            crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+            "Backend response exceeds maximum size",
+            initial_response_header_policy_plugins,
+        ))
+        .await;
         if !error_sent {
             crate::http3::stream_util::abort_response_stream(&mut send_half);
         }
@@ -10797,16 +10795,15 @@ async fn dispatch_grpc_native_h3(
         // Response BEFORE teardown: the reject goes on the wire first, then the
         // pump is retired (which halts the frontend receive half this task no
         // longer owns and finalizes the forwarded-byte count).
-        let reject_sent = await_h3_grpc_terminal_write_with_grace(
-            send_h3_grpc_reject_trailers_only(
+        let reject_sent =
+            await_h3_grpc_terminal_write_with_grace(send_h3_grpc_reject_trailers_only(
                 &mut send_half,
                 reject_status,
                 reject.body.clone(),
                 &reject.headers,
                 crate::proxy::FramedGrpcUnaryProvenance::NONE,
-            ),
-        )
-        .await;
+            ))
+            .await;
         if !reject_sent {
             crate::http3::stream_util::abort_response_stream(&mut send_half);
         }
