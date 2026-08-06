@@ -5299,7 +5299,8 @@ pub mod _test_support {
         scenario: H3GrpcHeaderWaitScenario,
     ) -> bool {
         let state = crate::http3::server::H3GrpcUploadState::new();
-        // Snapshot exactly where the relay does: at the start of the wait.
+        // Snapshot exactly where the relay does: before modeled upload work can
+        // begin (production takes this sample before spawning the pump).
         let progress_at_wait_start = state.progress();
         for _ in 0..scenario.progress_steps_during_wait {
             state.note_progress();

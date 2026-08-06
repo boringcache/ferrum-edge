@@ -9569,9 +9569,10 @@ pub(crate) struct H3GrpcUploadState {
     fault: std::sync::atomic::AtomicU8,
     /// Monotonic count of completed upload steps: one per client DATA frame
     /// taken off the frontend, one per frame the backend accepted. Snapshotted
-    /// at the START of the response-header wait so an expiry can tell a client
-    /// that is ACTIVELY streaming — a healthy bidirectional client whose backend
-    /// simply owes HEADERS — from one that produced nothing at all.
+    /// before the upload pump is spawned so no scheduler interleaving can erase
+    /// early progress; an expiry can then tell a client that is ACTIVELY
+    /// streaming — a healthy bidirectional client whose backend simply owes
+    /// HEADERS — from one that produced nothing at all.
     progress: std::sync::atomic::AtomicU64,
     /// True while the pump is parked on a BACKEND write / FIN rather than on the
     /// client. A backend that never opens flow-control credit for the upload and
