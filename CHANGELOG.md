@@ -27,11 +27,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `hugging_face`, `azure_openai`) with a static header credential; `anthropic`,
   `google_gemini`, `google_vertex`, `aws_bedrock`, `cohere`, and any AWS
   SigV4 / Google OAuth2 provider fail closed with a field-specific `501` and
-  belong to `ai_stream_router`. A claimed stream retains exactly one partial SSE
-  event (`streaming.max_event_bytes`, 4 KiB–1 MiB, default 256 KiB), and the
+  belong to `ai_stream_router`. A claimed stream retains at most one SSE event —
+  the partial event being assembled, or the terminal event once the provider has
+  framed its completion (`streaming.max_event_bytes`, 4 KiB–1 MiB, default
+  256 KiB) — and the
   ceiling is enforced on every complete AND partial event before any of its
   bytes are retained or released, so retained state grows with neither stream
-  length nor transport chunk size. Terminal detection follows the SSE field
+  length nor transport chunk size. Ordinary events are released as soon as they
+  are complete, but the terminal `data: [DONE]` event is HELD back until the
+  provider's body ends: a client following the OpenAI contract may stop reading
+  at `[DONE]`, so releasing one before upstream EOF would let it accept a
+  successful completion the gateway went on to refuse. At a clean EOF with
+  nothing else outstanding the provider's own terminal event is released
+  verbatim; ANY provider byte after the retained marker — a second terminal, a
+  data event, a comment / `id` / `retry` line, an oversized or non-UTF-8 block,
+  or a trailing partial line — fails the stream closed and DROPS the marker, so
+  the client receives the gateway-authored `error` event and no completion
+  marker at all. Terminal detection follows the SSE field
   grammar — an event is terminal only when the CONCATENATION of its `data` lines
   is exactly `[DONE]`, and `CR`/`LF`/`CRLF` plus their legal mixed blank-line
   forms are all recognized — so `data: [DONE]\ndata: …` is ordinary data and

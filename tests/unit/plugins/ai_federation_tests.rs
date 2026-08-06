@@ -761,37 +761,68 @@ async fn drive_guard(
     }
 }
 
-/// A well-formed stream is forwarded verbatim, in order, with its terminal
-/// marker and terminal usage chunk intact — and the first token is released
-/// before the stream ends.
+/// A well-formed stream is forwarded verbatim, in order, with its terminal usage
+/// chunk intact — the first token is released before the stream ends, and the
+/// provider's ORIGINAL terminal event is released verbatim at EOF, which is the
+/// only point that proves it was the provider's last event.
 #[tokio::test]
 async fn sse_guard_forwards_events_incrementally_and_preserves_terminal_usage() {
     let (default_bytes, _, _, _) = test_helpers::streaming_bounds_for_test();
-    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let mut probe = test_helpers::SseGuardProbe::new(default_bytes);
 
     // Time to first token: the first complete event is released on its own
     // chunk, before any later byte exists.
-    let first = guard
+    let (mut out, terminated) = probe
         .on_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"He\"}}]}\n\n")
         .await;
-    match first {
-        ResponseStreamAction::Forward(bytes) => assert!(
-            !bytes.is_empty(),
-            "the first complete event must be released immediately"
-        ),
-        other => panic!("expected forward, got {other:?}"),
+    assert!(!terminated, "a well-formed event must not cut the stream");
+    assert!(
+        !out.is_empty(),
+        "the first complete event must be released immediately"
+    );
+
+    for chunk in [
+        "data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"total_tokens\":7}}\n\n",
+    ] {
+        let (bytes, terminated) = probe.on_chunk(chunk.as_bytes()).await;
+        assert!(!terminated, "a well-formed event must not cut the stream");
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            chunk,
+            "ordinary events are released verbatim as they complete"
+        );
+        out.extend_from_slice(&bytes);
     }
 
-    let (out, terminated) = drive_guard(
-        &mut guard,
-        &[
-            "data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"total_tokens\":7}}\n\n",
-            "data: [DONE]\n\n",
-        ],
-    )
-    .await;
+    // The terminal event is HELD rather than forwarded: a client following the
+    // OpenAI contract may stop reading at `[DONE]`, so it may not see one until
+    // upstream EOF proves nothing else is coming.
+    let (held, terminated) = probe.on_chunk(b"data: [DONE]\n\n").await;
+    assert!(!terminated, "a valid terminal must not cut the stream");
+    assert!(
+        held.is_empty(),
+        "the terminal marker must not be released before EOF: {}",
+        String::from_utf8_lossy(&held)
+    );
+    assert_eq!(
+        probe.retained_bytes(),
+        0,
+        "no partial event is outstanding beside the held terminal"
+    );
+    assert_eq!(
+        probe.retained_terminal_bytes(),
+        "data: [DONE]\n\n".len(),
+        "exactly the terminal event is retained"
+    );
+
+    // Clean EOF releases the provider's original terminal event verbatim.
+    let (tail, terminated) = probe.on_end().await;
     assert!(!terminated, "a well-formed stream must not be truncated");
+    let released = String::from_utf8(tail.clone()).unwrap();
+    assert_eq!(released, "data: [DONE]\n\n");
+    out.extend_from_slice(&tail);
+
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("\"total_tokens\":7"),
@@ -802,6 +833,36 @@ async fn sse_guard_forwards_events_incrementally_and_preserves_terminal_usage() 
         "terminal marker: {text}"
     );
     assert_eq!(text.matches("[DONE]").count(), 1);
+}
+
+/// A terminal event split across transport reads is reassembled, still held, and
+/// released exactly once — verbatim — at EOF.
+#[tokio::test]
+async fn sse_guard_holds_a_split_terminal_event_until_eof() {
+    let (default_bytes, _, _, _) = test_helpers::streaming_bounds_for_test();
+    let mut probe = test_helpers::SseGuardProbe::new(default_bytes);
+
+    let (out, terminated) = probe.on_chunk(b"data: [DO").await;
+    assert!(!terminated);
+    assert!(out.is_empty(), "a partial event must not be released");
+
+    let (out, terminated) = probe.on_chunk(b"NE]\n\n").await;
+    assert!(!terminated);
+    assert!(
+        out.is_empty(),
+        "a reassembled terminal event is still held until EOF: {}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(probe.retained_bytes(), 0);
+    assert_eq!(
+        probe.retained_terminal_bytes(),
+        "data: [DONE]\n\n".len(),
+        "the reassembled terminal event is the whole retained state"
+    );
+
+    let (tail, terminated) = probe.on_end().await;
+    assert!(!terminated, "a split terminal completes cleanly");
+    assert_eq!(String::from_utf8(tail).unwrap(), "data: [DONE]\n\n");
 }
 
 /// A partial event that arrives across reads is held, not released early.
@@ -826,9 +887,12 @@ async fn sse_guard_holds_partial_events_until_complete() {
     assert!(text.starts_with("data: {\"choices\":[{\"delta\""), "{text}");
 }
 
-/// Exactly one terminal marker may reach the client. A DUPLICATE marker and any
-/// data after the marker both fail closed — the documented behavior in
-/// `docs/plugins.md` and the changelog — rather than being silently dropped.
+/// Exactly one terminal marker may reach the client, and because the marker is
+/// withheld until EOF, a DUPLICATE marker and any data after the marker fail
+/// closed with ZERO `[DONE]` reaching the client — the documented behavior in
+/// `docs/plugins.md` and the changelog. A normal OpenAI client is allowed to
+/// stop reading at `[DONE]`, so releasing one and appending an error afterwards
+/// would let it accept a completion the gateway went on to refuse.
 #[tokio::test]
 async fn sse_guard_enforces_exactly_one_terminal_marker() {
     let (default_bytes, _, _, _) = test_helpers::streaming_bounds_for_test();
@@ -850,9 +914,26 @@ async fn sse_guard_enforces_exactly_one_terminal_marker() {
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
         text.matches("[DONE]").count(),
-        1,
-        "duplicate marker: {text}"
+        0,
+        "no completion marker may reach the client on a duplicate: {text}"
     );
+    assert!(text.contains("event: error"), "{text}");
+    assert!(
+        text.starts_with("data: {\"a\":1}\n\n"),
+        "events released before the terminal are still delivered: {text}"
+    );
+
+    // Same violation inside ONE transport chunk: refused by event admission
+    // rather than by the next-chunk guard.
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let one_chunk = ["data: [DONE]\n\ndata: [DONE]\n\n"];
+    let (out, terminated) = drive_guard(&mut guard, &one_chunk).await;
+    assert!(
+        terminated,
+        "a duplicated terminal marker in one chunk must fail closed"
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.matches("[DONE]").count(), 0, "{text}");
     assert!(text.contains("event: error"), "{text}");
 
     let mut guard = test_helpers::sse_guard_for_test(default_bytes);
@@ -870,7 +951,90 @@ async fn sse_guard_enforces_exactly_one_terminal_marker() {
         !text.contains("smuggled"),
         "post-terminal data leaked: {text}"
     );
+    assert_eq!(
+        text.matches("[DONE]").count(),
+        0,
+        "no completion marker may reach the client on post-terminal data: {text}"
+    );
     assert!(text.contains("upstream_error"), "{text}");
+}
+
+/// NOTHING may follow the retained terminal event — not a comment, not a
+/// trailing partial line, not an oversized block, not undecidable bytes. Each is
+/// refused BEFORE `[DONE]` is released, so the client sees the gateway-authored
+/// error and no completion marker at all.
+#[tokio::test]
+async fn sse_guard_fails_closed_on_any_provider_bytes_after_the_terminal() {
+    let (default_bytes, min_bytes, _, _) = test_helpers::streaming_bounds_for_test();
+
+    // A keep-alive comment carries no data, but it is still provider output past
+    // a completion the provider itself framed.
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let chunks = ["data: [DONE]\n\n", ": keep-alive\n\n"];
+    let (out, terminated) = drive_guard(&mut guard, &chunks).await;
+    assert!(
+        terminated,
+        "a non-data event after the terminal marker must fail closed"
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.matches("[DONE]").count(), 0, "{text}");
+    assert!(
+        text.contains("after the terminal completion marker"),
+        "{text}"
+    );
+
+    // Bytes that never complete an event are refused as soon as they arrive, so
+    // the terminal is never held beside a partial event while awaiting EOF.
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let chunks = ["data: [DONE]\n\ndata: {\"partial\""];
+    let (out, terminated) = drive_guard(&mut guard, &chunks).await;
+    assert!(
+        terminated,
+        "a partial event after the terminal marker must fail closed"
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.matches("[DONE]").count(), 0, "{text}");
+    assert!(!text.contains("partial"), "provider bytes leaked: {text}");
+
+    // An oversized block after the marker is refused by the ceiling, still with
+    // no completion marker and no echoed provider bytes.
+    let mut guard = test_helpers::sse_guard_for_test(min_bytes);
+    let filler = "A".repeat(min_bytes + 1024);
+    let oversized = format!("data: [DONE]\n\ndata: {filler}\n\n");
+    let chunks = [oversized.as_str()];
+    let (out, terminated) = drive_guard(&mut guard, &chunks).await;
+    assert!(
+        terminated,
+        "an oversized event after the terminal marker must fail closed"
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.matches("[DONE]").count(), 0, "{text}");
+    assert!(text.contains("oversized"), "{text}");
+    assert!(!text.contains("AAAA"), "provider bytes leaked: {text}");
+
+    // Undecidable bytes after the marker: still refused with the terminal held.
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let ResponseStreamAction::Forward(held) = guard.on_chunk(b"data: [DONE]\n\n").await else {
+        panic!("a valid terminal event must be held, not terminate the stream");
+    };
+    assert!(
+        held.is_empty(),
+        "the terminal marker must not be released before EOF"
+    );
+    let mut hostile = b"data: ".to_vec();
+    hostile.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+    hostile.extend_from_slice(b"\n\n");
+    let action = guard.on_chunk(&hostile).await;
+    let ResponseStreamAction::Terminate(Some(bytes)) = action else {
+        panic!("post-terminal undecidable bytes must terminate the stream, got {action:?}");
+    };
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(!text.contains("[DONE]"), "{text}");
+    assert!(
+        text.contains("after the terminal completion marker"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{fffd}'), "provider bytes leaked: {text}");
 }
 
 /// SSE concatenates every `data` line of one event, so `data: [DONE]` followed
@@ -1043,13 +1207,24 @@ async fn sse_guard_retained_state_is_bounded_and_release_is_linear() {
     for index in 0..2_000 {
         many.push_str(&format!("data: {{\"i\":{index}}}\n\n"));
     }
+    let events = many.clone();
     many.push_str("data: [DONE]\n\n");
     let (out, terminated) = probe.on_chunk(many.as_bytes()).await;
     assert!(!terminated, "a well-formed batch must not be cut");
-    assert_eq!(String::from_utf8(out).unwrap(), many);
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        events,
+        "every event but the held terminal is released in order"
+    );
     assert_eq!(probe.retained_bytes(), 0);
-    let (_, terminated) = probe.on_end().await;
+    assert_eq!(
+        probe.retained_terminal_bytes(),
+        "data: [DONE]\n\n".len(),
+        "retained state after a 2,000-event chunk is exactly the terminal event"
+    );
+    let (tail, terminated) = probe.on_end().await;
     assert!(!terminated, "the batch ended with a valid terminal marker");
+    assert_eq!(String::from_utf8(tail).unwrap(), "data: [DONE]\n\n");
 }
 
 // --- Streaming lifecycle: concurrency, circuit, model, timeouts, headers ----

@@ -24233,7 +24233,7 @@ components:
               minimum: 4096
               maximum: 1048576
               default: 262144
-              description: "Ceiling on one retained partial server-sent event. This is the whole retained state of a claimed stream — there is exactly one carry buffer per response and no queue — so retention grows with neither stream length nor transport chunk size: the ceiling is enforced on every complete AND partial event before any of its bytes are retained or released. An event that exceeds it fails closed with a fixed-cardinality terminal SSE error event that never echoes provider bytes."
+              description: "Ceiling on one retained server-sent event. This is the whole retained state of a claimed stream — at most one event is held at a time (the partial event being assembled, or the terminal `data: [DONE]` event once the provider frames its completion) and there is no queue — so retention grows with neither stream length nor transport chunk size: the ceiling is enforced on every complete AND partial event before any of its bytes are retained or released. An event that exceeds it fails closed with a fixed-cardinality terminal SSE error event that never echoes provider bytes. The terminal event is held until the provider's body ends, because a client may stop reading at `[DONE]`; any provider byte after it fails the stream closed and the marker is dropped rather than released."
             read_timeout_seconds:
               type: integer
               minimum: 0

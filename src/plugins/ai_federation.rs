@@ -44,12 +44,22 @@
 //! after the claim, and OAuth2 has no per-attempt refresh boundary here. Use
 //! `ai_stream_router` for Anthropic/Gemini streaming translation.
 //!
-//! **Bounds.** The streaming path retains exactly one partial SSE event per
-//! response, capped by `streaming.max_event_bytes`; it creates no queues, no
+//! **Bounds.** The streaming path retains at most one partial SSE event per
+//! response — or, once the provider frames its completion, the single terminal
+//! event alone — capped by `streaming.max_event_bytes`; it creates no queues, no
 //! channels, and no detached tasks of its own. Oversized events, data after the
 //! terminal marker, a duplicated terminal marker, a truncated stream, a
 //! content-coded stream, and a non-event-stream 2xx all fail closed with
 //! fixed-cardinality reasons that never echo a provider byte.
+//!
+//! **The terminal marker is held until upstream EOF.** Ordinary events stream
+//! out as soon as they are complete, so time to first token is unchanged, but
+//! `data: [DONE]` is retained until the provider's body actually ends. A client
+//! following the OpenAI contract may stop reading at `[DONE]`, so releasing it
+//! before EOF would let a client accept a successful completion and never see a
+//! post-terminal violation reported afterwards. Any provider byte after that
+//! retained marker fails the stream closed and the marker is dropped: the client
+//! receives the gateway-authored `error` event and no completion marker.
 //!
 //! Enabling `streaming` makes this plugin declare a backend-boundary header
 //! policy and request header/destination mutation, so it can no longer be
@@ -137,7 +147,8 @@ const MIN_STREAM_EVENT_BYTES: usize = 4 * 1024;
 /// Upper bound an operator may configure for the streaming whole-exchange
 /// budget (24 hours). `0` means no gateway-imposed bound at all.
 const MAX_STREAM_READ_TIMEOUT_SECONDS: u64 = 86_400;
-/// Retained-state ceiling for one claimed stream is exactly one partial event,
+/// Retained-state ceiling for one claimed stream is exactly one event — either
+/// the partial event being assembled or the held terminal marker, never both —
 /// so the whole streaming path costs O(max_event_bytes) regardless of how long
 /// the provider streams. Asserted here so a later edit cannot quietly widen it.
 const _: () = assert!(MAX_STREAM_EVENT_BYTES <= 4 * 1024 * 1024);
@@ -5778,17 +5789,30 @@ fn split_sse_lines(text: &str) -> impl Iterator<Item = &str> {
 ///   BEFORE any of its bytes are retained or released, so neither a single huge
 ///   event nor a single huge transport chunk can be allocated first and refused
 ///   afterwards;
-/// * exactly ONE terminal event whose combined `data` payload is `[DONE]` may
-///   reach the client, and a repeat fails the stream closed;
-/// * no data after the terminal marker;
+/// * the ONE terminal event whose combined `data` payload is `[DONE]` is
+///   RETAINED rather than forwarded, until upstream EOF proves it was the last
+///   thing the provider wrote. An OpenAI streaming client is entitled to stop
+///   reading at `[DONE]`, so releasing a success-shaped marker before that proof
+///   would let it accept a completed generation and never observe an error
+///   appended afterwards — the fail-closed terminal contract below would be
+///   advisory rather than enforced;
+/// * consequently ANY provider byte that follows the retained terminal — a
+///   second terminal, a data event, a comment / `id` / `retry` line, an
+///   oversized or structurally undecidable block, or a trailing partial line at
+///   EOF — fails the stream closed, and the retained `[DONE]` is dropped instead
+///   of released. The client sees the gateway-authored `error` event and no
+///   completion marker at all;
 /// * a non-UTF-8 / structurally undecidable event fails closed rather than being
 ///   forwarded;
 /// * a truncated stream (clean EOF with no terminal marker, or a trailing
 ///   partial event) fails closed with one gateway-authored error frame.
 ///
 /// Retained state is independent of stream length AND of transport chunk size:
-/// at most one partial event, hard-capped at the configured ceiling. The release
-/// buffer is proportional only to the bytes released in the current call.
+/// at most one partial event OR the single retained terminal event, each
+/// hard-capped at the configured ceiling. The two are never held together —
+/// the first byte after the terminal ends the stream — so retention stays at one
+/// ceiling. The release buffer is proportional only to the bytes released in the
+/// current call.
 struct FederationSseGuard {
     /// Bytes of the current, not-yet-complete event. Never exceeds
     /// `max_event_bytes`.
@@ -5797,7 +5821,10 @@ struct FederationSseGuard {
     /// no byte is ever scanned twice.
     frame: SseFrameState,
     max_event_bytes: usize,
-    done_seen: bool,
+    /// The provider's own terminal event, held verbatim until EOF proves it
+    /// final. `Some` implies `carry` is empty and no further provider byte has
+    /// been seen.
+    retained_terminal: Option<Vec<u8>>,
     terminated: bool,
     /// Shared reservation; resolved exactly once from the COMPLETE body outcome.
     lifecycle: Option<Arc<FederationStreamLifecycle>>,
@@ -5809,7 +5836,7 @@ impl FederationSseGuard {
             carry: Vec::new(),
             frame: SseFrameState::Text,
             max_event_bytes,
-            done_seen: false,
+            retained_terminal: None,
             terminated: false,
             lifecycle,
         }
@@ -5817,9 +5844,14 @@ impl FederationSseGuard {
 
     /// Drop retained provider bytes and record the terminal outcome exactly
     /// once.
+    ///
+    /// This includes a retained terminal event: every path that reaches here
+    /// without having already released it is a path on which the client must not
+    /// receive a completion marker.
     fn finish(&mut self, outcome: StreamOutcome) {
         self.terminated = true;
         self.carry = Vec::new();
+        self.retained_terminal = None;
         if let Some(lifecycle) = self.lifecycle.as_ref() {
             lifecycle.resolve(outcome);
         }
@@ -5843,11 +5875,22 @@ impl FederationSseGuard {
 
     /// Admit one COMPLETE event whose bytes are `carry` + `tail`.
     ///
-    /// The ceiling is enforced before anything is copied anywhere.
+    /// The ceiling is enforced before anything is copied anywhere. A terminal
+    /// event is retained instead of released; every other kind is released in
+    /// order.
     fn admit_event(&mut self, tail: &[u8], released: &mut Vec<u8>) -> Result<(), &'static str> {
         let total = self.carry.len().saturating_add(tail.len());
         if total > self.max_event_bytes {
             return Err(STREAM_REASON_OVERSIZED_EVENT);
+        }
+        if self.retained_terminal.is_some() {
+            // NOTHING may follow the terminal event — not a second terminal, not
+            // data, not even a comment or a bare `id:` line. Forwarding a repeat
+            // would emit two completions, and dropping any of them would
+            // silently accept a provider that cannot frame its own stream.
+            // Refused here, BEFORE the retained `[DONE]` was ever released, so
+            // the client cannot have already accepted the generation.
+            return Err(STREAM_REASON_AFTER_TERMINAL);
         }
         // Avoid a second copy in the common case where the whole event arrived
         // inside this chunk.
@@ -5861,29 +5904,26 @@ impl FederationSseGuard {
             return Err(STREAM_REASON_MALFORMED_EVENT);
         };
         match kind {
+            // Held verbatim, bounded by the same ceiling every other event is
+            // checked against, until `on_end` proves the provider wrote nothing
+            // after it.
             SseEventKind::Terminal => {
-                if self.done_seen {
-                    // One documented behavior for a repeated terminal marker:
-                    // fail closed. Forwarding it would emit two completions and
-                    // dropping it would silently accept a provider that cannot
-                    // frame its own stream.
-                    return Err(STREAM_REASON_AFTER_TERMINAL);
-                }
-                self.done_seen = true;
+                let event = if self.carry.is_empty() {
+                    tail.to_vec()
+                } else {
+                    std::mem::take(&mut self.carry)
+                };
+                self.retained_terminal = Some(event);
             }
-            SseEventKind::Data => {
-                if self.done_seen {
-                    return Err(STREAM_REASON_AFTER_TERMINAL);
+            SseEventKind::Data | SseEventKind::NonData => {
+                if self.carry.is_empty() {
+                    released.extend_from_slice(tail);
+                } else {
+                    released.extend_from_slice(&self.carry);
                 }
             }
-            SseEventKind::NonData => {}
         }
-        if self.carry.is_empty() {
-            released.extend_from_slice(tail);
-        } else {
-            released.extend_from_slice(&self.carry);
-            self.carry.clear();
-        }
+        self.carry.clear();
         // A single early large event must not pin the ceiling for the rest of
         // the stream.
         if self.carry.capacity() > SSE_CARRY_COMPACT_BYTES {
@@ -5904,6 +5944,12 @@ impl ResponseStreamInspector for FederationSseGuard {
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
+        }
+        if self.retained_terminal.is_some() && !chunk.is_empty() {
+            // The provider kept writing after the completion marker it already
+            // framed. Refuse the whole stream while `[DONE]` is still retained,
+            // so no success-shaped terminal ever precedes this error.
+            return self.fail_closed(STREAM_REASON_AFTER_TERMINAL, Vec::new());
         }
         let mut released: Vec<u8> = Vec::new();
         // Start of the current event's bytes WITHIN this chunk. Everything
@@ -5952,6 +5998,13 @@ impl ResponseStreamInspector for FederationSseGuard {
         }
 
         let trailing = chunk.len() - segment_start;
+        if trailing > 0 && self.retained_terminal.is_some() {
+            // A partial event opened after the terminal event completed in this
+            // same chunk. Same refusal as a complete post-terminal event, and it
+            // keeps the retained-terminal invariant: `retained_terminal` is only
+            // ever held with an empty carry.
+            return self.fail_closed(STREAM_REASON_AFTER_TERMINAL, released);
+        }
         if self.carry.len().saturating_add(trailing) > self.max_event_bytes {
             return self.fail_closed(STREAM_REASON_OVERSIZED_EVENT, released);
         }
@@ -5979,19 +6032,19 @@ impl ResponseStreamInspector for FederationSseGuard {
         }
         // A trailing partial event or a missing terminal marker both mean the
         // client would otherwise be unable to distinguish a complete generation
-        // from a cut connection.
-        if !self.carry.is_empty() || !self.done_seen {
-            self.finish(StreamOutcome::Failed);
-            let frame = stream_error_frame(STREAM_REASON_TRUNCATED);
-            if released.is_empty() {
-                return ResponseStreamAction::Terminate(Some(frame));
-            }
-            let mut out = released;
-            out.extend_from_slice(&frame);
-            return ResponseStreamAction::Terminate(Some(Bytes::from(out)));
+        // from a cut connection. Either way `finish` drops any retained
+        // terminal, so the client never receives a completion marker here.
+        if !self.carry.is_empty() {
+            return self.fail_closed(STREAM_REASON_TRUNCATED, released);
         }
-        // Terminal proof: this is the only path that scores the stream as a
-        // provider success.
+        let Some(terminal) = self.retained_terminal.take() else {
+            return self.fail_closed(STREAM_REASON_TRUNCATED, released);
+        };
+        // Terminal proof: clean EOF, nothing retained, and exactly one terminal
+        // event. Only now is the provider's ORIGINAL marker released verbatim,
+        // and this is the only path that scores the stream as a provider
+        // success.
+        released.extend_from_slice(&terminal);
         self.finish(StreamOutcome::Succeeded);
         ResponseStreamAction::Forward(Bytes::from(released))
     }
@@ -8252,7 +8305,7 @@ pub mod test_helpers {
             }
         }
 
-        /// Bytes currently retained across transport calls.
+        /// Bytes of the partial event currently retained across transport calls.
         pub fn retained_bytes(&self) -> usize {
             self.guard.carry.len()
         }
@@ -8260,6 +8313,16 @@ pub mod test_helpers {
         /// Capacity currently reserved for retained bytes.
         pub fn retained_capacity(&self) -> usize {
             self.guard.carry.capacity()
+        }
+
+        /// Bytes of the terminal event currently held back from the client
+        /// (`0` when none is held), so retention bounds can be asserted over the
+        /// COMPLETE retained state rather than the carry buffer alone.
+        pub fn retained_terminal_bytes(&self) -> usize {
+            self.guard
+                .retained_terminal
+                .as_ref()
+                .map_or(0, |terminal| terminal.len())
         }
     }
 
