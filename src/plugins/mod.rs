@@ -2740,6 +2740,13 @@ pub struct RequestContext {
     /// replacement, cancellation, transport disconnect — so no cleanup task is
     /// ever spawned and no identity can leak its per-session capacity.
     pub(crate) mcp_sse_stream: Option<mcp_aggregate_sse::AggregateSseStream>,
+    /// Aggregate-SSE event reserved after final body policy selected an empty
+    /// POST-side `202`, but not yet visible to the listener. The committed hook
+    /// publishes it only if that exact acknowledgement survives the remaining
+    /// response-header lifecycle; drop/abort returns the reservation and stream
+    /// capacity exactly once. Private so metadata cannot forge publication.
+    pub(crate) mcp_sse_publication:
+        Option<mcp_aggregate_sse::AggregateSsePublication>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -3224,6 +3231,7 @@ impl RequestContext {
             mcp_batch_forbids_upstream: false,
             mcp_aggregate_sse: None,
             mcp_sse_stream: None,
+            mcp_sse_publication: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_instance_scores: HashMap::new(),
@@ -4343,6 +4351,9 @@ impl RequestContext {
             // state is copied back. Holding a lease here would terminalize the
             // live request's identity when the copy dropped.
             mcp_sse_stream: None,
+            // A pending response publication is likewise owned only by the live
+            // response lifecycle, never by a request-body compatibility clone.
+            mcp_sse_publication: None,
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_instance_scores: self.waf_instance_scores.clone(),

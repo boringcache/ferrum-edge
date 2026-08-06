@@ -1847,9 +1847,11 @@ impl McpGateway {
     /// still on the context. Ferrum's synthetic-response lifecycle carries those
     /// exact bytes through every response phase, and
     /// [`Self::multiplex_final_response`] — reached from
-    /// `on_final_response_body` on that same lifecycle — publishes whatever
-    /// representation the client is actually allowed to receive, or settles the
-    /// stream and answers the governed response inline.
+    /// `on_final_response_body` on that same lifecycle — reserves whatever
+    /// representation the client is actually allowed to receive. Publication
+    /// waits for `on_response_committed`, after the POST-side acknowledgement
+    /// has survived final header policy; otherwise the governed response stays
+    /// inline.
     ///
     /// Keeping the lease open until then also keeps cancellation meaningful for
     /// the whole of the response lifecycle, not just up to dispatch.
@@ -1895,8 +1897,8 @@ impl McpGateway {
             };
         }
         // Staged, not published. `mcp.route_decision` records the DISPATCH
-        // decision; `mcp.sse.delivery`, written by the final phase, is the
-        // authoritative record of what actually happened to the response.
+        // decision; `mcp.sse.delivery`, written at reservation refusal or the
+        // committed boundary, is the authoritative delivery outcome.
         ctx.mcp_sse_stream = Some(stream);
         Self::note_route_decision(ctx, "sse_multiplex");
         PluginResult::Reject {
@@ -1906,8 +1908,8 @@ impl McpGateway {
         }
     }
 
-    /// Route the FINAL client-visible JSON-RPC response onto the session's SSE
-    /// listener.
+    /// Reserve the FINAL governed JSON-RPC response for the session's SSE
+    /// listener and select the POST-side empty `202`.
     ///
     /// One decision point for both producers: an upstream-routed response and a
     /// gateway-authored one staged by [`Self::deliver_dispatch_result_via_sse`]
@@ -1916,12 +1918,13 @@ impl McpGateway {
     /// authoritative final client-visible body policy have produced the exact
     /// representation the client is allowed to receive.
     ///
-    /// Returns the replacement `202` when the response was delivered on the
-    /// event stream (or deliberately suppressed by a cancellation), and `None`
-    /// when this POST must answer inline. The published event is the exact
-    /// client-visible representation, so anything this phase cannot read as
-    /// bounded identity-encoded JSON answers inline rather than being re-encoded
-    /// or dropped.
+    /// Nothing becomes listener-visible here. A successful admission stores a
+    /// private RAII publication on the request context; the observe-only
+    /// committed hook publishes it only if the empty `202` survives the final
+    /// response-header lifecycle. This keeps a gateway-authored synthetic
+    /// response from escaping a policy that replaces that acknowledgement after
+    /// the body hook, while shared broker reservation accounting makes the
+    /// eventual commit capacity-infallible.
     fn multiplex_final_response(
         &self,
         ctx: &mut RequestContext,
@@ -1948,9 +1951,9 @@ impl McpGateway {
             Self::note_sse_delivery(ctx, "inline");
             return None;
         }
-        match stream.publish_encoded(body) {
-            Ok(_) => {
-                Self::note_sse_delivery(ctx, "multiplexed");
+        match stream.reserve_encoded(body) {
+            Ok(publication) => {
+                ctx.mcp_sse_publication = Some(publication);
                 Some(empty_response(202))
             }
             Err(AggregateSseError::StreamCancelled) => {
@@ -1970,6 +1973,9 @@ impl McpGateway {
     /// Release the request's stream identity because this POST is answering
     /// inline. Idempotent, and a no-op when no stream was opened.
     fn settle_sse_stream_inline(ctx: &mut RequestContext) {
+        if let Some(publication) = ctx.mcp_sse_publication.take() {
+            publication.abort();
+        }
         if let Some(stream) = ctx.mcp_sse_stream.take() {
             stream.settle_inline();
             Self::note_sse_delivery(ctx, "inline");
@@ -5431,15 +5437,16 @@ impl Plugin for McpGateway {
     /// enforcement unchanged is eligible to be multiplexed onto the session's
     /// event stream.
     ///
-    /// This is the SINGLE publication point for aggregate SSE. It owns the
-    /// terminal decision for `tools/call`, `prompts/get`, `resources/read`, and
+    /// This is the SINGLE reservation point for aggregate SSE. It owns the
+    /// terminal admission decision for `tools/call`, `prompts/get`,
+    /// `resources/read`, and
     /// every passthrough method routed to the primary upstream, and equally for
     /// the gateway-authored responses (`tools/list`, `prompts/list`,
     /// `resources/list`, `ping`, gateway JSON-RPC errors) that
     /// [`Self::deliver_dispatch_result_via_sse`] staged in `before_proxy` and
     /// that reach this hook on Ferrum's synthetic-response lifecycle. Both
-    /// therefore publish only bytes that the configured response-body policies
-    /// have already accepted.
+    /// therefore reserve only bytes that the configured response-body policies
+    /// have already accepted. The committed hook is the sole visibility point.
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,
@@ -5456,6 +5463,45 @@ impl Plugin for McpGateway {
         match self.multiplex_final_response(ctx, response_status, response_headers, body) {
             Some(replacement) => replacement,
             None => PluginResult::Continue,
+        }
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) {
+        let Some(publication) = ctx.mcp_sse_publication.take() else {
+            return;
+        };
+        // The reservation was made for one fixed empty acknowledgement. If a
+        // later reject/header phase selected anything else, keep that response
+        // inline and make the event permanently invisible.
+        if response_status != 202 || !body.is_empty() {
+            publication.abort();
+            Self::note_sse_delivery(ctx, "inline");
+            return;
+        }
+        match publication.commit() {
+            Ok(_) => Self::note_sse_delivery(ctx, "multiplexed"),
+            Err(AggregateSseError::StreamCancelled) => {
+                Self::note_sse_error(ctx, AggregateSseError::StreamCancelled);
+                Self::note_route_decision(ctx, "sse_cancelled");
+                Self::note_sse_delivery(ctx, "suppressed");
+            }
+            Err(error) => {
+                // Session deletion/retirement can race this boundary. The POST
+                // acknowledgement is already final, so record a fixed token and
+                // suppress rather than panic or expose a stale payload.
+                Self::note_sse_error(ctx, error);
+                Self::note_sse_delivery(ctx, "suppressed");
+            }
         }
     }
 

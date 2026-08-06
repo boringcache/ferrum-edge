@@ -1,7 +1,8 @@
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
     build_aggregate_sse_reject_for_test, drop_mcp_sse_stream_for_test,
-    mcp_aggregate_sse_listener_is_staged_for_test, mcp_sse_stream_is_open_for_test,
+    mcp_aggregate_sse_listener_is_staged_for_test,
+    mcp_sse_publication_is_pending_for_test, mcp_sse_stream_is_open_for_test,
     reject_headers_select_event_stream_for_test, take_mcp_aggregate_sse_listener_for_test,
 };
 use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
@@ -9619,15 +9620,57 @@ async fn sse_drain_until(body: &mut AggregateSseBody, wanted: &[&str], max: usiz
     seen
 }
 
-/// The final client-visible response-body phase of Ferrum's synthetic
-/// rejection lifecycle, driven over the exact representation `before_proxy`
-/// produced.
+/// Drive the final body hook and the observe-only committed boundary over the
+/// response it selected. The production funnel inserts the remaining header
+/// phases between these calls; focused tests can stop before the second call
+/// when they need to prove reservation invisibility.
+async fn final_body_and_commit(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    ctx: &mut ferrum_edge::plugins::RequestContext,
+    status_code: u16,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> PluginResult {
+    let result = plugin
+        .on_final_response_body(ctx, status_code, headers, body)
+        .await;
+    match &result {
+        PluginResult::Continue => {
+            plugin
+                .on_response_committed(ctx, status_code, headers, body)
+                .await;
+        }
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            plugin
+                .on_response_committed(ctx, *status_code, headers, body.as_bytes())
+                .await;
+        }
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            plugin
+                .on_response_committed(ctx, *status_code, headers, body)
+                .await;
+        }
+    }
+    result
+}
+
+/// The final client-visible response-body and committed phases of Ferrum's
+/// synthetic rejection lifecycle, driven over the exact representation
+/// `before_proxy` produced.
 ///
-/// Aggregate SSE publishes HERE and only here — a gateway-authored JSON-RPC
-/// response is merely *staged* in `before_proxy` so the response-body
-/// guardrails, semantic transforms, and the authoritative final body policy see
-/// the real payload rather than an empty `202`. A test that wants the
-/// client-visible outcome must therefore drive this phase too.
+/// Aggregate SSE reserves at the final body phase and publishes only at the
+/// committed phase — a gateway-authored JSON-RPC response is merely *staged* in
+/// `before_proxy` so response-body guardrails, semantic transforms, and final
+/// policy see the real payload rather than an empty `202`. A test that wants the
+/// client-visible outcome must therefore drive both phases.
 async fn finalize_synthetic_response(
     plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
     ctx: &mut ferrum_edge::plugins::RequestContext,
@@ -9641,10 +9684,7 @@ async fn finalize_synthetic_response(
         } => (status_code, body, headers),
         other => return other,
     };
-    match plugin
-        .on_final_response_body(ctx, status_code, &headers, body.as_bytes())
-        .await
-    {
+    match final_body_and_commit(plugin, ctx, status_code, &headers, body.as_bytes()).await {
         PluginResult::Continue => PluginResult::Reject {
             status_code,
             body,
@@ -9663,7 +9703,7 @@ async fn ping(
 }
 
 /// A `ping` driven through the complete gateway-authored lifecycle, returning
-/// the request context so a test can assert the metadata the final phase wrote.
+/// the request context so a test can assert the committed outcome metadata.
 async fn ping_with_context(
     plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
     session_id: &str,
@@ -10216,14 +10256,14 @@ async fn aggregate_sse_multiplexes_a_synthetic_list_and_a_routed_call_on_one_lis
     );
     assert!(list_ctx.metadata.get("mcp.sse.delivery").is_none());
 
-    let listed = plugin
-        .on_final_response_body(
-            &mut list_ctx,
-            staged_status,
-            &staged_headers,
-            staged_body.as_bytes(),
-        )
-        .await;
+    let listed = final_body_and_commit(
+        &plugin,
+        &mut list_ctx,
+        staged_status,
+        &staged_headers,
+        staged_body.as_bytes(),
+    )
+    .await;
     let (status, body, _) = reject_raw(listed);
     assert_eq!(
         status, 202,
@@ -10251,9 +10291,8 @@ async fn aggregate_sse_multiplexes_a_synthetic_list_and_a_routed_call_on_one_lis
     let mut call_ctx = route_tool_call_with_listener(&plugin, &session_id, 501).await;
     let upstream = weather_tool_result(501);
     let response_headers = known_json_response_headers(&upstream);
-    let delivered = plugin
-        .on_final_response_body(&mut call_ctx, 200, &response_headers, &upstream)
-        .await;
+    let delivered =
+        final_body_and_commit(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
     let (status, body, _) = reject_raw(delivered);
     assert_eq!(status, 202);
     assert!(body.is_empty());
@@ -10324,22 +10363,71 @@ async fn aggregate_sse_gateway_authored_error_is_staged_not_published_by_before_
         "before_proxy must not publish a gateway-authored response"
     );
 
-    // The final client-visible phase is what publishes and what turns the POST
-    // into the 202.
+    // The final body phase reserves the event and turns the POST into the 202,
+    // but nothing is listener-visible until the committed boundary confirms
+    // that later header policy kept that acknowledgement.
     let delivered = plugin
         .on_final_response_body(&mut ctx, status, &response_headers, body.as_bytes())
         .await;
     let (status, delivered_body, _) = reject_raw(delivered);
     assert_eq!(status, 202);
     assert!(delivered_body.is_empty());
+    assert!(mcp_sse_publication_is_pending_for_test(&ctx));
+    assert!(ctx.metadata.get("mcp.sse.delivery").is_none());
+    plugin
+        .on_response_committed(&mut ctx, status, &HashMap::new(), delivered_body.as_bytes())
+        .await;
     assert_eq!(
         ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
         Some("multiplexed")
     );
+    assert!(!mcp_sse_publication_is_pending_for_test(&ctx));
     assert!(!mcp_sse_stream_is_open_for_test(&ctx));
     let seen = sse_drain_until(&mut stream, &["staged-1"], 4).await;
     assert!(seen.contains("staged-1"));
     assert!(seen.contains("-32601"));
+}
+
+#[tokio::test]
+async fn aggregate_sse_late_response_replacement_aborts_reserved_event() {
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["sessions"] = json!({ "sse_max_streams_per_session": 1 });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let mut stream = attach_sse_body(&plugin, &session_id).await;
+
+    let (mut ctx, dispatched) =
+        stage_gateway_authored(&plugin, &session_id, json!("late-policy"), "ping").await;
+    let (status, body, headers) = reject_raw(dispatched);
+    let selected = plugin
+        .on_final_response_body(&mut ctx, status, &headers, body.as_bytes())
+        .await;
+    let (selected_status, selected_body, selected_headers) = reject_raw(selected);
+    assert_eq!(selected_status, 202);
+    assert!(selected_body.is_empty());
+    assert!(mcp_sse_publication_is_pending_for_test(&ctx));
+    assert!(ctx.metadata.get("mcp.sse.delivery").is_none());
+
+    // Model the synthetic lifecycle's deliberately-late response/header policy
+    // replacing the selected acknowledgement. The committed hook observes the
+    // actual replacement, aborts the reservation, and returns the sole stream
+    // slot without ever exposing the pre-policy JSON-RPC body.
+    let blocked = br#"{"error":"blocked by late response policy"}"#;
+    plugin
+        .on_response_committed(&mut ctx, 403, &selected_headers, blocked)
+        .await;
+    assert!(!mcp_sse_publication_is_pending_for_test(&ctx));
+    assert_eq!(
+        ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        Some("inline")
+    );
+
+    let next = ping(&plugin, &session_id, json!("after-late-policy")).await;
+    assert_eq!(reject_raw(next).0, 202, "aborted reservation returns capacity");
+    let seen = sse_drain_until(&mut stream, &["after-late-policy"], 6).await;
+    assert!(seen.contains("after-late-policy"));
+    assert!(!seen.contains("\"id\":\"late-policy\""));
+    assert!(!seen.contains("blocked by late response policy"));
 }
 
 #[tokio::test]
@@ -10366,9 +10454,7 @@ async fn aggregate_sse_final_body_policy_rejection_answers_inline_and_publishes_
     // failure semantics intact — never a 202, and never a published event.
     let governed = br#"{"error":"blocked by response policy"}"#;
     let governed_headers = known_json_response_headers(governed);
-    let inline = plugin
-        .on_final_response_body(&mut ctx, 403, &governed_headers, governed)
-        .await;
+    let inline = final_body_and_commit(&plugin, &mut ctx, 403, &governed_headers, governed).await;
     assert!(
         matches!(inline, PluginResult::Continue),
         "the governed non-200 response must remain on the POST"
@@ -10416,9 +10502,8 @@ async fn aggregate_sse_final_body_redaction_publishes_the_transformed_bytes() {
     }))
     .unwrap();
     let redacted_headers = known_json_response_headers(&redacted);
-    let delivered = plugin
-        .on_final_response_body(&mut ctx, 200, &redacted_headers, &redacted)
-        .await;
+    let delivered =
+        final_body_and_commit(&plugin, &mut ctx, 200, &redacted_headers, &redacted).await;
     let (status, delivered_body, _) = reject_raw(delivered);
     assert_eq!(status, 202);
     assert!(delivered_body.is_empty());
@@ -10460,9 +10545,14 @@ async fn aggregate_sse_cancellation_after_staging_suppresses_the_gateway_authore
         Some("cancelled")
     );
 
-    let suppressed = plugin
-        .on_final_response_body(&mut ctx, status, &response_headers, body.as_bytes())
-        .await;
+    let suppressed = final_body_and_commit(
+        &plugin,
+        &mut ctx,
+        status,
+        &response_headers,
+        body.as_bytes(),
+    )
+    .await;
     let (status, delivered_body, _) = reject_raw(suppressed);
     assert_eq!(status, 202, "a cancelled request is still acknowledged");
     assert!(delivered_body.is_empty());
@@ -10498,9 +10588,8 @@ async fn aggregate_sse_preserves_non_ok_upstream_http_status_inline() {
     let mut call_ctx = route_tool_call_with_listener(&plugin, &session_id, 550).await;
     let upstream = weather_tool_result(550);
     let response_headers = known_json_response_headers(&upstream);
-    let preserved = plugin
-        .on_final_response_body(&mut call_ctx, 503, &response_headers, &upstream)
-        .await;
+    let preserved =
+        final_body_and_commit(&plugin, &mut call_ctx, 503, &response_headers, &upstream).await;
     assert!(
         matches!(preserved, PluginResult::Continue),
         "the original non-200 response must remain on the POST"
@@ -10558,9 +10647,8 @@ async fn aggregate_sse_cancellation_marks_an_open_routed_request_and_suppresses_
     // The eventual result is suppressed: acknowledged, never published.
     let upstream = weather_tool_result(600);
     let response_headers = known_json_response_headers(&upstream);
-    let suppressed = plugin
-        .on_final_response_body(&mut call_ctx, 200, &response_headers, &upstream)
-        .await;
+    let suppressed =
+        final_body_and_commit(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
     let (status, body, _) = reject_raw(suppressed);
     assert_eq!(status, 202);
     assert!(body.is_empty());
@@ -10606,9 +10694,8 @@ async fn aggregate_sse_policy_replacement_answers_inline_and_returns_the_identit
     }))
     .unwrap();
     let response_headers = known_json_response_headers(&invalid);
-    let replaced = plugin
-        .on_final_response_body(&mut call_ctx, 200, &response_headers, &invalid)
-        .await;
+    let replaced =
+        final_body_and_commit(&plugin, &mut call_ctx, 200, &response_headers, &invalid).await;
     let (status, body, _) = reject_json(replaced);
     assert_eq!(status, 200);
     assert_eq!(body["error"]["code"], -32012);
@@ -10668,9 +10755,8 @@ async fn aggregate_sse_dropped_request_releases_the_identity_exactly_once() {
     // rather than published, and the identity is not reopened.
     let upstream = weather_tool_result(800);
     let response_headers = known_json_response_headers(&upstream);
-    let late = plugin
-        .on_final_response_body(&mut in_flight, 200, &response_headers, &upstream)
-        .await;
+    let late =
+        final_body_and_commit(&plugin, &mut in_flight, 200, &response_headers, &upstream).await;
     assert!(
         matches!(late, PluginResult::Continue),
         "a released identity must answer inline, never publish late"

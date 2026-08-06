@@ -349,6 +349,14 @@ pub mod _test_support {
         ctx.mcp_sse_stream.is_some()
     }
 
+    /// Whether final body policy reserved an aggregate-SSE event that is still
+    /// invisible pending the committed-response boundary.
+    pub fn mcp_sse_publication_is_pending_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.mcp_sse_publication.is_some()
+    }
+
     /// Drop just the multiplexed stream lease, modelling a request that ended
     /// without producing a response — a backend failure, a replaced rejection,
     /// or a client transport disconnect. The identity must terminalize and its

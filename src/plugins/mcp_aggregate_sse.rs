@@ -19,7 +19,10 @@
 //! * Retained event bytes have exactly ONE budget. Every event is retained
 //!   once, in a single ring that serves both pre-listener staging and
 //!   `Last-Event-ID` replay; delivery clones a `Bytes` handle, never the
-//!   payload.
+//!   payload. A response that has selected its POST-side `202` reserves one
+//!   event/count window before that response can enter final header policy;
+//!   direct publishers account for those reservations, so the later committed
+//!   hook cannot lose the event to a capacity race.
 //! * An undelivered event is never evicted. When the ring cannot admit one, the
 //!   publish fails closed and the caller answers the POST inline, so a JSON-RPC
 //!   response is never silently dropped. A refused publish still TERMINALIZES
@@ -457,6 +460,12 @@ struct SessionInner {
     /// Single retained ring: pre-listener staging AND `Last-Event-ID` replay.
     history: VecDeque<RetainedEvent>,
     history_bytes: usize,
+    /// Capacity promised to responses that selected an empty POST-side `202`
+    /// but have not crossed the observe-only committed-response boundary yet.
+    /// Reserved payloads live on their request contexts, not in this ring, so
+    /// listeners cannot observe them before the final response is accepted.
+    reserved_events: usize,
+    reserved_bytes: usize,
     last_event_id: u64,
     delivered_through: u64,
     /// Highest event id dropped from history. A cursor below it cannot resume.
@@ -475,6 +484,8 @@ impl SessionInner {
             terminal_order: VecDeque::new(),
             history: VecDeque::new(),
             history_bytes: 0,
+            reserved_events: 0,
+            reserved_bytes: 0,
             last_event_id: 0,
             delivered_through: 0,
             evicted_through: 0,
@@ -518,9 +529,9 @@ impl SessionInner {
     }
 
     /// Evict already-consumed history until the current ring plus an incoming
-    /// reservation fits. `incoming_events` is either zero (ordinary delivery
-    /// trimming) or one (publish admission); callers never reserve more than
-    /// one event at a time.
+    /// reservation fits. The incoming totals include every outstanding private
+    /// publication reservation plus, for publish/commit admission, the event
+    /// currently being considered.
     ///
     /// Looking only at the current ring is insufficient for publish admission:
     /// a ring exactly at its event or byte cap can still contain delivered,
@@ -565,15 +576,27 @@ impl SessionInner {
     ) -> Result<u64, AggregateSseError> {
         let event_id = self.last_event_id.saturating_add(1);
         let framed = frame_sse_event(event_id, encoded);
-        self.trim_for_admission(bounds, 1, framed.len());
-        let projected = self.history_bytes.saturating_add(framed.len());
-        if self.history.len() >= bounds.max_retained_events {
+        self.trim_for_admission(
+            bounds,
+            self.reserved_events.saturating_add(1),
+            self.reserved_bytes.saturating_add(framed.len()),
+        );
+        let projected_events = self
+            .history
+            .len()
+            .saturating_add(self.reserved_events)
+            .saturating_add(1);
+        let projected_bytes = self
+            .history_bytes
+            .saturating_add(self.reserved_bytes)
+            .saturating_add(framed.len());
+        if projected_events > bounds.max_retained_events {
             return Err(AggregateSseError::RetentionOverflow);
         }
-        if projected > bounds.max_retained_bytes {
+        if projected_bytes > bounds.max_retained_bytes {
             return Err(AggregateSseError::RetentionOverflow);
         }
-        self.history_bytes = projected;
+        self.history_bytes = self.history_bytes.saturating_add(framed.len());
         self.history.push_back(RetainedEvent { event_id, framed });
         self.last_event_id = event_id;
         self.last_activity = Instant::now();
@@ -651,6 +674,8 @@ impl SessionState {
         inner.terminal_order.clear();
         inner.history.clear();
         inner.history_bytes = 0;
+        inner.reserved_events = 0;
+        inner.reserved_bytes = 0;
         waker
     }
 
@@ -728,6 +753,107 @@ impl SessionState {
             waker.wake();
         }
         outcome
+    }
+
+    /// Promise one future retained-event slot without making payload bytes
+    /// visible to the listener. Every direct publisher includes this promise in
+    /// its own admission calculation, so a successful reservation remains
+    /// commit-capable even if unrelated responses publish first.
+    fn reserve_terminal(
+        &self,
+        identity: &StreamIdentity,
+        reserved_bytes: usize,
+    ) -> Result<(), AggregateSseError> {
+        let max_open = self.bounds.max_streams_per_session;
+        let mut inner = self.lock();
+        if inner.closed {
+            return Err(AggregateSseError::StaleSession);
+        }
+        match inner.streams.get(identity).copied() {
+            Some(StreamPhase::Open) => {}
+            Some(StreamPhase::Completed) => return Err(AggregateSseError::StreamCompleted),
+            Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
+            None => return Err(AggregateSseError::UnknownStream),
+        }
+        let incoming_events = inner.reserved_events.saturating_add(1);
+        let incoming_bytes = inner.reserved_bytes.saturating_add(reserved_bytes);
+        inner.trim_for_admission(&self.bounds, incoming_events, incoming_bytes);
+        if inner.history.len().saturating_add(incoming_events)
+            > self.bounds.max_retained_events
+            || inner.history_bytes.saturating_add(incoming_bytes)
+                > self.bounds.max_retained_bytes
+        {
+            inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
+            inner.last_activity = Instant::now();
+            return Err(AggregateSseError::RetentionOverflow);
+        }
+        inner.reserved_events = incoming_events;
+        inner.reserved_bytes = incoming_bytes;
+        inner.last_activity = Instant::now();
+        Ok(())
+    }
+
+    /// Commit a previously reserved payload after the POST-side response has
+    /// survived every rejecting header/body phase. Capacity failure is excluded
+    /// by `reserve_terminal` plus reservation-aware direct publication; the
+    /// `Result` remains defensive for teardown/cancellation races.
+    fn commit_reserved_terminal(
+        &self,
+        identity: &StreamIdentity,
+        encoded: &[u8],
+        reserved_bytes: usize,
+    ) -> Result<u64, AggregateSseError> {
+        let max_open = self.bounds.max_streams_per_session;
+        let (outcome, waker) = {
+            let mut inner = self.lock();
+            inner.reserved_events = inner.reserved_events.saturating_sub(1);
+            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_bytes);
+            if inner.closed {
+                return Err(AggregateSseError::StaleSession);
+            }
+            match inner.streams.get(identity).copied() {
+                Some(StreamPhase::Open) => {}
+                Some(StreamPhase::Completed) => return Err(AggregateSseError::StreamCompleted),
+                Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
+                None => return Err(AggregateSseError::UnknownStream),
+            }
+            match inner.retain_event(&self.bounds, encoded) {
+                Ok(event_id) => {
+                    inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
+                    let waker = inner.take_waker();
+                    (Ok(event_id), waker)
+                }
+                Err(error) => {
+                    // This means reservation accounting drifted. Stay
+                    // fail-closed and return the identity capacity rather than
+                    // panicking on a production request path.
+                    inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
+                    inner.last_activity = Instant::now();
+                    (Err(error), None)
+                }
+            }
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        outcome
+    }
+
+    /// Release a reservation whose POST-side response was replaced or whose
+    /// request ended before the committed boundary. Idempotence is owned by the
+    /// reservation lease; saturating counters also make stale-generation drops
+    /// harmless after `close_inner` has zeroed the session.
+    fn abort_reserved_terminal(&self, identity: &StreamIdentity, reserved_bytes: usize) {
+        let max_open = self.bounds.max_streams_per_session;
+        let mut inner = self.lock();
+        inner.reserved_events = inner.reserved_events.saturating_sub(1);
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_bytes);
+        if inner.closed {
+            return;
+        }
+        if inner.terminalize_stream(identity, StreamPhase::Completed, max_open) {
+            inner.last_activity = Instant::now();
+        }
     }
 
     /// Release an open identity without publishing anything, because the POST
@@ -1314,6 +1440,45 @@ impl AggregateSseStream {
         self.0.session.publish_terminal(&self.0.identity, encoded)
     }
 
+    /// Reserve delivery of the already-governed response while the POST-side
+    /// empty `202` crosses the final response-header and committed boundaries.
+    /// The payload is retained privately by the returned RAII lease and is not
+    /// visible to the listener until [`AggregateSsePublication::commit`].
+    pub fn reserve_encoded(
+        &self,
+        encoded: &[u8],
+    ) -> Result<AggregateSsePublication, AggregateSseError> {
+        if self.0.settled.swap(true, Ordering::AcqRel) {
+            return Err(AggregateSseError::StreamCompleted);
+        }
+        let max_event_bytes = self.0.session.bounds.max_event_bytes;
+        if let Err(error) = validate_event_bytes(encoded, max_event_bytes) {
+            self.0.session.settle_stream(&self.0.identity);
+            return Err(error);
+        }
+        if !response_matches_stream_identity(
+            encoded,
+            &self.0.identity,
+            self.0.session.bounds.max_stream_id_bytes,
+        ) {
+            self.0.session.settle_stream(&self.0.identity);
+            return Err(AggregateSseError::ResponseEnvelopeInvalid);
+        }
+        // Reserve against the framing ceiling rather than today's event-id
+        // width. Unrelated direct publications may advance the id before this
+        // response commits; the fixed ceiling keeps that harmless.
+        let reserved_bytes = encoded.len().saturating_add(SSE_FRAME_OVERHEAD_BYTES);
+        self.0
+            .session
+            .reserve_terminal(&self.0.identity, reserved_bytes)?;
+        Ok(AggregateSsePublication::new(
+            Arc::clone(&self.0.session),
+            self.0.identity.clone(),
+            Bytes::copy_from_slice(encoded),
+            reserved_bytes,
+        ))
+    }
+
     /// Give up the identity without publishing, because this POST answered
     /// inline. Idempotent, and never overwrites a cancellation.
     pub fn settle_inline(&self) {
@@ -1321,6 +1486,82 @@ impl AggregateSseStream {
             return;
         }
         self.0.session.settle_stream(&self.0.identity);
+    }
+}
+
+/// Clone-safe, RAII-owned publication staged between final body policy and the
+/// observe-only committed-response hook.
+///
+/// A `RequestContext` clone shares this one claim. Exactly one caller can commit
+/// or abort it; dropping the last handle aborts and returns both the retained
+/// reservation and the request-stream capacity.
+#[derive(Clone)]
+pub struct AggregateSsePublication(Arc<PublicationLease>);
+
+struct PublicationLease {
+    session: Arc<SessionState>,
+    identity: StreamIdentity,
+    encoded: Bytes,
+    reserved_bytes: usize,
+    finished: AtomicBool,
+}
+
+impl Drop for PublicationLease {
+    fn drop(&mut self) {
+        if self.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.session
+            .abort_reserved_terminal(&self.identity, self.reserved_bytes);
+    }
+}
+
+impl fmt::Debug for AggregateSsePublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Deliberately opaque: both the identity and payload are client data.
+        formatter.write_str("AggregateSsePublication { .. }")
+    }
+}
+
+impl AggregateSsePublication {
+    fn new(
+        session: Arc<SessionState>,
+        identity: StreamIdentity,
+        encoded: Bytes,
+        reserved_bytes: usize,
+    ) -> Self {
+        Self(Arc::new(PublicationLease {
+            session,
+            identity,
+            encoded,
+            reserved_bytes,
+            finished: AtomicBool::new(false),
+        }))
+    }
+
+    /// Make the reserved event visible. Capacity is already promised; errors
+    /// are limited to cancellation/session teardown or defensive accounting
+    /// failure and never panic the proxy path.
+    pub fn commit(&self) -> Result<u64, AggregateSseError> {
+        if self.0.finished.swap(true, Ordering::AcqRel) {
+            return Err(AggregateSseError::StreamCompleted);
+        }
+        self.0.session.commit_reserved_terminal(
+            &self.0.identity,
+            &self.0.encoded,
+            self.0.reserved_bytes,
+        )
+    }
+
+    /// Settle the identity without publication because final policy replaced
+    /// the POST-side acknowledgement. Idempotent across context clones.
+    pub fn abort(&self) {
+        if self.0.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.0
+            .session
+            .abort_reserved_terminal(&self.0.identity, self.0.reserved_bytes);
     }
 }
 

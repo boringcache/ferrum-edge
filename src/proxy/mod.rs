@@ -21516,7 +21516,7 @@ async fn enforce_final_client_visible_response_header_policy(
 /// Close the buffered response header map after every body/representation/
 /// transport outcome. Unlike the streaming/synthetic finalizer, this phase can
 /// replace the response directly in the client's immutable gRPC flavor.
-async fn enforce_buffered_final_client_visible_response_header_policy(
+pub(crate) async fn enforce_buffered_final_client_visible_response_header_policy(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     response_status: &mut u16,
@@ -31604,6 +31604,31 @@ async fn handle_proxy_request_inner(
             )
             .await;
             response_body = ResponseBody::buffered(body);
+        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
+    // `mcp_gateway` may have replaced the governed JSON-RPC body with an empty
+    // POST-side 202 while privately reserving the event. The ordinary buffered
+    // header policy ran before that legacy final-body hook, over the original
+    // 200 response. Close the newly selected acknowledgement here so the
+    // committed hook never publishes an event whose actual POST response did
+    // not pass final header policy. Synthetic rejects reach the equivalent
+    // boundary inside `apply_reject_after_proxy_and_synthetic_body_hooks`.
+    if ctx.mcp_sse_publication.is_some()
+        && let ResponseBody::Buffered(ref mut data) = response_body
+    {
+        let phase_start = Instant::now();
+        if enforce_buffered_final_client_visible_response_header_policy(
+            &plugins,
+            &mut ctx,
+            &mut response_status,
+            &mut response_headers,
+            data,
+        )
+        .await
+        {
+            response_trailers = None;
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }

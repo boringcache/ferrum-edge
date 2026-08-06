@@ -690,6 +690,50 @@ fn byte_budget_bounds_total_retained_bytes() {
     assert_eq!(overflow.unwrap_err(), SseError::RetentionOverflow);
 }
 
+#[tokio::test]
+async fn reserved_publication_is_invisible_and_protects_commit_capacity() {
+    let tuned = AggregateSseBounds {
+        max_retained_events: 2,
+        max_replay_events: 0,
+        ..bounds()
+    };
+    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
+    broker.ensure_session("sess-reserved").unwrap();
+    let listener = broker.attach_listener("sess-reserved", None).unwrap();
+    let mut body = listener.take_body().unwrap();
+    assert!(frame_text(next_frame(&mut body).await).contains(": mcp-sse"));
+
+    let first = broker
+        .open_stream("sess-reserved", &number_id(1))
+        .unwrap();
+    let first_payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    let reserved = first.reserve_encoded(&first_payload).unwrap();
+    assert!(
+        stays_idle(&mut body).await,
+        "a reservation must not become listener-visible before commit"
+    );
+
+    publish(&broker, "sess-reserved", 2)
+        .expect("one direct publication fits beside the promised event");
+    let third = broker
+        .open_stream("sess-reserved", &number_id(3))
+        .unwrap();
+    let third_payload = encode(&json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
+    assert_eq!(
+        third.publish_encoded(&third_payload).unwrap_err(),
+        SseError::RetentionOverflow,
+        "direct publishers must account for promised event capacity"
+    );
+
+    reserved
+        .commit()
+        .expect("a successful reservation must remain commit-capable");
+    let seen = drain_until(&mut body, &["\"id\":2", "\"id\":1"], 5).await;
+    assert!(seen.contains("\"id\":2"));
+    assert!(seen.contains("\"id\":1"));
+    assert!(!seen.contains("\"id\":3"));
+}
+
 #[test]
 fn oversized_event_payload_fails_closed() {
     let tuned = AggregateSseBounds {

@@ -7544,6 +7544,26 @@ async fn handle_h3_request(
             .entry("content-type".to_string())
             .or_insert_with(|| "application/json".to_string());
 
+        // The aggregate MCP SSE final-body hook selects a new empty 202 after
+        // the ordinary buffered header-policy pass. Re-close that exact map —
+        // including the H3 default content type above — before the committed
+        // hook can make its reserved event visible.
+        if ctx.mcp_sse_publication.is_some() {
+            let phase_start = std::time::Instant::now();
+            if crate::proxy::enforce_buffered_final_client_visible_response_header_policy(
+                &plugins,
+                &mut ctx,
+                &mut response_status,
+                &mut response_headers,
+                &mut response_body,
+            )
+            .await
+            {
+                response_trailers = None;
+            }
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        }
+
         if capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
             let phase_start = std::time::Instant::now();
             if crate::proxy::run_deadline_bounded_response_committed_hooks(
