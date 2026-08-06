@@ -515,19 +515,10 @@ pub(crate) struct K8sAccumulator {
     /// directly — no per-lookup `.to_string()` allocations.
     service_port_names: HashMap<String, HashMap<String, HashMap<String, u16>>>,
     service_ports: HashMap<String, HashMap<String, HashSet<u16>>>,
-    /// Captured `Service.spec.selector` labels keyed `namespace → name → labels`.
-    /// Built in the Service pre-pass so AuthorizationPolicy `targetRefs` can
-    /// resolve Service attachments without depending on pod-discovery
-    /// `CoreService` materialization.
-    service_selectors: HashMap<String, HashMap<String, HashMap<String, String>>>,
     pub(crate) mesh_config_registry: mesh_config::MeshConfigProviderRegistry,
     core: core::CoreState,
     explicit_workload_services: HashSet<K8sServiceKey>,
     explicit_service_entries: HashSet<K8sServiceKey>,
-    /// Pre-pass index of ServiceEntry `(namespace, name) → workloadSelector
-    /// labels` so AuthorizationPolicy `targetRefs` resolution does not depend
-    /// on ServiceEntry translation order in the main pass.
-    service_entry_selectors: HashMap<(String, String), HashMap<String, String>>,
     pub(crate) gateway_api_conflict_losers: HashMap<K8sResourceKey, Vec<GatewayApiRouteConflict>>,
     /// Source route kind for every materialized Gateway API HTTP-family proxy.
     /// The route table is port-agnostic, so cross-kind proxies must not collapse:
@@ -567,12 +558,10 @@ impl K8sAccumulator {
             known_namespaces: HashSet::new(),
             service_port_names: HashMap::new(),
             service_ports: HashMap::new(),
-            service_selectors: HashMap::new(),
             mesh_config_registry: mesh_config::MeshConfigProviderRegistry::default(),
             core: core::CoreState::default(),
             explicit_workload_services: HashSet::new(),
             explicit_service_entries: HashSet::new(),
-            service_entry_selectors: HashMap::new(),
             gateway_api_conflict_losers: HashMap::new(),
             gateway_api_route_proxy_kinds: HashMap::new(),
             gateway_api_listener_policies: HashMap::new(),
@@ -634,43 +623,16 @@ impl K8sAccumulator {
         core::secret_tls_material_digest(self, namespace, name)
     }
 
-    /// Captured `Service.spec.selector` labels for AuthorizationPolicy targetRefs.
-    pub(crate) fn service_selector_labels(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Option<&HashMap<String, String>> {
-        self.service_selectors
-            .get(namespace)
-            .and_then(|services| services.get(name))
-            .or_else(|| core::service_selector_labels(self, namespace, name))
-    }
-
     /// Whether a waypoint Gateway binding shell exists for `(namespace, name)`.
+    ///
+    /// Bindings are collected in a dedicated pre-pass (below) so
+    /// AuthorizationPolicy `targetRefs` → Gateway resolution does not depend on
+    /// informer/list order relative to Istio translation.
     pub(crate) fn waypoint_gateway_exists(&self, namespace: &str, name: &str) -> bool {
         self.mesh
             .waypoint_bindings
             .iter()
             .any(|binding| binding.namespace == namespace && binding.name == name)
-    }
-
-    pub(crate) fn record_service_entry_selector(
-        &mut self,
-        namespace: String,
-        name: String,
-        selector_labels: HashMap<String, String>,
-    ) {
-        self.service_entry_selectors
-            .insert((namespace, name), selector_labels);
-    }
-
-    pub(crate) fn service_entry_selector_labels(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Option<&HashMap<String, String>> {
-        self.service_entry_selectors
-            .get(&(namespace.to_string(), name.to_string()))
     }
 
     fn observe_namespace(&mut self, namespace: &str) {
@@ -1026,33 +988,12 @@ where
             if acc.options.pod_discovery_enabled {
                 core::collect(&mut acc, object)?;
             }
-        } else if object.kind == "ServiceEntry" {
-            // Index ServiceEntry selectors before AuthorizationPolicy
-            // translation so targetRefs resolution is order-independent.
-            let selector_labels = object
-                .spec
-                .get("workloadSelector")
-                .and_then(|selector| selector.get("labels"))
-                .and_then(Value::as_object)
-                .map(|labels| {
-                    labels
-                        .iter()
-                        .filter_map(|(k, v)| v.as_str().map(|value| (k.clone(), value.to_string())))
-                        .collect::<HashMap<String, String>>()
-                })
-                .unwrap_or_default();
-            acc.record_service_entry_selector(
-                object.metadata.namespace.clone(),
-                object.metadata.name.clone(),
-                selector_labels,
-            );
-            if acc.options.pod_discovery_enabled {
-                collect_explicit_service_entry_keys(&mut acc, object);
-            }
         } else if object.kind == "Secret" {
             core::collect(&mut acc, object)?;
         } else if mesh_config::is_istio_mesh_config_map(&acc.options, object) {
             mesh_config::collect(&mut acc, object)?;
+        } else if acc.options.pod_discovery_enabled && object.kind == "ServiceEntry" {
+            collect_explicit_service_entry_keys(&mut acc, object);
         } else if acc.options.pod_discovery_enabled && core::is_core_resource_kind(&object.kind) {
             core::collect(&mut acc, object)?;
         }
@@ -1362,22 +1303,6 @@ pub(crate) fn collect_service(
         .entry(object.metadata.namespace.clone())
         .or_default()
         .insert(object.metadata.name.clone(), port_numbers);
-
-    let selector_labels = object
-        .spec
-        .get("selector")
-        .and_then(Value::as_object)
-        .map(|selector| {
-            selector
-                .iter()
-                .filter_map(|(k, v)| v.as_str().map(|value| (k.clone(), value.to_string())))
-                .collect::<HashMap<String, String>>()
-        })
-        .unwrap_or_default();
-    acc.service_selectors
-        .entry(object.metadata.namespace.clone())
-        .or_default()
-        .insert(object.metadata.name.clone(), selector_labels);
 
     // GAMMA Waypoint binding: a Service with the `istio.io/use-waypoint`
     // annotation routes through the named waypoint. We append the binding

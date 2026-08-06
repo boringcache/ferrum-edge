@@ -1339,6 +1339,16 @@ impl CpGrpcServer {
             PolicyScope::WorkloadSelector { selector } => {
                 Self::selector_can_apply_to_namespace(selector, namespace)
             }
+            // Coarse namespace visibility only — the DP re-checks the exact
+            // attachment against its own waypoint/destination identity, so this
+            // hop must never be the thing that decides applicability.
+            //
+            // Service/Gateway attachments are same-namespace by contract
+            // (translation rejects anything else), so a policy is visible to a
+            // namespace exactly when one of its attachments names it.
+            // GatewayClass is cluster-scoped: `resource_owner_can_apply_to_namespace`
+            // above has already required the owner to be the root namespace,
+            // which is precisely the Istio rule for a class-wide policy.
             PolicyScope::TargetRefs { attachments } => attachments.iter().any(|attachment| {
                 use crate::modes::mesh::config::PolicyTargetAttachment;
                 match attachment {
@@ -1346,16 +1356,10 @@ impl CpGrpcServer {
                         namespace: target_ns,
                         ..
                     }
-                    | PolicyTargetAttachment::ServiceEntry {
-                        namespace: target_ns,
-                        ..
-                    }
                     | PolicyTargetAttachment::Gateway {
                         namespace: target_ns,
                         ..
                     } => target_ns == namespace,
-                    // GatewayClass attachments apply at every waypoint in the
-                    // mesh once translation has already constrained the class.
                     PolicyTargetAttachment::GatewayClass { .. } => true,
                 }
             }),

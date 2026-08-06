@@ -1,20 +1,31 @@
-//! External xDS round-trip coverage for AuthorizationPolicy GatewayClass
-//! `targetRefs` (issue #3226 / PR #3602).
+//! External xDS round-trip coverage for AuthorizationPolicy `targetRefs`
+//! (issue #3226 / PR #3602).
 //!
 //! Drives the real CP encode (`translate_mesh_slice_to_snapshot` /
 //! `build_slice_carriers`) → ECDS TypedExtensionConfig wire → DP decode
-//! (`MeshSliceCarrier::decode` / `apply_carrier`) path, then proves
-//! `mesh_authz` retains the GatewayClass DENY policy only for an exact
-//! matching class stamp. Malformed and oversized carriers are rejected, while
-//! missing or removed carriers never invent or reuse a stale class stamp. The
-//! DP's production reverse-translation tests separately pin rejection of an
-//! enforcing GatewayClass policy whose authoritative carrier is missing.
+//! (`MeshSliceCarrier::decode` / `apply_carrier`) path, then proves that an
+//! xDS-recovered slice enforces exactly what a natively-built one does:
+//!
+//! * a `GatewayClass` policy attaches only on an exact class stamp;
+//! * a mixed `{Service, other-Gateway}` policy does not broaden onto a sibling
+//!   destination just because it was retained (finding 1);
+//! * a missing / malformed / oversized / duplicate class carrier never invents
+//!   or reuses a stamp, and an ENFORCING class-targeted policy without its
+//!   authoritative carrier refuses the slice instead of silently degrading to
+//!   allow-by-default.
 
+use std::collections::HashMap;
+
+use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    MAX_POLICY_TARGET_REF_NAME_LEN, MAX_POLICY_TARGET_REF_NAMESPACE_LEN,
-    MAX_POLICY_TARGET_REF_SELECTOR_KEY_LEN, MAX_POLICY_TARGET_REF_SELECTOR_VALUE_LEN, MeshConfig,
-    MeshPolicy, MeshRule, MeshService, PolicyAction, PolicyScope, PolicyTargetAttachment,
+    MAX_POLICY_TARGET_REF_NAME_LEN, MAX_POLICY_TARGET_REF_NAMESPACE_LEN, MeshConfig, MeshPolicy,
+    MeshRule, MeshService, PolicyAction, PolicyScope, PolicyTargetAttachment, WaypointAttachment,
+    Workload, WorkloadSelector,
 };
+use ferrum_edge::modes::mesh::policy::{
+    MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization_policies,
+};
+use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -27,15 +38,15 @@ use ferrum_edge::xds::{
 use prost::Message;
 use serde_json::json;
 
-fn gateway_class_deny_policy(class_name: &str) -> MeshPolicy {
+const WAYPOINT: &str = "reviews-waypoint";
+const OTHER_WAYPOINT: &str = "other-waypoint";
+const NS: &str = "default";
+
+fn deny_policy(name: &str, attachments: Vec<PolicyTargetAttachment>) -> MeshPolicy {
     MeshPolicy {
-        name: "deny-class".to_string(),
+        name: name.to_string(),
         namespace: "istio-system".to_string(),
-        scope: PolicyScope::TargetRefs {
-            attachments: vec![PolicyTargetAttachment::GatewayClass {
-                name: class_name.to_string(),
-            }],
-        },
+        scope: PolicyScope::TargetRefs { attachments },
         rules: vec![MeshRule {
             action: PolicyAction::Deny,
             ..MeshRule::default()
@@ -43,13 +54,22 @@ fn gateway_class_deny_policy(class_name: &str) -> MeshPolicy {
     }
 }
 
-fn waypoint_slice(class: Option<&str>, policy_class: &str) -> MeshSlice {
+fn gateway_class_deny_policy(class_name: &str) -> MeshPolicy {
+    deny_policy(
+        "deny-class",
+        vec![PolicyTargetAttachment::GatewayClass {
+            name: class_name.to_string(),
+        }],
+    )
+}
+
+fn waypoint_slice(class: Option<&str>, policies: Vec<MeshPolicy>) -> MeshSlice {
     MeshSlice {
         node_id: "wp-node".to_string(),
-        namespace: "default".to_string(),
-        waypoint_name: Some("reviews-waypoint".to_string()),
+        namespace: NS.to_string(),
+        waypoint_name: Some(WAYPOINT.to_string()),
         waypoint_gateway_class: class.map(str::to_string),
-        mesh_policies: vec![gateway_class_deny_policy(policy_class)],
+        mesh_policies: policies,
         version: "v1".to_string(),
         ..MeshSlice::default()
     }
@@ -64,7 +84,7 @@ fn recover_from_snapshot(
 ) -> Result<MeshSlice, String> {
     let mut recovered = MeshSlice {
         node_id: "wp-node".to_string(),
-        namespace: "default".to_string(),
+        namespace: NS.to_string(),
         waypoint_name: waypoint_name.map(str::to_string),
         version: snapshot.version.clone(),
         ..MeshSlice::default()
@@ -110,12 +130,64 @@ async fn gateway_class_policy_enforced(slice: &MeshSlice) -> bool {
     )
 }
 
+fn workload_for(service: &str) -> Workload {
+    Workload {
+        spiffe_id: SpiffeId::new(&format!("spiffe://cluster.local/ns/{NS}/sa/{service}"))
+            .expect("valid spiffe"),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "backend".to_string())]),
+            namespace: Some(NS.to_string()),
+        },
+        service_name: service.to_string(),
+        service_namespace: None,
+        addresses: vec!["10.0.0.1".to_string()],
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+        namespace: NS.to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some(service.to_string()),
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    }
+}
+
+/// Evaluate the recovered slice's policies against one destination service,
+/// using the slice's own recovered waypoint identity — the exact evidence the
+/// request path uses.
+fn destination_decision(slice: &MeshSlice, service: &str) -> MeshAuthzDecision {
+    let scope = PolicyScopeCache::for_destination_service(&workload_for(service), NS, service);
+    let waypoint = WaypointAttachment {
+        namespace: &slice.namespace,
+        name: slice.waypoint_name.as_deref(),
+        gateway_class: slice.waypoint_gateway_class.as_deref(),
+    };
+    let request = MeshAuthzRequest {
+        method: Some("GET".to_string()),
+        path: Some("/".to_string()),
+        ..MeshAuthzRequest::default()
+    };
+    evaluate_mesh_authorization_policies(
+        slice
+            .mesh_policies
+            .iter()
+            .filter(|policy| scope.policy_applies_for_destination(policy, waypoint)),
+        &request,
+    )
+}
+
 #[tokio::test]
 async fn xds_round_trip_exact_matching_gateway_class_retains_authz_policy() {
-    let native = waypoint_slice(Some("istio-waypoint"), "istio-waypoint");
+    let native = waypoint_slice(
+        Some("istio-waypoint"),
+        vec![gateway_class_deny_policy("istio-waypoint")],
+    );
     let snapshot = translate_mesh_slice_to_snapshot(&native);
-    let recovered = recover_from_snapshot(&snapshot, Some("reviews-waypoint"))
-        .expect("exact-class snapshot recovers");
+    let recovered =
+        recover_from_snapshot(&snapshot, Some(WAYPOINT)).expect("exact-class snapshot recovers");
     assert_eq!(
         recovered.waypoint_gateway_class.as_deref(),
         Some("istio-waypoint")
@@ -129,9 +201,12 @@ async fn xds_round_trip_exact_matching_gateway_class_retains_authz_policy() {
 
 #[tokio::test]
 async fn xds_round_trip_different_gateway_class_drops_authz_policy() {
-    let native = waypoint_slice(Some("ferrum-waypoint"), "istio-waypoint");
+    let native = waypoint_slice(
+        Some("ferrum-waypoint"),
+        vec![gateway_class_deny_policy("istio-waypoint")],
+    );
     let snapshot = translate_mesh_slice_to_snapshot(&native);
-    let recovered = recover_from_snapshot(&snapshot, Some("reviews-waypoint"))
+    let recovered = recover_from_snapshot(&snapshot, Some(WAYPOINT))
         .expect("different-class snapshot recovers");
     assert_eq!(
         recovered.waypoint_gateway_class.as_deref(),
@@ -143,9 +218,67 @@ async fn xds_round_trip_different_gateway_class_drops_authz_policy() {
     );
 }
 
+/// Finding 1 over the xDS carrier path: a `{Service reviews, Gateway
+/// other-waypoint}` policy survives the round trip intact (attachments are NOT
+/// pruned), and the recovered slice still enforces it only on `reviews`.
 #[tokio::test]
-async fn xds_round_trip_missing_gateway_class_carrier_does_not_invent_stamp() {
-    let native = waypoint_slice(Some("istio-waypoint"), "istio-waypoint");
+async fn xds_round_trip_mixed_target_refs_do_not_broaden_to_sibling_destination() {
+    let mixed = deny_policy(
+        "deny-reviews",
+        vec![
+            PolicyTargetAttachment::Service {
+                namespace: NS.to_string(),
+                name: "reviews".to_string(),
+            },
+            PolicyTargetAttachment::Gateway {
+                namespace: NS.to_string(),
+                name: OTHER_WAYPOINT.to_string(),
+            },
+        ],
+    );
+    let native = waypoint_slice(Some("istio-waypoint"), vec![mixed.clone()]);
+    let recovered = recover_from_snapshot(
+        &translate_mesh_slice_to_snapshot(&native),
+        Some(WAYPOINT),
+    )
+    .expect("mixed-ref snapshot recovers");
+
+    assert_eq!(
+        recovered.mesh_policies, native.mesh_policies,
+        "the carrier must round-trip the full attachment list without pruning"
+    );
+    assert_eq!(
+        destination_decision(&recovered, "reviews"),
+        MeshAuthzDecision::Deny {
+            policy: "deny-reviews".to_string()
+        }
+    );
+    assert_eq!(
+        destination_decision(&recovered, "ratings"),
+        MeshAuthzDecision::Allow,
+        "the unmatched other-waypoint Gateway arm must not broaden onto a sibling destination"
+    );
+
+    // Native parity: the same slice built without the xDS hop decides the same.
+    assert_eq!(
+        destination_decision(&native, "reviews"),
+        destination_decision(&recovered, "reviews")
+    );
+    assert_eq!(
+        destination_decision(&native, "ratings"),
+        destination_decision(&recovered, "ratings")
+    );
+}
+
+/// An ENFORCING GatewayClass-targeted policy whose authoritative class carrier
+/// is absent must refuse the plugin generation (the DP keeps last-good) rather
+/// than silently dropping the policy into allow-by-default.
+#[test]
+fn missing_gateway_class_carrier_refuses_an_enforcing_class_policy() {
+    let native = waypoint_slice(
+        Some("istio-waypoint"),
+        vec![gateway_class_deny_policy("istio-waypoint")],
+    );
     let carriers: Vec<_> = build_slice_carriers(&native)
         .into_iter()
         .filter(|c| !matches!(c, MeshSliceCarrier::WaypointGatewayClass(_)))
@@ -164,7 +297,37 @@ async fn xds_round_trip_missing_gateway_class_carrier_does_not_invent_stamp() {
         recovered.waypoint_gateway_class.is_none(),
         "missing carrier must not invent a class stamp"
     );
-    assert!(!gateway_class_policy_enforced(&recovered).await);
+
+    let error = MeshAuthz::new(&json!({ "mesh_slice": recovered }))
+        .expect_err("an enforcing class policy without its class stamp must refuse the slice");
+    assert!(
+        error.contains("no authoritative waypoint gateway class"),
+        "unexpected refusal: {error}"
+    );
+}
+
+/// An AUDIT-only class-targeted policy is non-enforcing, so a missing class
+/// stamp is not a fail-open and must not refuse the slice.
+#[tokio::test]
+async fn missing_gateway_class_carrier_tolerates_an_audit_only_class_policy() {
+    let audit = MeshPolicy {
+        name: "audit-class".to_string(),
+        namespace: "istio-system".to_string(),
+        scope: PolicyScope::TargetRefs {
+            attachments: vec![PolicyTargetAttachment::GatewayClass {
+                name: "istio-waypoint".to_string(),
+            }],
+        },
+        rules: vec![MeshRule {
+            action: PolicyAction::Audit,
+            ..MeshRule::default()
+        }],
+    };
+    let slice = waypoint_slice(None, vec![audit]);
+    assert!(
+        !gateway_class_policy_enforced(&slice).await,
+        "an audit-only policy never rejects and must not refuse the slice"
+    );
 }
 
 #[test]
@@ -196,23 +359,25 @@ fn xds_round_trip_malformed_and_oversized_gateway_class_carrier_rejected() {
 
 #[tokio::test]
 async fn xds_round_trip_gateway_class_change_updates_authz_and_content_eq() {
-    let istio = waypoint_slice(Some("istio-waypoint"), "istio-waypoint");
-    let ferrum = waypoint_slice(Some("ferrum-waypoint"), "istio-waypoint");
+    let istio = waypoint_slice(
+        Some("istio-waypoint"),
+        vec![gateway_class_deny_policy("istio-waypoint")],
+    );
+    let ferrum = waypoint_slice(
+        Some("ferrum-waypoint"),
+        vec![gateway_class_deny_policy("istio-waypoint")],
+    );
     assert!(
         !istio.content_eq(&ferrum),
         "class-only change must move MeshSlice::content_eq"
     );
 
-    let istio_recovered = recover_from_snapshot(
-        &translate_mesh_slice_to_snapshot(&istio),
-        Some("reviews-waypoint"),
-    )
-    .expect("istio class recovers");
-    let ferrum_recovered = recover_from_snapshot(
-        &translate_mesh_slice_to_snapshot(&ferrum),
-        Some("reviews-waypoint"),
-    )
-    .expect("ferrum class recovers");
+    let istio_recovered =
+        recover_from_snapshot(&translate_mesh_slice_to_snapshot(&istio), Some(WAYPOINT))
+            .expect("istio class recovers");
+    let ferrum_recovered =
+        recover_from_snapshot(&translate_mesh_slice_to_snapshot(&ferrum), Some(WAYPOINT))
+            .expect("ferrum class recovers");
 
     assert!(gateway_class_policy_enforced(&istio_recovered).await);
     assert!(
@@ -224,14 +389,16 @@ async fn xds_round_trip_gateway_class_change_updates_authz_and_content_eq() {
 
 #[tokio::test]
 async fn xds_round_trip_gateway_class_carrier_removal_clears_stamp_and_policy() {
-    let with_class = waypoint_slice(Some("istio-waypoint"), "istio-waypoint");
-    let mut without_class = waypoint_slice(None, "istio-waypoint");
-    without_class.mesh_policies.clear();
+    let with_class = waypoint_slice(
+        Some("istio-waypoint"),
+        vec![gateway_class_deny_policy("istio-waypoint")],
+    );
+    let without_class = waypoint_slice(None, Vec::new());
     assert!(!with_class.content_eq(&without_class));
 
     let removed = recover_from_snapshot(
         &translate_mesh_slice_to_snapshot(&without_class),
-        Some("reviews-waypoint"),
+        Some(WAYPOINT),
     )
     .expect("class-less snapshot recovers");
     assert!(
@@ -256,27 +423,25 @@ async fn xds_round_trip_gateway_class_carrier_removal_clears_stamp_and_policy() 
 fn native_target_refs_reject_over_limit_hostile_strings() {
     let over_name = "n".repeat(MAX_POLICY_TARGET_REF_NAME_LEN + 1);
     let over_ns = "n".repeat(MAX_POLICY_TARGET_REF_NAMESPACE_LEN + 1);
-    let over_key = "k".repeat(MAX_POLICY_TARGET_REF_SELECTOR_KEY_LEN + 1);
-    let over_value = "v".repeat(MAX_POLICY_TARGET_REF_SELECTOR_VALUE_LEN + 1);
 
     let errors = MeshConfig {
+        istio_root_namespace: NS.to_string(),
         services: vec![MeshService {
             name: "reviews".to_string(),
-            namespace: "default".to_string(),
+            namespace: NS.to_string(),
             ports: Vec::new(),
             workloads: Vec::new(),
-            protocol_overrides: Default::default(),
+            protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
         }],
         mesh_policies: vec![MeshPolicy {
             name: "hostile".to_string(),
-            namespace: "default".to_string(),
+            namespace: NS.to_string(),
             scope: PolicyScope::TargetRefs {
                 attachments: vec![
                     PolicyTargetAttachment::Service {
                         namespace: over_ns,
                         name: "reviews".to_string(),
-                        selector_labels: [(over_key, over_value)].into_iter().collect(),
                     },
                     PolicyTargetAttachment::GatewayClass { name: over_name },
                 ],
@@ -302,10 +467,31 @@ fn native_target_refs_reject_over_limit_hostile_strings() {
             .any(|e| e.contains("name") && e.contains("at most")),
         "over-limit GatewayClass/name must reject: {errors:?}"
     );
+}
+
+#[test]
+fn native_target_refs_reject_over_limit_attachment_count() {
+    let attachments: Vec<_> = (0..(ferrum_edge::modes::mesh::config::MAX_POLICY_TARGET_REFS + 1))
+        .map(|i| PolicyTargetAttachment::Service {
+            namespace: NS.to_string(),
+            name: format!("svc-{i}"),
+        })
+        .collect();
+    let errors = MeshConfig {
+        mesh_policies: vec![MeshPolicy {
+            name: "too-many".to_string(),
+            namespace: NS.to_string(),
+            scope: PolicyScope::TargetRefs { attachments },
+            rules: vec![MeshRule {
+                action: PolicyAction::Deny,
+                ..MeshRule::default()
+            }],
+        }],
+        ..MeshConfig::default()
+    }
+    .validate();
     assert!(
-        errors
-            .iter()
-            .any(|e| e.contains("selector_labels") && e.contains("at most")),
-        "over-limit selector key/value must reject: {errors:?}"
+        errors.iter().any(|e| e.contains("at most") && e.contains("attachments")),
+        "over-limit attachment count must reject: {errors:?}"
     );
 }

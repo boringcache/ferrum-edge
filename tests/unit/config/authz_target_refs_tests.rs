@@ -1,239 +1,467 @@
-//! Unit coverage for AuthorizationPolicy `targetRefs` attachment matching
-//! and fail-closed config validation.
+//! AuthorizationPolicy `targetRefs` attachment matching and fail-closed config
+//! validation (issue #3226).
+//!
+//! The load-bearing invariant here is that **slice retention is OR over the
+//! whole attachment list and never prunes the non-matching arms**, so no
+//! runtime consumer may infer "this policy is loaded, therefore its Gateway
+//! arm matched". Every test that mixes a matching Service ref with a
+//! non-matching waypoint ref is guarding that boundary.
 
 use std::collections::HashMap;
 
-use ferrum_edge::identity::spiffe::SpiffeId;
+use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshRule, MeshService,
     MeshWaypointBinding, PeerAuthentication, PolicyAction, PolicyScope, PolicyTargetAttachment,
-    WorkloadSelector, policy_scope_applies_with_waypoint,
+    WaypointAttachment, Workload, WorkloadSelector, policy_scope_applies_with_waypoint,
+};
+use ferrum_edge::modes::mesh::policy::{
+    MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization_policies,
 };
 use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+
+const WAYPOINT_NS: &str = "default";
+const WAYPOINT_A: &str = "waypoint-a";
+const WAYPOINT_B: &str = "waypoint-b";
+const CLASS_ISTIO: &str = "istio-waypoint";
+const CLASS_FERRUM: &str = "ferrum-waypoint";
 
 fn spiffe(id: &str) -> SpiffeId {
     SpiffeId::new(id).expect("valid spiffe")
 }
 
-fn deny_policy(scope: PolicyScope) -> MeshPolicy {
+fn waypoint_a() -> WaypointAttachment<'static> {
+    WaypointAttachment {
+        namespace: WAYPOINT_NS,
+        name: Some(WAYPOINT_A),
+        gateway_class: Some(CLASS_ISTIO),
+    }
+}
+
+/// A non-waypoint proxy (Sidecar / NodeWaypoint): no attachment may apply.
+fn not_a_waypoint() -> WaypointAttachment<'static> {
+    WaypointAttachment {
+        namespace: WAYPOINT_NS,
+        name: None,
+        gateway_class: None,
+    }
+}
+
+fn policy(name: &str, action: PolicyAction, scope: PolicyScope) -> MeshPolicy {
     MeshPolicy {
-        name: "deny-evil".to_string(),
-        namespace: "default".to_string(),
+        name: name.to_string(),
+        namespace: WAYPOINT_NS.to_string(),
         scope,
         rules: vec![MeshRule {
-            action: PolicyAction::Deny,
+            action,
             ..MeshRule::default()
         }],
     }
 }
 
-fn cache_with_service(
-    labels: HashMap<String, String>,
-    service_namespace: &str,
-    service_name: &str,
-) -> PolicyScopeCache {
-    let mut cache = PolicyScopeCache::new(
-        spiffe("spiffe://cluster.local/ns/default/sa/reviews"),
-        "default",
-        labels,
+fn target_refs(attachments: Vec<PolicyTargetAttachment>) -> PolicyScope {
+    PolicyScope::TargetRefs { attachments }
+}
+
+fn service_ref(name: &str) -> PolicyTargetAttachment {
+    PolicyTargetAttachment::Service {
+        namespace: WAYPOINT_NS.to_string(),
+        name: name.to_string(),
+    }
+}
+
+fn gateway_ref(name: &str) -> PolicyTargetAttachment {
+    PolicyTargetAttachment::Gateway {
+        namespace: WAYPOINT_NS.to_string(),
+        name: name.to_string(),
+    }
+}
+
+fn class_ref(name: &str) -> PolicyTargetAttachment {
+    PolicyTargetAttachment::GatewayClass {
+        name: name.to_string(),
+    }
+}
+
+fn workload_for(service: &str) -> Workload {
+    Workload {
+        spiffe_id: spiffe(&format!(
+            "spiffe://cluster.local/ns/{WAYPOINT_NS}/sa/{service}"
+        )),
+        selector: WorkloadSelector {
+            // Deliberately IDENTICAL across services: shared pod-selector
+            // labels must never make one service inherit another's policy.
+            labels: HashMap::from([("app".to_string(), "backend".to_string())]),
+            namespace: Some(WAYPOINT_NS.to_string()),
+        },
+        service_name: service.to_string(),
+        service_namespace: None,
+        addresses: vec!["10.0.0.1".to_string()],
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+        namespace: WAYPOINT_NS.to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some(service.to_string()),
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    }
+}
+
+/// A destination scope as the `mesh_authz` index builds it: keyed by the
+/// Service it was indexed under, not by `Workload.service_name`.
+fn destination(service: &str) -> PolicyScopeCache {
+    PolicyScopeCache::for_destination_service(&workload_for(service), WAYPOINT_NS, service)
+}
+
+fn decision_for(policies: &[MeshPolicy], scope: &PolicyScopeCache) -> MeshAuthzDecision {
+    let request = MeshAuthzRequest {
+        method: Some("GET".to_string()),
+        path: Some("/".to_string()),
+        ..MeshAuthzRequest::default()
+    };
+    evaluate_mesh_authorization_policies(
+        policies
+            .iter()
+            .filter(|policy| scope.policy_applies_for_destination(policy, waypoint_a())),
+        &request,
+    )
+}
+
+// ── Exact attachment matching ────────────────────────────────────────────
+
+#[test]
+fn waypoint_attachment_matches_only_the_exact_gateway_and_class() {
+    let waypoint = waypoint_a();
+
+    assert!(waypoint.matches(&gateway_ref(WAYPOINT_A)));
+    assert!(!waypoint.matches(&gateway_ref(WAYPOINT_B)));
+    assert!(
+        !waypoint.matches(&PolicyTargetAttachment::Gateway {
+            namespace: "other".to_string(),
+            name: WAYPOINT_A.to_string(),
+        }),
+        "a same-named Gateway in another namespace is a different resource"
     );
-    cache.service_namespace = service_namespace.to_string();
-    cache.service_name = service_name.to_string();
-    cache
+
+    assert!(waypoint.matches(&class_ref(CLASS_ISTIO)));
+    assert!(
+        !waypoint.matches(&class_ref(CLASS_FERRUM)),
+        "istio-waypoint must never attach to a ferrum-waypoint Gateway"
+    );
+
+    // Service identity is never decided by the waypoint predicate.
+    assert!(!waypoint.matches(&service_ref("reviews")));
+
+    // Missing class evidence fails closed; a non-waypoint proxy matches nothing.
+    let no_class = WaypointAttachment {
+        gateway_class: None,
+        ..waypoint
+    };
+    assert!(!no_class.matches(&class_ref(CLASS_ISTIO)));
+    assert!(
+        no_class.matches(&gateway_ref(WAYPOINT_A)),
+        "an unknown class does not invalidate an exact Gateway-name attachment"
+    );
+    assert!(!not_a_waypoint().matches(&gateway_ref(WAYPOINT_A)));
+    assert!(!not_a_waypoint().matches(&class_ref(CLASS_ISTIO)));
+}
+
+// ── Finding 1: mixed attachments must not broaden ────────────────────────
+
+/// `targetRefs: [Service reviews, Gateway waypoint-b]` is legitimately retained
+/// at waypoint-a because the Service arm matches. The unmatched `waypoint-b`
+/// arm must NOT make the policy apply to every other destination at waypoint-a.
+#[test]
+fn mixed_service_and_other_gateway_ref_does_not_broaden_to_sibling_destinations() {
+    let deny = policy(
+        "deny-reviews",
+        PolicyAction::Deny,
+        target_refs(vec![service_ref("reviews"), gateway_ref(WAYPOINT_B)]),
+    );
+
+    assert!(destination("reviews").policy_applies_for_destination(&deny, waypoint_a()));
+    assert!(
+        !destination("ratings").policy_applies_for_destination(&deny, waypoint_a()),
+        "the unmatched waypoint-b Gateway arm must not attach the policy to a sibling service"
+    );
+
+    // And the real authorization outcome follows: DENY on the named service,
+    // untouched on the sibling.
+    assert_eq!(
+        decision_for(std::slice::from_ref(&deny), &destination("reviews")),
+        MeshAuthzDecision::Deny {
+            policy: "deny-reviews".to_string()
+        }
+    );
+    assert_eq!(
+        decision_for(std::slice::from_ref(&deny), &destination("ratings")),
+        MeshAuthzDecision::Allow
+    );
+}
+
+/// Same shape with an unmatched `GatewayClass` arm.
+#[test]
+fn mixed_service_and_other_gateway_class_ref_does_not_broaden_to_sibling_destinations() {
+    let deny = policy(
+        "deny-reviews",
+        PolicyAction::Deny,
+        target_refs(vec![service_ref("reviews"), class_ref(CLASS_FERRUM)]),
+    );
+
+    assert!(destination("reviews").policy_applies_for_destination(&deny, waypoint_a()));
+    assert!(
+        !destination("ratings").policy_applies_for_destination(&deny, waypoint_a()),
+        "an unmatched ferrum-waypoint class arm must not attach at an istio-waypoint waypoint"
+    );
+    assert_eq!(
+        decision_for(std::slice::from_ref(&deny), &destination("ratings")),
+        MeshAuthzDecision::Allow
+    );
+}
+
+/// The ALLOW half of finding 1. An `ALLOW` policy that reaches a destination
+/// brings Istio's implicit deny with it, so a broadened `ALLOW` is just as
+/// dangerous as a broadened `DENY` — it locks out the sibling service.
+#[test]
+fn mixed_ref_allow_policy_does_not_implicit_deny_a_sibling_destination() {
+    // An ALLOW rule that matches nothing (Istio empty-rule "allow-nothing").
+    let allow = MeshPolicy {
+        name: "allow-reviews".to_string(),
+        namespace: WAYPOINT_NS.to_string(),
+        scope: target_refs(vec![service_ref("reviews"), gateway_ref(WAYPOINT_B)]),
+        rules: vec![MeshRule {
+            action: PolicyAction::Allow,
+            never_matches: true,
+            ..MeshRule::default()
+        }],
+    };
+
+    assert_eq!(
+        decision_for(std::slice::from_ref(&allow), &destination("reviews")),
+        MeshAuthzDecision::Deny {
+            policy: "implicit-deny".to_string()
+        },
+        "the named destination gets the ALLOW policy's implicit deny"
+    );
+    assert_eq!(
+        decision_for(std::slice::from_ref(&allow), &destination("ratings")),
+        MeshAuthzDecision::Allow,
+        "a sibling destination must not inherit the implicit deny through an unmatched arm"
+    );
+}
+
+#[test]
+fn multiple_matching_service_refs_each_attach_and_others_do_not() {
+    let deny = policy(
+        "deny-two",
+        PolicyAction::Deny,
+        target_refs(vec![service_ref("reviews"), service_ref("ratings")]),
+    );
+
+    assert!(destination("reviews").policy_applies_for_destination(&deny, waypoint_a()));
+    assert!(destination("ratings").policy_applies_for_destination(&deny, waypoint_a()));
+    assert!(!destination("details").policy_applies_for_destination(&deny, waypoint_a()));
+}
+
+#[test]
+fn matching_gateway_ref_applies_to_every_destination_at_that_waypoint() {
+    let deny = policy(
+        "deny-waypoint",
+        PolicyAction::Deny,
+        target_refs(vec![gateway_ref(WAYPOINT_A)]),
+    );
+    for service in ["reviews", "ratings", "details"] {
+        assert!(
+            destination(service).policy_applies_for_destination(&deny, waypoint_a()),
+            "a Gateway attachment governs the whole waypoint"
+        );
+    }
+
+    let elsewhere = policy(
+        "deny-other-waypoint",
+        PolicyAction::Deny,
+        target_refs(vec![gateway_ref(WAYPOINT_B)]),
+    );
+    assert!(!destination("reviews").policy_applies_for_destination(&elsewhere, waypoint_a()));
 }
 
 #[test]
 fn service_target_ref_matches_only_named_destination_not_shared_selector_labels() {
-    let shared = HashMap::from([("app".to_string(), "backend".to_string())]);
-    let policy = deny_policy(PolicyScope::TargetRefs {
-        attachments: vec![PolicyTargetAttachment::Service {
-            namespace: "default".to_string(),
-            name: "reviews".to_string(),
-            selector_labels: shared.clone(),
-        }],
-    });
-
-    let reviews = cache_with_service(shared.clone(), "default", "reviews");
-    assert!(reviews.policy_applies_for_destination(&policy));
-
-    // Service B shares the same pod selector labels but is a different
-    // destination resource — the policy must not attach.
-    let ratings = cache_with_service(shared, "default", "ratings");
-    assert!(!ratings.policy_applies_for_destination(&policy));
-
-    // Bare source-scope matching must not broaden targeted policies.
-    assert!(!reviews.policy_applies(&policy));
-}
-
-#[test]
-fn selectorless_service_target_ref_requires_exact_service_membership() {
-    let policy = deny_policy(PolicyScope::TargetRefs {
-        attachments: vec![PolicyTargetAttachment::Service {
-            namespace: "default".to_string(),
-            name: "reviews".to_string(),
-            selector_labels: HashMap::new(),
-        }],
-    });
-    let member = cache_with_service(HashMap::new(), "default", "reviews");
-    assert!(member.policy_applies_for_destination(&policy));
-
-    let mut other = member.clone();
-    other.service_name = "ratings".to_string();
-    assert!(!other.policy_applies_for_destination(&policy));
-
-    // Missing destination identity fails closed.
-    let mut anonymous = member;
-    anonymous.service_name.clear();
-    assert!(!anonymous.policy_applies_for_destination(&policy));
-}
-
-#[test]
-fn gateway_target_ref_applies_to_every_destination_at_matching_waypoint() {
-    let policy = deny_policy(PolicyScope::TargetRefs {
-        attachments: vec![PolicyTargetAttachment::Gateway {
-            namespace: "default".to_string(),
-            name: "waypoint".to_string(),
-        }],
-    });
-    let destination = cache_with_service(
-        HashMap::from([("app".to_string(), "reviews".to_string())]),
-        "default",
-        "reviews",
+    let deny = policy(
+        "deny-reviews",
+        PolicyAction::Deny,
+        target_refs(vec![service_ref("reviews")]),
     );
-    assert!(destination.policy_applies_for_destination(&policy));
-    assert!(!destination.policy_applies(&policy));
 
-    let labels = HashMap::new();
-    assert!(policy_scope_applies_with_waypoint(
-        &policy,
-        "default",
-        &labels,
-        Some("waypoint"),
-        Some("istio-waypoint"),
-    ));
-    assert!(!policy_scope_applies_with_waypoint(
-        &policy,
-        "default",
-        &labels,
-        Some("other-waypoint"),
-        Some("istio-waypoint"),
-    ));
+    // Both destinations carry identical pod-selector labels by construction.
+    assert!(destination("reviews").policy_applies_for_destination(&deny, waypoint_a()));
+    assert!(!destination("ratings").policy_applies_for_destination(&deny, waypoint_a()));
+
+    // Bare source-scope matching must never broaden a targeted policy.
+    assert!(!destination("reviews").policy_applies(&deny));
 }
 
 #[test]
-fn gateway_class_target_ref_requires_exact_class_match() {
-    let istio_policy = deny_policy(PolicyScope::TargetRefs {
-        attachments: vec![PolicyTargetAttachment::GatewayClass {
-            name: "istio-waypoint".to_string(),
-        }],
-    });
-    let ferrum_policy = deny_policy(PolicyScope::TargetRefs {
-        attachments: vec![PolicyTargetAttachment::GatewayClass {
-            name: "ferrum-waypoint".to_string(),
-        }],
-    });
-    let labels = HashMap::new();
+fn destination_membership_is_absent_on_source_scopes_and_fails_closed() {
+    let deny = policy(
+        "deny-reviews",
+        PolicyAction::Deny,
+        target_refs(vec![service_ref("reviews")]),
+    );
+
+    // `from_workload` / `new` are SOURCE scopes: they carry no destination
+    // service membership, so a Service attachment cannot match through them.
+    let source = PolicyScopeCache::from_workload(&workload_for("reviews"));
+    assert!(source.service_name.is_empty());
+    assert!(source.service_namespace.is_empty());
+    assert!(!source.policy_applies_for_destination(&deny, waypoint_a()));
+
+    let bare = PolicyScopeCache::new(
+        spiffe("spiffe://cluster.local/ns/default/sa/reviews"),
+        WAYPOINT_NS,
+        HashMap::new(),
+    );
+    assert!(bare.service_name.is_empty());
+    assert!(!bare.policy_applies_for_destination(&deny, waypoint_a()));
+}
+
+/// One pod projected through several Services must stay ONE source attestation:
+/// `PolicyScopeCache` equality is the collapse used by ambient UDP source
+/// indexing and NodeWaypoint capture-destination resolution.
+#[test]
+fn source_scopes_for_one_pod_collapse_across_service_projections() {
+    let via_api = workload_for("api");
+    let mut via_alias = workload_for("api");
+    via_alias.service_name = "api-alias".to_string();
+
+    assert_eq!(
+        PolicyScopeCache::from_workload(&via_api),
+        PolicyScopeCache::from_workload(&via_alias),
+        "differing Service projections must not become a source-scope conflict"
+    );
+
+    let mut divergent = via_alias.clone();
+    divergent.selector.labels = HashMap::from([("app".to_string(), "other".to_string())]);
+    assert_ne!(
+        PolicyScopeCache::from_workload(&via_api),
+        PolicyScopeCache::from_workload(&divergent),
+        "genuinely divergent labels remain a source-scope conflict"
+    );
+
+    // Destination scopes keyed by different Services do differ — that is the
+    // whole point of `for_destination_service`.
+    assert_ne!(destination("api"), destination("api-alias"));
+}
+
+/// `targetRefs` policies apply at waypoint proxies only. On a Sidecar or
+/// NodeWaypoint destination path they must match nothing rather than becoming
+/// effectively mesh-wide.
+#[test]
+fn target_refs_never_apply_without_waypoint_context() {
+    for scope in [
+        target_refs(vec![service_ref("reviews")]),
+        target_refs(vec![gateway_ref(WAYPOINT_A)]),
+        target_refs(vec![class_ref(CLASS_ISTIO)]),
+    ] {
+        let deny = policy("deny", PolicyAction::Deny, scope);
+        assert!(
+            !destination("reviews").policy_applies_for_destination(&deny, not_a_waypoint()),
+            "a targeted policy must not apply on a non-waypoint proxy"
+        );
+    }
+}
+
+#[test]
+fn policy_scope_applies_with_waypoint_delegates_to_the_shared_predicate() {
+    let labels: HashMap<String, String> = HashMap::new();
+    let gateway = policy(
+        "gw",
+        PolicyAction::Deny,
+        target_refs(vec![gateway_ref(WAYPOINT_A)]),
+    );
+    let class = policy(
+        "class",
+        PolicyAction::Deny,
+        target_refs(vec![class_ref(CLASS_ISTIO)]),
+    );
 
     assert!(policy_scope_applies_with_waypoint(
-        &istio_policy,
-        "default",
+        &gateway,
+        WAYPOINT_NS,
         &labels,
-        Some("wp"),
-        Some("istio-waypoint"),
+        Some(WAYPOINT_A),
+        Some(CLASS_ISTIO),
     ));
     assert!(!policy_scope_applies_with_waypoint(
-        &istio_policy,
-        "default",
+        &gateway,
+        WAYPOINT_NS,
         &labels,
-        Some("wp"),
-        Some("ferrum-waypoint"),
+        Some(WAYPOINT_B),
+        Some(CLASS_ISTIO),
     ));
     assert!(policy_scope_applies_with_waypoint(
-        &ferrum_policy,
-        "default",
+        &class,
+        WAYPOINT_NS,
         &labels,
-        Some("wp"),
-        Some("ferrum-waypoint"),
+        Some(WAYPOINT_A),
+        Some(CLASS_ISTIO),
     ));
     assert!(!policy_scope_applies_with_waypoint(
-        &ferrum_policy,
-        "default",
+        &class,
+        WAYPOINT_NS,
         &labels,
-        Some("wp"),
-        Some("istio-waypoint"),
+        Some(WAYPOINT_A),
+        Some(CLASS_FERRUM),
     ));
     // Missing class evidence fails closed — never "any waypoint".
     assert!(!policy_scope_applies_with_waypoint(
-        &istio_policy,
-        "default",
+        &class,
+        WAYPOINT_NS,
         &labels,
-        Some("wp"),
+        Some(WAYPOINT_A),
+        None,
+    ));
+    // No waypoint at all: nothing attaches.
+    assert!(!policy_scope_applies_with_waypoint(
+        &gateway,
+        WAYPOINT_NS,
+        &labels,
+        None,
         None,
     ));
 }
 
-#[test]
-fn multiple_target_refs_use_or_semantics() {
-    let policy = deny_policy(PolicyScope::TargetRefs {
-        attachments: vec![
-            PolicyTargetAttachment::Service {
-                namespace: "default".to_string(),
-                name: "reviews".to_string(),
-                selector_labels: HashMap::new(),
-            },
-            PolicyTargetAttachment::Service {
-                namespace: "default".to_string(),
-                name: "ratings".to_string(),
-                selector_labels: HashMap::new(),
-            },
-        ],
-    });
-    assert!(
-        cache_with_service(HashMap::new(), "default", "reviews")
-            .policy_applies_for_destination(&policy)
-    );
-    assert!(
-        cache_with_service(HashMap::new(), "default", "ratings")
-            .policy_applies_for_destination(&policy)
-    );
-    assert!(
-        !cache_with_service(HashMap::new(), "default", "details")
-            .policy_applies_for_destination(&policy)
-    );
+// ── Config-boundary validation ───────────────────────────────────────────
+
+fn mesh_service(namespace: &str, name: &str) -> MeshService {
+    MeshService {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        ports: Vec::new(),
+        workloads: Vec::new(),
+        protocol_overrides: HashMap::new(),
+        cluster_ips: Vec::new(),
+    }
 }
 
-#[test]
-fn service_entry_target_ref_matches_exact_membership() {
-    let policy = deny_policy(PolicyScope::TargetRefs {
-        attachments: vec![PolicyTargetAttachment::ServiceEntry {
-            namespace: "default".to_string(),
-            name: "ext-api".to_string(),
-            selector_labels: HashMap::from([("app".to_string(), "ext".to_string())]),
-        }],
-    });
-    let member = cache_with_service(
-        HashMap::from([("app".to_string(), "ext".to_string())]),
-        "default",
-        "ext-api",
-    );
-    assert!(member.policy_applies_for_destination(&policy));
-
-    // Shared labels with a different ServiceEntry name must not match.
-    let other = cache_with_service(
-        HashMap::from([("app".to_string(), "ext".to_string())]),
-        "default",
-        "other-ext",
-    );
-    assert!(!other.policy_applies_for_destination(&policy));
+fn binding(namespace: &str, name: &str, class: Option<&str>) -> MeshWaypointBinding {
+    MeshWaypointBinding {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        waypoint_for: "service".to_string(),
+        gateway_class_name: class.map(str::to_string),
+        services: Vec::new(),
+    }
 }
 
 #[test]
 fn empty_target_refs_attachments_fail_closed_at_config_boundary() {
-    let policy = deny_policy(PolicyScope::TargetRefs {
-        attachments: Vec::new(),
-    });
     let errors = MeshConfig {
-        mesh_policies: vec![policy],
+        mesh_policies: vec![policy("deny", PolicyAction::Deny, target_refs(Vec::new()))],
         ..MeshConfig::default()
     }
     .validate();
@@ -246,41 +474,174 @@ fn empty_target_refs_attachments_fail_closed_at_config_boundary() {
 }
 
 #[test]
+fn mesh_policy_target_refs_require_referenced_service() {
+    let errors = MeshConfig {
+        mesh_policies: vec![policy(
+            "deny",
+            PolicyAction::Deny,
+            target_refs(vec![service_ref("missing")]),
+        )],
+        ..MeshConfig::default()
+    }
+    .validate();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("Service 'default/missing' was not found")),
+        "expected missing Service error, got {errors:?}"
+    );
+}
+
+#[test]
+fn mesh_policy_gateway_target_refs_require_waypoint_binding() {
+    let scope = target_refs(vec![gateway_ref(WAYPOINT_A)]);
+    let with_binding = MeshConfig {
+        mesh_policies: vec![policy("deny", PolicyAction::Deny, scope.clone())],
+        waypoint_bindings: vec![binding(WAYPOINT_NS, WAYPOINT_A, Some(CLASS_ISTIO))],
+        ..MeshConfig::default()
+    }
+    .validate();
+    assert!(
+        with_binding
+            .iter()
+            .all(|error| !error.contains("Gateway 'default/waypoint-a'")),
+        "present binding must validate: {with_binding:?}"
+    );
+
+    let missing = MeshConfig {
+        mesh_policies: vec![policy("deny", PolicyAction::Deny, scope)],
+        ..MeshConfig::default()
+    }
+    .validate();
+    assert!(
+        missing
+            .iter()
+            .any(|error| error.contains("Gateway 'default/waypoint-a' was not found")),
+        "expected missing Gateway error, got {missing:?}"
+    );
+}
+
+/// Istio lists Service / Gateway `targetRefs` as same-namespace only. The
+/// native/file boundary must not accept what the K8s translator rejects — a
+/// cross-namespace attachment would additionally be dropped by the CP's own
+/// owner-namespace filter before reaching the target DP slice.
+#[test]
+fn cross_namespace_target_refs_fail_closed_at_config_boundary() {
+    let errors = MeshConfig {
+        services: vec![mesh_service("other", "payments")],
+        waypoint_bindings: vec![binding("other", WAYPOINT_A, Some(CLASS_ISTIO))],
+        mesh_policies: vec![policy(
+            "deny",
+            PolicyAction::Deny,
+            target_refs(vec![
+                PolicyTargetAttachment::Service {
+                    namespace: "other".to_string(),
+                    name: "payments".to_string(),
+                },
+                PolicyTargetAttachment::Gateway {
+                    namespace: "other".to_string(),
+                    name: WAYPOINT_A.to_string(),
+                },
+            ]),
+        )],
+        ..MeshConfig::default()
+    }
+    .validate();
+
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("Service 'other/payments'") && e.contains("same-namespace only")),
+        "cross-namespace Service attachment must reject: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("Gateway 'other/waypoint-a'") && e.contains("same-namespace only")),
+        "cross-namespace Gateway attachment must reject: {errors:?}"
+    );
+}
+
+#[test]
+fn gateway_class_target_refs_require_root_namespace_ownership() {
+    let scope = target_refs(vec![class_ref(CLASS_ISTIO)]);
+
+    // Owned by a non-root namespace → rejected.
+    let non_root = MeshConfig {
+        istio_root_namespace: "istio-system".to_string(),
+        mesh_policies: vec![policy("deny", PolicyAction::Deny, scope.clone())],
+        ..MeshConfig::default()
+    }
+    .validate();
+    assert!(
+        non_root
+            .iter()
+            .any(|e| e.contains("GatewayClass") && e.contains("root namespace")),
+        "a non-root GatewayClass policy must reject: {non_root:?}"
+    );
+
+    // Owned by the root namespace → accepted.
+    let root_owned = MeshConfig {
+        istio_root_namespace: "istio-system".to_string(),
+        mesh_policies: vec![MeshPolicy {
+            namespace: "istio-system".to_string(),
+            ..policy("deny", PolicyAction::Deny, scope)
+        }],
+        ..MeshConfig::default()
+    }
+    .validate();
+    assert!(
+        root_owned.iter().all(|e| !e.contains("GatewayClass")),
+        "a root-namespace GatewayClass policy must validate: {root_owned:?}"
+    );
+}
+
+#[test]
+fn unsupported_gateway_class_name_fails_closed() {
+    let errors = MeshConfig {
+        istio_root_namespace: "istio-system".to_string(),
+        mesh_policies: vec![MeshPolicy {
+            namespace: "istio-system".to_string(),
+            ..policy(
+                "deny",
+                PolicyAction::Deny,
+                target_refs(vec![class_ref("some-other-class")]),
+            )
+        }],
+        ..MeshConfig::default()
+    }
+    .validate();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("GatewayClass 'some-other-class' is unsupported")),
+        "expected unsupported-class error, got {errors:?}"
+    );
+}
+
+#[test]
 fn target_refs_rejected_on_shared_scope_consumers() {
-    let target_refs = PolicyScope::TargetRefs {
-        attachments: vec![PolicyTargetAttachment::Service {
-            namespace: "default".to_string(),
-            name: "reviews".to_string(),
-            selector_labels: HashMap::new(),
-        }],
-    };
+    let scope = target_refs(vec![service_ref("reviews")]);
     let mesh = MeshConfig {
-        services: vec![MeshService {
-            name: "reviews".to_string(),
-            namespace: "default".to_string(),
-            ports: Vec::new(),
-            workloads: Vec::new(),
-            protocol_overrides: HashMap::new(),
-            cluster_ips: Vec::new(),
-        }],
+        services: vec![mesh_service(WAYPOINT_NS, "reviews")],
         peer_authentications: vec![PeerAuthentication {
             name: "pa".to_string(),
-            namespace: "default".to_string(),
-            scope: Some(target_refs.clone()),
+            namespace: WAYPOINT_NS.to_string(),
+            scope: Some(scope.clone()),
             selector: None,
             mtls_mode: Default::default(),
             port_overrides: HashMap::new(),
         }],
         request_authentications: vec![MeshRequestAuthentication {
             name: "ra".to_string(),
-            namespace: "default".to_string(),
-            scope: target_refs.clone(),
+            namespace: WAYPOINT_NS.to_string(),
+            scope: scope.clone(),
             jwt_rules: Vec::new(),
         }],
         proxy_configs: vec![MeshProxyConfig {
             name: "pc".to_string(),
-            namespace: "default".to_string(),
-            scope: target_refs.clone(),
+            namespace: WAYPOINT_NS.to_string(),
+            scope: scope.clone(),
             concurrency: None,
             image: None,
             environment: HashMap::new(),
@@ -288,8 +649,8 @@ fn target_refs_rejected_on_shared_scope_consumers() {
         }],
         telemetry_resources: vec![ferrum_edge::modes::mesh::config::MeshTelemetryResource {
             name: "tel".to_string(),
-            namespace: "default".to_string(),
-            scope: target_refs,
+            namespace: WAYPOINT_NS.to_string(),
+            scope,
             config: Default::default(),
         }],
         ..MeshConfig::default()
@@ -310,104 +671,43 @@ fn target_refs_rejected_on_shared_scope_consumers() {
     }
 }
 
+/// Ferrum has no ServiceEntry-to-waypoint association model, so the attachment
+/// variant does not exist at all — a hand-authored native/file config naming it
+/// fails to deserialize rather than producing an inert security policy.
 #[test]
-fn mesh_policy_target_refs_require_referenced_service() {
-    let policy = deny_policy(PolicyScope::TargetRefs {
-        attachments: vec![PolicyTargetAttachment::Service {
-            namespace: "default".to_string(),
-            name: "missing".to_string(),
-            selector_labels: HashMap::new(),
-        }],
+fn service_entry_attachment_kind_is_not_a_representable_scope() {
+    let json = serde_json::json!({
+        "kind": "target_refs",
+        "attachments": [{
+            "kind": "service_entry",
+            "namespace": "default",
+            "name": "ext"
+        }]
     });
-    let errors = MeshConfig {
-        mesh_policies: vec![policy],
-        ..MeshConfig::default()
-    }
-    .validate();
+    let parsed: Result<PolicyScope, _> = serde_json::from_value(json);
     assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("Service 'default/missing' was not found")),
-        "expected missing Service error, got {errors:?}"
-    );
-}
-
-#[test]
-fn mesh_policy_gateway_target_refs_require_waypoint_binding() {
-    let policy = deny_policy(PolicyScope::TargetRefs {
-        attachments: vec![PolicyTargetAttachment::Gateway {
-            namespace: "default".to_string(),
-            name: "waypoint".to_string(),
-        }],
-    });
-    let with_binding = MeshConfig {
-        mesh_policies: vec![policy.clone()],
-        waypoint_bindings: vec![MeshWaypointBinding {
-            name: "waypoint".to_string(),
-            namespace: "default".to_string(),
-            waypoint_for: "service".to_string(),
-            gateway_class_name: Some("istio-waypoint".to_string()),
-            services: Vec::new(),
-        }],
-        ..MeshConfig::default()
-    };
-    assert!(
-        with_binding
-            .validate()
-            .iter()
-            .all(|error| !error.contains("Gateway 'default/waypoint' was not found")),
-        "present binding must validate: {:?}",
-        with_binding.validate()
-    );
-
-    let missing = MeshConfig {
-        mesh_policies: vec![policy],
-        ..MeshConfig::default()
-    }
-    .validate();
-    assert!(
-        missing
-            .iter()
-            .any(|error| error.contains("Gateway 'default/waypoint' was not found")),
-        "expected missing Gateway error, got {missing:?}"
+        parsed.is_err(),
+        "a service_entry attachment must not deserialize into a PolicyScope"
     );
 }
 
 #[test]
 fn workload_selector_still_matches_without_target_refs() {
-    let policy = deny_policy(PolicyScope::WorkloadSelector {
-        selector: WorkloadSelector {
-            labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
-            namespace: Some("default".to_string()),
+    let selector = policy(
+        "selector",
+        PolicyAction::Deny,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "backend".to_string())]),
+                namespace: Some(WAYPOINT_NS.to_string()),
+            },
         },
-    });
-    let matching = PolicyScopeCache::new(
+    );
+    let cache = PolicyScopeCache::new(
         spiffe("spiffe://cluster.local/ns/default/sa/reviews"),
-        "default",
-        HashMap::from([("app".to_string(), "reviews".to_string())]),
+        WAYPOINT_NS,
+        HashMap::from([("app".to_string(), "backend".to_string())]),
     );
-    assert!(matching.policy_applies(&policy));
-}
-
-#[test]
-fn same_source_attestation_ignores_service_projection_membership() {
-    let labels = HashMap::from([("app".to_string(), "api".to_string())]);
-    let via_api = cache_with_service(labels.clone(), "default", "api");
-    let via_alias = cache_with_service(labels, "default", "api-alias");
-
-    assert!(
-        via_api.same_source_attestation(&via_alias),
-        "one pod projected through multiple Services retains one source attestation"
-    );
-    assert_ne!(
-        via_api, via_alias,
-        "destination membership still differs for Service targetRefs matching"
-    );
-
-    let mut conflicting = via_api.clone();
-    conflicting.labels = HashMap::from([("app".to_string(), "other".to_string())]);
-    assert!(
-        !via_api.same_source_attestation(&conflicting),
-        "divergent labels remain a genuine source-scope conflict"
-    );
+    assert!(cache.policy_applies(&selector));
+    assert!(cache.policy_applies_for_destination(&selector, waypoint_a()));
 }

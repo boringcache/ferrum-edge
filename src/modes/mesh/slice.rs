@@ -9,8 +9,8 @@ use crate::modes::mesh::config::{
     MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
     MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress, MeshTelemetryResource,
     MeshVirtualServiceCorsPolicy, MtlsMode, MultiClusterConfig, OutboundTrafficPolicy,
-    PeerAuthentication, PolicyScope, PolicyTargetAttachment, ResolvedIngressListener, ServiceEntry,
-    SidecarHostPattern, TrustBundleSet, Workload, WorkloadLabels, is_false, is_zero_usize,
+    PeerAuthentication, PolicyScope, ResolvedIngressListener, ServiceEntry, SidecarHostPattern,
+    TrustBundleSet, WaypointAttachment, Workload, WorkloadLabels, is_false, is_zero_usize,
     policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
     policy_target_attachment_applies_to_service, proxy_config_applies_to_workload,
     scope_applies_to_workload, service_entry_applies_to_workload,
@@ -1660,8 +1660,11 @@ fn resource_namespace_visible(
         })
 }
 
-/// Keep Service/ServiceEntry `targetRefs` whose named destination is bound to
-/// this waypoint — exact membership, never shared-label broadening.
+/// Admit Service `targetRefs` whose named destination is bound to this waypoint
+/// — exact `(namespace, name)` membership, never shared-label broadening.
+///
+/// ADMISSION ONLY: which destination the policy actually governs is re-decided
+/// per request against the exact destination service identity.
 fn target_refs_attach_to_waypoint_services(
     policy: &MeshPolicy,
     mesh: &MeshConfig,
@@ -1707,12 +1710,19 @@ fn narrow_for_service_waypoint(
     };
     if binding.waypoint_for.eq_ignore_ascii_case("none") {
         // Operator explicitly opted out — narrow to an empty admitted set.
+        // Targeted policies go with it: an attachment scope with no admitted
+        // destination has nothing to attach to, and carrying it would leave a
+        // Gateway/GatewayClass arm live on a waypoint the operator disabled.
         return ServiceWaypointNarrowingResources {
             services: Vec::new(),
             service_entries: Vec::new(),
             destination_rules: Vec::new(),
             workloads: Vec::new(),
-            mesh_policies: resources.mesh_policies,
+            mesh_policies: resources
+                .mesh_policies
+                .into_iter()
+                .filter(|policy| !matches!(policy.scope, PolicyScope::TargetRefs { .. }))
+                .collect(),
         };
     }
 
@@ -1780,21 +1790,22 @@ fn narrow_for_service_waypoint(
             .into_iter()
             .filter(|policy| {
                 match &policy.scope {
+                    // OR admission over the attachment list. The non-matching
+                    // arms are deliberately NOT pruned (the slice must stay a
+                    // faithful copy of the operator's policy), so every runtime
+                    // consumer re-checks the exact attachment — see
+                    // `PolicyScopeCache::policy_applies_for_destination`.
                     PolicyScope::TargetRefs { attachments } => {
-                        attachments.iter().any(|attachment| match attachment {
-                            PolicyTargetAttachment::Gateway { namespace, name } => {
-                                name == waypoint_name && namespace == waypoint_namespace
-                            }
-                            PolicyTargetAttachment::GatewayClass { name } => binding
-                                .gateway_class_name
-                                .as_deref()
-                                .is_some_and(|class| class == name.as_str()),
-                            PolicyTargetAttachment::Service { .. }
-                            | PolicyTargetAttachment::ServiceEntry { .. } => {
-                                bound.iter().any(|(ns, svc)| {
+                        let waypoint = WaypointAttachment {
+                            namespace: waypoint_namespace,
+                            name: Some(waypoint_name),
+                            gateway_class: binding.gateway_class_name.as_deref(),
+                        };
+                        attachments.iter().any(|attachment| {
+                            waypoint.matches(attachment)
+                                || bound.iter().any(|(ns, svc)| {
                                     policy_target_attachment_applies_to_service(attachment, ns, svc)
                                 })
-                            }
                         })
                     }
                     // Selector / namespace / mesh-wide policies stay; Istio
