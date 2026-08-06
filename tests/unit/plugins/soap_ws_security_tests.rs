@@ -6139,7 +6139,8 @@ async fn replay_state_survives_a_reload_generation_swap() {
 #[tokio::test]
 #[serial_test::serial(soap_nonce_replay_registry)]
 async fn distinct_plugin_configs_do_not_share_a_replay_scope() {
-    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&["soap-scope-b", "soap-scope-c"]);
+    let _lease =
+        SoapNonceReplayScopeLease::for_plugin_config_ids(&["soap-scope-b", "soap-scope-c"]);
     let a = digest_plugin_with_config_id(Some("soap-scope-b"));
     let b = digest_plugin_with_config_id(Some("soap-scope-c"));
     assert!(a.check_nonce_replay("independent-scope-nonce").is_ok());
