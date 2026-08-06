@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+use crate::backend_conn_limit::{BackendConnectionLimiter, SharedBackendConnectionLimiter};
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
@@ -815,6 +816,26 @@ pub struct StreamListenerManager {
     /// this set; untrusted peers are rejected outright to prevent IP spoofing.
     /// Empty when `FERRUM_TRUSTED_PROXIES` is not set.
     trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
+    /// The ONE gateway-wide DestinationRule `connectionPool.tcp.maxConnections`
+    /// counter, shared with `ProxyState` and therefore with WebSocket, the
+    /// pooled multiplexed transports, and reqwest.
+    ///
+    /// Every spawned TCP stream listener's [`TcpProxyMetrics`] gets a clone of
+    /// this exact `Arc`, so a destination's ceiling is per destination — not one
+    /// ceiling per stream listener plus another for the whole HTTP family.
+    ///
+    /// `OnceLock`, not `ArcSwap`: [`Self::attach_backend_conn_limit`] installs
+    /// the shared instance once, before the first `reconcile()`, and the value
+    /// can never be replaced afterwards. That matters because live
+    /// [`crate::backend_conn_limit::BackendConnectionGuard`]s hold `Arc`s into
+    /// the counters of whichever limiter admitted them — swapping the limiter on
+    /// a config reload or listener restart would strand those guards on an
+    /// orphaned map and let the destination be admitted up to `cap` a second
+    /// time while the old sessions are still relaying. A manager built without
+    /// the attach (focused tests, standalone callers) lazily initializes its
+    /// own private limiter on first use, which is safe because nothing else
+    /// shares it.
+    backend_conn_limit: std::sync::OnceLock<SharedBackendConnectionLimiter>,
 }
 
 impl StreamListenerManager {
@@ -1038,7 +1059,38 @@ impl StreamListenerManager {
             stream_gateway_ref,
             node_waypoint_identity_resolver: arc_swap::ArcSwap::new(Arc::new(None)),
             trusted_proxies,
+            backend_conn_limit: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the ONE gateway-wide `connectionPool.tcp.maxConnections` counter
+    /// so raw-TCP stream listeners admit backend sockets on the same
+    /// per-destination lane as WebSocket, the pooled multiplexed transports and
+    /// reqwest — rather than each listener enforcing its own private copy of the
+    /// cap.
+    ///
+    /// Must be called after [`Self::new`] and BEFORE the first `reconcile()`, so
+    /// no listener is ever spawned with the private fallback limiter. Idempotent
+    /// and one-shot: a later call (config reload, listener restart) is ignored,
+    /// which is what guarantees that live guards held by in-flight relays keep
+    /// counting against the limiter that admitted them.
+    pub fn attach_backend_conn_limit(&self, limiter: SharedBackendConnectionLimiter) {
+        let _ = self.backend_conn_limit.set(limiter);
+    }
+
+    /// The limiter every spawned TCP listener's metrics share.
+    ///
+    /// Falls back to a lazily created private limiter when nothing was attached
+    /// (focused tests, standalone callers). The fallback is created once and
+    /// then reused, so even in that mode every listener under this manager still
+    /// shares one ceiling.
+    fn backend_conn_limit(&self) -> SharedBackendConnectionLimiter {
+        self.backend_conn_limit
+            .get_or_init(|| {
+                let shards = self.pool_shard_amount;
+                Arc::new(BackendConnectionLimiter::with_shard_amount(shards))
+            })
+            .clone()
     }
 
     /// Inject the gateway-wide shutdown receiver. Each subsequently spawned
@@ -1994,7 +2046,13 @@ impl StreamListenerManager {
                 } else {
                     Arc::new(arc_swap::ArcSwap::new(Arc::new(None)))
                 };
-                let metrics = Arc::new(TcpProxyMetrics::default());
+                // Observability counters are listener-local, but the
+                // `maxConnections` admission counter is the ONE gateway-wide
+                // limiter: a raw-TCP socket and a pooled/WebSocket socket to the
+                // same destination must share the configured ceiling, and two
+                // stream listeners must not each get their own copy of it.
+                let conn_limit = self.backend_conn_limit();
+                let metrics = Arc::new(TcpProxyMetrics::with_backend_conn_limit(conn_limit));
                 let listener_tcp_metrics = Some(metrics.clone());
                 let tcp_idle_timeout = self.tcp_idle_timeout_seconds;
                 let tcp_half_close_max_wait = self.tcp_half_close_max_wait_seconds;

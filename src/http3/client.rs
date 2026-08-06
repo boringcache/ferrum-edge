@@ -711,26 +711,25 @@ type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes
 /// retry logic — wasted handshake amortization plus an avoidable
 /// fast-fail on the hot path.
 ///
-/// Every field is `Clone` and the clones share underlying state (the
-/// `maxConnections` slot is an `Arc`, so cloning shares the ONE reservation
-/// rather than taking another), so this struct is `Clone` at the same cost as
-/// the original `H3SendRequest`.
+/// Both fields are `Clone` and the clones share underlying state, so this
+/// struct is `Clone` at the same cost as the original `H3SendRequest`.
+///
+/// It deliberately does NOT carry the destination's
+/// `connectionPool.tcp.maxConnections` slot. The pooled value is only a handle:
+/// the physical QUIC connection and its UDP socket are owned by the spawned h3
+/// driver task, which outlives every handle (`h3`'s client `poll_close` resolves
+/// on connection close/error, not on `SendRequest` drop). Parking the slot here
+/// would release it as soon as the cached value and any in-flight clones dropped
+/// — on a force-drain / eviction that happens while the old connection is still
+/// open, so a replacement could be admitted past the cap. The slot therefore
+/// lives in the driver task (see `create_connection`), which makes its lifetime
+/// exactly the socket's lifetime in both directions: never shorter (a dead
+/// pooled handle does not free a live socket) and never longer (a dead socket
+/// does not stay charged because a handle lingers).
 #[derive(Clone)]
 struct H3PooledConnection {
     send_request: H3SendRequest,
     connection: quinn::Connection,
-    /// DestinationRule `connectionPool.tcp.maxConnections` slot for this
-    /// physical QUIC connection. `None` when the destination has no cap.
-    ///
-    /// Held on the pooled value rather than on the h3 driver task so the slot
-    /// also covers in-flight requests that still hold a clone after the pool
-    /// entry itself was evicted/drained — the socket really is still open then.
-    /// Released when the LAST clone drops: idle eviction, unhealthy replace,
-    /// `clear()` / `force_drain_*` on reload/update/delete, or shutdown.
-    ///
-    /// Pure RAII — never read, only dropped.
-    #[allow(dead_code)]
-    conn_slot: Option<crate::backend_conn_limit::SharedBackendConnectionGuard>,
 }
 
 impl H3PooledConnection {
@@ -738,18 +737,7 @@ impl H3PooledConnection {
         Self {
             send_request,
             connection,
-            conn_slot: None,
         }
-    }
-
-    /// Same as [`Self::new`] but carrying the destination's `maxConnections`
-    /// slot for the lifetime of this QUIC connection.
-    fn with_conn_slot(
-        mut self,
-        conn_slot: Option<crate::backend_conn_limit::SharedBackendConnectionGuard>,
-    ) -> Self {
-        self.conn_slot = conn_slot;
-        self
     }
 
     /// Returns `true` once the underlying QUIC connection has reached a
@@ -1462,12 +1450,17 @@ impl Http3ConnectionPool {
             .await
     }
 
+    /// `policy_port` is the DestinationRule policy port for this dispatch; see
+    /// [`Self::create_connection_to_target`]. It is threaded explicitly rather
+    /// than re-derived from `port` because a `targetPort` remap makes the two
+    /// differ and only the caller still holds the selected `UpstreamTarget`.
     async fn create_or_get_target_sender(
         &self,
         key: String,
         proxy: &Proxy,
         host: &str,
         port: u16,
+        policy_port: u16,
         tls_config: Arc<rustls::ClientConfig>,
         h3_config: super::config::Http3ServerConfig,
     ) -> Result<H3PooledConnection, anyhow::Error> {
@@ -1480,6 +1473,7 @@ impl Http3ConnectionPool {
                         proxy,
                         host,
                         port,
+                        policy_port,
                         &tls_config,
                         Some(&h3_config),
                     )
@@ -1803,6 +1797,12 @@ impl Http3ConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        // DestinationRule policy port for this dispatch — the selected target's
+        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
+        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
+        // for `connectionPool.tcp.maxConnections` admission; the dial address,
+        // TLS/SNI and the pool key all stay on `target_host:target_port`.
+        target_policy_port: u16,
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
@@ -1907,6 +1907,7 @@ impl Http3ConnectionPool {
                 proxy,
                 target_host,
                 target_port,
+                target_policy_port,
                 tls_config,
                 h3_config,
             )
@@ -1985,11 +1986,18 @@ impl Http3ConnectionPool {
         let port = proxy.backend_port;
         // DestinationRule `connectionPool.tcp.maxConnections`. A QUIC
         // connection is a physical backend connection, so reserve the slot
-        // BEFORE dialing and hand it to the pooled value: it is released when
-        // the last handle to this connection drops (idle eviction, unhealthy
-        // replace, pool clear / SVID drain on reload/update/delete, shutdown),
-        // never per request — unlimited multiplexed H3 streams ride one
-        // admitted connection.
+        // BEFORE dialing and hand it to the spawned h3 DRIVER: the slot is
+        // released when this QUIC connection actually ends (peer close,
+        // transport error, idle timeout, endpoint shutdown), never per request
+        // and never merely because the pooled handle was evicted or drained —
+        // an evicted-but-still-open connection keeps occupying its slot, so a
+        // replacement cannot push the destination past the cap. Unlimited
+        // multiplexed H3 streams ride one admitted connection.
+        //
+        // Direct-backend dispatch, so `proxy.backend_port` IS the
+        // DestinationRule policy port. The explicit-target path
+        // (`create_connection_to_target`) must be handed the policy port
+        // separately — see there.
         let conn_admission = crate::backend_conn_limit::PooledConnectionAdmission::resolve(
             self.backend_conn_limit.get().map(|limiter| &**limiter),
             proxy,
@@ -2039,10 +2047,19 @@ impl Http3ConnectionPool {
                             .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
 
                     tokio::spawn(async move {
+                        // The `maxConnections` slot lives exactly as long as
+                        // this driver, which owns the `h3_quinn::Connection`
+                        // and therefore the QUIC connection and its socket.
+                        // `poll_close` resolves on connection close/error, so
+                        // the slot retires when the physical connection really
+                        // ends — not when the pooled handle is evicted (the
+                        // socket is still open then) and not only once some
+                        // orphaned handle is finally dropped.
+                        let _conn_slot = conn_slot;
                         let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
                         debug!("HTTP/3 pool connection driver closed: {}", err);
                     });
-                    Ok(H3PooledConnection::new(send_request, quic_conn).with_conn_slot(conn_slot))
+                    Ok(H3PooledConnection::new(send_request, quic_conn))
                 }
             })
             .await
@@ -2070,11 +2087,19 @@ impl Http3ConnectionPool {
     /// through the same path the capability probe used — otherwise a
     /// proxy pinning a specific IP via `dns_override` would silently dial
     /// the default DNS answer for the load-balanced target instead.
+    ///
+    /// `policy_port` is the DestinationRule policy port for this dispatch
+    /// (`crate::proxy::dispatch_policy_port_for_target`, i.e. the selected
+    /// target's `dispatch_policy_port()`). It equals `port` unless a
+    /// `targetPort` remap applies, and it is the ONE source for
+    /// `connectionPool.tcp.maxConnections` admission — the dial `port` remains
+    /// a transport address.
     async fn create_connection_to_target(
         &self,
         proxy: &Proxy,
         host: &str,
         port: u16,
+        policy_port: u16,
         tls_config: &Arc<rustls::ClientConfig>,
         h3_config: Option<&super::config::Http3ServerConfig>,
     ) -> Result<H3PooledConnection, anyhow::Error> {
@@ -2105,16 +2130,25 @@ impl Http3ConnectionPool {
 
         // DestinationRule `connectionPool.tcp.maxConnections`. A QUIC
         // connection is a physical backend connection, so reserve the slot
-        // BEFORE dialing and hand it to the pooled value: it is released when
-        // the last handle to this connection drops (idle eviction, unhealthy
-        // replace, pool clear / SVID drain on reload/update/delete, shutdown),
-        // never per request — unlimited multiplexed H3 streams ride one
-        // admitted connection.
+        // BEFORE dialing and hand it to the spawned h3 DRIVER: the slot retires
+        // when this QUIC connection actually ends, not when the pooled handle
+        // is evicted/drained. See `create_connection` for the full rationale.
+        //
+        // Lookup is by `policy_port`, NOT the dial `port`. This is the explicit
+        // LB-selected-target path: the caller resolved its `Proxy` through
+        // `resolve_effective_proxy_for_target`, whose `dispatch_port_overrides`
+        // stay keyed by the DestinationRule/service port. With a `targetPort`
+        // remap (Service 80 -> workload 8080) `port` is 8080 and has no entry,
+        // so keying by it would resolve NO cap and let native H3 open unbounded
+        // connections — while every other transport to that destination counts
+        // on lane 80. Counting on the policy port keeps H3 on the one shared
+        // destination lane. The dial address stays `host:port`, so TLS/SNI,
+        // DNS and the pool key remain target-effective.
         let conn_admission = crate::backend_conn_limit::PooledConnectionAdmission::resolve(
             self.backend_conn_limit.get().map(|limiter| &**limiter),
             proxy,
             host,
-            port,
+            policy_port,
         );
         let conn_slot = match conn_admission {
             // A cap refusal must stay TYPED through the `anyhow` create surface:
@@ -2159,10 +2193,19 @@ impl Http3ConnectionPool {
                             .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
 
                     tokio::spawn(async move {
+                        // The `maxConnections` slot lives exactly as long as
+                        // this driver, which owns the `h3_quinn::Connection`
+                        // and therefore the QUIC connection and its socket.
+                        // `poll_close` resolves on connection close/error, so
+                        // the slot retires when the physical connection really
+                        // ends — not when the pooled handle is evicted (the
+                        // socket is still open then) and not only once some
+                        // orphaned handle is finally dropped.
+                        let _conn_slot = conn_slot;
                         let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
                         debug!("HTTP/3 pool connection driver closed: {}", err);
                     });
-                    Ok(H3PooledConnection::new(send_request, quic_conn).with_conn_slot(conn_slot))
+                    Ok(H3PooledConnection::new(send_request, quic_conn))
                 }
             })
             .await
@@ -2911,6 +2954,12 @@ impl Http3ConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        // DestinationRule policy port for this dispatch — the selected target's
+        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
+        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
+        // for `connectionPool.tcp.maxConnections` admission; the dial address,
+        // TLS/SNI and the pool key all stay on `target_host:target_port`.
+        target_policy_port: u16,
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
@@ -2994,6 +3043,7 @@ impl Http3ConnectionPool {
                 proxy,
                 target_host,
                 target_port,
+                target_policy_port,
                 tls_config,
                 h3_config,
             )
@@ -3043,6 +3093,12 @@ impl Http3ConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        // DestinationRule policy port for this dispatch — the selected target's
+        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
+        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
+        // for `connectionPool.tcp.maxConnections` admission; the dial address,
+        // TLS/SNI and the pool key all stay on `target_host:target_port`.
+        target_policy_port: u16,
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
@@ -3112,6 +3168,7 @@ impl Http3ConnectionPool {
                 proxy,
                 target_host,
                 target_port,
+                target_policy_port,
                 tls_config,
                 h3_config,
             )
@@ -3312,6 +3369,12 @@ impl Http3ConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        // DestinationRule policy port for this dispatch — the selected target's
+        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
+        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
+        // for `connectionPool.tcp.maxConnections` admission; the dial address,
+        // TLS/SNI and the pool key all stay on `target_host:target_port`.
+        target_policy_port: u16,
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
@@ -3407,6 +3470,7 @@ impl Http3ConnectionPool {
                 proxy,
                 target_host,
                 target_port,
+                target_policy_port,
                 tls_config,
                 h3_config,
             )

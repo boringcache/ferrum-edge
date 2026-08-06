@@ -5254,6 +5254,9 @@ async fn handle_h3_request(
                     &proxy,
                     &target.host,
                     target.port,
+                    // DestinationRule policy port for `maxConnections` admission;
+                    // differs from the dial port only under a `targetPort` remap.
+                    target.dispatch_policy_port(),
                     &method,
                     &backend_url,
                     &h3_headers,
@@ -8662,6 +8665,9 @@ async fn proxy_to_backend_h3_refined_response(
                 proxy,
                 &target.host,
                 target.port,
+                // DestinationRule policy port for `maxConnections` admission;
+                // differs from the dial port only under a `targetPort` remap.
+                target.dispatch_policy_port(),
                 method,
                 backend_url,
                 &h3_headers,
@@ -9619,6 +9625,9 @@ async fn dispatch_grpc_native_h3(
                     proxy,
                     &target.host,
                     target.port,
+                    // DestinationRule policy port for `maxConnections` admission;
+                    // differs from the dial port only under a `targetPort` remap.
+                    target.dispatch_policy_port(),
                     method,
                     backend_url,
                     &h3_headers,
@@ -11046,6 +11055,9 @@ async fn proxy_to_backend_h3_streaming(
                 proxy,
                 &target.host,
                 target.port,
+                // DestinationRule policy port for `maxConnections` admission;
+                // differs from the dial port only under a `targetPort` remap.
+                target.dispatch_policy_port(),
                 method,
                 backend_url,
                 &h3_headers,
@@ -11644,6 +11656,9 @@ async fn proxy_to_backend_h3(
                 proxy,
                 &target.host,
                 target.port,
+                // DestinationRule policy port for `maxConnections` admission;
+                // differs from the dial port only under a `targetPort` remap.
+                target.dispatch_policy_port(),
                 method,
                 backend_url,
                 &h3_headers,

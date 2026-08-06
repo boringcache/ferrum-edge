@@ -2224,6 +2224,370 @@ async fn h3_pool_request_reuses_an_admitted_shard_when_the_cap_refuses_creation(
     drop(backend);
 }
 
+/// The `maxConnections` slot for a native-H3 connection must be owned by the
+/// spawned h3 DRIVER — which owns the `h3_quinn::Connection`, and therefore the
+/// QUIC connection and its socket — and not by the pooled cache value.
+///
+/// Regression: the slot was parked on `H3PooledConnection`. Dropping that value
+/// (idle eviction, unhealthy replace, `force_drain_all()` on reload / update /
+/// delete / SVID rotation) begins a close but does NOT make the connection
+/// terminal: the driver task is still running and quinn has not finished
+/// closing the connection. Releasing the slot at that instant lets a
+/// replacement be admitted while the old physical connection is still open —
+/// two sockets for `maxConnections: 1`.
+///
+/// The contract, pinned in both directions:
+///   1. the instant the drain returns, the slot is STILL charged and a
+///      replacement admission is refused;
+///   2. once the driver's `poll_close` completes, the slot retires and a
+///      replacement is admitted normally — no wedge.
+///
+/// Step 1 is asserted with NO `.await` between the drain and the checks. This
+/// test runs on the default current-thread runtime, so the driver task provably
+/// cannot have made progress in between: any charge observed there is the
+/// pre-`poll_close` state.
+#[tokio::test]
+async fn h3_pool_conn_slot_is_owned_by_the_driver_not_the_pooled_handle() {
+    let (backend, port, client_tls) = capped_h3_backend("h3-cap-drain", 1).await;
+    let (pool, limiter, mut proxy) = capped_h3_pool(1, port);
+    // One shard: the alternate-shard reuse fallback must not mask what this
+    // test is about.
+    proxy.pool_http3_connections_per_backend = Some(1);
+
+    let url = format!("https://127.0.0.1:{port}/");
+    let headers = vec![(
+        http::header::HOST,
+        http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}")).unwrap(),
+    )];
+
+    let tls = client_tls.clone();
+    let response = pool
+        .request(
+            &proxy,
+            "GET",
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            move || Ok(tls),
+        )
+        .await
+        .expect("first request establishes the one admitted QUIC connection");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        limiter.current("127.0.0.1", port),
+        1,
+        "the admitted QUIC connection must hold exactly one slot"
+    );
+
+    // ---- Force-drain / eviction. No `.await` past this point until step 2. ----
+    pool.force_drain_all();
+    assert_eq!(pool.pool_size(), 0, "force_drain_all must evict the entry");
+    assert_eq!(
+        limiter.current("127.0.0.1", port),
+        1,
+        "dropping the pooled handle does not make the QUIC connection terminal \
+         — the driver has not run since the drain — so the slot must still be \
+         charged; releasing it here is exactly what admitted a replacement \
+         alongside a still-open connection"
+    );
+    assert!(
+        limiter
+            .try_acquire("127.0.0.1", port, Some(1))
+            .is_err_and(|limit| limit.cap == 1),
+        "a replacement must NOT be admissible while the drained connection's \
+         driver is still alive"
+    );
+
+    // ---- The driver terminates; the slot must retire and the destination
+    // ---- must recover rather than stay wedged.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let held = limiter.current("127.0.0.1", port);
+        if held == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slot must retire once the h3 driver's poll_close completes; \
+             still holding {held}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let tls = client_tls.clone();
+    let response = pool
+        .request(
+            &proxy,
+            "GET",
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            move || Ok(tls),
+        )
+        .await
+        .expect("a replacement must be admitted once the old driver terminated");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        backend.accepted_handshakes(),
+        2,
+        "exactly one replacement QUIC connection, established only after the \
+         drained one had fully closed"
+    );
+    assert_eq!(
+        limiter.current("127.0.0.1", port),
+        1,
+        "the replacement holds the one slot"
+    );
+
+    drop(backend);
+}
+
+/// The H3 pooled value must not carry the `maxConnections` slot at all.
+///
+/// Belt-and-braces on the behavioral test above: a future edit that re-adds a
+/// slot field to `H3PooledConnection` would restore the early-release window
+/// even if the driver also holds one, because the pooled clone would then keep
+/// charging a destination whose socket is already gone.
+#[test]
+fn h3_pooled_connection_does_not_park_the_max_connections_slot() {
+    const H3_CLIENT_SOURCE: &str = include_str!("../../src/http3/client.rs");
+
+    let decl = H3_CLIENT_SOURCE
+        .split("struct H3PooledConnection {")
+        .nth(1)
+        .expect("H3PooledConnection must exist");
+    let body = &decl[..decl.find('}').unwrap_or(decl.len())];
+    assert!(
+        !body.contains("BackendConnectionGuard"),
+        "the maxConnections slot must live in the spawned h3 driver task (whose \
+         poll_close ends with the socket), not on the pooled handle; found: {body}"
+    );
+
+    let create = H3_CLIENT_SOURCE
+        .split("async fn create_connection(")
+        .nth(1)
+        .expect("create_connection must exist");
+    let spawn = create
+        .split("tokio::spawn(")
+        .nth(1)
+        .expect("create_connection must spawn the h3 connection driver");
+    let spawn_head: String = spawn.chars().take(600).collect();
+    assert!(
+        spawn_head.contains("conn_slot"),
+        "the spawned h3 driver task must own the maxConnections slot so it \
+         retires exactly when poll_close completes"
+    );
+}
+
+/// An H3 pool + proxy whose `maxConnections` policy is published ONLY on
+/// `policy_port` while the workload is actually dialed on `dial_port` — the
+/// Kubernetes `targetPort` remap shape (Service `80` -> workload `8080`).
+fn capped_h3_pool_with_policy_port(
+    cap: u32,
+    dial_port: u16,
+    policy_port: u16,
+) -> (
+    ferrum_edge::http3::client::Http3ConnectionPool,
+    Arc<ferrum_edge::backend_conn_limit::BackendConnectionLimiter>,
+    Proxy,
+) {
+    use ferrum_edge::config::types::ResolvedPortOverride;
+    use std::collections::HashMap;
+
+    let (pool, limiter, mut proxy) = capped_h3_pool(cap, dial_port);
+    // Republish the policy on the SERVICE port only. This is exactly what
+    // `resolve_effective_proxy_for_target` hands native-H3 target dispatch: the
+    // override map stays keyed by the DestinationRule/service port, and nothing
+    // is mirrored onto the workload port.
+    proxy.dispatch_port_overrides = Some(HashMap::from([(
+        policy_port,
+        ResolvedPortOverride {
+            max_connections: Some(cap),
+            ..ResolvedPortOverride::default()
+        },
+    )]));
+    (pool, limiter, proxy)
+}
+
+/// Explicit-target native-H3 dispatch must admit on the DestinationRule POLICY
+/// port, not the dial port.
+///
+/// Regression: `create_connection_to_target` resolved admission with the dial
+/// `(host, port)`. Under a `targetPort` remap the effective proxy's overrides
+/// are still keyed by the service port, so the dial-port lookup found NO entry,
+/// resolved NO cap, and native H3 opened one connection per shard — unbounded
+/// relative to the configured ceiling — while every other transport to the same
+/// destination counted on the service-port lane.
+#[tokio::test]
+async fn h3_pool_target_dispatch_caps_on_the_policy_port_under_a_target_port_remap() {
+    const REQUESTS: usize = 4;
+    // Stand-in for the declared Service port; deliberately not the dial port.
+    const POLICY_PORT: u16 = 80;
+
+    let (backend, port, client_tls) = capped_h3_backend("h3-cap-remap", REQUESTS).await;
+    let (pool, limiter, proxy) = capped_h3_pool_with_policy_port(1, port, POLICY_PORT);
+
+    let url = format!("https://127.0.0.1:{port}/");
+    let headers = vec![(
+        http::header::HOST,
+        http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}")).unwrap(),
+    )];
+
+    for attempt in 0..REQUESTS {
+        let tls = client_tls.clone();
+        let response = pool
+            .request_with_target(
+                &proxy,
+                "127.0.0.1",
+                port,
+                POLICY_PORT,
+                "GET",
+                &url,
+                &headers,
+                bytes::Bytes::new(),
+                move || Ok(tls),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("buffered targeted request {attempt} must be served: {e}"));
+        assert_eq!(response.status, 200);
+    }
+
+    assert_eq!(
+        backend.accepted_handshakes(),
+        1,
+        "a targetPort-remapped destination must still be capped: one physical \
+         QUIC connection for maxConnections: 1, not one per shard"
+    );
+    assert_eq!(
+        limiter.current("127.0.0.1", POLICY_PORT),
+        1,
+        "the slot must be counted on the host + POLICY-port lane, which is the \
+         lane raw TCP / WebSocket / the other pools use for this destination"
+    );
+    assert_eq!(
+        limiter.current("127.0.0.1", port),
+        0,
+        "nothing may be counted on the workload dial port — that would be a \
+         second lane and an effective 2x ceiling"
+    );
+
+    drop(backend);
+}
+
+/// Same contract as the buffered surface above, for the streaming targeted
+/// dispatch surface. Both go through `create_or_get_target_sender`, but they are
+/// separate public entry points with their own shard-scan branches, so the
+/// policy-port binding is proved on each.
+#[tokio::test]
+async fn h3_pool_streaming_target_dispatch_caps_on_the_policy_port_under_a_remap() {
+    const REQUESTS: usize = 4;
+    const POLICY_PORT: u16 = 80;
+
+    let (backend, port, client_tls) = capped_h3_backend("h3-cap-remap-str", REQUESTS).await;
+    let (pool, limiter, proxy) = capped_h3_pool_with_policy_port(1, port, POLICY_PORT);
+
+    let url = format!("https://127.0.0.1:{port}/");
+    let headers = vec![(
+        http::header::HOST,
+        http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}")).unwrap(),
+    )];
+
+    for attempt in 0..REQUESTS {
+        let tls = client_tls.clone();
+        let response = pool
+            .request_with_target_streaming(
+                &proxy,
+                "127.0.0.1",
+                port,
+                POLICY_PORT,
+                "GET",
+                &url,
+                &headers,
+                bytes::Bytes::new(),
+                move || Ok(tls),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("streaming targeted request {attempt} must be served: {e}"));
+        assert_eq!(response.status, 200);
+    }
+
+    assert_eq!(
+        backend.accepted_handshakes(),
+        1,
+        "streaming targeted dispatch must be capped on the policy-port lane too"
+    );
+    assert_eq!(
+        limiter.current("127.0.0.1", POLICY_PORT),
+        1,
+        "streaming targeted dispatch must count on the policy-port lane"
+    );
+    assert_eq!(
+        limiter.current("127.0.0.1", port),
+        0,
+        "streaming targeted dispatch must not open a second dial-port lane"
+    );
+
+    drop(backend);
+}
+
+/// Every native-H3 explicit-target call site — both frontend families, buffered
+/// and streaming, first attempt and retry — must hand the pool the POLICY port.
+///
+/// The behavioral tests above drive the two entry points that can be exercised
+/// without a live H3/hyper frontend stream. This pins the remaining two
+/// (`*_streaming_body`, `*_streaming_incoming_body`) and every call site, so a
+/// future caller cannot silently pass the dial port and reintroduce the
+/// unbounded-H3 hole on one surface only.
+#[test]
+fn every_native_h3_target_call_site_passes_the_dispatch_policy_port() {
+    const PROXY_SOURCE: &str = include_str!("../../src/proxy/mod.rs");
+    const H3_FRONTEND_SOURCE: &str = include_str!("../../src/http3/server.rs");
+    const H3_CLIENT_SOURCE: &str = include_str!("../../src/http3/client.rs");
+
+    // The seam itself: the explicit-target create must admit on `policy_port`,
+    // never on the dial `port`.
+    let create = H3_CLIENT_SOURCE
+        .split("async fn create_connection_to_target(")
+        .nth(1)
+        .expect("create_connection_to_target must exist");
+    let admission_args = create
+        .split("PooledConnectionAdmission::resolve(")
+        .nth(1)
+        .expect("the explicit-target create must resolve an admission lane");
+    let end = admission_args.find(';').unwrap_or(admission_args.len());
+    let admission_args = &admission_args[..end];
+    assert!(
+        admission_args.contains("policy_port"),
+        "create_connection_to_target must resolve maxConnections admission by \
+         the DestinationRule policy port, not the dial port; got: {admission_args}"
+    );
+
+    // Every caller supplies it from the selected target.
+    for (name, source) in [
+        ("src/proxy/mod.rs", PROXY_SOURCE),
+        ("src/http3/server.rs", H3_FRONTEND_SOURCE),
+    ] {
+        let call_sites = source.matches(".request_with_target").count();
+        assert!(
+            call_sites > 0,
+            "{name} must still dispatch native H3 by explicit target"
+        );
+        // Each `request_with_target*` call must carry a policy-port derivation
+        // in its own argument list. Both shapes are used: a local binding
+        // (`target_policy_port`) or the method call inline.
+        for (index, chunk) in source.split(".request_with_target").enumerate().skip(1) {
+            let head: String = chunk.chars().take(900).collect();
+            assert!(
+                head.contains("target_policy_port") || head.contains("dispatch_policy_port()"),
+                "{name}: native-H3 target call site #{index} must pass the \
+                 DestinationRule policy port (target_policy_port / \
+                 dispatch_policy_port()); passing only the dial port silently \
+                 removes maxConnections for targetPort-remapped destinations"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn h3_pool_request_with_target_reuses_an_admitted_shard_when_the_cap_refuses_creation() {
     const REQUESTS: usize = 4;
@@ -2245,6 +2609,7 @@ async fn h3_pool_request_with_target_reuses_an_admitted_shard_when_the_cap_refus
             .request_with_target(
                 &proxy,
                 "127.0.0.1",
+                port,
                 port,
                 "GET",
                 &url,

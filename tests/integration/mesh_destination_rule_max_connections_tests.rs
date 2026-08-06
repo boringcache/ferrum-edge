@@ -489,8 +489,8 @@ fn pooled_slot_is_per_connection_not_per_request() {
     assert_eq!(err.current, 1);
     assert_eq!(err.cap, 1);
 
-    // Connection close (driver task ends / pooled handle dropped) frees it, and
-    // the destination recovers immediately.
+    // Connection close (the connection driver task, which owns the slot, ends)
+    // frees it, and the destination recovers immediately.
     drop(connection);
     assert_eq!(
         limiter.current(HOST_FQDN, 8080),
@@ -712,5 +712,306 @@ fn non_websocket_mesh_tunnel_dials_still_resolve_their_own_admission_lane() {
     assert!(
         hbone_pooled.contains("self.conn_admission("),
         "the pooled HBONE tunnel owns its physical connection"
+    );
+}
+
+/// Resolve the pooled admission lane for a capped destination.
+///
+/// A tiny wrapper so the call sites below stay readable; `resolve` returning
+/// `None` here would mean the fixture itself is wrong, not the code under test.
+fn pooled_lane<'a>(
+    limiter: &'a BackendConnectionLimiter,
+    proxy: &'a Proxy,
+    host: &'a str,
+    policy_port: u16,
+) -> PooledConnectionAdmission<'a> {
+    PooledConnectionAdmission::resolve(Some(limiter), proxy, host, policy_port)
+        .expect("a capped destination must resolve a pooled admission lane")
+}
+
+// ============================================================================
+// Raw TCP is on the SAME gateway-wide limiter as everything else
+// ----------------------------------------------------------------------------
+// `TcpProxyMetrics` is built once per stream LISTENER. Its `backend_inflight`
+// field used to be an owned `BackendConnectionLimiter`, so every raw-TCP
+// listener enforced a private copy of the cap while `ProxyState
+// .backend_conn_limit` governed only the HTTP family. A raw-TCP socket plus a
+// pooled/WebSocket socket could therefore exceed the configured ceiling, and two
+// raw-TCP listeners could each get their own. These tests pin the field as a
+// shared handle and pin the wiring that installs it.
+// ============================================================================
+
+/// Raw TCP admits through `TcpProxyMetrics.backend_inflight`; the pooled
+/// transports admit through `PooledConnectionAdmission`. Given the ONE shared
+/// limiter, both must land on the same `(host, policy port)` counter.
+#[test]
+fn raw_tcp_and_pooled_transports_share_one_destination_ceiling() {
+    use ferrum_edge::proxy::tcp_proxy::TcpProxyMetrics;
+    use std::sync::Arc;
+
+    const CAP: u32 = 2;
+    const POLICY_PORT: u16 = 80;
+
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    // Exactly how `StreamListenerManager` builds a listener's metrics.
+    let metrics = Arc::new(TcpProxyMetrics::with_backend_conn_limit(limiter.clone()));
+
+    let proxy = proxy_with_port_override(POLICY_PORT, Some(CAP), None);
+    let pooled = pooled_lane(&limiter, &proxy, HOST_FQDN, POLICY_PORT);
+
+    // One raw-TCP relay session takes the first of two slots.
+    let tcp_slot = metrics
+        .backend_inflight
+        .try_acquire(HOST_FQDN, POLICY_PORT, Some(CAP))
+        .expect("first raw-TCP session is under the cap")
+        .expect("a capped destination hands out a guard");
+    assert_eq!(
+        limiter.current(HOST_FQDN, POLICY_PORT),
+        1,
+        "the raw-TCP session must be counted on the gateway-wide limiter, not a \
+         private per-listener one"
+    );
+
+    // A pooled transport takes the second — it must SEE the raw-TCP socket.
+    let pooled_slot = pooled
+        .acquire()
+        .expect("second connection to the destination is still under the cap");
+    assert_eq!(limiter.current(HOST_FQDN, POLICY_PORT), 2);
+
+    // The destination is now full for BOTH families.
+    assert!(
+        pooled.acquire().is_err(),
+        "a pooled connection must be refused once raw TCP + pooled have filled \
+         the destination's ceiling"
+    );
+    assert!(
+        metrics
+            .backend_inflight
+            .try_acquire(HOST_FQDN, POLICY_PORT, Some(CAP))
+            .is_err(),
+        "a raw-TCP dial must be refused once the destination's ceiling is full, \
+         even though the other slot belongs to a pooled transport"
+    );
+
+    // Retirement recovers, from either side.
+    drop(tcp_slot);
+    assert_eq!(limiter.current(HOST_FQDN, POLICY_PORT), 1);
+    let recovered = pooled
+        .acquire()
+        .expect("a retired raw-TCP slot must free capacity for a pooled dial");
+    drop(recovered);
+    drop(pooled_slot);
+    assert_eq!(
+        limiter.current(HOST_FQDN, POLICY_PORT),
+        0,
+        "every slot must retire exactly once"
+    );
+}
+
+/// Two stream listeners must not each get their own copy of the cap.
+#[test]
+fn two_raw_tcp_listeners_share_one_destination_ceiling() {
+    use ferrum_edge::proxy::tcp_proxy::TcpProxyMetrics;
+    use std::sync::Arc;
+
+    const POLICY_PORT: u16 = 80;
+
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    let listener_a = Arc::new(TcpProxyMetrics::with_backend_conn_limit(limiter.clone()));
+    let listener_b = Arc::new(TcpProxyMetrics::with_backend_conn_limit(limiter.clone()));
+
+    let a_slot = listener_a
+        .backend_inflight
+        .try_acquire(HOST_FQDN, POLICY_PORT, Some(1))
+        .expect("listener A is under the cap")
+        .expect("guard present");
+    assert!(
+        listener_b
+            .backend_inflight
+            .try_acquire(HOST_FQDN, POLICY_PORT, Some(1))
+            .is_err(),
+        "a second stream listener must not get its own `maxConnections: 1`; the \
+         cap is per destination, not per listener"
+    );
+
+    // Listener-local observability counters stay independent.
+    listener_a
+        .active_backend_connections
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        listener_b
+            .active_backend_connections
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "sharing the admission counter must not merge per-listener metrics"
+    );
+
+    drop(a_slot);
+    assert!(
+        listener_b
+            .backend_inflight
+            .try_acquire(HOST_FQDN, POLICY_PORT, Some(1))
+            .is_ok(),
+        "listener B must be admitted once listener A's session retired"
+    );
+}
+
+/// The wiring: `ProxyState` installs its limiter on the stream listener manager
+/// before any reconcile, every spawned listener clones that instance, and the
+/// install is one-shot so a reload/restart cannot swap the limiter out from
+/// under relays whose guards are still counted.
+#[test]
+fn stream_listeners_are_wired_to_the_gateway_backend_conn_limit() {
+    const PROXY_SOURCE: &str = include_str!("../../src/proxy/mod.rs");
+    const STREAM_SOURCE: &str = include_str!("../../src/proxy/stream_listener.rs");
+    const TCP_SOURCE: &str = include_str!("../../src/proxy/tcp_proxy.rs");
+
+    assert!(
+        PROXY_SOURCE.contains("stream_listener_manager.attach_backend_conn_limit("),
+        "ProxyState must hand the stream listener manager the SAME limiter the \
+         HTTP-family transports use; without it every raw-TCP listener enforces \
+         a private copy of maxConnections"
+    );
+    // The spawn site itself: a listener's metrics come from the manager's
+    // shared limiter, not from `TcpProxyMetrics::default()` (which owns a
+    // private one and is reserved for standalone/test constructors).
+    assert!(
+        STREAM_SOURCE.contains("let conn_limit = self.backend_conn_limit();")
+            && STREAM_SOURCE.contains("TcpProxyMetrics::with_backend_conn_limit(conn_limit)"),
+        "the spawned stream listener must build its metrics from the manager's \
+         shared limiter, not from `TcpProxyMetrics::default()`, so every \
+         listener shares the gateway-wide counter"
+    );
+    assert!(
+        TCP_SOURCE.contains("pub backend_inflight: Arc<BackendConnectionLimiter>"),
+        "TcpProxyMetrics.backend_inflight must be a shared handle, not an owned \
+         per-listener limiter"
+    );
+    // One-shot install: a config reload or listener restart must not replace a
+    // limiter that live `BackendConnectionGuard`s are still counted against.
+    assert!(
+        STREAM_SOURCE
+            .contains("backend_conn_limit: std::sync::OnceLock<SharedBackendConnectionLimiter>"),
+        "the manager's limiter slot must be a OnceLock so it can never be \
+         replaced while open guards exist"
+    );
+    let attach = STREAM_SOURCE
+        .split("pub fn attach_backend_conn_limit(")
+        .nth(1)
+        .expect("attach_backend_conn_limit must exist");
+    let attach_body: String = attach.chars().take(400).collect();
+    assert!(
+        attach_body.contains("self.backend_conn_limit.set("),
+        "attaching must be a one-shot `OnceLock::set`, not a swap"
+    );
+}
+
+// ============================================================================
+// One destination, one counter key — host normalization lives in the limiter
+// ----------------------------------------------------------------------------
+// The callers disagree on how a host is spelled: raw TCP / WebSocket / the
+// direct pools pass the configured `Upstream`/`UpstreamTarget` host verbatim,
+// while reqwest's connector sees a URL-normalized authority (bracketed IPv6
+// literal, lowercased registered name). Normalizing at only one of them split
+// `Backend.Example` from `backend.example` and `[::1]` from `::1` into two
+// counters for ONE destination — an effective 2x ceiling.
+// ============================================================================
+
+#[test]
+fn limiter_keys_one_destination_regardless_of_host_spelling() {
+    const CAP: u32 = 1;
+    const PORT: u16 = 80;
+
+    // Case: the configured host vs. the lowercased authority reqwest sees.
+    let limiter = BackendConnectionLimiter::new();
+    let configured = limiter
+        .try_acquire("Backend.Example", PORT, Some(CAP))
+        .expect("first connection is under the cap")
+        .expect("guard present");
+    assert!(
+        limiter
+            .try_acquire("backend.example", PORT, Some(CAP))
+            .is_err(),
+        "a case-different spelling of the SAME destination must not get its own \
+         counter — that is an effective 2x ceiling"
+    );
+    assert_eq!(
+        limiter.current("backend.example", PORT),
+        1,
+        "the diagnostic lookup must normalize the same way the acquire path does"
+    );
+    assert_eq!(
+        limiter.current("BACKEND.EXAMPLE", PORT),
+        1,
+        "and it must do so for any spelling"
+    );
+    drop(configured);
+    assert_eq!(limiter.current("Backend.Example", PORT), 0);
+
+    // Case: an IPv6 literal, bracketed by the URL form and bare in config.
+    let limiter = BackendConnectionLimiter::new();
+    let bare = limiter
+        .try_acquire("::1", PORT, Some(CAP))
+        .expect("first connection is under the cap")
+        .expect("guard present");
+    assert!(
+        limiter.try_acquire("[::1]", PORT, Some(CAP)).is_err(),
+        "the bracketed URL form of an IPv6 literal is the same destination as \
+         the bare configured form"
+    );
+    assert_eq!(limiter.current("[::1]", PORT), 1);
+    drop(bare);
+    assert_eq!(limiter.current("[::1]", PORT), 0);
+
+    // Distinct destinations must still be distinct.
+    let limiter = BackendConnectionLimiter::new();
+    let _a = limiter
+        .try_acquire("a.example", PORT, Some(CAP))
+        .expect("a is under its own cap")
+        .expect("guard present");
+    assert!(
+        limiter
+            .try_acquire("b.example", PORT, Some(CAP))
+            .is_ok_and(|guard| guard.is_some()),
+        "normalization must not collapse different destinations onto one lane"
+    );
+}
+
+/// Cross-caller: the shared limiter must see a raw-TCP session and a pooled
+/// dial to the same destination as one lane even when they spell the host
+/// differently — the exact split the reqwest connector's own normalization used
+/// to hide.
+#[test]
+fn raw_tcp_and_pooled_admission_share_a_lane_across_host_spellings() {
+    use ferrum_edge::proxy::tcp_proxy::TcpProxyMetrics;
+    use std::sync::Arc;
+
+    const POLICY_PORT: u16 = 80;
+    // `UpstreamTarget.host` as an operator might write it in config.
+    const CONFIGURED: &str = "WS.Default.SVC.Cluster.Local";
+    // The same destination as a URL authority would carry it.
+    const NORMALIZED: &str = "ws.default.svc.cluster.local";
+
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    let metrics = Arc::new(TcpProxyMetrics::with_backend_conn_limit(limiter.clone()));
+
+    let tcp_slot = metrics
+        .backend_inflight
+        .try_acquire(CONFIGURED, POLICY_PORT, Some(1))
+        .expect("raw TCP is under the cap")
+        .expect("guard present");
+
+    let proxy = proxy_with_port_override(POLICY_PORT, Some(1), None);
+    let pooled = pooled_lane(&limiter, &proxy, NORMALIZED, POLICY_PORT);
+    assert!(
+        pooled.acquire().is_err(),
+        "the pooled dial must see the raw-TCP socket already occupying this \
+         destination's only slot, despite the different host spelling"
+    );
+
+    drop(tcp_slot);
+    assert!(
+        pooled.acquire().is_ok(),
+        "retiring the raw-TCP session must free the slot for the pooled dial"
     );
 }

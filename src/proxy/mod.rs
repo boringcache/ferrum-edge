@@ -5749,8 +5749,19 @@ pub struct ProxyState {
     /// dies (handshake failure, idle eviction, pool drain, reload/delete, SVID
     /// drain, shutdown) and reuse/multiplexing takes no extra slot. One shared
     /// instance means the ceiling is per destination `(host, policy port)`, not
-    /// per transport. See `docs/mesh.md` and the module docs in
-    /// `src/backend_conn_limit.rs`.
+    /// per transport.
+    ///
+    /// "Shared" is literal and has to stay that way. Raw TCP reaches this exact
+    /// `Arc` through `TcpProxyMetrics.backend_inflight`, which the stream
+    /// listener manager is handed via `attach_backend_conn_limit` right after
+    /// construction and before the first `reconcile()` — if a stream listener
+    /// ever built its own limiter instead, a destination's effective ceiling
+    /// would become `cap` per listener plus another `cap` for the HTTP family.
+    /// The host component of the key is normalized inside the limiter, not at
+    /// the callers, because the callers disagree on spelling (configured host
+    /// vs. reqwest's URL-normalized authority).
+    ///
+    /// See `docs/mesh.md` and the module docs in `src/backend_conn_limit.rs`.
     pub backend_conn_limit: Arc<crate::backend_conn_limit::BackendConnectionLimiter>,
     /// Gateway-wide `connectionPool.tcp.maxConnections` admission hook for the
     /// reqwest transports (HTTP/1.1 and ALPN-negotiated HTTP/2).
@@ -7389,6 +7400,14 @@ impl ProxyState {
                 trusted_proxies.clone(),
             ),
         );
+        // Raw TCP / TCP+TLS stream listeners own a dedicated backend socket per
+        // relay session, so they must admit on the SAME per-destination lane as
+        // WebSocket, the pooled multiplexed transports, and reqwest. Attached
+        // here — after construction, before any `reconcile()` — so every spawned
+        // listener's `TcpProxyMetrics` carries this exact `Arc` instead of a
+        // private per-listener limiter (which would make the effective ceiling
+        // `cap` per listener plus another `cap` for the whole HTTP family).
+        stream_listener_manager.attach_backend_conn_limit(backend_conn_limit.clone());
 
         let state = Self {
             config: config_arc,
@@ -40801,6 +40820,10 @@ async fn proxy_to_backend_http3(
                 let h3_result = if let Some(target) = upstream_target {
                     let target_host = target.host.clone();
                     let target_port = target.port;
+                    // DestinationRule policy port for `maxConnections` admission.
+                    // Differs from `target_port` only under a `targetPort` remap;
+                    // passing the dial port would resolve no cap at all.
+                    let target_policy_port = target.dispatch_policy_port();
                     let connection_pool = state.connection_pool.clone();
                     let proxy_clone = proxy.clone();
                     state
@@ -40809,6 +40832,7 @@ async fn proxy_to_backend_http3(
                             proxy,
                             &target_host,
                             target_port,
+                            target_policy_port,
                             method,
                             backend_url,
                             &http3_headers,
@@ -41174,6 +41198,10 @@ async fn proxy_to_backend_http3(
         let h3_result = if let Some(target) = upstream_target {
             let target_host = target.host.clone();
             let target_port = target.port;
+            // DestinationRule policy port for `maxConnections` admission.
+            // Differs from `target_port` only under a `targetPort` remap;
+            // passing the dial port would resolve no cap at all.
+            let target_policy_port = target.dispatch_policy_port();
             let connection_pool = state.connection_pool.clone();
             let proxy_clone = proxy.clone();
             state
@@ -41182,6 +41210,7 @@ async fn proxy_to_backend_http3(
                     proxy,
                     &target_host,
                     target_port,
+                    target_policy_port,
                     method,
                     backend_url,
                     &http3_headers,
@@ -41278,6 +41307,10 @@ async fn proxy_to_backend_http3(
         let h3_result = if let Some(target) = upstream_target {
             let target_host = target.host.clone();
             let target_port = target.port;
+            // DestinationRule policy port for `maxConnections` admission.
+            // Differs from `target_port` only under a `targetPort` remap;
+            // passing the dial port would resolve no cap at all.
+            let target_policy_port = target.dispatch_policy_port();
             let connection_pool = state.connection_pool.clone();
             let proxy_clone = proxy.clone();
             state
@@ -41286,6 +41319,7 @@ async fn proxy_to_backend_http3(
                     proxy,
                     &target_host,
                     target_port,
+                    target_policy_port,
                     method,
                     backend_url,
                     &http3_headers,
@@ -41870,12 +41904,17 @@ async fn proxy_to_backend_http3_retry(
         let h3_result = if let Some(target) = upstream_target {
             let target_host = target.host.clone();
             let target_port = target.port;
+            // DestinationRule policy port for `maxConnections` admission.
+            // Differs from `target_port` only under a `targetPort` remap;
+            // passing the dial port would resolve no cap at all.
+            let target_policy_port = target.dispatch_policy_port();
             state
                 .h3_pool
                 .request_with_target_streaming(
                     proxy,
                     &target_host,
                     target_port,
+                    target_policy_port,
                     method,
                     backend_url,
                     &http3_headers,
@@ -42006,12 +42045,17 @@ async fn proxy_to_backend_http3_retry(
     let h3_result = if let Some(target) = upstream_target {
         let target_host = target.host.clone();
         let target_port = target.port;
+        // DestinationRule policy port for `maxConnections` admission. Differs
+        // from `target_port` only under a `targetPort` remap; passing the dial
+        // port would resolve no cap at all.
+        let target_policy_port = target.dispatch_policy_port();
         state
             .h3_pool
             .request_with_target(
                 proxy,
                 &target_host,
                 target_port,
+                target_policy_port,
                 method,
                 backend_url,
                 &http3_headers,

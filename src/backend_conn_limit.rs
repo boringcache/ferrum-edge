@@ -11,7 +11,11 @@
 //! connection lifecycle Ferrum owns:
 //!
 //! * **Raw TCP / TCP+TLS stream proxy** (`src/proxy/tcp_proxy.rs`) — one
-//!   dedicated backend socket per relay session.
+//!   dedicated backend socket per relay session. `TcpProxyMetrics
+//!   .backend_inflight` is an `Arc` HANDLE to this one gateway-wide limiter,
+//!   installed on `StreamListenerManager` before the first listener reconcile;
+//!   it is not a per-listener limiter, or a destination would get one ceiling
+//!   per stream listener on top of the HTTP family's.
 //! * **WebSocket** dispatch (H1/H2 in `src/proxy/mod.rs`, H3 in
 //!   `src/http3/websocket.rs`) — one dedicated, non-pooled backend TCP/TLS
 //!   connection whose lifetime equals the session.
@@ -21,8 +25,10 @@
 //!   Sidecar mesh-mTLS (`src/proxy/mesh_mtls_pool.rs`). Each acquires a
 //!   [`SharedBackendConnectionGuard`] at the exact moment a new physical
 //!   connection is about to be constructed and hands it to that connection's
-//!   own driver (the spawned hyper/h2 connection task, or the pooled QUIC
-//!   handle), so the slot retires exactly when the socket dies — handshake
+//!   own driver task (the spawned hyper/h2 connection task, or the spawned h3
+//!   driver that owns the `h3_quinn::Connection`) — never to the pooled cache
+//!   value, which can be evicted or force-drained while the socket is still
+//!   open, so the slot retires exactly when the socket dies — handshake
 //!   failure, idle eviction, pool drain, reload/update/delete, SVID rotation
 //!   drain, or shutdown. Reuse of a pooled connection takes NO new slot, so
 //!   an arbitrary number of multiplexed streams still share one admitted
@@ -47,6 +53,14 @@
 //! (`UpstreamTarget::dispatch_policy_port()`), never the dial/transport port,
 //! so a `targetPort` remap and the mesh tunnel listeners (`:15008` / `:15006`)
 //! all share the one destination lane instead of splitting the ceiling.
+//!
+//! The host component of that key is normalized (lowercased, IPv6 brackets
+//! stripped) inside the limiter itself, not at any one transport, because the
+//! callers disagree on spelling: raw TCP / WebSocket / the direct pools pass
+//! the configured `Upstream`/`UpstreamTarget` host verbatim while reqwest's
+//! connector sees a URL-normalized authority. Normalizing at only one caller
+//! would give `Backend.Example` and `backend.example` (or `[::1]` and `::1`)
+//! separate counters for one destination and an effective 2x ceiling.
 //!
 //! # Hot-path discipline
 //!
@@ -79,6 +93,32 @@ use dashmap::DashMap;
 struct BackendConnKey {
     host: String,
     port: u16,
+}
+
+impl BackendConnKey {
+    /// Build the canonical counter key for a destination.
+    ///
+    /// The host is normalized HERE, at the one boundary every caller passes
+    /// through, rather than at any individual transport: raw TCP, WebSocket and
+    /// the direct pools hand over the configured `Upstream`/`UpstreamTarget`
+    /// host verbatim, while reqwest's connector sees a URL-normalized authority
+    /// (bracketed IPv6 literal, lowercased registered name). Normalizing at only
+    /// one of those splits `Backend.Example` from `backend.example` and `[::1]`
+    /// from `::1` into two counters for ONE destination, so the effective
+    /// ceiling becomes 2x the configured cap.
+    ///
+    /// This runs only on the capped path — `try_acquire` returns before
+    /// touching the map when no cap is configured, and a pooled/capped acquire
+    /// is the cold connection-establishment path that already allocates this
+    /// owned key. So an uncapped request pays nothing for it.
+    fn new(host: &str, port: u16) -> Self {
+        let mut normalized = String::with_capacity(host.len());
+        push_normalized_host(&mut normalized, host);
+        Self {
+            host: normalized,
+            port,
+        }
+    }
 }
 
 /// Shared per-destination open-connection counter map.
@@ -122,17 +162,12 @@ impl BackendConnectionLimiter {
     /// `Arc` handle. Two-phase: a cheap read first, falling back to the
     /// entry API only on the (cold) first request to a new destination.
     fn counter_for(&self, host: &str, port: u16) -> Arc<CachePadded<AtomicU64>> {
-        if let Some(existing) = self.inner.get(&BackendConnKey {
-            host: host.to_string(),
-            port,
-        }) {
+        let key = BackendConnKey::new(host, port);
+        if let Some(existing) = self.inner.get(&key) {
             return existing.clone();
         }
         self.inner
-            .entry(BackendConnKey {
-                host: host.to_string(),
-                port,
-            })
+            .entry(key)
             .or_insert_with(|| Arc::new(CachePadded::new(AtomicU64::new(0))))
             .clone()
     }
@@ -220,13 +255,15 @@ impl BackendConnectionLimiter {
 
     /// Current open-connection count for a destination. Test/metrics only —
     /// the hot path uses `try_acquire` directly.
+    ///
+    /// Goes through the SAME [`BackendConnKey::new`] normalization the acquire
+    /// path uses, so a diagnostic lookup can never report zero for a
+    /// destination that is actually at its ceiling just because the caller
+    /// spelled the host differently.
     #[allow(dead_code)]
     pub fn current(&self, host: &str, port: u16) -> u64 {
         self.inner
-            .get(&BackendConnKey {
-                host: host.to_string(),
-                port,
-            })
+            .get(&BackendConnKey::new(host, port))
             .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
@@ -286,12 +323,25 @@ impl<'a> PooledConnectionAdmission<'a> {
     /// Resolve the admission lane for a dial, or `None` when nothing is capped.
     ///
     /// `override_port` is the key the caller uses to read
-    /// `Proxy.dispatch_port_overrides`. For the socket-owning HTTP pools that
-    /// is `proxy.backend_port` (the per-dispatch clone built by
-    /// `resolve_backend_connection_proxy_for_target` mirrors a `targetPort`-
-    /// remapped service-port policy onto the dial port). For the mesh tunnels
-    /// it is the destination's app/service policy port, because the transport
-    /// dial is `:15008` / `:15006` and must never become the policy source.
+    /// `Proxy.dispatch_port_overrides`. It must always be a POLICY port, never
+    /// a bare dial/transport port:
+    ///
+    /// * pools that key and dial from `proxy.backend_host`/`backend_port`
+    ///   (direct H2, gRPC) pass `proxy.backend_port`, which is safe only
+    ///   because the per-dispatch clone built by
+    ///   `resolve_backend_connection_proxy_for_target` mirrors a `targetPort`-
+    ///   remapped service-port policy onto that dial port and stamps
+    ///   [`crate::config::types::ResolvedPortOverride::policy_port`];
+    /// * pools that receive the LB-selected target as an EXPLICIT argument
+    ///   (native HTTP/3) must pass the target's `dispatch_policy_port()`
+    ///   directly. Their effective proxy comes from
+    ///   `resolve_effective_proxy_for_target`, whose overrides stay keyed by
+    ///   the service port, so passing the dial port would resolve NO cap at all
+    ///   under a `targetPort` remap (Service 80 -> workload 8080) and let the
+    ///   transport open unbounded connections;
+    /// * the mesh tunnels pass the destination's app/service policy port,
+    ///   because the transport dial is `:15008` / `:15006` and must never
+    ///   become the policy source.
     ///
     /// The resulting counter lane is keyed by the DestinationRule **policy**
     /// port — `ResolvedPortOverride::policy_port` when the entry was mirrored
@@ -478,9 +528,14 @@ thread_local! {
         std::cell::RefCell::new(String::with_capacity(96));
 }
 
-/// Normalize a host for lane keying: ASCII-lowercased and with IPv6 brackets
-/// stripped, so the dispatch-side `UpstreamTarget.host` and the bracketed,
-/// URL-normalized authority reqwest hands the connector land on one key.
+/// Normalize a host for keying: lowercased and with IPv6 brackets stripped, so
+/// the dispatch-side `UpstreamTarget.host` and the bracketed, URL-normalized
+/// authority reqwest hands the connector land on one key.
+///
+/// Used by BOTH the reqwest dial-lane registry (`write_lane_key`) and the
+/// shared per-destination counter ([`BackendConnKey::new`]) — one normalizer,
+/// so a raw-TCP session to `Backend.Example` and a reqwest socket to
+/// `backend.example` can never allocate two counters for one destination.
 fn push_normalized_host(buf: &mut String, host: &str) {
     let host = host.strip_prefix('[').unwrap_or(host);
     let host = host.strip_suffix(']').unwrap_or(host);
@@ -697,20 +752,20 @@ impl reqwest::ConnectionAdmission for ReqwestConnectionAdmission {
                 _ => 80,
             },
         };
-        // Normalize once (brackets stripped, ASCII-lowercased) so the counter
-        // key matches the one the WebSocket / raw-TCP / pooled transports use
-        // for the same destination. This is the cold new-connection path, so
-        // the small allocation never touches per-request work.
-        let mut normalized_host = String::with_capacity(host.len());
-        push_normalized_host(&mut normalized_host, host);
-        let Some(lane) = self.lane_for(&normalized_host, port) else {
+        // `host` is passed through verbatim: both the lane registry
+        // (`write_lane_key`) and the shared counter (`BackendConnKey::new`)
+        // normalize internally with the SAME `push_normalized_host`, so the
+        // reqwest authority form (`[::1]`, `Backend.Example`) lands on exactly
+        // the key raw TCP / WebSocket / the direct pools use for the same
+        // destination without an extra allocation here.
+        let Some(lane) = self.lane_for(host, port) else {
             return Ok(reqwest::ConnectionAdmissionToken::unlimited());
         };
         // Count on the POLICY port, never the dial port, so every transport to
         // this destination shares one ceiling.
         match self
             .limiter
-            .try_acquire_shared(&normalized_host, lane.policy_port(), lane.cap())
+            .try_acquire_shared(host, lane.policy_port(), lane.cap())
         {
             Ok(slot) => Ok(reqwest::ConnectionAdmissionToken::new(slot)),
             Err(limit) => Err(Box::new(limit)),

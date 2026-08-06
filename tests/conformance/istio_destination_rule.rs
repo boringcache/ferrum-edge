@@ -162,7 +162,7 @@ fn dr_connection_pool_tcp_max_connections() {
         feature = "trafficPolicy.connectionPool.tcp.maxConnections",
         status = Status::Supported,
         maturity = Maturity::Ga,
-        notes = "T1-D (PR #897), extended by issue #3290: translated to MeshConnectionPoolTcp.max_connections and enforced as a physical open-connection ceiling on every transport whose socket lifecycle Ferrum owns — stream-family (TCP/TCP+TLS), HTTP-family WebSocket, the pooled multiplexed transports (direct H2, gRPC, native H3, HBONE, mesh-mTLS, each holding the slot for its connection driver), and the reqwest transports (HTTP/1.1 and ALPN-negotiated HTTP/2), admitted inside reqwest's own connector via the vendored connection_admission hook so pooled reuse and multiplexed streams take no slot while an idle socket still holds one — see docs/mesh.md.",
+        notes = "T1-D (PR #897), extended by issue #3290: translated to MeshConnectionPoolTcp.max_connections and enforced as a physical open-connection ceiling on every transport whose socket lifecycle Ferrum owns — stream-family (TCP/TCP+TLS), HTTP-family WebSocket, the pooled multiplexed transports (direct H2, gRPC, native H3, HBONE, mesh-mTLS — each connection's slot is owned by that connection's own driver task, so it retires with the socket rather than with the pooled handle), and the reqwest transports (HTTP/1.1 and ALPN-negotiated HTTP/2), admitted inside reqwest's own connector via the vendored connection_admission hook so pooled reuse and multiplexed streams take no slot while an idle socket still holds one — see docs/mesh.md.",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",
