@@ -39,10 +39,10 @@
 //! `ResponsePolicyProvenance` — the content digest of the published RTDS
 //! response-side gate map *and* the content digest of the effective static
 //! rules of **every** plugin whose response-body transform the replay skips
-//! (`response_transformer` and `sse` today; see
-//! `Plugin::response_presentation_policy` for the audited set and why
-//! `compression`, `grpc_web`, `ai_response_guard`, and `ai_tool_governor` are
-//! excluded) — and replays only while both still match:
+//! (`response_transformer`, `sse`, and `a2a_gateway` in its configured-public-
+//! base mode today; see `Plugin::response_presentation_policy` for the audited
+//! set and why `compression`, `grpc_web`, `ai_response_guard`, and
+//! `ai_tool_governor` are excluded) — and replays only while both still match:
 //!
 //! - **Lookup**: a stored response whose provenance differs from the live one
 //!   is refused with 409 rather than replayed. It is not re-executed: the
@@ -87,12 +87,27 @@
 //! digest can witness the live catalog that rewrite consumes, and deriving one
 //! would mean persisting or re-listing mutable upstream session state.
 //!
+//! `a2a_gateway` is the *conditional* case. Its Agent Card rewrite is normally a
+//! pure function of configuration — `discovery.public_base_url` plus
+//! `endpoint.path` — and enrolls `Static`. But with no configured base and
+//! `discovery.trust_forwarded_headers` enabled, the rewritten origin is built
+//! from `X-Forwarded-Proto` / `X-Forwarded-Host` / `Host` and, absent a
+//! forwarded scheme, from whether the connection carried a TLS SNI hostname.
+//! The fingerprint below binds neither the complete forwarded header set nor
+//! `frontend_sni_hostname`, so two requests sharing a replay key can legitimately
+//! deserve cards advertising different origins. That configuration therefore
+//! reports `Dynamic` and is refused, while a configured-public-base deployment
+//! composes normally.
+//!
 //! Rather than replay under an unprovable policy, the composition is refused:
 //! [`validate_composition`] rejects the pair at config admission and at
-//! plugin-cache construction. For the admission paths that only warn on
-//! pre-existing data, `ResponsePresentationPolicy::Dynamic` collapses the
-//! proxy's presentation digest to `None` at runtime, which fails both storage
-//! and replay closed through the rules above.
+//! plugin-cache construction — unconditionally for
+//! [`DYNAMIC_RESPONSE_PRESENTATION_PLUGINS`] and per-instance for
+//! [`CONDITIONALLY_DYNAMIC_RESPONSE_PRESENTATION_PLUGINS`]. For the admission
+//! paths that only warn on pre-existing data,
+//! `ResponsePresentationPolicy::Dynamic` collapses the proxy's presentation
+//! digest to `None` at runtime, which fails both storage and replay closed
+//! through the rules above.
 
 use crate::fips::approved::Sha256;
 use async_trait::async_trait;
@@ -307,6 +322,50 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext, ResponsePoli
 /// the list cannot drift away from the runtime behavior it stands in for.
 pub const DYNAMIC_RESPONSE_PRESENTATION_PLUGINS: &[&str] = &["mcp_gateway"];
 
+/// Plugins whose response-body rewrite is dynamic for SOME accepted
+/// configurations and a pure function of configuration for others.
+///
+/// These may not be refused by name: doing so would reject deployments that are
+/// perfectly provable. Each effective instance is classified individually by
+/// [`conditional_instance_is_dynamic`], which delegates to the owning plugin so
+/// the classification cannot drift from what that plugin reports at runtime.
+///
+/// `a2a_gateway` is the case today. With `discovery.public_base_url` configured
+/// its Agent Card rewrite is a pure function of configuration and it enrolls
+/// `Static`. With no configured base and `discovery.trust_forwarded_headers`
+/// enabled, the rewritten origin is derived from per-request forwarded headers
+/// and from whether the connection carried a TLS SNI hostname — and the
+/// deduplication fingerprint binds neither the complete forwarded header set nor
+/// the transport's SNI — so that configuration is `Dynamic` and cannot be
+/// composed here.
+pub const CONDITIONALLY_DYNAMIC_RESPONSE_PRESENTATION_PLUGINS: &[&str] = &["a2a_gateway"];
+
+/// Whether one effective instance of a conditionally dynamic plugin actually
+/// selects its dynamic mode.
+///
+/// A name with no classifier is treated as NOT dynamic rather than as dynamic:
+/// the list above and this function are edited together, and a name added to one
+/// without the other is caught by
+/// `tests/unit/plugins/request_deduplication_tests.rs`, which constructs each
+/// listed name in both modes and asserts the runtime policy agrees.
+fn conditional_instance_is_dynamic(plugin: &crate::config::types::PluginConfig) -> bool {
+    match plugin.plugin_name.as_str() {
+        "a2a_gateway" => {
+            crate::plugins::a2a_gateway::presentation_policy_is_request_derived(&plugin.config)
+        }
+        _ => false,
+    }
+}
+
+/// The identity narrowing for names that are dynamic in every configuration.
+fn every_instance(_plugin: &crate::config::types::PluginConfig) -> bool {
+    true
+}
+
+/// Narrowing applied to one plugin name's effective instances AFTER the runtime
+/// merge's shadow resolution has picked them.
+type InstanceFilter = fn(&crate::config::types::PluginConfig) -> bool;
+
 /// Whether an effective instance's hooks actually apply. An instance that is
 /// merged but inert does not rewrite a response and cannot make deduplication
 /// provenance unprovable.
@@ -345,7 +404,7 @@ fn plugin_hooks_are_active(plugin: &crate::config::types::PluginConfig) -> bool 
 pub fn validate_composition(
     config: &crate::config::types::GatewayConfig,
 ) -> Result<(), Vec<String>> {
-    use crate::config::types::{PluginConfig, PluginScope};
+    use crate::config::types::{PluginConfig, PluginScope, Proxy};
 
     // Keyed by `(namespace, id)` exactly like the runtime merge's scoped-plugin
     // map: a proxy only ever resolves associations against plugin configs in
@@ -369,7 +428,11 @@ pub fn validate_composition(
     //   dynamic rewrite. Filtering by activity before shadow resolution would
     //   fall back to a global that the runtime never merges, and reject a
     //   composition that cannot occur.
-    let effective_ids = |proxy: &crate::config::types::Proxy, name: &str| -> Vec<String> {
+    //
+    // `keep` narrows the resolved set AFTER shadow resolution, which is what
+    // lets a conditionally dynamic plugin be refused only in the configuration
+    // that actually makes it dynamic.
+    let effective_ids = |proxy: &Proxy, name: &str, keep: InstanceFilter| -> Vec<String> {
         let local: Vec<&PluginConfig> = proxy
             .plugins
             .iter()
@@ -403,19 +466,19 @@ pub fn validate_composition(
         };
         effective
             .into_iter()
-            .filter(|plugin| plugin_hooks_are_active(plugin))
+            .filter(|plugin| plugin_hooks_are_active(plugin) && keep(plugin))
             .map(|plugin| plugin.id.clone())
             .collect()
     };
 
     let mut errors = Vec::new();
     for proxy in &config.proxies {
-        let dedup_ids = effective_ids(proxy, "request_deduplication");
+        let dedup_ids = effective_ids(proxy, "request_deduplication", every_instance);
         if dedup_ids.is_empty() {
             continue;
         }
         for dynamic_name in DYNAMIC_RESPONSE_PRESENTATION_PLUGINS {
-            let dynamic_ids = effective_ids(proxy, dynamic_name);
+            let dynamic_ids = effective_ids(proxy, dynamic_name, every_instance);
             if dynamic_ids.is_empty() {
                 continue;
             }
@@ -426,6 +489,29 @@ pub fn validate_composition(
                  configuration, so a replay cannot be proven to match the current policy. \
                  request_deduplication: {}; {dynamic_name}: {}. \
                  Disable one of them on this proxy",
+                proxy.id,
+                dedup_ids.join(", "),
+                dynamic_ids.join(", ")
+            ));
+        }
+        // Conditionally dynamic plugins are refused only in the configuration
+        // that actually makes them dynamic, so a provable deployment of the same
+        // plugin composes normally.
+        for dynamic_name in CONDITIONALLY_DYNAMIC_RESPONSE_PRESENTATION_PLUGINS {
+            let dynamic_ids = effective_ids(proxy, dynamic_name, conditional_instance_is_dynamic);
+            if dynamic_ids.is_empty() {
+                continue;
+            }
+            errors.push(format!(
+                "request_deduplication cannot be composed with {dynamic_name} on proxy '{}' \
+                 while {dynamic_name} derives its public base from the request: an idempotent \
+                 replay is served without re-running {dynamic_name}'s Agent Card rewrite, and \
+                 with discovery.public_base_url unset and discovery.trust_forwarded_headers \
+                 enabled that rewrite is shaped by per-request forwarded headers and by the \
+                 connection's TLS SNI, neither of which the deduplication fingerprint binds. \
+                 request_deduplication: {}; {dynamic_name}: {}. \
+                 Set discovery.public_base_url on {dynamic_name}, or disable one of them on \
+                 this proxy",
                 proxy.id,
                 dedup_ids.join(", "),
                 dynamic_ids.join(", ")

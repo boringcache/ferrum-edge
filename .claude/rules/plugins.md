@@ -51,7 +51,14 @@ paths:
 - Exception: `request_deduplication` may not be effective on the same proxy as
   `mcp_gateway`; its response rewrite comes from live upstream discovery state
   that no persisted digest can witness (`DYNAMIC_RESPONSE_PRESENTATION_PLUGINS`,
-  mirrored at runtime by `ResponsePresentationPolicy::Dynamic`).
+  mirrored at runtime by `ResponsePresentationPolicy::Dynamic`). The same refusal
+  applies PER INSTANCE to an `a2a_gateway` whose Agent Card rewrite derives its
+  public base from the request (`discovery.public_base_url` unset while
+  `discovery.trust_forwarded_headers` is true): the origin then depends on
+  forwarded headers and on `frontend_sni_hostname`, which the fingerprint does
+  not bind (`CONDITIONALLY_DYNAMIC_RESPONSE_PRESENTATION_PLUGINS` +
+  `a2a_gateway::presentation_policy_is_request_derived`). A configured
+  public-base `a2a_gateway` enrolls `Static` and composes normally.
   Deduplication runs at priority 3010, after route dispatch and
   `request_transformer` header/query rules but before terminate-mode
   `serverless_function`. Plugin-cache admission rejects every same-protocol
