@@ -1989,7 +1989,7 @@
     ],
     "subsystem": "mesh",
     "export_surface": "/metrics",
-    "bundled": "dashboard",
+    "bundled": "documented_only",
     "emission": "conditional"
   },
   {
@@ -2095,7 +2095,7 @@
     ],
     "subsystem": "mesh",
     "export_surface": "/metrics",
-    "bundled": "dashboard",
+    "bundled": "documented_only",
     "emission": "conditional"
   },
   {
