@@ -2355,7 +2355,7 @@ fn build_inbound_hbone_relay_proxy(
     match ingress_remap {
         SidecarIngressConnectRelay::NotDeclared => {}
         SidecarIngressConnectRelay::Deny => {
-            warn!(
+            debug!(
                 listener_port = port,
                 "Refusing authenticated inbound CONNECT after a Sidecar ingress block was \
                  declared: the authority does not resolve to one valid, owner-stamped, \

@@ -1798,7 +1798,7 @@ mod tests {
                 owner_service: "redis".to_string(),
             }],
             sidecar_ingress_declared: true,
-            local_workload_addresses: vec!["10.244.1.7".to_string()],
+            local_workload_addresses: vec!["10.244.1.7".parse().unwrap()],
             ..MeshConfig::default()
         };
         let mut proxy = minimal_proxy();

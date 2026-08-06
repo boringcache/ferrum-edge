@@ -1429,9 +1429,9 @@ impl TrustBundleSet {
 // ── Sidecar (Istio egress scoping) ───────────────────────────────────────
 
 /// Istio `Sidecar` resource. Narrows which services / service-entries /
-/// destination-rules a workload may reach via egress. Mirror of Istio's
-/// `networking.istio.io/v1.Sidecar` for `egress` scoping; ingress listener
-/// configuration is intentionally not modeled.
+/// destination-rules a workload may reach via egress and can replace its
+/// default inbound surface with declared `ingress[]` HTTP or stream listeners.
+/// Mirror of the modeled `networking.istio.io/v1.Sidecar` fields.
 ///
 /// Resolution order at slice build time (most specific wins):
 /// 1. Workload-scoped (non-empty `workload_selector` whose labels match)
@@ -2683,8 +2683,7 @@ pub struct MeshConfig {
     /// Runtime-only back-projection of the unambiguously resolved local
     /// service workload set's addresses, taken
     /// from `MeshSlice.local_inbound_workloads` (the un-narrowed local-inbound
-    /// view) and canonicalized for comparison (IPv4-mapped IPv6 folded, DNS
-    /// names ASCII-lowercased).
+    /// view) and canonicalized for comparison (IPv4-mapped IPv6 folded).
     ///
     /// Deliberately NOT `workloads`: that is the subscription-NAMESPACE view
     /// and contains unrelated pods. This set can include sibling replicas of
@@ -2695,13 +2694,12 @@ pub struct MeshConfig {
     /// (issue #3260). Empty ⇒ no local identity resolved, and the remap is
     /// refused. `serde(skip)`: never operator-settable, never serialized.
     #[serde(skip)]
-    pub local_workload_addresses: Vec<String>,
+    pub local_workload_addresses: Vec<std::net::IpAddr>,
 }
 
 /// Canonical comparison form for a mesh host: IP literals fold IPv4-mapped
-/// IPv6 to their IPv4 form, everything else is ASCII-lowercased. Used to key
-/// [`MeshConfig::local_workload_addresses`] so an accepted/authority address
-/// and a slice-declared address describe one host exactly once.
+/// IPv6 to their IPv4 form, everything else is ASCII-lowercased. Used for
+/// validated loopback endpoint comparisons.
 pub fn canonical_mesh_host(host: &str) -> String {
     match host.parse::<std::net::IpAddr>() {
         Ok(ip) => ip.to_canonical().to_string(),
@@ -2753,8 +2751,8 @@ impl MeshConfig {
         if self.local_workload_addresses.is_empty() || host.is_empty() {
             return false;
         }
-        let canonical = canonical_mesh_host(host);
-        self.local_workload_addresses.contains(&canonical)
+        host.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| self.local_workload_addresses.contains(&ip.to_canonical()))
     }
 
     /// Resolve an authenticated inbound CONNECT `host:port` against this
@@ -2801,11 +2799,12 @@ impl MeshConfig {
         if rest.any(|entry| entry.port == port) {
             return SidecarIngressConnectRelay::Deny;
         }
-        let authority_host = canonical_mesh_host(host);
-        if !self.host_is_local_service_workload_address(host)
-            || accepted_local_ip
-                .map(|ip| canonical_mesh_host(&ip.to_string()))
-                .is_none_or(|local| local != authority_host)
+        let Ok(authority_ip) = host.parse::<std::net::IpAddr>() else {
+            return SidecarIngressConnectRelay::Deny;
+        };
+        let authority_ip = authority_ip.to_canonical();
+        if accepted_local_ip.map(std::net::IpAddr::to_canonical) != Some(authority_ip)
+            || !self.local_workload_addresses.contains(&authority_ip)
         {
             return SidecarIngressConnectRelay::Deny;
         }

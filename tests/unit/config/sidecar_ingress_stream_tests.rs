@@ -61,7 +61,7 @@ fn local_mesh(listeners: Vec<ResolvedIngressListener>) -> MeshConfig {
     MeshConfig {
         local_ingress_listeners: listeners,
         sidecar_ingress_declared: true,
-        local_workload_addresses: vec![POD_IP.to_string()],
+        local_workload_addresses: vec![POD_IP.parse().expect("test pod IP")],
         ..MeshConfig::default()
     }
 }
@@ -267,7 +267,7 @@ fn connect_remap_refuses_foreign_and_loopback_authorities() {
     // Local-service resolution can include sibling replicas. Reaching this
     // pod's socket does not authorize an authority naming the sibling.
     mesh.local_workload_addresses
-        .push("10.244.1.9".to_string());
+        .push("10.244.1.9".parse().expect("sibling pod IP"));
 
     for hostile in ["10.244.1.9", "127.0.0.1", "redis.default.svc"] {
         assert_eq!(
@@ -348,7 +348,7 @@ fn connect_remap_withdrawal_leaves_no_stale_routing() {
     assert_eq!(remap(&declared, POD_IP, 16379), expected_relay());
 
     let withdrawn = MeshConfig {
-        local_workload_addresses: vec![POD_IP.to_string()],
+        local_workload_addresses: vec![POD_IP.parse().expect("test pod IP")],
         ..MeshConfig::default()
     };
     assert_eq!(remap(&withdrawn, POD_IP, 16379), Remap::NotDeclared);

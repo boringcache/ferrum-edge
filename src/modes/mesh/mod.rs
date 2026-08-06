@@ -1312,13 +1312,12 @@ fn prepare_normalized_gateway_config_for_mesh(
         // subscription-NAMESPACE view and includes unrelated pods. `None` (no
         // local narrowing) and an empty local view both leave this empty, and
         // the remap is refused.
-        let mut local_addresses: Vec<String> = Vec::new();
+        let mut local_addresses: Vec<std::net::IpAddr> = Vec::new();
         if let Some(local) = mesh_slice.local_inbound_workloads.as_deref() {
             for workload in local {
                 for address in &workload.addresses {
-                    let canonical = config::canonical_mesh_host(address);
-                    if !canonical.is_empty() {
-                        local_addresses.push(canonical);
+                    if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+                        local_addresses.push(ip.to_canonical());
                     }
                 }
             }
@@ -32718,7 +32717,7 @@ mod tests {
         let mesh = config.mesh.as_deref().expect("prepared mesh");
         assert_eq!(
             mesh.local_workload_addresses,
-            vec!["10.244.1.7".to_string()],
+            vec!["10.244.1.7".parse().expect("test pod IP")],
             "IPv4-mapped duplicates must canonicalize + dedup to one address"
         );
         assert!(mesh.host_is_local_service_workload_address("10.244.1.7"));
