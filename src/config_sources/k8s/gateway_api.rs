@@ -2406,7 +2406,9 @@ fn udp_route_conflicts(entries: &[UdpRouteConflictEntry]) -> Vec<GatewayApiRoute
             BTreeMap::new();
         for (index, key) in claimants {
             let resource = entries[index].candidate.resource.clone();
-            let slot = by_resource.entry(resource).or_insert_with(|| (index, Vec::new()));
+            let slot = by_resource
+                .entry(resource)
+                .or_insert_with(|| (index, Vec::new()));
             slot.1.push(key);
         }
 

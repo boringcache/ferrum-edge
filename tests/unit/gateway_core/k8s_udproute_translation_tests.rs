@@ -1121,7 +1121,10 @@ fn udp_route_non_array_rules_rejects_invalid() {
     let objects = udp_lab(spec);
 
     let err = translate_k8s_objects(&objects, options()).expect_err("non-array rules fail closed");
-    assert!(err.to_string().contains("UDPRoute spec.rules must be an array"));
+    assert!(
+        err.to_string()
+            .contains("UDPRoute spec.rules must be an array")
+    );
 
     let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
     assert_eq!(
@@ -1139,7 +1142,10 @@ fn udp_route_empty_rules_rejects_invalid() {
     let objects = udp_lab(spec);
 
     let err = translate_k8s_objects(&objects, options()).expect_err("empty rules fail closed");
-    assert!(err.to_string().contains("UDPRoute spec.rules must contain at least 1"));
+    assert!(
+        err.to_string()
+            .contains("UDPRoute spec.rules must contain at least 1")
+    );
 
     let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
     assert_eq!(
@@ -1177,7 +1183,10 @@ fn udp_route_non_array_backend_refs_rejects_invalid() {
 
     let err =
         translate_k8s_objects(&objects, options()).expect_err("non-array backendRefs fail closed");
-    assert!(err.to_string().contains("UDPRoute backendRefs must be an array"));
+    assert!(
+        err.to_string()
+            .contains("UDPRoute backendRefs must be an array")
+    );
 
     let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
     assert_eq!(
@@ -1196,9 +1205,10 @@ fn udp_route_empty_backend_refs_rejects_invalid() {
 
     let err =
         translate_k8s_objects(&objects, options()).expect_err("empty backendRefs fail closed");
-    assert!(err
-        .to_string()
-        .contains("UDPRoute backendRefs must contain at least 1"));
+    assert!(
+        err.to_string()
+            .contains("UDPRoute backendRefs must contain at least 1")
+    );
 
     let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
     assert_eq!(
@@ -1306,10 +1316,7 @@ fn udp_routes_on_distinct_listeners_remain_independent() {
     let objects = [
         gateway_class(),
         gateway,
-        udp_route(
-            "dns",
-            attached_rule("edge", "dns", "coredns-a", 5353),
-        ),
+        udp_route("dns", attached_rule("edge", "dns", "coredns-a", 5353)),
         udp_route(
             "metrics",
             attached_rule("edge", "metrics", "coredns-b", 5354),
@@ -1318,7 +1325,11 @@ fn udp_routes_on_distinct_listeners_remain_independent() {
 
     let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
 
-    assert!(result.route_conflicts.is_empty(), "{:?}", result.route_conflicts);
+    assert!(
+        result.route_conflicts.is_empty(),
+        "{:?}",
+        result.route_conflicts
+    );
     let mut ports: Vec<Option<u16>> = result
         .config
         .proxies
