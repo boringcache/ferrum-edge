@@ -61,18 +61,32 @@ pub struct GatewayCertificateInput {
 /// `Debug` deliberately reports only counts: a `CertifiedKey` holds a live
 /// signing key, and a resolver is reachable from broad runtime state dumps.
 pub struct SniCertResolver {
-    exact: HashMap<String, Vec<Arc<CertifiedKey>>>,
+    /// Listener hostnames are authoritative routing/ownership claims. Keep
+    /// them separate from certificate-derived aliases so an unrelated
+    /// certificate SAN can never become a signature-compatible fallback for a
+    /// name another listener explicitly owns.
+    declared_exact: HashMap<String, Vec<Arc<CertifiedKey>>>,
+    declared_wildcard: HashMap<String, Vec<Arc<CertifiedKey>>>,
+    /// Certificate-derived aliases are considered only when no listener
+    /// hostname claims the SNI.
+    san_exact: HashMap<String, Vec<Arc<CertifiedKey>>>,
     /// Keyed by the suffix AFTER `*.`, so `*.example.com` is stored as
     /// `example.com` and matched against a client name's parent domain.
-    wildcard: HashMap<String, Vec<Arc<CertifiedKey>>>,
+    san_wildcard: HashMap<String, Vec<Arc<CertifiedKey>>>,
     fallback: Vec<Arc<CertifiedKey>>,
 }
 
 impl std::fmt::Debug for SniCertResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SniCertResolver")
-            .field("exact_names", &self.exact.len())
-            .field("wildcard_names", &self.wildcard.len())
+            .field(
+                "exact_names",
+                &(self.declared_exact.len() + self.san_exact.len()),
+            )
+            .field(
+                "wildcard_names",
+                &(self.declared_wildcard.len() + self.san_wildcard.len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -81,19 +95,26 @@ impl SniCertResolver {
     /// The certificate candidates a server name selects, or `None` to use the
     /// fallback listener's candidates.
     ///
-    /// Exact beats wildcard: `a.example.com` prefers a certificate that names
-    /// it outright over one that only names `*.example.com`. Wildcards match a
-    /// single label, per RFC 6125 — `*.example.com` covers `a.example.com` but
-    /// not `a.b.example.com` and not bare `example.com`.
+    /// Declared listener ownership beats every certificate-derived alias;
+    /// within each tier exact beats wildcard. Wildcards match a single label,
+    /// per RFC 6125 — `*.example.com` covers `a.example.com` but not
+    /// `a.b.example.com` and not bare `example.com`.
     fn candidates(&self, server_name: &str) -> Option<&[Arc<CertifiedKey>]> {
-        if let Some(certified_keys) = self.exact.get(server_name) {
+        if let Some(certified_keys) = self.declared_exact.get(server_name) {
             return Some(certified_keys);
         }
-        let (label, parent) = server_name.split_once('.')?;
-        if label.is_empty() || parent.is_empty() {
-            return None;
+        let wildcard_parent = server_name.split_once('.').and_then(|(label, parent)| {
+            (!label.is_empty() && !parent.is_empty()).then_some(parent)
+        });
+        if let Some(parent) = wildcard_parent {
+            if let Some(certified_keys) = self.declared_wildcard.get(parent) {
+                return Some(certified_keys);
+            }
         }
-        self.wildcard.get(parent).map(Vec::as_slice)
+        if let Some(certified_keys) = self.san_exact.get(server_name) {
+            return Some(certified_keys);
+        }
+        wildcard_parent.and_then(|parent| self.san_wildcard.get(parent).map(Vec::as_slice))
     }
 }
 
@@ -205,8 +226,10 @@ pub fn load_gateway_multi_cert_tls_config(
         loaded.push((input, certified_key, leaf));
     }
 
-    let mut exact: HashMap<String, Vec<Arc<CertifiedKey>>> = HashMap::new();
-    let mut wildcard: HashMap<String, Vec<Arc<CertifiedKey>>> = HashMap::new();
+    let mut declared_exact: HashMap<String, Vec<Arc<CertifiedKey>>> = HashMap::new();
+    let mut declared_wildcard: HashMap<String, Vec<Arc<CertifiedKey>>> = HashMap::new();
+    let mut san_exact: HashMap<String, Vec<Arc<CertifiedKey>>> = HashMap::new();
+    let mut san_wildcard: HashMap<String, Vec<Arc<CertifiedKey>>> = HashMap::new();
     let mut indexed_names = 0usize;
     let mut dropped_names = 0usize;
 
@@ -227,8 +250,8 @@ pub fn load_gateway_multi_cert_tls_config(
             )
         })?;
         if !index_sni_name(
-            &mut exact,
-            &mut wildcard,
+            &mut declared_exact,
+            &mut declared_wildcard,
             hostname,
             certified_key,
             &input.identity,
@@ -251,8 +274,8 @@ pub fn load_gateway_multi_cert_tls_config(
             .filter_map(|name| normalize_indexable_sni_name(&name))
         {
             if !index_sni_name(
-                &mut exact,
-                &mut wildcard,
+                &mut san_exact,
+                &mut san_wildcard,
                 name,
                 certified_key,
                 &input.identity,
@@ -296,14 +319,18 @@ pub fn load_gateway_multi_cert_tls_config(
 
     info!(
         certificate_count = certificates.len(),
-        exact_names = exact.len(),
-        wildcard_names = wildcard.len(),
+        declared_exact_names = declared_exact.len(),
+        declared_wildcard_names = declared_wildcard.len(),
+        san_exact_names = san_exact.len(),
+        san_wildcard_names = san_wildcard.len(),
         "Built SNI-aware Gateway frontend TLS certificate resolver"
     );
 
     let sni_resolver = Arc::new(SniCertResolver {
-        exact,
-        wildcard,
+        declared_exact,
+        declared_wildcard,
+        san_exact,
+        san_wildcard,
         fallback,
     });
     // ACME TLS-ALPN-01 validation still wins over SNI selection, exactly as it
@@ -567,5 +594,49 @@ mod tests {
             .is_none(),
             "an SNI with no compatible key must fail instead of falling back"
         );
+    }
+
+    #[test]
+    fn declared_listener_names_cannot_fall_through_to_unrelated_san_candidates() {
+        let declared = test_certified_key(&rcgen::PKCS_ECDSA_P256_SHA256, "claimed.example.com");
+        let san_alias = test_certified_key(&rcgen::PKCS_ED25519, "alias.example.com");
+        let resolver = SniCertResolver {
+            declared_exact: HashMap::from([(
+                "claimed.example.com".to_string(),
+                vec![declared.clone()],
+            )]),
+            declared_wildcard: HashMap::from([(
+                "example.net".to_string(),
+                vec![declared.clone()],
+            )]),
+            san_exact: HashMap::from([
+                (
+                    "claimed.example.com".to_string(),
+                    vec![san_alias.clone()],
+                ),
+                ("api.example.net".to_string(), vec![san_alias.clone()]),
+                ("unclaimed.example.org".to_string(), vec![san_alias.clone()]),
+            ]),
+            san_wildcard: HashMap::new(),
+            fallback: vec![san_alias.clone()],
+        };
+
+        let exact_claim = resolver
+            .candidates("claimed.example.com")
+            .expect("declared exact candidates");
+        assert_eq!(exact_claim.len(), 1);
+        assert!(Arc::ptr_eq(&exact_claim[0], &declared));
+
+        let wildcard_claim = resolver
+            .candidates("api.example.net")
+            .expect("declared wildcard candidates");
+        assert_eq!(wildcard_claim.len(), 1);
+        assert!(Arc::ptr_eq(&wildcard_claim[0], &declared));
+
+        let unclaimed_alias = resolver
+            .candidates("unclaimed.example.org")
+            .expect("unclaimed SAN alias candidates");
+        assert_eq!(unclaimed_alias.len(), 1);
+        assert!(Arc::ptr_eq(&unclaimed_alias[0], &san_alias));
     }
 }

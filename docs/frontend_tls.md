@@ -474,8 +474,8 @@ A data plane that receives its frontend TLS material from a Kubernetes Gateway (
 
 Every authorized certificate for the data plane's namespace is installed into one SNI-aware `rustls` certificate resolver:
 
-1. **Exact SNI match.** The client's `server_name` is looked up against the listener's declared `hostname` and the leaf certificate's own DNS SANs.
-2. **One-label wildcard.** `*.example.com` answers `a.example.com`, but not `a.b.example.com` and not bare `example.com` (RFC 6125).
+1. **Declared listener match.** Exact listener `hostname` claims win first, followed by declared one-label wildcards. A declared name is authoritative: certificate-derived aliases from other listeners are never added as alternative signing candidates for it.
+2. **Certificate SAN alias.** When no listener hostname claims the SNI, exact DNS SANs win over one-label wildcard SANs. `*.example.com` answers `a.example.com`, but not `a.b.example.com` and not bare `example.com` (RFC 6125).
 3. **Fallback listener.** A ClientHello with no SNI, or an SNI no certificate covers, is answered from the namespace's deterministic default — the catch-all listener (one with no `hostname`) when there is one, otherwise the oldest Gateway's first listener. Selection never fails a handshake merely for lack of a name match; it uses the fallback exactly as a single-certificate listener would.
 
 Each exact, wildcard, or fallback listener retains all of its certificate candidates in declared order and chooses the first signing key compatible with the ClientHello's offered signature schemes. This makes an RSA/ECDSA `certificateRefs` pair effective instead of silently pinning the first algorithm. If a name is claimed but none of its candidates is cryptographically compatible, the handshake fails closed rather than falling through to an unrelated listener's certificate.
