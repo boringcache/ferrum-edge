@@ -4595,8 +4595,7 @@ fn l4_route_hosts(
     object: &K8sObject,
     scheme: BackendScheme,
 ) -> Result<Vec<String>, K8sTranslateError> {
-    let hosts = string_array(&object.spec, "hostnames");
-    if scheme.is_udp() && !hosts.is_empty() {
+    if scheme.is_udp() && object.spec.get("hostnames").is_some() {
         return Err(invalid_resource(
             object,
             format!(
@@ -4605,7 +4604,7 @@ fn l4_route_hosts(
             ),
         ));
     }
-    Ok(hosts)
+    Ok(string_array(&object.spec, "hostnames"))
 }
 
 fn ensure_l4_parent_refs_are_same_namespace(object: &K8sObject) -> Result<(), K8sTranslateError> {

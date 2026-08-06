@@ -244,6 +244,22 @@ fn udp_route_hostnames_are_rejected_fail_closed() {
 }
 
 #[test]
+fn udp_route_rejects_any_present_hostnames_shape() {
+    for hostnames in [json!([]), Value::Null, json!("dns.example.com"), json!(42)] {
+        let spec = json!({
+            "hostnames": hostnames,
+            "rules": [{"backendRefs": [{"name": "coredns", "port": 5353}]}]
+        });
+        let objects = [udp_route("dns", spec)];
+
+        let translated = translate_k8s_objects(&objects, options());
+        let err = translated.expect_err("every present UDPRoute hostnames shape fails closed");
+
+        assert!(err.to_string().contains("UDPRoute spec.hostnames"));
+    }
+}
+
+#[test]
 fn udp_route_cross_namespace_backend_ref_requires_reference_grant() {
     let spec = cross_namespace_rule("coredns", "backends", 5353);
     let ungranted = [udp_route("dns", spec.clone())];

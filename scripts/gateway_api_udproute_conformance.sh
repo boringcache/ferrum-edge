@@ -323,19 +323,19 @@ wait_for_udp_echo() {
 
 assert_udp_exchange_fails() {
   # UDP has no handshake, so fail-closed means "no backend datagram comes back"
-  # (drop, or an ICMP-driven connection error). Any tagged echo is a leak.
+  # (drop, or an ICMP-driven connection error). Require three independent
+  # no-reply observations so one lost datagram cannot make a live backend look
+  # fail-closed. Any received datagram, including an empty one, is a leak.
   local port="$1"
   local label="$2"
   local body=""
-  if body="$(udp_exchange 127.0.0.1 "$port" "should-fail" 2>/dev/null)"; then
-    if [ -n "$body" ]; then
+  for attempt in 1 2 3; do
+    if body="$(udp_exchange 127.0.0.1 "$port" "should-fail-${attempt}" 2>/dev/null)"; then
       echo "${label}: unexpected backend datagram on :${port}: ${body}" >&2
       return 1
     fi
-    echo "${label}: UDP :${port} produced no backend datagram"
-    return 0
-  fi
-  echo "${label}: UDP :${port} produced no backend datagram (failed closed)"
+  done
+  echo "${label}: UDP :${port} produced no backend datagram in three attempts (failed closed)"
   return 0
 }
 
@@ -437,7 +437,7 @@ spec:
         - name: blackbox-udp-missing
           port: ${UDP_ECHO_BACKEND_PORT}
 YAML
-  sleep 5
+  wait_for_udproute_parent_condition blackbox-udp-invalid ResolvedRefs False | tee -a "$report"
   assert_udp_exchange_fails "$UDP_BLACKBOX_PORT_FAIL" "missing UDP backend Service" | tee -a "$report"
   echo "UDPRoute missing backend Service failed closed on :${UDP_BLACKBOX_PORT_FAIL}" >> "$report"
 
@@ -460,20 +460,10 @@ spec:
           namespace: ${BACKEND_NAMESPACE}
           port: ${UDP_ECHO_BACKEND_PORT}
 YAML
-  # Translation rejects unpermitted refs fail-closed; wait for status and refuse echo.
-  status=""
-  for _ in $(seq 1 30); do
-    status="$(kubectl -n "$DP_GATEWAY_NAMESPACE" get udproute blackbox-udp-denied -o jsonpath='{.status.parents[0].conditions[?(@.type=="ResolvedRefs")].status}' 2>/dev/null || true)"
-    if [ "$status" = "False" ]; then
-      break
-    fi
-    sleep 2
-  done
-  if [ "${status:-}" = "False" ]; then
-    echo "UDPRoute denied cross-namespace backendRef reported ResolvedRefs=False" | tee -a "$report"
-  else
-    echo "UDPRoute denied cross-namespace backendRef status ResolvedRefs='${status:-}' (traffic still must fail closed)" | tee -a "$report"
-  fi
+  # Translation rejects unpermitted refs fail-closed. Require the controller's
+  # negative status before probing traffic so the test cannot pass before the
+  # new route has been reconciled.
+  wait_for_udproute_parent_condition blackbox-udp-denied ResolvedRefs False | tee -a "$report"
   assert_udp_exchange_fails "$UDP_BLACKBOX_PORT_FAIL" "unpermitted cross-namespace UDP backendRef" | tee -a "$report"
   echo "UDPRoute unpermitted cross-namespace backendRef failed closed on :${UDP_BLACKBOX_PORT_FAIL}" >> "$report"
 
@@ -486,10 +476,16 @@ YAML
   wait_for_udp_echo "$UDP_BLACKBOX_PORT_DELETE" "blackbox-udp-a" "pre-delete" | tee -a "$report"
   kubectl -n "$DP_GATEWAY_NAMESPACE" delete udproute blackbox-udp-delete --wait=true
   local delete_ok=0
+  local consecutive_failures=0
   for _ in $(seq 1 30); do
     if ! udp_exchange 127.0.0.1 "$UDP_BLACKBOX_PORT_DELETE" "post-delete" >/dev/null 2>&1; then
-      delete_ok=1
-      break
+      consecutive_failures=$((consecutive_failures + 1))
+      if [ "$consecutive_failures" -ge 3 ]; then
+        delete_ok=1
+        break
+      fi
+    else
+      consecutive_failures=0
     fi
     sleep 2
   done
