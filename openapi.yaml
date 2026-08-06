@@ -16546,10 +16546,14 @@ components:
       type: object
       description: |
         Plugin: mesh_outbound_registry — Implements Istio
-        `MeshConfig.outboundTrafficPolicy.mode: REGISTRY_ONLY`. Rejects HTTP
+        `outboundTrafficPolicy.mode: REGISTRY_ONLY`. Rejects HTTP
         requests whose `Host` header is not in the configured destination
-        registry. Auto-injected by mesh mode when the slice declares
-        `RegistryOnly`; not registered when policy is `AllowAny` (default).
+        registry. Auto-injected by mesh mode when the EFFECTIVE outbound policy
+        resolves to `RegistryOnly` — workload-scoped
+        `Sidecar.outboundTrafficPolicy`, else mesh-wide
+        `MeshConfig.outboundTrafficPolicy`, else
+        `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`; not registered when the effective
+        policy is `AllowAny` (default).
         Operator-managed instances on non-mesh gateways behave as a generic
         HTTP `Host` allowlist.
 

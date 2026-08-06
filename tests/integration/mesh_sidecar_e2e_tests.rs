@@ -12,7 +12,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use ferrum_edge::modes::mesh::config::PolicyScope;
+use ferrum_edge::modes::mesh::config::{
+    MeshSidecar, MeshSidecarEgress, OutboundTrafficPolicy, PolicyScope,
+};
 use ferrum_edge::modes::mesh::{
     MESH_ACCESS_LOG_PLUGIN_ID, MESH_AUTHZ_PLUGIN_ID, MESH_SPIFFE_IDENTITY_PLUGIN_ID,
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshListenerKind, MeshTopology, MeshTrafficDirection,
@@ -374,4 +376,246 @@ async fn sidecar_returns_404_for_unmatched_host() {
     );
 
     shutdown_tx.send(true).expect("shutdown gateway");
+}
+
+// ── Sidecar outboundTrafficPolicy (issue #3262) ───────────────────────────
+//
+// These exercise the projection + capture-classification halves of the
+// workload-scoped policy: that the applicable `Sidecar` decides whether the
+// HTTP-family `mesh_outbound_registry` plugin is injected, and that the
+// stream-family enforcement built from the same slice actually denies unknown
+// destinations on the capture port while skipping non-capture listeners.
+// Translation, selection precedence, and carrier parity live in
+// `tests/unit/config/sidecar_outbound_policy_tests.rs`; the HTTP request-path
+// rejection lives in `tests/integration/mesh_outbound_registry_route_miss_tests.rs`.
+
+const REGISTRY_PLUGIN_ID: &str = ferrum_edge::modes::mesh::MESH_OUTBOUND_REGISTRY_PLUGIN_ID;
+/// Concrete outbound capture port. The default test runtime binds `:0`, and the
+/// injection path correctly skips a port-0 capture listener (there is nothing to
+/// enforce against), so a policy test must declare a real port.
+const CAPTURE_PORT: u16 = 15001;
+
+/// Sidecar-enforcing runtime for `app=reviews` in `default`, with a concrete
+/// outbound capture port and the given mesh-wide policy.
+fn outbound_policy_runtime(
+    mesh_wide: OutboundTrafficPolicy,
+    sidecar_enforced: bool,
+) -> ferrum_edge::modes::mesh::MeshRuntimeConfig {
+    let mut runtime = default_mesh_runtime();
+    runtime.outbound_traffic_policy = mesh_wide;
+    runtime.outbound_listen_addr = format!("127.0.0.1:{CAPTURE_PORT}").parse().expect("addr");
+    runtime.sidecar_enforced = sidecar_enforced;
+    runtime.workload_labels = HashMap::from([("app".to_string(), "reviews".to_string())]);
+    runtime
+}
+
+/// Namespace-default `Sidecar` carrying `policy`, with an allow-everything
+/// egress scope so narrowing never confounds the policy assertion.
+fn outbound_policy_sidecar(policy: Option<OutboundTrafficPolicy>) -> MeshSidecar {
+    MeshSidecar {
+        name: "default-sidecar".to_string(),
+        namespace: "default".to_string(),
+        workload_selector: None,
+        egress_inherits_defaults: false,
+        egress: vec![MeshSidecarEgress {
+            hosts: vec!["*/*".to_string()],
+            port: None,
+        }],
+        ingress_declared: false,
+        ingress: Vec::new(),
+        outbound_traffic_policy: policy,
+    }
+}
+
+/// One `reviews` service/workload plus a `Sidecar` carrying `policy`.
+fn outbound_policy_mesh(
+    policy: Option<OutboundTrafficPolicy>,
+) -> ferrum_edge::modes::mesh::config::MeshConfig {
+    let workload = workload_for("reviews", "default", [("app", "reviews")], ["10.0.0.1"]);
+    let service = service_for("reviews", "default", &[&workload]);
+    let mut mesh = mesh_config_with(vec![workload], vec![service], Vec::new());
+    mesh.sidecars = vec![outbound_policy_sidecar(policy)];
+    mesh
+}
+
+fn registry_plugin_injected(
+    mesh_wide: OutboundTrafficPolicy,
+    sidecar_policy: Option<OutboundTrafficPolicy>,
+    sidecar_enforced: bool,
+) -> bool {
+    let runtime = outbound_policy_runtime(mesh_wide, sidecar_enforced);
+    let mesh = outbound_policy_mesh(sidecar_policy);
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+    prepared
+        .plugin_configs
+        .iter()
+        .any(|p| p.id == REGISTRY_PLUGIN_ID)
+}
+
+/// A workload-scoped `REGISTRY_ONLY` arms the HTTP-family gate even though the
+/// mesh-wide policy (and the env default) are permissive.
+#[test]
+fn sidecar_registry_only_policy_arms_the_outbound_registry_plugin() {
+    assert!(
+        registry_plugin_injected(
+            OutboundTrafficPolicy::AllowAny,
+            Some(OutboundTrafficPolicy::RegistryOnly),
+            true,
+        ),
+        "a Sidecar REGISTRY_ONLY must inject mesh_outbound_registry"
+    );
+}
+
+/// The mirror direction, and the reason the tiers must stay distinct: a
+/// workload-scoped `ALLOW_ANY` disarms an otherwise mesh-wide `REGISTRY_ONLY`
+/// for exactly this workload (Istio semantics).
+#[test]
+fn sidecar_allow_any_policy_disarms_a_mesh_wide_registry_only() {
+    assert!(
+        registry_plugin_injected(OutboundTrafficPolicy::RegistryOnly, None, true),
+        "control: the mesh-wide policy alone arms the gate"
+    );
+    assert!(
+        !registry_plugin_injected(
+            OutboundTrafficPolicy::RegistryOnly,
+            Some(OutboundTrafficPolicy::AllowAny),
+            true,
+        ),
+        "a Sidecar ALLOW_ANY must override the mesh-wide REGISTRY_ONLY"
+    );
+}
+
+/// Without the rollout gate the workload-scoped value is inert in BOTH
+/// directions — it never arms the gate, and it never disarms a mesh-wide one.
+#[test]
+fn sidecar_outbound_policy_is_inert_without_the_enforcement_gate() {
+    assert!(
+        !registry_plugin_injected(
+            OutboundTrafficPolicy::AllowAny,
+            Some(OutboundTrafficPolicy::RegistryOnly),
+            false,
+        ),
+        "FERRUM_MESH_SIDECAR_ENFORCED gates arming the registry"
+    );
+    assert!(
+        registry_plugin_injected(
+            OutboundTrafficPolicy::RegistryOnly,
+            Some(OutboundTrafficPolicy::AllowAny),
+            false,
+        ),
+        "and a gated-off Sidecar must not weaken the mesh-wide policy either"
+    );
+}
+
+/// The injected plugin carries the slice-derived registry and the capture port,
+/// so the arming decision produces a usable gate rather than an empty one.
+#[test]
+fn sidecar_armed_registry_plugin_carries_the_slice_destinations_and_capture_port() {
+    let runtime = outbound_policy_runtime(OutboundTrafficPolicy::AllowAny, true);
+    let mesh = outbound_policy_mesh(Some(OutboundTrafficPolicy::RegistryOnly));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+    let plugin = prepared
+        .plugin_configs
+        .iter()
+        .find(|p| p.id == REGISTRY_PLUGIN_ID)
+        .expect("registry plugin injected");
+    let registry_value = plugin.config["registry"].clone();
+    let registry: Vec<String> = serde_json::from_value(registry_value).expect("registry");
+    assert!(
+        registry.iter().any(|entry| entry.starts_with(REVIEWS_HOST)),
+        "the slice's own service must be an admitted destination, got {registry:?}"
+    );
+    let ports_value = plugin.config["outbound_listen_ports"].clone();
+    let ports: Vec<u16> = serde_json::from_value(ports_value).expect("capture ports");
+    assert_eq!(
+        ports,
+        vec![CAPTURE_PORT],
+        "the gate must be scoped to the mesh outbound capture listener"
+    );
+}
+
+/// Capture-path classification: the stream-family enforcement built from a
+/// Sidecar-`REGISTRY_ONLY` slice denies an unknown destination on the capture
+/// port, admits a slice-declared one, and skips a non-capture listener (so the
+/// policy never gates inbound traffic).
+#[test]
+fn sidecar_registry_only_capture_classification_denies_unknown_destinations() {
+    use ferrum_edge::modes::mesh::outbound_enforcement::{Decision, MeshOutboundEnforcement};
+
+    let runtime = outbound_policy_runtime(OutboundTrafficPolicy::AllowAny, true);
+    let mesh = outbound_policy_mesh(Some(OutboundTrafficPolicy::RegistryOnly));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let slice = ferrum_edge::modes::mesh::slice::MeshSlice::from_gateway_config(
+        &config,
+        runtime.mesh_slice_request(),
+    );
+    assert_eq!(
+        slice.effective_outbound_traffic_policy(runtime.outbound_traffic_policy),
+        OutboundTrafficPolicy::RegistryOnly,
+        "the Sidecar must decide the effective policy for this workload"
+    );
+
+    let enforcement = MeshOutboundEnforcement::from_slice(
+        &slice,
+        &runtime.cluster_domain,
+        runtime.namespace.clone(),
+        vec![CAPTURE_PORT],
+        runtime.outbound_registry_reject_status,
+    )
+    .expect("enforcement built from a RegistryOnly slice");
+
+    assert_eq!(
+        enforcement.check_destination(CAPTURE_PORT, REVIEWS_HOST, 8080),
+        Decision::Admit,
+        "a slice-declared destination stays reachable"
+    );
+    assert_eq!(
+        enforcement.check_destination(CAPTURE_PORT, "evil.example.com", 443),
+        Decision::Deny,
+        "an unknown destination is refused on the capture listener"
+    );
+    assert_eq!(
+        enforcement.check_destination(CAPTURE_PORT, "10.9.9.9", 443),
+        Decision::Deny,
+        "a raw-IP escape to an address the slice never declared is refused"
+    );
+    assert_eq!(
+        enforcement.check_destination(15006, "evil.example.com", 443),
+        Decision::Skip,
+        "outbound policy must never gate the inbound mTLS listener"
+    );
+    let unknown = Some("evil.example.com");
+    assert_eq!(
+        enforcement.http_route_miss_reject_status(CAPTURE_PORT, unknown, Some(443)),
+        Some(runtime.outbound_registry_reject_status),
+        "an outbound-capture HTTP route miss takes the configured reject status"
+    );
+}
+
+/// A Sidecar `ALLOW_ANY` leaves the stream-family slot empty, so every captured
+/// connect falls through — the documented passthrough behaviour.
+#[test]
+fn sidecar_allow_any_leaves_the_capture_path_ungated() {
+    let runtime = outbound_policy_runtime(OutboundTrafficPolicy::RegistryOnly, true);
+    let mesh = outbound_policy_mesh(Some(OutboundTrafficPolicy::AllowAny));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let slice = ferrum_edge::modes::mesh::slice::MeshSlice::from_gateway_config(
+        &config,
+        runtime.mesh_slice_request(),
+    );
+    assert_eq!(
+        slice.effective_outbound_traffic_policy(runtime.outbound_traffic_policy),
+        OutboundTrafficPolicy::AllowAny,
+        "the Sidecar override must reach the effective policy"
+    );
+    assert!(
+        !registry_plugin_injected(
+            OutboundTrafficPolicy::RegistryOnly,
+            Some(OutboundTrafficPolicy::AllowAny),
+            true,
+        ),
+        "and no HTTP-family gate is installed"
+    );
 }

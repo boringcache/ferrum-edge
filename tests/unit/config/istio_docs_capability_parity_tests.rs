@@ -212,6 +212,75 @@ fn configuration_md_hosts_capability_contract_v1() {
     );
 }
 
+/// The `docs/mesh.md` ECDS carrier-table row for the workload-scoped Sidecar
+/// outbound policy (issue #3262).
+const MESH_MD_SIDECAR_OUTBOUND_CARRIER_ROW: &str = concat!(
+    "| `sidecar_outbound_traffic_policy` | `SidecarOutboundTrafficPolicyCarrier` ",
+    "| `ferrum-mesh-carrier/sidecar-outbound-traffic-policy` |",
+);
+
+/// The pre-#3262 `Sidecar` capability row, which omitted `outboundTrafficPolicy`
+/// entirely.
+const STALE_SIDECAR_CAPABILITY_ROW: &str = concat!(
+    "| `Sidecar` | Yes | Yes | Yes (egress/ingress scope) ",
+    "| Yes (`SidecarEgressScopeCarrier` + ingress carriers) |",
+);
+
+/// Issue #3262: the `Sidecar` capability row must name workload-scoped
+/// `outboundTrafficPolicy` support and its dedicated ECDS carrier, and the
+/// carrier source must actually define them. Without this, the row silently
+/// regresses to the pre-#3262 "egress/ingress scope" claim while the feature
+/// stays shipped.
+#[test]
+fn capability_contract_sidecar_row_covers_outbound_traffic_policy() {
+    let row = CONFIGURATION_MD
+        .lines()
+        .find(|line| line.trim_start().starts_with("| `Sidecar` |"))
+        .expect("capability contract must include an explicit Sidecar row");
+    assert!(
+        row.contains("outboundTrafficPolicy"),
+        "Sidecar row must claim native workload-scoped outboundTrafficPolicy support, got: {row}"
+    );
+    assert!(
+        row.contains("SidecarOutboundTrafficPolicyCarrier"),
+        "Sidecar row must name the xDS ECDS recovery carrier, got: {row}"
+    );
+    assert!(
+        row.contains("SidecarEgressScopeCarrier"),
+        "Sidecar row must keep the pre-existing egress-scope carrier claim, got: {row}"
+    );
+    // The claim must be backed by the carrier source, not just prose.
+    assert!(
+        CARRIER_RS.contains("SidecarOutboundTrafficPolicy(")
+            && CARRIER_RS.contains("FERRUM_ECDS_SIDECAR_OUTBOUND_POLICY_TYPE_URL")
+            && CARRIER_RS.contains("SidecarOutboundTrafficPolicyCarrier"),
+        "carrier.rs must define the SidecarOutboundTrafficPolicy carrier variant + type URL"
+    );
+    assert!(
+        CARRIER_RS.contains("ferrum-mesh-carrier/sidecar-outbound-traffic-policy"),
+        "carrier.rs must reserve the sidecar-outbound-traffic-policy ECDS resource name"
+    );
+    // Two distinct precedence tiers, two distinct carriers.
+    assert!(
+        CARRIER_RS.contains("ferrum-mesh-carrier/outbound-traffic-policy"),
+        "the mesh-wide outbound-traffic-policy carrier must stay separate"
+    );
+    // docs/mesh.md must carry the matching carrier table row and section.
+    assert!(
+        MESH_MD.contains(MESH_MD_SIDECAR_OUTBOUND_CARRIER_ROW),
+        "docs/mesh.md ECDS carrier table must list the sidecar outbound policy carrier"
+    );
+    assert!(
+        MESH_MD.contains("## Sidecar Outbound Traffic Policy"),
+        "docs/mesh.md must host the Sidecar Outbound Traffic Policy section the row links to"
+    );
+    // The pre-#3262 row text must not come back.
+    assert!(
+        !CONFIGURATION_MD.contains(STALE_SIDECAR_CAPABILITY_ROW),
+        "Sidecar capability row must not revert to the pre-#3262 egress/ingress-only claim"
+    );
+}
+
 #[test]
 fn configuration_md_rejects_stale_istio_capability_claims() {
     let stale = [
