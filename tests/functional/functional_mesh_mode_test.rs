@@ -10109,18 +10109,15 @@ async fn wait_for_ingress_connect(
     accept: impl Fn(&IngressConnectOutcome) -> bool,
 ) -> Result<IngressConnectOutcome, String> {
     let deadline = Instant::now() + timeout;
-    let mut last = "no CONNECT attempt completed".to_string();
     loop {
-        match sidecar_ingress_connect(inbound_port, authority, peers, "ping").await {
+        let last = match sidecar_ingress_connect(inbound_port, authority, peers, "ping").await {
             Ok(outcome) if accept(&outcome) => return Ok(outcome),
-            Ok(outcome) => {
-                last = format!(
-                    "last CONNECT to {authority}: status {} relayed {:?}",
-                    outcome.status, outcome.relayed
-                );
-            }
-            Err(e) => last = format!("last CONNECT to {authority} failed: {e}"),
-        }
+            Ok(outcome) => format!(
+                "last CONNECT to {authority}: status {} relayed {:?}",
+                outcome.status, outcome.relayed
+            ),
+            Err(e) => format!("last CONNECT to {authority} failed: {e}"),
+        };
         if Instant::now() >= deadline {
             return Err(last);
         }
