@@ -617,3 +617,100 @@ fn removing_the_destination_rule_lifts_the_pooled_cap() {
         "an uncapped destination must resolve no admission lane after reload"
     );
 }
+
+// ============================================================================
+// One socket, one charge: mesh WebSocket egress must not double-count
+//
+// A WebSocket to a `mesh.mtls` / `mesh.hbone` destination dials its OWN 1:1
+// tunnel connection, and the WebSocket connect loop already reserves a
+// session-scoped `BackendConnectionGuard` on the SAME `(dial host, policy
+// port)` lane before that dial and holds it for the whole session. If the mesh
+// pool ALSO admitted the dial, one physical socket would consume two slots —
+// and at `maxConnections: 1` the dial would refuse itself, so EVERY WebSocket
+// upgrade to a capped mesh destination would fail (observed live as
+// `first=502` with `1 open (cap 1)` on the very first upgrade).
+//
+// The pooled tunnel creates and the raw-TCP / datagram tunnel dials have no
+// caller-side guard, so those sites must keep resolving their own lane. These
+// source pins hold both halves of that ownership split in place.
+// ============================================================================
+
+/// Body of the method introduced by `signature` in `source`, ending at that
+/// method's own closing brace (the first line that is exactly `    }`).
+fn method_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source.find(signature).unwrap_or(usize::MAX);
+    assert!(start != usize::MAX, "{signature} must exist");
+    let rest = &source[start..];
+    let end = rest.find("\n    }\n").unwrap_or(usize::MAX);
+    assert!(end != usize::MAX, "{signature} must have a closing brace");
+    &rest[..end]
+}
+
+/// Source of the two mesh tunnel pools, pinned as text.
+fn mesh_mtls_pool_source() -> &'static str {
+    include_str!("../../src/proxy/mesh_mtls_pool.rs")
+}
+
+fn hbone_pool_source() -> &'static str {
+    include_str!("../../src/proxy/hbone_pool.rs")
+}
+
+#[test]
+fn mesh_websocket_dedicated_dials_do_not_double_charge_the_session_slot() {
+    let sidecar = method_body(
+        mesh_mtls_pool_source(),
+        "pub async fn open_ws_connect_tunnel(",
+    );
+    assert!(
+        !sidecar.contains("self.conn_admission("),
+        "the WebSocket-over-mesh-mTLS 1:1 dial must not re-admit: the WebSocket \
+         connect loop already holds this socket's maxConnections slot, so a \
+         second charge self-refuses the upgrade at maxConnections=1"
+    );
+
+    let ambient = method_body(hbone_pool_source(), "pub async fn get_ws_byte_tunnel(");
+    assert!(
+        !ambient.contains("self.conn_admission("),
+        "the WebSocket-over-HBONE 1:1 dial must not re-admit: the WebSocket \
+         connect loop already holds this socket's maxConnections slot, so a \
+         second charge self-refuses the upgrade at maxConnections=1"
+    );
+}
+
+#[test]
+fn non_websocket_mesh_tunnel_dials_still_resolve_their_own_admission_lane() {
+    // These dials have no caller-side session guard, so dropping their
+    // admission would remove the cap entirely for those transports.
+    let mtls = mesh_mtls_pool_source();
+    let hbone = hbone_pool_source();
+
+    let raw_tcp = method_body(mtls, "pub async fn open_connect_tunnel(");
+    assert!(
+        raw_tcp.contains("self.conn_admission("),
+        "the mesh-mTLS raw-TCP tunnel owns its physical connection"
+    );
+
+    let mtls_udp = method_body(mtls, "pub async fn open_datagram_tunnel(");
+    assert!(
+        mtls_udp.contains("self.conn_admission("),
+        "the mesh-mTLS datagram tunnel owns its physical connection"
+    );
+
+    let hbone_udp = method_body(hbone, "pub async fn get_datagram_tunnel(");
+    assert!(
+        hbone_udp.contains("self.conn_admission("),
+        "the HBONE datagram tunnel owns its physical connection"
+    );
+
+    let mtls_pooled = method_body(mtls, "async fn get_or_create_sender(");
+    assert!(
+        mtls_pooled.contains("self.conn_admission("),
+        "the pooled mesh-mTLS connection owns its physical connection"
+    );
+
+    let hbone_pooled = method_body(hbone, "async fn get_or_create_sender(");
+    assert!(
+        hbone_pooled.contains("self.conn_admission("),
+        "the pooled HBONE tunnel owns its physical connection"
+    );
+}

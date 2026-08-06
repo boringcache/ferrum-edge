@@ -876,9 +876,14 @@ impl HboneConnectionPool {
             .as_ref()
             .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
-        // Each WebSocket-over-HBONE session dials its OWN 1:1 tunnel, so it is
-        // admitted like any other physical connection to the destination.
-        let ws_conn_admission = self.conn_admission(proxy, dial_host, app_policy_port);
+        // Each WebSocket-over-HBONE session dials its OWN 1:1 tunnel, and that
+        // tunnel's `maxConnections` slot is ALREADY held by the caller: the
+        // WebSocket connect loop (`src/proxy/mod.rs`) reserves a session guard
+        // on the SAME `(dial host, policy port)` lane before this dial and holds
+        // it for the whole session. Admitting again here would charge the one
+        // socket twice — and at `maxConnections: 1` the dial would refuse
+        // itself, making every WebSocket upgrade to a capped mesh destination
+        // fail. The session guard is the single owner; do NOT re-admit.
         let dial_result: Result<H2ConnectTunnel, HbonePoolError> = async {
             let sender = dial_h2_connect_sender(
                 &self.dns_cache,
@@ -893,7 +898,8 @@ impl HboneConnectionPool {
                 &pool_config,
                 keepalive_override,
                 None,
-                ws_conn_admission.as_ref(),
+                // Caller-owned admission (see above).
+                None,
             )
             .await?;
             let baggage = baggage_header_for_source(hbone_source_identity);
