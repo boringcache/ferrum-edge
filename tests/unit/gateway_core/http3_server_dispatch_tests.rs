@@ -2830,6 +2830,44 @@ fn h3_native_grpc_failure_paths_write_the_response_before_tearing_down() {
 }
 
 #[test]
+fn h3_native_grpc_terminal_writes_cannot_pin_the_upload_pump() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let relay = native_h3_grpc_relay_source();
+    let failure_writer = source
+        .split("async fn send_failed_h3_grpc_dispatch_error<S>(")
+        .nth(1)
+        .expect("native H3 gRPC dispatch-failure writer")
+        .split("async fn record_failed_h3_grpc_dispatch(")
+        .next()
+        .expect("bounded native H3 gRPC dispatch-failure writer");
+    let grace_helper = source
+        .split("async fn await_h3_grpc_terminal_write_with_grace<F, E>(")
+        .nth(1)
+        .expect("native H3 gRPC terminal-write grace helper")
+        .split("async fn send_h3_grpc_terminal_trailers<S>(")
+        .next()
+        .expect("bounded native H3 gRPC terminal-write grace helper");
+
+    assert!(failure_writer.contains("await_h3_grpc_terminal_write_with_grace("));
+    assert!(failure_writer.contains("abort_response_stream(stream)"));
+    assert_eq!(
+        relay
+            .matches("await_h3_grpc_terminal_write_with_grace(")
+            .count(),
+        2,
+        "oversized-response and after_proxy terminal writes must both be bounded before pump retirement"
+    );
+    assert!(
+        relay
+            .matches("abort_response_stream(&mut send_half)")
+            .count()
+            >= 2,
+        "a failed or expired bounded terminal write must reset the response half"
+    );
+    assert!(grace_helper.contains("await_post_deadline_terminal_response_write(write)"));
+}
+
+#[test]
 fn h3_native_grpc_bidi_open_is_pre_wire_and_splits() {
     let client = include_str!("../../../src/http3/client.rs");
     let opener = client

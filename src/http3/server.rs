@@ -10056,14 +10056,17 @@ where
     // here would leak it on a client disconnect during the error write. Capture
     // whether the gRPC error actually reached the client so the transaction log's
     // `client_disconnected` stays accurate when the client already reset.
-    let error_sent = send_h3_grpc_error_send(
-        stream,
-        grpc_status,
-        grpc_message,
-        initial_response_header_policy_plugins,
-    )
-    .await
-    .is_ok();
+    let error_sent =
+        await_h3_grpc_terminal_write_with_grace(send_h3_grpc_error_send(
+            stream,
+            grpc_status,
+            grpc_message,
+            initial_response_header_policy_plugins,
+        ))
+        .await;
+    if !error_sent {
+        crate::http3::stream_util::abort_response_stream(stream);
+    }
 
     // Split the WIRE status from the backend-HEALTH status, exactly like
     // the H1/H2 and cross-protocol gRPC paths (`write_grpc_error` returns
@@ -10696,14 +10699,17 @@ async fn dispatch_grpc_native_h3(
         // error before its request direction is halted. Retiring the pump
         // afterwards closes the backend request direction and finalizes the
         // forwarded-byte count read below.
-        let error_sent = send_h3_grpc_error_send(
-            &mut send_half,
-            crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-            "Backend response exceeds maximum size",
-            initial_response_header_policy_plugins,
-        )
-        .await
-        .is_ok();
+        let error_sent =
+            await_h3_grpc_terminal_write_with_grace(send_h3_grpc_error_send(
+                &mut send_half,
+                crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                "Backend response exceeds maximum size",
+                initial_response_header_policy_plugins,
+            ))
+            .await;
+        if !error_sent {
+            crate::http3::stream_util::abort_response_stream(&mut send_half);
+        }
         pump_guard.retire().await;
         // CB/passive-health see the real backend status (the backend responded
         // before we found the body too large) but with `ResponseBodyTooLarge` so
@@ -10791,15 +10797,19 @@ async fn dispatch_grpc_native_h3(
         // Response BEFORE teardown: the reject goes on the wire first, then the
         // pump is retired (which halts the frontend receive half this task no
         // longer owns and finalizes the forwarded-byte count).
-        let reject_sent = send_h3_grpc_reject_trailers_only(
-            &mut send_half,
-            reject_status,
-            reject.body.clone(),
-            &reject.headers,
-            crate::proxy::FramedGrpcUnaryProvenance::NONE,
+        let reject_sent = await_h3_grpc_terminal_write_with_grace(
+            send_h3_grpc_reject_trailers_only(
+                &mut send_half,
+                reject_status,
+                reject.body.clone(),
+                &reject.headers,
+                crate::proxy::FramedGrpcUnaryProvenance::NONE,
+            ),
         )
-        .await
-        .is_ok();
+        .await;
+        if !reject_sent {
+            crate::http3::stream_util::abort_response_stream(&mut send_half);
+        }
         pump_guard.retire().await;
         // CB / passive-health must see the TRUE backend status, not the gateway
         // policy override.
@@ -13326,6 +13336,26 @@ where
     stream.send_response(resp).await?;
     stream.finish().await?;
     Ok(())
+}
+
+/// Bound a trailers-only terminal write that must settle before the native-H3
+/// gRPC upload pump is retired.
+///
+/// Response-before-teardown ordering prevents a client from observing
+/// `STOP_SENDING` ahead of the gRPC status, but the ordering must not let a
+/// client that withholds response flow-control credit retain the pump,
+/// admission permit, and QUIC stream indefinitely. The shared post-deadline
+/// grace gives the tiny HEADERS/FIN write a real opportunity and remains
+/// bounded even when the failure was not itself a deadline expiry. Callers
+/// reset the response send half when this returns `false`, then retire and join
+/// the pump.
+async fn await_h3_grpc_terminal_write_with_grace<F, E>(write: F) -> bool
+where
+    F: std::future::Future<Output = Result<(), E>>,
+{
+    crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+        .await
+        .is_ok()
 }
 
 /// Send a terminal gRPC status as TRAILERS on an **already-open** H3 response
