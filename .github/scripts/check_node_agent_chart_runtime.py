@@ -80,7 +80,8 @@ TRAILING_HASH_COMMENT_RE = re.compile(
 # `privileged: {{ .Values.foo }}` whose default might be false but which would
 # otherwise create an operator-controlled privilege escalation.
 PRIVILEGED_ASSIGNMENT_RE = re.compile(
-    r"(?im)(?:^|[,{]\s*)[\"']?privileged[\"']?\s*:\s*(?P<value>[^,}\n]+)"
+    r"(?im)(?:^[ \t]*|[,{][ \t]*)[\"']?privileged[\"']?[ \t]*:[ \t]*"
+    r"(?P<value>[^,}\n]+)"
 )
 LITERAL_FALSE_VALUES = frozenset(("false", '"false"', "'false'"))
 
