@@ -1,21 +1,28 @@
 //! Gateway API `UDPRoute` translation, admission, and status coverage (#3275).
 //!
 //! A `UDPRoute` carries no request-level predicate, so the Gateway listener
-//! port is the entire match and the rule's `backendRefs` entry is the datagram
-//! peer. These tests pin the strict admission boundaries (backendRef port,
-//! backend kind, ReferenceGrant, namespace, listener protocol/kind) and the
-//! reload/delete behavior, not only first-start construction.
+//! port is the entire match and the rule's `backendRefs` **set** is the
+//! datagram peer set. These tests pin the strict admission boundaries
+//! (backendRef port, backend kind, ReferenceGrant, namespace, listener
+//! protocol/kind), the weighted multi-backend semantics required by pinned
+//! Gateway API v1.5.1, the declared-parent fail-closed invariant shared with
+//! `TCPRoute`/`TLSRoute`, and the reload/delete behavior — not only
+//! first-start construction.
 
-use ferrum_edge::config::types::BackendScheme;
+use ferrum_edge::_test_support::merge_k8s_translation;
+use ferrum_edge::config::types::{
+    BackendScheme, GatewayConfig, LoadBalancerAlgorithm, Proxy, Upstream,
+};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    translate_k8s_objects_collecting_skips,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::status::{
     FERRUM_GATEWAY_CONTROLLER_NAME, GatewayApiStatusUpdate, plan_gateway_api_status_updates,
 };
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 const GATEWAY_API_SRC: &str = include_str!("../../../src/config_sources/k8s/gateway_api.rs");
 const WATCHER_SRC: &str = include_str!("../../../src/k8s_controller/watcher.rs");
@@ -79,6 +86,26 @@ fn udp_gateway(name: &str, listener: &str, port: u16) -> K8sObject {
     });
     let version = "gateway.networking.k8s.io/v1";
     object_in("Gateway", version, "default", name, spec)
+}
+
+fn gateway_object(name: &str, spec: Value) -> K8sObject {
+    let version = "gateway.networking.k8s.io/v1";
+    object_in("Gateway", version, "default", name, spec)
+}
+
+fn l4_route(kind: &str, name: &str, spec: Value) -> K8sObject {
+    let version = "gateway.networking.k8s.io/v1alpha2";
+    object_in(kind, version, "default", name, spec)
+}
+
+/// The standard single-UDP-listener lab: GatewayClass, a Ferrum Gateway with
+/// listener `dns` on 15353, and one `UDPRoute` named `dns` carrying `spec`.
+fn udp_lab(spec: Value) -> [K8sObject; 3] {
+    [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        udp_route("dns", spec),
+    ]
 }
 
 fn service(namespace: &str, name: &str, port: u16) -> K8sObject {
@@ -438,6 +465,743 @@ fn udp_route_status_reports_unresolved_missing_backend() {
         route_condition(&updates, "dns", "ResolvedRefs").as_deref(),
         Some("False")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Declared-parent fail-closed invariant (shared with TCPRoute / TLSRoute)
+// ---------------------------------------------------------------------------
+
+/// A route that declares Gateway `parentRefs` but resolves no materializable
+/// listener must open **nothing**. The backend-port fallback exists only for
+/// the parentless legacy shape; letting a declared-but-unmatched parent reach
+/// it would bind an unintended OS listener on the backend port while status
+/// reports `NoMatchingParent`.
+fn assert_no_listener_for_declared_parent(objects: &[K8sObject], backend_port: u16) {
+    let result = translate_k8s_objects(objects, options()).expect("translation succeeds");
+
+    assert!(
+        result.config.proxies.is_empty(),
+        "a declared-but-unmatched parent must not materialize a proxy, got {:?}",
+        result
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| (proxy.id.clone(), proxy.listen_port))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !result
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.listen_port == Some(backend_port)),
+        "the backend port must never become a listen port here"
+    );
+    assert!(result.config.upstreams.is_empty());
+}
+
+/// The route is rejected outright: assert the *snapshot* still opens no
+/// listener on the backend port rather than only that the error exists.
+fn assert_rejected_route_opens_no_listener(objects: &[K8sObject], backend_port: u16) {
+    let (translation, skipped) = translate_k8s_objects_collecting_skips(objects, options())
+        .expect("translation converges after skipping the rejected route");
+
+    assert!(
+        !skipped.is_empty(),
+        "the route was expected to be rejected, but nothing was skipped"
+    );
+    assert!(
+        !translation
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.listen_port == Some(backend_port)),
+        "a rejected route must not leave a backend-port listener, got {:?}",
+        translation
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| (proxy.id.clone(), proxy.listen_port))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn udp_route_with_unknown_gateway_parent_opens_no_listener() {
+    let spec = json!({
+        "parentRefs": [{"name": "absent"}],
+        "rules": [{"backendRefs": [{"name": "coredns", "port": 5353}]}]
+    });
+    let objects = [gateway_class(), udp_route("dns", spec)];
+
+    assert_no_listener_for_declared_parent(&objects, 5353);
+}
+
+#[test]
+fn udp_route_parented_to_a_foreign_controller_gateway_opens_no_listener() {
+    // A Gateway owned by another controller contributes no listener policy, so
+    // a UDPRoute naming it has nothing to attach to.
+    let spec = json!({
+        "gatewayClassName": "not-ferrum",
+        "listeners": [{"name": "dns", "port": 15353, "protocol": "UDP"}]
+    });
+    let foreign = gateway_object("edge", spec);
+    let route_spec = json!({
+        "parentRefs": [{"name": "edge"}],
+        "rules": [{"backendRefs": [{"name": "coredns", "port": 5353}]}]
+    });
+    let objects = [gateway_class(), foreign, udp_route("dns", route_spec)];
+
+    assert_no_listener_for_declared_parent(&objects, 5353);
+}
+
+#[test]
+fn tcp_route_with_unknown_gateway_parent_opens_no_listener() {
+    // The fail-closed listener gate is shared L4 code; TCPRoute must not keep
+    // the old fail-open backend-port fallback for a declared parent either.
+    let spec = json!({
+        "parentRefs": [{"name": "absent"}],
+        "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
+    });
+    let route = l4_route("TCPRoute", "db", spec);
+    let objects = [gateway_class(), route];
+
+    assert_no_listener_for_declared_parent(&objects, 5432);
+}
+
+#[test]
+fn tls_route_with_unknown_gateway_parent_opens_no_listener() {
+    let spec = json!({
+        "parentRefs": [{"name": "absent"}],
+        "hostnames": ["db.example.com"],
+        "rules": [{"backendRefs": [{"name": "db", "port": 15443}]}]
+    });
+    let route = l4_route("TLSRoute", "db", spec);
+    let objects = [gateway_class(), route];
+
+    assert_no_listener_for_declared_parent(&objects, 15443);
+}
+
+#[test]
+fn parentless_l4_routes_keep_the_backend_port_fallback() {
+    // The legacy parentless shape is unchanged: with no declared parent there
+    // is no parent status to contradict, so the backend port stays the listen
+    // port for both stream kinds.
+    let udp_objects = [udp_route("dns", simple_rule("coredns", 5353))];
+    let udp = translate_k8s_objects(&udp_objects, options()).expect("translation succeeds");
+    assert_eq!(udp.config.proxies[0].listen_port, Some(5353));
+
+    let tcp_route = l4_route(
+        "TCPRoute",
+        "db",
+        json!({"rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]}),
+    );
+    let tcp = translate_k8s_objects(&[tcp_route], options()).expect("translation succeeds");
+    assert_eq!(tcp.config.proxies[0].listen_port, Some(5432));
+}
+
+#[test]
+fn udp_route_with_unmatched_section_name_opens_no_listener() {
+    let route = udp_route(
+        "dns",
+        attached_rule("edge", "absent-listener", "coredns", 5353),
+    );
+    let objects = [gateway_class(), udp_gateway("edge", "dns", 15353), route];
+
+    assert_rejected_route_opens_no_listener(&objects, 5353);
+}
+
+#[test]
+fn udp_route_on_a_tcp_listener_opens_no_listener() {
+    let spec = json!({
+        "gatewayClassName": "ferrum",
+        "listeners": [{
+            "name": "stream",
+            "port": 15353,
+            "protocol": "TCP",
+            "allowedRoutes": {"kinds": [{"kind": "TCPRoute"}]}
+        }]
+    });
+    let gateway = gateway_object("edge", spec);
+    let route = udp_route("dns", attached_rule("edge", "stream", "coredns", 5353));
+    let objects = [gateway_class(), gateway, route];
+
+    assert_rejected_route_opens_no_listener(&objects, 5353);
+}
+
+#[test]
+fn udp_route_disallowed_by_listener_namespace_selector_opens_no_listener() {
+    let spec = json!({
+        "gatewayClassName": "ferrum",
+        "listeners": [{
+            "name": "dns",
+            "port": 15353,
+            "protocol": "UDP",
+            "allowedRoutes": {
+                "kinds": [{"kind": "UDPRoute"}],
+                "namespaces": {
+                    "from": "Selector",
+                    "selector": {"matchLabels": {"gateway-access": "true"}}
+                }
+            }
+        }]
+    });
+    let gateway = gateway_object("edge", spec);
+    let route = udp_route("dns", attached_rule("edge", "dns", "coredns", 5353));
+    let objects = [gateway_class(), gateway, route];
+
+    assert_rejected_route_opens_no_listener(&objects, 5353);
+}
+
+// ---------------------------------------------------------------------------
+// backendRefs is a weighted set (pinned Gateway API v1.5.1)
+// ---------------------------------------------------------------------------
+
+fn weighted_rule(legs: Value) -> Value {
+    json!({
+        "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+        "rules": [{"backendRefs": legs}]
+    })
+}
+
+fn sole_proxy_and_upstream(
+    result: &ferrum_edge::config_sources::k8s::K8sTranslation,
+) -> (&Proxy, &Upstream) {
+    assert_eq!(result.config.proxies.len(), 1);
+    assert_eq!(result.config.upstreams.len(), 1);
+    let proxy = &result.config.proxies[0];
+    let upstream = &result.config.upstreams[0];
+    assert_eq!(proxy.upstream_id.as_deref(), Some(upstream.id.as_str()));
+    assert_eq!(upstream.namespace, proxy.namespace);
+    (proxy, upstream)
+}
+
+fn target_weights(upstream: &Upstream) -> Vec<(String, u16, u32)> {
+    upstream
+        .targets
+        .iter()
+        .map(|target| (target.host.clone(), target.port, target.weight))
+        .collect()
+}
+
+#[test]
+fn udp_route_two_weighted_backends_materialize_one_weighted_upstream() {
+    let spec = weighted_rule(json!([
+        {"name": "coredns-a", "port": 5353, "weight": 3},
+        {"name": "coredns-b", "port": 5354, "weight": 1}
+    ]));
+    let objects = udp_lab(spec);
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    let (proxy, upstream) = sole_proxy_and_upstream(&result);
+
+    assert_eq!(proxy.listen_port, Some(15353));
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Udp));
+    // The upstream is authoritative for a multi-leg rule; the direct backend
+    // fields must not carry a second, contradictory destination.
+    assert!(proxy.backend_host.is_empty());
+    assert_eq!(proxy.backend_port, 0);
+    assert_eq!(
+        target_weights(upstream),
+        vec![
+            ("coredns-a.default.svc.cluster.local".to_string(), 5353, 3),
+            ("coredns-b.default.svc.cluster.local".to_string(), 5354, 1),
+        ]
+    );
+    assert_eq!(
+        upstream.algorithm,
+        LoadBalancerAlgorithm::WeightedRoundRobin
+    );
+}
+
+#[test]
+fn udp_route_omitted_weights_default_to_equal_shares() {
+    let spec = weighted_rule(json!([
+        {"name": "coredns-a", "port": 5353},
+        {"name": "coredns-b", "port": 5353}
+    ]));
+    let objects = udp_lab(spec);
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    let (_, upstream) = sole_proxy_and_upstream(&result);
+
+    assert!(upstream.targets.iter().all(|target| target.weight == 1));
+    assert_eq!(upstream.algorithm, LoadBalancerAlgorithm::RoundRobin);
+}
+
+#[test]
+fn udp_route_zero_weight_legs_are_filtered_from_the_upstream() {
+    let spec = weighted_rule(json!([
+        {"name": "coredns-a", "port": 5353, "weight": 2},
+        {"name": "dark", "port": 5353, "weight": 0},
+        {"name": "coredns-b", "port": 5353, "weight": 1}
+    ]));
+    let objects = udp_lab(spec);
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    let (_, upstream) = sole_proxy_and_upstream(&result);
+
+    assert_eq!(upstream.targets.len(), 2);
+    assert!(
+        !upstream
+            .targets
+            .iter()
+            .any(|target| target.host.starts_with("dark."))
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("UDPRoute skipped 1 zero-weight"))
+    );
+}
+
+#[test]
+fn udp_route_single_serviceable_leg_stays_a_direct_backend() {
+    // A one-leg rule must not gain an upstream indirection.
+    let spec = weighted_rule(json!([{"name": "coredns", "port": 5353, "weight": 7}]));
+    let objects = udp_lab(spec);
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+    assert_eq!(result.config.proxies.len(), 1);
+    assert!(result.config.upstreams.is_empty());
+    assert_eq!(
+        result.config.proxies[0].backend_host,
+        "coredns.default.svc.cluster.local"
+    );
+    assert_eq!(result.config.proxies[0].backend_port, 5353);
+    assert!(result.config.proxies[0].upstream_id.is_none());
+}
+
+#[test]
+fn udp_route_unresolved_leg_keeps_its_weight_as_a_blackhole_target() {
+    // Pinned v1.5.1 UDPRoute: "if an invalid backend is requested to have 80%
+    // of the packets, then 80% of packets must be dropped instead". The
+    // unresolved leg keeps weight 3 pointed at an unresolvable host; the valid
+    // leg keeps weight 1 and is NOT renormalized up to the whole rule.
+    let spec = weighted_rule(json!([
+        {"name": "coredns", "port": 5353, "weight": 1},
+        {"name": "absent", "port": 5353, "weight": 3}
+    ]));
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        service("default", "coredns", 5353),
+        udp_route("dns", spec),
+    ];
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    let (_, upstream) = sole_proxy_and_upstream(&result);
+
+    assert_eq!(
+        target_weights(upstream),
+        vec![
+            ("coredns.default.svc.cluster.local".to_string(), 5353, 1),
+            ("ferrum-zero-weight.invalid.".to_string(), 65535, 3),
+        ]
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("not redistributed"))
+    );
+}
+
+#[test]
+fn udp_route_leg_whose_service_lacks_the_port_is_a_blackhole_target() {
+    let spec = weighted_rule(json!([
+        {"name": "coredns", "port": 5353, "weight": 1},
+        {"name": "coredns", "port": 9999, "weight": 1}
+    ]));
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        service("default", "coredns", 5353),
+        udp_route("dns", spec),
+    ];
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    let (_, upstream) = sole_proxy_and_upstream(&result);
+
+    assert_eq!(
+        target_weights(upstream),
+        vec![
+            ("coredns.default.svc.cluster.local".to_string(), 5353, 1),
+            ("ferrum-zero-weight.invalid.".to_string(), 65535, 1),
+        ]
+    );
+}
+
+#[test]
+fn udp_route_status_reports_unresolved_refs_for_a_mixed_rule() {
+    let spec = weighted_rule(json!([
+        {"name": "coredns", "port": 5353, "weight": 1},
+        {"name": "absent", "port": 5353, "weight": 3}
+    ]));
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        service("default", "coredns", 5353),
+        udp_route("dns", spec),
+    ];
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+
+    assert_eq!(
+        route_condition(&updates, "dns", "ResolvedRefs").as_deref(),
+        Some("False")
+    );
+    // The rule still attaches; only the reference resolution is negative.
+    assert_eq!(
+        route_condition(&updates, "dns", "Accepted").as_deref(),
+        Some("True")
+    );
+}
+
+#[test]
+fn udp_route_denied_cross_namespace_leg_fails_the_whole_rule_closed() {
+    // No ReferenceGrant: the rule is unrepresentable as a weighted set that
+    // still honors the denial, so the entire route fails closed instead of
+    // silently serving only the permitted leg.
+    let spec = json!({
+        "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+        "rules": [{"backendRefs": [
+            {"name": "coredns", "port": 5353, "weight": 1},
+            {"name": "coredns", "namespace": "backends", "port": 5353, "weight": 1}
+        ]}]
+    });
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        udp_route("dns", spec),
+    ];
+
+    let err = translate_k8s_objects(&objects, multi_namespace_options())
+        .expect_err("an ungranted leg fails the rule closed");
+
+    assert!(
+        err.to_string()
+            .contains("requires a matching ReferenceGrant")
+    );
+}
+
+#[test]
+fn udp_route_unsupported_backend_kind_in_a_set_fails_the_whole_rule_closed() {
+    let spec = weighted_rule(json!([
+        {"name": "coredns", "port": 5353, "weight": 1},
+        {"group": "example.com", "kind": "DatagramSink", "name": "sink", "port": 5353}
+    ]));
+    let objects = udp_lab(spec);
+
+    let err = translate_k8s_objects(&objects, options())
+        .expect_err("an unsupported kind fails the rule closed");
+
+    assert!(err.to_string().contains("only core Service backendRefs"));
+}
+
+#[test]
+fn udp_route_zero_weight_leg_still_has_its_port_validated() {
+    // A malformed port is a spec error regardless of the weight that would
+    // have selected the leg.
+    for port in [json!(0), json!(70000)] {
+        let spec = weighted_rule(json!([
+            {"name": "coredns", "port": 5353, "weight": 1},
+            {"name": "dark", "port": port, "weight": 0}
+        ]));
+        let objects = udp_lab(spec);
+
+        let err = translate_k8s_objects(&objects, options())
+            .expect_err("a malformed port fails closed at any weight");
+
+        assert!(err.to_string().contains("UDPRoute backendRefs[].port"));
+    }
+}
+
+#[test]
+fn udp_route_hostile_weight_shapes_fail_closed() {
+    for weight in [json!(1_000_000), json!(-1), json!("high"), json!(1.5)] {
+        let spec = weighted_rule(json!([
+            {"name": "coredns-a", "port": 5353, "weight": 1},
+            {"name": "coredns-b", "port": 5353, "weight": weight}
+        ]));
+        let objects = udp_lab(spec);
+
+        let err = translate_k8s_objects(&objects, options())
+            .expect_err("an out-of-range or non-integer weight fails closed");
+
+        assert!(err.to_string().contains("weight must be between 0 and"));
+    }
+}
+
+#[test]
+fn udp_route_backend_ref_fan_out_is_bounded() {
+    // Gateway API bounds UDPRouteRule.backendRefs at 16; a non-CRD-validated
+    // config source must not be able to expand an unbounded target set.
+    let legs: Vec<Value> = (0..17)
+        .map(|index| json!({"name": format!("coredns-{index}"), "port": 5353}))
+        .collect();
+    let spec = weighted_rule(Value::Array(legs));
+    let objects = udp_lab(spec);
+
+    let err =
+        translate_k8s_objects(&objects, options()).expect_err("a 17-entry fan-out fails closed");
+
+    assert!(err.to_string().contains("at most 16 entries"));
+}
+
+#[test]
+fn udp_route_multiple_matchless_rules_fail_closed() {
+    // A UDPRouteRule carries no match predicate, so two rules on one listener
+    // would be two competing OS listeners on the same port with no
+    // standards-defined precedence.
+    let spec = json!({
+        "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+        "rules": [
+            {"backendRefs": [{"name": "coredns-a", "port": 5353}]},
+            {"backendRefs": [{"name": "coredns-b", "port": 5354}]}
+        ]
+    });
+    let objects = udp_lab(spec);
+
+    let err = translate_k8s_objects(&objects, options()).expect_err("competing rules fail closed");
+
+    assert!(
+        err.to_string()
+            .contains("spec.rules must contain at most one rule")
+    );
+    assert!(err.to_string().contains("UDPRoute"));
+}
+
+#[test]
+fn udp_route_weight_only_update_replaces_the_upstream_targets() {
+    let gateway = udp_gateway("edge", "dns", 15353);
+    let before = weighted_rule(json!([
+        {"name": "coredns-a", "port": 5353, "weight": 1},
+        {"name": "coredns-b", "port": 5353, "weight": 1}
+    ]));
+    let after = weighted_rule(json!([
+        {"name": "coredns-a", "port": 5353, "weight": 9},
+        {"name": "coredns-b", "port": 5353, "weight": 1}
+    ]));
+
+    let first = translate_k8s_objects(
+        &[gateway_class(), gateway.clone(), udp_route("dns", before)],
+        options(),
+    )
+    .expect("translation succeeds");
+    let (_, first_upstream) = sole_proxy_and_upstream(&first);
+    let upstream_id = first_upstream.id.clone();
+    assert_eq!(first_upstream.algorithm, LoadBalancerAlgorithm::RoundRobin);
+
+    let second = translate_k8s_objects(
+        &[gateway_class(), gateway, udp_route("dns", after)],
+        options(),
+    )
+    .expect("translation succeeds");
+    let (_, second_upstream) = sole_proxy_and_upstream(&second);
+
+    // Same deterministic id, replaced targets — no stale sibling upstream.
+    assert_eq!(second_upstream.id, upstream_id);
+    assert_eq!(
+        second_upstream
+            .targets
+            .iter()
+            .map(|target| target.weight)
+            .collect::<Vec<_>>(),
+        vec![9, 1]
+    );
+    assert_eq!(
+        second_upstream.algorithm,
+        LoadBalancerAlgorithm::WeightedRoundRobin
+    );
+}
+
+#[test]
+fn udp_route_shrinking_to_one_leg_drops_the_upstream() {
+    let gateway = udp_gateway("edge", "dns", 15353);
+    let two_legs = weighted_rule(json!([
+        {"name": "coredns-a", "port": 5353, "weight": 1},
+        {"name": "coredns-b", "port": 5353, "weight": 1}
+    ]));
+    let one_leg = weighted_rule(json!([{"name": "coredns-a", "port": 5353, "weight": 1}]));
+
+    let before = translate_k8s_objects(
+        &[gateway_class(), gateway.clone(), udp_route("dns", two_legs)],
+        options(),
+    )
+    .expect("translation succeeds");
+    assert_eq!(before.config.upstreams.len(), 1);
+
+    let after = translate_k8s_objects(
+        &[gateway_class(), gateway, udp_route("dns", one_leg)],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    assert!(
+        after.config.upstreams.is_empty(),
+        "the replaced snapshot must not retain a stale upstream"
+    );
+    assert_eq!(
+        after.config.proxies[0].backend_host,
+        "coredns-a.default.svc.cluster.local"
+    );
+    assert!(after.config.proxies[0].upstream_id.is_none());
+}
+
+#[test]
+fn udp_route_deletion_removes_both_proxy_and_upstream() {
+    let gateway = udp_gateway("edge", "dns", 15353);
+    let spec = weighted_rule(json!([
+        {"name": "coredns-a", "port": 5353, "weight": 1},
+        {"name": "coredns-b", "port": 5353, "weight": 1}
+    ]));
+
+    let live = translate_k8s_objects(
+        &[gateway_class(), gateway.clone(), udp_route("dns", spec)],
+        options(),
+    )
+    .expect("translation succeeds");
+    assert_eq!(live.config.proxies.len(), 1);
+    assert_eq!(live.config.upstreams.len(), 1);
+
+    let deleted = translate_k8s_objects(&[gateway_class(), gateway], options())
+        .expect("translation succeeds without the route");
+
+    assert!(deleted.config.proxies.is_empty());
+    assert!(deleted.config.upstreams.is_empty());
+}
+
+#[test]
+fn udp_route_on_two_listeners_shares_one_upstream_across_distinct_proxies() {
+    let spec = json!({
+        "gatewayClassName": "ferrum",
+        "listeners": [
+            {
+                "name": "dns",
+                "port": 15353,
+                "protocol": "UDP",
+                "allowedRoutes": {"kinds": [{"kind": "UDPRoute"}]}
+            },
+            {
+                "name": "dns-alt",
+                "port": 15354,
+                "protocol": "UDP",
+                "allowedRoutes": {"kinds": [{"kind": "UDPRoute"}]}
+            }
+        ]
+    });
+    let gateway = gateway_object("edge", spec);
+    let route_spec = json!({
+        "parentRefs": [{"name": "edge"}],
+        "rules": [{"backendRefs": [
+            {"name": "coredns-a", "port": 5353, "weight": 1},
+            {"name": "coredns-b", "port": 5353, "weight": 1}
+        ]}]
+    });
+    let objects = [gateway_class(), gateway, udp_route("dns", route_spec)];
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+    assert_eq!(result.config.upstreams.len(), 1);
+    let mut ports: Vec<Option<u16>> = result
+        .config
+        .proxies
+        .iter()
+        .map(|proxy| proxy.listen_port)
+        .collect();
+    ports.sort();
+    assert_eq!(ports, vec![Some(15353), Some(15354)]);
+
+    let ids: Vec<&str> = result
+        .config
+        .proxies
+        .iter()
+        .map(|proxy| proxy.id.as_str())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "each listener needs its own proxy id");
+    let upstream_id = result.config.upstreams[0].id.as_str();
+    assert!(
+        result
+            .config
+            .proxies
+            .iter()
+            .all(|proxy| proxy.upstream_id.as_deref() == Some(upstream_id))
+    );
+}
+
+#[test]
+fn udp_route_proxy_ids_do_not_collide_with_a_same_named_tcp_route() {
+    // The historical L4 proxy id encodes only (namespace, name, rule index).
+    let tcp = l4_route(
+        "TCPRoute",
+        "dns",
+        json!({"rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]}),
+    );
+    let udp = udp_route("dns", simple_rule("coredns", 5353));
+    let objects = [tcp, udp];
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+    assert_eq!(
+        result.config.proxies.len(),
+        2,
+        "a UDPRoute must not upsert over a same-named TCPRoute, got {:?}",
+        result
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.id.clone())
+            .collect::<Vec<_>>()
+    );
+    let udp_proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.backend_scheme == Some(BackendScheme::Udp))
+        .expect("the UDP proxy survives");
+    assert!(udp_proxy.id.contains("udproute"));
+}
+
+#[test]
+fn deleting_a_weighted_udp_route_prunes_its_generated_upstream_from_live_config() {
+    // Translation alone regenerates from the snapshot, but the live gateway
+    // config is a *merge* of the K8s translation onto whatever another source
+    // owns. If `gwapi-l4-upstream-` is missing from the reconciler's managed
+    // prefix list, the deleted route's upstream survives the merge forever.
+    let gateway = udp_gateway("edge", "dns", 15353);
+    let spec = weighted_rule(json!([
+        {"name": "coredns-a", "port": 5353, "weight": 1},
+        {"name": "coredns-b", "port": 5353, "weight": 1}
+    ]));
+    let live = translate_k8s_objects(
+        &[gateway_class(), gateway.clone(), udp_route("dns", spec)],
+        options(),
+    )
+    .expect("translation succeeds");
+    let managed: BTreeSet<String> = ["default".to_string()].into_iter().collect();
+
+    let active = merge_k8s_translation(&GatewayConfig::default(), &live.config, &managed);
+    assert_eq!(active.upstreams.len(), 1);
+    assert!(active.upstreams[0].id.starts_with("gwapi-l4-upstream-"));
+
+    let deleted = translate_k8s_objects(&[gateway_class(), gateway], options())
+        .expect("translation succeeds without the route");
+    let after = merge_k8s_translation(&active, &deleted.config, &managed);
+
+    assert!(
+        after.upstreams.is_empty(),
+        "the generated L4 upstream must be pruned with its route, got {:?}",
+        after
+            .upstreams
+            .iter()
+            .map(|upstream| upstream.id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(after.proxies.is_empty());
 }
 
 #[test]

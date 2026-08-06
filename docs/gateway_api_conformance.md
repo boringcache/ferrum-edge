@@ -87,7 +87,7 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | Route update and deletion | Yes | Reconciliation regenerates live proxy/upstream/plugin config; deletion removes the route from live config |
 | `GRPCRoute` | Not claimed by the `GATEWAY-HTTP` gate | Watched and translated — see [GRPCRoute predicate translation](#grpcroute-predicate-translation) — but not advertised as a passing upstream `GATEWAY-GRPC` profile until request traffic conformance is added |
 | `TCPRoute` | Yes, via Ferrum black-box live checks (not upstream `GATEWAY-TCP`) | Lab installs the pinned `v1.5.1` experimental-channel CRD bundle (one coherent channel that includes `TCPRoute`). Live kind traffic proves parent/listener attachment, same-namespace and ReferenceGrant cross-namespace backend resolution, tagged TCP echo forwarding, empty/missing/unpermitted backend fail-closed behavior, parent status (`Accepted`/`ResolvedRefs`/`Programmed`), live backendRef updates, and deletion withdrawal. Upstream profile/features remain `GATEWAY-HTTP` / `Gateway,ReferenceGrant,HTTPRoute`; `GATEWAY-TCP` is **not** claimed on this pin (the profile/tests land in later Gateway API releases). |
-| `UDPRoute` | Yes, via Ferrum black-box live checks (not upstream `GATEWAY-UDP`) | Lab installs the same pinned `v1.5.1` experimental-channel CRD bundle (which includes `UDPRoute`). A `UDPRoute` attached to a `protocol: UDP` Gateway listener materializes a Ferrum UDP stream proxy on the listener port, preserving datagram semantics (no connection state, per-session idle expiry, response-amplification limits). Live kind traffic proves parent/listener attachment, same-namespace and ReferenceGrant cross-namespace backend resolution, tagged UDP echo forwarding, missing/unpermitted backend fail-closed behavior, parent status (`Accepted`/`ResolvedRefs`/`Programmed`), live backendRef updates, and deletion withdrawal — see [UDPRoute translation](#udproute-translation). Upstream profile/features remain `GATEWAY-HTTP` / `Gateway,ReferenceGrant,HTTPRoute`; `GATEWAY-UDP` is **not** claimed on this pin. |
+| `UDPRoute` | Yes, via Ferrum black-box live checks (not upstream `GATEWAY-UDP`) | Lab installs the same pinned `v1.5.1` experimental-channel CRD bundle (which includes `UDPRoute`). A `UDPRoute` attached to a `protocol: UDP` Gateway listener materializes a Ferrum UDP stream proxy on the listener port, preserving datagram semantics (no connection state, per-session idle expiry, response-amplification limits). Live kind traffic proves parent/listener attachment, same-namespace and ReferenceGrant cross-namespace backend resolution, tagged UDP echo forwarding, **weighted multi-backend distribution across both legs**, zero-weight withdrawal, mixed valid/invalid weighted drop behavior, missing/unpermitted backend fail-closed behavior, parent status (`Accepted`/`ResolvedRefs`/`Programmed`), live backendRef and weight-only updates, and deletion withdrawal — see [UDPRoute translation](#udproute-translation). Upstream profile/features remain `GATEWAY-HTTP` / `Gateway,ReferenceGrant,HTTPRoute`; `GATEWAY-UDP` is **not** claimed on this pin. |
 | `TLSRoute` | Not claimed | Watched/translated for L4 experiments, but not advertised as a supported Gateway API conformance profile |
 | `BackendTLSPolicy`, `ListenerSet`, `BackendLBPolicy` | No | Not claimed as effective Gateway API conformance features |
 
@@ -95,24 +95,37 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 
 `UDPRoute` shares the L4 materialization path with `TCPRoute`/`TLSRoute`: the
 route carries no request-level predicate, so the Gateway listener port is the
-entire match and the rule's `backendRefs` entry is the datagram peer.
+entire match and the rule's `backendRefs` **set** is the weighted datagram peer
+set.
 
 | Surface | Behavior |
 |---|---|
 | Listener attachment | A `UDPRoute` attaches only to a `protocol: UDP` listener. `allowedRoutes.kinds` may narrow it to `UDPRoute`; naming any other kind for a UDP listener invalidates that kinds list, exactly as for TCP/TLS |
-| Materialization | One Ferrum stream proxy per rule per attached listener port, `backend_scheme: udp`, backend `<service>.<namespace>.svc.<cluster-domain>:<port>`. With no materialized listener port the backendRef port is the listen port |
-| `backendRefs[].port` | **Required** and numeric `1..=65535`; absent or out-of-range fails closed with a `UDPRoute backendRefs[].port` diagnostic |
-| `backendRefs[]` target | Core `Service` only; any other group/kind fails closed |
-| Cross-namespace `backendRefs` | Requires an exact `ReferenceGrant` (`from` `gateway.networking.k8s.io`/`UDPRoute`, `to` core `Service`); a missing or mismatched grant fails closed and reports `ResolvedRefs=False` |
+| Declared parents | A route that declares Gateway `parentRefs` materializes **only** on concrete listener ports that survive Gateway identity, `sectionName`/`port` selection, listener protocol/kind, `allowedRoutes` namespace, and listener materializability. An unknown, mismatched, or wholly ineligible declared parent opens nothing (`Accepted=False` with `NoMatchingParent` / `NotAllowedByListeners`) — it never falls back to the backend port. The backend-port fallback below applies only to the parentless legacy shape, and this gate is shared with `TCPRoute`/`TLSRoute` |
+| Materialization | One Ferrum stream proxy per rule per attached listener port, `backend_scheme: udp`. With no *declared* parent at all, the backendRef port is the listen port |
+| `spec.rules` | At most one rule. A `UDPRouteRule` carries no match predicate (pinned `apis/v1alpha2/udproute_types.go`), so N rules on one listener would be N competing OS listeners on the same port with no standards-defined precedence; the shape is rejected fail closed with a field-specific error rather than resolved by bind order |
+| `backendRefs[].port` | **Required** and numeric `1..=65535` on every entry — including `weight: 0` entries; absent or out-of-range fails closed with a `UDPRoute backendRefs[].port` diagnostic |
+| `backendRefs[]` target | Core `Service` only; any other group/kind fails the whole rule closed. The set is bounded at 16 entries, matching the CRD |
+| Backend set | One serviceable leg dispatches directly to `<service>.<namespace>.svc.<cluster-domain>:<port>`. Two or more non-zero-weight legs materialize one namespaced Ferrum upstream whose weighted targets preserve the **declared relative weights** (omitted weight defaults to `1`) |
+| Selection granularity | Per UDP **session** (client 5-tuple), not per datagram: Ferrum's UDP data path selects a target once per session and reuses it for that session's lifetime. Distribution therefore converges over sessions, not over individual packets |
+| Weights | `weight: 0` removes a leg from the target set entirely; a rule whose backendRefs are all `weight: 0` materializes nothing and warns. A weight outside `0..=65535` or of any non-integer shape fails closed |
+| Invalid legs | A leg naming a missing `Service`, or a `Service` without the referenced port, **keeps its declared weight** and is pointed at an unresolvable blackhole target, so its share of sessions fails closed. Weight is never renormalized onto the resolvable legs. `ResolvedRefs=False` is reported for the route |
+| Cross-namespace `backendRefs` | Requires an exact `ReferenceGrant` (`from` `gateway.networking.k8s.io`/`UDPRoute`, `to` core `Service`); a missing or mismatched grant fails the **whole rule** closed (the strongest fail-closed outcome) and reports `ResolvedRefs=False` |
 | Cross-namespace `parentRefs` | Rejected, matching `TCPRoute`/`TLSRoute` — Ferrum has no L4 cross-namespace parent materialization yet |
-| Weights | The first non-zero-weight `backendRefs` entry is selected; a rule whose backendRefs are all `weight: 0` materializes nothing and warns |
 | `spec.hostnames` | Not a Gateway API `UDPRoute` field, and a datagram carries no name to match on. A hostname supplied through a non-Kubernetes config source is rejected fail closed rather than silently ignored |
 | Status | `status.parents[]` carries Ferrum-authored `Accepted`, `ResolvedRefs`, and `Programmed`, written through the same read-modify-write path as every other route kind |
-| Update / delete | Reconciliation regenerates live stream listeners; a changed `backendRefs` switches live datagram traffic and a deleted `UDPRoute` withdraws the listener |
+| Update / delete | Reconciliation regenerates live stream listeners and upstreams from the full snapshot; a changed `backendRefs` or a weight-only change replaces the upstream's target set under the same deterministic id, and a deleted `UDPRoute` withdraws both the listener and its upstream |
 
 Datagram semantics come from the existing Ferrum UDP data path and are not
 re-implemented for Gateway API: sessions are keyed by client address with an
 idle timeout, and the response-amplification guard stays in force.
+
+Support boundary, stated exactly: Ferrum implements Gateway API `UDPRoute` with
+a **single** rule, a weighted `backendRefs` set of up to 16 core `Service`
+legs, and session-granular weighted selection. Ferrum does **not** claim
+packet-level weighted drop precision, `ServiceImport` or any other
+implementation-specific backend kind, multiple rules per route, or the upstream
+`GATEWAY-UDP` conformance profile.
 
 ## GRPCRoute predicate translation
 

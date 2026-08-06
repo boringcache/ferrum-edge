@@ -174,7 +174,8 @@ pub(super) fn translate(
         }
         // UDPRoute shares the L4 materialization path with TCPRoute/TLSRoute:
         // the route carries no request-level predicate, so the Gateway listener
-        // port is the entire match and the backendRef is the datagram peer.
+        // port is the entire match and the rule's `backendRefs` set is the
+        // weighted datagram peer set (see `udp_rule_backends`).
         // The stream scheme is what makes the materialized proxy a UDP
         // listener/relay rather than a TCP one; datagram semantics (no
         // connection state, per-session idle expiry, amplification limits) are
@@ -4504,6 +4505,7 @@ fn l4_route_proxies(
     ensure_route_parent_refs_allowed(object, acc)?;
     ensure_l4_parent_refs_are_same_namespace(object)?;
     let hosts = l4_route_hosts(object, scheme)?;
+    ensure_udp_route_rule_shape(object, scheme)?;
     let materialized_parent_refs = route_materialized_parent_ref_keys_for_namespace(
         object,
         acc,
@@ -4511,6 +4513,29 @@ fn l4_route_proxies(
     );
     let materialized_listener_ports =
         l4_route_listener_ports_for_namespace(object, acc, Some(&object.metadata.namespace));
+
+    // Fail closed on a declared-but-unmatched Gateway parent.
+    //
+    // `materialized_listener_ports` is the set of concrete listener ports that
+    // survived every gate: Gateway identity, `sectionName`/`port` selection,
+    // listener protocol and `allowedRoutes` kind, `allowedRoutes` namespace,
+    // and listener materializability. A route that *declares* a Gateway parent
+    // and clears none of those gates has no listener to attach to, so it must
+    // open nothing — falling through to the backend port would bind an
+    // unintended OS listener while status correctly reports `NoMatchingParent`
+    // / `NotAllowedByListeners`. The backend-port fallback below is retained
+    // only for the parentless legacy shape (a bare TCPRoute/TLSRoute/UDPRoute
+    // supplied by a non-Kubernetes config source), which has no parent to
+    // contradict.
+    if materialized_listener_ports.is_empty() && route_declares_gateway_parent_ref(object) {
+        acc.warnings.push(format!(
+            "{} {}/{} declares Gateway parentRefs but none resolved to a materializable listener; \
+             no listener was opened",
+            object.kind, object.metadata.namespace, object.metadata.name
+        ));
+        return Ok(Vec::new());
+    }
+
     let mut proxies = Vec::new();
     for (rule_index, rule) in object
         .spec
@@ -4520,34 +4545,46 @@ fn l4_route_proxies(
         .flatten()
         .enumerate()
     {
-        let Some(backend_ref) = first_backend_ref(object, rule, acc)? else {
+        let Some(resolved) = l4_rule_backends(object, rule, acc, scheme)? else {
             continue;
         };
-        let backend_name = string_field(backend_ref, "name")
-            .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
-        let backend_namespace =
-            checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
-        // Field-specific diagnostics name the route's own kind: an operator
-        // reading a UDPRoute condition must not be told about TCPRoute/TLSRoute.
-        let backend_port_field = format!("{} backendRefs[].port", object.kind);
-        let Some(raw_backend_port) = backend_ref.get("port").and_then(Value::as_u64) else {
-            return Err(invalid_resource(
-                object,
-                format!("{backend_port_field} is required"),
-            ));
-        };
-        let backend_port = port_from_u64(object, raw_backend_port, &backend_port_field)?;
 
         let listen_ports = if materialized_listener_ports.is_empty() {
-            vec![backend_port]
+            vec![resolved.fallback_listen_port]
         } else {
             materialized_listener_ports.clone()
         };
+        let rule_suffix = l4_rule_suffix(scheme, rule_index);
+
+        // One leg dispatches directly; a set of legs becomes one namespaced
+        // upstream whose weighted targets preserve the declared relative
+        // weights. The upstream is listener-independent, so every listen port
+        // for this rule shares it.
+        let (backend_host, backend_port, upstream_id) = if resolved.backends.len() == 1 {
+            let Some(backend) = resolved.backends.into_iter().next() else {
+                continue;
+            };
+            (backend.host, backend.port, None)
+        } else {
+            let upstream_id = resource_id(
+                "gwapi-l4-upstream",
+                &object.metadata.namespace,
+                &object.metadata.name,
+                &rule_suffix,
+            );
+            acc.upsert_upstream(upstream_for_route(
+                upstream_id.clone(),
+                object.metadata.namespace.clone(),
+                resolved.backends,
+            ));
+            (String::new(), 0, Some(upstream_id))
+        };
+
         for (listen_port_index, listen_port) in listen_ports.iter().copied().enumerate() {
             let suffix = if listen_ports.len() == 1 {
-                rule_index.to_string()
+                rule_suffix.clone()
             } else {
-                format!("{rule_index}-{listen_port_index}")
+                format!("{rule_suffix}-{listen_port_index}")
             };
             proxies.push(proxy_for_route(RouteProxySpec {
                 id: resource_id(
@@ -4561,13 +4598,9 @@ fn l4_route_proxies(
                 listen_path: None,
                 strip_listen_path: false,
                 preserve_host_header: false,
-                backend_host: service_dns_name(
-                    backend_name,
-                    &backend_namespace,
-                    &acc.options.cluster_domain,
-                ),
+                backend_host: backend_host.clone(),
                 backend_port,
-                upstream_id: None,
+                upstream_id: upstream_id.clone(),
                 backend_scheme: scheme,
                 listen_port: Some(listen_port),
                 retry: None,
@@ -4581,6 +4614,259 @@ fn l4_route_proxies(
         }
     }
     Ok(proxies)
+}
+
+/// True when the route names at least one Gateway `parentRefs[]` entry.
+///
+/// A non-Gateway parent (a GAMMA `Service` parent, say) is not a listener
+/// declaration and must not arm the fail-closed listener gate.
+fn route_declares_gateway_parent_ref(object: &K8sObject) -> bool {
+    object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .is_some_and(|parent_refs| parent_refs.iter().any(parent_ref_is_gateway))
+}
+
+/// Proxy/upstream id suffix for one L4 rule.
+///
+/// `UDPRoute` ids are kind-scoped. The historical L4 id encodes only
+/// `(namespace, route name, rule index)`, so a `UDPRoute` and a same-named
+/// `TCPRoute` in one namespace would upsert over each other's proxy. Existing
+/// `TCPRoute`/`TLSRoute` ids stay byte-identical.
+fn l4_rule_suffix(scheme: BackendScheme, rule_index: usize) -> String {
+    if scheme.is_udp() {
+        format!("udproute-{rule_index}")
+    } else {
+        rule_index.to_string()
+    }
+}
+
+/// Gateway API v1.5.1 bounds `UDPRouteSpec.rules` and `UDPRouteRule.backendRefs`
+/// at 16 entries each. A non-Kubernetes config source is not CRD-validated, so
+/// the cold path enforces the same ceiling rather than expanding an unbounded
+/// hostile fan-out.
+const MAX_UDP_ROUTE_BACKEND_REFS: usize = 16;
+
+/// A `UDPRouteRule` carries no match predicate (pinned v1.5.1
+/// `udproute_types.go`: the rule has only `name` and `backendRefs`), so two
+/// rules on one listener are indistinguishable and the standard defines no
+/// precedence between them. Materializing both would queue two competing OS
+/// listeners on the same UDP port and make the winner depend on bind order.
+/// Reject the shape fail closed with a field-specific diagnostic instead.
+/// `TCPRoute`/`TLSRoute` keep their historical behavior.
+fn ensure_udp_route_rule_shape(
+    object: &K8sObject,
+    scheme: BackendScheme,
+) -> Result<(), K8sTranslateError> {
+    if !scheme.is_udp() {
+        return Ok(());
+    }
+    let rule_count = object
+        .spec
+        .get("rules")
+        .and_then(Value::as_array)
+        .map_or(0, |rules| rules.len());
+    if rule_count > 1 {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} spec.rules must contain at most one rule: a UDPRouteRule carries no match \
+                 predicate, so {rule_count} rules would be {rule_count} competing listeners on \
+                 the same port with no standards-defined precedence",
+                object.kind
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// One L4 rule's resolved backend set.
+struct L4RuleBackends {
+    /// Listen port used only by the parentless legacy shape. This is the
+    /// *declared* `backendRefs[].port`, never a resolved blackhole port.
+    fallback_listen_port: u16,
+    /// Weighted target set. Exactly one entry dispatches directly; more than
+    /// one becomes an upstream.
+    backends: Vec<RouteBackend>,
+}
+
+fn l4_rule_backends(
+    object: &K8sObject,
+    rule: &Value,
+    acc: &mut K8sAccumulator,
+    scheme: BackendScheme,
+) -> Result<Option<L4RuleBackends>, K8sTranslateError> {
+    if scheme.is_udp() {
+        return udp_rule_backends(object, rule, acc);
+    }
+
+    // TCPRoute / TLSRoute: unchanged first-non-zero-weight selection.
+    let Some(backend_ref) = first_backend_ref(object, rule, acc)? else {
+        return Ok(None);
+    };
+    let backend_name = string_field(backend_ref, "name")
+        .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
+    let backend_namespace =
+        checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
+    // Field-specific diagnostics name the route's own kind: an operator
+    // reading a UDPRoute condition must not be told about TCPRoute/TLSRoute.
+    let backend_port_field = format!("{} backendRefs[].port", object.kind);
+    let Some(raw_backend_port) = backend_ref.get("port").and_then(Value::as_u64) else {
+        return Err(invalid_resource(
+            object,
+            format!("{backend_port_field} is required"),
+        ));
+    };
+    let backend_port = port_from_u64(object, raw_backend_port, &backend_port_field)?;
+    Ok(Some(L4RuleBackends {
+        fallback_listen_port: backend_port,
+        backends: vec![RouteBackend {
+            host: service_dns_name(
+                backend_name,
+                &backend_namespace,
+                &acc.options.cluster_domain,
+            ),
+            port: backend_port,
+            weight: 1,
+            service_namespace: None,
+            service_name: None,
+            service_port: None,
+        }],
+    }))
+}
+
+/// Resolve one `UDPRouteRule`'s `backendRefs` **set**.
+///
+/// Pinned Gateway API v1.5.1 (`apis/v1alpha2/udproute_types.go`) makes
+/// `backendRefs` a set of up to 16 backends with Extended weight support, and
+/// requires that an invalid backend's share of traffic be dropped rather than
+/// handed to the valid backends: "if an invalid backend is requested to have
+/// 80% of the packets, then 80% of packets must be dropped instead."
+///
+/// Ferrum honors that by never renormalizing: an unserviceable leg keeps its
+/// declared weight and is pointed at the unresolvable blackhole host, so the
+/// sessions that select it fail closed instead of shifting onto a valid leg.
+/// Selection granularity is the UDP *session* (client 5-tuple), not the
+/// individual datagram — Ferrum's UDP data path selects a target once per
+/// session and reuses it for that session's lifetime.
+///
+/// Unsupported backend kinds and denied cross-namespace `ReferenceGrant`s stay
+/// whole-route hard errors (the strongest fail-closed outcome) rather than
+/// per-leg blackholes, matching `TCPRoute`/`TLSRoute`.
+fn udp_rule_backends(
+    object: &K8sObject,
+    rule: &Value,
+    acc: &mut K8sAccumulator,
+) -> Result<Option<L4RuleBackends>, K8sTranslateError> {
+    let Some(backend_refs) = rule.get("backendRefs").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    if backend_refs.len() > MAX_UDP_ROUTE_BACKEND_REFS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} backendRefs supports at most {MAX_UDP_ROUTE_BACKEND_REFS} entries (got {})",
+                object.kind,
+                backend_refs.len()
+            ),
+        ));
+    }
+
+    let backend_port_field = format!("{} backendRefs[].port", object.kind);
+    let mut backends = Vec::new();
+    let mut fallback_listen_port = None;
+    let mut skipped_zero = 0usize;
+    let mut unserviceable = 0usize;
+    for backend_ref in backend_refs {
+        // Every entry's port is validated, including a zero-weight one: a
+        // malformed port is a spec error regardless of whether traffic would
+        // have selected that leg.
+        let Some(raw_backend_port) = backend_ref.get("port").and_then(Value::as_u64) else {
+            return Err(invalid_resource(
+                object,
+                format!("{backend_port_field} is required"),
+            ));
+        };
+        let backend_port = port_from_u64(object, raw_backend_port, &backend_port_field)?;
+        // `backend_weight` bounds the declared weight to 0..=65535 and rejects
+        // any non-integer shape, so hostile weights cannot reach the LB.
+        let weight = backend_weight(object, backend_ref)?;
+        if weight == 0 {
+            skipped_zero += 1;
+            continue;
+        }
+        let backend_name = string_field(backend_ref, "name")
+            .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
+        let backend_namespace =
+            checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
+        fallback_listen_port.get_or_insert(backend_port);
+
+        // A missing Service, or a Service without the referenced port, is an
+        // unserviceable leg. It keeps its weight and becomes an explicit
+        // blackhole target so its share of sessions is dropped, never
+        // redistributed. The check is skipped entirely when no Service has
+        // been observed at all (a non-Kubernetes or not-yet-synced source),
+        // so a cold cache cannot blackhole a healthy route.
+        let serviceable = !acc.has_observed_services()
+            || (acc.service_exists(&backend_namespace, backend_name)
+                && acc.service_port_exists(&backend_namespace, backend_name, backend_port));
+        if serviceable {
+            backends.push(RouteBackend {
+                host: service_dns_name(
+                    backend_name,
+                    &backend_namespace,
+                    &acc.options.cluster_domain,
+                ),
+                port: backend_port,
+                weight,
+                service_namespace: Some(backend_namespace.clone()),
+                service_name: Some(backend_name.to_string()),
+                service_port: Some(backend_port),
+            });
+        } else {
+            unserviceable += 1;
+            backends.push(RouteBackend {
+                host: ZERO_WEIGHT_BACKEND_HOST.to_string(),
+                port: ZERO_WEIGHT_BACKEND_PORT,
+                weight,
+                service_namespace: None,
+                service_name: None,
+                service_port: None,
+            });
+        }
+    }
+
+    if backends.is_empty() {
+        if skipped_zero > 0 {
+            acc.warnings.push(format!(
+                "{} rule has only zero-weight backendRefs; no proxy was materialized",
+                object.kind
+            ));
+        }
+        return Ok(None);
+    }
+    if skipped_zero > 0 {
+        acc.warnings.push(format!(
+            "{} skipped {} zero-weight backendRef(s)",
+            object.kind, skipped_zero
+        ));
+    }
+    if unserviceable > 0 {
+        acc.warnings.push(format!(
+            "{} {}/{} has {} unresolved backendRef(s); their declared weight is dropped fail \
+             closed and is not redistributed to the resolvable backends",
+            object.kind, object.metadata.namespace, object.metadata.name, unserviceable
+        ));
+    }
+
+    let Some(fallback_listen_port) = fallback_listen_port else {
+        return Ok(None);
+    };
+    Ok(Some(L4RuleBackends {
+        fallback_listen_port,
+        backends,
+    }))
 }
 
 /// Route-level hostnames an L4 route may carry.

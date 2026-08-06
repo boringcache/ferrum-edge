@@ -339,6 +339,139 @@ assert_udp_exchange_fails() {
   return 0
 }
 
+sample_udp_backends() {
+  # Sample `count` INDEPENDENT UDP sessions and tally which backend answered.
+  #
+  # Ferrum keys a UDP session on the client 5-tuple and selects the backend
+  # once per session, so a fresh socket per iteration (fresh ephemeral source
+  # port) is exactly one independent weighted selection. Reusing one socket
+  # would re-hit the same pinned target and prove nothing about distribution.
+  local port="$1"
+  local count="$2"
+  local timeout="$3"
+  python3 - "$port" "$count" "$timeout" <<'PY'
+import socket
+import sys
+
+port, count, timeout = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
+tally = {}
+drops = 0
+for index in range(count):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(f"sample-{index}".encode(), ("127.0.0.1", port))
+        data, _ = sock.recvfrom(65535)
+        tag = data.split(b":", 1)[0].decode("ascii", "replace")
+        tally[tag] = tally.get(tag, 0) + 1
+    except OSError:
+        drops += 1
+    finally:
+        sock.close()
+for tag in sorted(tally):
+    print(f"{tag} {tally[tag]}")
+print(f"__drops__ {drops}")
+PY
+}
+
+udp_sample_hits() {
+  local sample="$1"
+  local tag="$2"
+  local hits
+  hits="$(awk -v want="$tag" '$1==want {print $2}' <<<"$sample")"
+  printf '%s\n' "${hits:-0}"
+}
+
+wait_for_weighted_udp_distribution() {
+  # Bounded, statistically slack assertion: with two equally weighted valid
+  # legs Ferrum's weighted round-robin alternates, so ~half of `count`
+  # sessions land on each. Requiring only `min_each` leaves a wide margin for
+  # datagram loss while still failing if one leg never receives traffic (which
+  # is exactly the "only the first backendRef is used" defect).
+  local port="$1"
+  local count="$2"
+  local min_each="$3"
+  shift 3
+  local expected=("$@")
+  local sample=""
+  local attempt
+  for attempt in $(seq 1 12); do
+    sample="$(sample_udp_backends "$port" "$count" 2 || true)"
+    local satisfied=1
+    local tag
+    for tag in "${expected[@]}"; do
+      if [ "$(udp_sample_hits "$sample" "$tag")" -lt "$min_each" ]; then
+        satisfied=0
+      fi
+    done
+    if [ "$satisfied" -eq 1 ]; then
+      printf 'UDP :%s weighted sample over %s sessions: %s\n' \
+        "$port" "$count" "$(tr '\n' ' ' <<<"$sample")"
+      return 0
+    fi
+    sleep 3
+  done
+  echo "UDP :${port} never reached >=${min_each} sessions on each of ${expected[*]}; last sample=${sample}" >&2
+  return 1
+}
+
+wait_for_exclusive_udp_backend() {
+  # Every successful reply must carry `tag`, and at least `min_hits` replies
+  # must arrive. This is the exact form of the zero-weight assertion: a
+  # weight-0 leg is removed from the target set outright, so it can never
+  # answer.
+  local port="$1"
+  local count="$2"
+  local min_hits="$3"
+  local tag="$4"
+  local sample=""
+  local attempt
+  for attempt in $(seq 1 12); do
+    sample="$(sample_udp_backends "$port" "$count" 2 || true)"
+    local other
+    other="$(awk -v want="$tag" '$1!=want && $1!="__drops__" {sum+=$2} END {print sum+0}' <<<"$sample")"
+    if [ "$other" -eq 0 ] && [ "$(udp_sample_hits "$sample" "$tag")" -ge "$min_hits" ]; then
+      printf 'UDP :%s served only %s over %s sessions: %s\n' \
+        "$port" "$tag" "$count" "$(tr '\n' ' ' <<<"$sample")"
+      return 0
+    fi
+    sleep 3
+  done
+  echo "UDP :${port} did not serve ${tag} exclusively; last sample=${sample}" >&2
+  return 1
+}
+
+wait_for_invalid_leg_weight_is_dropped() {
+  # A mixed rule (one resolvable leg, one unresolvable leg of equal weight)
+  # must drop the invalid leg's share instead of handing it to the valid leg.
+  # Pinned Gateway API v1.5.1 UDPRoute: "if an invalid backend is requested to
+  # have 80% of the packets, then 80% of packets must be dropped instead."
+  #
+  # The thresholds are deliberately slack (round-robin makes the true split
+  # ~50/50 of `count`), so this fails only on the two defects that matter:
+  # every session succeeding (the invalid weight was renormalized onto the
+  # valid leg) or every session dropping (the valid leg was withdrawn too).
+  local port="$1"
+  local count="$2"
+  local min_hits="$3"
+  local min_drops="$4"
+  local tag="$5"
+  local sample=""
+  local attempt
+  for attempt in $(seq 1 10); do
+    sample="$(sample_udp_backends "$port" "$count" 2 || true)"
+    if [ "$(udp_sample_hits "$sample" "$tag")" -ge "$min_hits" ] \
+      && [ "$(udp_sample_hits "$sample" "__drops__")" -ge "$min_drops" ]; then
+      printf 'UDP :%s mixed valid/invalid sample over %s sessions: %s\n' \
+        "$port" "$count" "$(tr '\n' ' ' <<<"$sample")"
+      return 0
+    fi
+    sleep 3
+  done
+  echo "UDP :${port} did not show both ${tag} replies and dropped sessions; last sample=${sample}" >&2
+  return 1
+}
+
 wait_for_udproute_parent_condition() {
   local name="$1"
   local condition_type="$2"
@@ -472,6 +605,61 @@ YAML
     -p='[{"op":"replace","path":"/spec/rules/0/backendRefs/0/name","value":"blackbox-udp-b"}]'
   wait_for_udp_echo "$UDP_BLACKBOX_PORT_MAIN" "blackbox-udp-b" "post-update" | tee -a "$report"
   echo "UDPRoute update switched live datagram traffic to blackbox-udp-b on :${UDP_BLACKBOX_PORT_MAIN}" >> "$report"
+
+  # backendRefs is a SET: both non-zero-weight legs must receive traffic. A
+  # "first backendRef wins" implementation fails here because blackbox-udp-a
+  # is never reached.
+  kubectl -n "$DP_GATEWAY_NAMESPACE" patch udproute blackbox-udp-main --type=merge -p "$(cat <<JSON
+{"spec":{"rules":[{"backendRefs":[
+  {"name":"blackbox-udp-a","port":${UDP_ECHO_BACKEND_PORT},"weight":1},
+  {"name":"blackbox-udp-b","port":${UDP_ECHO_BACKEND_PORT},"weight":1}
+]}]}}
+JSON
+)"
+  wait_for_udproute_parent_condition blackbox-udp-main ResolvedRefs True | tee -a "$report"
+  wait_for_weighted_udp_distribution "$UDP_BLACKBOX_PORT_MAIN" 24 4 \
+    blackbox-udp-a blackbox-udp-b | tee -a "$report"
+  echo "UDPRoute two-backend weighted set served both legs on :${UDP_BLACKBOX_PORT_MAIN}" >> "$report"
+
+  # Weight-only update: dropping a leg to weight 0 removes it from the target
+  # set, so the remaining leg must serve every session.
+  kubectl -n "$DP_GATEWAY_NAMESPACE" patch udproute blackbox-udp-main --type=merge -p "$(cat <<JSON
+{"spec":{"rules":[{"backendRefs":[
+  {"name":"blackbox-udp-a","port":${UDP_ECHO_BACKEND_PORT},"weight":1},
+  {"name":"blackbox-udp-b","port":${UDP_ECHO_BACKEND_PORT},"weight":0}
+]}]}}
+JSON
+)"
+  wait_for_exclusive_udp_backend "$UDP_BLACKBOX_PORT_MAIN" 12 6 blackbox-udp-a | tee -a "$report"
+  echo "UDPRoute weight-only update withdrew the zero-weight leg on :${UDP_BLACKBOX_PORT_MAIN}" >> "$report"
+
+  # Mixed valid/invalid weighted rule on the fail listener: the invalid leg's
+  # share must be dropped, never renormalized onto the valid leg.
+  kubectl -n "$DP_GATEWAY_NAMESPACE" delete udproute blackbox-udp-denied --wait=true
+  cat <<YAML | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: UDPRoute
+metadata:
+  name: blackbox-udp-mixed
+  namespace: ${DP_GATEWAY_NAMESPACE}
+spec:
+  parentRefs:
+    - name: ferrum-blackbox-udp
+      sectionName: udp-fail
+  rules:
+    - backendRefs:
+        - name: blackbox-udp-a
+          port: ${UDP_ECHO_BACKEND_PORT}
+          weight: 1
+        - name: blackbox-udp-missing
+          port: ${UDP_ECHO_BACKEND_PORT}
+          weight: 1
+YAML
+  wait_for_udproute_parent_condition blackbox-udp-mixed Accepted True | tee -a "$report"
+  wait_for_udproute_parent_condition blackbox-udp-mixed ResolvedRefs False | tee -a "$report"
+  wait_for_invalid_leg_weight_is_dropped "$UDP_BLACKBOX_PORT_FAIL" 16 3 3 blackbox-udp-a \
+    | tee -a "$report"
+  echo "UDPRoute mixed valid/invalid weighted rule dropped the invalid leg's share on :${UDP_BLACKBOX_PORT_FAIL}" >> "$report"
 
   wait_for_udp_echo "$UDP_BLACKBOX_PORT_DELETE" "blackbox-udp-a" "pre-delete" | tee -a "$report"
   kubectl -n "$DP_GATEWAY_NAMESPACE" delete udproute blackbox-udp-delete --wait=true

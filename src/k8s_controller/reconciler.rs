@@ -1113,7 +1113,14 @@ fn log_mesh_overlay_transition(
 }
 
 const K8S_MANAGED_PROXY_ID_PREFIXES: &[&str] = &["gwapi-route-", "gwapi-l4-", "istio-vs-"];
-const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &["gwapi-route-upstream-", "istio-vs-upstream-"];
+// `gwapi-l4-upstream-` is the weighted backend set generated for a multi-leg
+// UDPRoute rule. It must be pruned with the rest of the K8s-managed upstreams,
+// or a deleted/shrunk route would leave a stale upstream in live config.
+const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &[
+    "gwapi-route-upstream-",
+    "gwapi-l4-upstream-",
+    "istio-vs-upstream-",
+];
 const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] = &[
     "istio-vs-cors-",
     "istio-vs-fi-",

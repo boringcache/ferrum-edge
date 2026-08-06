@@ -13,14 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gateway.networking.k8s.io/v1alpha2` `UDPRoute`, translates it onto the shared
   L4 materialization path as a Ferrum UDP stream proxy bound to the attached
   `protocol: UDP` Gateway listener port, and writes `Accepted` / `ResolvedRefs` /
-  `Programmed` parent status. Admission is strict and fail closed: a numeric
-  `backendRefs[].port` is required, only core `Service` backends are accepted,
+  `Programmed` parent status. Per pinned Gateway API v1.5.1, `backendRefs` is a
+  weighted **set**: one serviceable leg dispatches directly, two or more
+  non-zero-weight legs materialize a namespaced Ferrum upstream that preserves
+  the declared relative weights (omitted weight defaults to `1`, `weight: 0` is
+  withdrawn, and the set is bounded at 16 legs). A leg naming a missing Service
+  or a Service without the referenced port keeps its declared weight and is
+  pointed at an unresolvable blackhole target, so its share of sessions fails
+  closed and is never renormalized onto the resolvable legs. Selection is
+  per UDP session (client 5-tuple), not per datagram. Admission is strict and
+  fail closed: a numeric `backendRefs[].port` is required on every entry
+  including zero-weight ones, only core `Service` backends are accepted,
   cross-namespace backendRefs need an exact `UDPRoute` ReferenceGrant,
   cross-namespace `parentRefs` are refused, a `UDPRoute` never attaches to a
-  non-UDP listener, and `spec.hostnames` (not a Gateway API `UDPRoute` field, and
+  non-UDP listener, multiple matchless rules are rejected rather than resolved
+  by bind order, and `spec.hostnames` (not a Gateway API `UDPRoute` field, and
   unmatchable on a datagram) is rejected rather than silently ignored. Update and
-  delete regenerate live stream listeners. Live attachment/traffic/status/update/
-  deletion evidence is gated by a new black-box lab step
+  delete regenerate live stream listeners and upstreams. Live
+  attachment/traffic/weighted-distribution/status/update/deletion evidence is
+  gated by a new black-box lab step
   (`scripts/gateway_api_udproute_conformance.sh`); the upstream profile stays
   `GATEWAY-HTTP` and no `GATEWAY-UDP` profile is claimed.
 - NodeWaypoint captured TCP observability now exports the bounded-cardinality
@@ -293,6 +304,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Gateway API L4 routes (`TCPRoute`, `TLSRoute`, `UDPRoute`) no longer fall back
+  to opening a listener on the **backend** port when they declare Gateway
+  `parentRefs` that resolve to no materializable listener. An unknown,
+  mismatched, protocol-incompatible, or disallowed declared parent previously
+  bound an unintended OS listener while status correctly reported
+  `NoMatchingParent`; it now materializes nothing and warns. The backend-port
+  fallback is retained only for the parentless legacy shape.
 - Applied DestinationRule subset-scoped
   `connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}`
   with per-port > selected-subset > top-level precedence, target-rotation-safe

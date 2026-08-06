@@ -443,17 +443,27 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 Stream proxies can also be produced by the Kubernetes controller instead of
 being written by hand. A Gateway API `TCPRoute` attached to a `protocol: TCP`
 listener and a `UDPRoute` attached to a `protocol: UDP` listener each
-materialize one stream proxy per rule on the Gateway listener port, with the
-rule's `backendRefs` entry as the backend (`<service>.<namespace>.svc.<cluster
-domain>:<port>`). Everything on this page — session management, idle timeout,
-the amplification guard, stream plugins, metrics — applies unchanged to those
-generated proxies; the route only decides the listen port and backend.
+materialize one stream proxy per rule on the Gateway listener port. Everything
+on this page — session management, idle timeout, the amplification guard,
+stream plugins, metrics — applies unchanged to those generated proxies; the
+route only decides the listen port and the backend.
 
-Route admission is strict and fail closed (required numeric `backendRefs[].port`,
-core `Service` backends only, `ReferenceGrant` for cross-namespace backends, no
-cross-namespace `parentRefs`). See
-[gateway_api_conformance.md](gateway_api_conformance.md) for the full field
-table and the live black-box coverage.
+For a `UDPRoute` the rule's `backendRefs` is a weighted **set**. A single
+serviceable leg becomes a direct backend
+(`<service>.<namespace>.svc.<cluster-domain>:<port>`); two or more
+non-zero-weight legs become a generated Ferrum upstream whose target weights are
+the declared Gateway API weights, so ordinary weighted round-robin selection
+applies. Selection happens **once per UDP session** (the client 5-tuple keyed
+above), not per datagram, so distribution converges over sessions. A leg whose
+`Service` is missing keeps its weight but points at an unresolvable target, so
+its share of sessions is dropped rather than handed to the healthy legs.
+
+Route admission is strict and fail closed (required numeric `backendRefs[].port`
+on every entry, core `Service` backends only, `ReferenceGrant` for
+cross-namespace backends, no cross-namespace `parentRefs`, at most one rule per
+`UDPRoute`, and no listener at all for a declared Gateway parent that matches
+nothing). See [gateway_api_conformance.md](gateway_api_conformance.md) for the
+full field table, the exact support boundary, and the live black-box coverage.
 
 ## Compatible Plugins
 
