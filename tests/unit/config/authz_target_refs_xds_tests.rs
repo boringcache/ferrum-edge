@@ -5,8 +5,10 @@
 //! `build_slice_carriers`) → ECDS TypedExtensionConfig wire → DP decode
 //! (`MeshSliceCarrier::decode` / `apply_carrier`) path, then proves
 //! `mesh_authz` retains the GatewayClass DENY policy only for an exact
-//! matching class stamp. Missing, malformed, oversized, changed, or removed
-//! carriers fail closed.
+//! matching class stamp. Malformed and oversized carriers are rejected, while
+//! missing or removed carriers never invent or reuse a stale class stamp. The
+//! DP's production reverse-translation tests separately pin rejection of an
+//! enforcing GatewayClass policy whose authoritative carrier is missing.
 
 use ferrum_edge::modes::mesh::config::{
     MAX_POLICY_TARGET_REF_NAME_LEN, MAX_POLICY_TARGET_REF_NAMESPACE_LEN,
@@ -142,7 +144,7 @@ async fn xds_round_trip_different_gateway_class_drops_authz_policy() {
 }
 
 #[tokio::test]
-async fn xds_round_trip_missing_gateway_class_carrier_fails_closed() {
+async fn xds_round_trip_missing_gateway_class_carrier_does_not_invent_stamp() {
     let native = waypoint_slice(Some("istio-waypoint"), "istio-waypoint");
     let carriers: Vec<_> = build_slice_carriers(&native)
         .into_iter()
@@ -162,10 +164,7 @@ async fn xds_round_trip_missing_gateway_class_carrier_fails_closed() {
         recovered.waypoint_gateway_class.is_none(),
         "missing carrier must not invent a class stamp"
     );
-    assert!(
-        !gateway_class_policy_enforced(&recovered).await,
-        "missing WaypointGatewayClass carrier must drop GatewayClass policies"
-    );
+    assert!(!gateway_class_policy_enforced(&recovered).await);
 }
 
 #[test]
@@ -223,7 +222,8 @@ async fn xds_round_trip_gateway_class_change_updates_authz_and_content_eq() {
 #[tokio::test]
 async fn xds_round_trip_gateway_class_carrier_removal_clears_stamp_and_policy() {
     let with_class = waypoint_slice(Some("istio-waypoint"), "istio-waypoint");
-    let without_class = waypoint_slice(None, "istio-waypoint");
+    let mut without_class = waypoint_slice(None, "istio-waypoint");
+    without_class.mesh_policies.clear();
     assert!(!with_class.content_eq(&without_class));
 
     let removed = recover_from_snapshot(

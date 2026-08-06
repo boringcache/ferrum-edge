@@ -15,7 +15,8 @@ use super::common::{
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::modes::mesh::config::{
-    AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, ServicePort,
+    AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, PolicyAction, PolicyScope,
+    PolicyTargetAttachment, ServicePort,
 };
 use crate::modes::mesh::revision::MeshRevisionRejection;
 use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall, XdsConvergenceSnapshot};
@@ -1328,6 +1329,7 @@ fn reverse_translate(
     // would have empty authz/PeerAuth/JWT/trust-bundle/ServiceEntry/
     // ProxyConfig/workload fields (an unprotected mesh).
     let recovered = recover_slice_carriers(accumulator)?;
+    validate_waypoint_gateway_class_carrier(&recovered, config)?;
 
     // Prefer the full `MeshService` shape recovered from the Services carrier
     // (protocol + per-service workload refs) over the name-only CDS/EDS
@@ -1411,8 +1413,9 @@ fn reverse_translate(
         waypoint_name: config.waypoint_name.clone(),
         // Authoritative Gateway.spec.gatewayClassName for this waypoint,
         // recovered from the WaypointGatewayClass ECDS carrier. Absent when
-        // the CP emitted no carrier (non-waypoint slice, or class unknown) —
-        // GatewayClass targetRefs then fail closed at mesh_authz retain.
+        // the CP emitted no carrier (non-waypoint slice, or class unknown).
+        // An enforcing GatewayClass-targeted policy without this authoritative
+        // carrier was rejected above, before the last-good slice can change.
         waypoint_gateway_class: recovered.waypoint_gateway_class,
         // A non-empty WorkloadLabels carrier is authoritative — the CP computed
         // real effective labels for this workload. An EMPTY carrier is NOT
@@ -1659,11 +1662,54 @@ struct RecoveredSliceCarriers {
     multi_cluster: Option<crate::modes::mesh::config::MultiClusterConfig>,
     sidecar_egress_scope: Option<MeshEgressScopeSnapshot>,
     /// Authoritative waypoint `GatewayClass` name recovered from the dedicated
-    /// ECDS carrier. `None` when absent — GatewayClass targetRefs fail closed.
+    /// ECDS carrier. `None` is valid only when the slice has no enforcing
+    /// GatewayClass-targeted policy; the reverse-translation boundary rejects
+    /// that incoherent combination before installation.
     waypoint_gateway_class: Option<String>,
     /// Guards against multiple WaypointGatewayClass carriers in one ECDS
     /// response (must be exactly one authoritative value when present).
     waypoint_gateway_class_seen: bool,
+}
+
+/// Reject an incoherent waypoint policy snapshot before it can replace the
+/// last-good slice. An enforcing GatewayClass-targeted policy cannot be
+/// evaluated without the authoritative Gateway class carrier: silently
+/// filtering it out would turn a DENY (or an ALLOW policy's implicit deny)
+/// into allow-by-default. Audit-only policies do not affect authorization and
+/// therefore do not make the carrier mandatory.
+fn validate_waypoint_gateway_class_carrier(
+    recovered: &RecoveredSliceCarriers,
+    config: &XdsClientConfig,
+) -> Result<(), String> {
+    if config.waypoint_name.is_none() || recovered.waypoint_gateway_class.is_some() {
+        return Ok(());
+    }
+
+    let missing_authoritative_class = recovered.mesh_policies.iter().any(|policy| {
+        let targets_gateway_class = matches!(
+            &policy.scope,
+            PolicyScope::TargetRefs { attachments }
+                if attachments
+                    .iter()
+                    .any(|attachment| {
+                        matches!(attachment, PolicyTargetAttachment::GatewayClass { .. })
+                    })
+        );
+        let enforces = policy
+            .rules
+            .iter()
+            .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny));
+        targets_gateway_class && enforces
+    });
+
+    if missing_authoritative_class {
+        return Err(
+            "xDS waypoint slice contains an enforcing GatewayClass-targeted policy but no authoritative WaypointGatewayClass carrier"
+                .to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 /// Decode every Ferrum mesh-slice ECDS carrier in `accumulator` and fold it
@@ -4901,18 +4947,34 @@ mod tests {
             Some("ferrum-waypoint")
         );
 
+        let mut missing_class = native.clone();
+        missing_class.waypoint_gateway_class = None;
+        let missing_class_error = accumulator_from_snapshot(&translate_mesh_slice_to_snapshot(
+            &missing_class,
+        ))
+        .try_build_mesh_slice(&config)
+        .expect_err("an enforcing GatewayClass policy without its class carrier must be rejected");
+        assert!(
+            missing_class_error.contains(
+                "enforcing GatewayClass-targeted policy but no authoritative WaypointGatewayClass carrier"
+            ),
+            "unexpected rejection: {missing_class_error}"
+        );
+
         let mut cleared = native.clone();
         cleared.waypoint_gateway_class = None;
+        cleared.mesh_policies.clear();
         let cleared_recovered = accumulator_from_snapshot(&translate_mesh_slice_to_snapshot(
             &cleared,
         ))
         .try_build_mesh_slice(&config)
-        .expect("cleared class recovers")
+        .expect("coherent class and policy removal recovers")
         .expect("present");
         assert!(
             cleared_recovered.waypoint_gateway_class.is_none(),
             "missing carrier must not reuse a stale class stamp"
         );
+        assert!(cleared_recovered.mesh_policies.is_empty());
     }
 
     #[test]
