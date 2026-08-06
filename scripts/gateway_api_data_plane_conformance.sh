@@ -6,8 +6,8 @@ RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/conformance-results}"
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-ferrum-gwapi}"
 FERRUM_IMAGE="${FERRUM_IMAGE:-ferrum-edge:gateway-api-conformance}"
 GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.5.1}"
-GATEWAY_API_PROFILE="${GATEWAY_API_PROFILE:-GATEWAY-HTTP}"
-GATEWAY_API_SUPPORTED_FEATURES="${GATEWAY_API_SUPPORTED_FEATURES:-Gateway,ReferenceGrant,HTTPRoute}"
+GATEWAY_API_PROFILE="${GATEWAY_API_PROFILE:-GATEWAY-HTTP,GATEWAY-GRPC}"
+GATEWAY_API_SUPPORTED_FEATURES="${GATEWAY_API_SUPPORTED_FEATURES:-Gateway,ReferenceGrant,HTTPRoute,GRPCRoute}"
 GATEWAY_API_SKIP_TESTS="${GATEWAY_API_SKIP_TESTS:-}"
 GATEWAY_API_STATUS_ADDRESS="${GATEWAY_API_STATUS_ADDRESS:-127.0.0.1}"
 
@@ -710,21 +710,6 @@ spec:
       backendRefs:
         - name: blackbox-a
           port: 8080
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: GRPCRoute
-metadata:
-  name: blackbox-grpc-declared-unsupported
-  namespace: gateway-conformance-infra
-spec:
-  hostnames: ["grpc.blackbox.example"]
-  parentRefs:
-    - name: ferrum-blackbox
-      sectionName: http
-  rules:
-    - backendRefs:
-        - name: blackbox-a
-          port: 8080
 YAML
 }
 
@@ -848,7 +833,7 @@ run_blackbox_tests() {
     --resolve "tls.blackbox.example:443:${GATEWAY_API_STATUS_ADDRESS}" \
     https://tls.blackbox.example/tls | tee -a "$report"
 
-  echo "GRPCRoute resource applied but request traffic is not run because Ferrum does not claim GATEWAY-GRPC support in this job." >> "$report"
+  echo "HTTPRoute black-box checks complete; GRPCRoute live coverage runs in scripts/gateway_api_grpcroute_conformance.sh (upstream GATEWAY-GRPC claimed separately)." >> "$report"
 }
 
 collect_diagnostics() {

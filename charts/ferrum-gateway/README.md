@@ -283,6 +283,10 @@ must publish matching `streamPorts` (with `service: true` when the Service
 should expose them). The Gateway API conformance lab exercises this path with
 dedicated NodePorts; see [`docs/gateway_api_conformance.md`](../../docs/gateway_api_conformance.md).
 
+Gateway API `GRPCRoute` attaches to HTTP/HTTPS listeners and is release-gated by
+the upstream `GATEWAY-GRPC` profile plus Ferrum black-box checks in
+`scripts/gateway_api_grpcroute_conformance.sh` (same doc).
+
 ## TLS material
 
 Each surface under `tls.*` (`frontend`, `admin`, `backend`, `cpGrpc`, `dpGrpc`)

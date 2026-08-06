@@ -3,8 +3,8 @@
 Ferrum's conformance story spans two surfaces, each with its own owner doc:
 
 1. **Upstream Gateway API conformance** — the `gateway.networking.k8s.io`
-   `GatewayClass` / `Gateway` / `HTTPRoute` surface (plus watched `GRPCRoute`
-   and live black-box `TCPRoute`), validated by the standalone
+   `GatewayClass` / `Gateway` / `HTTPRoute` / `GRPCRoute` surface (plus live
+   black-box `TCPRoute`), validated by the standalone
    **`Gateway API Conformance`** GitHub Actions workflow
    (`.github/workflows/gateway-api-conformance.yml`) against a real
    `kind` data plane.
@@ -32,8 +32,9 @@ citations):
   (Mondays 07:00 UTC), and manual `workflow_dispatch`. A path-filter `changes`
   job skips the heavy lab when no routing / translation / chart / image / proto
   / CI surface changed.
-- **Profile & features.** Gateway API `v1.5.1`, profile `GATEWAY-HTTP`,
-  supported features `Gateway,ReferenceGrant,HTTPRoute`, GatewayClass `ferrum`,
+- **Profile & features.** Gateway API `v1.5.1`, profiles
+  `GATEWAY-HTTP,GATEWAY-GRPC`, supported features
+  `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`, GatewayClass `ferrum`,
   controller `ferrum.io/gateway-controller`. Live `TCPRoute` data-plane behavior
   is release-gated by Ferrum black-box checks in the same workflow (not by
   advertising an upstream `GATEWAY-TCP` profile on this pin).
@@ -48,8 +49,9 @@ citations):
 - **Artifacts.** A `gateway-api-conformance-<version>` bundle
   (`conformance-results/`, 90-day retention). The **run-local `CONFORMANCE.md`**
   inside that bundle is generated per run by
-  `scripts/gateway_api_data_plane_conformance.sh` (with TCPRoute ports and
-  resources appended by `scripts/gateway_api_tcproute_conformance.sh`) and is a
+  `scripts/gateway_api_data_plane_conformance.sh` (with GRPCRoute/TCPRoute ports
+  and resources appended by `scripts/gateway_api_grpcroute_conformance.sh` and
+  `scripts/gateway_api_tcproute_conformance.sh`) and is a
   different file from this repo-root page.
 
 # Istio + xDS Conformance Suite

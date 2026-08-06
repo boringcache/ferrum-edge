@@ -5354,10 +5354,11 @@ fn is_authoritative_cross_cluster_grpc_rejection(response: &GrpcEgressResponse) 
 /// A cross-cluster gRPC route-miss emitted by the source gateway before its
 /// outbound slice materializes. Two shapes qualify: the
 /// `normalize_reject_response(NOT_FOUND, grpc=true)` Trailers-Only `grpc-status:
-/// 5` (NOT_FOUND) with no backend body, or a bare HTTP route-miss /
-/// upstream-overflow status (`404`/`503`/`502`) carrying NO gRPC trailers —
-/// symmetric with [`classify_cross_cluster_http`]'s transient 404/503/bare-502
-/// set. Any response that reached the routed / backend layer always carries a
+/// 12` (UNIMPLEMENTED — Ferrum's HTTP 404→gRPC mapping) with no backend body,
+/// or a bare HTTP route-miss / upstream-overflow status (`404`/`503`/`502`)
+/// carrying NO gRPC trailers — symmetric with
+/// [`classify_cross_cluster_http`]'s transient 404/503/bare-502 set. Any
+/// response that reached the routed / backend layer always carries a
 /// `grpc-status` (the mesh-mTLS rejection uses `grpc-status: 14`; a backend
 /// reply uses `grpc-status: 0`), so a genuinely routed-but-wrong result is never
 /// classified as a route-miss and is asserted immediately instead of retried.
@@ -5367,7 +5368,7 @@ fn cross_cluster_grpc_is_route_miss(response: &GrpcEgressResponse) -> bool {
         .get("grpc-status")
         .or_else(|| response.trailers.get("grpc-status"))
         .map(String::as_str);
-    if response.status == 200 && grpc_status == Some("5") && response.body.is_empty() {
+    if response.status == 200 && grpc_status == Some("12") && response.body.is_empty() {
         return true;
     }
     matches!(response.status, 404 | 502 | 503) && grpc_status.is_none()

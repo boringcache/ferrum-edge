@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Gateway API live `GATEWAY-GRPC` conformance: CI advertises
+  `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`, runs the upstream
+  `GATEWAY-HTTP,GATEWAY-GRPC` profiles against a live Ferrum listener, and
+  adds Ferrum black-box GRPCRoute status / ReferenceGrant / fail-closed /
+  update / delete / Unimplemented coverage via
+  `scripts/gateway_api_grpcroute_conformance.sh` (issue #3272).
+
 - NodeWaypoint captured TCP observability now exports the bounded-cardinality
   `ferrum_mesh_bpf_accept_to_first_byte_microseconds` histogram for IPv4 and
   IPv6. SOCK_OPS timestamps passive establishment and enrolls the exact accepted
@@ -374,6 +381,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address); a distinct backend TLS SNI override is unsupported.
 
 ### Changed
+
+- Native gRPC trailers-only mapping for Ferrum-authored HTTP 404 rejects
+  (route miss, GRPCRoute `reject_unmatched`) now emits `grpc-status`
+  `UNIMPLEMENTED` (12) instead of `NOT_FOUND` (5), matching the official gRPC
+  HTTP↔status table and Gateway API `GRPCExactMethodMatching` (issue #3272).
 
 - Reqwest backend TLS clients built via `use_preconfigured_tls` /
   `BackendTlsConfigBuilder::build_rustls_for_reqwest` now advertise ALPN

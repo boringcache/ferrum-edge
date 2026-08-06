@@ -1389,8 +1389,8 @@ async fn test_grpc_early_rejects_use_grpc_error_shape() {
     );
     assert_eq!(
         headers.get("grpc-status").map(|s| s.as_str()),
-        Some("5"),
-        "Missing route should map to grpc-status 5 (NOT_FOUND)"
+        Some("12"),
+        "Missing route should map to grpc-status 12 (UNIMPLEMENTED)"
     );
 
     let (status2, headers2, body2) = send_grpc_request(
