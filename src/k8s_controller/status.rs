@@ -1711,8 +1711,7 @@ fn route_status(
         // on the conflict-rejects path below).
         let conflict_rejects_acceptance =
             all_parent_matches_conflicted && object.kind != "UDPRoute";
-        let udp_fully_shadowed =
-            object.kind == "UDPRoute" && all_parent_matches_conflicted;
+        let udp_fully_shadowed = object.kind == "UDPRoute" && all_parent_matches_conflicted;
         let conflict_message = parent_conflicts
             .first()
             .map(|conflict| route_conflict_message(conflict));
