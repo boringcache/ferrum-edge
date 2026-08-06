@@ -268,8 +268,8 @@ TLS configuration for client connections with optional mutual authentication:
 
 **Listener Architecture**:
 - **Separate HTTP and HTTPS listeners** for clear protocol separation
-- **HTTP listener**: Always enabled, handles plain text traffic
-- **HTTPS listener**: Enabled only when TLS certificates are configured
+- **HTTP listener**: Enabled by default; `FERRUM_PROXY_HTTP_PORT=0` disables plaintext proxy traffic
+- **HTTPS listener**: Enabled only when TLS certificates are configured and `FERRUM_PROXY_HTTPS_PORT` is non-zero
 - **No protocol conflicts**: Each listener handles its protocol exclusively
 - **Standard port conventions**: HTTP (8000), HTTPS (8443), both configurable
 
@@ -308,7 +308,7 @@ Optional HTTP/3 listener using QUIC transport, enabled via `FERRUM_ENABLE_HTTP3=
 - QUIC-based transport with TLS 1.3 (mandatory per spec)
 - Shares the HTTPS port with HTTP/1.1 and HTTP/2 listeners
 - Configurable idle timeout and max concurrent streams
-- **0-RTT early data** — disabled by default. HTTP/3 can opt in via `FERRUM_TLS_EARLY_DATA_METHODS` (method allowlist; non-GET methods log replay-risk warnings). Allowed methods are enforced at accept time and disallowed methods are rejected; allowed 0-RTT requests forward `Early-Data: 1` to backends. HTTPS/HTTP/1.1 and HTTP/2 frontends keep 0-RTT disabled even when the env var is set (tokio-rustls cannot expose per-request early-data state)
+- **0-RTT early data** — disabled by default. HTTP/3 can opt in via `FERRUM_TLS_EARLY_DATA_METHODS` (method allowlist; non-GET methods log replay-risk warnings). The allowlist is enforced when each request is admitted: disallowed early requests receive `425 Too Early`, while allowed 0-RTT requests forward `Early-Data: 1` to backends. HTTPS/HTTP/1.1 and HTTP/2 frontends keep 0-RTT disabled even when the env var is set (tokio-rustls cannot expose per-request early-data state)
 
 ### **4. Load Balancer & Health Checks (`src/load_balancer.rs`, `src/health_check.rs`)**
 
