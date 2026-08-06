@@ -605,15 +605,9 @@ mod tests {
                 "claimed.example.com".to_string(),
                 vec![declared.clone()],
             )]),
-            declared_wildcard: HashMap::from([(
-                "example.net".to_string(),
-                vec![declared.clone()],
-            )]),
+            declared_wildcard: HashMap::from([("example.net".to_string(), vec![declared.clone()])]),
             san_exact: HashMap::from([
-                (
-                    "claimed.example.com".to_string(),
-                    vec![san_alias.clone()],
-                ),
+                ("claimed.example.com".to_string(), vec![san_alias.clone()]),
                 ("api.example.net".to_string(), vec![san_alias.clone()]),
                 ("unclaimed.example.org".to_string(), vec![san_alias.clone()]),
             ]),
