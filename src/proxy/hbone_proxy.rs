@@ -1797,6 +1797,7 @@ mod tests {
                 owner_namespace: "default".to_string(),
                 owner_service: "redis".to_string(),
             }],
+            sidecar_ingress_declared: true,
             local_workload_addresses: vec!["10.244.1.7".to_string()],
             ..MeshConfig::default()
         };
@@ -1837,6 +1838,16 @@ mod tests {
             &proxy,
             None,
             Some(&MeshConfig::default()),
+            Some(16379)
+        ));
+        let stale_listener_without_declaration = MeshConfig {
+            local_ingress_listeners: mesh.local_ingress_listeners.clone(),
+            ..MeshConfig::default()
+        };
+        assert!(!inbound_ingress_relay_effective_destination_allowed(
+            &proxy,
+            None,
+            Some(&stale_listener_without_declaration),
             Some(16379)
         ));
     }

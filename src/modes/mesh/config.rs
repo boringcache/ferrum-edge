@@ -2839,6 +2839,9 @@ impl MeshConfig {
         host: &str,
         port: u16,
     ) -> bool {
+        if !self.sidecar_ingress_declared {
+            return false;
+        }
         let mut rest = self.local_ingress_listeners.iter();
         let Some(listener) = rest.find(|entry| entry.port == listener_port) else {
             return false;

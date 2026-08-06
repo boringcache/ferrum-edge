@@ -1272,6 +1272,18 @@ fn prepare_normalized_gateway_config_for_mesh(
             })
             .cloned()
             .collect();
+        // The listener port is the dispatch key for the HTTP router, plaintext
+        // TCP table, and authenticated CONNECT resolver. Preserve no winner
+        // when an untrusted carrier duplicates it: the materializer already
+        // drops every claimant, so retaining phantom duplicates here would put
+        // router grouping out of lock-step with the routes it emitted. An empty
+        // result remains fail-closed through `sidecar_ingress_declared` below.
+        let mut carried_port_counts = std::collections::BTreeMap::<u16, usize>::new();
+        for listener in &mesh.local_ingress_listeners {
+            *carried_port_counts.entry(listener.port).or_default() += 1;
+        }
+        mesh.local_ingress_listeners
+            .retain(|listener| carried_port_counts.get(&listener.port) == Some(&1));
         // Preserve the declaration signal independently of the surviving
         // listener set. Explicit-empty, all-unsupported, and carrier-rejected
         // ingress blocks still replace the ordinary inbound CONNECT surface;
@@ -11849,6 +11861,24 @@ fn resolve_inbound_mtls_mode(
     slice.resolve_inbound_workload_mtls_mode_fail_closed()
 }
 
+/// Count valid, owner-stamped Sidecar ingress carrier entries by their declared
+/// listener port. Any count above one is ambiguous and must contribute to no
+/// route, TLS alias, or PeerAuthentication selection domain.
+fn valid_owned_ingress_listener_port_counts(
+    slice: &MeshSlice,
+) -> std::collections::BTreeMap<u16, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for listener in &slice.local_ingress_listeners {
+        if listener.endpoint_is_valid()
+            && !listener.owner_namespace.is_empty()
+            && !listener.owner_service.is_empty()
+        {
+            *counts.entry(listener.port).or_default() += 1;
+        }
+    }
+    counts
+}
+
 /// Return every local app/listener port that can select a PeerAuthentication
 /// override for this slice. Carried namespace policies may mention ports served
 /// by unrelated workloads, so their raw key union is not a safe listener table.
@@ -11857,6 +11887,7 @@ fn selectable_inbound_peer_auth_ports(
     runtime: &MeshRuntimeConfig,
 ) -> std::collections::BTreeSet<u16> {
     let mut ports = std::collections::BTreeSet::new();
+    let ingress_port_counts = valid_owned_ingress_listener_port_counts(slice);
     let (services, local_workload_src): (
         &[crate::modes::mesh::config::MeshService],
         &[crate::modes::mesh::config::Workload],
@@ -11872,6 +11903,7 @@ fn selectable_inbound_peer_auth_ports(
                 listener.endpoint_is_valid()
                     && !listener.owner_namespace.is_empty()
                     && !listener.owner_service.is_empty()
+                    && ingress_port_counts.get(&listener.port) == Some(&1)
             })
             .map(|listener| listener.endpoint_port)
             .filter(|port| *port != 0)
@@ -11922,6 +11954,7 @@ fn selectable_inbound_peer_auth_ports(
         if listener.endpoint_is_valid()
             && !listener.owner_namespace.is_empty()
             && !listener.owner_service.is_empty()
+            && ingress_port_counts.get(&listener.port) == Some(&1)
         {
             ports.insert(listener.endpoint_port);
         }
@@ -12038,6 +12071,7 @@ fn resolve_inbound_app_ports_by_orig_dst_port(
     let Some(slice) = slice else {
         return std::collections::BTreeMap::new();
     };
+    let ingress_port_counts = valid_owned_ingress_listener_port_counts(slice);
     let mut aliases = std::collections::BTreeMap::new();
     for listener in &slice.local_ingress_listeners {
         // Match the ingress materializer's carried-value boundary checks. A
@@ -12046,15 +12080,11 @@ fn resolve_inbound_app_ports_by_orig_dst_port(
         if !listener.endpoint_is_valid()
             || listener.owner_namespace.is_empty()
             || listener.owner_service.is_empty()
+            || ingress_port_counts.get(&listener.port) != Some(&1)
         {
             continue;
         }
-        // Native Sidecar resolution already deduplicates by listener port and
-        // keeps the first entry. Preserve that deterministic behavior for a
-        // defensive carried-slice duplicate as well.
-        aliases
-            .entry(listener.port)
-            .or_insert(listener.endpoint_port);
+        aliases.insert(listener.port, listener.endpoint_port);
     }
     aliases
 }
@@ -32499,8 +32529,21 @@ mod tests {
                 declared_ingress_http_ports: 1,
                 ..MeshSlice::default()
             };
+            assert!(
+                resolve_inbound_app_ports_by_orig_dst_port(Some(&slice)).is_empty(),
+                "duplicate declared port must not select a pre-handshake TLS app-port alias"
+            );
             let config = gateway_config_from_mesh_slice(&slice, &runtime, None, None)
                 .expect("slice to config");
+            assert!(
+                config
+                    .mesh
+                    .as_ref()
+                    .unwrap()
+                    .local_ingress_listeners
+                    .is_empty(),
+                "duplicate declared port must not leave phantom router/CONNECT entries"
+            );
             assert!(
                 config
                     .mesh
