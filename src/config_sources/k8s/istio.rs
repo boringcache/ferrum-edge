@@ -5379,10 +5379,6 @@ pub(crate) const SIDECAR_OUTBOUND_POLICY_MALFORMED: &str =
 /// Ferrum cannot redirect unmatched egress through a named destination.
 pub(crate) const SIDECAR_OUTBOUND_POLICY_EGRESS_PROXY: &str =
     "outboundTrafficPolicy.egressProxy is not supported (enforcing REGISTRY_ONLY)";
-/// Reported reason: `outboundTrafficPolicy.mode` was omitted inside a present
-/// block, so the Istio proto zero value (`REGISTRY_ONLY`) applies.
-pub(crate) const SIDECAR_OUTBOUND_POLICY_MODE_OMITTED: &str =
-    "outboundTrafficPolicy.mode omitted (enforcing the REGISTRY_ONLY proto default)";
 /// Fail-closed deferral reason: `outboundTrafficPolicy.mode` is not one of the
 /// two supported tokens, or is not a string at all.
 pub(crate) const SIDECAR_OUTBOUND_POLICY_MODE_UNSUPPORTED: &str =
@@ -5412,11 +5408,13 @@ pub(crate) struct SidecarOutboundPolicy {
 ///
 /// Supported, exactly: `mode: ALLOW_ANY` and `mode: REGISTRY_ONLY`.
 ///
-/// Everything else about a PRESENT block **fails closed to `REGISTRY_ONLY`** and
-/// records a field-specific deferral reason:
-///   - **`mode` omitted** — `REGISTRY_ONLY` is the Istio proto zero value of
-///     `OutboundTrafficPolicy.Mode`, so this is simultaneously the faithful and
-///     the conservative reading. Still reported, so it is never silent.
+/// A present object with **`mode` omitted or null** resolves to `ALLOW_ANY`, the
+/// documented Istio Sidecar API default. This is distinct from omitting the
+/// entire `outboundTrafficPolicy` block, which inherits Ferrum's mesh-wide tier.
+/// The enum's protobuf zero value does not override the API-level default.
+///
+/// Every other unrepresentable PRESENT block **fails closed to `REGISTRY_ONLY`**
+/// and records a field-specific deferral reason:
 ///   - **`mode` unrecognized or not a string** (an `ALOW_ANY` typo, the numeric
 ///     proto form, …) — the intent is ambiguous, so the restrictive mode applies.
 ///     The raw value is never echoed into the status.
@@ -5466,7 +5464,10 @@ pub(crate) fn classify_sidecar_outbound_traffic_policy(spec: &Value) -> SidecarO
         return fail_closed(SIDECAR_OUTBOUND_POLICY_EGRESS_PROXY);
     }
     match block.get("mode") {
-        None | Some(Value::Null) => fail_closed(SIDECAR_OUTBOUND_POLICY_MODE_OMITTED),
+        None | Some(Value::Null) => SidecarOutboundPolicy {
+            policy: Some(OutboundTrafficPolicy::AllowAny),
+            deferred: None,
+        },
         Some(Value::String(mode)) => match mode.as_str() {
             "ALLOW_ANY" => SidecarOutboundPolicy {
                 policy: Some(OutboundTrafficPolicy::AllowAny),

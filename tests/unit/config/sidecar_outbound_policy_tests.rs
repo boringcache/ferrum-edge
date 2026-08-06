@@ -3,8 +3,9 @@
 //!
 //! Scope of this file (no mesh runtime, no sockets):
 //!   - **Translation**: the supported `ALLOW_ANY` / `REGISTRY_ONLY` modes, and
-//!     every fail-closed variant (omitted / unknown / non-string `mode`,
-//!     non-object block, unsupported `egressProxy`). A degraded variant must
+//!     the documented `ALLOW_ANY` default for an omitted/null `mode`, and every
+//!     fail-closed variant (unknown / non-string `mode`, non-object block,
+//!     unsupported `egressProxy`). A degraded variant must
 //!     still leave the `Sidecar` — and therefore its `egress` narrowing — in the
 //!     translation, because dropping it would WIDEN the slice.
 //!   - **Selection**: which `Sidecar` supplies the policy for a workload, and
@@ -139,6 +140,22 @@ fn registry_only_mode_translates_to_registry_only() {
     );
 }
 
+#[test]
+fn present_policy_with_omitted_or_null_mode_uses_istio_allow_any_default() {
+    for policy in [
+        json!({}),
+        json!({ "mode": null }),
+        json!({ "egressProxy": null }),
+    ] {
+        let sidecar = translate_one(spec_with_egress_and_policy(Some(policy)));
+        assert_eq!(
+            sidecar.outbound_traffic_policy,
+            Some(OutboundTrafficPolicy::AllowAny),
+            "a present Sidecar outboundTrafficPolicy object with no concrete mode uses Istio's documented ALLOW_ANY default"
+        );
+    }
+}
+
 // ── Translation: fail-closed variants ─────────────────────────────────────
 
 /// Every unrepresentable-but-present variant must resolve to the restrictive
@@ -146,7 +163,6 @@ fn registry_only_mode_translates_to_registry_only() {
 #[test]
 fn unrepresentable_outbound_policy_variants_fail_closed_without_dropping_the_sidecar() {
     let cases: Vec<(&str, Value)> = vec![
-        ("mode omitted (Istio proto zero value)", json!({})),
         (
             "egressProxy with no mode",
             json!({ "egressProxy": { "host": "istio-egressgateway.istio-system.svc.cluster.local" } }),
@@ -154,7 +170,6 @@ fn unrepresentable_outbound_policy_variants_fail_closed_without_dropping_the_sid
         ("unknown mode token", json!({ "mode": "ALOW_ANY" })),
         ("lowercase mode token", json!({ "mode": "allow_any" })),
         ("numeric proto form", json!({ "mode": 1 })),
-        ("null mode", json!({ "mode": null })),
         (
             "egressProxy alongside an explicit ALLOW_ANY",
             json!({
@@ -226,15 +241,15 @@ fn explicit_null_egress_proxy_is_treated_as_absent() {
         Some(OutboundTrafficPolicy::RegistryOnly)
     );
 
-    // Still fail-closed when the block carries neither a usable mode nor a
-    // proxy: the mode is what is missing, not the (absent) egressProxy.
+    // With no concrete mode and no egress proxy, Istio's documented Sidecar
+    // API default applies.
     let sidecar = translate_one(spec_with_egress_and_policy(Some(
         json!({ "egressProxy": null }),
     )));
     assert_eq!(
         sidecar.outbound_traffic_policy,
-        Some(OutboundTrafficPolicy::RegistryOnly),
-        "an omitted mode still resolves to the REGISTRY_ONLY proto default"
+        Some(OutboundTrafficPolicy::AllowAny),
+        "an omitted mode resolves to the documented ALLOW_ANY API default"
     );
 }
 

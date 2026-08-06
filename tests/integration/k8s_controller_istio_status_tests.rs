@@ -958,6 +958,27 @@ fn sidecar_supported_outbound_traffic_policy_is_reported_as_enforced() {
     }
 }
 
+#[test]
+fn sidecar_omitted_mode_reports_the_istio_allow_any_default_without_deferral() {
+    let obj = object(
+        "networking.istio.io/v1",
+        "Sidecar",
+        "sc-default-mode",
+        json!({ "outboundTrafficPolicy": {} }),
+    );
+    let updates = plan_istio_status_updates(
+        &[obj],
+        options().with_mesh_sidecar_ingress_enforced(true),
+    );
+    let translation = sidecar_translation(&updates, "sc-default-mode");
+    assert_eq!(translation["outbound_traffic_policy"], json!("ALLOW_ANY"));
+    assert_eq!(
+        translation["outbound_traffic_policy_enforced"],
+        json!(true)
+    );
+    assert_eq!(translation["deferred_fields"], json!([]));
+}
+
 /// An omitted block reports `Inherit` and is never claimed as enforced — the
 /// mesh-wide policy is what is actually in force.
 #[test]
@@ -1017,7 +1038,6 @@ fn sidecar_outbound_traffic_policy_not_reported_as_enforced_when_gate_is_off() {
 fn sidecar_unrepresentable_outbound_traffic_policy_is_accepted_and_deferred_fail_closed() {
     let enforced = options().with_mesh_sidecar_ingress_enforced(true);
     let cases: Vec<(&str, Value, &str)> = vec![
-        ("sc-no-mode", json!({}), "mode omitted"),
         (
             "sc-bad-mode",
             json!({ "mode": "ALOW_ANY" }),

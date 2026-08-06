@@ -1619,14 +1619,15 @@ pub struct MeshSidecar {
     /// workload, so there is no inheritance chain here (unlike `egress`, whose
     /// omitted-means-inherit walk is a separate, egress-only concern).
     ///
-    /// Fail-closed on the K8s path: a PRESENT `outboundTrafficPolicy` block that
-    /// Ferrum cannot represent exactly — an omitted `mode` (the Istio proto zero
-    /// value is `REGISTRY_ONLY`), an unrecognized/non-string `mode`, a non-object
-    /// block, or an `egressProxy` Ferrum cannot route through — resolves to
-    /// [`OutboundTrafficPolicy::RegistryOnly`] and is surfaced in the resource's
-    /// `deferred_fields` status. The Sidecar itself is never REJECTED over this
-    /// field: dropping it would also drop its egress narrowing and thereby WIDEN
-    /// both the slice's service view and the derived outbound registry.
+    /// On the K8s path, a present object with omitted/null `mode` uses Istio's
+    /// documented `ALLOW_ANY` default. A PRESENT `outboundTrafficPolicy` block
+    /// Ferrum cannot represent exactly — an unrecognized/non-string `mode`, a
+    /// non-object block, or an `egressProxy` Ferrum cannot route through —
+    /// resolves fail-closed to [`OutboundTrafficPolicy::RegistryOnly`] and is
+    /// surfaced in the resource's `deferred_fields` status. The Sidecar itself
+    /// is never REJECTED over this field: dropping it would also drop its egress
+    /// narrowing and thereby WIDEN both the slice's service view and the derived
+    /// outbound registry.
     ///
     /// Applied only under `FERRUM_MESH_SIDECAR_ENFORCED && !…_DRY_RUN` (the same
     /// effective gate as `ingress[]` materialization) — see

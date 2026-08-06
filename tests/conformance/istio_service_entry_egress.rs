@@ -456,11 +456,10 @@ fn sidecar_unrepresentable_outbound_traffic_policy_fails_closed() {
         category = CATEGORY,
         feature = "Sidecar.outboundTrafficPolicy unsupported variants fail closed to REGISTRY_ONLY",
         status = Status::Supported,
-        notes = "Issue #3262: omitted/unknown/non-string mode, non-object block, and egressProxy all enforce REGISTRY_ONLY with a field-specific deferred_fields entry; the Sidecar itself stays accepted.",
+        notes = "Issue #3262: unknown/non-string mode, non-object block, and egressProxy all enforce REGISTRY_ONLY with a field-specific deferred_fields entry; the Sidecar itself stays accepted. An omitted mode uses Istio's documented ALLOW_ANY default.",
     );
 
     let cases = [
-        json!({}),
         json!({ "mode": "ALOW_ANY" }),
         json!({ "mode": 1 }),
         json!("REGISTRY_ONLY"),
