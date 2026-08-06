@@ -131,7 +131,6 @@ async fn spawn_h3_gateway(config: Value) -> (GatewayHarness, u16, tempfile::Temp
             .capture_output()
             .max_attempts(1)
             .env("FERRUM_ENABLE_HTTP3", "true")
-            .env("FERRUM_PROXY_HTTP_PORT", "0")
             .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
             .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
             .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)

@@ -4392,6 +4392,190 @@ mod backend_target_selection_tests {
         );
     }
 
+    /// Ordinary configured targets carry `service_port_policy_key = None` while
+    /// TCP reconstructs the exclude with `Some(effective_policy_port)`. Full
+    /// sticky-identity equality would miss the just-tried entry; endpoint-lane
+    /// matching via `dispatch_policy_port()` must still rotate away.
+    #[test]
+    fn tcp_retry_excludes_none_policy_key_via_effective_lane() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        let configured = config.upstreams[0].targets[0].clone();
+        assert!(
+            configured.service_port_policy_key.is_none(),
+            "fixture must use an ordinary None policy key"
+        );
+        assert_eq!(configured.dispatch_policy_port(), 5432);
+
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let params = retry_params();
+        let proxy = proxy_with_subset(None);
+        let health_checker = HealthChecker::new();
+
+        // Reconstruct the TCP exclude the same way try_next_target does:
+        // Some(policy_port) against configured None.
+        let exclude = UpstreamTarget {
+            host: "allowed.local".into(),
+            port: 5432,
+            service_port_policy_key: Some(5432),
+            weight: 1,
+            path: None,
+            tags: HashMap::new(),
+            locality: None,
+        };
+        assert!(
+            !crate::load_balancer::same_sticky_identity(&configured, &exclude),
+            "sticky identity must not equate None-keyed configured target with Some(port) reconstruct"
+        );
+
+        let next = LoadBalancerCache::select_next_target_excluding_endpoint_lane_from(
+            &snapshot, "ferrum", "orders", "retry", &exclude, None,
+        )
+        .expect("endpoint-lane exclude must recognize the None-keyed target");
+        assert_eq!(next.host, "blocked.local");
+        assert_eq!(next.port, 5432);
+
+        let (host, port, policy_port) = try_next_target(
+            &params,
+            &proxy,
+            &health_checker,
+            "allowed.local",
+            5432,
+            5432,
+            &snapshot,
+        )
+        .expect("try_next_target must rotate via endpoint-lane exclude");
+        assert_eq!(host, "blocked.local");
+        assert_eq!(port, 5432);
+        assert_eq!(policy_port, 5432);
+    }
+
+    /// Same dial endpoint and policy lane, distinct Service identity tags:
+    /// TCP retains only the endpoint/lane tuple, so both ambiguous entries must
+    /// be excluded (fail closed) rather than pretending empty reconstructed
+    /// tags identify one of them.
+    #[test]
+    fn tcp_retry_excludes_ambiguous_same_endpoint_lane_identities() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        config.upstreams[0].targets = vec![
+            UpstreamTarget {
+                host: "shared.local".into(),
+                port: 5432,
+                service_port_policy_key: None,
+                weight: 1,
+                tags: HashMap::from([(
+                    crate::config::types::UPSTREAM_TARGET_SERVICE_NAME_TAG.to_string(),
+                    "svc-a".to_string(),
+                )]),
+                locality: None,
+                path: None,
+            },
+            UpstreamTarget {
+                host: "shared.local".into(),
+                port: 5432,
+                service_port_policy_key: None,
+                weight: 1,
+                tags: HashMap::from([(
+                    crate::config::types::UPSTREAM_TARGET_SERVICE_NAME_TAG.to_string(),
+                    "svc-b".to_string(),
+                )]),
+                locality: None,
+                path: None,
+            },
+            UpstreamTarget {
+                host: "other.local".into(),
+                port: 5432,
+                service_port_policy_key: None,
+                weight: 1,
+                tags: HashMap::new(),
+                locality: None,
+                path: None,
+            },
+        ];
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let params = retry_params();
+        let proxy = proxy_with_subset(None);
+        let health_checker = HealthChecker::new();
+
+        let (host, port, policy_port) = try_next_target(
+            &params,
+            &proxy,
+            &health_checker,
+            "shared.local",
+            5432,
+            5432,
+            &snapshot,
+        )
+        .expect("alternate host outside the excluded lane must remain selectable");
+        assert_eq!(host, "other.local");
+        assert_eq!(port, 5432);
+        assert_eq!(policy_port, 5432);
+
+        // Only the ambiguous shared.local lane remains — rotation must stop.
+        let mut only_shared = config;
+        only_shared.upstreams[0].targets.truncate(2);
+        let cache = LoadBalancerCache::new(&only_shared);
+        let snapshot = cache.load();
+        assert_eq!(
+            try_next_target(
+                &params,
+                &proxy,
+                &health_checker,
+                "shared.local",
+                5432,
+                5432,
+                &snapshot,
+            ),
+            None,
+            "ambiguous same-endpoint/lane entries must not be reselected"
+        );
+    }
+
+    /// Anti-drift: every TCP connect-retry selection site must use the
+    /// endpoint-lane exclude helpers, never the HTTP sticky-identity variants.
+    #[test]
+    fn tcp_retry_call_sites_use_endpoint_lane_exclude_helpers() {
+        let src = include_str!("tcp_proxy.rs");
+        // Build the markers from fragments so this source-scanning test cannot
+        // match its own string literal before it reaches the production body.
+        let try_next_marker = concat!("fn try_next", "_target(");
+        let try_next = src
+            .split(try_next_marker)
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("try_next_target body");
+        assert!(
+            try_next.contains("excluding_endpoint_lane"),
+            "try_next_target must call endpoint-lane exclude helpers"
+        );
+        assert!(
+            !try_next.contains("select_next_target_from(")
+                && !try_next.contains("select_next_target_for_port_from(")
+                && !try_next.contains("select_next_target_subset_from(")
+                && !try_next.contains("select_next_target_for_port_subset_from("),
+            "try_next_target must not call sticky-identity select_next helpers"
+        );
+        // try_next_enforced_target is the only other retry rotator and must
+        // delegate to try_next_target (not open-code a second selection path).
+        let enforced_marker = concat!("fn try_next_enforced", "_target(");
+        let enforced = src
+            .split(enforced_marker)
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("try_next_enforced_target body");
+        assert!(
+            enforced.contains("try_next_target("),
+            "enforced retry must reuse try_next_target"
+        );
+        assert!(
+            !enforced.contains("select_next_target"),
+            "enforced retry must not open-code select_next"
+        );
+    }
+
     #[test]
     fn tcp_retry_target_skips_unhealthy_alternate_target() {
         let mut config = config_with_two_targets();
@@ -4547,18 +4731,20 @@ mod backend_target_selection_tests {
                     tags: HashMap::new(),
                     locality: None,
                 };
-                let expected = LoadBalancerCache::select_next_target_for_port_from(
-                    &snapshot, "ferrum", "orders", &key, 5432, &exclude, None,
-                )?;
-                let failed_host_key = LoadBalancerCache::select_next_target_for_port_from(
-                    &snapshot,
-                    "ferrum",
-                    "orders",
-                    &initial.target.host,
-                    5432,
-                    &exclude,
-                    None,
-                )?;
+                let expected =
+                    LoadBalancerCache::select_next_target_for_port_excluding_endpoint_lane_from(
+                        &snapshot, "ferrum", "orders", &key, 5432, &exclude, None,
+                    )?;
+                let failed_host_key =
+                    LoadBalancerCache::select_next_target_for_port_excluding_endpoint_lane_from(
+                        &snapshot,
+                        "ferrum",
+                        "orders",
+                        &initial.target.host,
+                        5432,
+                        &exclude,
+                        None,
+                    )?;
                 (expected.host != failed_host_key.host)
                     .then(|| (key, (initial.target.host.clone(), initial.target.port)))
             })
@@ -4590,7 +4776,7 @@ mod backend_target_selection_tests {
             tags: HashMap::new(),
             locality: None,
         };
-        let expected = LoadBalancerCache::select_next_target_for_port_from(
+        let expected = LoadBalancerCache::select_next_target_for_port_excluding_endpoint_lane_from(
             &snapshot, "ferrum", "orders", &flow_key, 5432, &exclude, None,
         )
         .expect("expected retry target");
@@ -5082,6 +5268,14 @@ enum ClientRelayStream {
 
 /// Try to select a different upstream target for retry, excluding the current one.
 /// Returns `None` if no upstream is configured or no alternate target is available.
+///
+/// Stream connect-retry retains only the live `(host, dial port, policy lane)`
+/// tuple — not the full sticky/routing identity HTTP/H3 exclusion uses — so
+/// selection goes through the endpoint-lane exclude contract. That contract
+/// matches `dispatch_policy_port()` (covering both `service_port_policy_key =
+/// None` ordinary targets and stamped mesh policy keys) and drops every
+/// configured entry on that effective lane, so ambiguous same-endpoint
+/// siblings cannot be reselected from a reconstructed empty-tags exclude.
 fn try_next_target(
     params: &TcpConnParams,
     proxy: &Proxy,
@@ -5102,6 +5296,10 @@ fn try_next_target(
     let exclude = crate::config::types::UpstreamTarget {
         host: current_host.to_string(),
         port: current_port,
+        // Stamp the effective policy lane the dial used. Endpoint-lane matching
+        // compares via `dispatch_policy_port()`, so this matches both ordinary
+        // targets (`service_port_policy_key = None`, policy port == dial port)
+        // and mesh targets that carry an explicit policy key.
         service_port_policy_key: Some(current_policy_port),
         weight: 1,
         path: None,
@@ -5113,7 +5311,7 @@ fn try_next_target(
     let lb_hash_key = params.lb_hash_key.as_str();
     let next = match (params.upstream_subset.as_deref(), params.lb_port_lane) {
         (Some(subset_name), Some(port)) => {
-            LoadBalancerCache::select_next_target_for_port_subset_from(
+            LoadBalancerCache::select_next_target_for_port_subset_excluding_endpoint_lane_from(
                 lb_snapshot,
                 &proxy.namespace,
                 upstream_id,
@@ -5124,25 +5322,29 @@ fn try_next_target(
                 Some(&health_ctx),
             )
         }
-        (Some(subset_name), None) => LoadBalancerCache::select_next_target_subset_from(
-            lb_snapshot,
-            &proxy.namespace,
-            upstream_id,
-            lb_hash_key,
-            subset_name,
-            &exclude,
-            Some(&health_ctx),
-        ),
-        (None, Some(port)) => LoadBalancerCache::select_next_target_for_port_from(
-            lb_snapshot,
-            &proxy.namespace,
-            upstream_id,
-            lb_hash_key,
-            port,
-            &exclude,
-            Some(&health_ctx),
-        ),
-        (None, None) => LoadBalancerCache::select_next_target_from(
+        (Some(subset_name), None) => {
+            LoadBalancerCache::select_next_target_subset_excluding_endpoint_lane_from(
+                lb_snapshot,
+                &proxy.namespace,
+                upstream_id,
+                lb_hash_key,
+                subset_name,
+                &exclude,
+                Some(&health_ctx),
+            )
+        }
+        (None, Some(port)) => {
+            LoadBalancerCache::select_next_target_for_port_excluding_endpoint_lane_from(
+                lb_snapshot,
+                &proxy.namespace,
+                upstream_id,
+                lb_hash_key,
+                port,
+                &exclude,
+                Some(&health_ctx),
+            )
+        }
+        (None, None) => LoadBalancerCache::select_next_target_excluding_endpoint_lane_from(
             lb_snapshot,
             &proxy.namespace,
             upstream_id,

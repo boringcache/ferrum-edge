@@ -17,6 +17,7 @@ use crate::modes::mesh::config::{
     TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
     WorkloadSelector, admit_request_match_port_pattern, is_mesh_condition_ip_key,
     is_supported_mesh_condition_key, mesh_condition_has_values, validate_mesh_condition_ip_block,
+    validate_mesh_export_to,
 };
 
 use super::{
@@ -1024,6 +1025,38 @@ fn destination_rule(
         .map(|subset| translate_subset(acc, object, subset))
         .collect::<Result<Vec<_>, _>>()?;
 
+    // `spec.exportTo` visibility (issue #2465). Istio's default for an
+    // omitted — or explicitly empty — list is PUBLIC, so it is materialized as
+    // an explicit `["*"]`: the mesh model's EMPTY `export_to` means
+    // namespace-local on the native/file sources, exactly like ServiceEntry and
+    // the VirtualService CORS carrier, and leaving the list empty here would
+    // silently make every Kubernetes DestinationRule namespace-local.
+    //
+    // `optional_string_array` (not the lossy `string_array`) is deliberate: a
+    // non-array `exportTo`, or a non-string entry, is a REJECTION rather than a
+    // silently dropped visibility constraint. The declaring namespace travels
+    // on the rule itself, which is what lets `.` expand later.
+    let export_to = {
+        let declared = optional_string_array(
+            object,
+            &object.spec,
+            "exportTo",
+            "DestinationRule spec.exportTo",
+        )?;
+        let mut errors = Vec::new();
+        validate_mesh_export_to("DestinationRule spec", &declared, &mut errors);
+        if let Some(first) = errors.first() {
+            return Err(invalid_resource(object, first.clone()));
+        }
+        if declared.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            let mut entries = declared;
+            crate::modes::mesh::config::normalize_mesh_export_to(&mut entries);
+            entries
+        }
+    };
+
     Ok(MeshDestinationRule {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
@@ -1031,6 +1064,7 @@ fn destination_rule(
         traffic_policy,
         port_level_settings,
         subsets,
+        export_to,
     })
 }
 
@@ -2163,6 +2197,33 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
         return Err(invalid_resource(object, "ServiceEntry requires spec.hosts"));
     }
 
+    // Istio's omitted or explicitly empty `spec.exportTo` is public. Preserve
+    // that at the Kubernetes boundary as an explicit `["*"]`, because the native
+    // mesh model intentionally interprets an empty list as namespace-local.
+    // Parse strictly: silently dropping a malformed visibility constraint and
+    // then substituting a default would either hide or expose the resource for
+    // the wrong tenants.
+    let export_to = {
+        let declared = optional_string_array(
+            object,
+            &object.spec,
+            "exportTo",
+            "ServiceEntry spec.exportTo",
+        )?;
+        let mut errors = Vec::new();
+        validate_mesh_export_to("ServiceEntry spec", &declared, &mut errors);
+        if let Some(first) = errors.first() {
+            return Err(invalid_resource(object, first.clone()));
+        }
+        if declared.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            let mut entries = declared;
+            crate::modes::mesh::config::normalize_mesh_export_to(&mut entries);
+            entries
+        }
+    };
+
     let mut endpoints = Vec::new();
     for endpoint in object
         .spec
@@ -2211,7 +2272,7 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
             _ => ServiceEntryLocation::MeshExternal,
         },
         ports: service_ports(object)?,
-        export_to: string_array(&object.spec, "exportTo"),
+        export_to,
         workload_selector: object
             .spec
             .get("workloadSelector")
@@ -3722,12 +3783,38 @@ fn virtual_service_routes(
         .and_then(|http| http.get("corsPolicy"))
         .and_then(mesh_cors_policy_from_value)
     {
+        // Same fail-closed boundary the DestinationRule path applies: this
+        // list is the only thing keeping a namespace-local CORS policy off
+        // another tenant's outbound routes, and
+        // `virtual_service_cors_policy_exported_to_namespace` interprets it
+        // through the shared `export_visibility_admits` evaluator rather than
+        // re-validating it. Rejecting HERE keeps a malformed VirtualService a
+        // per-resource `FerrumAccepted=False` instead of letting it reach the
+        // mesh-config backstop and refuse the whole config.
+        //
+        // `optional_string_array` (not the lossy `string_array`) for the same
+        // reason the DestinationRule path uses it: a non-array `exportTo`, or
+        // a non-string entry, would otherwise be silently dropped and the
+        // policy would default to Istio's PUBLIC `["*"]` — a fail-open on the
+        // one field that bounds the policy's blast radius.
         let export_to = {
-            let declared = string_array(&object.spec, "exportTo");
+            let declared = optional_string_array(
+                object,
+                &object.spec,
+                "exportTo",
+                "VirtualService spec.exportTo",
+            )?;
+            let mut errors = Vec::new();
+            validate_mesh_export_to("VirtualService spec", &declared, &mut errors);
+            if let Some(first) = errors.first() {
+                return Err(invalid_resource(object, first.clone()));
+            }
             if declared.is_empty() {
                 vec!["*".to_string()]
             } else {
-                declared
+                let mut entries = declared;
+                crate::modes::mesh::config::normalize_mesh_export_to(&mut entries);
+                entries
             }
         };
         for host in &hosts {
@@ -6528,6 +6615,51 @@ mod tests {
         let mesh = result.config.mesh.expect("mesh config");
         assert_eq!(mesh.service_entries[0].hosts, vec!["api.example.com"]);
         assert_eq!(mesh.service_entries[0].ports[0].protocol, AppProtocol::Tls);
+        assert_eq!(
+            mesh.service_entries[0].export_to,
+            vec!["*"],
+            "Istio's omitted ServiceEntry exportTo must remain public"
+        );
+    }
+
+    #[test]
+    fn service_entry_export_to_is_strict_and_preserves_istio_public_default() {
+        let translate = |export_to: Option<Value>| {
+            let mut spec = serde_json::json!({
+                "hosts": ["api.example.com"],
+                "ports": [{"number": 443, "name": "https", "protocol": "TLS"}]
+            });
+            if let Some(export_to) = export_to {
+                spec["exportTo"] = export_to;
+            }
+            translate_k8s_objects(&[object("ServiceEntry", spec)], options())
+        };
+
+        for declared in [None, Some(serde_json::json!([]))] {
+            let result = translate(declared).expect("public default must translate");
+            let mesh = result.config.mesh.expect("mesh config");
+            assert_eq!(mesh.service_entries[0].export_to, vec!["*"]);
+        }
+
+        let result = translate(Some(serde_json::json!([".", " beta "])))
+            .expect("valid explicit visibility must translate");
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.service_entries[0].export_to, vec![".", "beta"]);
+
+        for invalid in [
+            serde_json::json!("*"),
+            serde_json::json!([7]),
+            serde_json::json!(["*", "beta"]),
+            serde_json::json!(["~"]),
+            serde_json::json!([""]),
+        ] {
+            let error = translate(Some(invalid))
+                .expect_err("malformed ServiceEntry exportTo must fail closed");
+            assert!(
+                error.to_string().contains("ServiceEntry spec.exportTo"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
