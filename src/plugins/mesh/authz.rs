@@ -1146,14 +1146,20 @@ impl MeshAuthz {
             let proxy_namespace = slice.namespace.clone();
             let proxy_labels = slice.labels.clone();
             let waypoint_name = slice.waypoint_name.clone();
+            let waypoint_gateway_class = slice.waypoint_gateway_class.clone();
             slice.mesh_policies.retain(|policy| {
                 policy_scope_applies_with_waypoint(
                     policy,
                     &proxy_namespace,
                     &proxy_labels,
                     waypoint_name.as_deref(),
-                    None,
+                    waypoint_gateway_class.as_deref(),
                 ) || target_refs_attach_to_slice_services(policy, &slice.services)
+                    || target_refs_gateway_class_retained_without_stamp(
+                        policy,
+                        waypoint_name.as_deref(),
+                        waypoint_gateway_class.as_deref(),
+                    )
             });
         }
 
@@ -1643,6 +1649,28 @@ fn target_refs_attach_to_slice_services(
     })
 }
 
+/// xDS reverse-translate does not yet stamp `waypoint_gateway_class` on the
+/// slice. GatewayClass policies that reached a waypoint slice were already
+/// exact-class-filtered by CP `from_gateway_config` / ServiceWaypoint
+/// narrowing; retaining them here does not broaden. When the class *is*
+/// stamped, exact matching in [`policy_scope_applies_with_waypoint`] applies
+/// instead — never fall open across classes.
+fn target_refs_gateway_class_retained_without_stamp(
+    policy: &MeshPolicy,
+    waypoint_name: Option<&str>,
+    waypoint_gateway_class: Option<&str>,
+) -> bool {
+    if waypoint_name.is_none() || waypoint_gateway_class.is_some() {
+        return false;
+    }
+    let PolicyScope::TargetRefs { attachments } = &policy.scope else {
+        return false;
+    };
+    attachments
+        .iter()
+        .any(|attachment| matches!(attachment, PolicyTargetAttachment::GatewayClass { .. }))
+}
+
 fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result<(), String> {
     let has_proxy_namespace = !slice.namespace.trim().is_empty();
     let has_proxy_labels = !slice.labels.is_empty();
@@ -1658,34 +1686,10 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                     ));
                 }
             }
-            PolicyScope::TargetRefs { attachments } => {
-                // Gateway / GatewayClass attachments are waypoint-scoped and
-                // do not require proxy labels. Service / ServiceEntry
-                // attachments with selector labels follow the same
-                // fail-closed rules as WorkloadSelector when this proxy is
-                // not a waypoint carrying the named services.
-                let needs_labels = attachments.iter().any(|attachment| match attachment {
-                    PolicyTargetAttachment::Service {
-                        selector_labels, ..
-                    }
-                    | PolicyTargetAttachment::ServiceEntry {
-                        selector_labels, ..
-                    } => !selector_labels.is_empty(),
-                    PolicyTargetAttachment::Gateway { .. }
-                    | PolicyTargetAttachment::GatewayClass { .. } => false,
-                });
-                if needs_labels
-                    && !has_proxy_labels
-                    && slice.waypoint_name.is_none()
-                    && !from_slice
-                    && policy_has_enforcing_rule(policy)
-                {
-                    return Err(format!(
-                        "mesh_authz: policy '{}' uses targetRefs with service selector labels but \
-                         no proxy labels are configured; set `labels` so the policy can be scoped",
-                        policy.name
-                    ));
-                }
+            PolicyScope::TargetRefs { .. } => {
+                // Gateway / GatewayClass attachments are waypoint-scoped.
+                // Service / ServiceEntry destination identity uses exact
+                // service membership, not proxy labels.
             }
             PolicyScope::WorkloadSelector { selector } => {
                 if let Some(selector_namespace) = selector.namespace.as_ref() {

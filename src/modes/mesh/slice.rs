@@ -211,6 +211,14 @@ pub struct MeshSlice {
     /// so consumers can identify the binding the projection narrowed to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waypoint_name: Option<String>,
+    /// Authoritative `Gateway.spec.gatewayClassName` for [`Self::waypoint_name`],
+    /// stamped from [`crate::modes::mesh::config::MeshWaypointBinding::gateway_class_name`]
+    /// at slice build. Required for exact `GatewayClass` `targetRefs` matching
+    /// so an `istio-waypoint` policy never attaches to a `ferrum-waypoint`
+    /// Gateway (and vice versa). Absent when not a ServiceWaypoint slice or
+    /// when the binding has no class yet (Service-only shell).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waypoint_gateway_class: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     /// `labels` is an AMBIGUOUS intersection inferred from a shared-SPIFFE match
@@ -634,6 +642,7 @@ impl MeshSlice {
             && self.namespace == other.namespace
             && self.workload_spiffe_id == other.workload_spiffe_id
             && self.waypoint_name == other.waypoint_name
+            && self.waypoint_gateway_class == other.waypoint_gateway_class
             && self.labels == other.labels
             // The ambiguous-labels marker can flip independently of `labels`
             // (e.g. the shared-SPIFFE candidate set shrinks from two workloads
@@ -934,6 +943,7 @@ impl MeshSlice {
                 namespace: request.namespace,
                 workload_spiffe_id: request.workload_spiffe_id,
                 waypoint_name: request.waypoint_name,
+                waypoint_gateway_class: None,
                 labels: request.labels,
                 virtual_service_l4_proxies,
                 version,
@@ -1305,14 +1315,27 @@ impl MeshSlice {
             .iter()
             .filter(|policy| {
                 let waypoint = request.waypoint_name.as_deref();
+                let waypoint_class = waypoint.and_then(|name| {
+                    mesh.waypoint_bindings
+                        .iter()
+                        .find(|binding| {
+                            binding.name == name && binding.namespace == effective_namespace
+                        })
+                        .and_then(|binding| binding.gateway_class_name.as_deref())
+                });
                 let waypoint_match = policy_scope_applies_with_waypoint(
                     policy,
                     effective_namespace,
                     &effective_labels,
                     waypoint,
-                    None,
+                    waypoint_class,
                 ) || (waypoint.is_some()
-                    && matches!(policy.scope, PolicyScope::TargetRefs { .. }));
+                    && target_refs_attach_to_waypoint_services(
+                        policy,
+                        mesh,
+                        waypoint,
+                        effective_namespace,
+                    ));
                 let candidate_match = (!ambient_udp_policy_candidates.is_empty()
                     && ambient_udp_policy_candidates.iter().any(
                         |(candidate_namespace, labels)| {
@@ -1532,11 +1555,18 @@ impl MeshSlice {
         // happens once per slice; the alternative (reordering field
         // initialization) is fragile across future struct changes.
         let request_namespace = request.namespace;
+        let waypoint_gateway_class = request.waypoint_name.as_deref().and_then(|name| {
+            mesh.waypoint_bindings
+                .iter()
+                .find(|binding| binding.name == name && binding.namespace == request_namespace)
+                .and_then(|binding| binding.gateway_class_name.clone())
+        });
         Self {
             node_id: request.node_id,
             namespace: request_namespace.clone(),
             workload_spiffe_id: request.workload_spiffe_id,
             waypoint_name: request.waypoint_name,
+            waypoint_gateway_class,
             labels: effective_labels,
             labels_ambiguous,
             virtual_service_l4_proxies,
@@ -1628,6 +1658,38 @@ fn resource_namespace_visible(
         .map_or(resource_namespace == request_namespace, |namespaces| {
             namespaces.contains(resource_namespace)
         })
+}
+
+/// Keep Service/ServiceEntry `targetRefs` whose named destination is bound to
+/// this waypoint — exact membership, never shared-label broadening.
+fn target_refs_attach_to_waypoint_services(
+    policy: &MeshPolicy,
+    mesh: &MeshConfig,
+    waypoint_name: Option<&str>,
+    waypoint_namespace: &str,
+) -> bool {
+    let Some(waypoint_name) = waypoint_name else {
+        return false;
+    };
+    let Some(binding) = mesh
+        .waypoint_bindings
+        .iter()
+        .find(|binding| binding.name == waypoint_name && binding.namespace == waypoint_namespace)
+    else {
+        return false;
+    };
+    let PolicyScope::TargetRefs { attachments } = &policy.scope else {
+        return false;
+    };
+    attachments.iter().any(|attachment| {
+        binding.services.iter().any(|service| {
+            policy_target_attachment_applies_to_service(
+                attachment,
+                &service.namespace,
+                &service.name,
+            )
+        })
+    })
 }
 
 fn narrow_for_service_waypoint(
@@ -1723,7 +1785,10 @@ fn narrow_for_service_waypoint(
                             PolicyTargetAttachment::Gateway { namespace, name } => {
                                 name == waypoint_name && namespace == waypoint_namespace
                             }
-                            PolicyTargetAttachment::GatewayClass { .. } => true,
+                            PolicyTargetAttachment::GatewayClass { name } => binding
+                                .gateway_class_name
+                                .as_deref()
+                                .is_some_and(|class| class == name.as_str()),
                             PolicyTargetAttachment::Service { .. }
                             | PolicyTargetAttachment::ServiceEntry { .. } => {
                                 bound.iter().any(|(ns, svc)| {

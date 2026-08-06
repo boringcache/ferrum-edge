@@ -331,10 +331,20 @@ pub enum PolicyScope {
     MeshWide,
 }
 
+/// Upper bound on `AuthorizationPolicy` / `MeshPolicy` `targetRefs` attachments
+/// accepted at the native/file/xDS config boundary (matches the K8s translator).
+pub const MAX_POLICY_TARGET_REFS: usize = 16;
+
+/// Upper bound on captured selector labels per Service / ServiceEntry
+/// `targetRefs` attachment.
+pub const MAX_POLICY_TARGET_SELECTOR_LABELS: usize = 64;
+
 /// One resolved `AuthorizationPolicy` / policy `targetRefs[]` attachment.
 ///
-/// Captures the concrete resource the policy attaches to plus any selector
-/// labels needed for destination-workload matching (Service / ServiceEntry).
+/// Captures the concrete resource the policy attaches to. Service /
+/// ServiceEntry attachments may carry captured selector labels for
+/// translation provenance; runtime destination matching uses exact
+/// service namespace/name membership, never shared-label overlap alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PolicyTargetAttachment {
@@ -342,9 +352,12 @@ pub enum PolicyTargetAttachment {
     Service {
         namespace: String,
         name: String,
-        /// Captured `Service.spec.selector` labels. Empty when the Service has
-        /// no selector; matching then requires exact service membership via
-        /// [`policy_target_attachment_applies_to_service`].
+        /// Captured `Service.spec.selector` labels (translation provenance).
+        /// Runtime attachment uses exact service membership via
+        /// [`policy_target_attachment_applies_to_service`] /
+        /// [`crate::modes::mesh::runtime::PolicyScopeCache::policy_applies_for_destination`];
+        /// these labels must not broaden a policy onto another Service that
+        /// happens to share the same pod selector.
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         selector_labels: HashMap<String, String>,
     },
@@ -356,6 +369,8 @@ pub enum PolicyTargetAttachment {
     ServiceEntry {
         namespace: String,
         name: String,
+        /// Captured ServiceEntry workload selector labels (provenance only;
+        /// runtime matching is exact ServiceEntry namespace/name membership).
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         selector_labels: HashMap<String, String>,
     },
@@ -807,11 +822,11 @@ impl WorkloadLabels for ::std::collections::BTreeMap<String, String> {
 /// - [`PolicyScope::TargetRefs`] — never matches via bare namespace/labels alone.
 ///   Waypoint Gateway / GatewayClass attachments require
 ///   [`policy_scope_applies_with_waypoint`]; Service / ServiceEntry attachments
-///   match destination workloads through
-///   [`crate::modes::mesh::runtime::PolicyScopeCache::policy_applies_for_destination`]
-///   or ServiceWaypoint service-membership narrowing. This prevents targeted
-///   waypoint policies from broadening onto Sidecar workloads that happen to
-///   share Service selector labels.
+///   match destination identity through exact service namespace/name membership
+///   ([`policy_target_attachment_applies_to_service`],
+///   [`crate::modes::mesh::runtime::PolicyScopeCache::policy_applies_for_destination`],
+///   ServiceWaypoint narrowing). Targeted policies never broaden onto Sidecar
+///   workloads or sibling Services that share selector labels.
 pub fn policy_scope_applies_to_workload<L: WorkloadLabels + ?Sized>(
     policy: &MeshPolicy,
     proxy_namespace: &str,
@@ -850,12 +865,19 @@ pub fn scope_applies_to_workload<L: WorkloadLabels + ?Sized>(
 /// Extends [`policy_scope_applies_to_workload`] so Gateway / GatewayClass
 /// `targetRefs` attachments apply inside the matching ServiceWaypoint slice
 /// without broadening onto Sidecar / Ambient workloads.
+///
+/// `waypoint_gateway_class` must be the authoritative
+/// `Gateway.spec.gatewayClassName` for this waypoint (from
+/// [`MeshWaypointBinding::gateway_class_name`]). A `GatewayClass` attachment
+/// matches only that exact class — `istio-waypoint` never attaches to a
+/// `ferrum-waypoint` Gateway (and vice versa). Missing class evidence fails
+/// closed.
 pub fn policy_scope_applies_with_waypoint<L: WorkloadLabels + ?Sized>(
     policy: &MeshPolicy,
     proxy_namespace: &str,
     proxy_labels: &L,
     waypoint_name: Option<&str>,
-    _waypoint_gateway_class: Option<&str>,
+    waypoint_gateway_class: Option<&str>,
 ) -> bool {
     match &policy.scope {
         PolicyScope::TargetRefs { attachments } => attachments.iter().any(|attachment| {
@@ -863,19 +885,17 @@ pub fn policy_scope_applies_with_waypoint<L: WorkloadLabels + ?Sized>(
                 PolicyTargetAttachment::Gateway { namespace, name } => {
                     waypoint_name == Some(name.as_str()) && namespace == proxy_namespace
                 }
-                PolicyTargetAttachment::GatewayClass { .. } => waypoint_name.is_some(),
-                PolicyTargetAttachment::Service { .. }
-                | PolicyTargetAttachment::ServiceEntry { .. } => {
-                    // Service/ServiceEntry attachments are waypoint destination
-                    // scopes. Do not match Sidecar workloads that happen to
-                    // share selector labels — that would broaden the policy.
+                PolicyTargetAttachment::GatewayClass { name } => {
                     waypoint_name.is_some()
-                        && policy_target_attachment_matches_labels(
-                            attachment,
-                            proxy_namespace,
-                            proxy_labels,
-                        )
+                        && waypoint_gateway_class.is_some_and(|class| class == name.as_str())
                 }
+                // Service/ServiceEntry attachments are destination-resource
+                // identity scopes. They never match via waypoint pod labels —
+                // callers keep them through exact service membership
+                // (slice narrowing / `target_refs_attach_to_slice_services` /
+                // `policy_applies_for_destination`).
+                PolicyTargetAttachment::Service { .. }
+                | PolicyTargetAttachment::ServiceEntry { .. } => false,
             }
         }),
         _ => policy_scope_applies_to_workload(policy, proxy_namespace, proxy_labels),
@@ -905,37 +925,10 @@ pub fn policy_target_attachment_applies_to_service(
     }
 }
 
-fn policy_target_attachment_matches_labels<L: WorkloadLabels + ?Sized>(
-    attachment: &PolicyTargetAttachment,
-    proxy_namespace: &str,
-    proxy_labels: &L,
-) -> bool {
-    match attachment {
-        PolicyTargetAttachment::Service {
-            namespace,
-            selector_labels,
-            ..
-        }
-        | PolicyTargetAttachment::ServiceEntry {
-            namespace,
-            selector_labels,
-            ..
-        } => {
-            if namespace != proxy_namespace {
-                return false;
-            }
-            // Empty selector labels would match every workload in the
-            // namespace — that broadens a targeted policy. Fail closed unless
-            // the caller uses service-membership narrowing instead.
-            if selector_labels.is_empty() {
-                return false;
-            }
-            labels_match_subset(selector_labels, proxy_labels)
-        }
-        PolicyTargetAttachment::Gateway { .. } | PolicyTargetAttachment::GatewayClass { .. } => {
-            false
-        }
-    }
+/// Supported waypoint `GatewayClass` names (`istio-waypoint` / `ferrum-waypoint`).
+#[inline]
+pub fn is_supported_waypoint_gateway_class_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("istio-waypoint") || name.eq_ignore_ascii_case("ferrum-waypoint")
 }
 
 /// Returns `true` when a [`WorkloadSelector`] matches a workload whose
@@ -2900,6 +2893,7 @@ impl MeshConfig {
             &self.destination_rules,
             &self.proxy_configs,
             &self.sidecars,
+            &self.waypoint_bindings,
             self.trust_bundles.as_ref(),
             self.multi_cluster.as_ref(),
         );
@@ -3294,6 +3288,7 @@ pub fn validate_mesh_config(
         &[],
         &[],
         &[],
+        &[],
         trust_bundles,
         None,
     )
@@ -3429,6 +3424,7 @@ fn validate_mesh_config_internal(
     destination_rules: &[MeshDestinationRule],
     proxy_configs: &[MeshProxyConfig],
     sidecars: &[MeshSidecar],
+    waypoint_bindings: &[MeshWaypointBinding],
     trust_bundles: Option<&TrustBundleSet>,
     multi_cluster: Option<&MultiClusterConfig>,
 ) -> Vec<String> {
@@ -3620,6 +3616,20 @@ fn validate_mesh_config_internal(
     // Policies
     for policy in policies {
         validate_non_empty_string("MeshPolicy.name".to_string(), &policy.name, &mut errors);
+        validate_non_empty_string(
+            format!("MeshPolicy '{}'.namespace", policy.name),
+            &policy.namespace,
+            &mut errors,
+        );
+        validate_mesh_policy_target_refs_scope(
+            "MeshPolicy",
+            &policy.name,
+            &policy.scope,
+            services,
+            service_entries,
+            waypoint_bindings,
+            &mut errors,
+        );
         for (i, rule) in policy.rules.iter().enumerate() {
             for (j, principal) in rule.from.iter().enumerate() {
                 if principal.spiffe_id_pattern.is_none()
@@ -3771,6 +3781,14 @@ fn validate_mesh_config_internal(
             &pa.namespace,
             &mut errors,
         );
+        if let Some(scope) = pa.scope.as_ref() {
+            reject_unsupported_target_refs_scope(
+                "PeerAuthentication",
+                &pa.name,
+                scope,
+                &mut errors,
+            );
+        }
         for port in pa.port_overrides.keys() {
             validate_non_zero_port(
                 format!("PeerAuthentication '{}'.port_overrides[{}]", pa.name, port),
@@ -3804,6 +3822,12 @@ fn validate_mesh_config_internal(
         validate_non_empty_string(
             format!("MeshRequestAuthentication '{}'.namespace", ra.name),
             &ra.namespace,
+            &mut errors,
+        );
+        reject_unsupported_target_refs_scope(
+            "MeshRequestAuthentication",
+            &ra.name,
+            &ra.scope,
             &mut errors,
         );
         for (i, rule) in ra.jwt_rules.iter().enumerate() {
@@ -3873,6 +3897,12 @@ fn validate_mesh_config_internal(
         validate_non_empty_string(
             format!("MeshTelemetryResource '{}'.namespace", telemetry.name),
             &telemetry.namespace,
+            &mut errors,
+        );
+        reject_unsupported_target_refs_scope(
+            "MeshTelemetryResource",
+            &telemetry.name,
+            &telemetry.scope,
             &mut errors,
         );
         if let Some(tracing) = telemetry.config.tracing.as_ref() {
@@ -3993,6 +4023,12 @@ fn validate_mesh_config_internal(
             &proxy_config.namespace,
             &mut errors,
         );
+        reject_unsupported_target_refs_scope(
+            "MeshProxyConfig",
+            &proxy_config.name,
+            &proxy_config.scope,
+            &mut errors,
+        );
         validate_percentage(
             format!("MeshProxyConfig '{}'.tracing_sampling", proxy_config.name),
             proxy_config.tracing_sampling,
@@ -4085,6 +4121,150 @@ fn validate_mesh_config_internal(
     }
 
     errors
+}
+
+/// Reject `PolicyScope::TargetRefs` on shared-scope consumers that do not yet
+/// implement end-to-end targetRefs attachment (PeerAuthentication,
+/// RequestAuthentication, Telemetry, ProxyConfig). AuthorizationPolicy /
+/// MeshPolicy validate attachments separately.
+fn reject_unsupported_target_refs_scope(
+    resource_kind: &str,
+    resource_name: &str,
+    scope: &PolicyScope,
+    errors: &mut Vec<String>,
+) {
+    if matches!(scope, PolicyScope::TargetRefs { .. }) {
+        errors.push(format!(
+            "{resource_kind} '{resource_name}': PolicyScope::target_refs is not supported; \
+             only AuthorizationPolicy/MeshPolicy implement targetRefs attachment"
+        ));
+    }
+}
+
+/// Fail-closed validation for AuthorizationPolicy / MeshPolicy `targetRefs`.
+fn validate_mesh_policy_target_refs_scope(
+    resource_kind: &str,
+    resource_name: &str,
+    scope: &PolicyScope,
+    services: &[MeshService],
+    service_entries: &[ServiceEntry],
+    waypoint_bindings: &[MeshWaypointBinding],
+    errors: &mut Vec<String>,
+) {
+    let PolicyScope::TargetRefs { attachments } = scope else {
+        return;
+    };
+    let context = format!("{resource_kind} '{resource_name}'.scope.target_refs");
+    if attachments.is_empty() {
+        errors.push(format!(
+            "{context}: attachments must not be empty (targeted policies fail closed)"
+        ));
+        return;
+    }
+    if attachments.len() > MAX_POLICY_TARGET_REFS {
+        errors.push(format!(
+            "{context}: supports at most {MAX_POLICY_TARGET_REFS} attachments"
+        ));
+    }
+    for (index, attachment) in attachments.iter().enumerate() {
+        let path = format!("{context}[{index}]");
+        match attachment {
+            PolicyTargetAttachment::Service {
+                namespace,
+                name,
+                selector_labels,
+            } => {
+                validate_non_empty_string(format!("{path}.namespace"), namespace, errors);
+                validate_non_empty_string(format!("{path}.name"), name, errors);
+                validate_target_ref_selector_labels(&path, selector_labels, errors);
+                if !namespace.trim().is_empty()
+                    && !name.trim().is_empty()
+                    && !services
+                        .iter()
+                        .any(|service| service.namespace == *namespace && service.name == *name)
+                {
+                    errors.push(format!(
+                        "{path}: Service '{namespace}/{name}' was not found; \
+                         targeted policies fail closed when the target is missing"
+                    ));
+                }
+            }
+            PolicyTargetAttachment::ServiceEntry {
+                namespace,
+                name,
+                selector_labels,
+            } => {
+                validate_non_empty_string(format!("{path}.namespace"), namespace, errors);
+                validate_non_empty_string(format!("{path}.name"), name, errors);
+                validate_target_ref_selector_labels(&path, selector_labels, errors);
+                if !namespace.trim().is_empty()
+                    && !name.trim().is_empty()
+                    && !service_entries
+                        .iter()
+                        .any(|entry| entry.namespace == *namespace && entry.name == *name)
+                {
+                    errors.push(format!(
+                        "{path}: ServiceEntry '{namespace}/{name}' was not found; \
+                         targeted policies fail closed when the target is missing"
+                    ));
+                }
+            }
+            PolicyTargetAttachment::Gateway { namespace, name } => {
+                validate_non_empty_string(format!("{path}.namespace"), namespace, errors);
+                validate_non_empty_string(format!("{path}.name"), name, errors);
+                if !namespace.trim().is_empty()
+                    && !name.trim().is_empty()
+                    && !waypoint_bindings.iter().any(|binding| {
+                        binding.namespace == *namespace && binding.name == *name
+                    })
+                {
+                    errors.push(format!(
+                        "{path}: Gateway '{namespace}/{name}' was not found in waypoint_bindings; \
+                         targeted policies fail closed when the target is missing"
+                    ));
+                }
+            }
+            PolicyTargetAttachment::GatewayClass { name } => {
+                validate_non_empty_string(format!("{path}.name"), name, errors);
+                if !name.trim().is_empty() && !is_supported_waypoint_gateway_class_name(name) {
+                    let known_on_binding = waypoint_bindings.iter().any(|binding| {
+                        binding
+                            .gateway_class_name
+                            .as_deref()
+                            .is_some_and(|class| class == name.as_str())
+                    });
+                    if !known_on_binding {
+                        errors.push(format!(
+                            "{path}: GatewayClass '{name}' is unsupported; \
+                             Ferrum accepts istio-waypoint/ferrum-waypoint class attachments"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_target_ref_selector_labels(
+    path: &str,
+    selector_labels: &HashMap<String, String>,
+    errors: &mut Vec<String>,
+) {
+    if selector_labels.len() > MAX_POLICY_TARGET_SELECTOR_LABELS {
+        errors.push(format!(
+            "{path}.selector_labels: supports at most {MAX_POLICY_TARGET_SELECTOR_LABELS} labels"
+        ));
+    }
+    for (key, value) in selector_labels {
+        if key.trim().is_empty() {
+            errors.push(format!("{path}.selector_labels: label key must not be empty"));
+        }
+        if value.trim().is_empty() {
+            errors.push(format!(
+                "{path}.selector_labels['{key}']: label value must not be empty"
+            ));
+        }
+    }
 }
 
 fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<String>) {

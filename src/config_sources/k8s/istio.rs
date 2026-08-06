@@ -173,7 +173,8 @@ fn authorization_policy(
     })
 }
 
-const AUTHZ_TARGET_REF_MAX: usize = 16;
+const AUTHZ_TARGET_REF_MAX: usize =
+    crate::modes::mesh::config::MAX_POLICY_TARGET_REFS;
 const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
 const ISTIO_NETWORKING_GROUP: &str = "networking.istio.io";
 
@@ -6600,6 +6601,242 @@ mod tests {
                     assert_eq!(name, "waypoint");
                 }
                 other => panic!("expected Gateway attachment, got {other:?}"),
+            },
+            other => panic!("expected TargetRefs scope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translates_authorization_policy_gateway_class_target_refs_for_each_supported_class() {
+        for class_name in ["istio-waypoint", "ferrum-waypoint"] {
+            let result = translate_k8s_objects(
+                &[
+                    object_with_metadata(
+                        "Gateway",
+                        "gateway.networking.k8s.io/v1",
+                        "waypoint",
+                        "istio-system",
+                        serde_json::json!({
+                            "gatewayClassName": class_name,
+                            "listeners": [{
+                                "name": "mesh",
+                                "port": 15008,
+                                "protocol": "HBONE"
+                            }]
+                        }),
+                    ),
+                    object_with_metadata(
+                        "AuthorizationPolicy",
+                        "security.istio.io/v1",
+                        "class-deny",
+                        "istio-system",
+                        serde_json::json!({
+                            "targetRefs": [{
+                                "group": "gateway.networking.k8s.io",
+                                "kind": "GatewayClass",
+                                "name": class_name
+                            }],
+                            "action": "DENY",
+                            "rules": [{
+                                "from": [{"source": {"namespaces": ["evil"]}}]
+                            }]
+                        }),
+                    ),
+                ],
+                options_for_namespace("istio-system")
+                    .with_istio_root_namespace("istio-system".to_string()),
+            )
+            .unwrap_or_else(|err| panic!("GatewayClass {class_name} must translate: {err}"));
+
+            let mesh = result.config.mesh.expect("mesh config");
+            match &mesh.mesh_policies[0].scope {
+                PolicyScope::TargetRefs { attachments } => match &attachments[0] {
+                    PolicyTargetAttachment::GatewayClass { name } => {
+                        assert_eq!(name, class_name);
+                    }
+                    other => panic!("expected GatewayClass attachment, got {other:?}"),
+                },
+                other => panic!("expected TargetRefs scope, got {other:?}"),
+            }
+            assert_eq!(
+                mesh.waypoint_bindings[0].gateway_class_name.as_deref(),
+                Some(class_name)
+            );
+        }
+    }
+
+    #[test]
+    fn translates_authorization_policy_multiple_target_refs_or_semantics() {
+        let result = translate_k8s_objects(
+            &[
+                object_with_metadata(
+                    "Service",
+                    "v1",
+                    "reviews",
+                    "default",
+                    serde_json::json!({
+                        "selector": {"app": "reviews"},
+                        "ports": [{"port": 9080}]
+                    }),
+                ),
+                object_with_metadata(
+                    "Service",
+                    "v1",
+                    "ratings",
+                    "default",
+                    serde_json::json!({
+                        "selector": {"app": "ratings"},
+                        "ports": [{"port": 9080}]
+                    }),
+                ),
+                object(
+                    "AuthorizationPolicy",
+                    serde_json::json!({
+                        "targetRefs": [
+                            {"kind": "Service", "name": "reviews"},
+                            {"kind": "Service", "name": "ratings"}
+                        ],
+                        "action": "DENY",
+                        "rules": [{
+                            "from": [{"source": {"namespaces": ["evil"]}}]
+                        }]
+                    }),
+                ),
+            ],
+            options(),
+        )
+        .expect("multiple Service targetRefs must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        match &mesh.mesh_policies[0].scope {
+            PolicyScope::TargetRefs { attachments } => {
+                assert_eq!(attachments.len(), 2);
+                assert!(matches!(
+                    &attachments[0],
+                    PolicyTargetAttachment::Service { name, .. } if name == "reviews"
+                ));
+                assert!(matches!(
+                    &attachments[1],
+                    PolicyTargetAttachment::Service { name, .. } if name == "ratings"
+                ));
+            }
+            other => panic!("expected TargetRefs scope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translates_authorization_policy_service_entry_target_refs() {
+        let result = translate_k8s_objects(
+            &[
+                object_with_metadata(
+                    "ServiceEntry",
+                    "networking.istio.io/v1",
+                    "ext",
+                    "default",
+                    serde_json::json!({
+                        "hosts": ["ext.example.com"],
+                        "location": "MESH_EXTERNAL",
+                        "ports": [{"number": 443, "name": "https", "protocol": "HTTPS"}],
+                        "resolution": "DNS",
+                        "workloadSelector": {"labels": {"app": "ext"}}
+                    }),
+                ),
+                object(
+                    "AuthorizationPolicy",
+                    serde_json::json!({
+                        "targetRefs": [{
+                            "group": "networking.istio.io",
+                            "kind": "ServiceEntry",
+                            "name": "ext"
+                        }],
+                        "action": "ALLOW",
+                        "rules": [{
+                            "to": [{"operation": {"methods": ["GET"]}}]
+                        }]
+                    }),
+                ),
+            ],
+            options(),
+        )
+        .expect("ServiceEntry targetRefs must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        match &mesh.mesh_policies[0].scope {
+            PolicyScope::TargetRefs { attachments } => match &attachments[0] {
+                PolicyTargetAttachment::ServiceEntry {
+                    namespace,
+                    name,
+                    selector_labels,
+                } => {
+                    assert_eq!(namespace, "default");
+                    assert_eq!(name, "ext");
+                    assert_eq!(selector_labels.get("app").map(String::as_str), Some("ext"));
+                }
+                other => panic!("expected ServiceEntry attachment, got {other:?}"),
+            },
+            other => panic!("expected TargetRefs scope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translates_authorization_policy_cross_namespace_service_with_reference_grant() {
+        let result = translate_k8s_objects(
+            &[
+                object_with_metadata(
+                    "Service",
+                    "v1",
+                    "payments",
+                    "other",
+                    serde_json::json!({
+                        "selector": {"app": "payments"},
+                        "ports": [{"port": 8080}]
+                    }),
+                ),
+                object_with_metadata(
+                    "ReferenceGrant",
+                    "gateway.networking.k8s.io/v1beta1",
+                    "allow-authz",
+                    "other",
+                    serde_json::json!({
+                        "from": [{
+                            "group": "security.istio.io",
+                            "kind": "AuthorizationPolicy",
+                            "namespace": "default"
+                        }],
+                        "to": [{
+                            "group": "",
+                            "kind": "Service",
+                            "name": "payments"
+                        }]
+                    }),
+                ),
+                object(
+                    "AuthorizationPolicy",
+                    serde_json::json!({
+                        "targetRefs": [{
+                            "kind": "Service",
+                            "name": "payments",
+                            "namespace": "other"
+                        }],
+                        "action": "DENY",
+                        "rules": [{
+                            "from": [{"source": {"namespaces": ["evil"]}}]
+                        }]
+                    }),
+                ),
+            ],
+            options().with_source_namespaces(vec!["default".to_string(), "other".to_string()]),
+        )
+        .expect("ReferenceGrant must authorize cross-namespace Service targetRefs");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        match &mesh.mesh_policies[0].scope {
+            PolicyScope::TargetRefs { attachments } => match &attachments[0] {
+                PolicyTargetAttachment::Service { namespace, name, .. } => {
+                    assert_eq!(namespace, "other");
+                    assert_eq!(name, "payments");
+                }
+                other => panic!("expected Service attachment, got {other:?}"),
             },
             other => panic!("expected TargetRefs scope, got {other:?}"),
         }

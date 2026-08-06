@@ -180,10 +180,13 @@ impl PolicyScopeCache {
 
     /// Destination-scope applicability inside a waypoint / node-waypoint path.
     ///
-    /// Service and ServiceEntry `targetRefs` match backing-workload labels or
-    /// exact service membership; Gateway / GatewayClass attachments apply to
-    /// every destination processed by the waypoint (they must not broaden onto
-    /// ordinary Sidecar source filtering via [`Self::policy_applies`]).
+    /// Service and ServiceEntry `targetRefs` match by exact destination service
+    /// namespace/name membership and fail closed when that identity is absent.
+    /// Shared selector labels alone must never attach a Service A policy to
+    /// Service B traffic. Gateway / GatewayClass attachments apply to every
+    /// destination processed by the waypoint that already carries the policy
+    /// (they must not broaden onto ordinary Sidecar source filtering via
+    /// [`Self::policy_applies`]).
     pub fn policy_applies_for_destination(&self, policy: &MeshPolicy) -> bool {
         match &policy.scope {
             crate::modes::mesh::config::PolicyScope::TargetRefs { attachments } => {
@@ -192,22 +195,14 @@ impl PolicyScopeCache {
                     PolicyTargetAttachment::Gateway { .. }
                     | PolicyTargetAttachment::GatewayClass { .. } => true,
                     PolicyTargetAttachment::Service {
-                        namespace,
-                        name,
-                        selector_labels,
+                        namespace, name, ..
                     }
                     | PolicyTargetAttachment::ServiceEntry {
-                        namespace,
-                        name,
-                        selector_labels,
+                        namespace, name, ..
                     } => {
-                        if !selector_labels.is_empty() {
-                            return namespace == &self.namespace
-                                && selector_labels.iter().all(|(key, value)| {
-                                    self.labels.get(key).map(String::as_str) == Some(value.as_str())
-                                });
-                        }
-                        // Selectorless attachment: exact service membership only.
+                        // Destination-resource identity only. Missing or empty
+                        // service membership fails closed — never broaden by
+                        // shared pod-selector labels.
                         !self.service_name.is_empty()
                             && namespace == &self.service_namespace
                             && name == &self.service_name

@@ -436,7 +436,8 @@ fn authz_target_refs_service_attachment_is_preserved() {
         feature = "targetRefs → Service attachment scope",
         status = Status::Supported,
         notes = "AuthorizationPolicy targetRefs to a same-namespace Service resolve into \
-                 PolicyScope::TargetRefs with captured Service.spec.selector labels. \
+                 PolicyScope::TargetRefs with captured Service.spec.selector labels for \
+                 provenance; runtime attachment uses exact Service namespace/name membership. \
                  selector + targetRefs exclusivity and unsupported group/kind fail closed.",
     );
 

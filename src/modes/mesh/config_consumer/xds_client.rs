@@ -1409,6 +1409,11 @@ fn reverse_translate(
         namespace: config.namespace.clone(),
         workload_spiffe_id: config.workload_spiffe_id.clone(),
         waypoint_name: config.waypoint_name.clone(),
+        // Stamped from waypoint_bindings on the native path. xDS recovers
+        // policies already exact-class-filtered by the CP; class remains
+        // unset here and authz retains GatewayClass attachments that reached
+        // the waypoint slice without re-broadening.
+        waypoint_gateway_class: None,
         // A non-empty WorkloadLabels carrier is authoritative — the CP computed
         // real effective labels for this workload. An EMPTY carrier is NOT
         // treated as authoritative: a Ferrum CP always emits this carrier, and
