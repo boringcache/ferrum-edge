@@ -1,0 +1,484 @@
+//! VirtualService `tcp[]`/`tls[]` weighted multi-destination routing (issue #3251).
+
+use std::collections::HashMap;
+
+use dashmap::DashMap;
+use ferrum_edge::config::types::{
+    LoadBalancerAlgorithm, UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
+    UPSTREAM_TARGET_SERVICE_PORT_TAG,
+};
+use ferrum_edge::config_sources::k8s::{
+    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+};
+use ferrum_edge::identity::spiffe::TrustDomain;
+use ferrum_edge::load_balancer::{HealthContext, LoadBalancerCache, target_key};
+use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use serde_json::Value;
+
+fn options() -> K8sTranslationOptions {
+    K8sTranslationOptions::new(
+        "default".to_string(),
+        TrustDomain::new("cluster.local").expect("test trust domain"),
+    )
+}
+
+fn object(kind: &str, name: &str, namespace: &str, api_version: &str, spec: Value) -> K8sObject {
+    K8sObject {
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        metadata: K8sMetadata {
+            name: name.to_string(),
+            uid: String::new(),
+            namespace: namespace.to_string(),
+            generation: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            creation_timestamp: None,
+            deletion_timestamp: None,
+        },
+        spec,
+        status: Value::Object(serde_json::Map::new()),
+    }
+}
+
+fn vs(name: &str, spec: Value) -> K8sObject {
+    object(
+        "VirtualService",
+        name,
+        "default",
+        "networking.istio.io/v1beta1",
+        spec,
+    )
+}
+
+#[test]
+fn virtual_service_tcp_weighted_split_uses_generated_upstream_weights() {
+    let result = translate_k8s_objects(
+        &[vs(
+            "db-split",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "match": [{"port": 3306}],
+                    "route": [
+                        {"destination": {"host": "mysql-v1.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 900},
+                        {"destination": {"host": "mysql-v2.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 90},
+                        {"destination": {"host": "mysql-v3.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 10}
+                    ]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_port == Some(3306))
+        .expect("tcp proxy");
+    let upstream = result
+        .config
+        .upstreams
+        .iter()
+        .find(|upstream| proxy.upstream_id.as_deref() == Some(upstream.id.as_str()))
+        .expect("weighted L4 upstream");
+    assert_eq!(upstream.algorithm, LoadBalancerAlgorithm::WeightedRoundRobin);
+    assert_eq!(
+        upstream.targets.iter().map(|t| t.weight).collect::<Vec<_>>(),
+        vec![900, 90, 10]
+    );
+
+    let lb = LoadBalancerCache::new(&result.config);
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for i in 0..1000 {
+        let target = lb
+            .select_target("default", &upstream.id, &i.to_string(), None)
+            .expect("target")
+            .target;
+        *counts.entry(target.host.clone()).or_default() += 1;
+    }
+    assert_eq!(
+        counts
+            .get("mysql-v1.default.svc.cluster.local")
+            .copied()
+            .unwrap_or_default(),
+        900
+    );
+    assert_eq!(
+        counts
+            .get("mysql-v2.default.svc.cluster.local")
+            .copied()
+            .unwrap_or_default(),
+        90
+    );
+    assert_eq!(
+        counts
+            .get("mysql-v3.default.svc.cluster.local")
+            .copied()
+            .unwrap_or_default(),
+        10
+    );
+}
+
+#[test]
+fn virtual_service_tcp_weighted_split_skips_zero_weight_and_fails_closed_on_invalid() {
+    let skipped = translate_k8s_objects(
+        &[vs(
+            "db-skip-zero",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "match": [{"port": 3306}],
+                    "route": [
+                        {"destination": {"host": "dark.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 0},
+                        {"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 100}
+                    ]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("zero-weight leg is skipped");
+    let upstream = &skipped.config.upstreams[0];
+    assert_eq!(upstream.targets.len(), 1);
+    assert_eq!(upstream.targets[0].host, "stable.default.svc.cluster.local");
+    assert!(
+        skipped
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("zero-weight split destination"))
+    );
+
+    let all_zero = translate_k8s_objects(
+        &[vs(
+            "db-all-zero",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "match": [{"port": 3306}],
+                    "route": [
+                        {"destination": {"host": "a.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 0},
+                        {"destination": {"host": "b.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 0}
+                    ]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("all-zero split translates without a proxy");
+    assert!(
+        !all_zero
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.listen_port == Some(3306))
+    );
+    assert!(
+        all_zero
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("only zero-weight"))
+    );
+
+    let invalid = translate_k8s_objects(
+        &[vs(
+            "db-bad-weight",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "match": [{"port": 3306}],
+                    "route": [
+                        {"destination": {"host": "a.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 70000},
+                        {"destination": {"host": "b.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 1}
+                    ]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect_err("weight above MAX_TARGET_WEIGHT fails closed");
+    assert!(
+        format!("{invalid:?}").contains("weight must be between 0 and"),
+        "{invalid:?}"
+    );
+
+    let subset = translate_k8s_objects(
+        &[vs(
+            "db-subset",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "match": [{"port": 3306}],
+                    "route": [
+                        {"destination": {"host": "a.default.svc.cluster.local", "port": {"number": 3306}, "subset": "v1"}, "weight": 80},
+                        {"destination": {"host": "a.default.svc.cluster.local", "port": {"number": 3306}, "subset": "v2"}, "weight": 20}
+                    ]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect_err("destination.subset is unrepresentable for L4 weighted routes");
+    assert!(
+        format!("{subset:?}").contains("destination.subset is not supported"),
+        "{subset:?}"
+    );
+}
+
+#[test]
+fn virtual_service_tcp_weighted_split_failover_skips_unhealthy_target() {
+    let result = translate_k8s_objects(
+        &[vs(
+            "db-failover",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "match": [{"port": 3306}],
+                    "route": [
+                        {"destination": {"host": "mysql-v1.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 50},
+                        {"destination": {"host": "mysql-v2.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 50}
+                    ]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let upstream = &result.config.upstreams[0];
+    let unhealthy = &upstream.targets[0];
+    let lb = LoadBalancerCache::new(&result.config);
+    let namespaced_id =
+        ferrum_edge::config::db_backend::namespaced_runtime_key("default", &upstream.id);
+    let active_unhealthy = DashMap::new();
+    active_unhealthy.insert(target_key(&namespaced_id, unhealthy), 1u64);
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for i in 0..40 {
+        let target = lb
+            .select_target("default", &upstream.id, &i.to_string(), Some(&health))
+            .expect("healthy target")
+            .target;
+        *counts.entry(target.host.clone()).or_default() += 1;
+    }
+    assert_eq!(
+        counts
+            .get("mysql-v1.default.svc.cluster.local")
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "unhealthy destination must receive no selections: {counts:?}"
+    );
+    assert_eq!(
+        counts
+            .get("mysql-v2.default.svc.cluster.local")
+            .copied()
+            .unwrap_or_default(),
+        40
+    );
+}
+
+#[test]
+fn virtual_service_tcp_weighted_split_reload_and_delete_update_slice_upstreams() {
+    let initial = translate_k8s_objects(
+        &[vs(
+            "db-live",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "match": [{"port": 3306, "gateways": ["mesh"]}],
+                    "route": [
+                        {"destination": {"host": "mysql-v1.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 70},
+                        {"destination": {"host": "mysql-v2.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 30}
+                    ]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("initial translate");
+    let initial_slice = MeshSlice::from_gateway_config(
+        &initial.config,
+        MeshSliceRequest {
+            node_id: "sidecar-a".to_string(),
+            namespace: "default".to_string(),
+            ..MeshSliceRequest::default()
+        },
+    );
+    assert_eq!(initial_slice.virtual_service_l4_proxies.len(), 1);
+    assert_eq!(initial_slice.virtual_service_l4_upstreams.len(), 1);
+    assert_eq!(
+        initial_slice.virtual_service_l4_upstreams[0]["targets"][0]["weight"],
+        70
+    );
+
+    let updated = translate_k8s_objects(
+        &[vs(
+            "db-live",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "match": [{"port": 3306, "gateways": ["mesh"]}],
+                    "route": [
+                        {"destination": {"host": "mysql-v1.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 20},
+                        {"destination": {"host": "mysql-v2.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 80}
+                    ]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("updated translate");
+    let updated_slice = MeshSlice::from_gateway_config(
+        &updated.config,
+        MeshSliceRequest {
+            node_id: "sidecar-a".to_string(),
+            namespace: "default".to_string(),
+            ..MeshSliceRequest::default()
+        },
+    );
+    assert!(
+        !initial_slice.content_eq(&updated_slice),
+        "weight change must invalidate slice content equality"
+    );
+    assert_eq!(
+        updated_slice.virtual_service_l4_upstreams[0]["targets"][0]["weight"],
+        20
+    );
+    assert_eq!(
+        updated_slice.virtual_service_l4_upstreams[0]["targets"][1]["weight"],
+        80
+    );
+
+    let deleted = translate_k8s_objects(&[], options()).expect("delete translate");
+    let deleted_slice = MeshSlice::from_gateway_config(
+        &deleted.config,
+        MeshSliceRequest {
+            node_id: "sidecar-a".to_string(),
+            namespace: "default".to_string(),
+            ..MeshSliceRequest::default()
+        },
+    );
+    assert!(deleted_slice.virtual_service_l4_proxies.is_empty());
+    assert!(deleted_slice.virtual_service_l4_upstreams.is_empty());
+}
+
+#[test]
+fn virtual_service_tls_weighted_split_preserves_passthrough_and_service_identity_tags() {
+    let result = translate_k8s_objects(
+        &[
+            object(
+                "Service",
+                "secure-v1",
+                "default",
+                "v1",
+                serde_json::json!({
+                    "ports": [{"name": "https", "port": 443}]
+                }),
+            ),
+            object(
+                "Service",
+                "secure-v2",
+                "default",
+                "v1",
+                serde_json::json!({
+                    "ports": [{"name": "https", "port": 443}]
+                }),
+            ),
+            vs(
+                "secure-split",
+                serde_json::json!({
+                    "hosts": ["secure.example.com"],
+                    "tls": [{
+                        "match": [{"sniHosts": ["secure.example.com"], "port": 443}],
+                        "route": [
+                            {"destination": {"host": "secure-v1", "port": {"number": 443}}, "weight": 60},
+                            {"destination": {"host": "secure-v2", "port": {"number": 443}}, "weight": 40}
+                        ]
+                    }]
+                }),
+            ),
+        ],
+        options(),
+    )
+    .expect("weighted tls[] translates");
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_port == Some(443))
+        .expect("tls proxy");
+    assert!(proxy.passthrough);
+    let upstream = result
+        .config
+        .upstreams
+        .iter()
+        .find(|upstream| proxy.upstream_id.as_deref() == Some(upstream.id.as_str()))
+        .expect("tls weighted upstream");
+    assert_eq!(upstream.targets.len(), 2);
+    for target in &upstream.targets {
+        assert_eq!(
+            target
+                .tags
+                .get(UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG)
+                .map(String::as_str),
+            Some("default")
+        );
+        assert!(
+            target.tags.contains_key(UPSTREAM_TARGET_SERVICE_NAME_TAG),
+            "service name tag missing: {target:?}"
+        );
+        assert_eq!(
+            target
+                .tags
+                .get(UPSTREAM_TARGET_SERVICE_PORT_TAG)
+                .map(String::as_str),
+            Some("443")
+        );
+    }
+}
+
+#[test]
+fn virtual_service_tcp_weighted_export_projects_upstream_into_consumer_namespace() {
+    let result = translate_k8s_objects(
+        &[vs(
+            "db-export",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "exportTo": ["consumer"],
+                "tcp": [{
+                    "match": [{"port": 3306, "gateways": ["mesh"]}],
+                    "route": [
+                        {"destination": {"host": "mysql-v1", "port": {"number": 3306}}, "weight": 50},
+                        {"destination": {"host": "mysql-v2", "port": {"number": 3306}}, "weight": 50}
+                    ]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("exportTo weighted L4 translates");
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_port == Some(3306))
+        .expect("projected proxy");
+    assert_eq!(proxy.namespace, "consumer");
+    let upstream = result
+        .config
+        .upstreams
+        .iter()
+        .find(|upstream| {
+            upstream.namespace == "consumer"
+                && proxy.upstream_id.as_deref() == Some(upstream.id.as_str())
+        })
+        .expect("projected upstream must share the consumer namespace for LB lookup");
+    assert_eq!(upstream.targets.len(), 2);
+}

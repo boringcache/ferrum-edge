@@ -82,6 +82,7 @@ mod mesh_federation_poller_tests;
 mod mesh_file_source_tests;
 mod mesh_hbone_tests;
 mod mesh_k8s_pod_discovery_tests;
+mod mesh_l4_weighted_routing_tests;
 mod mesh_l7_routing_tests;
 mod mesh_multicluster_discovery_tests;
 mod mesh_node_waypoint_stream_scope_tests;

@@ -139,6 +139,12 @@ pub const FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL: &str =
 /// proxies do not otherwise ride `MeshSlice`.
 pub const FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.VirtualServiceL4ProxiesCarrier";
+/// Inner `type_url` for weighted multi-destination upstreams referenced by
+/// VirtualService L4 proxies. Ordinary `GatewayConfig.upstreams` do not ride
+/// `MeshSlice`, so translator-owned weighted stream upstreams are carried
+/// beside the L4 proxies.
+pub const FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.VirtualServiceL4UpstreamsCarrier";
 /// Inner `type_url` for the authorization-policy carrier (`MeshPolicy` list).
 pub const FERRUM_ECDS_MESH_POLICIES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.MeshPoliciesCarrier";
@@ -216,6 +222,7 @@ pub enum MeshSliceCarrier {
     /// only emits it when set); see [`FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL`].
     LabelsAmbiguous(bool),
     VirtualServiceL4Proxies(Vec<serde_json::Value>),
+    VirtualServiceL4Upstreams(Vec<serde_json::Value>),
     MeshPolicies(Vec<MeshPolicy>),
     VirtualServiceCorsPolicies(Vec<MeshVirtualServiceCorsPolicy>),
     PeerAuthentications(Vec<PeerAuthentication>),
@@ -266,6 +273,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
             MeshSliceCarrier::LabelsAmbiguous(_) => FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL,
             MeshSliceCarrier::VirtualServiceL4Proxies(_) => FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL,
+            MeshSliceCarrier::VirtualServiceL4Upstreams(_) => FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
             MeshSliceCarrier::VirtualServiceCorsPolicies(_) => {
                 FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL
@@ -304,6 +312,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
             MeshSliceCarrier::LabelsAmbiguous(_) => "workload-labels-ambiguous",
             MeshSliceCarrier::VirtualServiceL4Proxies(_) => "virtual-service-l4-proxies",
+            MeshSliceCarrier::VirtualServiceL4Upstreams(_) => "virtual-service-l4-upstreams",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
             MeshSliceCarrier::VirtualServiceCorsPolicies(_) => "virtual-service-cors-policies",
             MeshSliceCarrier::PeerAuthentications(_) => "peer-authentications",
@@ -337,6 +346,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::WorkloadLabels(value) => encode(value),
             MeshSliceCarrier::LabelsAmbiguous(value) => encode(value),
             MeshSliceCarrier::VirtualServiceL4Proxies(value) => encode(value),
+            MeshSliceCarrier::VirtualServiceL4Upstreams(value) => encode(value),
             MeshSliceCarrier::MeshPolicies(value) => encode(value),
             MeshSliceCarrier::VirtualServiceCorsPolicies(value) => encode(value),
             MeshSliceCarrier::PeerAuthentications(value) => encode(value),
@@ -404,6 +414,9 @@ impl MeshSliceCarrier {
             }
             FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL => {
                 MeshSliceCarrier::VirtualServiceL4Proxies(decode_json(value)?)
+            }
+            FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL => {
+                MeshSliceCarrier::VirtualServiceL4Upstreams(decode_json(value)?)
             }
             FERRUM_ECDS_MESH_POLICIES_TYPE_URL => {
                 MeshSliceCarrier::MeshPolicies(decode_json(value)?)
@@ -484,6 +497,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         }
         FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL => {
             Some("ferrum-mesh-carrier/virtual-service-l4-proxies")
+        }
+        FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL => {
+            Some("ferrum-mesh-carrier/virtual-service-l4-upstreams")
         }
         FERRUM_ECDS_MESH_POLICIES_TYPE_URL => Some("ferrum-mesh-carrier/mesh-policies"),
         FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL => {
@@ -626,6 +642,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
             slice.virtual_service_l4_proxies.clone(),
         ));
     }
+    if !slice.virtual_service_l4_upstreams.is_empty() {
+        carriers.push(MeshSliceCarrier::VirtualServiceL4Upstreams(
+            slice.virtual_service_l4_upstreams.clone(),
+        ));
+    }
     if !slice.mesh_policies.is_empty() {
         carriers.push(MeshSliceCarrier::MeshPolicies(slice.mesh_policies.clone()));
     }
@@ -707,6 +728,9 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         MeshSliceCarrier::LabelsAmbiguous(value) => slice.labels_ambiguous = value,
         MeshSliceCarrier::VirtualServiceL4Proxies(value) => {
             slice.virtual_service_l4_proxies = value
+        }
+        MeshSliceCarrier::VirtualServiceL4Upstreams(value) => {
+            slice.virtual_service_l4_upstreams = value
         }
         MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
         MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {
@@ -893,6 +917,9 @@ mod tests {
             MeshSliceCarrier::VirtualServiceL4Proxies(vec![serde_json::json!({
                 "id": "istio-vs-l4_tcp__default__db__0-0"
             })]),
+            MeshSliceCarrier::VirtualServiceL4Upstreams(vec![serde_json::json!({
+                "id": "istio-vs-l4-upstream-default-db-tcp-0"
+            })]),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),
@@ -991,6 +1018,7 @@ mod tests {
             )])),
             MeshSliceCarrier::LabelsAmbiguous(true),
             MeshSliceCarrier::VirtualServiceL4Proxies(Vec::new()),
+            MeshSliceCarrier::VirtualServiceL4Upstreams(Vec::new()),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),

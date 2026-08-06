@@ -240,6 +240,15 @@ pub struct MeshSlice {
     /// stale route or stale materialized local-workload selector decision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub virtual_service_l4_proxies: Vec<serde_json::Value>,
+    /// Weighted multi-destination upstreams referenced by
+    /// [`Self::virtual_service_l4_proxies`]. Ordinary `GatewayConfig.upstreams`
+    /// do not ride `MeshSlice`, so translator-owned `istio-vs-l4-upstream-*`
+    /// objects are serialized beside the L4 proxies and decoded into
+    /// `GatewayConfig.upstreams` at apply time. Slice content equality includes
+    /// this field so weight/target updates and deletions cannot retain a stale
+    /// load-balancer set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_service_l4_upstreams: Vec<serde_json::Value>,
     pub version: String,
     /// Authoritative, CP-replica-shared config revision this slice was built
     /// from (issue #2473).
@@ -642,6 +651,7 @@ impl MeshSlice {
             // to) its local labels; omitting it would keep the stale precedence.
             && self.labels_ambiguous == other.labels_ambiguous
             && self.virtual_service_l4_proxies == other.virtual_service_l4_proxies
+            && self.virtual_service_l4_upstreams == other.virtual_service_l4_upstreams
             && self.workloads == other.workloads
             && self.ambient_udp_source_workloads == other.ambient_udp_source_workloads
             && self.node_waypoint_assertors == other.node_waypoint_assertors
@@ -924,10 +934,27 @@ impl MeshSlice {
                         .is_some_and(|criteria| !criteria.is_empty())
             })
             .collect();
+        let virtual_service_l4_upstream_candidates: Vec<&crate::config::types::Upstream> = {
+            let referenced: BTreeSet<&str> = virtual_service_l4_proxy_candidates
+                .iter()
+                .filter_map(|proxy| proxy.upstream_id.as_deref())
+                .collect();
+            config
+                .upstreams
+                .iter()
+                .filter(|upstream| {
+                    upstream.namespace == request.namespace
+                        && referenced.contains(upstream.id.as_str())
+                        && upstream.id.starts_with("istio-vs-l4-upstream-")
+                })
+                .collect()
+        };
 
         let Some(mesh) = config.mesh.as_ref() else {
             let virtual_service_l4_proxies =
                 serialize_virtual_service_l4_proxies(virtual_service_l4_proxy_candidates);
+            let virtual_service_l4_upstreams =
+                serialize_virtual_service_l4_upstreams(virtual_service_l4_upstream_candidates);
             return Self {
                 node_id: request.node_id,
                 namespace: request.namespace,
@@ -935,6 +962,7 @@ impl MeshSlice {
                 waypoint_name: request.waypoint_name,
                 labels: request.labels,
                 virtual_service_l4_proxies,
+                virtual_service_l4_upstreams,
                 version,
                 revision,
                 ..Self::default()
@@ -1144,22 +1172,51 @@ impl MeshSlice {
                     let Some(sidecar) = applicable_sidecar else {
                         return true;
                     };
-                    let (resource_namespace, host_candidates) = policy_host_scope(
-                        &proxy.backend_host,
-                        &proxy.namespace,
-                        &cluster_domain,
-                        &mesh_service_identities,
-                        &service_entry_hosts,
-                    );
-                    let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
-                    sidecar_egress_includes_service(
-                        sidecar.namespace,
-                        sidecar.egress,
-                        &resource_namespace,
-                        &host_refs,
-                        Some(&[proxy.backend_port]),
-                    )
+                    let upstream = proxy.upstream_id.as_deref().and_then(|upstream_id| {
+                        virtual_service_l4_upstream_candidates
+                            .iter()
+                            .copied()
+                            .find(|upstream| upstream.id == upstream_id)
+                    });
+                    let destinations: Vec<(String, u16)> = if let Some(upstream) = upstream {
+                        upstream
+                            .targets
+                            .iter()
+                            .map(|target| (target.host.clone(), target.port))
+                            .collect()
+                    } else {
+                        vec![(proxy.backend_host.clone(), proxy.backend_port)]
+                    };
+                    // Fail closed: every weighted destination must be admitted
+                    // by Sidecar egress before the L4 proxy rides the slice.
+                    destinations.iter().all(|(host, port)| {
+                        let (resource_namespace, host_candidates) = policy_host_scope(
+                            host,
+                            &proxy.namespace,
+                            &cluster_domain,
+                            &mesh_service_identities,
+                            &service_entry_hosts,
+                        );
+                        let host_refs: Vec<&str> =
+                            host_candidates.iter().map(String::as_str).collect();
+                        sidecar_egress_includes_service(
+                            sidecar.namespace,
+                            sidecar.egress,
+                            &resource_namespace,
+                            &host_refs,
+                            Some(&[*port]),
+                        )
+                    })
                 }),
+        );
+        let admitted_upstream_ids: BTreeSet<&str> = virtual_service_l4_proxies
+            .iter()
+            .filter_map(|value| value.get("upstream_id").and_then(|id| id.as_str()))
+            .collect();
+        let virtual_service_l4_upstreams = serialize_virtual_service_l4_upstreams(
+            virtual_service_l4_upstream_candidates
+                .into_iter()
+                .filter(|upstream| admitted_upstream_ids.contains(upstream.id.as_str())),
         );
 
         let services: Vec<MeshService> = mesh
@@ -1529,6 +1586,7 @@ impl MeshSlice {
             labels: effective_labels,
             labels_ambiguous,
             virtual_service_l4_proxies,
+            virtual_service_l4_upstreams,
             version,
             revision,
             workloads,
@@ -2143,6 +2201,26 @@ fn serialize_virtual_service_l4_proxies<'a>(
                     error = %error,
                     "Failed to serialize a VirtualService L4 proxy into the mesh slice; \
                      dropping the route fail-closed"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+fn serialize_virtual_service_l4_upstreams<'a>(
+    upstreams: impl IntoIterator<Item = &'a crate::config::types::Upstream>,
+) -> Vec<serde_json::Value> {
+    upstreams
+        .into_iter()
+        .filter_map(|upstream| match serde_json::to_value(upstream) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                warn!(
+                    upstream_id = %upstream.id,
+                    error = %error,
+                    "Failed to serialize a VirtualService L4 upstream into the mesh slice; \
+                     dropping the upstream fail-closed"
                 );
                 None
             }
@@ -3588,6 +3666,7 @@ mod tests {
             destination_rules: Vec::new(),
             virtual_service_cors_policies: Vec::new(),
             virtual_service_l4_proxies: Vec::new(),
+            virtual_service_l4_upstreams: Vec::new(),
             proxy_configs: Vec::new(),
             request_authentications: vec![make_request_auth("ra1", "ns", PolicyScope::MeshWide)],
             telemetry_resources: vec![make_telemetry("t1", "ns", PolicyScope::MeshWide)],
