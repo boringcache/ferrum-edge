@@ -8503,14 +8503,12 @@ fn apply_traffic_policy_tls_to_backend_config(
     {
         return Err(anyhow::anyhow!(error));
     }
-    if let Some(error) =
-        crate::config::types::validate_system_trust_roots_skip_verify_pairing(
-            "DestinationRule trafficPolicy.tls.ca_certificates",
-            "DestinationRule trafficPolicy.tls.insecure_skip_verify",
-            tls.ca_certificates.as_deref(),
-            tls.insecure_skip_verify,
-        )
-    {
+    if let Some(error) = crate::config::types::validate_system_trust_roots_skip_verify_pairing(
+        "DestinationRule trafficPolicy.tls.ca_certificates",
+        "DestinationRule trafficPolicy.tls.insecure_skip_verify",
+        tls.ca_certificates.as_deref(),
+        tls.insecure_skip_verify,
+    ) {
         return Err(anyhow::anyhow!(error));
     }
 
@@ -21766,12 +21764,11 @@ mod tests {
             ..MeshTrafficPolicy::default()
         };
 
-        let error = apply_traffic_policy_to_upstream(
-            &mut upstream,
-            &policy,
-            &test_mesh_runtime_config(),
-        )
-        .expect_err("cold apply must defend against an unvalidated contradictory trust policy");
+        let error =
+            apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+                .expect_err(
+                    "cold apply must defend against an unvalidated contradictory trust policy",
+                );
         let diagnostic = error.to_string();
         assert!(diagnostic.contains("insecure_skip_verify"), "{diagnostic}");
         assert!(diagnostic.contains("system://"), "{diagnostic}");

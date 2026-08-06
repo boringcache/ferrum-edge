@@ -4355,14 +4355,12 @@ fn validate_mesh_traffic_policy_tls(
     {
         errors.push(error);
     }
-    if let Some(error) =
-        crate::config::types::validate_system_trust_roots_skip_verify_pairing(
-            &format!("{context}.ca_certificates"),
-            &format!("{context}.insecure_skip_verify"),
-            tls.ca_certificates.as_deref(),
-            tls.insecure_skip_verify,
-        )
-    {
+    if let Some(error) = crate::config::types::validate_system_trust_roots_skip_verify_pairing(
+        &format!("{context}.ca_certificates"),
+        &format!("{context}.insecure_skip_verify"),
+        tls.ca_certificates.as_deref(),
+        tls.insecure_skip_verify,
+    ) {
         errors.push(error);
     }
 
