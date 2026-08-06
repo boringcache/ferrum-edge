@@ -15362,6 +15362,7 @@ components:
         - port_exhaustion
         - graceful_remote_close
         - dispatch_policy_rejected
+        - backend_connection_limit
         - request_error
       description: |
         Stable classification of a backend dispatch failure. Emitted on
@@ -15380,6 +15381,14 @@ components:
         adaptive-concurrency effect) and not retried, and it surfaces as HTTP
         `503` or gRPC `RESOURCE_EXHAUSTED` — never as a backend `502` /
         `response_body_too_large`.
+        `backend_connection_limit` is the gateway refusing to open one more
+        physical backend connection because the destination is already at its
+        DestinationRule `connectionPool.tcp.maxConnections` ceiling. Nothing was
+        dialed, so it is health-neutral (no circuit-breaker, passive-health,
+        load-balancer-penalty, or adaptive-concurrency effect) — a saturated
+        operator-configured ceiling must never eject a healthy destination —
+        while still being pre-wire, so `retry_on_connect_failure` may rotate to
+        another load-balanced target with its own admission lane.
 
     DisconnectCause:
       type: string

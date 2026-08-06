@@ -987,6 +987,7 @@ fn gateway_hbone_mtls_observed(
                     | retry::ErrorClass::PortExhaustion
                     | retry::ErrorClass::ProtocolError
                     | retry::ErrorClass::DispatchPolicyRejected
+                    | retry::ErrorClass::BackendConnectionLimit
                     | retry::ErrorClass::RequestError
                     | retry::ErrorClass::RequestBodyTooLarge
             )
@@ -27810,12 +27811,22 @@ async fn handle_proxy_request_inner(
                         grpc_current_cb_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true, grpc_cb_probe_slot);
+                    // A `maxConnections` refusal is retryable (pre-wire, so the
+                    // loop may rotate to another target) but carries no backend
+                    // signal — the ceiling is the gateway's own policy. Settle
+                    // the breaker neutrally instead of opening it on a healthy
+                    // destination whose cap simply saturated.
+                    if backend_dispatch::client_side_no_backend_signal(grpc_retry_error_class) {
+                        cb.record_neutral(grpc_cb_probe_slot);
+                    } else {
+                        cb.record_failure(502, true, grpc_cb_probe_slot);
+                    }
                     // This intermediate failure consumes the probe slot (if any);
                     // the post-dispatch record must not decrement it again.
                     grpc_cb_probe_slot = false;
                     // The probe slot this guard would release on drop has now
-                    // been released by record_failure above, so disarm it.
+                    // been released by the record above (failure or neutral —
+                    // both consume it), so disarm it.
                     // Otherwise a future dropped during the retry backoff/next
                     // attempt would call record_neutral on the same breaker and
                     // release a second slot (over-admitting probes when
@@ -28187,7 +28198,18 @@ async fn handle_proxy_request_inner(
                             ..
                         }
                     );
-                    cb.record_failure(502, connection_error, grpc_cb_probe_slot);
+                    // A DestinationRule `maxConnections` refusal is a
+                    // gateway-side ceiling, not a backend fault: no socket was
+                    // opened. Settle NEUTRAL, the same posture the raw-TCP
+                    // over-cap path and `apply_circuit_breaker_outcome` take,
+                    // so a saturated cap cannot open the breaker on a healthy
+                    // destination.
+                    let grpc_error_class = retry::classify_grpc_proxy_error(e);
+                    if backend_dispatch::client_side_no_backend_signal(Some(grpc_error_class)) {
+                        cb.record_neutral(grpc_cb_probe_slot);
+                    } else {
+                        cb.record_failure(502, connection_error, grpc_cb_probe_slot);
+                    }
                 }
             }
         }
@@ -30404,11 +30426,25 @@ async fn handle_proxy_request_inner(
                     current_cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(
-                    result.status_code,
-                    result.connection_error,
-                    cb_retry_probe_slot_available,
-                );
+                // A retryable outcome that carries NO backend-health signal must
+                // settle the breaker NEUTRALLY here, not as a failure. Until
+                // `BackendConnectionLimit` there was no such class — every other
+                // `client_side_no_backend_signal` class is rejected by
+                // `should_retry`, so this arm only ever saw genuine backend
+                // failures. A `maxConnections` refusal is pre-wire (so the loop
+                // may rotate to another target) but is the operator's own
+                // gateway-side ceiling, so charging it would open the breaker on
+                // a healthy destination. Mirrors `apply_circuit_breaker_outcome`
+                // and the raw-TCP over-cap path's `record_cb_neutral`.
+                if backend_dispatch::client_side_no_backend_signal(result.error_class) {
+                    cb.record_neutral(cb_retry_probe_slot_available);
+                } else {
+                    cb.record_failure(
+                        result.status_code,
+                        result.connection_error,
+                        cb_retry_probe_slot_available,
+                    );
+                }
                 cb_retry_probe_slot_available = false;
             }
 

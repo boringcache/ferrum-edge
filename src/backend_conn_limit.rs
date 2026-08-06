@@ -73,12 +73,24 @@
 //!   [`crate::util::sharding::pool_shard_amount`]; counters are
 //!   [`crossbeam_utils::CachePadded`] so a hot destination's count does not
 //!   false-share with adjacent map slots.
-//! - Acquisition uses a compare-exchange CAS loop so two concurrent
-//!   upgrades can never both squeak past `cap - 1`.
+//! - Acquisition checks the cap and reserves the slot **together under the
+//!   `DashMap` shard lock** (`get_mut`/`entry`), so two concurrent acquirers
+//!   can never both squeak past `cap - 1`, and — crucially — the reservation is
+//!   atomic with the drop-time eviction below. This mirrors
+//!   [`crate::backend_pending_limit`] exactly: a lock-free CAS on a cloned `Arc`
+//!   would race eviction, letting an acquirer resurrect a counter the last drop
+//!   just removed (orphaning it, splitting the count, and admitting past the
+//!   cap).
 //! - [`BackendConnectionGuard`]'s `Drop` decrements exactly once on every
-//!   session-end path (clean close, relay error, upgrade failure, task
-//!   cancellation), so a connection slot can never leak and wedge a
-//!   destination.
+//!   connection-end path (clean close, relay error, handshake failure, idle
+//!   eviction, pool drain, task cancellation), so a connection slot can never
+//!   leak and wedge a destination. The decrement runs inside a `remove_if`
+//!   predicate under the **same shard lock** as acquisition, and the key is
+//!   evicted in that same locked section when the count returns to zero. That
+//!   matters now that every transport admits here: mesh dial hosts are pod IPs
+//!   and reqwest authorities can come from wildcard-host routing, so retaining
+//!   a zero-count entry per destination ever seen would grow the map unbounded
+//!   over the gateway lifetime.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,7 +141,17 @@ impl BackendConnKey {
 /// the same destination — matching how the cap is materialized per upstream
 /// destination port rather than per proxy.
 pub struct BackendConnectionLimiter {
-    inner: Arc<DashMap<BackendConnKey, Arc<CachePadded<AtomicU64>>>>,
+    inner: Arc<DashMap<BackendConnKey, Arc<BackendConnCounter>>>,
+}
+
+/// Refcounted per-destination open-connection counter.
+///
+/// Owns its own map key so [`BackendConnectionGuard`]'s `Drop` can evict the
+/// entry under the same shard lock admission takes — see the module docs.
+#[derive(Debug)]
+struct BackendConnCounter {
+    key: BackendConnKey,
+    count: CachePadded<AtomicU64>,
 }
 
 impl Default for BackendConnectionLimiter {
@@ -158,20 +180,6 @@ impl BackendConnectionLimiter {
         }
     }
 
-    /// Look up or insert the counter for a destination, returning a cheap
-    /// `Arc` handle. Two-phase: a cheap read first, falling back to the
-    /// entry API only on the (cold) first request to a new destination.
-    fn counter_for(&self, host: &str, port: u16) -> Arc<CachePadded<AtomicU64>> {
-        let key = BackendConnKey::new(host, port);
-        if let Some(existing) = self.inner.get(&key) {
-            return existing.clone();
-        }
-        self.inner
-            .entry(key)
-            .or_insert_with(|| Arc::new(CachePadded::new(AtomicU64::new(0))))
-            .clone()
-    }
-
     /// Try to acquire one open-connection slot for `(host, port)`.
     ///
     /// * `Ok(None)` — no cap configured (`cap` is `None`). Hot path: a single
@@ -198,38 +206,72 @@ impl BackendConnectionLimiter {
         self.acquire_slot(host, port, cap).map(Some)
     }
 
-    /// Shared CAS admission used by both the optional-cap and the mandatory-cap
+    /// Shared admission used by both the optional-cap and the mandatory-cap
     /// entry points, so the two can never drift.
+    ///
+    /// The cap check and the reservation happen together under the `DashMap`
+    /// shard lock, which is what makes them atomic with respect to the
+    /// at-zero eviction in [`BackendConnectionGuard::drop`].
     fn acquire_slot(
         &self,
         host: &str,
         port: u16,
         cap: u32,
     ) -> Result<BackendConnectionGuard, BackendConnectionLimitExceeded> {
-        let counter = self.counter_for(host, port);
         let cap_u64 = u64::from(cap);
-        loop {
-            let current = counter.load(Ordering::Relaxed);
+        // A zero cap rejects unconditionally — reject BEFORE touching the map.
+        // No guard is ever handed out for it, so the drop-time eviction could
+        // never fire; creating a counter here would leave a permanent
+        // zero-count entry per destination (the exact unbounded growth the
+        // eviction guards against). `maxConnections: 0` is rejected at
+        // translate/validate time on both the Kubernetes and native/file
+        // paths, so production never reaches this; it is defensive.
+        if cap_u64 == 0 {
+            return Err(BackendConnectionLimitExceeded { current: 0, cap: 0 });
+        }
+        let key = BackendConnKey::new(host, port);
+        // Hit path: `get_mut` write-locks only this shard. Check the cap and
+        // reserve the slot while that lock is held, so the reservation is
+        // atomic with a concurrent release's eviction.
+        if let Some(existing) = self.inner.get_mut(&key) {
+            let current = existing.count.load(Ordering::Relaxed);
             if current >= cap_u64 {
                 return Err(BackendConnectionLimitExceeded {
                     current,
                     cap: cap_u64,
                 });
             }
-            // compare-exchange-weak in a CAS loop: two concurrent acquirers
-            // can never both pass `cap - 1`. A `fetch_add`/check/rollback
-            // shape would have the same uncontended throughput but is harder
-            // to reason about for correctness.
-            match counter.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Ok(BackendConnectionGuard { counter }),
-                Err(_) => continue,
-            }
+            existing.count.fetch_add(1, Ordering::Relaxed);
+            return Ok(BackendConnectionGuard {
+                counters: Arc::clone(&self.inner),
+                counter: existing.clone(),
+            });
         }
+        // Cold path: first open connection to this destination. `entry`
+        // re-resolves under the shard lock in case a concurrent acquirer
+        // inserted between the `get_mut` miss and here; a freshly inserted
+        // entry has count 0 < cap, so the cap check only ever rejects on a
+        // sibling-inserted entry that is already at its cap.
+        let entry = self.inner.entry(key.clone()).or_insert_with(|| {
+            Arc::new(BackendConnCounter {
+                key,
+                count: CachePadded::new(AtomicU64::new(0)),
+            })
+        });
+        let current = entry.count.load(Ordering::Relaxed);
+        if current >= cap_u64 {
+            return Err(BackendConnectionLimitExceeded {
+                current,
+                cap: cap_u64,
+            });
+        }
+        entry.count.fetch_add(1, Ordering::Relaxed);
+        let counter = entry.clone();
+        drop(entry);
+        Ok(BackendConnectionGuard {
+            counters: Arc::clone(&self.inner),
+            counter,
+        })
     }
 
     /// Reserve one slot and return a **shareable** guard.
@@ -264,8 +306,16 @@ impl BackendConnectionLimiter {
     pub fn current(&self, host: &str, port: u16) -> u64 {
         self.inner
             .get(&BackendConnKey::new(host, port))
-            .map(|c| c.load(Ordering::Relaxed))
+            .map(|c| c.count.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    /// Number of destinations with a resident counter. Tests/diagnostics —
+    /// proves the map drains rather than retaining a zero-count entry per
+    /// destination the gateway has ever dialed.
+    #[allow(dead_code)]
+    pub fn resident_counters(&self) -> usize {
+        self.inner.len()
     }
 }
 
@@ -275,16 +325,31 @@ impl BackendConnectionLimiter {
 /// connections, not in-flight requests.
 #[derive(Debug)]
 pub struct BackendConnectionGuard {
-    counter: Arc<CachePadded<AtomicU64>>,
+    counters: Arc<DashMap<BackendConnKey, Arc<BackendConnCounter>>>,
+    counter: Arc<BackendConnCounter>,
 }
 
 impl Drop for BackendConnectionGuard {
     fn drop(&mut self) {
-        // Straight `fetch_sub`, not `saturating_sub`: a `saturating_sub`
-        // would silently mask a double-release / missing-acquire bug. The
-        // test suite asserts the count returns to zero so any guard-lifetime
-        // regression surfaces immediately.
-        self.counter.fetch_sub(1, Ordering::AcqRel);
+        // Release the slot and evict the entry if this was the last one, in ONE
+        // shard-locked `remove_if`. The predicate runs under the `DashMap` shard
+        // write lock, so the decrement and the at-zero removal are atomic with
+        // respect to `acquire_slot` (which checks-and-increments under the same
+        // lock): an acquirer can never observe this counter "between" the
+        // decrement and the removal, so it can neither resurrect an orphan (cap
+        // bypass) nor leave a stranded zero-count entry.
+        //
+        // `fetch_sub` returning 1 means this drop took the count to 0 → remove
+        // the now-idle key, so pod-IP churn and wildcard-host routing cannot
+        // retain unbounded zero-count entries for the gateway lifetime. Straight
+        // `fetch_sub`, not `saturating_sub`: a double-release / missing-acquire
+        // bug must underflow loudly rather than be masked into a silently
+        // unbounded destination. The key is always present here — every guard
+        // decrements exactly once and the entry lives for the guard's lifetime
+        // (count >= 1).
+        self.counters.remove_if(&self.counter.key, |_, current| {
+            current.count.fetch_sub(1, Ordering::AcqRel) == 1
+        });
     }
 }
 
@@ -384,8 +449,8 @@ impl<'a> PooledConnectionAdmission<'a> {
     /// POST-wire. That is exactly wrong for a refusal decided before any packet
     /// is sent: it would let the dispatch charge backend health and the
     /// capability probe downgrade a perfectly healthy backend. Keeping the type
-    /// in the chain keeps the refusal a pre-wire `ConnectionPoolError` and lets
-    /// callers recognize it structurally
+    /// in the chain keeps the refusal a pre-wire, health-neutral
+    /// `BackendConnectionLimit` and lets callers recognize it structurally
     /// ([`is_backend_connection_limit_error`]).
     pub fn acquire_or_typed_error(
         &self,
@@ -889,6 +954,63 @@ mod tests {
             .try_acquire("h", 7777, Some(1))
             .expect("slot freed after drop")
             .expect("guard present");
+    }
+
+    #[test]
+    fn idle_destinations_are_evicted_rather_than_retained() {
+        let limiter = BackendConnectionLimiter::new();
+        // Two slots on one destination: the entry must survive the first drop
+        // (a sibling connection is still open) and be evicted by the last.
+        let g1 = limiter
+            .try_acquire("churn.example", 8080, Some(2))
+            .expect("first under cap")
+            .expect("guard present");
+        let g2 = limiter
+            .try_acquire("churn.example", 8080, Some(2))
+            .expect("second under cap")
+            .expect("guard present");
+        assert_eq!(limiter.resident_counters(), 1);
+        drop(g1);
+        assert_eq!(
+            limiter.resident_counters(),
+            1,
+            "an entry with a live sibling guard must not be evicted"
+        );
+        drop(g2);
+        assert_eq!(
+            limiter.resident_counters(),
+            0,
+            "the last release must evict the idle destination"
+        );
+
+        // Pod-IP churn / wildcard-host routing must not accumulate one
+        // zero-count entry per destination ever dialed.
+        for i in 0..64u16 {
+            let host = format!("10.0.0.{i}");
+            let _guard = limiter
+                .try_acquire(&host, 8080, Some(1))
+                .expect("under cap")
+                .expect("guard present");
+        }
+        assert_eq!(
+            limiter.resident_counters(),
+            0,
+            "every transient destination must drain from the counter map"
+        );
+    }
+
+    #[test]
+    fn cap_of_zero_leaves_no_resident_entry() {
+        let limiter = BackendConnectionLimiter::new();
+        limiter
+            .try_acquire("h", 1, Some(0))
+            .expect_err("cap 0 rejects every connection");
+        assert_eq!(
+            limiter.resident_counters(),
+            0,
+            "a zero cap hands out no guard, so it must not create a counter \
+             that nothing can ever evict"
+        );
     }
 
     #[test]

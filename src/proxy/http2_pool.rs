@@ -935,12 +935,15 @@ pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorCla
 
     // 0b. `maxConnections` refusal: the gateway declined to open a NEW socket
     //     for a destination already at its DestinationRule ceiling. Nothing was
-    //     dialed, so this is a pool-side, pre-wire refusal — the same class the
-    //     pool uses when it cannot supply a connection. Keeping it pre-wire lets
-    //     `retry_on_connect_failure` rotate to another LB target, which is
-    //     exactly what the raw-TCP over-cap path already does.
+    //     dialed, so this is a pre-wire refusal — `retry_on_connect_failure` may
+    //     rotate to another LB target, exactly what the raw-TCP over-cap path
+    //     already does. It is deliberately NOT the generic `ConnectionPoolError`:
+    //     that class is a backend-health signal, and charging a gateway-side
+    //     ceiling against the destination would trip its circuit breaker /
+    //     passive health whenever live traffic saturated the cap.
+    //     `BackendConnectionLimit` is pre-wire AND health-neutral.
     if matches!(err, Http2PoolError::MaxConnectionsExceeded { .. }) {
-        return ErrorClass::ConnectionPoolError;
+        return ErrorClass::BackendConnectionLimit;
     }
 
     // 1. Walk the typed source chain first — covers io::Error, hyper::Error,
@@ -987,7 +990,7 @@ pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorCla
         Http2PoolError::Internal { message, .. } => message.as_str(),
         // Already returned above — keep match exhaustive.
         Http2PoolError::BackendSelectedHttp1 { .. } => return ErrorClass::ProtocolError,
-        Http2PoolError::MaxConnectionsExceeded { .. } => return ErrorClass::ConnectionPoolError,
+        Http2PoolError::MaxConnectionsExceeded { .. } => return ErrorClass::BackendConnectionLimit,
     };
     let lower = message.to_ascii_lowercase();
 
@@ -1023,7 +1026,7 @@ pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorCla
         }
         Http2PoolError::Internal { .. } => ErrorClass::ConnectionPoolError,
         Http2PoolError::BackendSelectedHttp1 { .. } => ErrorClass::ProtocolError,
-        Http2PoolError::MaxConnectionsExceeded { .. } => ErrorClass::ConnectionPoolError,
+        Http2PoolError::MaxConnectionsExceeded { .. } => ErrorClass::BackendConnectionLimit,
     }
 }
 
@@ -1259,10 +1262,11 @@ pub enum Http2PoolError {
     BackendSelectedHttp1 { pool_key: String },
     /// The destination is already at its DestinationRule
     /// `connectionPool.tcp.maxConnections` ceiling, so no NEW physical H2
-    /// connection may be opened. Classified `ConnectionPoolError` — a
-    /// pre-wire, pool-side refusal, matching the raw-TCP path where an
-    /// over-cap dial fails before relay and `retry_on_connect_failure` may
-    /// rotate to another LB target (with its own lane). `get_sender()` first
+    /// connection may be opened. Classified
+    /// [`crate::retry::ErrorClass::BackendConnectionLimit`] — pre-wire AND
+    /// health-neutral, matching the raw-TCP path where an over-cap dial fails
+    /// before relay, records `cb.record_neutral()`, and `retry_on_connect_failure`
+    /// may rotate to another LB target (with its own lane). `get_sender()` first
     /// falls back to any already-established shard, so a capped destination
     /// keeps serving by multiplexing rather than failing.
     MaxConnectionsExceeded { message: String },

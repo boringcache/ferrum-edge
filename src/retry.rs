@@ -82,6 +82,29 @@ pub enum ErrorClass {
     /// Classified as non-connection-error so `retry_on_connect_failure` does
     /// not fire, and `should_retry` rejects it before status-code retry checks.
     DispatchPolicyRejected,
+    /// The gateway refused to open a NEW physical backend connection because
+    /// the destination is already at its DestinationRule
+    /// `connectionPool.tcp.maxConnections` ceiling
+    /// ([`crate::backend_conn_limit`]).
+    ///
+    /// This class exists because the refusal is simultaneously **pre-wire** and
+    /// **health-neutral**, and no other class expresses both:
+    ///
+    /// * pre-wire — nothing was dialed and no request byte reached the backend,
+    ///   so `request_reached_wire` is false and `retry_on_connect_failure` may
+    ///   rotate to another load-balanced target with its own admission lane.
+    ///   That is exactly what the raw-TCP over-cap path does
+    ///   (`src/proxy/tcp_proxy.rs`, `StreamSetupKind::BackendMaxConnectionsExceeded`).
+    /// * health-neutral — the ceiling is the operator's own gateway-side
+    ///   policy, not evidence about the backend, so it is a
+    ///   `client_side_no_backend_signal` class: no circuit-breaker failure, no
+    ///   passive-health ding, no load-balancer penalty sample and no
+    ///   adaptive-concurrency shrink. The raw-TCP path records
+    ///   `cb.record_neutral()` at its over-cap refusal for the same reason.
+    ///   Using the generic `ConnectionPoolError` here would eject a perfectly
+    ///   healthy destination from the load balancer the moment live traffic
+    ///   saturated its configured cap.
+    BackendConnectionLimit,
     /// Catch-all for unclassified request errors.
     RequestError,
 }
@@ -106,6 +129,7 @@ impl ErrorClass {
             Self::PortExhaustion => "port_exhaustion",
             Self::GracefulRemoteClose => "graceful_remote_close",
             Self::DispatchPolicyRejected => "dispatch_policy_rejected",
+            Self::BackendConnectionLimit => "backend_connection_limit",
             Self::RequestError => "request_error",
         }
     }
@@ -163,6 +187,7 @@ pub fn request_reached_wire(error_class: ErrorClass) -> bool {
             | ErrorClass::TlsError
             | ErrorClass::PortExhaustion
             | ErrorClass::ConnectionPoolError
+            | ErrorClass::BackendConnectionLimit
     )
 }
 
@@ -191,6 +216,7 @@ pub fn error_class_log_kind(class: ErrorClass) -> &'static str {
         ErrorClass::GatewayBufferCapacity => "gateway_buffer_capacity",
         ErrorClass::GracefulRemoteClose => "graceful_remote_close",
         ErrorClass::DispatchPolicyRejected => "dispatch_policy_rejected",
+        ErrorClass::BackendConnectionLimit => "backend_connection_limit",
         ErrorClass::RequestError => "request_error",
     }
 }
@@ -359,9 +385,11 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
                 GrpcBackendUnavailableKind::DispatchCanceled => ErrorClass::ConnectionPoolError,
                 // Gateway-side `connectionPool.tcp.maxConnections` refusal: the
                 // destination is at its physical-connection ceiling and no new
-                // socket was opened. Pre-wire pool refusal, so
-                // `retry_on_connect_failure` may rotate to another LB target.
-                GrpcBackendUnavailableKind::MaxConnections => ErrorClass::ConnectionPoolError,
+                // socket was opened. Pre-wire, so `retry_on_connect_failure`
+                // may rotate to another LB target — and health-NEUTRAL, so a
+                // saturated ceiling never trips the destination's circuit
+                // breaker / passive health (see the class docs).
+                GrpcBackendUnavailableKind::MaxConnections => ErrorClass::BackendConnectionLimit,
             }
         }
         GrpcProxyError::ResourceExhausted(_) => ErrorClass::RequestError,
@@ -738,15 +766,15 @@ fn classify_boxed_with_phase(
     phase_is_connect: bool,
 ) -> ErrorClass {
     // Gateway-side `connectionPool.tcp.maxConnections` refusal: no socket was
-    // opened and nothing reached the wire, so this is a pool-side, PRE-wire
-    // refusal (`ConnectionPoolError`), matching the typed classes the direct-H2,
-    // gRPC and HBONE pools already return. Checked before the typed/substring
-    // walk because the refusal carries no io/hyper/rustls type and would
-    // otherwise fall through to the `RequestError` catch-all, which
+    // opened and nothing reached the wire, so this is a PRE-wire, health-neutral
+    // refusal (`BackendConnectionLimit`), matching the typed classes the
+    // direct-H2, gRPC and HBONE pools already return. Checked before the
+    // typed/substring walk because the refusal carries no io/hyper/rustls type
+    // and would otherwise fall through to the `RequestError` catch-all, which
     // `request_reached_wire` treats as POST-wire.
     let plain: &(dyn std::error::Error + 'static) = e;
     if crate::backend_conn_limit::is_backend_connection_limit_error(plain) {
-        return ErrorClass::ConnectionPoolError;
+        return ErrorClass::BackendConnectionLimit;
     }
     if let Some(class) = classify_typed_chain(Some(e), phase_is_connect) {
         return class;

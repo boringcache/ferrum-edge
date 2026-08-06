@@ -1790,3 +1790,107 @@ fn retry_dispatch_arms_pass_the_streaming_decision_on_every_attempt() {
         "mesh, native-H3, and reqwest retry arms must each forward `should_stream` unchanged"
     );
 }
+
+/// STRUCTURAL CONTRACT (issue #3290): a DestinationRule
+/// `connectionPool.tcp.maxConnections` refusal is the ONE class that must be
+/// pre-wire and backend-health-neutral at the same time, on EVERY pooled
+/// transport that can emit it.
+///
+/// * pre-wire — no socket was opened, so `connection_error` is true and
+///   `retry_on_connect_failure` may rotate to another load-balanced target with
+///   its own admission lane. That is what the raw-TCP over-cap path does.
+/// * health-neutral — the ceiling is the operator's own gateway-side policy,
+///   not evidence about the backend. Classifying it as the generic
+///   `ConnectionPoolError` (which IS a backend-health signal) made every
+///   over-cap refusal record a circuit-breaker failure, a passive-health
+///   failure, a load-balancer penalty sample, and an adaptive-concurrency
+///   shrink — so saturating a configured cap would eject a perfectly healthy
+///   destination. The raw-TCP path records `cb.record_neutral()` for exactly
+///   this reason.
+#[test]
+fn max_connections_refusal_is_pre_wire_and_health_neutral_on_every_transport() {
+    use ferrum_edge::_test_support::{
+        error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
+    };
+    use ferrum_edge::backend_conn_limit::BackendConnectionLimitExceeded;
+    use ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind;
+    use ferrum_edge::proxy::hbone_pool::HbonePoolError;
+    use ferrum_edge::proxy::http2_pool::{Http2PoolError, classify_http2_pool_error};
+
+    let grpc_err = GrpcProxyError::backend_unavailable(
+        GrpcBackendUnavailableKind::MaxConnections,
+        "gRPC pool over cap".to_string(),
+    );
+    let grpc = classify_grpc_proxy_error(&grpc_err);
+
+    let h2_err = Http2PoolError::MaxConnectionsExceeded {
+        message: "direct HTTP/2 pool over cap".to_string(),
+    };
+    let direct_h2 = classify_http2_pool_error(&h2_err);
+
+    let hbone_err = HbonePoolError::MaxConnectionsExceeded {
+        host: "b".to_string(),
+        port: 8080,
+        current: 1,
+        cap: 1,
+    };
+    let hbone = hbone_err.error_class();
+
+    // The native-H3 / reqwest-connector surface has no typed enum — the refusal
+    // travels as the marker error itself, recognized structurally by the shared
+    // boxed-setup classifier.
+    let refusal = BackendConnectionLimitExceeded { current: 1, cap: 1 };
+    let boxed = classify_boxed_setup_error(&refusal);
+
+    for (transport, class) in [
+        ("gRPC", grpc),
+        ("direct H2", direct_h2),
+        ("HBONE / mesh-mTLS", hbone),
+        ("native H3 / boxed setup", boxed),
+    ] {
+        assert_eq!(
+            class,
+            ErrorClass::BackendConnectionLimit,
+            "{transport}: an over-cap refusal must carry the dedicated class"
+        );
+        assert!(
+            !ferrum_edge::retry::request_reached_wire(class),
+            "{transport}: nothing was dialed, so the refusal must stay pre-wire \
+             and remain replayable on another target"
+        );
+        assert!(
+            error_class_is_health_neutral_for_test(class),
+            "{transport}: a gateway-side ceiling must not trip the circuit \
+             breaker, ding passive health, penalize the load balancer, or \
+             shrink the adaptive-concurrency permit"
+        );
+        assert!(
+            !error_class_is_backend_failure_for_test(class),
+            "{transport}: an over-cap refusal is not a post-wire backend failure"
+        );
+    }
+}
+
+/// The retry loop settles the circuit breaker for every INTERMEDIATE attempt
+/// with a direct `record_failure`. Until `BackendConnectionLimit` existed, every
+/// retryable class was a genuine backend failure, so that was sound. It is not
+/// any more: this pins the neutral branch so an over-cap refusal that rotates
+/// targets cannot open the breaker on a healthy destination.
+#[test]
+fn retry_loop_settles_health_neutral_intermediate_attempts_neutrally() {
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    let loop_body = proxy_src
+        .split("// Record the failed attempt against the current target's circuit breaker")
+        .nth(1)
+        .expect("retry-loop intermediate circuit-breaker record")
+        .split("let delay = retry::retry_delay(retry_config, attempt);")
+        .next()
+        .expect("bounded intermediate circuit-breaker block");
+
+    assert!(
+        loop_body.contains("client_side_no_backend_signal(result.error_class)")
+            && loop_body.contains("cb.record_neutral(cb_retry_probe_slot_available)"),
+        "an intermediate attempt whose class carries no backend signal must \
+         settle the breaker neutrally rather than as a failure"
+    );
+}

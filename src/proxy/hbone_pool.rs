@@ -147,8 +147,8 @@ pub enum HbonePoolError {
     ConnectRejected { authority: String, status: u16 },
     /// The destination is already at its DestinationRule
     /// `connectionPool.tcp.maxConnections` ceiling, so no NEW physical tunnel
-    /// connection may be opened. Nothing was dialed — a pool-side, pre-wire
-    /// refusal classified `ConnectionPoolError`, and NOT a capability failure
+    /// connection may be opened. Nothing was dialed — a pre-wire, health-neutral
+    /// refusal classified `BackendConnectionLimit`, and NOT a capability failure
     /// (the peer's HBONE/mesh-mTLS support is unchanged; only the gateway's own
     /// ceiling was reached).
     #[error("backend maxConnections reached for {host}:{port}: {current} open (cap {cap})")]
@@ -239,8 +239,10 @@ impl HbonePoolError {
             | Self::ExtendedConnectUnsupported { .. } => ErrorClass::ProtocolError,
             // Pre-wire, gateway-side ceiling refusal: no socket was opened, so
             // `retry_on_connect_failure` may rotate to another LB target with
-            // its own admission lane (the raw-TCP over-cap posture).
-            Self::MaxConnectionsExceeded { .. } => ErrorClass::ConnectionPoolError,
+            // its own admission lane — and the refusal is health-NEUTRAL, so a
+            // saturated ceiling never trips the destination's circuit breaker /
+            // passive health. That is the full raw-TCP over-cap posture.
+            Self::MaxConnectionsExceeded { .. } => ErrorClass::BackendConnectionLimit,
         }
     }
 

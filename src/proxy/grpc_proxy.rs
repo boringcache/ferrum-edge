@@ -1546,11 +1546,13 @@ pub enum GrpcBackendUnavailableKind {
     /// The destination is already at its DestinationRule
     /// `connectionPool.tcp.maxConnections` ceiling, so no NEW physical H2
     /// connection may be opened. Nothing was dialed — pre-wire, and mapped to
-    /// [`crate::retry::ErrorClass::ConnectionPoolError`] so
+    /// [`crate::retry::ErrorClass::BackendConnectionLimit`] so
     /// `retry_on_connect_failure` can rotate to another LB target with its own
-    /// admission lane, matching the raw-TCP over-cap posture. `get_sender()`
-    /// first falls back to an already-established shard, so a capped
-    /// destination keeps serving by multiplexing rather than failing.
+    /// admission lane while the refusal stays neutral to the destination's
+    /// circuit breaker, passive health, and adaptive concurrency — the full
+    /// raw-TCP over-cap posture. `get_sender()` first falls back to an
+    /// already-established shard, so a capped destination keeps serving by
+    /// multiplexing rather than failing.
     MaxConnections,
 }
 
@@ -1718,7 +1720,7 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
             SharedPoolCreateKind::Internal => Self::Internal(message),
             // Coalesced waiters must see the SAME typed over-cap refusal the
             // creator produced, so `get_sender`'s already-established-shard
-            // fallback and the pre-wire `ConnectionPoolError` classification
+            // fallback and the pre-wire `BackendConnectionLimit` classification
             // apply to them identically.
             SharedPoolCreateKind::MaxConnections => {
                 Self::backend_unavailable(GrpcBackendUnavailableKind::MaxConnections, message)
@@ -1760,6 +1762,7 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
                     | ErrorClass::GatewayBufferCapacity
                     | ErrorClass::RequestBodyTooLarge
                     | ErrorClass::GracefulRemoteClose
+                    | ErrorClass::BackendConnectionLimit
                     | ErrorClass::RequestError => GrpcBackendUnavailableKind::Connect,
                 };
                 // Retain the shared classification payload as the typed source so

@@ -57,7 +57,8 @@ pub enum SharedPoolCreateKind {
     /// pooled transports fall back to an already-established shard rather than
     /// failing a destination that is healthy but full, and the capability probe
     /// must not read it as evidence the backend lost the protocol. Carries
-    /// `ErrorClass::ConnectionPoolError` (pre-wire).
+    /// `ErrorClass::BackendConnectionLimit` (pre-wire AND backend-health
+    /// neutral).
     MaxConnections,
     /// Generic backend unreachable / pool acquire failure.
     Unavailable,
@@ -87,6 +88,7 @@ impl SharedPoolCreateKind {
             ErrorClass::ProtocolError => Self::Protocol,
             ErrorClass::PortExhaustion => Self::PortExhaustion,
             ErrorClass::DispatchPolicyRejected => Self::DispatchPolicyRejected,
+            ErrorClass::BackendConnectionLimit => Self::MaxConnections,
             ErrorClass::ConnectionPoolError => Self::Unavailable,
             ErrorClass::ClientDisconnect
             | ErrorClass::ResponseBodyTooLarge

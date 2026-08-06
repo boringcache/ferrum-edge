@@ -1974,9 +1974,9 @@ async fn h3_full_handshake_exposes_peer_identity_before_any_stream_is_accepted()
 // Two properties, both of which fail before the repair:
 //
 //  1. A cap refusal must stay TYPED through the pool's `anyhow` create surface
-//     so it classifies as a PRE-wire `ConnectionPoolError`. A plain
-//     `anyhow!("...")` message classifies as the `RequestError` catch-all,
-//     which `retry::request_reached_wire` treats as POST-wire.
+//     so it classifies as a PRE-wire, health-NEUTRAL `BackendConnectionLimit`.
+//     A plain `anyhow!("...")` message classifies as the `RequestError`
+//     catch-all, which `retry::request_reached_wire` treats as POST-wire.
 //  2. `http3_connections_per_backend` is a sharding knob and can exceed the
 //     cap. When creating the selected shard is refused BY THE CAP, an
 //     already-established healthy shard must serve the request by multiplexing
@@ -2034,13 +2034,21 @@ fn h3_max_connections_refusal_classifies_pre_wire_and_is_not_capability_evidence
     let class = ferrum_edge::http3::client::classify_http3_error(dyn_err);
     assert_eq!(
         class,
-        ErrorClass::ConnectionPoolError,
-        "a cap refusal is a pool-side refusal decided before any packet is sent, \
-         not the `RequestError` catch-all (which is treated as POST-wire)"
+        ErrorClass::BackendConnectionLimit,
+        "a cap refusal is a gateway-side refusal decided before any packet is \
+         sent, not the `RequestError` catch-all (which is treated as POST-wire) \
+         and not the generic `ConnectionPoolError` (which is a backend-health \
+         signal)"
     );
     assert!(
         !ferrum_edge::retry::request_reached_wire(class),
         "no request byte reached the backend, so the class must be pre-wire"
+    );
+    assert!(
+        ferrum_edge::_test_support::error_class_is_health_neutral_for_test(class),
+        "a gateway-side ceiling carries no evidence about the backend, so it \
+         must not trip the circuit breaker, ding passive health, penalize the \
+         load balancer, or shrink the adaptive-concurrency permit"
     );
 }
 
@@ -2055,7 +2063,7 @@ fn h3_max_connections_refusal_survives_coalesced_waiter_fan_out() {
     // survive so the waiter takes the same shard-reuse path.
     let shared = SharedPoolCreateError::capture(err.as_ref());
     assert_eq!(shared.kind(), SharedPoolCreateKind::MaxConnections);
-    assert_eq!(shared.error_class(), ErrorClass::ConnectionPoolError);
+    assert_eq!(shared.error_class(), ErrorClass::BackendConnectionLimit);
 
     let waiter_error = anyhow::Error::new(shared);
     let dyn_waiter: &(dyn std::error::Error + 'static) = waiter_error.as_ref();
@@ -2065,8 +2073,8 @@ fn h3_max_connections_refusal_survives_coalesced_waiter_fan_out() {
     );
     assert_eq!(
         ferrum_edge::http3::client::classify_http3_error(dyn_waiter),
-        ErrorClass::ConnectionPoolError,
-        "waiters must inherit the creator's pre-wire classification"
+        ErrorClass::BackendConnectionLimit,
+        "waiters must inherit the creator's pre-wire, health-neutral classification"
     );
 }
 

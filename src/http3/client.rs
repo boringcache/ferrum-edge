@@ -51,9 +51,10 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
     use crate::retry::ErrorClass;
 
     // Gateway-side `connectionPool.tcp.maxConnections` refusal. Decided BEFORE
-    // any packet is sent, so it is a pool-side, pre-wire refusal —
-    // `ConnectionPoolError` (`request_reached_wire == false`), matching the
-    // typed direct-H2 (`Http2PoolError::MaxConnectionsExceeded`), gRPC
+    // any packet is sent, so it is a pre-wire, health-NEUTRAL refusal —
+    // `BackendConnectionLimit` (`request_reached_wire == false`, and a
+    // `client_side_no_backend_signal` class), matching the typed direct-H2
+    // (`Http2PoolError::MaxConnectionsExceeded`), gRPC
     // (`GrpcBackendUnavailableKind::MaxConnections`) and HBONE
     // (`HbonePoolError::MaxConnectionsExceeded`) classes. Checked FIRST: the
     // message carries no quinn/io type and the substring fallback below would
@@ -62,7 +63,7 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
     // class is excluded from `is_h3_transport_error_class`, so it never
     // downgrades the cached H3 capability either.
     if crate::backend_conn_limit::is_backend_connection_limit_error(err) {
-        return ErrorClass::ConnectionPoolError;
+        return ErrorClass::BackendConnectionLimit;
     }
 
     // Coalesced GenericPool create waiters receive `anyhow` wrapping
@@ -2013,10 +2014,11 @@ impl Http3ConnectionPool {
         );
         let conn_slot = match conn_admission {
             // A cap refusal must stay TYPED through the `anyhow` create surface:
-            // `classify_http3_error` recognizes it as a pre-wire
-            // `ConnectionPoolError`, and `request()` recognizes it structurally
-            // so it can fall back to an already-established shard instead of
-            // failing a destination that is healthy but at its ceiling.
+            // `classify_http3_error` recognizes it as a pre-wire, health-neutral
+            // `BackendConnectionLimit`, and `request()` recognizes it
+            // structurally so it can fall back to an already-established shard
+            // instead of failing a destination that is healthy but at its
+            // ceiling.
             Some(admission) => Some(admission.acquire_or_typed_error("HTTP/3 pool")?),
             None => None,
         };
@@ -2159,10 +2161,11 @@ impl Http3ConnectionPool {
         );
         let conn_slot = match conn_admission {
             // A cap refusal must stay TYPED through the `anyhow` create surface:
-            // `classify_http3_error` recognizes it as a pre-wire
-            // `ConnectionPoolError`, and `request()` recognizes it structurally
-            // so it can fall back to an already-established shard instead of
-            // failing a destination that is healthy but at its ceiling.
+            // `classify_http3_error` recognizes it as a pre-wire, health-neutral
+            // `BackendConnectionLimit`, and `request()` recognizes it
+            // structurally so it can fall back to an already-established shard
+            // instead of failing a destination that is healthy but at its
+            // ceiling.
             Some(admission) => Some(admission.acquire_or_typed_error("HTTP/3 pool")?),
             None => None,
         };
