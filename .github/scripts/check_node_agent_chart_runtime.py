@@ -54,10 +54,18 @@ REQUIRED_RELATIVE_PATHS: tuple[str, ...] = (
     "charts/ferrum-mesh/values.yaml",
 )
 
-# Additional chart surfaces scanned when present (examples/overlays).
-OPTIONAL_GLOBS: tuple[str, ...] = (
-    "charts/ferrum-mesh/examples/*.yaml",
-    "charts/ferrum-mesh/examples/*.yml",
+# Every rendered template and every values/example input is governed. Keeping
+# this recursive and chart-wide prevents a rename, a second DaemonSet template,
+# a helper fragment, or the sibling gateway chart from becoming an escape hatch.
+GOVERNED_GLOBS: tuple[str, ...] = (
+    "charts/**/templates/**/*",
+    "charts/**/values*.yaml",
+    "charts/**/values*.yml",
+    "charts/**/values*.json",
+    "charts/**/examples/**/*.yaml",
+    "charts/**/examples/**/*.yml",
+    "charts/**/examples/**/*.json",
+    "charts/**/files/**/*",
 )
 
 HELM_COMMENT_RE = re.compile(r"\{\{-?\s*/\*.*?\*/\s*-?\}\}", re.DOTALL)
@@ -67,9 +75,14 @@ TRAILING_HASH_COMMENT_RE = re.compile(
     r"(?m)^(?P<code>(?:[^#'\"\n]|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")*?)\s+#.*$"
 )
 
-PRIVILEGED_TRUE_RE = re.compile(
-    r"(?m)^\s*privileged\s*:\s*(?:true|True|TRUE|\"true\"|'true')\s*$"
+# Reject a privileged field unless its value is a literal false. This catches
+# hard-coded true, inline YAML/JSON, and Helm expressions such as
+# `privileged: {{ .Values.foo }}` whose default might be false but which would
+# otherwise create an operator-controlled privilege escalation.
+PRIVILEGED_ASSIGNMENT_RE = re.compile(
+    r"(?im)(?:^|[,{]\s*)[\"']?privileged[\"']?\s*:\s*(?P<value>[^,}\n]+)"
 )
+LITERAL_FALSE_VALUES = frozenset(("false", '"false"', "'false'"))
 
 # Path / socket references that grant container-runtime or host-escape access.
 PROHIBITED_REFERENCE_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -103,31 +116,37 @@ def strip_chart_comments(text: str) -> str:
 
 
 def iter_scan_paths(root: Path) -> list[Path]:
-    paths: list[Path] = []
+    paths: set[Path] = set()
     missing: list[str] = []
     for relative in REQUIRED_RELATIVE_PATHS:
         path = root / relative
         if not path.is_file():
             missing.append(relative)
             continue
-        paths.append(path)
+        paths.add(path)
     if missing:
         raise FileNotFoundError(
             "required node-agent/ambient chart surfaces missing or not regular "
             f"files: {', '.join(missing)}"
         )
-    for pattern in OPTIONAL_GLOBS:
+    for pattern in GOVERNED_GLOBS:
         for path in sorted(root.glob(pattern)):
-            if path.is_file() and path not in paths:
-                paths.append(path)
-    return paths
+            if path.is_file():
+                paths.add(path)
+    return sorted(paths)
 
 
 def scan_text(relative: str, text: str) -> list[str]:
     content = strip_chart_comments(text)
     findings: list[str] = []
-    if PRIVILEGED_TRUE_RE.search(content):
-        findings.append(f"{relative}: privileged: true is prohibited")
+    for match in PRIVILEGED_ASSIGNMENT_RE.finditer(content):
+        value = match.group("value").strip().lower()
+        if value not in LITERAL_FALSE_VALUES:
+            findings.append(
+                f"{relative}: privileged must be literal false "
+                "(true or dynamic values are prohibited)"
+            )
+            break
     for label, pattern in PROHIBITED_REFERENCE_RES:
         if pattern.search(content):
             findings.append(
@@ -327,6 +346,26 @@ def run_self_test() -> list[str]:
                 _CLEAN_VALUES,
             ),
             (
+                "dynamic privileged value",
+                _CLEAN_NODE_AGENT.replace(
+                    "privileged: false",
+                    "privileged: {{ .Values.nodeAgent.security.privileged }}",
+                    1,
+                ),
+                _CLEAN_AMBIENT,
+                _CLEAN_VALUES,
+            ),
+            (
+                "inline privileged true",
+                _CLEAN_NODE_AGENT.replace(
+                    "securityContext:\n            privileged: false",
+                    'securityContext: {"privileged": true}',
+                    1,
+                ),
+                _CLEAN_AMBIENT,
+                _CLEAN_VALUES,
+            ),
+            (
                 "values docker socket path",
                 _CLEAN_NODE_AGENT,
                 _CLEAN_AMBIENT,
@@ -348,6 +387,38 @@ def run_self_test() -> list[str]:
                 continue
             if not findings:
                 failures.append(f"{label}: prohibited fixture was not rejected")
+
+        renamed_surface_root = Path(tmp) / "additional-template"
+        _required_tree(
+            renamed_surface_root,
+            node_agent=_CLEAN_NODE_AGENT,
+            ambient=_CLEAN_AMBIENT,
+            values=_CLEAN_VALUES,
+        )
+        _write(
+            renamed_surface_root
+            / "charts/ferrum-gateway/templates/runtime-access-daemonset.yaml",
+            """\
+apiVersion: apps/v1
+kind: DaemonSet
+spec:
+  template:
+    spec:
+      volumes:
+        - name: runtime
+          hostPath:
+            path: /run/containerd/containerd.sock
+""",
+        )
+        try:
+            findings = check_repository(renamed_surface_root)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"additional template fixture raised: {exc}")
+        else:
+            if not findings:
+                failures.append(
+                    "additional/renamed chart template was not governed"
+                )
 
         missing_root = Path(tmp) / "missing"
         _write(missing_root / REQUIRED_RELATIVE_PATHS[0], _CLEAN_NODE_AGENT)
@@ -422,7 +493,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(
             "node-agent/ambient chart runtime lint self-test passed "
-            f"({len(REQUIRED_RELATIVE_PATHS)} required surfaces)"
+            "(required surfaces plus recursive chart templates/values/examples)"
         )
         return 0
 
@@ -438,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(
         "node-agent/ambient chart runtime lint passed "
-        f"({len(REQUIRED_RELATIVE_PATHS)} required surfaces)"
+        "(required surfaces plus recursive chart templates/values/examples)"
     )
     return 0
 

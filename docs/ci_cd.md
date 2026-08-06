@@ -214,8 +214,11 @@ queued planner edit cannot self-classify as light.
 merge groups the checker is extracted from the base branch when present, then
 self-tested and executed against the proposed chart tree, so a hostile PR cannot
 replace the gate while adding a Docker/containerd/CRI-O socket mount,
-`runtime.sock`, or `privileged: true`. The required `Tests` aggregate re-runs the
-proposed checker self-test and scan through `verify_required_ci.py`.
+`runtime.sock`, or a true/dynamic `privileged` assignment. The scan recursively
+governs every chart template, values file, example values file, and chart file
+fragment rather than trusting two workload filenames. The required `Tests`
+aggregate re-runs the proposed checker self-test and scan through
+`verify_required_ci.py`.
 Any unrecognized path, an empty/unavailable diff, a mixed code-and-docs change,
 a push to `main`, or a manual run fails over to full mode. The decision table
 and its executable examples live in `.github/scripts/pr_ci_plan.py`. PR
