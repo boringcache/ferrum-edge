@@ -732,6 +732,13 @@ struct H3PooledConnection {
     connection: quinn::Connection,
 }
 
+#[derive(Clone, Copy)]
+struct H3ConnectionTarget<'a> {
+    host: &'a str,
+    port: u16,
+    policy_port: u16,
+}
+
 impl H3PooledConnection {
     fn new(send_request: H3SendRequest, connection: quinn::Connection) -> Self {
         Self {
@@ -1458,9 +1465,7 @@ impl Http3ConnectionPool {
         &self,
         key: String,
         proxy: &Proxy,
-        host: &str,
-        port: u16,
-        policy_port: u16,
+        target: H3ConnectionTarget<'_>,
         tls_config: Arc<rustls::ClientConfig>,
         h3_config: super::config::Http3ServerConfig,
     ) -> Result<H3PooledConnection, anyhow::Error> {
@@ -1471,9 +1476,9 @@ impl Http3ConnectionPool {
                 async move {
                     self.create_connection_to_target(
                         proxy,
-                        host,
-                        port,
-                        policy_port,
+                        target.host,
+                        target.port,
+                        target.policy_port,
                         &tls_config,
                         Some(&h3_config),
                     )
@@ -1905,9 +1910,11 @@ impl Http3ConnectionPool {
             .create_or_get_target_sender(
                 key,
                 proxy,
-                target_host,
-                target_port,
-                target_policy_port,
+                H3ConnectionTarget {
+                    host: target_host,
+                    port: target_port,
+                    policy_port: target_policy_port,
+                },
                 tls_config,
                 h3_config,
             )
@@ -3041,9 +3048,11 @@ impl Http3ConnectionPool {
             .create_or_get_target_sender(
                 key,
                 proxy,
-                target_host,
-                target_port,
-                target_policy_port,
+                H3ConnectionTarget {
+                    host: target_host,
+                    port: target_port,
+                    policy_port: target_policy_port,
+                },
                 tls_config,
                 h3_config,
             )
@@ -3166,9 +3175,11 @@ impl Http3ConnectionPool {
             .create_or_get_target_sender(
                 key,
                 proxy,
-                target_host,
-                target_port,
-                target_policy_port,
+                H3ConnectionTarget {
+                    host: target_host,
+                    port: target_port,
+                    policy_port: target_policy_port,
+                },
                 tls_config,
                 h3_config,
             )
@@ -3468,9 +3479,11 @@ impl Http3ConnectionPool {
             .create_or_get_target_sender(
                 key,
                 proxy,
-                target_host,
-                target_port,
-                target_policy_port,
+                H3ConnectionTarget {
+                    host: target_host,
+                    port: target_port,
+                    policy_port: target_policy_port,
+                },
                 tls_config,
                 h3_config,
             )
