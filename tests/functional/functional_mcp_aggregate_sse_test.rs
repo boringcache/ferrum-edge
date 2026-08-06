@@ -1,0 +1,1344 @@
+//! Live-datapath functional coverage for multiplexed aggregate MCP SSE.
+//!
+//! These tests drive a real gateway over a real client transport: a downstream
+//! MCP session is initialized, one `GET` with `Accept: text/event-stream`
+//! attaches the session's single listener, and concurrent JSON-RPC requests are
+//! issued over `POST` while a scripted MCP upstream holds both of them in
+//! flight at once. The assertions are made on the wire — the POSTs are answered
+//! with an empty `202` and the JSON-RPC responses arrive as `id:`/`event:
+//! message`/`data:` records on the one listener, with the string id `"7"` and
+//! the number id `7` kept as distinct streams.
+//!
+//! Covered transports: HTTP/1.1 (raw socket, so the absence of
+//! `Content-Length` and the chunked framing are observed directly), HTTP/2 over
+//! h2c prior knowledge, and native HTTP/3 through the shared H3 client
+//! scaffolding.
+//!
+//! Covered lifecycle/security behavior: a second `GET` while a listener is
+//! attached is refused `409`, a client disconnect releases the slot so the
+//! session can reattach and still receive events staged while detached,
+//! `notifications/cancelled` suppresses a late response, and session `DELETE`
+//! ends the listener's stream.
+//!
+//! Every wait in this file is either a channel handshake driven by the scripted
+//! upstream or a bounded poll. No assertion is timing-based: an absence is
+//! always proved by a later, ordered observation (the next event cursor)
+//! rather than by elapsed time, and no authoritative protocol answer is ever
+//! re-requested. The one backoff loop is the post-disconnect reattach, which
+//! polls a SETUP step whose only tolerated intermediate outcome is the
+//! duplicate-listener `409`.
+//!
+//! Run: `cargo build --bin ferrum-edge && cargo test --test functional_tests
+//! functional_mcp_aggregate_sse -- --ignored --nocapture`
+
+use crate::scaffolding::clients::{GetOptions, Http3Client, Http3ResponseStream};
+use crate::scaffolding::{reserve_colocated_tcp_udp, reserve_port};
+
+use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
+use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::config::{EnvConfig, OperatingMode};
+use ferrum_edge::modes::file::ServeOptions;
+use serde_json::{Value, json};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+
+const TEST_NAMESPACE: &str = "ferrum";
+const TEST_JWT_SECRET: &str = "ferrum-edge-mcp-aggregate-sse-secret-0000";
+const TEST_JWT_ISSUER: &str = "ferrum-edge-mcp-aggregate-sse";
+const PROTOCOL_VERSION: &str = "2025-11-25";
+const SESSION_HEADER: &str = "mcp-session-id";
+/// Method the aggregate router does not implement, so it is routed to the
+/// scripted upstream through `capabilities.passthrough_unknown_methods`. That
+/// is what lets a test hold a request in flight and observe true multiplexing
+/// rather than back-to-back synthetic answers.
+const HELD_METHOD: &str = "session/echo";
+/// Opening comment the broker writes as soon as a listener attaches.
+const SSE_GREETING_RECORD: &str = ": mcp-sse";
+/// Hard ceiling on one buffered message in the scripted upstream and in the
+/// test's own response readers.
+const MAX_MESSAGE_BYTES: usize = 256 * 1024;
+/// Bound on every socket read. A wedged datapath fails the test instead of
+/// hanging the suite; it is never used to infer a protocol outcome.
+const READ_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bounded reattach budget after a client disconnect. The gateway learns of the
+/// disconnect when the transport drops the broker-owned body, which is a
+/// separate task from this one, so the retry is on the ATTACH (a non-
+/// authoritative setup step), never on a protocol answer under assertion.
+const REATTACH_ATTEMPTS: u32 = 300;
+/// Backoff between reattach attempts. Bounds the poll's cost; it is never used
+/// to decide a protocol outcome.
+const REATTACH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+// ===========================================================================
+// Scripted MCP upstream
+// ===========================================================================
+
+/// One JSON-RPC request the scripted upstream has received and is holding.
+///
+/// The upstream answers only after `release` is fired, which is what makes
+/// "both requests are in flight at the same time" an observed fact rather than
+/// a timing assumption.
+struct Arrival {
+    id: Value,
+    release: oneshot::Sender<()>,
+}
+
+/// Serve HTTP/1.1 JSON-RPC on `listener` until it is dropped.
+///
+/// Requests carrying an `id` are parked: the arrival (with its release handle)
+/// is published to the test, and the response is written only once the test
+/// releases it. Notification-form messages (no `id`) are answered immediately
+/// with an empty `202`, which is what `notifications/cancelled` needs when it
+/// is routed upstream.
+///
+/// The JSON body is serialized WITHOUT a trailing newline on purpose: the
+/// broker refuses to fold CR/LF into an SSE `data:` line, so a newline-
+/// terminated upstream body would legitimately fall back to an inline answer.
+async fn serve_scripted_mcp_upstream(
+    listener: TcpListener,
+    arrivals: mpsc::UnboundedSender<Arrival>,
+) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let arrivals = arrivals.clone();
+        tokio::spawn(async move {
+            let _ = stream.set_nodelay(true);
+            let mut pending = Vec::new();
+            loop {
+                let Some(body) = read_one_http_request(&mut stream, &mut pending).await else {
+                    return;
+                };
+                let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let Some(id) = parsed.get("id").cloned() else {
+                    if write_http_response(&mut stream, 202, "").await.is_err() {
+                        return;
+                    }
+                    continue;
+                };
+                let (release, released) = oneshot::channel();
+                if arrivals
+                    .send(Arrival {
+                        id: id.clone(),
+                        release,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                // A dropped release handle means the test finished with this
+                // request; answering anyway keeps the socket well-framed.
+                let _ = released.await;
+                let kind = match &id {
+                    Value::String(_) => "string",
+                    Value::Number(_) => "number",
+                    _ => "other",
+                };
+                let payload = serde_json::to_string(&json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "kind": kind }
+                }))
+                .expect("scripted upstream response serializes");
+                if write_http_response(&mut stream, 200, &payload).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+}
+
+/// Read exactly one HTTP/1.1 message off `stream`, leaving any pipelined bytes
+/// in `pending`. Returns `None` (fail closed, no answer) on EOF-before-complete,
+/// a missing/invalid `Content-Length`, `Transfer-Encoding`, or an oversized
+/// message. Termination is decided entirely by the parsed framing.
+async fn read_one_http_request(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let mut chunk = [0u8; 8192];
+    loop {
+        if let Some(offset) = find_header_terminator(pending) {
+            let headers = std::str::from_utf8(&pending[..offset]).ok()?;
+            let length = parse_content_length(headers)?;
+            let need = offset + 4 + length;
+            if pending.len() >= need {
+                let body = pending[offset + 4..need].to_vec();
+                pending.drain(..need);
+                return Some(body);
+            }
+        }
+        if pending.len() > MAX_MESSAGE_BYTES {
+            return None;
+        }
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        pending.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn find_header_terminator(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+/// Body length from a request/response head. Absent `Content-Length` means an
+/// empty body; `Transfer-Encoding` is refused rather than guessed at.
+fn parse_content_length(headers: &str) -> Option<usize> {
+    let mut length = Some(0usize);
+    for line in headers.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            return None;
+        }
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            length = value.trim().parse::<usize>().ok();
+        }
+    }
+    length.filter(|value| *value <= MAX_MESSAGE_BYTES)
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &str,
+) -> std::io::Result<()> {
+    let reason = if status == 200 { "OK" } else { "Accepted" };
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body.as_bytes()).await?;
+    stream.flush().await
+}
+
+async fn next_arrival(rx: &mut mpsc::UnboundedReceiver<Arrival>) -> Arrival {
+    tokio::time::timeout(READ_TIMEOUT, rx.recv())
+        .await
+        .expect("scripted upstream did not receive the request")
+        .expect("scripted upstream arrival channel closed")
+}
+
+// ===========================================================================
+// Gateway harness
+// ===========================================================================
+
+struct RunningGateway {
+    http_port: u16,
+    https_port: u16,
+    shutdown_tx: watch::Sender<bool>,
+    join: JoinHandle<()>,
+}
+
+impl RunningGateway {
+    async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), self.join).await;
+    }
+}
+
+/// Fixture bundling the gateway with its scripted upstream and the arrival
+/// channel that drives every handshake in these tests.
+struct SseFixture {
+    gateway: RunningGateway,
+    arrivals: mpsc::UnboundedReceiver<Arrival>,
+    upstream_task: JoinHandle<()>,
+}
+
+impl SseFixture {
+    async fn start() -> Self {
+        // Pre-bound fixture listener: the socket is never dropped and rebound,
+        // so it cannot race a port the gateway is about to claim.
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scripted MCP upstream");
+        let upstream_port = upstream_listener
+            .local_addr()
+            .expect("scripted upstream local addr")
+            .port();
+        let (arrivals_tx, arrivals) = mpsc::unbounded_channel();
+        let upstream_task =
+            tokio::spawn(serve_scripted_mcp_upstream(upstream_listener, arrivals_tx));
+
+        let gateway = start_gateway(aggregate_sse_config(upstream_port))
+            .await
+            .expect("start aggregate MCP SSE gateway");
+
+        Self {
+            gateway,
+            arrivals,
+            upstream_task,
+        }
+    }
+
+    fn http_port(&self) -> u16 {
+        self.gateway.http_port
+    }
+
+    fn https_port(&self) -> u16 {
+        self.gateway.https_port
+    }
+
+    async fn shutdown(self) {
+        self.gateway.shutdown().await;
+        self.upstream_task.abort();
+    }
+}
+
+async fn start_gateway(
+    config: GatewayConfig,
+) -> Result<RunningGateway, Box<dyn std::error::Error + Send + Sync>> {
+    let http = reserve_port().await?;
+    let (https_tcp, https_udp) = reserve_colocated_tcp_udp().await?;
+    let admin = reserve_port().await?;
+    let http_port = http.port;
+    let https_port = https_tcp.port;
+    assert_eq!(https_port, https_udp.port);
+
+    let env_config = EnvConfig {
+        mode: OperatingMode::File,
+        log_level: "warn".to_string(),
+        proxy_http_port: http_port,
+        proxy_https_port: https_port,
+        admin_http_port: admin.port,
+        admin_https_port: 0,
+        admin_jwt_secret: Some(TEST_JWT_SECRET.to_string()),
+        admin_jwt_issuer: TEST_JWT_ISSUER.to_string(),
+        frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+        frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+        enable_http3: true,
+        pool_warmup_enabled: false,
+        shutdown_drain_seconds: 0,
+        max_connections: 0,
+        namespace: TEST_NAMESPACE.to_string(),
+        ..EnvConfig::default()
+    };
+
+    let jwt_manager = JwtManager::new(JwtConfig {
+        secret: TEST_JWT_SECRET.to_string(),
+        issuer: TEST_JWT_ISSUER.to_string(),
+        audience: None,
+        max_ttl_seconds: 3600,
+        algorithm: jsonwebtoken::Algorithm::HS256,
+    });
+    let options = ServeOptions {
+        proxy_http: Some(http.into_listener()),
+        proxy_https: Some(https_tcp.into_listener()),
+        admin_http: Some(admin.into_listener()),
+        admin_jwt_manager: Some(jwt_manager),
+        skip_initial_capability_refresh: true,
+        ..ServeOptions::default()
+    };
+    // The QUIC listener is bound by the gateway on the same port the TCP
+    // reservation proved free; hold the reservation until `serve` owns it.
+    drop(https_udp);
+
+    let (shutdown_tx, _) = watch::channel(false);
+    let handles = ferrum_edge::modes::file::serve(env_config, config, options, shutdown_tx.clone())
+        .await
+        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("file::serve failed: {error}").into()
+        })?;
+    let join = tokio::spawn(async move {
+        if let Err(error) = handles.join().await {
+            eprintln!("in-process aggregate MCP SSE gateway listener panicked: {error}");
+        }
+    });
+
+    Ok(RunningGateway {
+        http_port,
+        https_port,
+        shutdown_tx,
+        join,
+    })
+}
+
+fn aggregate_sse_config(upstream_port: u16) -> GatewayConfig {
+    serde_json::from_value(json!({
+        "version": "1",
+        "proxies": [{
+            "id": "mcp-aggregate-sse",
+            "namespace": TEST_NAMESPACE,
+            "listen_path": "/mcp",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": upstream_port,
+            "strip_listen_path": false,
+            "plugins": [{"plugin_config_id": "mcp-aggregate-sse-gw"}]
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "mcp-aggregate-sse-gw",
+            "namespace": TEST_NAMESPACE,
+            "plugin_name": "mcp_gateway",
+            "scope": "proxy",
+            "proxy_id": "mcp-aggregate-sse",
+            "enabled": true,
+            "config": {
+                "enabled": true,
+                "mode": "aggregate_router",
+                "endpoint": {
+                    "path": "/mcp",
+                    "protocol_versions": [PROTOCOL_VERSION]
+                },
+                "servers": {
+                    "echo": {
+                        "upstream_url": format!("http://127.0.0.1:{upstream_port}/mcp"),
+                        "namespace": "echo",
+                        "enabled": true,
+                        "expose_tools": true
+                    }
+                },
+                "sessions": {
+                    // No upstream initialize handshake: the scripted upstream
+                    // only has to answer the requests the test issues.
+                    "initialize_upstreams": "passthrough",
+                    "sse_multiplexing": true,
+                    // A short keepalive bounds when the gateway next writes to
+                    // a listener. That is what makes "the client went away"
+                    // observable in bounded time without depending on how a
+                    // transport happens to detect a half-closed peer.
+                    "sse_keepalive_seconds": 5,
+                    "sse_listener_max_lifetime_seconds": 120
+                },
+                "capabilities": {
+                    "passthrough_unknown_methods": true
+                },
+                "policy": {
+                    "default_action": "allow"
+                }
+            }
+        }]
+    }))
+    .expect("aggregate MCP SSE config is valid")
+}
+
+// ===========================================================================
+// SSE record parsing
+// ===========================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SseMessage {
+    event_id: u64,
+    data: String,
+}
+
+impl SseMessage {
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.data).expect("SSE data line is a JSON-RPC response")
+    }
+}
+
+/// Incremental SSE record splitter. Records are separated by a blank line, so a
+/// record boundary is decided by the bytes on the wire, never by a timer.
+#[derive(Default)]
+struct SseCursor {
+    decoded: Vec<u8>,
+}
+
+impl SseCursor {
+    fn feed(&mut self, bytes: &[u8]) {
+        self.decoded.extend_from_slice(bytes);
+    }
+
+    fn take_record(&mut self) -> Option<String> {
+        let position = self.decoded.windows(2).position(|window| window == b"\n\n")?;
+        let record =
+            String::from_utf8(self.decoded[..position].to_vec()).expect("SSE record is UTF-8");
+        self.decoded.drain(..position + 2);
+        Some(record)
+    }
+}
+
+/// Parse a non-comment SSE record into its `id:` / `data:` pair, asserting the
+/// event name the broker publishes.
+fn parse_sse_message(record: &str) -> SseMessage {
+    let mut event_id = None;
+    let mut data = None;
+    let mut event_name = None;
+    for line in record.split('\n') {
+        if let Some(rest) = line.strip_prefix("id: ") {
+            event_id = Some(rest.parse::<u64>().expect("SSE id is a numeric cursor"));
+        } else if let Some(rest) = line.strip_prefix("data: ") {
+            data = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("event: ") {
+            event_name = Some(rest.to_string());
+        }
+    }
+    assert_eq!(
+        event_name.as_deref(),
+        Some("message"),
+        "multiplexed JSON-RPC responses must be published as `event: message`: {record:?}"
+    );
+    SseMessage {
+        event_id: event_id.expect("SSE record carries an id"),
+        data: data.expect("SSE record carries a data line"),
+    }
+}
+
+fn is_comment_record(record: &str) -> bool {
+    record.starts_with(':')
+}
+
+// ===========================================================================
+// HTTP/1.1 raw SSE listener
+// ===========================================================================
+
+/// Raw HTTP/1.1 listener socket.
+///
+/// Raw rather than `reqwest` on purpose: this is the only way to observe that
+/// the gateway published NO `Content-Length` for the event stream and framed it
+/// as `chunked`, and it makes "the client disconnected" an unambiguous act
+/// (dropping the socket) rather than a client-library detail.
+struct RawSseListener {
+    stream: TcpStream,
+    raw: Vec<u8>,
+    cursor: SseCursor,
+    ended: bool,
+}
+
+enum SseAttach {
+    Attached(RawSseListener),
+    Refused { status: u16, body: String },
+}
+
+async fn attach_sse_h1(port: u16, session_id: &str, last_event_id: Option<&str>) -> SseAttach {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect to gateway proxy port");
+    stream.set_nodelay(true).expect("set nodelay");
+    let mut request = format!(
+        "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\
+         {SESSION_HEADER}: {session_id}\r\nMCP-Protocol-Version: {PROTOCOL_VERSION}\r\n"
+    );
+    if let Some(cursor) = last_event_id {
+        request.push_str(&format!("Last-Event-ID: {cursor}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write SSE GET request");
+    stream.flush().await.expect("flush SSE GET request");
+
+    let mut raw = Vec::new();
+    let (status, headers) = read_response_head(&mut stream, &mut raw).await;
+    if status != 200 {
+        let length = parse_content_length(&headers).unwrap_or(0);
+        while raw.len() < length {
+            let mut chunk = [0u8; 4096];
+            let read = read_with_timeout(&mut stream, &mut chunk).await;
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+        }
+        let body = String::from_utf8_lossy(&raw[..raw.len().min(length)]).to_string();
+        return SseAttach::Refused { status, body };
+    }
+
+    let lowered = headers.to_ascii_lowercase();
+    assert!(
+        lowered.contains("content-type: text/event-stream"),
+        "attached listener must be an event stream: {headers}"
+    );
+    assert!(
+        !lowered.contains("\ncontent-length:"),
+        "an event stream must not publish Content-Length for unwritten bytes: {headers}"
+    );
+    assert!(
+        lowered.contains("transfer-encoding: chunked"),
+        "HTTP/1.1 event streams must be chunk-framed: {headers}"
+    );
+
+    let mut listener = RawSseListener {
+        stream,
+        raw,
+        cursor: SseCursor::default(),
+        ended: false,
+    };
+    listener.decode_buffered();
+    SseAttach::Attached(listener)
+}
+
+/// Reattach a session's listener after a client disconnect.
+///
+/// Slot release is owned by the transport task that drops the broker-owned
+/// body, not by the disconnecting client, so this is a bounded poll on a SETUP
+/// step: every attempt is a real attach whose only tolerated outcome is the
+/// duplicate-listener refusal, and exhausting the budget fails the test. No
+/// protocol answer under assertion is ever retried.
+async fn reattach_with_bounded_poll(port: u16, session_id: &str) -> RawSseListener {
+    for _ in 0..REATTACH_ATTEMPTS {
+        match attach_sse_h1(port, session_id, None).await {
+            SseAttach::Attached(listener) => return listener,
+            SseAttach::Refused { status, body } => {
+                assert_eq!(
+                    status, 409,
+                    "only the duplicate-listener refusal is expected while the slot drains: {body}"
+                );
+                tokio::time::sleep(REATTACH_POLL_INTERVAL).await;
+            }
+        }
+    }
+    panic!("client disconnect must release the session's listener slot");
+}
+
+async fn attach_sse_h1_expect_attached(port: u16, session_id: &str) -> RawSseListener {
+    match attach_sse_h1(port, session_id, None).await {
+        SseAttach::Attached(listener) => listener,
+        SseAttach::Refused { status, body } => {
+            panic!("expected an attached SSE listener, got {status}: {body}")
+        }
+    }
+}
+
+impl RawSseListener {
+    /// Decode whatever chunked bytes are already buffered. Returns `true` once
+    /// the terminal zero-length chunk has been seen.
+    fn decode_buffered(&mut self) -> bool {
+        loop {
+            let Some(position) = self.raw.windows(2).position(|window| window == b"\r\n") else {
+                return false;
+            };
+            let line = String::from_utf8_lossy(&self.raw[..position]).to_string();
+            let size_token = line.split(';').next().unwrap_or_default().trim().to_string();
+            let size = usize::from_str_radix(&size_token, 16)
+                .unwrap_or_else(|_| panic!("malformed chunk size {size_token:?}"));
+            let start = position + 2;
+            let need = start + size + 2;
+            if self.raw.len() < need {
+                return false;
+            }
+            let data = self.raw[start..start + size].to_vec();
+            self.cursor.feed(&data);
+            self.raw.drain(..need);
+            if size == 0 {
+                self.ended = true;
+                return true;
+            }
+        }
+    }
+
+    /// Next SSE record, or `None` once the response body has ended.
+    async fn next_record(&mut self) -> Option<String> {
+        loop {
+            if let Some(record) = self.cursor.take_record() {
+                return Some(record);
+            }
+            if self.ended {
+                return None;
+            }
+            let mut chunk = [0u8; 8192];
+            let read = read_with_timeout(&mut self.stream, &mut chunk).await;
+            if read == 0 {
+                self.ended = true;
+                return self.cursor.take_record();
+            }
+            self.raw.extend_from_slice(&chunk[..read]);
+            self.decode_buffered();
+        }
+    }
+
+    async fn expect_greeting(&mut self) {
+        let record = self
+            .next_record()
+            .await
+            .expect("attached listener must emit its opening comment");
+        assert_eq!(
+            record, SSE_GREETING_RECORD,
+            "listener must open with the broker greeting"
+        );
+    }
+
+    async fn next_message(&mut self) -> SseMessage {
+        loop {
+            let record = self
+                .next_record()
+                .await
+                .expect("event stream ended before the expected message");
+            if is_comment_record(&record) {
+                continue;
+            }
+            return parse_sse_message(&record);
+        }
+    }
+
+    /// Drain until the stream ends, asserting no further message record is
+    /// published. Used to prove a session `DELETE` really terminated the
+    /// listener rather than leaving it idle.
+    async fn expect_end_without_message(&mut self) {
+        while let Some(record) = self.next_record().await {
+            assert!(
+                is_comment_record(&record),
+                "listener must not publish a message after the session ended: {record:?}"
+            );
+        }
+    }
+}
+
+async fn read_response_head(stream: &mut TcpStream, raw: &mut Vec<u8>) -> (u16, String) {
+    loop {
+        if let Some(offset) = find_header_terminator(raw) {
+            let head = String::from_utf8_lossy(&raw[..offset]).to_string();
+            let status = head
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|code| code.parse::<u16>().ok())
+                .unwrap_or_else(|| panic!("malformed status line: {head:?}"));
+            raw.drain(..offset + 4);
+            return (status, head);
+        }
+        let mut chunk = [0u8; 4096];
+        let read = read_with_timeout(stream, &mut chunk).await;
+        assert!(read > 0, "connection closed before response headers");
+        raw.extend_from_slice(&chunk[..read]);
+    }
+}
+
+async fn read_with_timeout(stream: &mut TcpStream, chunk: &mut [u8]) -> usize {
+    match tokio::time::timeout(READ_TIMEOUT, stream.read(chunk)).await {
+        Ok(Ok(read)) => read,
+        Ok(Err(_)) => 0,
+        Err(_) => panic!("timed out reading from the gateway"),
+    }
+}
+
+// ===========================================================================
+// JSON-RPC client helpers
+// ===========================================================================
+
+fn mcp_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/mcp")
+}
+
+fn initialize_body() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": "init",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "ferrum-functional-sse", "version": "1"}
+        }
+    })
+}
+
+fn held_request_body(id: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": HELD_METHOD,
+        "params": {}
+    })
+}
+
+fn cancel_notification_body(request_id: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId": request_id}
+    })
+}
+
+/// Initialize a downstream MCP session and return its id.
+async fn initialize_session(client: &reqwest::Client, port: u16) -> String {
+    let response = client
+        .post(mcp_url(port))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .json(&initialize_body())
+        .send()
+        .await
+        .expect("initialize request");
+    assert_eq!(response.status().as_u16(), 200, "initialize must succeed");
+    let session_id = response
+        .headers()
+        .get(SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("initialize must mint a downstream session id")
+        .to_string();
+    assert!(!session_id.is_empty(), "session id must not be empty");
+    session_id
+}
+
+/// POST a JSON-RPC message and return `(status, body)`.
+async fn post_jsonrpc(
+    client: &reqwest::Client,
+    port: u16,
+    session_id: &str,
+    body: Value,
+) -> (u16, String) {
+    let response = client
+        .post(mcp_url(port))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header(SESSION_HEADER, session_id)
+        .header("mcp-protocol-version", PROTOCOL_VERSION)
+        .json(&body)
+        .send()
+        .await
+        .expect("JSON-RPC POST");
+    let status = response.status().as_u16();
+    let text = response.text().await.expect("JSON-RPC POST body");
+    (status, text)
+}
+
+fn assert_multiplexed_acknowledgement(status: u16, body: &str, label: &str) {
+    assert_eq!(
+        status, 202,
+        "{label}: a multiplexed response leaves an empty 202 on the POST: {body:?}"
+    );
+    assert!(
+        body.is_empty(),
+        "{label}: the POST acknowledgement must carry no body, got {body:?}"
+    );
+}
+
+fn assert_response_identity(message: &SseMessage, expected_id: &Value, expected_kind: &str) {
+    let payload = message.json();
+    assert_eq!(
+        payload.get("jsonrpc").and_then(Value::as_str),
+        Some("2.0"),
+        "multiplexed event must be a JSON-RPC response: {payload}"
+    );
+    assert_eq!(
+        payload.get("id"),
+        Some(expected_id),
+        "multiplexed event must carry the exact JSON-RPC id, including its type: {payload}"
+    );
+    assert_eq!(
+        payload
+            .get("result")
+            .and_then(|result| result.get("kind"))
+            .and_then(Value::as_str),
+        Some(expected_kind),
+        "the upstream answer routed onto this stream must be the one for this id type: {payload}"
+    );
+}
+
+// ===========================================================================
+// HTTP/1.1: multiplexing, listener exclusivity, disconnect + reattach
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn functional_mcp_aggregate_sse_h1_multiplexes_concurrent_requests_and_permits_reattach() {
+    let mut fixture = SseFixture::start().await;
+    let port = fixture.http_port();
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("HTTP/1.1 client builds");
+
+    let session_id = initialize_session(&client, port).await;
+    let mut listener = attach_sse_h1_expect_attached(port, &session_id).await;
+    listener.expect_greeting().await;
+
+    // A second GET while a listener is attached is refused, so the session
+    // really has exactly one event stream.
+    match attach_sse_h1(port, &session_id, None).await {
+        SseAttach::Refused { status, body } => {
+            assert_eq!(status, 409, "a duplicate listener must be refused: {body}");
+            assert!(
+                body.contains("SSE listener already attached"),
+                "refusal must name the duplicate-listener reason: {body}"
+            );
+        }
+        SseAttach::Attached(_) => panic!("a session must not attach two event streams"),
+    }
+
+    // Two concurrent requests whose JSON-RPC ids differ only by TYPE.
+    let string_id = json!("7");
+    let number_id = json!(7);
+    let string_post = tokio::spawn({
+        let client = client.clone();
+        let session_id = session_id.clone();
+        let body = held_request_body(string_id.clone());
+        async move { post_jsonrpc(&client, port, &session_id, body).await }
+    });
+    let number_post = tokio::spawn({
+        let client = client.clone();
+        let session_id = session_id.clone();
+        let body = held_request_body(number_id.clone());
+        async move { post_jsonrpc(&client, port, &session_id, body).await }
+    });
+
+    // Both requests are parked at the upstream at the same time before either
+    // is answered: this is a real concurrent multiplex, not two sequential
+    // exchanges.
+    let first = next_arrival(&mut fixture.arrivals).await;
+    let second = next_arrival(&mut fixture.arrivals).await;
+    let (string_arrival, number_arrival) = if first.id == string_id {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!(
+        (&string_arrival.id, &number_arrival.id),
+        (&string_id, &number_id),
+        "both id types must reach the upstream as separate requests"
+    );
+
+    // Release in a fixed order so the event order under assertion is decided by
+    // the upstream, not by scheduling.
+    string_arrival
+        .release
+        .send(())
+        .expect("release the string-id request");
+    let string_message = listener.next_message().await;
+    assert_eq!(
+        string_message.event_id, 1,
+        "the first published event carries cursor 1"
+    );
+    assert_response_identity(&string_message, &string_id, "string");
+
+    number_arrival
+        .release
+        .send(())
+        .expect("release the number-id request");
+    let number_message = listener.next_message().await;
+    assert_eq!(
+        number_message.event_id, 2,
+        "event cursors advance monotonically on the single listener"
+    );
+    assert_response_identity(&number_message, &number_id, "number");
+
+    let (string_status, string_body) = string_post.await.expect("string-id POST joined");
+    let (number_status, number_body) = number_post.await.expect("number-id POST joined");
+    assert_multiplexed_acknowledgement(string_status, &string_body, "string id");
+    assert_multiplexed_acknowledgement(number_status, &number_body, "number id");
+
+    // Client disconnect: dropping the socket must release the single-listener
+    // slot so the same session can reattach. The configured keepalive bounds
+    // when the gateway attempts its next write to the vanished peer, so the
+    // release is guaranteed rather than dependent on read-side EOF detection.
+    drop(listener);
+    let mut reattached = reattach_with_bounded_poll(port, &session_id).await;
+    reattached.expect_greeting().await;
+
+    // The reattached listener resumes at the same session cursor rather than
+    // restarting, and the session is fully usable again.
+    let resumed_id = json!("after-reattach");
+    let resumed_post = tokio::spawn({
+        let client = client.clone();
+        let session_id = session_id.clone();
+        let body = held_request_body(resumed_id.clone());
+        async move { post_jsonrpc(&client, port, &session_id, body).await }
+    });
+    let resumed_arrival = next_arrival(&mut fixture.arrivals).await;
+    assert_eq!(resumed_arrival.id, resumed_id);
+    resumed_arrival
+        .release
+        .send(())
+        .expect("release the post-reattach request");
+    let resumed_message = reattached.next_message().await;
+    assert_eq!(
+        resumed_message.event_id, 3,
+        "the reattached listener continues the same session cursor"
+    );
+    assert_response_identity(&resumed_message, &resumed_id, "string");
+    let (resumed_status, resumed_body) = resumed_post.await.expect("post-reattach POST joined");
+    assert_multiplexed_acknowledgement(resumed_status, &resumed_body, "after reattach");
+
+    drop(reattached);
+    fixture.shutdown().await;
+}
+
+// ===========================================================================
+// HTTP/1.1: cancellation suppression and session DELETE
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn functional_mcp_aggregate_sse_cancel_suppresses_late_response_and_delete_ends() {
+    let mut fixture = SseFixture::start().await;
+    let port = fixture.http_port();
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("HTTP/1.1 client builds");
+
+    let session_id = initialize_session(&client, port).await;
+    let mut listener = attach_sse_h1_expect_attached(port, &session_id).await;
+    listener.expect_greeting().await;
+
+    // Park a request at the upstream so the cancellation lands while the stream
+    // identity is genuinely open.
+    let cancelled_id = json!("cancel-me");
+    let cancelled_post = tokio::spawn({
+        let client = client.clone();
+        let session_id = session_id.clone();
+        let body = held_request_body(cancelled_id.clone());
+        async move { post_jsonrpc(&client, port, &session_id, body).await }
+    });
+    let cancelled_arrival = next_arrival(&mut fixture.arrivals).await;
+    assert_eq!(cancelled_arrival.id, cancelled_id);
+
+    let (cancel_status, cancel_body) = post_jsonrpc(
+        &client,
+        port,
+        &session_id,
+        cancel_notification_body(cancelled_id.clone()),
+    )
+    .await;
+    assert_eq!(
+        cancel_status, 202,
+        "a JSON-RPC notification is acknowledged with 202: {cancel_body}"
+    );
+
+    // Now let the upstream answer. The response is late relative to the cancel,
+    // so it must be suppressed rather than published.
+    cancelled_arrival
+        .release
+        .send(())
+        .expect("release the cancelled request");
+    let (late_status, late_body) = cancelled_post.await.expect("cancelled POST joined");
+    assert_eq!(
+        late_status, 202,
+        "a suppressed response still acknowledges the POST: {late_body}"
+    );
+    assert!(
+        late_body.is_empty(),
+        "a suppressed response must not be answered inline: {late_body:?}"
+    );
+
+    // Absence is proved by ORDER, not by elapsed time: the very next message on
+    // the listener is a later, uncancelled request's response. If the cancelled
+    // response had been published it would necessarily hold cursor 1.
+    let surviving_id = json!("survivor");
+    let surviving_post = tokio::spawn({
+        let client = client.clone();
+        let session_id = session_id.clone();
+        let body = held_request_body(surviving_id.clone());
+        async move { post_jsonrpc(&client, port, &session_id, body).await }
+    });
+    let surviving_arrival = next_arrival(&mut fixture.arrivals).await;
+    assert_eq!(surviving_arrival.id, surviving_id);
+    surviving_arrival
+        .release
+        .send(())
+        .expect("release the surviving request");
+    let surviving_message = listener.next_message().await;
+    assert_response_identity(&surviving_message, &surviving_id, "string");
+    assert_eq!(
+        surviving_message.event_id, 1,
+        "the cancelled response must never have consumed an event cursor"
+    );
+    let (surviving_status, surviving_body) = surviving_post.await.expect("surviving POST joined");
+    assert_multiplexed_acknowledgement(surviving_status, &surviving_body, "survivor");
+
+    // Session DELETE ends the listener's stream.
+    let delete = client
+        .delete(mcp_url(port))
+        .header(SESSION_HEADER, &session_id)
+        .header("mcp-protocol-version", PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("session DELETE");
+    assert_eq!(delete.status().as_u16(), 200, "session DELETE succeeds");
+    listener.expect_end_without_message().await;
+
+    // The session is gone, so a fresh attach is refused rather than resurrecting
+    // the deleted session's stream.
+    match attach_sse_h1(port, &session_id, None).await {
+        SseAttach::Refused { status, .. } => {
+            assert_eq!(status, 404, "a deleted session cannot attach a listener")
+        }
+        SseAttach::Attached(_) => panic!("a deleted session must not attach an event stream"),
+    }
+
+    fixture.shutdown().await;
+}
+
+// ===========================================================================
+// HTTP/2 (h2c prior knowledge)
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn functional_mcp_aggregate_sse_h2_multiplexes_concurrent_requests() {
+    let mut fixture = SseFixture::start().await;
+    let port = fixture.http_port();
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .expect("h2c client builds");
+
+    let session_id = initialize_session(&client, port).await;
+
+    let mut response = client
+        .get(mcp_url(port))
+        .header("accept", "text/event-stream")
+        .header(SESSION_HEADER, &session_id)
+        .header("mcp-protocol-version", PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("h2c SSE GET");
+    assert_eq!(
+        response.version(),
+        reqwest::Version::HTTP_2,
+        "the listener must be served over HTTP/2"
+    );
+    assert_eq!(response.status().as_u16(), 200, "h2c listener attaches");
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+        "h2c listener must be an event stream"
+    );
+    assert!(
+        response.content_length().is_none(),
+        "an event stream must not publish a content length for unwritten bytes"
+    );
+
+    let mut cursor = SseCursor::default();
+    let greeting = next_record_h2(&mut response, &mut cursor)
+        .await
+        .expect("h2c listener must emit its opening comment");
+    assert_eq!(greeting, SSE_GREETING_RECORD);
+
+    let string_id = json!("h2");
+    let number_id = json!(42);
+    let string_post = tokio::spawn({
+        let client = client.clone();
+        let session_id = session_id.clone();
+        let body = held_request_body(string_id.clone());
+        async move { post_jsonrpc(&client, port, &session_id, body).await }
+    });
+    let number_post = tokio::spawn({
+        let client = client.clone();
+        let session_id = session_id.clone();
+        let body = held_request_body(number_id.clone());
+        async move { post_jsonrpc(&client, port, &session_id, body).await }
+    });
+
+    let first = next_arrival(&mut fixture.arrivals).await;
+    let second = next_arrival(&mut fixture.arrivals).await;
+    let (string_arrival, number_arrival) = if first.id == string_id {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    string_arrival.release.send(()).expect("release string id");
+    let string_message = next_message_h2(&mut response, &mut cursor).await;
+    assert_eq!(string_message.event_id, 1);
+    assert_response_identity(&string_message, &string_id, "string");
+
+    number_arrival.release.send(()).expect("release number id");
+    let number_message = next_message_h2(&mut response, &mut cursor).await;
+    assert_eq!(number_message.event_id, 2);
+    assert_response_identity(&number_message, &number_id, "number");
+
+    let (string_status, string_body) = string_post.await.expect("h2 string POST joined");
+    let (number_status, number_body) = number_post.await.expect("h2 number POST joined");
+    assert_multiplexed_acknowledgement(string_status, &string_body, "h2 string id");
+    assert_multiplexed_acknowledgement(number_status, &number_body, "h2 number id");
+
+    drop(response);
+    fixture.shutdown().await;
+}
+
+async fn next_record_h2(
+    response: &mut reqwest::Response,
+    cursor: &mut SseCursor,
+) -> Option<String> {
+    loop {
+        if let Some(record) = cursor.take_record() {
+            return Some(record);
+        }
+        let chunk = tokio::time::timeout(READ_TIMEOUT, response.chunk())
+            .await
+            .expect("timed out reading the h2c event stream")
+            .expect("h2c event stream read failed");
+        match chunk {
+            Some(bytes) => cursor.feed(&bytes),
+            None => return cursor.take_record(),
+        }
+    }
+}
+
+async fn next_message_h2(response: &mut reqwest::Response, cursor: &mut SseCursor) -> SseMessage {
+    loop {
+        let record = next_record_h2(response, cursor)
+            .await
+            .expect("h2c event stream ended before the expected message");
+        if is_comment_record(&record) {
+            continue;
+        }
+        return parse_sse_message(&record);
+    }
+}
+
+// ===========================================================================
+// Native HTTP/3
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn functional_mcp_aggregate_sse_h3_multiplexes_concurrent_requests() {
+    let mut fixture = SseFixture::start().await;
+    let https_port = fixture.https_port();
+    let url = format!("https://localhost:{https_port}/mcp");
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let initialize = client
+        .post_bytes(
+            &url,
+            serde_json::to_vec(&initialize_body()).expect("initialize body"),
+        )
+        .await
+        .expect("h3 initialize");
+    assert_eq!(
+        initialize.status.as_u16(),
+        200,
+        "h3 initialize must succeed: {}",
+        initialize.body_text()
+    );
+    let session_id = initialize
+        .headers
+        .get(SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("h3 initialize mints a session id")
+        .to_string();
+
+    let listener_client = Http3Client::insecure().expect("h3 listener client");
+    let mut stream = listener_client
+        .open_response_stream(
+            &url,
+            GetOptions::default()
+                .header("accept", "text/event-stream")
+                .header(SESSION_HEADER, session_id.clone())
+                .header("mcp-protocol-version", PROTOCOL_VERSION),
+        )
+        .await
+        .expect("open h3 SSE listener");
+    let (status, headers) = stream.recv_response().await.expect("h3 listener response");
+    assert_eq!(status.as_u16(), 200, "h3 listener attaches");
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+        "h3 listener must be an event stream"
+    );
+    assert!(
+        headers.get("content-length").is_none(),
+        "native H3 must not publish a content length for an event stream"
+    );
+
+    let mut cursor = SseCursor::default();
+    let greeting = next_record_h3(&mut stream, &mut cursor)
+        .await
+        .expect("h3 listener must emit its opening comment");
+    assert_eq!(greeting, SSE_GREETING_RECORD);
+
+    let string_id = json!("h3");
+    let number_id = json!(3);
+    let string_post = tokio::spawn({
+        let url = url.clone();
+        let session_id = session_id.clone();
+        let body = held_request_body(string_id.clone());
+        async move { post_jsonrpc_h3(&url, &session_id, body).await }
+    });
+    let number_post = tokio::spawn({
+        let url = url.clone();
+        let session_id = session_id.clone();
+        let body = held_request_body(number_id.clone());
+        async move { post_jsonrpc_h3(&url, &session_id, body).await }
+    });
+
+    let first = next_arrival(&mut fixture.arrivals).await;
+    let second = next_arrival(&mut fixture.arrivals).await;
+    let (string_arrival, number_arrival) = if first.id == string_id {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    string_arrival.release.send(()).expect("release string id");
+    let string_message = next_message_h3(&mut stream, &mut cursor).await;
+    assert_eq!(string_message.event_id, 1);
+    assert_response_identity(&string_message, &string_id, "string");
+
+    number_arrival.release.send(()).expect("release number id");
+    let number_message = next_message_h3(&mut stream, &mut cursor).await;
+    assert_eq!(number_message.event_id, 2);
+    assert_response_identity(&number_message, &number_id, "number");
+
+    let (string_status, string_body) = string_post.await.expect("h3 string POST joined");
+    let (number_status, number_body) = number_post.await.expect("h3 number POST joined");
+    assert_multiplexed_acknowledgement(string_status, &string_body, "h3 string id");
+    assert_multiplexed_acknowledgement(number_status, &number_body, "h3 number id");
+
+    drop(stream);
+    fixture.shutdown().await;
+}
+
+/// POST one JSON-RPC message over native HTTP/3. Each call uses its own client
+/// so two requests can genuinely be in flight at once.
+async fn post_jsonrpc_h3(url: &str, session_id: &str, body: Value) -> (u16, String) {
+    let client = Http3Client::insecure().expect("h3 post client");
+    let options = GetOptions::default()
+        .method(http::Method::POST)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header(SESSION_HEADER, session_id.to_string())
+        .header("mcp-protocol-version", PROTOCOL_VERSION)
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(&body).expect("JSON-RPC body serializes"),
+        ));
+    let mut stream = client
+        .open_response_stream(url, options)
+        .await
+        .expect("h3 JSON-RPC POST");
+    let (status, _) = stream.recv_response().await.expect("h3 POST response");
+    let mut collected = Vec::new();
+    while let Some(chunk) = stream.recv_data().await.expect("h3 POST body") {
+        collected.extend_from_slice(&chunk);
+        assert!(
+            collected.len() <= MAX_MESSAGE_BYTES,
+            "h3 POST response body exceeded the test ceiling"
+        );
+    }
+    (
+        status.as_u16(),
+        String::from_utf8_lossy(&collected).to_string(),
+    )
+}
+
+async fn next_record_h3(
+    stream: &mut Http3ResponseStream,
+    cursor: &mut SseCursor,
+) -> Option<String> {
+    loop {
+        if let Some(record) = cursor.take_record() {
+            return Some(record);
+        }
+        match stream.recv_data().await.expect("h3 event stream read") {
+            Some(bytes) => cursor.feed(&bytes),
+            None => return cursor.take_record(),
+        }
+    }
+}
+
+async fn next_message_h3(stream: &mut Http3ResponseStream, cursor: &mut SseCursor) -> SseMessage {
+    loop {
+        let record = next_record_h3(stream, cursor)
+            .await
+            .expect("h3 event stream ended before the expected message");
+        if is_comment_record(&record) {
+            continue;
+        }
+        return parse_sse_message(&record);
+    }
+}
