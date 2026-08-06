@@ -2705,8 +2705,8 @@ fn default_trusted_hbone_assertors() -> Vec<TrustedAssertor> {
 #[cfg(test)]
 mod tests {
     use super::{
-        mesh_authz_authorization_path, mesh_authz_destination_port,
-        mesh_ingress_authz_port_missing, mesh_inbound_app_port,
+        mesh_authz_authorization_path, mesh_authz_destination_port, mesh_inbound_app_port,
+        mesh_ingress_authz_port_missing,
     };
     use crate::modes::mesh::{
         MESH_INBOUND_PROXY_ID_PREFIX, MESH_INGRESS_PROXY_ID_PREFIX, MeshTrafficDirection,
