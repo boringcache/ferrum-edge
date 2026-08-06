@@ -1909,7 +1909,39 @@ Each spool is partitioned
 by a non-secret owner identity (plugin config id, Ferrum namespace/ledger,
 ClickHouse endpoint/database/table, node id), so sibling instances can never
 replay, delete, or dead-letter each other's billing records. Set
-`FERRUM_NODE_ID` for stable spool ownership on persistent storage. Ordinary HTTP
+`FERRUM_NODE_ID` for stable spool ownership on persistent storage.
+
+`spool.max_bytes` is a hard ceiling on encoded owned bytes, with one bounded and
+explicit exception. A dead-letter handoff has to protect the authoritative
+source **and** its rejected copy at the same time, so exactly one handoff per
+managed namespace holds a **source credit**: an accounted reservation for the
+bytes its terminal claim removal will free, taken at claim time and sized from
+the pinned artifact's own length. Peak encoded on-disk bytes are therefore
+
+```text
+steady state   <= spool.max_bytes
+transient peak <= spool.max_bytes + reserved_source_bytes   (<= 2 x spool.max_bytes)
+```
+
+The credit is held under an exclusive OS advisory lock on a
+`.spool-dead-letter-credit` record in the namespace root, so a second manager
+instance, plugin generation, or Ferrum process sharing the namespace cannot
+obtain a second one — every spend also re-proves the locked record pathname and
+the source descriptor's current length. Invalidated credit admits against the
+plain ceiling and fails closed instead of double-spending capacity the first
+handoff already promised. **The
+bound therefore does not grow with the number of concurrent handoffs.** Ordinary
+spool writes never carry a credit, and each admission that spends one re-proves
+it from the durable record and the live pinned claim rather than from process
+memory. Releasing the credit is closing a descriptor, so a crash, panic, abort,
+or dropped claim frees it immediately with no lease horizon and no leaked
+capacity; a full prepare reconciles a crashed holder's stale record and fails
+closed on a symlinked or non-regular path, and on a hard-linked path on Unix
+(Windows pins a no-delete handle while live). Without this reservation
+a source larger than roughly half `spool.max_bytes` could never complete a
+handoff and permanently head-of-line-blocked its namespace's replay. See
+[plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) →
+"Dead-letter source credit and peak on-disk bytes". Ordinary HTTP
 is priced by wire status. Native gRPC and
 translated gRPC-Web use the same canonical effective-status mapping documented
 for `api_chargeback`; durable events retain the billable `status_code`, raw
