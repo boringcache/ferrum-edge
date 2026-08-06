@@ -20,7 +20,8 @@ use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
 use ferrum_edge::plugins::ai_response_guard::AiResponseGuard;
 use ferrum_edge::plugins::ai_tool_governor::AiToolGovernor;
 use ferrum_edge::plugins::request_deduplication::{
-    DYNAMIC_RESPONSE_PRESENTATION_PLUGINS, RequestDeduplication,
+    CONDITIONALLY_DYNAMIC_RESPONSE_PRESENTATION_PLUGINS, DYNAMIC_RESPONSE_PRESENTATION_PLUGINS,
+    RequestDeduplication,
 };
 use ferrum_edge::plugins::response_transformer::ResponseTransformer;
 use ferrum_edge::plugins::serverless_function::ServerlessFunction;
@@ -1456,6 +1457,48 @@ fn every_dynamic_presentation_plugin_name_reports_dynamic_when_constructed() {
             plugin.response_presentation_policy(),
             Some(ResponsePresentationPolicy::Dynamic),
             "{name} is listed as dynamic for config admission but does not report Dynamic"
+        );
+    }
+}
+
+/// A conditionally dynamic name is joined to runtime behavior by name *and* by
+/// the classifier that decides which of its configurations are unprovable, so
+/// both directions have to be pinned. Getting either wrong is a real defect:
+/// classifying a provable configuration as dynamic refuses a composition the
+/// runtime would happily serve, and classifying an unprovable one as static
+/// admits a replay whose producing policy was never witnessed.
+#[test]
+fn every_conditionally_dynamic_presentation_plugin_reports_both_modes() {
+    for name in CONDITIONALLY_DYNAMIC_RESPONSE_PRESENTATION_PLUGINS {
+        let (dynamic_config, provable_config) = match *name {
+            "a2a_gateway" => (
+                json!({"discovery": {"trust_forwarded_headers": true}}),
+                json!({"discovery": {"public_base_url": "https://agents.example.com"}}),
+            ),
+            other => panic!("no test config for conditionally dynamic plugin '{other}'"),
+        };
+
+        let dynamic =
+            create_plugin_with_http_client(name, &dynamic_config, PluginHttpClient::default())
+                .unwrap_or_else(|err| panic!("{name} dynamic config must be valid: {err}"))
+                .unwrap_or_else(|| panic!("{name} must be a built-in plugin"));
+        assert_eq!(
+            dynamic.response_presentation_policy(),
+            Some(ResponsePresentationPolicy::Dynamic),
+            "{name} is classified dynamic for this config but does not report Dynamic"
+        );
+
+        let provable =
+            create_plugin_with_http_client(name, &provable_config, PluginHttpClient::default())
+                .unwrap_or_else(|err| panic!("{name} provable config must be valid: {err}"))
+                .unwrap_or_else(|| panic!("{name} must be a built-in plugin"));
+        assert!(
+            matches!(
+                provable.response_presentation_policy(),
+                Some(ResponsePresentationPolicy::Static(_))
+            ),
+            "{name} must stay composable with deduplication when its rewrite is \
+             a pure function of configuration"
         );
     }
 }
