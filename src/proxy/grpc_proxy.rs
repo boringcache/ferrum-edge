@@ -256,6 +256,10 @@ pub enum GrpcBody {
         /// is recorded at upload termination, not at response-header time.
         /// `None` when no circuit breaker is configured for the proxy.
         upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
+        /// Authoritative gRPC length-prefixed message counter shared with
+        /// `RequestContext.grpc_request_messages_observed`.
+        grpc_messages: Option<Arc<AtomicU64>>,
+        grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
     },
     /// Streaming body sourced from a channel rather than a hyper `Incoming`.
     ///
@@ -288,6 +292,10 @@ pub enum GrpcBody {
         /// as [`GrpcBody::Streaming::upload_observer`]. `None` for the H3
         /// bridge, which records the circuit-breaker outcome at response time.
         upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
+        /// Authoritative gRPC length-prefixed message counter shared with
+        /// `RequestContext.grpc_request_messages_observed`.
+        grpc_messages: Option<Arc<AtomicU64>>,
+        grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
     },
 }
 
@@ -342,23 +350,30 @@ impl http_body::Body for GrpcBody {
                 bytes_seen,
                 max_bytes,
                 exceeded,
+                grpc_messages,
+                grpc_scanner,
                 ..
             } => match Pin::new(incoming).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
-                    if *max_bytes > 0
-                        && let Some(data) = frame.data_ref()
-                    {
-                        *bytes_seen = bytes_seen.saturating_add(data.len());
-                        if *bytes_seen > *max_bytes {
-                            exceeded.store(true, Ordering::Release);
-                            // Return an error to RST_STREAM the request,
-                            // preventing the backend from treating a truncated
-                            // prefix as a completed stream.
-                            return Poll::Ready(Some(Err(format!(
-                                "gRPC request payload exceeds maximum of {} bytes",
-                                max_bytes
-                            )
-                            .into())));
+                    if let Some(data) = frame.data_ref() {
+                        if *max_bytes > 0 {
+                            *bytes_seen = bytes_seen.saturating_add(data.len());
+                            if *bytes_seen > *max_bytes {
+                                exceeded.store(true, Ordering::Release);
+                                // Return an error to RST_STREAM the request,
+                                // preventing the backend from treating a truncated
+                                // prefix as a completed stream.
+                                return Poll::Ready(Some(Err(format!(
+                                    "gRPC request payload exceeds maximum of {} bytes",
+                                    max_bytes
+                                )
+                                .into())));
+                            }
+                        }
+                        if let (Some(messages), Some(scanner)) =
+                            (grpc_messages.as_ref(), grpc_scanner.as_mut())
+                        {
+                            scanner.push(data, messages);
                         }
                     }
                     Poll::Ready(Some(Ok(frame)))
@@ -375,6 +390,8 @@ impl http_body::Body for GrpcBody {
                 cancelled,
                 cancelled_terminal,
                 forwarded_bytes,
+                grpc_messages,
+                grpc_scanner,
                 ..
             } => {
                 if *cancelled_terminal {
@@ -412,6 +429,11 @@ impl http_body::Body for GrpcBody {
                                 }
                             }
                             forwarded_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            if let (Some(messages), Some(scanner)) =
+                                (grpc_messages.as_ref(), grpc_scanner.as_mut())
+                            {
+                                scanner.push(data, messages);
+                            }
                         }
                         Poll::Ready(Some(Ok(frame)))
                     }
@@ -2831,14 +2853,24 @@ pub async fn proxy_grpc_request_streaming(
     upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
+    grpc_request_messages: Option<Arc<AtomicU64>>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
+    let (grpc_messages, grpc_scanner) = match grpc_request_messages {
+        Some(messages) => (
+            Some(messages),
+            Some(crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default()),
+        ),
+        None => (None, None),
+    };
     let grpc_body = GrpcBody::Streaming {
         incoming: body,
         bytes_seen: 0,
         max_bytes: max_grpc_recv_size_bytes,
         exceeded: Arc::clone(&body_size_exceeded),
         upload_observer,
+        grpc_messages,
+        grpc_scanner,
     };
     proxy_grpc_streaming_dispatch(
         parts.method,
@@ -2886,7 +2918,15 @@ pub async fn proxy_grpc_request_streaming_channel(
     upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
+    grpc_request_messages: Option<Arc<AtomicU64>>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
+    let (grpc_messages, grpc_scanner) = match grpc_request_messages {
+        Some(messages) => (
+            Some(messages),
+            Some(crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default()),
+        ),
+        None => (None, None),
+    };
     let grpc_body = GrpcBody::Channel {
         receiver,
         bytes_seen: 0,
@@ -2896,6 +2936,8 @@ pub async fn proxy_grpc_request_streaming_channel(
         cancelled_terminal: false,
         forwarded_bytes: body_bytes_forwarded,
         upload_observer,
+        grpc_messages,
+        grpc_scanner,
     };
     proxy_grpc_streaming_dispatch(
         method,

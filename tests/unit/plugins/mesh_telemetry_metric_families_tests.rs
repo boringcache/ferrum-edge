@@ -299,6 +299,31 @@ fn grpc_length_prefixed_scanner_counts_spanning_frames() {
     );
 }
 
+#[test]
+fn complete_grpc_message_count_uses_fetch_max_not_additive_retry() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::{
+        metadata_observes_grpc_messages, record_complete_grpc_message_count,
+    };
+
+    let mut metadata = HashMap::new();
+    metadata.insert("request_protocol".into(), "grpc".into());
+    assert!(metadata_observes_grpc_messages(&metadata));
+    metadata.insert("request_protocol".into(), "http".into());
+    assert!(!metadata_observes_grpc_messages(&metadata));
+
+    let counter = Arc::new(AtomicU64::new(0));
+    let body = [0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 2, 3]; // two messages
+    record_complete_grpc_message_count(&counter, &body);
+    record_complete_grpc_message_count(&counter, &body); // retry re-observe
+    assert_eq!(counter.load(Ordering::Relaxed), 2);
+
+    // Hostile declared length must not count or panic.
+    let hostile = [0, 0xff, 0xff, 0xff, 0xff, 1];
+    assert_eq!(count_grpc_length_prefixed_messages(&hostile), 0);
+    record_complete_grpc_message_count(&counter, &hostile);
+    assert_eq!(counter.load(Ordering::Relaxed), 2);
+}
+
 #[tokio::test]
 async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
     let plugin = WorkloadMetrics::new(&json!({

@@ -1610,6 +1610,10 @@ pub struct SizeLimitedIncoming {
     /// from here: the `h2::SendStream` that could do it is owned by hyper's
     /// detached task and never exposed.
     cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Optional gRPC length-prefixed request message counter shared with
+    /// `RequestContext.grpc_request_messages_observed`.
+    grpc_messages: Option<Arc<AtomicU64>>,
+    grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
 }
 
 /// Outcome to report when the adapter is dropped without having reached a
@@ -1682,6 +1686,8 @@ impl SizeLimitedIncoming {
             exceeded,
             completion: None,
             cancel: None,
+            grpc_messages: None,
+            grpc_scanner: None,
         }
     }
 
@@ -1708,6 +1714,8 @@ impl SizeLimitedIncoming {
             exceeded,
             completion: Some(completion),
             cancel: Some(cancel),
+            grpc_messages: None,
+            grpc_scanner: None,
         }
     }
 
@@ -1722,6 +1730,17 @@ impl SizeLimitedIncoming {
     #[must_use]
     pub fn with_cancel(mut self, cancel: tokio::sync::oneshot::Receiver<()>) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Enable authoritative gRPC length-prefixed message counting while
+    /// streaming the request body under a size limit. Incomplete trailing
+    /// frames are ignored. Hostile declared lengths never allocate.
+    #[must_use]
+    pub fn with_grpc_message_counter(mut self, messages: Arc<AtomicU64>) -> Self {
+        self.grpc_messages = Some(messages);
+        self.grpc_scanner =
+            Some(crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default());
         self
     }
 
@@ -1869,6 +1888,11 @@ impl http_body::Body for SizeLimitedIncoming {
                         this.exceeded.store(true, Ordering::Release);
                         this.signal_completion(RequestBodyOutcome::Exceeded);
                         return Poll::Ready(Some(Err("request body exceeds maximum size".into())));
+                    }
+                    if let (Some(messages), Some(scanner)) =
+                        (this.grpc_messages.as_ref(), this.grpc_scanner.as_mut())
+                    {
+                        scanner.push(data, messages);
                     }
                 }
                 Poll::Ready(Some(Ok(frame)))

@@ -3476,6 +3476,16 @@ async fn prepare_mesh_request_body(
             buffered.body.len() as u64,
             std::sync::atomic::Ordering::Release,
         );
+        if let Some(request_ctx) = ctx.as_deref()
+            && crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                &request_ctx.metadata,
+            )
+        {
+            crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
+                &request_ctx.grpc_request_messages_observed,
+                &buffered.body,
+            );
+        }
     }
     let body = if request_body_prepared {
         buffered.body
@@ -27060,6 +27070,10 @@ async fn handle_proxy_request_inner(
                 grpc_req_body.len() as u64,
                 std::sync::atomic::Ordering::Release,
             );
+            crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
+                &ctx.grpc_request_messages_observed,
+                &grpc_req_body,
+            );
 
             // Transform request body via plugins (e.g., gRPC-Web base64 decoding)
             let mut hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
@@ -27424,6 +27438,7 @@ async fn handle_proxy_request_inner(
                     upload_observer,
                     ctx.grpc_deadline_at(),
                     &mut held_frontend_grpc_upload,
+                    Some(Arc::clone(&ctx.grpc_request_messages_observed)),
                 )
                 .await;
                 (result, Bytes::new())
@@ -27467,6 +27482,10 @@ async fn handle_proxy_request_inner(
                         ctx.bytes_sent_observed.fetch_max(
                             grpc_req_body.len() as u64,
                             std::sync::atomic::Ordering::Release,
+                        );
+                        crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
+                            &ctx.grpc_request_messages_observed,
+                            &grpc_req_body,
                         );
                         backend_admission_permits =
                             match backend_dispatch::run_backend_admission_plugins(
@@ -28467,6 +28486,12 @@ async fn handle_proxy_request_inner(
                         response_streamed: streamed,
                         error_class: final_error_class,
                         bytes_sent,
+                        grpc_request_messages: ctx
+                            .grpc_request_messages_observed
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        grpc_response_messages: ctx
+                            .grpc_response_messages_observed
+                            .load(std::sync::atomic::Ordering::Acquire),
                         metadata,
                         ai_usage_export: ctx.ai_usage_export.clone(),
                         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
@@ -28757,18 +28782,16 @@ async fn handle_proxy_request_inner(
                 }
                 if let Some(logger) = deferred_grpc_logger {
                     body = body.with_logger(logger);
-                    if ctx
-                        .metadata
-                        .get("request_protocol")
-                        .or_else(|| ctx.metadata.get("mesh.request_protocol"))
-                        .is_some_and(|p| {
-                            crate::plugins::mesh::prometheus_helpers::is_mesh_grpc_protocol(p)
-                        })
-                    {
-                        body = body.with_grpc_message_counter(Arc::clone(
-                            &ctx.grpc_response_messages_observed,
-                        ));
-                    }
+                }
+                // Always attach for streaming gRPC responses — independent of
+                // whether a deferred logger is present — so message metrics are
+                // not silently zero when plugins are absent.
+                if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                    &ctx.metadata,
+                ) {
+                    body = body.with_grpc_message_counter(Arc::clone(
+                        &ctx.grpc_response_messages_observed,
+                    ));
                 }
 
                 // Detach the deferred logger before handing the body to
@@ -29479,6 +29502,10 @@ async fn handle_proxy_request_inner(
                         .bytes_sent_observed
                         .load(std::sync::atomic::Ordering::Acquire);
                     let bytes_received = response_body.len() as u64;
+                    crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
+                        &ctx.grpc_response_messages_observed,
+                        &response_body,
+                    );
                     let summary = TransactionSummary {
                         namespace: proxy.namespace.clone(),
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -29502,6 +29529,12 @@ async fn handle_proxy_request_inner(
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
                         bytes_sent,
                         bytes_received,
+                        grpc_request_messages: ctx
+                            .grpc_request_messages_observed
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        grpc_response_messages: ctx
+                            .grpc_response_messages_observed
+                            .load(std::sync::atomic::Ordering::Acquire),
                         metadata: clone_log_metadata(&ctx),
                         ai_usage_export: ctx.ai_usage_export.clone(),
                         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
@@ -31677,22 +31710,17 @@ async fn handle_proxy_request_inner(
             let grpc_response_messages = if matches!(response_body, ResponseBody::Buffered(_)) {
                 // Buffered gRPC responses carry the complete body here; count
                 // length-prefixed frames authoritatively before logging.
-                if ctx
-                    .metadata
-                    .get("request_protocol")
-                    .or_else(|| ctx.metadata.get("mesh.request_protocol"))
-                    .is_some_and(|p| {
-                        crate::plugins::mesh::prometheus_helpers::is_mesh_grpc_protocol(p)
-                    })
-                {
+                if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                    &ctx.metadata,
+                ) {
                     match &response_body {
                         ResponseBody::Buffered(v) => {
-                            let count = crate::plugins::mesh::prometheus_helpers::count_grpc_length_prefixed_messages(
+                            crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
+                                &ctx.grpc_response_messages_observed,
                                 v,
                             );
                             ctx.grpc_response_messages_observed
-                                .store(count, std::sync::atomic::Ordering::Release);
-                            count
+                                .load(std::sync::atomic::Ordering::Acquire)
                         }
                         _ => 0,
                     }
@@ -32483,20 +32511,19 @@ async fn handle_proxy_request_inner(
     };
 
     let mut body = if let Some(logger) = deferred_logger {
-        let body = body.with_logger(logger);
-        if ctx
-            .metadata
-            .get("request_protocol")
-            .or_else(|| ctx.metadata.get("mesh.request_protocol"))
-            .is_some_and(|p| crate::plugins::mesh::prometheus_helpers::is_mesh_grpc_protocol(p))
-        {
-            body.with_grpc_message_counter(Arc::clone(&ctx.grpc_response_messages_observed))
-        } else {
-            body
-        }
+        body.with_logger(logger)
     } else {
         body
     };
+    // Streaming responses: count complete length-prefixed messages as DATA
+    // frames are delivered to the client. Buffered responses are counted once
+    // from the complete body at summary construction (fetch_max) so we do not
+    // double-count when the Full body is later polled.
+    if is_streaming_response
+        && crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata)
+    {
+        body = body.with_grpc_message_counter(Arc::clone(&ctx.grpc_response_messages_observed));
+    }
 
     // Detach the logger before handing the body to the builder. `http::Error`
     // doesn't expose the consumed body, so we can't recover the logger after
@@ -35548,6 +35575,15 @@ async fn proxy_to_backend(
                         Arc::clone(&body_size_exceeded),
                         Arc::clone(ctx_bytes_sent_observed),
                     );
+                    let limited = if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                        &request_ctx.metadata,
+                    ) {
+                        limited.with_grpc_message_counter(Arc::clone(
+                            &request_ctx.grpc_request_messages_observed,
+                        ))
+                    } else {
+                        limited
+                    };
                     req_builder = req_builder.body(limited.into_reqwest_body());
                 } else {
                     // No size limit — stream body directly. Wrap in
@@ -35559,13 +35595,9 @@ async fn proxy_to_backend(
                         incoming,
                         Arc::clone(ctx_bytes_sent_observed),
                     );
-                    let counting = if request_ctx
-                        .metadata
-                        .get("request_protocol")
-                        .or_else(|| request_ctx.metadata.get("mesh.request_protocol"))
-                        .is_some_and(|p| {
-                            crate::plugins::mesh::prometheus_helpers::is_mesh_grpc_protocol(p)
-                        }) {
+                    let counting = if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                        &request_ctx.metadata,
+                    ) {
                         counting.with_grpc_message_counter(Arc::clone(
                             &request_ctx.grpc_request_messages_observed,
                         ))
@@ -35679,21 +35711,13 @@ async fn proxy_to_backend(
                     body_bytes.len() as u64,
                     std::sync::atomic::Ordering::Release,
                 );
-                if request_ctx
-                    .metadata
-                    .get("request_protocol")
-                    .or_else(|| request_ctx.metadata.get("mesh.request_protocol"))
-                    .is_some_and(|p| {
-                        crate::plugins::mesh::prometheus_helpers::is_mesh_grpc_protocol(p)
-                    })
-                {
-                    let messages =
-                        crate::plugins::mesh::prometheus_helpers::count_grpc_length_prefixed_messages(
-                            &body_bytes,
-                        );
-                    request_ctx
-                        .grpc_request_messages_observed
-                        .fetch_max(messages, std::sync::atomic::Ordering::Release);
+                if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                    &request_ctx.metadata,
+                ) {
+                    crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
+                        &request_ctx.grpc_request_messages_observed,
+                        &body_bytes,
+                    );
                 }
 
                 // Transform request body via plugins (JSON field rename, add, remove, etc.)
@@ -38146,6 +38170,18 @@ async fn proxy_to_backend_hbone(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             );
+            let body = match ctx {
+                Some(c)
+                    if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                        &c.metadata,
+                    ) =>
+                {
+                    body.with_grpc_message_counter(Arc::clone(
+                        &c.grpc_request_messages_observed,
+                    ))
+                }
+                _ => body,
+            };
             (parts, http_body_util::Either::Left(body))
         }
         MeshClientRequestBody::Replayable {
@@ -39073,6 +39109,15 @@ async fn proxy_to_backend_mesh_mtls(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             );
+            let body = if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                &request_ctx.metadata,
+            ) {
+                body.with_grpc_message_counter(Arc::clone(
+                    &request_ctx.grpc_request_messages_observed,
+                ))
+            } else {
+                body
+            };
             (parts, http_body_util::Either::Left(body))
         }
         MeshClientRequestBody::Replayable {
@@ -39700,30 +39745,38 @@ async fn proxy_to_backend_http2(
     // completion channel (and therefore the response gate) is limit-gated.
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let mut body_cancel_tx = Some(cancel_tx);
+    let observe_grpc = ctx
+        .map(|c| {
+            crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&c.metadata)
+                .then(|| Arc::clone(&c.grpc_request_messages_observed))
+        })
+        .flatten();
     let (body, body_completion_rx) = if effective_max_request_body_size_bytes > 0 {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        (
-            body::SizeLimitedIncoming::new_with_counter_and_completion(
-                body,
-                max_request_body_size,
-                Arc::clone(&body_size_exceeded),
-                Arc::clone(ctx_bytes_sent_observed),
-                completion_tx,
-                cancel_rx,
-            ),
-            Some(completion_rx),
-        )
+        let mut body = body::SizeLimitedIncoming::new_with_counter_and_completion(
+            body,
+            max_request_body_size,
+            Arc::clone(&body_size_exceeded),
+            Arc::clone(ctx_bytes_sent_observed),
+            completion_tx,
+            cancel_rx,
+        );
+        if let Some(messages) = observe_grpc.clone() {
+            body = body.with_grpc_message_counter(messages);
+        }
+        (body, Some(completion_rx))
     } else {
-        (
-            body::SizeLimitedIncoming::new_with_counter(
-                body,
-                max_request_body_size,
-                Arc::clone(&body_size_exceeded),
-                Arc::clone(ctx_bytes_sent_observed),
-            )
-            .with_cancel(cancel_rx),
-            None,
+        let mut body = body::SizeLimitedIncoming::new_with_counter(
+            body,
+            max_request_body_size,
+            Arc::clone(&body_size_exceeded),
+            Arc::clone(ctx_bytes_sent_observed),
         )
+        .with_cancel(cancel_rx);
+        if let Some(messages) = observe_grpc {
+            body = body.with_grpc_message_counter(messages);
+        }
+        (body, None)
     };
 
     // Set the URI
@@ -40513,6 +40566,13 @@ async fn proxy_to_backend_http3(
                     let target_port = target.port;
                     let connection_pool = state.connection_pool.clone();
                     let proxy_clone = proxy.clone();
+                    let grpc_messages = response_decision_ctx
+                        .filter(|c| {
+                            crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                                &c.metadata,
+                            )
+                        })
+                        .map(|c| Arc::clone(&c.grpc_request_messages_observed));
                     state
                         .h3_pool
                         .request_with_target_streaming_incoming_body(
@@ -40525,12 +40585,20 @@ async fn proxy_to_backend_http3(
                             body,
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
+                            grpc_messages,
                             move || connection_pool.get_tls_config_for_backend(&proxy_clone),
                         )
                         .await
                 } else {
                     let connection_pool = state.connection_pool.clone();
                     let proxy_clone = proxy.clone();
+                    let grpc_messages = response_decision_ctx
+                        .filter(|c| {
+                            crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                                &c.metadata,
+                            )
+                        })
+                        .map(|c| Arc::clone(&c.grpc_request_messages_observed));
                     state
                         .h3_pool
                         .request_streaming_incoming_body(
@@ -40541,6 +40609,7 @@ async fn proxy_to_backend_http3(
                             body,
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
+                            grpc_messages,
                             move || connection_pool.get_tls_config_for_backend(&proxy_clone),
                         )
                         .await
@@ -40824,6 +40893,16 @@ async fn proxy_to_backend_http3(
     // bytes instead of client-wire bytes.
     if !request_body_prepared {
         ctx_bytes_sent_observed.fetch_max(request_body.len() as u64, Ordering::Release);
+        if let Some(request_ctx) = response_decision_ctx.or(ctx.as_deref())
+            && crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                &request_ctx.metadata,
+            )
+        {
+            crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
+                &request_ctx.grpc_request_messages_observed,
+                &request_body,
+            );
+        }
     }
 
     let request_body = if request_body_prepared {

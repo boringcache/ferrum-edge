@@ -6197,6 +6197,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         None,
         ctx.grpc_deadline_at(),
         &mut held_frontend_grpc_upload,
+        Some(Arc::clone(&ctx.grpc_request_messages_observed)),
     )
     .await;
 

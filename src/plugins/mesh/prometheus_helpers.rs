@@ -1725,6 +1725,22 @@ pub fn is_mesh_grpc_protocol(protocol: &str) -> bool {
     normalized == "grpc" || normalized.starts_with("grpc-")
 }
 
+/// True when request metadata identifies a gRPC (or gRPC-Web) transaction that
+/// should populate authoritative length-prefixed message counters.
+pub fn metadata_observes_grpc_messages(metadata: &HashMap<String, String>) -> bool {
+    metadata
+        .get("request_protocol")
+        .or_else(|| metadata.get("mesh.request_protocol"))
+        .is_some_and(|protocol| is_mesh_grpc_protocol(protocol))
+}
+
+/// Record a complete buffered gRPC body with store/fetch_max semantics so
+/// retry/replay of the same bytes cannot inflate the counter.
+pub fn record_complete_grpc_message_count(counter: &AtomicU64, body: &[u8]) {
+    let count = count_grpc_length_prefixed_messages(body);
+    counter.fetch_max(count, Ordering::Release);
+}
+
 pub fn mesh_label_fragment(key: &MeshRequestKey, le: Option<&str>) -> String {
     let mut labels = mesh_label_base_fragment(key);
     if let Some(le) = le {

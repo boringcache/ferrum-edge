@@ -1725,7 +1725,7 @@ The auto-injected `workload_metrics` plugin emits Istio/GAMMA-shaped RED and lif
 - `ferrum_mesh_request_bytes` / `ferrum_mesh_response_bytes` -- HTTP/gRPC body-size histograms (`REQUEST_SIZE` / `RESPONSE_SIZE`).
 - `ferrum_mesh_tcp_connections_opened_total` / `ferrum_mesh_tcp_connections_closed_total` -- TCP connection lifecycle counters.
 - `ferrum_mesh_tcp_sent_bytes_total` / `ferrum_mesh_tcp_received_bytes_total` -- TCP byte counters recorded on disconnect.
-- `ferrum_mesh_request_messages_total` / `ferrum_mesh_response_messages_total` -- gRPC length-prefixed message counters.
+- `ferrum_mesh_request_messages_total` / `ferrum_mesh_response_messages_total` -- gRPC length-prefixed message counters observed on supported H1/H2/H3 frontend and direct-H2/HBONE/mesh-mTLS request and response body paths. Only complete 5-byte length-prefixed frames count; incomplete trailing frames are ignored.
 
 Supported Telemetry selectors are `REQUEST_COUNT`, `REQUEST_DURATION`, `REQUEST_SIZE`, `RESPONSE_SIZE`, `TCP_OPENED_CONNECTIONS`, `TCP_CLOSED_CONNECTIONS`, `TCP_SENT_BYTES`, `TCP_RECEIVED_BYTES`, `GRPC_REQUEST_MESSAGES`, `GRPC_RESPONSE_MESSAGES`, the matching `ferrum_mesh_*` names, and `ALL_METRICS`. Unknown family names and malformed policy remain construction errors. `ALL_METRICS` applies to every emitted Ferrum family above.
 

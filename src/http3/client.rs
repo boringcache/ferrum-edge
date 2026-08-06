@@ -2166,6 +2166,8 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
+        // Optional authoritative gRPC length-prefixed request message counter.
+        grpc_messages: Option<Arc<AtomicU64>>,
         // Response-header wait bound (ms; `0` = unbounded). Normally
         // `proxy.backend_read_timeout_ms`, but the native-H3 gRPC path overrides it
         // with `0` when a client `grpc-timeout` is present so the outer absolute
@@ -2232,6 +2234,9 @@ impl Http3ConnectionPool {
         // Uses Buf::copy_to_bytes() which is zero-copy when the underlying
         // buffer is already bytes::Bytes (common with h3-quinn).
         let mut total_sent: usize = 0;
+        let mut grpc_scanner = grpc_messages.as_ref().map(|_| {
+            crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default()
+        });
         loop {
             let recv_res = frontend_stream.recv_data().await;
             let chunk_opt = match recv_res {
@@ -2256,8 +2261,14 @@ impl Http3ConnectionPool {
             if len == 0 {
                 continue;
             }
+            let data = chunk.copy_to_bytes(len);
+            if let (Some(messages), Some(scanner)) =
+                (grpc_messages.as_ref(), grpc_scanner.as_mut())
+            {
+                scanner.push(&data, messages);
+            }
             backend_stream
-                .send_data(chunk.copy_to_bytes(len))
+                .send_data(data)
                 .await
                 .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
             bytes_seen.fetch_add(len as u64, Ordering::Release);
@@ -2348,6 +2359,7 @@ impl Http3ConnectionPool {
         frontend_body: Incoming,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
+        grpc_messages: Option<Arc<AtomicU64>>,
     ) -> Result<H3StreamingResponse, (H3PoolError, Option<Incoming>)> {
         let backend_stream = match Self::open_streaming_incoming_backend_stream(
             send_request,
@@ -2370,6 +2382,7 @@ impl Http3ConnectionPool {
             frontend_body,
             max_request_body_size,
             bytes_seen,
+            grpc_messages,
         )
         .await
         .map_err(|e| (e, None))
@@ -2424,8 +2437,12 @@ impl Http3ConnectionPool {
         mut frontend_body: Incoming,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
+        grpc_messages: Option<Arc<AtomicU64>>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let mut total_sent: usize = 0;
+        let mut grpc_scanner = grpc_messages.as_ref().map(|_| {
+            crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default()
+        });
         while let Some(frame_result) = frontend_body.frame().await {
             let frame = frame_result.map_err(|e| {
                 H3PoolError::post_wire(anyhow::anyhow!(
@@ -2448,8 +2465,14 @@ impl Http3ConnectionPool {
             if len == 0 {
                 continue;
             }
+            let data = chunk.copy_to_bytes(len);
+            if let (Some(messages), Some(scanner)) =
+                (grpc_messages.as_ref(), grpc_scanner.as_mut())
+            {
+                scanner.push(&data, messages);
+            }
             backend_stream
-                .send_data(chunk.copy_to_bytes(len))
+                .send_data(data)
                 .await
                 .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
             bytes_seen.fetch_add(len as u64, Ordering::Release);
@@ -2492,6 +2515,7 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
+        grpc_messages: Option<Arc<AtomicU64>>,
         // Response-header wait bound (ms; `0` = unbounded), forwarded to
         // `do_request_streaming_body`. Callers pass `proxy.backend_read_timeout_ms`
         // normally; the native-H3 gRPC path passes `0` under a client `grpc-timeout`
@@ -2530,6 +2554,7 @@ impl Http3ConnectionPool {
                 frontend_stream,
                 max_request_body_size,
                 Arc::clone(&bytes_seen),
+                grpc_messages.clone(),
                 header_read_timeout_ms,
                 Arc::clone(&stream_opened),
                 Arc::clone(&upload_complete),
@@ -2574,6 +2599,7 @@ impl Http3ConnectionPool {
             frontend_stream,
             max_request_body_size,
             bytes_seen,
+            grpc_messages,
             header_read_timeout_ms,
             stream_opened,
             upload_complete,
@@ -2594,6 +2620,7 @@ impl Http3ConnectionPool {
         mut frontend_body: Incoming,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
+        grpc_messages: Option<Arc<AtomicU64>>,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
@@ -2614,6 +2641,7 @@ impl Http3ConnectionPool {
                 frontend_body,
                 max_request_body_size,
                 Arc::clone(&bytes_seen),
+                grpc_messages.clone(),
             )
             .await
             {
@@ -2658,6 +2686,7 @@ impl Http3ConnectionPool {
             frontend_body,
             max_request_body_size,
             bytes_seen,
+            grpc_messages,
         )
         .await
         .map_err(|(e, _)| e)
@@ -2680,6 +2709,7 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
+        grpc_messages: Option<Arc<AtomicU64>>,
         // Response-header wait bound (ms; `0` = unbounded), forwarded to
         // `do_request_streaming_body`. Callers pass `proxy.backend_read_timeout_ms`
         // normally; the native-H3 gRPC path passes `0` under a client `grpc-timeout`
@@ -2718,6 +2748,7 @@ impl Http3ConnectionPool {
                 frontend_stream,
                 max_request_body_size,
                 Arc::clone(&bytes_seen),
+                grpc_messages.clone(),
                 header_read_timeout_ms,
                 Arc::clone(&stream_opened),
                 Arc::clone(&upload_complete),
@@ -2766,6 +2797,7 @@ impl Http3ConnectionPool {
             frontend_stream,
             max_request_body_size,
             bytes_seen,
+            grpc_messages,
             header_read_timeout_ms,
             stream_opened,
             upload_complete,
@@ -2787,6 +2819,7 @@ impl Http3ConnectionPool {
         mut frontend_body: Incoming,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
+        grpc_messages: Option<Arc<AtomicU64>>,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
@@ -2812,6 +2845,7 @@ impl Http3ConnectionPool {
                 frontend_body,
                 max_request_body_size,
                 Arc::clone(&bytes_seen),
+                grpc_messages.clone(),
             )
             .await
             {
@@ -2862,6 +2896,7 @@ impl Http3ConnectionPool {
             frontend_body,
             max_request_body_size,
             bytes_seen,
+            grpc_messages,
         )
         .await
         .map_err(|(e, _)| e)
