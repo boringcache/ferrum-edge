@@ -11411,9 +11411,24 @@ async fn dispatch_grpc_native_h3(
                 (Some(_), None) => true,
                 _ => false,
             };
-            let trailers_result = match trailer_wait_at {
+            // Keep the request and response directions in the SAME cancellation
+            // domain through the terminal trailer wait. Reaching DATA EOS does
+            // not prove the client upload completed: a full-duplex backend may
+            // finish its response body while the client still owns an open
+            // request direction. If that upload then aborts, exceeds the receive
+            // ceiling, or supplies malformed trailers, waiting only on backend
+            // trailers would pin the RPC until a configured timeout (and forever
+            // when both bounds are disabled).
+            let trailer_fut = async {
+                tokio::select! {
+                    biased;
+                    fault = &mut upload_fault_wait => Err(fault),
+                    result = backend_recv.recv_trailers() => Ok(result),
+                }
+            };
+            let trailer_wait_result = match trailer_wait_at {
                 Some(at) => {
-                    match tokio::time::timeout_at(at, backend_recv.recv_trailers()).await {
+                    match tokio::time::timeout_at(at, trailer_fut).await {
                         Ok(result) => result,
                         Err(_) if trailer_timeout_is_deadline => {
                             client_deadline_expired = true;
@@ -11481,7 +11496,47 @@ async fn dispatch_grpc_native_h3(
                         }
                     }
                 }
-                None => backend_recv.recv_trailers().await,
+                None => trailer_fut.await,
+            };
+            let trailers_result = match trailer_wait_result {
+                Ok(result) => result,
+                Err(fault) => {
+                    let (fault_status, fault_message) = fault.grpc_signal();
+                    warn!(
+                        proxy_id = %proxy.id,
+                        ?fault,
+                        "native H3 gRPC request upload failed while awaiting backend trailers; \
+                         terminating the response"
+                    );
+                    if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
+                        bytes_streamed,
+                    ) {
+                        if send_h3_grpc_terminal_trailers(
+                            &mut send_half,
+                            fault_status,
+                            fault_message,
+                            grpc_deadline_at,
+                        )
+                        .await
+                        {
+                            // Gateway-authored, client-caused status: do not train
+                            // adaptive concurrency as a backend terminal result.
+                            body_completed = true;
+                        } else {
+                            crate::http3::stream_util::abort_response_stream(&mut send_half);
+                            client_disconnected = true;
+                        }
+                    } else {
+                        crate::http3::stream_util::abort_response_stream(&mut send_half);
+                    }
+                    crate::proxy::insert_grpc_error_metadata(
+                        &mut ctx.metadata,
+                        fault_status,
+                        fault_message,
+                    );
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    break;
+                }
             };
             match trailers_result {
                 Ok(Some(mut trailers)) => {

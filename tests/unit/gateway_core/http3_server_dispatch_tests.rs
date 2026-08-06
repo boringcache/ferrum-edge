@@ -2755,6 +2755,51 @@ fn h3_native_grpc_upload_fault_arm_cannot_lose_to_backend_data() {
     );
 }
 
+/// Reaching backend DATA EOS does not retire the concurrent request upload.
+/// The terminal trailer wait must therefore keep racing the same terminating
+/// upload-fault future; otherwise a malformed/oversized/aborted client upload
+/// can pin the RPC behind a backend that never supplies trailers.
+#[test]
+fn h3_native_grpc_trailer_wait_stays_in_the_upload_cancellation_domain() {
+    let relay = native_h3_grpc_relay_source();
+    let trailer_phase = relay
+        .split("let trailer_fut = async {")
+        .nth(1)
+        .expect("native gRPC trailer wait future")
+        .split("let trailer_wait_result =")
+        .next()
+        .expect("bounded native gRPC trailer wait future");
+    let fault = trailer_phase
+        .find("fault = &mut upload_fault_wait")
+        .expect("terminal trailer wait must observe terminating upload faults");
+    let trailers = trailer_phase
+        .find("backend_recv.recv_trailers()")
+        .expect("terminal trailer wait must still read backend trailers");
+    assert!(trailer_phase[..fault].contains("biased;"));
+    assert!(
+        fault < trailers,
+        "a simultaneous client-upload fault must win over backend trailers"
+    );
+
+    let fault_arm = relay
+        .split("let trailers_result = match trailer_wait_result {")
+        .nth(1)
+        .expect("terminal trailer wait outcome")
+        .split("match trailers_result {")
+        .next()
+        .expect("bounded terminal trailer upload-fault arm");
+    assert!(fault_arm.contains("fault.grpc_signal()"));
+    assert!(fault_arm.contains("grpc_deadline_can_send_terminal_status("));
+    assert!(fault_arm.contains("abort_response_stream(&mut send_half)"));
+    assert!(fault_arm.contains(
+        "body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect)"
+    ));
+    assert!(
+        !fault_arm.contains("grpc_trailer_status = Some("),
+        "a gateway-authored upload-fault status must not train adaptive concurrency"
+    );
+}
+
 /// Every native-H3 gRPC failure/reject path writes the client's response BEFORE
 /// it tears anything down.
 ///
