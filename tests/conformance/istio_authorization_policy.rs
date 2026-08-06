@@ -507,7 +507,7 @@ fn authz_target_refs_namespace_and_kind_boundaries_fail_closed() {
     register_feature!(
         category = CATEGORY,
         feature = "targetRefs namespace + kind boundaries",
-        status = Status::Partial,
+        status = Status::Supported,
         maturity = Maturity::Beta,
         notes = "Gateway/Service targetRefs are same-namespace only (a Gateway API \
                  ReferenceGrant does NOT widen the Istio policy-attachment contract, and \
