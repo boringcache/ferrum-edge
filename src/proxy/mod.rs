@@ -28757,6 +28757,18 @@ async fn handle_proxy_request_inner(
                 }
                 if let Some(logger) = deferred_grpc_logger {
                     body = body.with_logger(logger);
+                    if ctx
+                        .metadata
+                        .get("request_protocol")
+                        .or_else(|| ctx.metadata.get("mesh.request_protocol"))
+                        .is_some_and(|p| {
+                            crate::plugins::mesh::prometheus_helpers::is_mesh_grpc_protocol(p)
+                        })
+                    {
+                        body = body.with_grpc_message_counter(Arc::clone(
+                            &ctx.grpc_response_messages_observed,
+                        ));
+                    }
                 }
 
                 // Detach the deferred logger before handing the body to
@@ -31659,6 +31671,39 @@ async fn handle_proxy_request_inner(
                 ResponseBody::Buffered(v) => v.len() as u64,
                 _ => 0,
             };
+            let grpc_request_messages = ctx
+                .grpc_request_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire);
+            let grpc_response_messages = if matches!(response_body, ResponseBody::Buffered(_)) {
+                // Buffered gRPC responses carry the complete body here; count
+                // length-prefixed frames authoritatively before logging.
+                if ctx
+                    .metadata
+                    .get("request_protocol")
+                    .or_else(|| ctx.metadata.get("mesh.request_protocol"))
+                    .is_some_and(|p| {
+                        crate::plugins::mesh::prometheus_helpers::is_mesh_grpc_protocol(p)
+                    })
+                {
+                    match &response_body {
+                        ResponseBody::Buffered(v) => {
+                            let count = crate::plugins::mesh::prometheus_helpers::count_grpc_length_prefixed_messages(
+                                v,
+                            );
+                            ctx.grpc_response_messages_observed
+                                .store(count, std::sync::atomic::Ordering::Release);
+                            count
+                        }
+                        _ => 0,
+                    }
+                } else {
+                    ctx.grpc_response_messages_observed
+                        .load(std::sync::atomic::Ordering::Acquire)
+                }
+            } else {
+                ctx.grpc_response_messages_observed
+                    .load(std::sync::atomic::Ordering::Acquire)
+            };
             let summary = TransactionSummary {
                 namespace: proxy.namespace.clone(),
                 timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -31684,6 +31729,8 @@ async fn handle_proxy_request_inner(
                 error_class: backend_error_class,
                 bytes_sent,
                 bytes_received: bytes_received_buffered,
+                grpc_request_messages,
+                grpc_response_messages,
                 metadata: clone_log_metadata(&ctx),
                 ai_usage_export: ctx.ai_usage_export.clone(),
                 proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
@@ -32436,7 +32483,19 @@ async fn handle_proxy_request_inner(
     };
 
     let mut body = if let Some(logger) = deferred_logger {
-        body.with_logger(logger)
+        let body = body.with_logger(logger);
+        if ctx
+            .metadata
+            .get("request_protocol")
+            .or_else(|| ctx.metadata.get("mesh.request_protocol"))
+            .is_some_and(|p| {
+                crate::plugins::mesh::prometheus_helpers::is_mesh_grpc_protocol(p)
+            })
+        {
+            body.with_grpc_message_counter(Arc::clone(&ctx.grpc_response_messages_observed))
+        } else {
+            body
+        }
     } else {
         body
     };
@@ -35502,6 +35561,19 @@ async fn proxy_to_backend(
                         incoming,
                         Arc::clone(ctx_bytes_sent_observed),
                     );
+                    let counting = if request_ctx
+                        .metadata
+                        .get("request_protocol")
+                        .or_else(|| request_ctx.metadata.get("mesh.request_protocol"))
+                        .is_some_and(|p| {
+                            crate::plugins::mesh::prometheus_helpers::is_mesh_grpc_protocol(p)
+                        }) {
+                        counting.with_grpc_message_counter(Arc::clone(
+                            &request_ctx.grpc_request_messages_observed,
+                        ))
+                    } else {
+                        counting
+                    };
                     req_builder = req_builder.body(counting.into_reqwest_body());
                 }
             }
@@ -35609,6 +35681,22 @@ async fn proxy_to_backend(
                     body_bytes.len() as u64,
                     std::sync::atomic::Ordering::Release,
                 );
+                if request_ctx
+                    .metadata
+                    .get("request_protocol")
+                    .or_else(|| request_ctx.metadata.get("mesh.request_protocol"))
+                    .is_some_and(|p| {
+                        crate::plugins::mesh::prometheus_helpers::is_mesh_grpc_protocol(p)
+                    })
+                {
+                    let messages =
+                        crate::plugins::mesh::prometheus_helpers::count_grpc_length_prefixed_messages(
+                            &body_bytes,
+                        );
+                    request_ctx
+                        .grpc_request_messages_observed
+                        .fetch_max(messages, std::sync::atomic::Ordering::Release);
+                }
 
                 // Transform request body via plugins (JSON field rename, add, remove, etc.)
                 let body_bytes = apply_request_body_plugins_with_context(

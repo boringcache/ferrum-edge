@@ -5173,6 +5173,12 @@ async fn handle_h3_request(
             body_completed: outcome.body_completed,
             bytes_sent: outcome.bytes_sent,
             bytes_received: outcome.bytes_streamed,
+            grpc_request_messages: ctx
+                .grpc_request_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire),
+            grpc_response_messages: ctx
+                .grpc_response_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire),
             error_class: outcome.error_class,
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
@@ -5670,6 +5676,12 @@ async fn handle_h3_request(
                 } else {
                     0
                 },
+                grpc_request_messages: ctx
+                    .grpc_request_messages_observed
+                    .load(std::sync::atomic::Ordering::Acquire),
+                grpc_response_messages: ctx
+                    .grpc_response_messages_observed
+                    .load(std::sync::atomic::Ordering::Acquire),
                 mirror: false,
                 metadata: crate::proxy::clone_log_metadata(&ctx),
                 ai_usage_export: ctx.ai_usage_export.clone(),
@@ -6211,6 +6223,12 @@ async fn handle_h3_request(
             // Response bytes delivered to the client — tracked by the
             // streaming loop above as `bytes_streamed`.
             bytes_received: bytes_streamed,
+            grpc_request_messages: ctx
+                .grpc_request_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire),
+            grpc_response_messages: ctx
+                .grpc_response_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire),
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
             ai_usage_export: ctx.ai_usage_export.clone(),
@@ -6809,6 +6827,12 @@ async fn handle_h3_request(
             // count of body bytes pushed to the client's h3 stream. Mirror
             // it into the unified `bytes_received` field.
             bytes_received: h3_stream_result.bytes_streamed,
+            grpc_request_messages: ctx
+                .grpc_request_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire),
+            grpc_response_messages: ctx
+                .grpc_response_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire),
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
             ai_usage_export: ctx.ai_usage_export.clone(),
@@ -10980,6 +11004,12 @@ async fn log_h3_grpc_transaction(
         body_completed,
         bytes_sent,
         bytes_received,
+        grpc_request_messages: ctx
+            .grpc_request_messages_observed
+            .load(std::sync::atomic::Ordering::Acquire),
+        grpc_response_messages: ctx
+            .grpc_response_messages_observed
+            .load(std::sync::atomic::Ordering::Acquire),
         error_class,
         mirror: false,
         metadata: crate::proxy::clone_log_metadata(ctx),

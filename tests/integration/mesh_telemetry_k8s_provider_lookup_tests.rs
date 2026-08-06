@@ -373,36 +373,27 @@ fn k8s_telemetry_match_mode_server_plus_client_union_becomes_client_and_server()
 }
 
 #[tokio::test]
-async fn translated_unsupported_standard_metric_families_do_not_omit_plugin() {
-    let oversized_ignored_literal =
-        serde_json::to_string(&"x".repeat(257)).expect("serialize ignored metric literal");
+async fn translated_standard_metric_family_disable_and_override_are_live() {
     let translation = translate_k8s_objects(
         &[telemetry(json!({
             "metrics": [{
                 "overrides": [
                     {
                         "match": {"metric": "REQUEST_SIZE"},
-                        "disabled": true,
-                        "tagOverrides": {
-                            "request_bytes": {
-                                "operation": "UPSERT",
-                                "value": "request.host"
-                            }
-                        }
-                    },
-                    {
-                        "match": {"metric": "RESPONSE_SIZE"},
-                        "disabled": true,
-                        "tagOverrides": {
-                            "response_bytes": {
-                                "operation": "UPSERT",
-                                "value": oversized_ignored_literal
-                            }
-                        }
+                        "disabled": true
                     },
                     {
                         "match": {"metric": "REQUEST_DURATION"},
                         "disabled": true
+                    },
+                    {
+                        "match": {"metric": "TCP_SENT_BYTES"},
+                        "tagOverrides": {
+                            "source_workload": {
+                                "operation": "UPSERT",
+                                "value": "\"edge\""
+                            }
+                        }
                     }
                 ]
             }]
@@ -425,25 +416,31 @@ async fn translated_unsupported_standard_metric_families_do_not_omit_plugin() {
         "labels": {"app": "frontend"},
         "metrics": serde_json::to_value(metrics).expect("serialize metrics")
     }))
-    .expect("recognized non-emitted standard families must not omit workload_metrics");
+    .expect("standard families construct");
     let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
     let mut headers = HashMap::new();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
 
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(
-        ctx.metadata
-            .get("mesh.source.principal")
-            .map(String::as_str),
-        Some("spiffe://cluster.local/ns/default/sa/frontend")
+    let disabled = ctx
+        .metadata
+        .get("mesh.metrics.disabled")
+        .map(String::as_str)
+        .expect("disabled marker");
+    assert!(
+        disabled.split(',').any(|n| n == "request_size"),
+        "REQUEST_SIZE disable must stamp request_size: {disabled}"
     );
-    assert_eq!(
+    assert!(
+        disabled.split(',').any(|n| n == "request_duration"),
+        "REQUEST_DURATION disable must stamp request_duration: {disabled}"
+    );
+    assert!(
         ctx.metadata
-            .get("mesh.metrics.disabled")
-            .map(String::as_str),
-        Some("request_duration"),
-        "supported family policy must survive while size-family policy is ignored"
+            .get("mesh.metrics.tcp_sent_bytes.tag_overrides")
+            .is_some_and(|plan| plan.contains("s0,4:edge;")),
+        "TCP_SENT_BYTES tag override must be stamped"
     );
 }
 
@@ -484,7 +481,7 @@ async fn translated_disabled_override_without_match_suppresses_all_mesh_metrics(
         ctx.metadata
             .get("mesh.metrics.disabled")
             .map(String::as_str),
-        Some("request_count,request_duration")
+        Some("request_count,request_duration,request_size,response_size,tcp_opened_connections,tcp_closed_connections,tcp_sent_bytes,tcp_received_bytes,grpc_request_messages,grpc_response_messages")
     );
 
     let registry = MetricsRegistry::new();
@@ -509,6 +506,14 @@ async fn translated_disabled_override_without_match_suppresses_all_mesh_metrics(
     assert!(
         !output.contains("ferrum_mesh_request_duration_ms_bucket{"),
         "ALL_METRICS must suppress the emitted histogram family"
+    );
+    assert!(
+        !output.contains("ferrum_mesh_request_bytes_"),
+        "ALL_METRICS must suppress REQUEST_SIZE"
+    );
+    assert!(
+        !output.contains("ferrum_mesh_response_bytes_"),
+        "ALL_METRICS must suppress RESPONSE_SIZE"
     );
 }
 

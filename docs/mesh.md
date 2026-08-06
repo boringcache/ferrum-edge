@@ -1718,12 +1718,16 @@ This is a deliberate, tested limitation rather than an oversight: a counter keye
 
 ### RED Metrics
 
-The auto-injected `workload_metrics` plugin emits Istio/GAMMA-shaped RED (Rate, Errors, Duration) metrics:
+The auto-injected `workload_metrics` plugin emits Istio/GAMMA-shaped RED and lifecycle metrics:
 
 - `ferrum_mesh_requests_total` -- request counter.
 - `ferrum_mesh_request_duration_ms` -- request duration histogram.
+- `ferrum_mesh_request_bytes` / `ferrum_mesh_response_bytes` -- HTTP/gRPC body-size histograms (`REQUEST_SIZE` / `RESPONSE_SIZE`).
+- `ferrum_mesh_tcp_connections_opened_total` / `ferrum_mesh_tcp_connections_closed_total` -- TCP connection lifecycle counters.
+- `ferrum_mesh_tcp_sent_bytes_total` / `ferrum_mesh_tcp_received_bytes_total` -- TCP byte counters recorded on disconnect.
+- `ferrum_mesh_request_messages_total` / `ferrum_mesh_response_messages_total` -- gRPC length-prefixed message counters.
 
-Istio Telemetry selectors for standard families Ferrum does not emit (request/response size, TCP connection/byte, and gRPC message families) are accepted and ignored with one bounded construction-time warning, so those family-specific overrides do not suppress the optional `workload_metrics` plugin. Unknown family names and malformed policy remain construction errors. `ALL_METRICS` applies only to the two emitted Ferrum families.
+Supported Telemetry selectors are `REQUEST_COUNT`, `REQUEST_DURATION`, `REQUEST_SIZE`, `RESPONSE_SIZE`, `TCP_OPENED_CONNECTIONS`, `TCP_CLOSED_CONNECTIONS`, `TCP_SENT_BYTES`, `TCP_RECEIVED_BYTES`, `GRPC_REQUEST_MESSAGES`, `GRPC_RESPONSE_MESSAGES`, the matching `ferrum_mesh_*` names, and `ALL_METRICS`. Unknown family names and malformed policy remain construction errors. `ALL_METRICS` applies to every emitted Ferrum family above.
 
 Labels include:
 
@@ -1839,7 +1843,7 @@ Datadog export groups spans by trace in the Agent v0.3 payload shape and sends t
 
 **Metrics configuration**:
 
-- `tag_overrides`: remove, rename, or set labels on the finalized mesh metric key. Istio label names such as `source_workload`, `destination_service`, and `response_flags` are normalized to Ferrum's fixed `mesh.*` metric-label vocabulary; adding a new Istio tag dimension is not supported. Overrides preserve their `match.metric` scope and apply in declaration order. Ferrum does not evaluate general Istio CEL expressions in `UPSERT.value`: the only accepted form is a double-quoted JSON-style string literal (for example, `value: '"edge"'`), whose decoded value becomes the label value. Missing, empty, or non-literal expressions such as `request.host` and `string(destination.port)` make the Telemetry resource invalid (`FerrumAccepted=False`) instead of being emitted as literal expression text. Supported metric selectors are `REQUEST_COUNT`, `REQUEST_DURATION`, `ferrum_mesh_requests_total`, `ferrum_mesh_request_duration_ms`, and `ALL_METRICS`. Unsupported tag names, unsafe or oversized values, and unknown metric selectors likewise fail translation visibly. A changed label shape creates a new Prometheus series; the previous series ages out under the configured stale-entry TTL.
+- `tag_overrides`: remove, rename, or set labels on the finalized mesh metric key. Istio label names such as `source_workload`, `destination_service`, and `response_flags` are normalized to Ferrum's fixed `mesh.*` metric-label vocabulary; adding a new Istio tag dimension is not supported. Overrides preserve their `match.metric` scope and apply in declaration order. Ferrum does not evaluate general Istio CEL expressions in `UPSERT.value`: the only accepted form is a double-quoted JSON-style string literal (for example, `value: '"edge"'`), whose decoded value becomes the label value. Missing, empty, or non-literal expressions such as `request.host` and `string(destination.port)` make the Telemetry resource invalid (`FerrumAccepted=False`) instead of being emitted as literal expression text. Supported metric selectors are `REQUEST_COUNT`, `REQUEST_DURATION`, `REQUEST_SIZE`, `RESPONSE_SIZE`, `TCP_OPENED_CONNECTIONS`, `TCP_CLOSED_CONNECTIONS`, `TCP_SENT_BYTES`, `TCP_RECEIVED_BYTES`, `GRPC_REQUEST_MESSAGES`, `GRPC_RESPONSE_MESSAGES`, the matching `ferrum_mesh_*` names, and `ALL_METRICS`. Unsupported tag names, unsafe or oversized values, and unknown metric selectors likewise fail translation visibly. A changed label shape creates a new Prometheus series; the previous series ages out under the configured stale-entry TTL.
 - `disabled_metrics`: suppresses only the selected mesh metric family before its counter or histogram is updated. It accepts the same metric selectors as `tag_overrides`. Newly accepted Telemetry configuration affects subsequent transactions immediately; an already-created series remains visible at its last value until the Prometheus stale-entry TTL evicts it, and re-enabling resumes recording without a restart.
 
 **Access logging configuration**:

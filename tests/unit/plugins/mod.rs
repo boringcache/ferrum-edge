@@ -73,6 +73,7 @@ mod openapi_validator_tests;
 mod otel_tracing_tests;
 mod plugin_cache_tests;
 mod workload_metrics_custom_env_tags_tests;
+mod mesh_telemetry_metric_families_tests;
 pub(crate) use plugin_cache_tests::minimal_plugin_config;
 mod plugin_doc_parity_tests;
 mod plugin_http_client_tests;
