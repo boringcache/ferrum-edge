@@ -10,6 +10,7 @@
 //! DNS lookups off the hot request path. A shared pool shell in `src/pool/`
 //! handles the DashMap, key-buffer fast path, and idle cleanup.
 
+use crate::backend_conn_limit::ReqwestConnectionAdmission;
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::{DnsCache, DnsCacheResolver};
@@ -38,6 +39,16 @@ struct ReqwestPoolManager {
     backend_h3_tls_configs: BackendTlsConfigCache,
     backend_svid_generation: BackendSvidGeneration,
     workload_svid_cert_path: Option<String>,
+    /// Shared DestinationRule `connectionPool.tcp.maxConnections` admission
+    /// hook, installed on every client this manager builds.
+    ///
+    /// One hook for the whole gateway is what makes divergent reqwest pool
+    /// keys (TLS material, `rcfg`, forced-H1 ALPN, subset) for the same
+    /// destination share ONE physical-connection ceiling instead of getting one
+    /// each. `OnceLock` because `ProxyState` attaches it right after
+    /// construction; a pool built without it (focused tests, standalone
+    /// callers) simply never enforces a cap.
+    reqwest_conn_admission: std::sync::OnceLock<Arc<ReqwestConnectionAdmission>>,
 }
 
 impl ReqwestPoolManager {
@@ -122,6 +133,18 @@ impl ReqwestPoolManager {
         // `PoolConfig::append_reqwest_client_behavior_pool_key` so two proxies
         // with divergent values do not share a first-creator-wins client.
         // `max_idle_per_host` remains global-only by deliberate tradeoff.
+
+        // DestinationRule `connectionPool.tcp.maxConnections`: admitted at
+        // reqwest's connector, the one place a NEW physical socket is dialed.
+        // Pooled reuse and multiplexed HTTP/2 streams never reach the hook, and
+        // the token it hands back is owned by the connection object, so the
+        // slot retires exactly when that socket closes — including while
+        // reqwest keeps it idle after the request that opened it finished.
+        // See `docs/upstream-reqwest-patches/003-connection-admission-hook/`.
+        if let Some(admission) = self.reqwest_conn_admission.get() {
+            let hook: Arc<dyn reqwest::ConnectionAdmission> = admission.clone();
+            client_builder = client_builder.connection_admission(hook);
+        }
 
         if config.enable_http_keep_alive {
             client_builder =
@@ -313,11 +336,20 @@ impl ConnectionPool {
             backend_h3_tls_configs: BackendTlsConfigCache::with_shards(shards),
             backend_svid_generation,
             workload_svid_cert_path,
+            reqwest_conn_admission: std::sync::OnceLock::new(),
         });
 
         Self {
             pool: GenericPool::new(manager, global_config, cleanup_interval, shards),
         }
+    }
+
+    /// Install the gateway-wide `maxConnections` admission hook.
+    ///
+    /// Additive and idempotent (`OnceLock::set`), called by `ProxyState`
+    /// immediately after construction and before any client is built.
+    pub fn attach_reqwest_connection_admission(&self, admission: Arc<ReqwestConnectionAdmission>) {
+        let _ = self.pool.manager().reqwest_conn_admission.set(admission);
     }
 
     /// Get or create a client for the given proxy using global defaults + proxy overrides.

@@ -150,6 +150,7 @@ jobs:
             kind: integration
             filters: |
               integration::mesh_l7_routing_tests
+              integration::mesh_l4_weighted_routing_tests
               integration::mesh_topology_hbone_tests
               integration::mesh_authz_e2e_tests
               integration::mesh_authz_negative_match_tests
