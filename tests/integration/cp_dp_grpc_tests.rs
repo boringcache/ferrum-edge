@@ -4010,6 +4010,69 @@ async fn test_cp_rejects_dp_with_mismatched_namespace_subscribe() {
     server_handle.abort();
 }
 
+/// Doc-contract guard for `docs/multi_region_ha.md` (issue #3610): a `us-east`
+/// DP cannot treat a `us-west`-scoped CP as failover — the subscribe is rejected
+/// with `FAILED_PRECONDITION` naming `FERRUM_CP_NAMESPACES`, not a transport error
+/// that would imply healthy cross-region CP redundancy.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_multi_region_ha_doc_cross_region_cp_failover_rejected() {
+    let cp_config = create_test_config(2);
+    let (addr, _update_tx, server_handle) =
+        start_test_cp_server_with_namespace(cp_config, "us-west").await;
+
+    let generated_token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "dp-east-1").unwrap();
+    let token_meta: tonic::metadata::MetadataValue<_> =
+        format!("Bearer {}", generated_token).parse().unwrap();
+    let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let mut client =
+        ferrum_edge::grpc::proto::config_sync_client::ConfigSyncClient::with_interceptor(
+            channel,
+            move |mut req: tonic::Request<()>| {
+                req.metadata_mut()
+                    .insert("authorization", token_meta.clone());
+                Ok(req)
+            },
+        );
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "dp-east-1".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "us-east".to_string(),
+        real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
+    });
+
+    let result = client.subscribe(request).await;
+    assert!(
+        result.is_err(),
+        "us-west CP must reject us-east DP subscribe (doc's cross-region failover pattern)"
+    );
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("us-east"),
+        "Error should mention DP namespace 'us-east', got: {}",
+        status.message()
+    );
+    assert!(
+        status.message().contains("us-west"),
+        "Error should mention CP scope 'us-west', got: {}",
+        status.message()
+    );
+    assert!(
+        status.message().contains("FERRUM_CP_NAMESPACES"),
+        "Error should steer operators toward CP scope configuration, got: {}",
+        status.message()
+    );
+
+    server_handle.abort();
+}
+
 /// `MeshSubscribe` enforces the same namespace boundary as classic Subscribe:
 /// a mesh node in `staging` must not receive a CP's `production` mesh slice.
 #[tokio::test(flavor = "multi_thread")]

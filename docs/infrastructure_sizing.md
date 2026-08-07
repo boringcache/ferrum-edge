@@ -96,7 +96,7 @@ Suitable for high-traffic production APIs. Consider running multiple instances b
 | Memory | 2 GB | 4–8 GB |
 | File descriptors | 262,144 | 1,048,576 |
 
-At this scale, use the [Control Plane / Data Plane](cp_dp_mode.md) deployment mode with multiple Data Plane instances for horizontal scaling. For multi-region deployments, configure DPs with [multi-CP failover](multi_region_ha.md) (`FERRUM_DP_CP_GRPC_URLS`) so DPs can connect to CPs in other regions during regional outages.
+At this scale, use the [Control Plane / Data Plane](cp_dp_mode.md) deployment mode with multiple Data Plane instances for horizontal scaling. For multi-region deployments, see [multi_region_ha.md](multi_region_ha.md): configure `FERRUM_DP_CP_GRPC_URLS` with CPs that **serve the DP's namespace** (same-region replicas or hot-standby CPs), not CPs in other regions that run a different `FERRUM_NAMESPACE`.
 
 ## How Payload Size Affects Memory
 
