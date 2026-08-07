@@ -4482,13 +4482,20 @@ async fn handle_h3_request(
     // Determine streaming vs buffered mode from the finalized request context.
     // This remains after selected-target retry capping and now also after the
     // fail-fast breaker admission above.
-    let has_retry = match backend_http_flavor {
-        HttpFlavor::Plain => {
-            crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method)
-        }
-        HttpFlavor::Grpc => crate::retry::can_retry_connection_failures(proxy.retry.as_ref()),
-        HttpFlavor::WebSocket => false,
-    };
+    let selected_target_allows_retry = crate::proxy::current_retry_attempt_allowed(
+        route_retry_ceiling,
+        &proxy,
+        upstream_target.as_deref(),
+        0,
+    );
+    let has_retry = selected_target_allows_retry
+        && match backend_http_flavor {
+            HttpFlavor::Plain => {
+                crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method)
+            }
+            HttpFlavor::Grpc => crate::retry::can_retry_connection_failures(proxy.retry.as_ref()),
+            HttpFlavor::WebSocket => false,
+        };
     let should_stream_response = crate::proxy::should_stream_response_body(
         &proxy,
         &plugins,

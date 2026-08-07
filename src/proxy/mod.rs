@@ -30194,7 +30194,13 @@ async fn handle_proxy_request_inner(
     // collecting it into memory. When effective retries are enabled, we force
     // buffered mode so the collected body bytes can be replayed on connection
     // failures.
-    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method);
+    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method)
+        && current_retry_attempt_allowed(
+            route_retry_ceiling,
+            &proxy,
+            upstream_target.as_deref(),
+            0,
+        );
     let stream_request_body = !has_retry && !requires_request_body_buffering;
     // A retry may rotate from an ordinary backend target onto a secured mesh
     // target. Share the pristine field-line representation before the initial
