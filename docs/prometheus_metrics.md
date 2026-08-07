@@ -156,6 +156,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_admin_audit_unknown_outcome_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Prepared admin audit records whose trustworthy outcome observer was lost to process exit or request cancellation. |
 | `ferrum_admin_max_connections` | gauge | `namespace` | `admin` | `documented_only` | `conditional` | Configured admin connection cap (0 = unlimited). |
 | `ferrum_admin_max_connections_per_ip` | gauge | `namespace` | `admin` | `documented_only` | `conditional` | Configured per-source-IP admin connection cap (0 = unlimited). |
+| `ferrum_admin_read_only_rejected_mutations_total` | counter | `namespace` | `admin` | `documented_only` | `always` | Admin configuration mutations refused because the Admin API is in read-only mode. |
 | `ferrum_admin_rejected_connections_total` | counter | `reason`, `namespace` | `admin` | `documented_only` | `conditional` | Admin connections rejected by the connection limiter, by reason. |
 | `ferrum_ai_completion_tokens_total` | counter | `proxy_id`, `provider`, `namespace` | `ai` | `documented_only` | `when_series_present` | Completion tokens reported by AI providers. |
 | `ferrum_ai_estimated_cost_currency_units_total` | counter | `proxy_id`, `provider`, `namespace` | `ai` | `documented_only` | `when_series_present` | Estimated AI cost in the configured currency units, retaining sub-micro precision and rounding the aggregate to six decimals. |

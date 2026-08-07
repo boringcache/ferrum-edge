@@ -574,6 +574,10 @@ pub struct MetricsRegistry {
     pub mesh_request_duration_buckets: DashMap<MeshRequestKey, HistogramBuckets>,
     /// Rate limit exceeded counter
     pub rate_limit_exceeded: AtomicU64,
+    /// Admin configuration mutations refused because the Admin API is in
+    /// read-only mode. Counted only on real admission attempts, not on
+    /// observe-only health probes.
+    admin_read_only_rejected_mutations: AtomicU64,
     /// `request_mirror` detached tasks admitted past concurrency + byte budgets.
     request_mirror_dispatched: AtomicU64,
     /// `request_mirror` tasks that fully drained a response within bounds.
@@ -729,6 +733,7 @@ impl MetricsRegistry {
             mesh_request_counter: DashMap::new(),
             mesh_request_duration_buckets: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
+            admin_read_only_rejected_mutations: AtomicU64::new(0),
             request_mirror_dispatched: AtomicU64::new(0),
             request_mirror_completed: AtomicU64::new(0),
             request_mirror_request_timeouts: AtomicU64::new(0),
@@ -899,6 +904,28 @@ impl MetricsRegistry {
     pub fn record_rate_limit_exceeded(&self) {
         self.rate_limit_exceeded.fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
+    }
+
+    /// Record one admin configuration mutation refused by read-only mode.
+    /// Returns the counter value before this increment.
+    pub fn record_admin_read_only_rejection(&self) -> u64 {
+        let previous = self
+            .admin_read_only_rejected_mutations
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+        previous
+    }
+
+    #[doc(hidden)]
+    pub fn reset_admin_read_only_rejection_metrics_for_test(&self) {
+        self.admin_read_only_rejected_mutations
+            .store(0, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn admin_read_only_rejected_mutations_total(&self) -> u64 {
+        self.admin_read_only_rejected_mutations
+            .load(Ordering::Relaxed)
     }
 
     /// Process-wide `request_mirror` lifecycle counters. Labels are never used:
@@ -2202,6 +2229,17 @@ impl MetricsRegistry {
             output.push_str(&format!("# TYPE {name} counter\n"));
             render_process_counter(&mut output, name, value, &ns_label);
         }
+        output.push_str(
+            "# HELP ferrum_admin_read_only_rejected_mutations_total Admin configuration mutations refused because the Admin API is in read-only mode.\n",
+        );
+        output.push_str("# TYPE ferrum_admin_read_only_rejected_mutations_total counter\n");
+        render_process_counter(
+            &mut output,
+            "ferrum_admin_read_only_rejected_mutations_total",
+            self.admin_read_only_rejected_mutations
+                .load(Ordering::Relaxed),
+            &ns_label,
+        );
         output.push_str(
             "# HELP ferrum_admin_audit_events_dropped_total Admin audit events lost without a durable record, by reason.\n",
         );

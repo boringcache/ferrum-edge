@@ -486,7 +486,10 @@ impl AdminState {
         // transient spool I/O error would permanently wedge fail-closed writes
         // after the filesystem recovered. Observe-only health still uses the
         // cached reason through `evaluate_write_gate()`.
-        if let Some(response) = self.evaluate_independent_store_write_gate() {
+        if let Some(response) = self.admit_read_only_gate() {
+            return Err(response);
+        }
+        if let Some(response) = self.evaluate_db_unavailable_gate() {
             return Err(response);
         }
         if let Some(ref db) = self.db {
@@ -551,7 +554,10 @@ impl AdminState {
     // allocation/dereference layer on an already exceptional path.
     #[allow(clippy::result_large_err)]
     pub async fn admit_non_config_db_write(&self) -> Result<(), Response<Full<Bytes>>> {
-        if let Some(response) = self.evaluate_independent_store_write_gate() {
+        if let Some(response) = self.admit_read_only_gate() {
+            return Err(response);
+        }
+        if let Some(response) = self.evaluate_db_unavailable_gate() {
             return Err(response);
         }
         if let Some(response) = self.prepare_audit_intent().await {
@@ -596,15 +602,25 @@ impl AdminState {
         None
     }
 
-    /// Common gates for mutations of stores independent from config-DB
-    /// topology and from the config-DB audit event stream.
-    fn evaluate_independent_store_write_gate(&self) -> Option<Response<Full<Bytes>>> {
-        if self.read_only {
-            return Some(json_response(
-                StatusCode::FORBIDDEN,
-                &json!({"error": "Admin API is in read-only mode"}),
-            ));
+    fn read_only_forbidden_response() -> Response<Full<Bytes>> {
+        json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"}),
+        )
+    }
+
+    /// Admission-only read-only gate. Observationally pure callers such as
+    /// [`Self::check_write_allowed`] use [`Self::evaluate_independent_store_write_gate`]
+    /// instead so health probes do not inflate rejection counters or logs.
+    fn admit_read_only_gate(&self) -> Option<Response<Full<Bytes>>> {
+        if !self.read_only {
+            return None;
         }
+        note_read_only_rejection();
+        Some(Self::read_only_forbidden_response())
+    }
+
+    fn evaluate_db_unavailable_gate(&self) -> Option<Response<Full<Bytes>>> {
         if let Some(ref flag) = self.db_available
             && !flag.load(Ordering::Relaxed)
         {
@@ -614,6 +630,15 @@ impl AdminState {
             ));
         }
         None
+    }
+
+    /// Common gates for mutations of stores independent from config-DB
+    /// topology and from the config-DB audit event stream.
+    fn evaluate_independent_store_write_gate(&self) -> Option<Response<Full<Bytes>>> {
+        if self.read_only {
+            return Some(Self::read_only_forbidden_response());
+        }
+        self.evaluate_db_unavailable_gate()
     }
 
     fn evaluate_write_gate(&self) -> Option<Response<Full<Bytes>>> {
@@ -633,6 +658,55 @@ impl AdminState {
         }
         None
     }
+}
+
+static READ_ONLY_REJECTION_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+static READ_ONLY_REJECTION_WARN_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Count and emit a bounded structured warning for one admin mutation refused
+/// by read-only mode. Called only from admission paths, never from observe-only
+/// gates such as [`AdminState::check_write_allowed`].
+fn note_read_only_rejection() {
+    let total = crate::plugins::prometheus_metrics::global_registry()
+        .record_admin_read_only_rejection()
+        .saturating_add(1);
+    READ_ONLY_REJECTION_LOG_COUNT.store(total, Ordering::Relaxed);
+
+    let should_sample = total == 1 || total.is_multiple_of(1_024);
+    if !should_sample {
+        return;
+    }
+    const WINDOW_MS: u64 = 5_000;
+    let now = crate::socket_opts::monotonic_now_ms();
+    let last = READ_ONLY_REJECTION_WARN_LAST_MS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < WINDOW_MS {
+        return;
+    }
+    if READ_ONLY_REJECTION_WARN_LAST_MS
+        .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let Some((method, path, namespace)) = audit::read_only_rejection_log_context() else {
+        return;
+    };
+    warn!(
+        method = %method,
+        path = %path,
+        namespace = %namespace,
+        outcome = "forbidden",
+        total_rejections = total,
+        "admin mutation blocked by read-only mode"
+    );
+}
+
+#[doc(hidden)]
+pub fn reset_read_only_rejection_observability_for_test() {
+    READ_ONLY_REJECTION_LOG_COUNT.store(0, Ordering::Relaxed);
+    READ_ONLY_REJECTION_WARN_LAST_MS.store(0, Ordering::Relaxed);
+    crate::plugins::prometheus_metrics::global_registry()
+        .reset_admin_read_only_rejection_metrics_for_test();
 }
 
 /// Configured maximum age of the cached TLS inventory snapshot behind the

@@ -661,6 +661,18 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_admin_read_only_rejected_mutations_total",
+    "type": "counter",
+    "help": "Admin configuration mutations refused because the Admin API is in read-only mode.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_admin_rejected_connections_total",
     "type": "counter",
     "help": "Admin connections rejected by the connection limiter, by reason.",
