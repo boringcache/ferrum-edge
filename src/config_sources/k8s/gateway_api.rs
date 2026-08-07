@@ -43,6 +43,12 @@ const GATEWAY_API_REDIRECT_REPLACE_PREFIX_MATCH_KEY: &str =
 /// honored so operators migrating from Istio do not have to retag.
 const WAYPOINT_GATEWAY_CLASS_NAMES: &[&str] = &["istio-waypoint", "ferrum-waypoint"];
 
+pub(crate) fn is_supported_waypoint_gateway_class(name: &str) -> bool {
+    WAYPOINT_GATEWAY_CLASS_NAMES
+        .iter()
+        .any(|expected| expected.eq_ignore_ascii_case(name))
+}
+
 /// Service label naming the GAMMA Waypoint a Service routes through.
 /// `None` (the literal string) opts the Service out of any inherited
 /// namespace-level waypoint binding. Annotations are accepted as a
@@ -2136,6 +2142,7 @@ pub(super) fn add_waypoint_binding(acc: &mut super::K8sAccumulator, object: &K8s
     let waypoint_for = metadata_key(object, KEY_WAYPOINT_FOR)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| "service".to_string());
+    let gateway_class_name = string_field(&object.spec, "gatewayClassName").map(ToOwned::to_owned);
     if let Some(existing) = acc
         .mesh
         .waypoint_bindings
@@ -2146,11 +2153,15 @@ pub(super) fn add_waypoint_binding(acc: &mut super::K8sAccumulator, object: &K8s
         // defaults because the Gateway is the canonical owner of the
         // waypoint identity.
         existing.waypoint_for = waypoint_for;
+        if gateway_class_name.is_some() {
+            existing.gateway_class_name = gateway_class_name;
+        }
     } else {
         acc.mesh.waypoint_bindings.push(MeshWaypointBinding {
             name: object.metadata.name.clone(),
             namespace: object.metadata.namespace.clone(),
             waypoint_for,
+            gateway_class_name,
             services: Vec::new(),
         });
     }
@@ -2192,6 +2203,7 @@ pub(super) fn add_service_waypoint_binding(acc: &mut super::K8sAccumulator, obje
         name: waypoint_name,
         namespace: waypoint_namespace,
         waypoint_for: waypoint_for_override.unwrap_or_else(|| "service".to_string()),
+        gateway_class_name: None,
         services: vec![service_ref],
     });
 }

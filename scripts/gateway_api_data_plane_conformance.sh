@@ -94,6 +94,14 @@ deploy_control_plane() {
   done
   kubectl create namespace "$CP_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
   create_frontend_tls_secret
+  # FERRUM_K8S_WATCH_IDLE_RELIST_SECS, not FERRUM_K8S_FULL_SYNC_INTERVAL_SECS, is
+  # the bound on watch staleness: a full sync re-reconciles the SAME reflector
+  # store. The black-box phase deletes the upstream conformance Gateways and
+  # applies its own seconds later, and Ferrum serves one frontend TLS certificate
+  # per Gateway namespace, so a scope still holding a deleted Gateway makes the
+  # new Gateway lose that slot and withholds its HTTPS listener routes (404, not
+  # 502). Keep the window well inside the 120s black-box probe budget rather than
+  # at the 300s production default.
   helm upgrade --install ferrum "$ROOT_DIR/charts/ferrum-mesh" \
     --namespace "$CP_NAMESPACE" \
     --set image.repository=ferrum-edge \
@@ -121,6 +129,7 @@ deploy_control_plane() {
     --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false \
     --set controlPlane.env.FERRUM_K8S_POD_DISCOVERY_ENABLED=true \
     --set controlPlane.env.FERRUM_K8S_FULL_SYNC_INTERVAL_SECS=15 \
+    --set controlPlane.env.FERRUM_K8S_WATCH_IDLE_RELIST_SECS=20 \
     --set controlPlane.env.FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAMESPACE="$CP_NAMESPACE" \
     --set controlPlane.env.FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAME="$DP_SERVICE_NAME" \
     --set controlPlane.env.FERRUM_GATEWAY_API_STATUS_ADDRESS="$GATEWAY_API_STATUS_ADDRESS" \
@@ -750,6 +759,14 @@ curl_redirect() {
     -H "Host: ${host}" "http://${GATEWAY_API_STATUS_ADDRESS}${path}"
 }
 
+curl_tls_body() {
+  local host="$1"
+  local path="$2"
+  curl --fail --silent --show-error --max-time 10 --insecure \
+    --resolve "${host}:443:${GATEWAY_API_STATUS_ADDRESS}" \
+    "https://${host}${path}"
+}
+
 wait_for_body_contains() {
   local host="$1"
   local path="$2"
@@ -763,6 +780,26 @@ wait_for_body_contains() {
     sleep 2
   done
   echo "expected ${host}${path} to contain ${expected}" >&2
+  return 1
+}
+
+# Same retry budget as wait_for_body_contains, over the HTTPS listener. The TLS
+# route is the only black-box assertion whose listener depends on the CP having
+# already withdrawn the deleted upstream Gateway's claim on the namespace's
+# single frontend TLS slot, so it needs at least as much convergence room as the
+# plaintext probes, not a single non-retrying request.
+wait_for_tls_body_contains() {
+  local host="$1"
+  local path="$2"
+  local expected="$3"
+  for _ in $(seq 1 60); do
+    if body="$(curl_tls_body "$host" "$path" 2>/dev/null)" && grep -q "$expected" <<<"$body"; then
+      printf '%s\n' "$body"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "expected https://${host}${path} to contain ${expected}" >&2
   return 1
 }
 
@@ -844,9 +881,8 @@ run_blackbox_tests() {
   fi
   echo "deleted route stopped serving with HTTP ${delete_status}" >> "$report"
 
-  curl --fail --silent --show-error --max-time 10 --insecure \
-    --resolve "tls.blackbox.example:443:${GATEWAY_API_STATUS_ADDRESS}" \
-    https://tls.blackbox.example/tls | tee -a "$report"
+  wait_for_tls_body_contains tls.blackbox.example /tls "backend=blackbox-a" \
+    | tee -a "$report"
 
   echo "GRPCRoute resource applied but request traffic is not run because Ferrum does not claim GATEWAY-GRPC support in this job." >> "$report"
 }
