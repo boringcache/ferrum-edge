@@ -2745,10 +2745,26 @@ impl Http3ConnectionPool {
 
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let pooled = self
+        // A create refused by the destination's `maxConnections` ceiling is not
+        // a dead end: an already-established shard can serve this request by
+        // multiplexing. Only a cap refusal takes that path — see
+        // `reuse_shard_after_max_connections`. Opening is pre-wire by
+        // construction, so nothing has been delivered to any backend yet.
+        let pooled = match self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
-            .map_err(H3PoolError::pre_wire)?;
+        {
+            Ok(pooled) => pooled,
+            Err(err) => match self.reuse_shard_after_max_connections(
+                &err,
+                start,
+                conns_per_backend,
+                |index| self.pool_key_with_current_generation(proxy, index),
+            ) {
+                Some(pooled) => pooled,
+                None => return Err(H3PoolError::pre_wire(err)),
+            },
+        };
         let mut sr_for_request = pooled.send_request;
         Self::do_open_bidi_backend_stream(&mut sr_for_request, proxy, method, backend_url, headers)
             .await
@@ -2761,6 +2777,12 @@ impl Http3ConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        // DestinationRule policy port for this dispatch — the selected target's
+        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
+        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
+        // for `connectionPool.tcp.maxConnections` admission; the dial address,
+        // TLS/SNI and the pool key all stay on `target_host:target_port`.
+        target_policy_port: u16,
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
@@ -2799,17 +2821,40 @@ impl Http3ConnectionPool {
 
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let pooled = self
+        // Cap refusal falls back to an already-established shard, exactly like
+        // the drain-then-read entry points — see `reuse_shard_after_max_connections`.
+        let pooled = match self
             .create_or_get_target_sender(
                 key,
                 proxy,
-                target_host,
-                target_port,
+                H3ConnectionTarget {
+                    host: target_host,
+                    port: target_port,
+                    policy_port: target_policy_port,
+                },
                 tls_config,
                 h3_config,
             )
             .await
-            .map_err(H3PoolError::pre_wire)?;
+        {
+            Ok(pooled) => pooled,
+            Err(err) => match self.reuse_shard_after_max_connections(
+                &err,
+                start,
+                conns_per_backend,
+                |index| {
+                    self.pool_key_for_target_with_current_generation(
+                        proxy,
+                        target_host,
+                        target_port,
+                        index,
+                    )
+                },
+            ) {
+                Some(pooled) => pooled,
+                None => return Err(H3PoolError::pre_wire(err)),
+            },
+        };
         let mut sr_for_request = pooled.send_request;
         Self::do_open_bidi_backend_stream(&mut sr_for_request, proxy, method, backend_url, headers)
             .await
