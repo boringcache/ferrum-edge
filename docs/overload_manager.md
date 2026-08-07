@@ -54,7 +54,20 @@ FERRUM_OVERLOAD_LOOP_CRITICAL_US=500000       # reject connections (500ms)
 
 ## Admin Endpoint
 
-`GET /overload` returns the current state (unauthenticated, suitable for monitoring probes):
+`GET /overload` is tiered like `/health` and `/status`:
+
+- **Unauthenticated** callers (load balancers and orchestrator probes) receive only a coarse, LB-safe `{"level": ...}` with the correct HTTP status code. This is enough to drive shedding decisions without exposing resource internals.
+- **Authenticated** callers receive the full snapshot. Authentication uses the same observability policy as `/metrics`: a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP in `FERRUM_METRICS_ALLOWED_CIDRS`.
+
+Unauthenticated example:
+
+```json
+{
+  "level": "normal"
+}
+```
+
+Authenticated example (full snapshot):
 
 ```json
 {
@@ -69,6 +82,10 @@ FERRUM_OVERLOAD_LOOP_CRITICAL_US=500000       # reject connections (500ms)
     "dtls_demux_sessions": [],
     "bind_failures_total": 0,
     "bind_failures": []
+  },
+  "listener_failures": {
+    "failures_total": 0,
+    "failures": []
   },
   "pressure": {
     "file_descriptors": {
@@ -96,11 +113,11 @@ FERRUM_OVERLOAD_LOOP_CRITICAL_US=500000       # reject connections (500ms)
 }
 ```
 
-Returns HTTP 503 when `level` is `critical`.
+Returns HTTP 503 when `level` is `critical` (both tiers).
 
 ## Port Exhaustion Monitoring
 
-The `port_exhaustion_events` counter in the `/overload` response is a monotonic count of EADDRNOTAVAIL errors (OS error 99 on Linux, 49 on macOS) encountered across all outbound connection paths. This counter never resets and indicates that the gateway ran out of ephemeral ports for outbound connections.
+The `port_exhaustion_events` counter in the authenticated `/overload` detail tier is a monotonic count of EADDRNOTAVAIL errors (OS error 99 on Linux, 49 on macOS) encountered across all outbound connection paths. This counter never resets and indicates that the gateway ran out of ephemeral ports for outbound connections.
 
 **When this counter increases:**
 - Widen the kernel ephemeral port range: `sysctl net.ipv4.ip_local_port_range="1024 65535"`

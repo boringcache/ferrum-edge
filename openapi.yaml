@@ -1596,8 +1596,8 @@ paths:
         so load balancers and monitoring probes can act on the level without
         seeing resource internals. The **full** snapshot — resource pressure
         (file descriptors, connections, requests, event-loop latency), active
-        counts, port-exhaustion events, load-shedding actions, and stream-listener
-        diagnostics — requires a valid admin JWT, a matching
+        counts, port-exhaustion events, load-shedding actions, stream-listener
+        diagnostics, and `listener_failures` — requires a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS`
         source IP.
 
@@ -16451,10 +16451,15 @@ components:
 
         Auto-injected by mesh mode on every applicable topology; reserved
         plugin id `__mesh_authz`. PolicyScope filtering (`MeshWide` /
-        `Namespace` / `WorkloadSelector`) is applied at construction time
-        from the slice-embedded workload identity, except in node-waypoint
-        topology where the filter runs per-request against the pod-scoped
-        cache attached to `RequestContext`.
+        `Namespace` / `WorkloadSelector` / `TargetRefs`) is applied at
+        construction time from the slice-embedded workload identity, except in
+        node-waypoint topology where the filter runs per-request against the
+        pod-scoped cache attached to `RequestContext`. `TargetRefs`
+        (AuthorizationPolicy `spec.targetRefs`) is waypoint-only and is
+        additionally re-checked per request against the exact destination
+        Service and waypoint Gateway/GatewayClass identity — construction-time
+        retention is OR over the attachment list and never widens a targeted
+        policy onto another destination. See `docs/mesh.md`.
       properties:
         mesh_slice:
           type: object
