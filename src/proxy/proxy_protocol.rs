@@ -6,7 +6,7 @@
 //! header carries the original client address so the backend can see the real
 //! source IP rather than the LB's own IP.
 //!
-//! Outbound encoding ([`encode_v2_proxy_header`] / [`write_v2_proxy_header`])
+//! Outbound encoding ([`encode_v2_proxy_header`])
 //! prepends the same v2 binary framing to backend TCP connections when a
 //! stream proxy opts in via `backend_proxy_protocol: v2`, so L4 backends
 //! (PostgreSQL, MySQL, Redis, …) can see the originating client identity.
@@ -37,7 +37,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::warn;
 
 /// Outcome of parsing the PROXY protocol header from an inbound TCP stream.
@@ -604,20 +604,4 @@ fn encode_v2_inet6(src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16) -
     buf.extend_from_slice(&src_port.to_be_bytes());
     buf.extend_from_slice(&dst_port.to_be_bytes());
     buf
-}
-
-/// Write a PROXY protocol v2 header to `writer` and flush so the first relayed
-/// application byte cannot race ahead of the framing on a coalesced write.
-pub async fn write_v2_proxy_header<W>(
-    writer: &mut W,
-    src: SocketAddr,
-    dst: SocketAddr,
-) -> Result<(), std::io::Error>
-where
-    W: AsyncWrite + Unpin,
-{
-    let header = encode_v2_proxy_header(src, dst);
-    writer.write_all(&header).await?;
-    writer.flush().await?;
-    Ok(())
 }
