@@ -42,6 +42,7 @@ use ferrum_edge::load_balancer::{
     HealthContext, LoadBalancerCache, STICKY_SESSION_TOKEN_LEN, is_sticky_session_token,
     sticky_session_token,
 };
+use sha2::{Digest, Sha256};
 
 const NAMESPACE: &str = "ferrum";
 const UPSTREAM_ID: &str = "gwapi-route-upstream-default-sample-r0";
@@ -157,6 +158,43 @@ fn distinct_backends_mint_distinct_tokens() {
     let token_other_port = token_for(NAMESPACE, UPSTREAM_ID, &other_port);
     assert_ne!(token_a, token_b);
     assert_ne!(token_a, token_other_port);
+}
+
+#[test]
+fn predictable_route_and_backend_metadata_cannot_forge_a_binding() {
+    let backend = target("10.1.0.11", 8080);
+    let cache = cache_for(sticky_upstream(vec![backend.clone()]));
+    let snapshot = cache.load();
+
+    // This mirrors the vulnerable unkeyed construction: knowing the public
+    // domain, route scope, and endpoint was sufficient to manufacture a token.
+    let mut digest = Sha256::new();
+    digest.update(b"ferrum-sticky-session-v3");
+    digest.update([0x1f]);
+    digest.update((scope(NAMESPACE, UPSTREAM_ID).len() as u64).to_be_bytes());
+    digest.update(scope(NAMESPACE, UPSTREAM_ID));
+    digest.update((backend.host.len() as u64).to_be_bytes());
+    digest.update(backend.host.as_bytes());
+    digest.update(backend.port.to_be_bytes());
+    digest.update([0, 0, 0]);
+    digest.update([0, 0]);
+    digest.update(0u64.to_be_bytes());
+    let forged = hex::encode(digest.finalize());
+
+    assert!(is_sticky_session_token(&forged));
+    assert!(
+        LoadBalancerCache::select_sticky_from(
+            &snapshot,
+            NAMESPACE,
+            UPSTREAM_ID,
+            &forged,
+            None,
+            None,
+            None,
+        )
+        .is_none(),
+        "an unkeyed digest of predictable metadata must not authenticate"
+    );
 }
 
 #[test]
