@@ -36,6 +36,7 @@ mod mesh_validation_tests;
 mod migration_runner_tests;
 mod mongo_index_plan_tests;
 mod mongo_store_tests;
+mod mysql_collation_probe_tests;
 mod peer_auth_mtls_tests;
 mod plugin_migration_split_tests;
 mod plugin_migration_tests;
