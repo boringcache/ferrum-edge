@@ -9840,9 +9840,9 @@ async fn run_h3_grpc_upload_pump(
     shutdown: Arc<tokio::sync::Notify>,
 ) {
     let mut total_sent: usize = 0;
-    let mut grpc_scanner = grpc_messages.as_ref().map(|_| {
-        crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default()
-    });
+    let mut grpc_scanner = grpc_messages
+        .as_ref()
+        .map(|_| crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default());
     // Every `break` carries the exit reason, so there is no initial value that
     // teardown could read by accident. `blocked_on_backend` is published around
     // the backend awaits (and only those) so a response-header wait that expires
