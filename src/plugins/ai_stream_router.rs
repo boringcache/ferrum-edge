@@ -1263,37 +1263,13 @@ fn is_system_role(role: &str) -> bool {
     role == "system" || role == "developer"
 }
 
-/// Flatten OpenAI message `content` (string or content-part array) to plain
-/// text. MVP Anthropic translation is text-first; non-text parts are dropped.
-fn flatten_content_text(content: &Value) -> String {
-    if let Some(s) = content.as_str() {
-        return s.to_string();
-    }
-    let Some(parts) = content.as_array() else {
-        return String::new();
-    };
-    let mut out = String::new();
-    for part in parts {
-        if part.get("type").and_then(Value::as_str) == Some("text")
-            && let Some(text) = part.get("text").and_then(Value::as_str)
-            && !text.is_empty()
-        {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(text);
-        }
-    }
-    out
-}
-
 /// Closed Gemini-representable OpenAI message `content`.
 ///
 /// Only a string or a closed array of text-part objects with exactly `type` and
 /// `text` may be translated. Mixed text-plus-image/audio/unknown parts, extra
 /// or unknown fields on a text part, non-object array members, malformed text
 /// parts, null content, and non-array/non-string shapes fail closed rather than
-/// being silently reduced by [`flatten_content_text`]. Callers that intentionally
+/// being silently reduced. Callers that intentionally
 /// allow assistant null/empty content when a valid `tool_calls` or legacy
 /// `function_call` is present must handle that null case before calling this
 /// helper.
@@ -1318,6 +1294,53 @@ fn gemini_message_content_text(content: &Value) -> Result<String, String> {
         if object.len() != 2 || object.get("type").and_then(Value::as_str) != Some("text") {
             return Err(format!(
                 "content[{index}] is not a Gemini-representable text part"
+            ));
+        }
+        let text = object
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("content[{index}] text part is malformed"))?;
+        if text.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(text);
+    }
+    Ok(out)
+}
+
+/// Closed Anthropic-representable OpenAI message `content`.
+///
+/// Only a string or a closed array of text-part objects with exactly `type` and
+/// `text` may be translated. Mixed text-plus-image/audio/unknown parts, extra
+/// or unknown fields on a text part, non-object array members, malformed text
+/// parts, null content, and non-array/non-string shapes fail closed rather than
+/// being silently reduced. Callers that intentionally allow assistant null/empty
+/// content when a valid `tool_calls` or legacy `function_call` is present must
+/// handle that null case before calling this helper.
+fn anthropic_message_content_text(content: &Value) -> Result<String, String> {
+    if let Some(text) = content.as_str() {
+        return Ok(text.to_string());
+    }
+    if content.is_null() {
+        return Err("content must be a string or text-parts array".to_string());
+    }
+    let parts = content
+        .as_array()
+        .ok_or_else(|| "content must be a string or text-parts array".to_string())?;
+    let mut out = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        let Some(object) = part.as_object() else {
+            return Err(format!(
+                "content[{index}] is not an Anthropic-representable text part"
+            ));
+        };
+        // Closed claim shape: exactly `{ "type": "text", "text": "..." }`.
+        if object.len() != 2 || object.get("type").and_then(Value::as_str) != Some("text") {
+            return Err(format!(
+                "content[{index}] is not an Anthropic-representable text part"
             ));
         }
         let text = object
@@ -1635,14 +1658,19 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
 
         if role == "assistant" {
             let tool_calls = parse_openai_tool_calls(message, index)?;
-            if tool_calls.is_empty()
-                && legacy_call.is_none()
-                && flatten_content_text(message_object.get("content").unwrap_or(&Value::Null))
-                    .is_empty()
-            {
-                return Err(format!(
-                    "messages[{index}] has no Anthropic-representable content"
-                ));
+            if tool_calls.is_empty() && legacy_call.is_none() {
+                let content = message_object.get("content").unwrap_or(&Value::Null);
+                let text = if content.is_null() {
+                    String::new()
+                } else {
+                    anthropic_message_content_text(content)
+                        .map_err(|error| format!("messages[{index}] {error}"))?
+                };
+                if text.is_empty() {
+                    return Err(format!(
+                        "messages[{index}] has no Anthropic-representable content"
+                    ));
+                }
             }
             if !tool_calls.is_empty() {
                 for call in tool_calls {
@@ -1710,6 +1738,48 @@ fn validate_anthropic_translation(openai_body: &Value) -> Result<(), String> {
         .and_then(Value::as_array)
         .ok_or_else(|| "request missing 'messages' array".to_string())?;
     validate_openai_tool_history(messages)?;
+    for (message_index, message) in messages.iter().enumerate() {
+        let role = message["role"].as_str().unwrap_or("");
+        if is_system_role(role) {
+            anthropic_message_content_text(&message["content"])
+                .map_err(|error| format!("messages[{message_index}] {error}"))?;
+            continue;
+        }
+        if matches!(role, "tool" | "function") {
+            continue;
+        }
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let tool_calls = if role == "assistant" {
+            parse_openai_tool_calls(message, message_index)?
+        } else {
+            Vec::new()
+        };
+        let legacy_call = if role == "assistant" {
+            parse_openai_function_call(message, message_index)?
+        } else {
+            None
+        };
+        let has_tool_representation = !tool_calls.is_empty() || legacy_call.is_some();
+        let text = if message["content"].is_null() {
+            if role == "assistant" && has_tool_representation {
+                String::new()
+            } else {
+                return Err(format!(
+                    "messages[{message_index}] content must be a string or text-parts array"
+                ));
+            }
+        } else {
+            anthropic_message_content_text(&message["content"])
+                .map_err(|error| format!("messages[{message_index}] {error}"))?
+        };
+        if role == "assistant" && text.is_empty() && !has_tool_representation {
+            return Err(format!(
+                "messages[{message_index}] has no Anthropic-representable content"
+            ));
+        }
+    }
     let tool_choice = resolve_anthropic_tool_choice(openai_body)?;
     resolve_anthropic_thinking(openai_body, tool_choice.as_ref().map(|(kind, _)| *kind))?;
     Ok(())
@@ -1908,12 +1978,17 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
         .ok_or_else(|| "request missing 'messages' array".to_string())?;
     validate_anthropic_translation(openai_body)?;
 
-    let system_parts: Vec<String> = messages
-        .iter()
-        .filter(|m| m["role"].as_str().is_some_and(is_system_role))
-        .map(|m| flatten_content_text(&m["content"]))
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut system_parts = Vec::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        if !message["role"].as_str().is_some_and(is_system_role) {
+            continue;
+        }
+        let text = anthropic_message_content_text(&message["content"])
+            .map_err(|error| format!("messages[{message_index}] {error}"))?;
+        if !text.is_empty() {
+            system_parts.push(text);
+        }
+    }
 
     let mut translated_messages = Vec::with_capacity(messages.len());
     let mut pending_legacy_by_name: HashMap<String, String> = HashMap::new();
@@ -1993,7 +2068,6 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
             ));
         }
 
-        let text = flatten_content_text(&message["content"]);
         let tool_calls = if role == "assistant" {
             parse_openai_tool_calls(message, message_index)?
         } else {
@@ -2003,6 +2077,19 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
             parse_openai_function_call(message, message_index)?
         } else {
             None
+        };
+        let has_tool_representation = !tool_calls.is_empty() || legacy_call.is_some();
+        let text = if message["content"].is_null() {
+            if role == "assistant" && has_tool_representation {
+                String::new()
+            } else {
+                return Err(format!(
+                    "messages[{message_index}] content must be a string or text-parts array"
+                ));
+            }
+        } else {
+            anthropic_message_content_text(&message["content"])
+                .map_err(|error| format!("messages[{message_index}] {error}"))?
         };
         let content = if tool_calls.is_empty() && legacy_call.is_none() {
             if text.is_empty() && role == "assistant" {
