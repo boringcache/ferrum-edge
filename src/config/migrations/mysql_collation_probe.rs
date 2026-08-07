@@ -314,10 +314,7 @@ pub fn identity_bearing_columns() -> &'static [IdentityBearingColumn] {
 }
 
 fn identity_tables() -> BTreeSet<&'static str> {
-    identity_bearing_columns()
-        .iter()
-        .map(|c| c.table)
-        .collect()
+    identity_bearing_columns().iter().map(|c| c.table).collect()
 }
 
 fn identity_column_set() -> BTreeSet<(&'static str, &'static str)> {
@@ -420,12 +417,7 @@ pub fn format_affected_columns_summary(findings: &[StaleCollationFinding]) -> St
     let listed: Vec<String> = findings
         .iter()
         .take(MAX_COLUMNS_IN_LOG)
-        .map(|f| {
-            format!(
-                "{}.{} ({})",
-                f.table_name, f.column_name, f.found_collation
-            )
-        })
+        .map(|f| format!("{}.{} ({})", f.table_name, f.column_name, f.found_collation))
         .collect();
     let omitted = findings.len().saturating_sub(listed.len());
     if omitted == 0 {
@@ -498,10 +490,7 @@ pub async fn inspect_mysql_identity_collations(
 ///
 /// Probe failures warn and continue — matching the pending-plugin-migration
 /// probe posture in `database` / `cp` modes. Non-MySQL backends are no-ops.
-pub async fn warn_stale_mysql_identity_collations(
-    connection: &mut AnyConnection,
-    db_type: &str,
-) {
+pub async fn warn_stale_mysql_identity_collations(connection: &mut AnyConnection, db_type: &str) {
     match inspect_mysql_identity_collations(connection, db_type).await {
         Ok(findings) if findings.is_empty() => {}
         Ok(findings) => emit_stale_collation_warning(&findings),

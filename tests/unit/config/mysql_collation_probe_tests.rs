@@ -52,11 +52,9 @@ fn stale_general_ci_collation_is_detected() {
             .iter()
             .any(|f| f.table_name == "consumers" && f.found_collation == "utf8mb4_general_ci")
     );
-    assert!(
-        findings.iter().any(|f| {
-            f.table_name == "consumer_identity_index" && f.found_collation == "utf8mb4_0900_as_cs"
-        })
-    );
+    assert!(findings.iter().any(|f| {
+        f.table_name == "consumer_identity_index" && f.found_collation == "utf8mb4_0900_as_cs"
+    }));
     assert!(
         findings
             .iter()
