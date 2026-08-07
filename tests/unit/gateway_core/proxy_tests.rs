@@ -24,8 +24,11 @@ fn terminal_final_body_dispatch_follows_path_policy_and_precedes_backend_breaker
     let terminal_dispatch = src
         .find("if final_body_before_backend_dispatch {")
         .expect("terminal final-body dispatch gate must remain present");
+    // Match without the `let` binder: the initial selection is now `let mut
+    // selection` so the deferred-override rebind can replace it wholesale. The
+    // first occurrence is still the pre-deferred lookup this ordering pins.
     let selection = src
-        .find("let selection = backend_dispatch::select_upstream_target(")
+        .find("selection = backend_dispatch::select_upstream_target(")
         .expect("selected-target lookup must remain present");
     let path_policy = src[selection..]
         .find("if backend_path_is_policy_bound {")
