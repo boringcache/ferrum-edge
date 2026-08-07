@@ -11,11 +11,12 @@ use crate::modes::mesh::config::{
     MeshRequestAuthentication, MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress,
     MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MtlsMode, MultiClusterConfig,
     OutboundTrafficPolicy, PeerAuthentication, PolicyScope, ResolvedIngressListener, ServiceEntry,
-    SidecarHostPattern, TrustBundleSet, Workload, WorkloadLabels,
+    SidecarHostPattern, TrustBundleSet, WaypointAttachment, Workload, WorkloadLabels,
     destination_rule_exported_to_namespace, destination_rule_lookup_tier, is_false, is_zero_usize,
-    policy_scope_applies_to_workload, proxy_config_applies_to_workload, scope_applies_to_workload,
-    service_entry_applies_to_workload, virtual_service_cors_policy_exported_to_namespace,
-    workload_selector_matches,
+    policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
+    policy_target_attachment_applies_to_service, proxy_config_applies_to_workload,
+    scope_applies_to_workload, service_entry_applies_to_workload,
+    virtual_service_cors_policy_exported_to_namespace, workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
 
@@ -232,6 +233,14 @@ pub struct MeshSlice {
     /// so consumers can identify the binding the projection narrowed to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waypoint_name: Option<String>,
+    /// Authoritative `Gateway.spec.gatewayClassName` for [`Self::waypoint_name`],
+    /// stamped from [`crate::modes::mesh::config::MeshWaypointBinding::gateway_class_name`]
+    /// at slice build. Required for exact `GatewayClass` `targetRefs` matching
+    /// so an `istio-waypoint` policy never attaches to a `ferrum-waypoint`
+    /// Gateway (and vice versa). Absent when not a ServiceWaypoint slice or
+    /// when the binding has no class yet (Service-only shell).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waypoint_gateway_class: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     /// `labels` is an AMBIGUOUS intersection inferred from a shared-SPIFFE match
@@ -262,6 +271,15 @@ pub struct MeshSlice {
     /// stale route or stale materialized local-workload selector decision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub virtual_service_l4_proxies: Vec<serde_json::Value>,
+    /// Weighted multi-destination upstreams referenced by
+    /// [`Self::virtual_service_l4_proxies`]. Ordinary `GatewayConfig.upstreams`
+    /// do not ride `MeshSlice`, so translator-owned `istio-vs-l4-upstream-*`
+    /// objects are serialized beside the L4 proxies and decoded into
+    /// `GatewayConfig.upstreams` at apply time. Slice content equality includes
+    /// this field so weight/target updates and deletions cannot retain a stale
+    /// load-balancer set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_service_l4_upstreams: Vec<serde_json::Value>,
     pub version: String,
     /// Authoritative, CP-replica-shared config revision this slice was built
     /// from (issue #2473).
@@ -683,6 +701,7 @@ impl MeshSlice {
             && self.istio_root_namespace == other.istio_root_namespace
             && self.workload_spiffe_id == other.workload_spiffe_id
             && self.waypoint_name == other.waypoint_name
+            && self.waypoint_gateway_class == other.waypoint_gateway_class
             && self.labels == other.labels
             // The ambiguous-labels marker can flip independently of `labels`
             // (e.g. the shared-SPIFFE candidate set shrinks from two workloads
@@ -692,6 +711,7 @@ impl MeshSlice {
             // to) its local labels; omitting it would keep the stale precedence.
             && self.labels_ambiguous == other.labels_ambiguous
             && self.virtual_service_l4_proxies == other.virtual_service_l4_proxies
+            && self.virtual_service_l4_upstreams == other.virtual_service_l4_upstreams
             && self.workloads == other.workloads
             && self.ambient_udp_source_workloads == other.ambient_udp_source_workloads
             && self.node_waypoint_assertors == other.node_waypoint_assertors
@@ -1024,17 +1044,36 @@ impl MeshSlice {
                         .is_some_and(|criteria| !criteria.is_empty())
             })
             .collect();
+        let virtual_service_l4_upstream_candidates: Vec<&crate::config::types::Upstream> = {
+            let referenced: BTreeSet<&str> = virtual_service_l4_proxy_candidates
+                .iter()
+                .filter_map(|proxy| proxy.upstream_id.as_deref())
+                .collect();
+            config
+                .upstreams
+                .iter()
+                .filter(|upstream| {
+                    upstream.namespace == request.namespace
+                        && referenced.contains(upstream.id.as_str())
+                        && upstream.id.starts_with("istio-vs-l4-upstream-")
+                })
+                .collect()
+        };
 
         let Some(mesh) = config.mesh.as_ref() else {
             let virtual_service_l4_proxies =
                 serialize_virtual_service_l4_proxies(virtual_service_l4_proxy_candidates);
+            let virtual_service_l4_upstreams =
+                serialize_virtual_service_l4_upstreams(virtual_service_l4_upstream_candidates);
             return Self {
                 node_id: request.node_id,
                 namespace: request.namespace,
                 workload_spiffe_id: request.workload_spiffe_id,
                 waypoint_name: request.waypoint_name,
+                waypoint_gateway_class: None,
                 labels: request.labels,
                 virtual_service_l4_proxies,
+                virtual_service_l4_upstreams,
                 version,
                 revision,
                 ..Self::default()
@@ -1296,32 +1335,58 @@ impl MeshSlice {
                     let Some(sidecar) = applicable_sidecar else {
                         return true;
                     };
-                    let host_scope = policy_host_scope(
-                        &proxy.backend_host,
-                        &proxy.namespace,
-                        &cluster_domain,
-                        &mesh_service_identities,
-                        &service_entry_hosts,
-                    );
-                    // Egress scope matching needs a concrete namespace, so this
-                    // uses `scope_namespace` (which falls back to the proxy's
-                    // own namespace) rather than the evidence-backed
-                    // `service_namespace`. Sidecar egress is a reachability
-                    // filter, not an ownership decision — ownership only gates
-                    // the DestinationRule / CORS lookup tiers.
-                    let host_refs: Vec<&str> = host_scope
-                        .host_candidates
-                        .iter()
-                        .map(String::as_str)
-                        .collect();
-                    sidecar_egress_includes_service(
-                        sidecar.namespace,
-                        sidecar.egress,
-                        &host_scope.scope_namespace,
-                        &host_refs,
-                        Some(&[proxy.backend_port]),
-                    )
+                    let upstream = proxy.upstream_id.as_deref().and_then(|upstream_id| {
+                        virtual_service_l4_upstream_candidates
+                            .iter()
+                            .copied()
+                            .find(|upstream| upstream.id == upstream_id)
+                    });
+                    let destinations: Vec<(String, u16)> = if let Some(upstream) = upstream {
+                        upstream
+                            .targets
+                            .iter()
+                            .map(|target| (target.host.clone(), target.port))
+                            .collect()
+                    } else {
+                        vec![(proxy.backend_host.clone(), proxy.backend_port)]
+                    };
+                    // Fail closed: every weighted destination must be admitted
+                    // by Sidecar egress before the L4 proxy rides the slice.
+                    destinations.iter().all(|(host, port)| {
+                        let host_scope = policy_host_scope(
+                            host,
+                            &proxy.namespace,
+                            &cluster_domain,
+                            &mesh_service_identities,
+                            &service_entry_hosts,
+                        );
+                        // Egress scope matching needs a concrete namespace, so this
+                        // uses `scope_namespace` rather than the evidence-backed
+                        // `service_namespace`. Sidecar egress is a reachability
+                        // filter, not an ownership decision.
+                        let host_refs: Vec<&str> = host_scope
+                            .host_candidates
+                            .iter()
+                            .map(String::as_str)
+                            .collect();
+                        sidecar_egress_includes_service(
+                            sidecar.namespace,
+                            sidecar.egress,
+                            &host_scope.scope_namespace,
+                            &host_refs,
+                            Some(&[*port]),
+                        )
+                    })
                 }),
+        );
+        let admitted_upstream_ids: BTreeSet<&str> = virtual_service_l4_proxies
+            .iter()
+            .filter_map(|value| value.get("upstream_id").and_then(|id| id.as_str()))
+            .collect();
+        let virtual_service_l4_upstreams = serialize_virtual_service_l4_upstreams(
+            virtual_service_l4_upstream_candidates
+                .into_iter()
+                .filter(|upstream| admitted_upstream_ids.contains(upstream.id.as_str())),
         );
 
         let services: Vec<MeshService> = mesh
@@ -1465,15 +1530,38 @@ impl MeshSlice {
             .mesh_policies
             .iter()
             .filter(|policy| {
-                (!ambient_udp_policy_candidates.is_empty()
-                    && ambient_udp_policy_candidates
+                let waypoint = request.waypoint_name.as_deref();
+                let waypoint_class = waypoint.and_then(|name| {
+                    mesh.waypoint_bindings
                         .iter()
-                        .any(|(candidate_namespace, labels)| {
+                        .find(|binding| {
+                            binding.name == name && binding.namespace == effective_namespace
+                        })
+                        .and_then(|binding| binding.gateway_class_name.as_deref())
+                });
+                let waypoint_match = policy_scope_applies_with_waypoint(
+                    policy,
+                    effective_namespace,
+                    &effective_labels,
+                    waypoint,
+                    waypoint_class,
+                ) || (waypoint.is_some()
+                    && target_refs_attach_to_waypoint_services(
+                        policy,
+                        mesh,
+                        waypoint,
+                        effective_namespace,
+                    ));
+                let candidate_match = (!ambient_udp_policy_candidates.is_empty()
+                    && ambient_udp_policy_candidates.iter().any(
+                        |(candidate_namespace, labels)| {
                             policy_scope_applies_to_workload(policy, candidate_namespace, labels)
-                        }))
+                        },
+                    ))
                     || policy_candidate_labels.iter().any(|labels| {
                         policy_scope_applies_to_workload(policy, effective_namespace, *labels)
-                    })
+                    });
+                waypoint_match || candidate_match
             })
             .cloned()
             .collect();
@@ -1695,6 +1783,12 @@ impl MeshSlice {
         // happens once per slice; the alternative (reordering field
         // initialization) is fragile across future struct changes.
         let request_namespace = request.namespace;
+        let waypoint_gateway_class = request.waypoint_name.as_deref().and_then(|name| {
+            mesh.waypoint_bindings
+                .iter()
+                .find(|binding| binding.name == name && binding.namespace == request_namespace)
+                .and_then(|binding| binding.gateway_class_name.clone())
+        });
         Self {
             node_id: request.node_id,
             namespace: request_namespace.clone(),
@@ -1705,9 +1799,11 @@ impl MeshSlice {
             istio_root_namespace: mesh.istio_root_namespace.clone(),
             workload_spiffe_id: request.workload_spiffe_id,
             waypoint_name: request.waypoint_name,
+            waypoint_gateway_class,
             labels: effective_labels,
             labels_ambiguous,
             virtual_service_l4_proxies,
+            virtual_service_l4_upstreams,
             version,
             revision,
             workloads,
@@ -1799,6 +1895,41 @@ fn resource_namespace_visible(
         })
 }
 
+/// Admit Service `targetRefs` whose named destination is bound to this waypoint
+/// — exact `(namespace, name)` membership, never shared-label broadening.
+///
+/// ADMISSION ONLY: which destination the policy actually governs is re-decided
+/// per request against the exact destination service identity.
+fn target_refs_attach_to_waypoint_services(
+    policy: &MeshPolicy,
+    mesh: &MeshConfig,
+    waypoint_name: Option<&str>,
+    waypoint_namespace: &str,
+) -> bool {
+    let Some(waypoint_name) = waypoint_name else {
+        return false;
+    };
+    let Some(binding) = mesh
+        .waypoint_bindings
+        .iter()
+        .find(|binding| binding.name == waypoint_name && binding.namespace == waypoint_namespace)
+    else {
+        return false;
+    };
+    let PolicyScope::TargetRefs { attachments } = &policy.scope else {
+        return false;
+    };
+    attachments.iter().any(|attachment| {
+        binding.services.iter().any(|service| {
+            policy_target_attachment_applies_to_service(
+                attachment,
+                &service.namespace,
+                &service.name,
+            )
+        })
+    })
+}
+
 fn narrow_for_service_waypoint(
     waypoint_name: &str,
     waypoint_namespace: &str,
@@ -1815,12 +1946,19 @@ fn narrow_for_service_waypoint(
     };
     if binding.waypoint_for.eq_ignore_ascii_case("none") {
         // Operator explicitly opted out — narrow to an empty admitted set.
+        // Targeted policies go with it: an attachment scope with no admitted
+        // destination has nothing to attach to, and carrying it would leave a
+        // Gateway/GatewayClass arm live on a waypoint the operator disabled.
         return ServiceWaypointNarrowingResources {
             services: Vec::new(),
             service_entries: Vec::new(),
             destination_rules: Vec::new(),
             workloads: Vec::new(),
-            mesh_policies: resources.mesh_policies,
+            mesh_policies: resources
+                .mesh_policies
+                .into_iter()
+                .filter(|policy| !matches!(policy.scope, PolicyScope::TargetRefs { .. }))
+                .collect(),
         };
     }
 
@@ -1884,7 +2022,37 @@ fn narrow_for_service_waypoint(
         service_entries: admitted_service_entries,
         destination_rules: admitted_destination_rules,
         workloads: admitted_workloads,
-        mesh_policies: resources.mesh_policies,
+        mesh_policies: resources
+            .mesh_policies
+            .into_iter()
+            .filter(|policy| {
+                match &policy.scope {
+                    // OR admission over the attachment list. The non-matching
+                    // arms are deliberately NOT pruned (the slice must stay a
+                    // faithful copy of the operator's policy), so every runtime
+                    // consumer re-checks the exact attachment — see
+                    // `PolicyScopeCache::policy_applies_for_destination`.
+                    PolicyScope::TargetRefs { attachments } => {
+                        let waypoint = WaypointAttachment {
+                            namespace: waypoint_namespace,
+                            name: Some(waypoint_name),
+                            gateway_class: binding.gateway_class_name.as_deref(),
+                        };
+                        attachments.iter().any(|attachment| {
+                            waypoint.matches(attachment)
+                                || bound.iter().any(|(ns, svc)| {
+                                    policy_target_attachment_applies_to_service(attachment, ns, svc)
+                                })
+                        })
+                    }
+                    // Selector / namespace / mesh-wide policies stay; Istio
+                    // ambient ignores selector policies at waypoints, but
+                    // Ferrum continues to evaluate them for Sidecar-parity
+                    // source scoping already applied above.
+                    _ => true,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -2441,6 +2609,26 @@ fn serialize_virtual_service_l4_proxies<'a>(
                     error = %error,
                     "Failed to serialize a VirtualService L4 proxy into the mesh slice; \
                      dropping the route fail-closed"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+fn serialize_virtual_service_l4_upstreams<'a>(
+    upstreams: impl IntoIterator<Item = &'a crate::config::types::Upstream>,
+) -> Vec<serde_json::Value> {
+    upstreams
+        .into_iter()
+        .filter_map(|upstream| match serde_json::to_value(upstream) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                warn!(
+                    upstream_id = %upstream.id,
+                    error = %error,
+                    "Failed to serialize a VirtualService L4 upstream into the mesh slice; \
+                     dropping the upstream fail-closed"
                 );
                 None
             }
@@ -3829,7 +4017,9 @@ fn proxy_config_scope_tier(pc: &MeshProxyConfig) -> u8 {
     match pc.scope {
         PolicyScope::MeshWide => 0,
         PolicyScope::Namespace { .. } => 1,
-        PolicyScope::WorkloadSelector { .. } => 2,
+        // TargetRefs is AuthorizationPolicy-only; treat as workload-specific
+        // so a mis-authored native ProxyConfig cannot outrank selectors.
+        PolicyScope::WorkloadSelector { .. } | PolicyScope::TargetRefs { .. } => 2,
     }
 }
 
@@ -3849,6 +4039,8 @@ fn classify_peer_auth_scope(pa: &PeerAuthentication) -> PeerAuthScope {
                 PeerAuthScope::MeshWide
             }
             PolicyScope::WorkloadSelector { .. } => PeerAuthScope::Namespace,
+            // TargetRefs is AuthorizationPolicy-only; never classify PeerAuth.
+            PolicyScope::TargetRefs { .. } => PeerAuthScope::Namespace,
         };
     }
 
@@ -4146,6 +4338,7 @@ mod tests {
                 name: "waypoint".into(),
                 namespace: "infra".into(),
                 waypoint_for: "service".into(),
+                gateway_class_name: None,
                 services: vec![MeshWaypointServiceRef {
                     namespace: "default".into(),
                     name: "reviews".into(),
@@ -4206,6 +4399,7 @@ mod tests {
                 name: "waypoint".into(),
                 namespace: "infra".into(),
                 waypoint_for: "service".into(),
+                gateway_class_name: None,
                 services: vec![MeshWaypointServiceRef {
                     namespace: "default".into(),
                     name: "reviews".into(),
@@ -4398,6 +4592,7 @@ mod tests {
         let slice = MeshSlice {
             node_id: "n1".into(),
             namespace: "ns".into(),
+            waypoint_gateway_class: None,
             workload_spiffe_id: Some("spiffe://td/ns/x/sa/y".into()),
             labels: BTreeMap::from([("app".into(), "web".into())]),
             labels_ambiguous: false,
@@ -4420,6 +4615,7 @@ mod tests {
             destination_rules: Vec::new(),
             virtual_service_cors_policies: Vec::new(),
             virtual_service_l4_proxies: Vec::new(),
+            virtual_service_l4_upstreams: Vec::new(),
             proxy_configs: Vec::new(),
             request_authentications: vec![make_request_auth("ra1", "ns", PolicyScope::MeshWide)],
             telemetry_resources: vec![make_telemetry("t1", "ns", PolicyScope::MeshWide)],
@@ -6099,7 +6295,9 @@ mod tests {
     ) -> PeerAuthentication {
         let selector = match &scope {
             PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
-            PolicyScope::MeshWide | PolicyScope::Namespace { .. } => None,
+            PolicyScope::MeshWide
+            | PolicyScope::Namespace { .. }
+            | PolicyScope::TargetRefs { .. } => None,
         };
         PeerAuthentication {
             name: name.to_string(),

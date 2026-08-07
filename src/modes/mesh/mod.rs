@@ -23,7 +23,7 @@ pub mod runtime;
 pub mod runtime_overlay_consumers;
 pub mod slice;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1527,6 +1527,7 @@ fn scoped_policy_label(policy: &MeshPolicy) -> String {
         PolicyScope::MeshWide => "mesh-wide",
         PolicyScope::Namespace { .. } => "namespace",
         PolicyScope::WorkloadSelector { .. } => "selector",
+        PolicyScope::TargetRefs { .. } => "targetRefs",
     };
     format!("{}/{} ({scope})", policy.namespace, policy.name)
 }
@@ -2254,8 +2255,10 @@ fn gateway_config_from_mesh_slice_with_federation(
     let materialization_slice = merged_slice.as_ref().unwrap_or(slice);
 
     let proxies = decode_virtual_service_l4_proxies(slice)?;
+    let upstreams = decode_virtual_service_l4_upstreams(slice)?;
     let config = GatewayConfig {
         proxies,
+        upstreams,
         mesh: Some(Box::new(MeshConfig {
             workloads,
             services,
@@ -2289,6 +2292,11 @@ fn gateway_config_from_mesh_slice_with_federation(
 }
 
 fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, anyhow::Error> {
+    let carried_upstream_ids: BTreeSet<&str> = slice
+        .virtual_service_l4_upstreams
+        .iter()
+        .filter_map(|value| value.get("id").and_then(|id| id.as_str()))
+        .collect();
     slice
         .virtual_service_l4_proxies
         .iter()
@@ -2312,7 +2320,47 @@ fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, an
                     "Mesh slice VirtualService L4 proxy {index} has invalid ownership or matcher identity"
                 ));
             }
+            if let Some(upstream_id) = proxy.upstream_id.as_deref()
+                && !carried_upstream_ids.contains(upstream_id)
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice VirtualService L4 proxy {index} references missing upstream {upstream_id}"
+                ));
+            }
             Ok(proxy)
+        })
+        .collect()
+}
+
+fn decode_virtual_service_l4_upstreams(
+    slice: &MeshSlice,
+) -> Result<Vec<crate::config::types::Upstream>, anyhow::Error> {
+    let referenced: BTreeSet<&str> = slice
+        .virtual_service_l4_proxies
+        .iter()
+        .filter_map(|value| value.get("upstream_id").and_then(|id| id.as_str()))
+        .collect();
+    slice
+        .virtual_service_l4_upstreams
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let upstream: crate::config::types::Upstream = serde_json::from_value(value.clone())
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Mesh slice VirtualService L4 upstream {index} is malformed: {error}"
+                    )
+                })?;
+            if upstream.namespace != slice.namespace
+                || !upstream.id.starts_with("istio-vs-l4-upstream-")
+                || !referenced.contains(upstream.id.as_str())
+                || upstream.targets.is_empty()
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice VirtualService L4 upstream {index} has invalid ownership or is unreferenced"
+                ));
+            }
+            Ok(upstream)
         })
         .collect()
 }
@@ -10035,7 +10083,7 @@ fn merge_applicable_telemetry(mesh_slice: &MeshSlice) -> MeshTelemetryConfig {
             let specificity = match &t.scope {
                 PolicyScope::MeshWide => 0,
                 PolicyScope::Namespace { .. } => 1,
-                PolicyScope::WorkloadSelector { .. } => 2,
+                PolicyScope::WorkloadSelector { .. } | PolicyScope::TargetRefs { .. } => 2,
             };
             (
                 specificity,
@@ -23302,12 +23350,14 @@ mod tests {
         let mesh_slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
+            waypoint_gateway_class: None,
             istio_root_namespace: "istio-system".to_string(),
             workload_spiffe_id: None,
             waypoint_name: None,
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             labels_ambiguous: false,
             virtual_service_l4_proxies: Vec::new(),
+            virtual_service_l4_upstreams: Vec::new(),
             version: "test".to_string(),
             revision: None,
             workloads: Vec::new(),

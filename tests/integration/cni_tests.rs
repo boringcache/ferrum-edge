@@ -85,6 +85,29 @@ fn run_ferrum_cni_gc(stdin_config: serde_json::Value) -> std::process::Output {
     child.wait_with_output().expect("wait ferrum-cni")
 }
 
+/// Wait until the async `spawn_cni_listener` task has published a connectable
+/// UDS. `Path::exists` alone is insufficient: the listener binds in a private
+/// staging directory and atomically renames into place, so the pathname can lag
+/// under runner load while ferrum-cni would fail the invocation.
+async fn wait_for_cni_listener_ready(socket_path: &std::path::Path) {
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if tokio::net::UnixStream::connect(socket_path).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+
+    if result.is_err() {
+        panic!(
+            "CNI listener socket {:?} did not become connectable within 5s",
+            socket_path
+        );
+    }
+}
+
 fn run_ferrum_cni_status(stdin_config: serde_json::Value) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
         .env("CNI_COMMAND", "STATUS")
@@ -341,14 +364,9 @@ async fn ferrum_cni_binary_check_rejection_exits_nonzero() {
         shutdown_rx,
     );
 
-    let output = tokio::task::spawn_blocking(move || {
-        for _ in 0..50 {
-            if socket_path.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+    wait_for_cni_listener_ready(&socket_path).await;
 
+    let output = tokio::task::spawn_blocking(move || {
         let stdin_config = serde_json::json!({
             "cniVersion": "0.4.0",
             "name": "ferrum-mesh-chain",
@@ -718,14 +736,9 @@ async fn ferrum_cni_binary_gc_exits_zero_on_ok() {
         shutdown_rx,
     );
 
-    let output = tokio::task::spawn_blocking(move || {
-        for _ in 0..50 {
-            if socket_path.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+    wait_for_cni_listener_ready(&socket_path).await;
 
+    let output = tokio::task::spawn_blocking(move || {
         let stdin_config = serde_json::json!({
             "cniVersion": "1.1.0",
             "name": "ferrum-mesh-chain",
@@ -981,14 +994,9 @@ async fn ferrum_cni_binary_status_not_ready_maps_to_code_50() {
         shutdown_rx,
     );
 
-    let output = tokio::task::spawn_blocking(move || {
-        for _ in 0..50 {
-            if socket_path.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+    wait_for_cni_listener_ready(&socket_path).await;
 
+    let output = tokio::task::spawn_blocking(move || {
         run_ferrum_cni_status(serde_json::json!({
             "cniVersion": "1.1.0",
             "name": "ferrum-mesh-chain",
@@ -1041,14 +1049,9 @@ async fn ferrum_cni_binary_status_exits_zero_on_ok() {
         shutdown_rx,
     );
 
-    let output = tokio::task::spawn_blocking(move || {
-        for _ in 0..50 {
-            if socket_path.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+    wait_for_cni_listener_ready(&socket_path).await;
 
+    let output = tokio::task::spawn_blocking(move || {
         run_ferrum_cni_status(serde_json::json!({
             "cniVersion": "1.1.0",
             "name": "ferrum-mesh-chain",

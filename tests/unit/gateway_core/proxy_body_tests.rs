@@ -5,10 +5,10 @@
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
     DirectH2UploadGateForTest, UploadCancelSignalForTest, direct_h2_upload_gate_for_test,
-    poll_upload_cancel_for_test, request_body_drop_outcome_for_test,
+    poll_upload_cancel_for_test, proxy_body_streaming_for_test, request_body_drop_outcome_for_test,
 };
 use ferrum_edge::proxy::body::{ProxyBody, RequestBodyOutcome, StreamingMetrics};
-use http_body::Body;
+use http_body::{Body, Frame};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -506,4 +506,67 @@ fn test_direct_h2_upload_cancel_signal_lifecycle() {
         poll_upload_cancel_for_test(&mut cancel),
         UploadCancelSignalForTest::Idle
     );
+}
+
+// ── gRPC length-prefixed response message counting ───────────────────────
+
+fn grpc_frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + payload.len());
+    out.push(0); // uncompressed
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+#[tokio::test]
+async fn proxy_body_grpc_message_counter_counts_complete_frames_only() {
+    use futures_util::stream;
+    use http_body_util::BodyExt;
+    use http_body_util::StreamBody;
+    use std::sync::atomic::Ordering;
+
+    // Two complete messages, then an incomplete trailing header byte.
+    let msg1 = grpc_frame(b"");
+    let msg2 = grpc_frame(&[1, 2, 3]);
+    // Error type is ProxyBodyError at the stream Item boundary so StreamBody
+    // remains an http_body::Body (StreamExt::map would yield Stream, not Body).
+    let chunks = vec![
+        // Split the first 5-byte header across two frames.
+        Ok::<_, ferrum_edge::proxy::body::ProxyBodyError>(Frame::data(Bytes::copy_from_slice(
+            &msg1[..3],
+        ))),
+        Ok(Frame::data(Bytes::copy_from_slice(&msg1[3..]))),
+        Ok(Frame::data(Bytes::copy_from_slice(&msg2))),
+        Ok(Frame::data(Bytes::from_static(&[0, 0, 0]))), // incomplete
+    ];
+
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let body = proxy_body_streaming_for_test(Box::pin(StreamBody::new(stream::iter(chunks))))
+        .with_grpc_message_counter(Arc::clone(&counter));
+
+    let _ = body.collect().await.expect("collect body");
+    assert_eq!(
+        counter.load(Ordering::Acquire),
+        2,
+        "only two complete length-prefixed messages must count"
+    );
+}
+
+#[tokio::test]
+async fn proxy_body_grpc_message_counter_ignores_hostile_declared_length() {
+    use futures_util::stream;
+    use http_body_util::{BodyExt, StreamBody};
+    use std::sync::atomic::Ordering;
+
+    // Declares 1 GiB payload but only supplies 1 byte — must not panic or count.
+    let mut hostile = vec![0, 0x40, 0, 0, 0]; // len = 0x40000000
+    hostile.push(0xff);
+    let frames: Vec<Result<Frame<Bytes>, ferrum_edge::proxy::body::ProxyBodyError>> =
+        vec![Ok(Frame::data(Bytes::from(hostile)))];
+    let stream = StreamBody::new(stream::iter(frames));
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let body = proxy_body_streaming_for_test(Box::pin(stream))
+        .with_grpc_message_counter(Arc::clone(&counter));
+    let _ = body.collect().await.expect("collect hostile body");
+    assert_eq!(counter.load(Ordering::Acquire), 0);
 }
