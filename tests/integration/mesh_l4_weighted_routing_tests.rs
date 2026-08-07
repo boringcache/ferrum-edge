@@ -707,17 +707,26 @@ fn virtual_service_tcp_weighted_export_projects_upstream_into_consumer_namespace
     assert_eq!(upstream.targets.len(), 2);
 }
 
+/// Namespace `team-a` + name `db` and namespace `team` + name `a-db` join to
+/// the same `namespace-name` string, so a `-`-delimited generated id derives
+/// ONE upstream id for two unrelated VirtualServices. Both export into
+/// `consumer`, where projected upstreams are keyed by (namespace, id) — a
+/// collision therefore lets one tenant's VirtualService silently REPLACE the
+/// other tenant's L4 destination.
+///
+/// The two resources are otherwise fully independent (distinct hosts, distinct
+/// listen ports), so the generated-id derivation is the only thing under test.
 #[test]
 fn virtual_service_l4_exported_upstream_ids_preserve_source_boundaries() {
-    let weighted_spec = |backend: &str| {
+    let weighted_spec = |host: &str, port: u16, backend: &str| {
         serde_json::json!({
-            "hosts": ["db.example.com"],
+            "hosts": [host],
             "exportTo": ["consumer"],
             "tcp": [{
-                "match": [{"port": 3306, "gateways": ["mesh"]}],
+                "match": [{"port": port, "gateways": ["mesh"]}],
                 "route": [
-                    {"destination": {"host": backend, "port": {"number": 3306}}, "weight": 50},
-                    {"destination": {"host": format!("backup-{backend}"), "port": {"number": 3306}}, "weight": 50}
+                    {"destination": {"host": backend, "port": {"number": port}}, "weight": 50},
+                    {"destination": {"host": format!("backup-{backend}"), "port": {"number": port}}, "weight": 50}
                 ]
             }]
         })
@@ -729,17 +738,20 @@ fn virtual_service_l4_exported_upstream_ids_preserve_source_boundaries() {
                 "db",
                 "team-a",
                 "networking.istio.io/v1beta1",
-                weighted_spec("victim.example.internal"),
+                weighted_spec("victim.example.com", 3306, "victim.example.internal"),
             ),
             object(
                 "VirtualService",
                 "a-db",
                 "team",
                 "networking.istio.io/v1beta1",
-                weighted_spec("attacker.example.internal"),
+                weighted_spec("attacker.example.com", 3307, "attacker.example.internal"),
             ),
         ],
-        options(),
+        // The shared `options()` helper scopes translation to `default`; these
+        // fixtures deliberately live in two other namespaces, and an
+        // out-of-scope object is dropped before it ever reaches translation.
+        options().with_source_namespaces(vec!["team-a".to_string(), "team".to_string()]),
     )
     .expect("colliding hyphenated source names translate safely");
 
@@ -751,22 +763,50 @@ fn virtual_service_l4_exported_upstream_ids_preserve_source_boundaries() {
         .collect();
     assert_eq!(upstreams.len(), 2, "neither projected upstream is replaced");
     assert_ne!(upstreams[0].id, upstreams[1].id);
+    for upstream in &upstreams {
+        assert!(
+            upstream.id.starts_with("istio-vs-l4-upstream-"),
+            "generated id must keep the prefix listed in \
+             K8S_MANAGED_UPSTREAM_ID_PREFIXES so reconcile withdraws it, got {}",
+            upstream.id
+        );
+        ferrum_edge::config::types::validate_resource_id(&upstream.id)
+            .expect("generated upstream id must satisfy resource-id admission");
+    }
 
     let proxies: Vec<_> = result
         .config
         .proxies
         .iter()
-        .filter(|proxy| proxy.namespace == "consumer" && proxy.listen_port == Some(3306))
+        .filter(|proxy| proxy.namespace == "consumer" && proxy.upstream_id.is_some())
         .collect();
     assert_eq!(proxies.len(), 2, "both exported routes remain materialized");
-    for proxy in proxies {
+
+    // Each projected proxy must still reach its OWN source VirtualService's
+    // destinations. Under a shared id both proxies resolve to whichever
+    // upstream was written last — the cross-tenant takeover.
+    for (listen_port, backend) in [
+        (3306u16, "victim.example.internal"),
+        (3307, "attacker.example.internal"),
+    ] {
+        let proxy = proxies
+            .iter()
+            .find(|proxy| proxy.listen_port == Some(listen_port))
+            .expect("projected proxy for the exported listen port");
         let upstream_id = proxy
             .upstream_id
             .as_deref()
             .expect("weighted proxy references an upstream");
-        assert!(
-            upstreams.iter().any(|upstream| upstream.id == upstream_id),
-            "each proxy keeps its own projected upstream"
+        let upstream = upstreams
+            .iter()
+            .find(|upstream| upstream.id == upstream_id)
+            .expect("each proxy keeps its own projected upstream");
+        let hosts: Vec<&str> = upstream.targets.iter().map(|t| t.host.as_str()).collect();
+        let backup = format!("backup-{backend}");
+        assert_eq!(
+            hosts,
+            vec![backend, backup.as_str()],
+            "projected upstream must keep its own source's destinations"
         );
     }
 }
