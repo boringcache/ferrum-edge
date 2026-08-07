@@ -1207,11 +1207,9 @@ fn backend_tls_policy_status_uses_the_last_free_ancestor_slot() {
 
 /// A live status already carrying sixteen third-party ancestors leaves Ferrum
 /// no representable slot. Gateway API forbids adding a seventeenth entry, so
-/// Ferrum writes nothing at all — and, because status and data-plane behaviour
-/// must agree, translation rejects the policy so covered backends fail closed
-/// with the HTTP 500 fault rather than silently originating unreportable TLS.
+/// Ferrum writes nothing, but third-party status must not affect translation.
 #[test]
-fn backend_tls_policy_with_full_third_party_ancestors_fails_closed_and_writes_no_status() {
+fn backend_tls_policy_with_full_third_party_ancestors_applies_and_writes_no_status() {
     let mut policy = backend_tls_policy_system("reviews-tls", "reviews");
     policy.status = serde_json::json!({ "ancestors": third_party_ancestors(16) });
     let objects = vec![
@@ -1223,28 +1221,18 @@ fn backend_tls_policy_with_full_third_party_ancestors_fails_closed_and_writes_no
     ];
 
     let translated = translate_k8s_objects(&objects, options()).expect("translate");
-    assert!(
-        translated
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("unimplementable")),
-        "an unrepresentable policy must be diagnosed: {:?}",
-        translated.warnings
+    assert_eq!(translated.config.upstreams.len(), 1);
+    assert_eq!(
+        translated.config.upstreams[0].backend_tls_sni.as_deref(),
+        Some("backend.example.com")
     );
-    assert!(
-        translated.config.upstreams.is_empty(),
-        "an unrepresentable policy must not keep applying backend TLS"
-    );
-    assert!(
-        fault_body_mentions(&translated),
-        "covered backends must fail closed with a 500 fault, never fall back to plaintext"
-    );
+    assert!(!fault_body_mentions(&translated));
     let status = translated
         .backend_tls_policy_statuses
         .first()
         .expect("policy status projection");
-    assert!(!status.accepted);
-    assert_eq!(status.accepted_reason, "Invalid");
+    assert!(status.accepted);
+    assert_eq!(status.accepted_reason, "Accepted");
 
     assert!(
         policy_status_update(&objects, "reviews-tls").is_none(),
