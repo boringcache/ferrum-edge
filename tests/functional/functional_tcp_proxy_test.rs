@@ -1250,12 +1250,7 @@ async fn start_proxy_v2_expecting_echo_server_on(
     })
 }
 
-fn v2_header_tcp4_bytes(
-    src: [u8; 4],
-    dst: [u8; 4],
-    src_port: u16,
-    dst_port: u16,
-) -> Vec<u8> {
+fn v2_header_tcp4_bytes(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16) -> Vec<u8> {
     let mut h = Vec::new();
     h.extend_from_slice(b"\r\n\r\n\x00\r\nQUIT\n");
     h.push(0x21);

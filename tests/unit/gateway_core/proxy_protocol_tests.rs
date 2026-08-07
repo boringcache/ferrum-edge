@@ -338,7 +338,9 @@ async fn encode_v2_ipv4_round_trips_through_parser() {
     let header = encode_v2_proxy_header(src, dst);
     assert_eq!(header.len(), 28, "AF_INET header is signature+fixed+12");
 
-    let result = parse_bytes(&header).await.expect("encoded header must parse");
+    let result = parse_bytes(&header)
+        .await
+        .expect("encoded header must parse");
     match result {
         ProxyProtocolResult::Forwarded {
             src: parsed_src,
@@ -356,12 +358,20 @@ async fn encode_v2_ipv6_round_trips_through_parser() {
     use ferrum_edge::proxy::proxy_protocol::encode_v2_proxy_header;
     use std::net::Ipv6Addr;
 
-    let src = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 50000);
-    let dst = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)), 443);
+    let src = SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        50000,
+    );
+    let dst = SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+        443,
+    );
     let header = encode_v2_proxy_header(src, dst);
     assert_eq!(header.len(), 52, "AF_INET6 header is signature+fixed+36");
 
-    let result = parse_bytes(&header).await.expect("encoded header must parse");
+    let result = parse_bytes(&header)
+        .await
+        .expect("encoded header must parse");
     match result {
         ProxyProtocolResult::Forwarded {
             src: parsed_src,
@@ -380,7 +390,10 @@ async fn encode_v2_mixed_family_promotes_to_ipv6_mapped() {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 4000);
-    let dst = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 443);
+    let dst = SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        443,
+    );
     let header = encode_v2_proxy_header(src, dst);
     assert_eq!(header.len(), 52);
 
@@ -428,7 +441,11 @@ fn outbound_v2_addrs_fall_back_to_local_listener() {
         outbound_v2_addrs(client, 4321, None, 5432, Some(local)).expect("fallback should work");
     assert_eq!(src.port(), 4321);
     assert_eq!(dst.ip(), local.ip());
-    assert_eq!(dst.port(), 5432, "destination port is listen_port, not local ephemeral");
+    assert_eq!(
+        dst.port(),
+        5432,
+        "destination port is listen_port, not local ephemeral"
+    );
 }
 
 #[test]

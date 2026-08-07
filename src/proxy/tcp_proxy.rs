@@ -5606,7 +5606,8 @@ async fn connect_backend_tls_cached(
     outbound_proxy_v2_header: Option<&[u8]>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, anyhow::Error> {
     let connect_started = Instant::now();
-    let mut tcp_stream = connect_backend_plain(addr, connect_timeout, tcp_fastopen, overload).await?;
+    let mut tcp_stream =
+        connect_backend_plain(addr, connect_timeout, tcp_fastopen, overload).await?;
     apply_backend_tcp_keepalive(proxy_id, &tcp_stream, keepalive);
 
     // PROXY protocol is TCP-borne framing that precedes the TLS handshake
@@ -5693,9 +5694,7 @@ fn resolve_outbound_proxy_v2_header(
                 client_local_addr,
             )
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "outbound PROXY v2 enabled but destination address is unavailable"
-                )
+                anyhow::anyhow!("outbound PROXY v2 enabled but destination address is unavailable")
             })?;
             Ok(Some(crate::proxy::proxy_protocol::encode_v2_proxy_header(
                 src, dst,

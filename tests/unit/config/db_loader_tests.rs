@@ -2340,9 +2340,11 @@ fn every_sql_proxy_write_path_persists_stream_match() {
     assert!(source.contains(
         "stream_proxy_protocol=?, backend_proxy_protocol=?, stream_match=?, updated_at=?"
     ));
-    assert!(source.contains(
-        "stream_proxy_protocol = ?, backend_proxy_protocol = ?, stream_match = ?, \\"
-    ));
+    assert!(
+        source.contains(
+            "stream_proxy_protocol = ?, backend_proxy_protocol = ?, stream_match = ?, \\"
+        )
+    );
 }
 
 #[test]

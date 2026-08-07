@@ -566,9 +566,7 @@ pub fn encode_v2_proxy_header(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
     let src_ip = crate::util::client_identity::canonical_ip(src.ip());
     let dst_ip = crate::util::client_identity::canonical_ip(dst.ip());
     match (src_ip, dst_ip) {
-        (IpAddr::V4(s), IpAddr::V4(d)) => {
-            encode_v2_inet(s, d, src.port(), dst.port())
-        }
+        (IpAddr::V4(s), IpAddr::V4(d)) => encode_v2_inet(s, d, src.port(), dst.port()),
         (s, d) => encode_v2_inet6(ip_to_v6(s), ip_to_v6(d), src.port(), dst.port()),
     }
 }

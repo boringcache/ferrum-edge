@@ -10315,15 +10315,17 @@ fn row_to_proxy_inner(
                 if trimmed.is_empty() {
                     None
                 } else {
-                    Some(crate::config::types::BackendProxyProtocol::parse(trimmed).ok_or_else(
-                        || {
-                            anyhow::anyhow!(
-                                "Proxy {}: invalid backend_proxy_protocol value {:?}",
-                                pid,
-                                trimmed
-                            )
-                        },
-                    )?)
+                    Some(
+                        crate::config::types::BackendProxyProtocol::parse(trimmed).ok_or_else(
+                            || {
+                                anyhow::anyhow!(
+                                    "Proxy {}: invalid backend_proxy_protocol value {:?}",
+                                    pid,
+                                    trimmed
+                                )
+                            },
+                        )?,
+                    )
                 }
             }
             None => None,
