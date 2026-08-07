@@ -821,9 +821,7 @@ async fn test_pool_sharing_siblings_observe_per_request_connect_timeout_at_runti
 /// same ErrorClass contracts as the reqwest path.
 #[test]
 fn test_direct_h2_dispatch_allows_default_nonzero_body_limits() {
-    use ferrum_edge::_test_support::{
-        can_dispatch_direct_http2_pool, can_use_direct_http2_pool,
-    };
+    use ferrum_edge::_test_support::{can_dispatch_direct_http2_pool, can_use_direct_http2_pool};
 
     const DEFAULT_LIMIT: usize = 10_485_760;
 
@@ -832,22 +830,42 @@ fn test_direct_h2_dispatch_allows_default_nonzero_body_limits() {
         "default 10 MiB request/response limits must allow direct-H2 dispatch"
     );
     assert!(can_dispatch_direct_http2_pool(
-        true, false, false, DEFAULT_LIMIT, 0
+        true,
+        false,
+        false,
+        DEFAULT_LIMIT,
+        0
     ));
     assert!(can_dispatch_direct_http2_pool(
-        true, false, false, 0, DEFAULT_LIMIT
+        true,
+        false,
+        false,
+        0,
+        DEFAULT_LIMIT
     ));
     assert!(can_dispatch_direct_http2_pool(true, false, false, 1, 1));
 
     // Body-compat still gates: retry replay / buffering force reqwest.
     assert!(!can_dispatch_direct_http2_pool(
-        true, true, false, DEFAULT_LIMIT, DEFAULT_LIMIT
+        true,
+        true,
+        false,
+        DEFAULT_LIMIT,
+        DEFAULT_LIMIT
     ));
     assert!(!can_dispatch_direct_http2_pool(
-        true, false, true, DEFAULT_LIMIT, DEFAULT_LIMIT
+        true,
+        false,
+        true,
+        DEFAULT_LIMIT,
+        DEFAULT_LIMIT
     ));
     assert!(!can_dispatch_direct_http2_pool(
-        false, false, false, DEFAULT_LIMIT, DEFAULT_LIMIT
+        false,
+        false,
+        false,
+        DEFAULT_LIMIT,
+        DEFAULT_LIMIT
     ));
 
     // Ordinary and SNI share the same gate after in-path enforcement.

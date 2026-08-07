@@ -3279,7 +3279,9 @@ async fn direct_h2_rejects_streaming_oversized_request_under_nonzero_limits() {
     let send = client
         .as_reqwest()
         .post(format!("{}/api/upload", harness.proxy_base_url()))
-        .body(reqwest::Body::wrap_stream(futures_util::stream::iter(chunks)))
+        .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+            chunks,
+        )))
         .send()
         .await;
 
