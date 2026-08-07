@@ -320,14 +320,26 @@ impl PluginTlsPosture {
 /// redirects and ambient proxies disabled and applies the caller's TLS posture.
 /// If that cannot be constructed either, drop custom TLS posture but retain
 /// those two non-negotiable egress controls.
-fn env_flag_default_true(key: &str) -> bool {
-    match std::env::var(key) {
-        Ok(value) => {
+/// Parse a `FERRUM_*` boolean gate that defaults to enabled when unset.
+pub fn parse_ferrum_flag_default_true(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => {
             let normalized = value.trim().to_ascii_lowercase();
             !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
         }
-        Err(_) => true,
+        None => true,
     }
+}
+
+fn env_flag_default_true(key: &str) -> bool {
+    parse_ferrum_flag_default_true(crate::config::conf_file::resolve_ferrum_var(key).as_deref())
+}
+
+/// Parse `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` from an already-resolved value.
+pub fn parse_max_request_body_size_bytes_from_resolved(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(10_485_760)
 }
 
 fn build_dns_cached_fallback_client(
@@ -707,10 +719,10 @@ impl PluginHttpClient {
     pub(crate) fn with_process_compression_admission_policy(self) -> Self {
         let gzip_enabled = env_flag_default_true("FERRUM_COMPRESSION_GZIP_ENABLED");
         let brotli_enabled = env_flag_default_true("FERRUM_COMPRESSION_BROTLI_ENABLED");
-        let max_request_body_size_bytes = std::env::var("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(10_485_760);
+        let max_request_body_size_bytes = parse_max_request_body_size_bytes_from_resolved(
+            crate::config::conf_file::resolve_ferrum_var("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES")
+                .as_deref(),
+        );
         self.with_compression_algorithms(gzip_enabled, brotli_enabled)
             .with_max_request_body_size_bytes(max_request_body_size_bytes)
     }

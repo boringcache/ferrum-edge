@@ -15887,8 +15887,13 @@ pub fn new_ulid() -> String {
 }
 
 fn resolve_node_id() -> String {
-    std::env::var("FERRUM_NODE_ID")
-        .ok()
+    resolve_node_id_with_primary(crate::config::conf_file::resolve_ferrum_var("FERRUM_NODE_ID"))
+}
+
+/// Resolve chargeback node identity from the conf-aware `FERRUM_NODE_ID` value,
+/// then the usual hostname fallbacks.
+pub fn resolve_node_id_with_primary(primary: Option<String>) -> String {
+    primary
         .filter(|value| !value.trim().is_empty())
         .map(|value| bound_string(value.trim(), MAX_FIELD_LEN))
         .or_else(|| {

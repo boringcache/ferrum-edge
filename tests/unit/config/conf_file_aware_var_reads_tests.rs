@@ -1,0 +1,109 @@
+//! Issue #3624: settings documented in ferrum.conf must route through the
+//! conf-file-aware resolver instead of reading `std::env::var` only.
+
+use crate::unit::env_lock::EnvGuard;
+use ferrum_edge::config::conf_file::ConfFile;
+use ferrum_edge::plugins::api_chargeback_sink::resolve_node_id_with_primary;
+use ferrum_edge::plugins::utils::http_client::{
+    parse_ferrum_flag_default_true, parse_max_request_body_size_bytes_from_resolved,
+};
+use ferrum_edge::plugins::utils::metadata_redaction::{
+    parse_extras_from_env, parse_extras_from_resolved,
+};
+
+const ISSUE_3624_CONF: &str = r"
+FERRUM_LOG_REDACT_METADATA_KEYS = conf_only_redact,tenant_marker
+FERRUM_NODE_ID = conf-chargeback-node
+FERRUM_COMPRESSION_GZIP_ENABLED = false
+FERRUM_COMPRESSION_BROTLI_ENABLED = off
+FERRUM_MAX_REQUEST_BODY_SIZE_BYTES = 2048
+";
+
+#[test]
+fn conf_file_values_honored_for_metadata_redaction_extras() {
+    let conf = ConfFile::parse(ISSUE_3624_CONF).unwrap();
+    let extras = parse_extras_from_resolved(
+        conf.get("FERRUM_LOG_REDACT_METADATA_KEYS").map(|s| s.to_string()),
+    );
+    assert_eq!(extras, ["conf_only_redact", "tenant_marker"]);
+}
+
+#[test]
+fn conf_file_values_honored_for_chargeback_node_id() {
+    let conf = ConfFile::parse(ISSUE_3624_CONF).unwrap();
+    let node_id =
+        resolve_node_id_with_primary(conf.get("FERRUM_NODE_ID").map(|s| s.to_string()));
+    assert_eq!(node_id, "conf-chargeback-node");
+}
+
+#[test]
+fn conf_file_values_honored_for_validation_client_compression_gates() {
+    let conf = ConfFile::parse(ISSUE_3624_CONF).unwrap();
+    assert!(!parse_ferrum_flag_default_true(
+        conf.get("FERRUM_COMPRESSION_GZIP_ENABLED"),
+    ));
+    assert!(!parse_ferrum_flag_default_true(
+        conf.get("FERRUM_COMPRESSION_BROTLI_ENABLED"),
+    ));
+    assert_eq!(
+        parse_max_request_body_size_bytes_from_resolved(
+            conf.get("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES"),
+        ),
+        2048,
+    );
+}
+
+#[test]
+fn env_still_overrides_conf_for_metadata_redaction_extras() {
+    let _guard = EnvGuard::new(&["FERRUM_LOG_REDACT_METADATA_KEYS"]);
+    unsafe {
+        std::env::set_var("FERRUM_LOG_REDACT_METADATA_KEYS", "env_wins");
+    }
+    let extras = parse_extras_from_env();
+    assert_eq!(extras, ["env_wins"]);
+}
+
+#[test]
+fn issue_3624_reads_use_conf_aware_resolver_not_std_env_var() {
+    let metadata = include_str!("../../../src/plugins/utils/metadata_redaction.rs");
+    assert!(
+        metadata.contains("resolve_ferrum_var(\"FERRUM_LOG_REDACT_METADATA_KEYS\")"),
+        "metadata redaction must resolve through ferrum.conf"
+    );
+    assert!(
+        !metadata.contains("std::env::var(\"FERRUM_LOG_REDACT_METADATA_KEYS\")"),
+        "metadata redaction must not bypass ferrum.conf"
+    );
+
+    let chargeback = include_str!("../../../src/plugins/api_chargeback_sink.rs");
+    assert!(
+        chargeback.contains("resolve_ferrum_var(\"FERRUM_NODE_ID\")"),
+        "chargeback node id must resolve through ferrum.conf"
+    );
+    assert!(
+        !chargeback.contains("std::env::var(\"FERRUM_NODE_ID\")"),
+        "chargeback node id must not bypass ferrum.conf"
+    );
+
+    let http_client = include_str!("../../../src/plugins/utils/http_client.rs");
+    assert!(
+        http_client.contains("resolve_ferrum_var(key)"),
+        "compression gates must resolve through ferrum.conf"
+    );
+    assert!(
+        http_client.contains("resolve_ferrum_var(\"FERRUM_MAX_REQUEST_BODY_SIZE_BYTES\")"),
+        "validation client body ceiling must resolve through ferrum.conf"
+    );
+    assert!(
+        !http_client.contains("std::env::var(\"FERRUM_COMPRESSION_GZIP_ENABLED\")"),
+        "gzip gate must not bypass ferrum.conf"
+    );
+    assert!(
+        !http_client.contains("std::env::var(\"FERRUM_COMPRESSION_BROTLI_ENABLED\")"),
+        "brotli gate must not bypass ferrum.conf"
+    );
+    assert!(
+        !http_client.contains("std::env::var(\"FERRUM_MAX_REQUEST_BODY_SIZE_BYTES\")"),
+        "body ceiling must not bypass ferrum.conf"
+    );
+}
