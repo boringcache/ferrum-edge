@@ -1113,13 +1113,21 @@ fn log_mesh_overlay_transition(
 }
 
 const K8S_MANAGED_PROXY_ID_PREFIXES: &[&str] = &["gwapi-route-", "gwapi-l4-", "istio-vs-"];
-// `gwapi-l4-upstream-` is the weighted backend set generated for a multi-leg
-// UDPRoute rule. It must be pruned with the rest of the K8s-managed upstreams,
-// or a deleted/shrunk route would leave a stale upstream in live config.
+/// Every generated-upstream id prefix the translator can emit. A prefix missing
+/// here is never withdrawn from the active snapshot, so each compose appends
+/// another copy of the same upstream — unbounded growth plus a spurious
+/// "config changed" republication on every reconcile.
+///
+/// The two L4 prefixes are NOT covered by their HTTP counterparts and must both
+/// be listed: `gwapi-l4-upstream-` is the weighted backend set generated for a
+/// multi-leg UDPRoute/TCPRoute/TLSRoute rule, and `istio-vs-l4-upstream-` is the
+/// one generated for VirtualService `tcp[]`/`tls[]` weighted splits. Without
+/// them a deleted or shrunk route leaves a stale upstream in live config.
 const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &[
     "gwapi-route-upstream-",
     "gwapi-l4-upstream-",
     "istio-vs-upstream-",
+    "istio-vs-l4-upstream-",
 ];
 const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] = &[
     "istio-vs-cors-",

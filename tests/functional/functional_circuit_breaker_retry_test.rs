@@ -17,6 +17,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Database-mode admin writes are observed by the proxy through the poller.
+/// Ten seconds proved too tight when the hosted application shard ran 578
+/// tests concurrently; keep the wait bounded but allow scheduler contention.
+const PROXY_ROUTE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ============================================================================
 // Controllable backend (specific to these tests — the shared echo helpers
 // return fixed responses; circuit-breaker/retry coverage needs a backend
@@ -83,6 +88,7 @@ async fn spawn_gateway() -> TestGateway {
         .mode_database_sqlite()
         .log_level("debug")
         .db_poll_interval_seconds(2)
+        .capture_output()
         .spawn()
         .await
         .expect("start gateway")
@@ -90,9 +96,11 @@ async fn spawn_gateway() -> TestGateway {
 
 async fn wait_for_proxy_route(
     client: &reqwest::Client,
-    url: String,
+    gateway: &mut TestGateway,
+    path: &str,
     timeout: Duration,
 ) -> reqwest::Response {
+    let url = gateway.proxy_url(path);
     let deadline = Instant::now() + timeout;
     let mut last_status = None;
     loop {
@@ -106,11 +114,20 @@ async fn wait_for_proxy_route(
             }
         }
 
-        assert!(
-            Instant::now() < deadline,
-            "proxy route {url} did not load before timeout; last status: {:?}",
-            last_status
-        );
+        if !gateway.is_running() {
+            panic!(
+                "gateway exited while waiting for proxy route {url}; last status: \
+                 {last_status:?}\n--- captured gateway output ---\n{}",
+                gateway.diagnostic_captured_output()
+            );
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "proxy route {url} did not load within {timeout:?}; last status: \
+                 {last_status:?}\n--- captured gateway output ---\n{}",
+                gateway.diagnostic_captured_output()
+            );
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -127,7 +144,7 @@ async fn test_circuit_breaker_opens_and_recovers() {
     let (backend_port, _backend) =
         start_controllable_backend(fail_flag.clone(), request_count.clone()).await;
 
-    let gateway = spawn_gateway().await;
+    let mut gateway = spawn_gateway().await;
     let client = reqwest::Client::new();
     let auth = gateway.auth_header();
 
@@ -159,8 +176,9 @@ async fn test_circuit_breaker_opens_and_recovers() {
     // Phase 1: Verify normal operation
     let resp = wait_for_proxy_route(
         &client,
-        gateway.proxy_url("/cb/test"),
-        Duration::from_secs(10),
+        &mut gateway,
+        "/cb/test",
+        PROXY_ROUTE_PROPAGATION_TIMEOUT,
     )
     .await;
     assert_eq!(
@@ -227,7 +245,7 @@ async fn stalled_buffered_upload_releases_half_open_probe_neutrally() {
     let (backend_port, _backend) =
         start_controllable_backend(fail_flag.clone(), request_count).await;
 
-    let gateway = spawn_gateway().await;
+    let mut gateway = spawn_gateway().await;
     let client = reqwest::Client::new();
     let auth = gateway.auth_header();
     let proxy_id = "proxy-cb-stalled-buffer";
@@ -264,8 +282,9 @@ async fn stalled_buffered_upload_releases_half_open_probe_neutrally() {
 
     let ready = wait_for_proxy_route(
         &client,
-        gateway.proxy_url("/cb-stalled-buffer/test"),
-        Duration::from_secs(10),
+        &mut gateway,
+        "/cb-stalled-buffer/test",
+        PROXY_ROUTE_PROPAGATION_TIMEOUT,
     )
     .await;
     assert_eq!(ready.status().as_u16(), 200);
@@ -356,7 +375,7 @@ async fn test_retry_on_backend_failure() {
     let (backend_port, _backend) =
         start_controllable_backend(fail_flag.clone(), request_count.clone()).await;
 
-    let gateway = spawn_gateway().await;
+    let mut gateway = spawn_gateway().await;
     let client = reqwest::Client::new();
     let auth = gateway.auth_header();
 
@@ -388,8 +407,9 @@ async fn test_retry_on_backend_failure() {
 
     let _ = wait_for_proxy_route(
         &client,
-        gateway.proxy_url("/retry/test"),
-        Duration::from_secs(10),
+        &mut gateway,
+        "/retry/test",
+        PROXY_ROUTE_PROPAGATION_TIMEOUT,
     )
     .await;
 
@@ -423,7 +443,7 @@ async fn test_retry_succeeds_on_second_attempt() {
     let (backend_port, _backend) =
         start_controllable_backend(fail_flag.clone(), request_count.clone()).await;
 
-    let gateway = spawn_gateway().await;
+    let mut gateway = spawn_gateway().await;
     let client = reqwest::Client::new();
     let auth = gateway.auth_header();
 
@@ -454,8 +474,9 @@ async fn test_retry_succeeds_on_second_attempt() {
 
     let _ = wait_for_proxy_route(
         &client,
-        gateway.proxy_url("/retry-recover/test"),
-        Duration::from_secs(10),
+        &mut gateway,
+        "/retry-recover/test",
+        PROXY_ROUTE_PROPAGATION_TIMEOUT,
     )
     .await;
 
@@ -503,7 +524,7 @@ async fn test_retry_on_connect_failure() {
         port
     };
 
-    let gateway = spawn_gateway().await;
+    let mut gateway = spawn_gateway().await;
     let client = reqwest::Client::new();
     let auth = gateway.auth_header();
 
@@ -534,8 +555,9 @@ async fn test_retry_on_connect_failure() {
 
     let _ = wait_for_proxy_route(
         &client,
-        gateway.proxy_url("/retry-connect/test"),
-        Duration::from_secs(10),
+        &mut gateway,
+        "/retry-connect/test",
+        PROXY_ROUTE_PROPAGATION_TIMEOUT,
     )
     .await;
 

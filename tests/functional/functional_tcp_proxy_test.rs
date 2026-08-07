@@ -1209,3 +1209,83 @@ plugin_configs: []
     // Cleanup
     shutdown_gateway(&mut gateway);
 }
+
+/// Live datapath: weighted_round_robin TCP upstream distributes connections
+/// across tagged backends (issue #3251 L4 weighted stream selection).
+#[ignore]
+#[tokio::test]
+async fn test_tcp_proxy_weighted_upstream_distribution() {
+    let heavy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let heavy_port = heavy_listener.local_addr().unwrap().port();
+    let heavy = start_tagged_tcp_echo_server_on(heavy_listener, b"H:").await;
+
+    let light_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let light_port = light_listener.local_addr().unwrap().port();
+    let light = start_tagged_tcp_echo_server_on(light_listener, b"L:").await;
+
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
+        |proxy_port| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "tcp-wrr"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {heavy_port}
+    upstream_id: "tcp-wrr-upstream"
+
+upstreams:
+  - id: "tcp-wrr-upstream"
+    algorithm: weighted_round_robin
+    targets:
+      - host: "127.0.0.1"
+        port: {heavy_port}
+        weight: 5
+      - host: "127.0.0.1"
+        port: {light_port}
+        weight: 1
+
+consumers: []
+plugin_configs: []
+"#
+            )
+        },
+        None,
+        None,
+    )
+    .await;
+
+    let mut heavy_hits = 0u32;
+    let mut light_hits = 0u32;
+    for i in 0..60 {
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
+            .await
+            .unwrap_or_else(|error| panic!("connect {i} failed: {error}"));
+        let payload = format!("req-{i}");
+        stream
+            .write_all(payload.as_bytes())
+            .await
+            .expect("send payload");
+        let mut buf = vec![0u8; 2 + payload.len()];
+        stream.read_exact(&mut buf).await.expect("read tagged echo");
+        if buf.starts_with(b"H:") {
+            heavy_hits += 1;
+        } else if buf.starts_with(b"L:") {
+            light_hits += 1;
+        } else {
+            panic!("unexpected tag for request {i}: {buf:?}");
+        }
+    }
+
+    assert_eq!(heavy_hits + light_hits, 60);
+    assert!(
+        heavy_hits > light_hits * 3,
+        "heavy ({heavy_hits}) should get at least 3x light ({light_hits})"
+    );
+
+    shutdown_gateway(&mut gateway);
+    heavy.abort();
+    light.abort();
+}

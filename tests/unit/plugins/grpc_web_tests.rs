@@ -1300,6 +1300,130 @@ async fn request_without_trailer_frame_stages_nothing() {
     }
 }
 
+// ── gRPC message accounting across the translation boundary (issue #3256) ──
+//
+// `GRPC_REQUEST_MESSAGES` / `GRPC_RESPONSE_MESSAGES` count complete native
+// length-prefixed frames exchanged with the BACKEND. These tests pin the two
+// representations a proxy ladder must choose between, so a regression that
+// scans the client-visible gRPC-Web body is caught here rather than only in the
+// live functional suite.
+
+#[tokio::test]
+async fn translated_request_messages_count_the_native_body_not_the_client_wire() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::count_grpc_length_prefixed_messages;
+
+    let mut messages = request_frame(0x00, b"one");
+    messages.extend_from_slice(&request_frame(0x00, b"two"));
+    let trailer = request_frame(0x80, b"x-app-id: 42\r\n");
+    let mut binary_wire = messages.clone();
+    binary_wire.extend_from_slice(&trailer);
+    let text_wire = grpc_web_text_body(&binary_wire);
+    let segmented_text_wire = segmented_grpc_web_text_body(&messages, &trailer);
+
+    assert_eq!(
+        count_grpc_length_prefixed_messages(&messages),
+        2,
+        "the native backend-visible body carries exactly two messages"
+    );
+    // Binary mode: the terminal gRPC-Web trailer frame is length-prefixed too,
+    // so the client wire body over-counts by one.
+    assert_eq!(
+        count_grpc_length_prefixed_messages(&binary_wire),
+        3,
+        "binary client wire body counts the terminal trailer frame as a message"
+    );
+    // Text mode: base64 armour is not gRPC framing at all. The first frame
+    // header decodes to an absurd declared length, so the scan yields nothing.
+    assert_eq!(
+        count_grpc_length_prefixed_messages(&text_wire),
+        0,
+        "whole-body text client wire must not scan as native gRPC framing"
+    );
+    assert_eq!(
+        count_grpc_length_prefixed_messages(&segmented_text_wire),
+        0,
+        "segmented text client wire must not scan as native gRPC framing"
+    );
+
+    for (label, content_type, wire) in [
+        ("binary", "application/grpc-web+proto", binary_wire),
+        ("text", "application/grpc-web-text+proto", text_wire),
+        (
+            "segmented text",
+            "application/grpc-web-text+proto",
+            segmented_text_wire,
+        ),
+    ] {
+        let (transformed, _staged, outcome) =
+            run_grpc_web_request_pipeline(content_type, &wire).await;
+        assert!(
+            matches!(outcome, PluginResult::Continue),
+            "{label}: valid gRPC-Web request must be accepted, got {outcome:?}"
+        );
+        assert_eq!(
+            transformed, messages,
+            "{label}: the backend-visible body is the decoded, trailer-stripped one"
+        );
+        assert_eq!(
+            count_grpc_length_prefixed_messages(&transformed),
+            2,
+            "{label}: request message accounting must run on the transformed body"
+        );
+    }
+}
+
+#[tokio::test]
+async fn translated_response_messages_count_the_backend_body_not_the_client_wire() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::count_grpc_length_prefixed_messages;
+
+    let plugin = create_plugin_default();
+    let mut backend_body = request_frame(0x00, b"a");
+    backend_body.extend_from_slice(&request_frame(0x00, b"b"));
+    assert_eq!(count_grpc_length_prefixed_messages(&backend_body), 2);
+
+    for (label, content_type, expected_client_wire_count) in [
+        // Binary: the appended terminal trailer frame inflates the count.
+        ("binary", "application/grpc-web", 3),
+        // Text: base64 armour scans as nothing at all.
+        ("text", "application/grpc-web-text", 0),
+    ] {
+        let mut response_headers = HashMap::new();
+        response_headers.insert("content-type".to_string(), content_type.to_string());
+        response_headers.insert("grpc-status".to_string(), "0".to_string());
+        let translated = plugin
+            .transform_response_body(&backend_body, Some(content_type), &response_headers)
+            .await
+            .unwrap_or_else(|| panic!("{label}: gRPC-Web response translation must apply"));
+        assert_eq!(
+            count_grpc_length_prefixed_messages(&translated),
+            expected_client_wire_count,
+            "{label}: client wire body must not be the accounting source"
+        );
+    }
+}
+
+#[test]
+fn buffered_request_message_accounting_is_idempotent_across_replays() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let mut messages = request_frame(0x00, b"one");
+    messages.extend_from_slice(&request_frame(0x00, b"two"));
+
+    let counter = AtomicU64::new(0);
+    // A retry replays the same prepared buffer through the dispatch ladder; a
+    // prepared body is also recorded by both the preparation and the dispatch
+    // site. `fetch_max` keeps every one of those idempotent.
+    for _ in 0..4 {
+        record_complete_grpc_message_count(&counter, &messages);
+    }
+    assert_eq!(counter.load(Ordering::Acquire), 2);
+
+    // A truncated replay (client disconnect mid-upload) must not lower it.
+    record_complete_grpc_message_count(&counter, &messages[..6]);
+    assert_eq!(counter.load(Ordering::Acquire), 2);
+}
+
 #[tokio::test]
 async fn invalid_request_trailer_frame_rejects_before_dispatch() {
     let message = request_frame(0x00, b"ok");

@@ -992,6 +992,16 @@ pub(crate) fn record_backend_outcome_no_conn_end(
 ///   against the backend would let a gateway-local memory bound eject healthy
 ///   targets — including every target at once, since the budget is
 ///   process-global and shared by all of them.
+/// * `BackendConnectionLimit` — the gateway refused to open one more physical
+///   connection because the destination is at its DestinationRule
+///   `connectionPool.tcp.maxConnections` ceiling. Nothing was dialed and the
+///   ceiling is the operator's own gateway-side policy, so counting it against
+///   the destination would let a saturated cap eject a perfectly healthy
+///   backend (and, with several targets saturated, every target at once). The
+///   raw-TCP over-cap path records `cb.record_neutral()` for exactly this
+///   reason; this keeps the HTTP-family pooled transports identical. Unlike the
+///   classes above it is still pre-wire, so `retry_on_connect_failure` may
+///   rotate to another target with its own admission lane.
 #[inline]
 pub(crate) fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
     matches!(
@@ -1001,6 +1011,7 @@ pub(crate) fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> 
                 | ErrorClass::RequestBodyTooLarge
                 | ErrorClass::DispatchPolicyRejected
                 | ErrorClass::GatewayBufferCapacity
+                | ErrorClass::BackendConnectionLimit
         )
     )
 }
