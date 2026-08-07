@@ -41,6 +41,7 @@ Current mesh HBONE/DNS perf status lives in
 | Residual | Issue(s) | Notes |
 |---|---|---|
 | EgressGateway UDP `ServiceEntry` materialization | [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) | HTTP/TCP stream egress exists; UDP ports still skipped |
+| Enrolled Ambient destination pod UDP round trip | [#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621) | Source-capture live gate exists; destination pod-netns relay not yet live-gated |
 | Native-gRPC transcript capture | [#3304](https://github.com/ferrum-edge/ferrum-edge/issues/3304) | HTTP-only today |
 | Pre-first-byte stream-router fallback | [#3328](https://github.com/ferrum-edge/ferrum-edge/issues/3328) | Implement or explicitly reject |
 | Native SMTP/email notification channel | [#3329](https://github.com/ferrum-edge/ferrum-edge/issues/3329) | |
