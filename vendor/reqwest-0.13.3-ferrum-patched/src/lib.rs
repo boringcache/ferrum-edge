@@ -363,6 +363,8 @@ if_hyper! {
         Body, Client, ClientBuilder, Request, RequestBuilder, Response, Upgraded,
     };
     pub use self::proxy::{Proxy,NoProxy};
+    // Ferrum patch 003: physical-connection admission hook.
+    pub use self::connect::{ConnectionAdmission, ConnectionAdmissionToken};
     #[cfg(feature = "__tls")]
     // Re-exports, to be removed in a future release
     pub use tls::{Certificate, Identity};

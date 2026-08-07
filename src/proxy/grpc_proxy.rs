@@ -34,14 +34,17 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
+use crate::backend_conn_limit::{
+    PooledConnectionAdmission, SharedBackendConnectionGuard, SharedBackendConnectionLimiter,
+};
 use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
@@ -599,6 +602,12 @@ struct GrpcPoolManager {
     tls_configs: BackendTlsConfigCache,
     backend_svid_generation: BackendSvidGeneration,
     workload_svid_cert_path: Option<String>,
+    /// Shared gateway-wide DestinationRule `connectionPool.tcp.maxConnections`
+    /// counter, installed once by `ProxyState` via
+    /// [`GrpcConnectionPool::attach_backend_conn_limit`]. Unset for focused
+    /// tests and standalone callers, in which case no cap is enforced. Read
+    /// only on the cold connection-establishment path.
+    backend_conn_limit: OnceLock<SharedBackendConnectionLimiter>,
 }
 
 impl Default for GrpcConnectionPool {
@@ -670,12 +679,21 @@ impl GrpcConnectionPool {
             tls_configs: BackendTlsConfigCache::with_shards(shards),
             backend_svid_generation,
             workload_svid_cert_path,
+            backend_conn_limit: OnceLock::new(),
         });
 
         Self {
             pool: GenericPool::new(manager, global_pool_config, cleanup_interval, shards),
             rr_counters: Arc::new(DashMap::with_shard_amount(shards)),
         }
+    }
+
+    /// Install the gateway-wide `connectionPool.tcp.maxConnections` counter so
+    /// this pool's physical H2 connections are admitted against the same
+    /// per-destination ceiling as WebSocket, raw TCP, and the other pooled
+    /// transports. Idempotent; later calls are ignored.
+    pub fn attach_backend_conn_limit(&self, limiter: SharedBackendConnectionLimiter) {
+        let _ = self.pool.manager().backend_conn_limit.set(limiter);
     }
 
     /// Number of connections in the pool (for metrics).
@@ -1010,6 +1028,36 @@ impl GrpcPoolManager {
             .as_ref()
             .and_then(|m| m.get(&port))
             .and_then(|o| o.tcp_keepalive.as_ref());
+        // DestinationRule `connectionPool.tcp.maxConnections`. Reserved BEFORE
+        // any dial and handed to the spawned connection driver below, so the
+        // slot lives exactly as long as this physical H2 connection: it is
+        // released on idle eviction, pool drain/clear, SVID drain,
+        // reload/update/delete, shutdown, or peer GOAWAY, and NOT when the
+        // request that happened to create the connection finishes. Reuse takes
+        // no slot, so unlimited multiplexed gRPC streams ride one admitted
+        // connection.
+        let conn_admission = PooledConnectionAdmission::resolve(
+            self.backend_conn_limit.get().map(|limiter| &**limiter),
+            proxy,
+            host,
+            port,
+        );
+        let conn_slot = match conn_admission {
+            Some(admission) => match admission.acquire() {
+                Ok(slot) => Some(slot),
+                Err(limit) => {
+                    return Err(GrpcProxyError::backend_unavailable(
+                        GrpcBackendUnavailableKind::MaxConnections,
+                        format!(
+                            "gRPC pool: {limit} for backend {}:{}",
+                            admission.host(),
+                            admission.policy_port()
+                        ),
+                    ));
+                }
+            },
+            None => None,
+        };
         let use_tls = matches!(proxy.backend_scheme, Some(BackendScheme::Https));
 
         // The candidate attempt includes TCP socket setup, negotiated ALPN h2
@@ -1033,6 +1081,9 @@ impl GrpcPoolManager {
                 let connector = connector.clone();
                 let server_name = server_name.clone();
                 let pool_config = &pool_config;
+                // One reservation, cloned per candidate: a failed attempt drops
+                // its clone, so only an established connection keeps the slot.
+                let conn_slot = conn_slot.clone();
                 async move {
                     let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                         .await
@@ -1051,7 +1102,7 @@ impl GrpcPoolManager {
                         pool_config.enable_http_keep_alive,
                         pool_config.tcp_keepalive_seconds,
                     );
-                    self.create_tls_connection(tcp, connector, server_name, pool_config)
+                    self.create_tls_connection(tcp, connector, server_name, pool_config, conn_slot)
                         .await
                 }
             })
@@ -1059,6 +1110,7 @@ impl GrpcPoolManager {
         } else {
             crate::dns::connect_candidates(&candidates, port, connect_timeout, |sock_addr| {
                 let pool_config = &pool_config;
+                let conn_slot = conn_slot.clone();
                 async move {
                     let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                         .await
@@ -1077,7 +1129,8 @@ impl GrpcPoolManager {
                         pool_config.enable_http_keep_alive,
                         pool_config.tcp_keepalive_seconds,
                     );
-                    self.create_h2c_connection(tcp, pool_config).await
+                    self.create_h2c_connection(tcp, pool_config, conn_slot)
+                        .await
                 }
             })
             .await
@@ -1166,6 +1219,7 @@ impl GrpcPoolManager {
         &self,
         tcp: TcpStream,
         pool_config: &PoolConfig,
+        conn_slot: Option<SharedBackendConnectionGuard>,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let settings_received = Arc::new(AtomicBool::new(false));
         let io = TokioIo::new(H2cSettingsIo::new(tcp, Arc::clone(&settings_received)));
@@ -1188,6 +1242,9 @@ impl GrpcPoolManager {
         }
 
         tokio::spawn(async move {
+            // The `maxConnections` slot lives exactly as long as the connection
+            // driver, i.e. as long as the socket is open.
+            let _conn_slot = conn_slot;
             if let Err(e) = conn.await {
                 debug!("gRPC h2c connection closed: {}", e);
             }
@@ -1267,6 +1324,7 @@ impl GrpcPoolManager {
         connector: tokio_rustls::TlsConnector,
         server_name: rustls::pki_types::ServerName<'static>,
         pool_config: &PoolConfig,
+        conn_slot: Option<SharedBackendConnectionGuard>,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
@@ -1296,6 +1354,9 @@ impl GrpcPoolManager {
 
         // TLS negotiation already proved H2 via ALPN.
         tokio::spawn(async move {
+            // The `maxConnections` slot lives exactly as long as the connection
+            // driver, i.e. as long as the socket is open.
+            let _conn_slot = conn_slot;
             if let Err(e) = conn.await {
                 debug!("gRPC h2 TLS connection closed: {}", e);
             }
@@ -1482,6 +1543,17 @@ pub enum GrpcBackendUnavailableKind {
     /// keep [`Self::BackendRequest`] even on `is_canceled` because the
     /// upload may already be unreplayable.
     DispatchCanceled,
+    /// The destination is already at its DestinationRule
+    /// `connectionPool.tcp.maxConnections` ceiling, so no NEW physical H2
+    /// connection may be opened. Nothing was dialed — pre-wire, and mapped to
+    /// [`crate::retry::ErrorClass::BackendConnectionLimit`] so
+    /// `retry_on_connect_failure` can rotate to another LB target with its own
+    /// admission lane while the refusal stays neutral to the destination's
+    /// circuit breaker, passive health, and adaptive concurrency — the full
+    /// raw-TCP over-cap posture. `get_sender()` first falls back to an
+    /// already-established shard, so a capped destination keeps serving by
+    /// multiplexing rather than failing.
+    MaxConnections,
 }
 
 impl GrpcBackendUnavailableKind {
@@ -1502,7 +1574,11 @@ impl GrpcBackendUnavailableKind {
             | Self::H2Handshake
             | Self::H2cHandshake
             | Self::InvalidServerName
-            | Self::DispatchCanceled => true,
+            | Self::DispatchCanceled
+            // Over-cap refusal happens before any dial, so it is pre-wire and
+            // `retry_on_connect_failure` may rotate to another LB target (with
+            // its own admission lane) — the same posture the raw-TCP path takes.
+            | Self::MaxConnections => true,
             Self::BackendRequest => false,
         }
     }
@@ -1642,6 +1718,13 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
                 message,
             },
             SharedPoolCreateKind::Internal => Self::Internal(message),
+            // Coalesced waiters must see the SAME typed over-cap refusal the
+            // creator produced, so `get_sender`'s already-established-shard
+            // fallback and the pre-wire `BackendConnectionLimit` classification
+            // apply to them identically.
+            SharedPoolCreateKind::MaxConnections => {
+                Self::backend_unavailable(GrpcBackendUnavailableKind::MaxConnections, message)
+            }
             // NegotiatedHttp1 is an H2-pool signal; gRPC create never emits it.
             // Fall through to unavailable reconstruction so waiters still fail.
             SharedPoolCreateKind::NegotiatedHttp1
@@ -1679,6 +1762,7 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
                     | ErrorClass::GatewayBufferCapacity
                     | ErrorClass::RequestBodyTooLarge
                     | ErrorClass::GracefulRemoteClose
+                    | ErrorClass::BackendConnectionLimit
                     | ErrorClass::RequestError => GrpcBackendUnavailableKind::Connect,
                 };
                 // Retain the shared classification payload as the typed source so
@@ -1708,6 +1792,20 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
             Self::Internal(message) => SharedPoolCreateError::new(
                 message.clone(),
                 SharedPoolCreateKind::Internal,
+                error_class,
+                None,
+            ),
+            // Preserve the over-cap refusal as a STRUCTURAL kind so coalesced
+            // waiters rebuild the same typed variant. Its ErrorClass alone
+            // (`ConnectionPoolError`) is shared with unrelated pool faults and
+            // would collapse to `Unavailable` in the class-driven arm below.
+            Self::BackendUnavailable {
+                kind: GrpcBackendUnavailableKind::MaxConnections,
+                message,
+                ..
+            } => SharedPoolCreateError::new(
+                message.clone(),
+                SharedPoolCreateKind::MaxConnections,
                 error_class,
                 None,
             ),
