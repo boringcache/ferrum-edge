@@ -779,6 +779,7 @@ jobs:
             # protocol, TLS, pool, CP-DP gRPC, DB, and shutdown coverage.
             filters: |
               integration::mesh_l7_routing_tests
+              integration::mesh_l4_weighted_routing_tests
               integration::mesh_topology_hbone_tests
               integration::mesh_authz_e2e_tests
               integration::mesh_authz_negative_match_tests
@@ -1117,6 +1118,7 @@ jobs:
           - shard: protocols
             filters: |
               functional_cors_protocol_test
+              functional_grpc_message_metrics_test
               functional_grpc_test
               functional_h3_soap_utf16_test
               functional_key_auth_query_test
