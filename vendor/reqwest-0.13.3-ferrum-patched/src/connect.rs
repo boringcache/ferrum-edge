@@ -129,6 +129,135 @@ impl Service<Uri> for Connector {
     }
 }
 
+/// Ferrum patch 003 — physical-connection admission.
+///
+/// Consulted by the connector **immediately before a new physical connection
+/// is dialed**, and only then: a checkout that reuses an already-open pooled
+/// connection never reaches the connector, and HTTP/2 streams multiplexed onto
+/// an existing connection never reach it either. The returned
+/// [`ConnectionAdmissionToken`] is moved into the connection object handed to
+/// hyper, so it is dropped exactly when that physical connection is dropped —
+/// covering handshake failure, normal close, idle eviction, pool drain,
+/// cancellation, and shutdown.
+///
+/// Returning `Err` refuses the dial; the error is surfaced to the caller as the
+/// connect error for that request, with its source chain preserved.
+pub trait ConnectionAdmission: Send + Sync + 'static {
+    /// Admit one new physical connection to `dst`, or refuse it.
+    fn admit(&self, dst: &Uri) -> Result<ConnectionAdmissionToken, BoxError>;
+}
+
+/// Opaque handle whose `Drop` marks the end of one physical connection's
+/// lifetime. See [`ConnectionAdmission`].
+pub struct ConnectionAdmissionToken(Option<Box<dyn std::any::Any + Send + Sync>>);
+
+impl ConnectionAdmissionToken {
+    /// Wrap an arbitrary RAII value (typically a permit/guard) as a token.
+    pub fn new<T: std::any::Any + Send + Sync>(guard: T) -> Self {
+        Self(Some(Box::new(guard)))
+    }
+
+    /// A token that holds nothing — the admission hook decided this
+    /// destination is not governed by a limit.
+    pub fn unlimited() -> Self {
+        Self(None)
+    }
+}
+
+impl std::fmt::Debug for ConnectionAdmissionToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionAdmissionToken")
+            .field("held", &self.0.is_some())
+            .finish()
+    }
+}
+
+/// Ferrum patch 003: binds an admission token to a physical connection's
+/// lifetime by owning it alongside the connection's IO. Every trait method
+/// delegates; the token is only ever dropped.
+struct AdmittedConn {
+    inner: BoxConn,
+    _token: ConnectionAdmissionToken,
+}
+
+impl Connection for AdmittedConn {
+    fn connected(&self) -> Connected {
+        self.inner.connected()
+    }
+}
+
+impl Read for AdmittedConn {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        Read::poll_read(Pin::new(&mut self.inner), cx, buf)
+    }
+}
+
+impl Write for AdmittedConn {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        Write::poll_write(Pin::new(&mut self.inner), cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        Write::poll_write_vectored(Pin::new(&mut self.inner), cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Write::poll_flush(Pin::new(&mut self.inner), cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Write::poll_shutdown(Pin::new(&mut self.inner), cx)
+    }
+}
+
+#[cfg(feature = "__tls")]
+impl TlsInfoFactory for AdmittedConn {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        self.inner.tls_info()
+    }
+}
+
+/// Ferrum patch 003: await one connect attempt and, on success, bind the
+/// admission token to the resulting physical connection. On failure the token
+/// drops here, releasing the reservation for a handshake that never produced a
+/// socket.
+async fn with_admission<F>(f: F, token: Option<ConnectionAdmissionToken>) -> Result<Conn, BoxError>
+where
+    F: Future<Output = Result<Conn, BoxError>>,
+{
+    let conn = f.await?;
+    Ok(match token {
+        None => conn,
+        Some(token) => Conn {
+            inner: Box::new(AdmittedConn {
+                inner: conn.inner,
+                _token: token,
+            }),
+            is_proxy: conn.is_proxy,
+            tls_info: conn.tls_info,
+        },
+    })
+}
+
 pub(crate) type BoxedConnectorService = BoxCloneSyncService<Unnameable, Conn, BoxError>;
 
 pub(crate) type BoxedConnectorLayer =
@@ -154,13 +283,20 @@ pub(crate) struct ConnectorBuilder {
 }
 
 impl ConnectorBuilder {
-    pub(crate) fn build(self, layers: Vec<BoxedConnectorLayer>) -> Connector
+    pub(crate) fn build(
+        self,
+        layers: Vec<BoxedConnectorLayer>,
+        // Ferrum patch 003: consulted immediately before every NEW physical
+        // connection dial; see `ConnectionAdmission`.
+        connection_admission: Option<Arc<dyn ConnectionAdmission>>,
+    ) -> Connector
 where {
         // construct the inner tower service
         let mut base_service = ConnectorService {
             inner: self.inner,
             proxies: self.proxies,
             verbose: self.verbose,
+            connection_admission,
             #[cfg(feature = "__tls")]
             nodelay: self.nodelay,
             #[cfg(feature = "__tls")]
@@ -533,6 +669,9 @@ pub(crate) struct ConnectorService {
     inner: Inner,
     proxies: Arc<Vec<ProxyMatcher>>,
     verbose: verbose::Wrapper,
+    /// Ferrum patch 003: physical-connection admission hook. `None` (the
+    /// upstream default) makes every dial unconditional.
+    connection_admission: Option<Arc<dyn ConnectionAdmission>>,
     connect_timeout: Option<Duration>,
     /// When there is a single timeout layer and no other layers,
     /// we embed it directly inside our base Service::call().
@@ -982,27 +1121,39 @@ impl Service<Uri> for ConnectorService {
         log::debug!("starting new connection '{:?}'", dst.host());
         let timeout = effective_connect_timeout(self.simple_timeout);
 
+        // Ferrum patch 003: this method is reached only for a NEW physical
+        // connection — pooled reuse and HTTP/2 stream multiplexing never call
+        // the connector — so admission belongs exactly here, before any dial.
+        // The token is bound to the connection below and released when it dies.
+        let admission = match self.connection_admission.as_ref() {
+            None => None,
+            Some(hook) => match hook.admit(&dst) {
+                Ok(token) => Some(token),
+                Err(err) => return Box::pin(std::future::ready(Err::<Conn, BoxError>(err))),
+            },
+        };
+
         // Local transports (UDS, Windows Named Pipes) skip proxies
         #[cfg(any(unix, target_os = "windows"))]
         if self.should_use_local_transport() {
-            return Box::pin(with_timeout(
-                self.clone().connect_local_transport(dst),
-                timeout,
+            return Box::pin(with_admission(
+                with_timeout(self.clone().connect_local_transport(dst), timeout),
+                admission,
             ));
         }
 
         for prox in self.proxies.iter() {
             if let Some(intercepted) = prox.intercept(&dst) {
-                return Box::pin(with_timeout(
-                    self.clone().connect_via_proxy(dst, intercepted),
-                    timeout,
+                return Box::pin(with_admission(
+                    with_timeout(self.clone().connect_via_proxy(dst, intercepted), timeout),
+                    admission,
                 ));
             }
         }
 
-        Box::pin(with_timeout(
-            self.clone().connect_with_maybe_proxy(dst, false),
-            timeout,
+        Box::pin(with_admission(
+            with_timeout(self.clone().connect_with_maybe_proxy(dst, false), timeout),
+            admission,
         ))
     }
 }

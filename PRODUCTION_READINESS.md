@@ -86,25 +86,40 @@ issue body alone.
 
 ## Current residual map (live dedicated trackers)
 
+**Last reconciled:** 2026-08-06 (issue #3627; verified against `origin/main`).
+
 | Residual | Live issue(s) | Notes |
 |----------|---------------|-------|
-| Subset-scoped Istio HTTP connection-pool policy | #3228 / #3240–#3242 | `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests` inside subsets |
 | EgressGateway UDP `ServiceEntry` materialization | #3263 | Explicit mesh product deferral |
-| `ai_stream_router` `google_gemini` adapter | #3299 | Implemented — request translation + SSE/JSON stream normalization |
-| Native-gRPC transcript capture | #3304 | HTTP-only today |
-| Pre-first-byte stream-router fallback | #3328 | Resolved by explicit rejection: the `fallback` block now fails admission. Implementing it needs a per-attempt request-preparation boundary in proxy dispatch, not a plugin change |
-| Native SMTP/email notification channel | #3329 | |
-| MongoDB replica-set change-stream wakeups | #3330 | Polling remains authoritative backstop |
-| Multicluster poller partition / last-good live gate | #3331 | File-config fixture does not exercise pollers |
 | Provenance-complete mesh/HBONE/DNS perf baselines | #3332 | Harnesses exist; baseline tables still `_TBD_` |
 | Live OIDC / OAuth2 introspection coverage | #3333 | |
 | NodeWaypoint observability + promotion gates | #3334 | |
 | Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Repository-owned lifecycle inventory; closes #3335 |
 | SPIFFE Workload API JWT-SVID mint/validate | #3617 | X.509 complete; JWT RPCs return `UNIMPLEMENTED` fail-closed until mint/validate ships |
 | Admin CRUD refactor (retired plan remainder) | #2110 (historical) | Discretionary; fold into future admin-surface work |
+| Mesh/SPIRE CA-health signal + startup contract | #3608 | Documented SPIRE contract vs runtime wiring |
+| CNI ferrum-cni chaining uninstall/rollback | #3609 | Node-agent becomes node-wide pod-creation dependency |
+| Cross-region CP failover topology | #3610 | `multi_region_ha.md` vs CP rejection/failover fence |
+| CP/K8s authoritative mesh config revision | #3611 | DP stale-fallback gate inert in flagship K8s topology |
+| Gateway API port-aware route representation | #3612 | Per-listener routes collide at validation |
+| OIDC RP pending login state (HA) | #3613 | Process-local state breaks non-sticky multi-replica login |
+| `ai_stream_router` Anthropic multimodal content | #3616 | Silent drop vs Gemini fail-closed path |
+| TCP outbound PROXY protocol v2 | #3618 | Inbound only today |
+| TCP/kTLS kernel splice (frontend-TLS relay) | #3619 | Unbuffered rustls handshake leaves splice inert |
+| HTTP/3 plain-HTTP/WebSocket to mesh-tagged targets | #3620 | H3 retry rotation must skip fail-closed targets |
+| Ambient UDP enrolled-destination round trip | #3621 | Restore live tracker after #2013/#2038 closure |
+| Direct-H2 in-path body-size limits | #3622 | Default nonzero limits still force reqwest path |
+| Admin read-only write audit logging | #3623 | Docs promise logging/counts that do not exist |
+| Env-only reads ignoring `ferrum.conf` | #3624 | `FERRUM_LOG_REDACT_METADATA_KEYS`, `FERRUM_NODE_ID`, validation-client gates |
+| Gateway SVID auto-refresh (external/inline) | #3625 | Static until restart or manual rotate |
 
 **Implemented since the epic (do not re-open from stale checklists):** remote-discovery
 JWT audience binding (#2475); Ambient UDP capture producer + live source-capture e2e
 (#2013 / #2038); VirtualService `tls[]` SNI passthrough L4 routing (see
 `docs/mesh_supported_matrix.md` + `tests/integration/mesh_l7_routing_tests.rs`);
-AI semantic-firewall token windows (#3302).
+AI semantic-firewall token windows (#3302); subset-scoped Istio HTTP connection-pool
+policy (#3547, closing #3228 / #3240–#3242); `ai_stream_router` `google_gemini`
+adapter (#3299); pre-first-byte stream-router fallback (#3328 — explicit admission
+rejection); native-gRPC transcript capture (#3304); native SMTP/email notification
+channel (#3329); MongoDB replica-set change-stream wakeups (#3330); multicluster
+poller partition / last-good live gate (#3331).

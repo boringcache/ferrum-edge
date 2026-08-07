@@ -2103,6 +2103,10 @@ pub struct RequestContext {
     /// admission uses it to reject a retired service-discovery target view
     /// after a structural target-set publication.
     pub lb_generation: u64,
+    /// Configuration generation pinned with this request's route and policy
+    /// snapshot. Transport admission uses it to prevent a late request from a
+    /// retired configuration from re-publishing stale connection limits.
+    pub(crate) config_generation: u64,
     /// Per-proxy lifecycle ownership generation captured at routing/admission
     /// from the published plugin-cache generation. Carried into transaction
     /// summaries so `proxy_alerts` can reject samples from a prior
@@ -3120,6 +3124,7 @@ impl RequestContext {
             frontend_listen_port: None,
             frontend_sni_hostname: None,
             lb_generation: 1,
+            config_generation: 1,
             proxy_lifecycle_generation: None,
             raw_headers: None,
             headers: HashMap::new(),
@@ -4161,6 +4166,7 @@ impl RequestContext {
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
             lb_generation: self.lb_generation,
+            config_generation: self.config_generation,
             proxy_lifecycle_generation: self.proxy_lifecycle_generation,
             // Carried, not dropped: the final-request-body stage is where
             // `ai_semantic_cache` derives its replay partition, and that
