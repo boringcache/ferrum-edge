@@ -706,3 +706,67 @@ fn virtual_service_tcp_weighted_export_projects_upstream_into_consumer_namespace
         .expect("projected upstream must share the consumer namespace for LB lookup");
     assert_eq!(upstream.targets.len(), 2);
 }
+
+#[test]
+fn virtual_service_l4_exported_upstream_ids_preserve_source_boundaries() {
+    let weighted_spec = |backend: &str| {
+        serde_json::json!({
+            "hosts": ["db.example.com"],
+            "exportTo": ["consumer"],
+            "tcp": [{
+                "match": [{"port": 3306, "gateways": ["mesh"]}],
+                "route": [
+                    {"destination": {"host": backend, "port": {"number": 3306}}, "weight": 50},
+                    {"destination": {"host": format!("backup-{backend}"), "port": {"number": 3306}}, "weight": 50}
+                ]
+            }]
+        })
+    };
+    let result = translate_k8s_objects(
+        &[
+            object(
+                "VirtualService",
+                "db",
+                "team-a",
+                "networking.istio.io/v1beta1",
+                weighted_spec("victim.example.internal"),
+            ),
+            object(
+                "VirtualService",
+                "a-db",
+                "team",
+                "networking.istio.io/v1beta1",
+                weighted_spec("attacker.example.internal"),
+            ),
+        ],
+        options(),
+    )
+    .expect("colliding hyphenated source names translate safely");
+
+    let upstreams: Vec<_> = result
+        .config
+        .upstreams
+        .iter()
+        .filter(|upstream| upstream.namespace == "consumer")
+        .collect();
+    assert_eq!(upstreams.len(), 2, "neither projected upstream is replaced");
+    assert_ne!(upstreams[0].id, upstreams[1].id);
+
+    let proxies: Vec<_> = result
+        .config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.namespace == "consumer" && proxy.listen_port == Some(3306))
+        .collect();
+    assert_eq!(proxies.len(), 2, "both exported routes remain materialized");
+    for proxy in proxies {
+        let upstream_id = proxy
+            .upstream_id
+            .as_deref()
+            .expect("weighted proxy references an upstream");
+        assert!(
+            upstreams.iter().any(|upstream| upstream.id == upstream_id),
+            "each proxy keeps its own projected upstream"
+        );
+    }
+}

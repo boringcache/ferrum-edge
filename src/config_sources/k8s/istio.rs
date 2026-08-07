@@ -3090,11 +3090,11 @@ fn l4_route_backend_binding(
             Ok((backend.host, backend.port, None, None))
         }
         _ => {
-            let upstream_id = resource_id(
-                "istio-vs-l4-upstream",
+            let upstream_id = virtual_service_l4_upstream_id(
+                kind,
                 &object.metadata.namespace,
                 &object.metadata.name,
-                &format!("{kind}-{block_index}"),
+                block_index,
             );
             let Some(first) = backends.first() else {
                 return Err(invalid_resource(
@@ -3117,6 +3117,19 @@ fn l4_route_backend_binding(
             ))
         }
     }
+}
+
+fn virtual_service_l4_upstream_id(
+    route_kind: &str,
+    namespace: &str,
+    vs_name: &str,
+    block_index: usize,
+) -> String {
+    // Kubernetes namespaces and object names cannot contain underscores, so
+    // these boundaries remain unambiguous after exportTo projects upstreams
+    // from different source namespaces into the same consumer namespace.
+    format!("istio-vs-l4-upstream-{route_kind}__{namespace}__{vs_name}__{block_index}")
+        .replace(['/', '.'], "-")
 }
 
 fn virtual_service_l4_proxy_id(
