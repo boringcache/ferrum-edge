@@ -144,6 +144,8 @@ REQUIRED_LIVE_ASSERTIONS=(
   sidecar.request_auth.missing_jwt_rejected
   sidecar.request_auth.invalid_jwt_rejected
   sidecar.destination_rule.tcp_connect_timeout
+  sidecar.destination_rule.export_to_namespace_visibility
+  sidecar.destination_rule.lookup_tier_client_wins
   sidecar.destination_rule.tcp_max_connections
   sidecar.virtual_service.cors_policy
   sidecar.config.native_subscribe_delivered
@@ -243,6 +245,39 @@ record_live_assertion() {
     "" \
     "" \
     "$diagnostics"
+}
+
+# Run the deterministic, process-level DestinationRule security probes that
+# require three distinct namespaces. They spawn the shipped ferrum-edge binary,
+# drive the real mTLS egress datapath, and distinguish an applied rule from an
+# ignored rule by observing consistent-hash versus round-robin backend choice.
+probe_destination_rule_namespace_security() {
+  local diagnostics="$RESULTS_DIR/destination-rule-namespace-security.txt"
+  log "probing DestinationRule namespace visibility and lookup precedence"
+  if (
+    cd "$ROOT_DIR"
+    cargo test --test functional_tests functional_mesh_dr_ -- --ignored --nocapture
+  ) >"$diagnostics" 2>&1; then
+    record_live_assertion sidecar.destination_rule.export_to_namespace_visibility pass \
+      "namespace/ferrum" "service/beta/dr-live-external" \
+      "namespace-local rule ignored and exported root control applied on the live datapath" \
+      "$(basename "$diagnostics")"
+    record_live_assertion sidecar.destination_rule.lookup_tier_client_wins pass \
+      "namespace/ferrum" "service/beta/dr-live-external" \
+      "client-namespace rule won over visible service and root rules on the live datapath" \
+      "$(basename "$diagnostics")"
+  else
+    record_live_assertion sidecar.destination_rule.export_to_namespace_visibility fail \
+      "namespace/ferrum" "service/beta/dr-live-external" \
+      "DestinationRule namespace security functional probes failed" \
+      "$(basename "$diagnostics")"
+    record_live_assertion sidecar.destination_rule.lookup_tier_client_wins fail \
+      "namespace/ferrum" "service/beta/dr-live-external" \
+      "DestinationRule namespace security functional probes failed" \
+      "$(basename "$diagnostics")"
+    cat "$diagnostics" >&2
+    return 1
+  fi
 }
 
 # ── JWT material (RS256 + inline JWKS) ──────────────────────────────────────
@@ -1390,6 +1425,8 @@ main() {
   trap collect_diagnostics EXIT
   preflight
   init_live_assertions
+
+  probe_destination_rule_namespace_security
 
   create_cluster
   build_and_load_image

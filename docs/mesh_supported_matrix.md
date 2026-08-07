@@ -33,11 +33,9 @@ assertion): PeerAuthentication STRICT, AuthorizationPolicy ALLOW/DENY,
 RequestAuthentication JWT, DestinationRule `connectTimeout`/`maxConnections`,
 and VirtualService CORS, each backed by a `sidecar.*` live assertion the
 `mesh-e2e-sidecar` suite must emit and pass. DestinationRule `exportTo`
-visibility and lookup-namespace resolution are also GA-enrolled and
-semantically blocking, with focused Rust conformance/integration coverage;
-their declared live IDs remain `live_deferred` because Trusted Cross policy
-forbids PR-authored changes to the sidecar suite's executable/configuration
-surfaces. VS CORS's prior deferral closed with issue #1973 — the mesh slice now carries
+visibility and lookup-namespace resolution are also GA-enrolled and live
+blocking: the sidecar fixture runs focused, three-namespace shipped-binary
+datapath probes and requires both emitted assertion IDs to pass. VS CORS's prior deferral closed with issue #1973 — the mesh slice now carries
 `virtual_service_cors_policies` and the client sidecar synthesizes the `cors`
 plugin onto its materialized outbound routes. **SPIFFE identity plumbing
 (SPIRE Agent CA) is now enrolled too** (`mesh.identity.spire_svid_issuance`):

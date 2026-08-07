@@ -57,6 +57,8 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 | `sidecar.request_auth.valid_jwt_admitted` | RS256 JWT validated against the RequestAuthentication **inline JWKS** → 200 |
 | `sidecar.request_auth.missing_jwt_rejected` | token-less request on the gated path → 403 (RequestAuth is permissive; the authz `request_principals` ALLOW does not match) |
 | `sidecar.request_auth.invalid_jwt_rejected` | wrong-key signature → 401 `Invalid or unrecognized JWT` (`jwks_auth`) |
+| `sidecar.destination_rule.export_to_namespace_visibility` | three-namespace shipped-binary datapath: a service-namespace rule exported only to `.` leaves round-robin active, while an exported root-namespace control applies consistent hashing |
+| `sidecar.destination_rule.lookup_tier_client_wins` | three visible rules at client, service, and root tiers; the client-tier round-robin rule wins over sticky lower-priority rules |
 | `sidecar.destination_rule.tcp_connect_timeout` | two-phase timing: the black-holed mesh-mTLS dial fails at ~8s under `connect_timeout_ms: 8000`, then ~2s after a re-render + rollout restart to `2000` — the observed time must **track** the configured value (both windows exclude the built-in 5000ms default) |
 | `sidecar.virtual_service.cors_policy` | VS-derived CORS on the client sidecar: allowed `Origin` → backend 200 with the origin reflected, allowed `OPTIONS` preflight → **200 by the sidecar** with `access-control-allow-methods`, and unmatched actual/preflight requests → backend 200 with the app marker and no gateway-added `access-control-allow-origin` (Istio omitted/FORWARD semantics) |
 | `sidecar.destination_rule.tcp_max_connections` | WebSocket flow (`wssvc`, maxConnections=1): one **held** WS session admitted (101), a concurrent second upgrade rejected **503** by the client sidecar's `BackendConnectionGuard` before dialing, and a fresh upgrade admitted after the held session closes — cap enforcement **and** release |
@@ -64,7 +66,7 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 
 Every assertion backs a GA-contract capability row in
 `tests/conformance/ga_contract.yaml` — STRICT mTLS, AuthorizationPolicy
-allow/deny, RequestAuthentication JWT, DR connectTimeout, DR maxConnections,
+allow/deny, RequestAuthentication JWT, DR namespace visibility/lookup precedence, DR connectTimeout, DR maxConnections,
 VirtualService CORS, SPIFFE identity plumbing
 (`mesh.identity.spire_svid_issuance`, backed by
 `sidecar.spire.workload_entries` plus the SVID-carried
