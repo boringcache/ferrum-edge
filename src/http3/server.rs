@@ -40,6 +40,7 @@ use crate::plugins::{
     RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, ResponseStreamAction,
     TransactionSummary, normalize_response_body_for_inspection,
 };
+use crate::proxy::backend_dispatch::client_side_no_backend_signal;
 use crate::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
 use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
@@ -1791,6 +1792,7 @@ async fn handle_h3_request(
 
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
+    ctx.config_generation = epoch.config_generation;
 
     // Route: host + longest prefix match via router cache
     let route_match = state.router_cache.find_proxy_in_snapshot(
@@ -5253,6 +5255,9 @@ async fn handle_h3_request(
                     &proxy,
                     &target.host,
                     target.port,
+                    // DestinationRule policy port for `maxConnections` admission;
+                    // differs from the dial port only under a `targetPort` remap.
+                    target.dispatch_policy_port(),
                     &method,
                     &backend_url,
                     &h3_headers,
@@ -6999,11 +7004,22 @@ async fn handle_h3_request(
                         current_cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(
-                        result.status,
-                        h3_connection_error(result.request_on_wire, result.error_class),
-                        cb_retry_probe_slot_available,
-                    );
+                    // A retryable outcome carrying NO backend-health signal —
+                    // today only a DestinationRule `maxConnections` refusal,
+                    // which is pre-wire (so the loop may rotate) but is the
+                    // gateway's own ceiling — must settle the breaker NEUTRALLY
+                    // rather than opening it on a healthy destination. Mirrors
+                    // `apply_circuit_breaker_outcome` and the raw-TCP over-cap
+                    // path.
+                    if client_side_no_backend_signal(result.error_class) {
+                        cb.record_neutral(cb_retry_probe_slot_available);
+                    } else {
+                        cb.record_failure(
+                            result.status,
+                            h3_connection_error(result.request_on_wire, result.error_class),
+                            cb_retry_probe_slot_available,
+                        );
+                    }
                     cb_retry_probe_slot_available = false;
                 }
 
@@ -8661,6 +8677,9 @@ async fn proxy_to_backend_h3_refined_response(
                 proxy,
                 &target.host,
                 target.port,
+                // DestinationRule policy port for `maxConnections` admission;
+                // differs from the dial port only under a `targetPort` remap.
+                target.dispatch_policy_port(),
                 method,
                 backend_url,
                 &h3_headers,
@@ -9618,6 +9637,9 @@ async fn dispatch_grpc_native_h3(
                     proxy,
                     &target.host,
                     target.port,
+                    // DestinationRule policy port for `maxConnections` admission;
+                    // differs from the dial port only under a `targetPort` remap.
+                    target.dispatch_policy_port(),
                     method,
                     backend_url,
                     &h3_headers,
@@ -11045,6 +11067,9 @@ async fn proxy_to_backend_h3_streaming(
                 proxy,
                 &target.host,
                 target.port,
+                // DestinationRule policy port for `maxConnections` admission;
+                // differs from the dial port only under a `targetPort` remap.
+                target.dispatch_policy_port(),
                 method,
                 backend_url,
                 &h3_headers,
@@ -11643,6 +11668,9 @@ async fn proxy_to_backend_h3(
                 proxy,
                 &target.host,
                 target.port,
+                // DestinationRule policy port for `maxConnections` admission;
+                // differs from the dial port only under a `targetPort` remap.
+                target.dispatch_policy_port(),
                 method,
                 backend_url,
                 &h3_headers,
