@@ -580,6 +580,8 @@ fn make_summary(proxy_id: &str) -> TransactionSummary {
         body_completed: true,
         bytes_sent: 32,
         bytes_received: 64,
+        grpc_request_messages: 0,
+        grpc_response_messages: 0,
         mirror: false,
         metadata: HashMap::new(),
         ai_usage_export: None,
@@ -631,6 +633,82 @@ fn representative_exposition() -> String {
         .metadata
         .insert("grpc_status".to_string(), "0".to_string());
     registry.record(&grpc_summary);
+
+    let mut mesh_http = make_summary("mesh-http");
+    mesh_http.metadata.extend([
+        ("mesh.source.workload".into(), "frontend".into()),
+        ("mesh.source.namespace".into(), "default".into()),
+        (
+            "mesh.source.principal".into(),
+            "spiffe://cluster.local/ns/default/sa/frontend".into(),
+        ),
+        ("mesh.source.app".into(), "frontend".into()),
+        ("mesh.source.service".into(), "frontend".into()),
+        ("mesh.destination.workload".into(), "orders".into()),
+        ("mesh.destination.namespace".into(), "default".into()),
+        (
+            "mesh.destination.principal".into(),
+            "spiffe://cluster.local/ns/default/sa/orders".into(),
+        ),
+        ("mesh.destination.app".into(), "orders".into()),
+        ("mesh.destination.service".into(), "orders".into()),
+        ("mesh.request_protocol".into(), "http".into()),
+        ("mesh.response_flags".into(), "-".into()),
+        (
+            "mesh.connection_security_policy".into(),
+            "mutual_tls".into(),
+        ),
+    ]);
+    mesh_http.bytes_sent = 128;
+    mesh_http.bytes_received = 256;
+    registry.record(&mesh_http);
+
+    let mut mesh_grpc = mesh_http.clone();
+    mesh_grpc.proxy_id = Some("mesh-grpc".into());
+    mesh_grpc
+        .metadata
+        .insert("mesh.request_protocol".into(), "grpc".into());
+    mesh_grpc.grpc_request_messages = 2;
+    mesh_grpc.grpc_response_messages = 3;
+    registry.record(&mesh_grpc);
+
+    let mut tcp_meta = HashMap::new();
+    tcp_meta.extend([
+        (
+            ferrum_edge::plugins::mesh::prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA
+                .into(),
+            "1".into(),
+        ),
+        ("mesh.source.workload".into(), "frontend".into()),
+        ("mesh.source.namespace".into(), "default".into()),
+        (
+            "mesh.source.principal".into(),
+            "spiffe://cluster.local/ns/default/sa/frontend".into(),
+        ),
+        ("mesh.source.app".into(), "frontend".into()),
+        ("mesh.source.service".into(), "frontend".into()),
+        ("mesh.destination.workload".into(), "db".into()),
+        ("mesh.destination.namespace".into(), "default".into()),
+        (
+            "mesh.destination.principal".into(),
+            "spiffe://cluster.local/ns/default/sa/db".into(),
+        ),
+        ("mesh.destination.app".into(), "db".into()),
+        ("mesh.destination.service".into(), "db".into()),
+        ("mesh.request_protocol".into(), "tcp".into()),
+        ("mesh.response_flags".into(), "-".into()),
+        (
+            "mesh.connection_security_policy".into(),
+            "mutual_tls".into(),
+        ),
+    ]);
+    registry.finalize_mesh_tcp_opened(&mut tcp_meta, "mesh-tcp", Some("db"));
+    let mut tcp_summary = make_stream_summary("mesh-tcp", "tcp");
+    tcp_summary.metadata = tcp_meta;
+    tcp_summary.bytes_sent = 1024;
+    tcp_summary.bytes_received = 2048;
+    registry.record_stream(&tcp_summary);
+
     registry.record_rate_limit_exceeded();
     registry.record_request_mirror_dispatched();
     registry.record_mesh_tcp_egress_connection("hbone", true);

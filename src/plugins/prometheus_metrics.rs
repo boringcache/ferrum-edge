@@ -490,6 +490,18 @@ impl HistogramBuckets {
         )
     }
 
+    /// Istio-aligned byte histogram buckets for REQUEST_SIZE / RESPONSE_SIZE.
+    fn new_bytes(epoch: Instant) -> Self {
+        Self::new_with_boundaries(
+            vec![
+                1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
+                8192.0, 16384.0, 32768.0, 65536.0, 131072.0, 262144.0, 524288.0, 1048576.0,
+                2097152.0, 4194304.0, 8388608.0,
+            ],
+            epoch,
+        )
+    }
+
     fn new_with_boundaries(boundaries: Vec<f64>, epoch: Instant) -> Self {
         let counts = boundaries
             .iter()
@@ -572,6 +584,22 @@ pub struct MetricsRegistry {
     pub mesh_request_counter: DashMap<MeshRequestKey, TimestampedCounter>,
     /// Mesh request duration histogram by the same bounded RED label set.
     pub mesh_request_duration_buckets: DashMap<MeshRequestKey, HistogramBuckets>,
+    /// Mesh HTTP request body size histogram (REQUEST_SIZE).
+    pub mesh_request_bytes_buckets: DashMap<MeshRequestKey, HistogramBuckets>,
+    /// Mesh HTTP response body size histogram (RESPONSE_SIZE).
+    pub mesh_response_bytes_buckets: DashMap<MeshRequestKey, HistogramBuckets>,
+    /// Mesh TCP connections opened (TCP_OPENED_CONNECTIONS).
+    pub mesh_tcp_opened_counter: DashMap<MeshRequestKey, TimestampedCounter>,
+    /// Mesh TCP connections closed (TCP_CLOSED_CONNECTIONS).
+    pub mesh_tcp_closed_counter: DashMap<MeshRequestKey, TimestampedCounter>,
+    /// Mesh TCP response bytes sent (Istio TCP_SENT_BYTES semantics).
+    pub mesh_tcp_sent_bytes_counter: DashMap<MeshRequestKey, TimestampedCounter>,
+    /// Mesh TCP request bytes received (Istio TCP_RECEIVED_BYTES semantics).
+    pub mesh_tcp_received_bytes_counter: DashMap<MeshRequestKey, TimestampedCounter>,
+    /// Mesh gRPC request messages (GRPC_REQUEST_MESSAGES).
+    pub mesh_grpc_request_messages_counter: DashMap<MeshRequestKey, TimestampedCounter>,
+    /// Mesh gRPC response messages (GRPC_RESPONSE_MESSAGES).
+    pub mesh_grpc_response_messages_counter: DashMap<MeshRequestKey, TimestampedCounter>,
     /// Rate limit exceeded counter
     pub rate_limit_exceeded: AtomicU64,
     /// `request_mirror` detached tasks admitted past concurrency + byte budgets.
@@ -728,6 +756,14 @@ impl MetricsRegistry {
             ai_estimated_cost_counter: DashMap::new(),
             mesh_request_counter: DashMap::new(),
             mesh_request_duration_buckets: DashMap::new(),
+            mesh_request_bytes_buckets: DashMap::new(),
+            mesh_response_bytes_buckets: DashMap::new(),
+            mesh_tcp_opened_counter: DashMap::new(),
+            mesh_tcp_closed_counter: DashMap::new(),
+            mesh_tcp_sent_bytes_counter: DashMap::new(),
+            mesh_tcp_received_bytes_counter: DashMap::new(),
+            mesh_grpc_request_messages_counter: DashMap::new(),
+            mesh_grpc_response_messages_counter: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
             request_mirror_dispatched: AtomicU64::new(0),
             request_mirror_completed: AtomicU64::new(0),
@@ -836,7 +872,141 @@ impl MetricsRegistry {
             .or_insert_with(|| TimestampedCounter::new(self.epoch))
             .increment(self.epoch);
 
+        self.record_mesh_tcp_closed_and_bytes(summary);
+
         self.maybe_invalidate_cache();
+    }
+
+    /// Finalize mesh `TCP_OPENED_CONNECTIONS` exactly once for a stream under
+    /// the metadata that path will also use for closed/byte series.
+    ///
+    /// The caller is the stream path after the last `on_stream_connect` hook
+    /// that actually ran (or, for captured mesh egress TCP, after selected
+    /// target metadata is stamped) — never an individual plugin hook. Ferrum
+    /// allows several effective `workload_metrics` instances per proxy and each
+    /// one runs the hook, so emitting from the hook counted one connection once
+    /// per instance under intermediate tag/disable metadata. Stamping first and
+    /// returning early on an already-stamped map keeps the counter at one
+    /// increment per connection even if a path calls this twice.
+    ///
+    /// This is a connection lifecycle finalizer, not an authorization-success
+    /// counter: rejection and client-disconnect-during-admission paths that
+    /// reached workload-metrics observation finalize here too so opened/closed
+    /// stay balanced. The stamp gates `record_mesh_tcp_closed_and_bytes`.
+    pub fn finalize_mesh_tcp_opened(
+        &self,
+        metadata: &mut std::collections::HashMap<String, String>,
+        proxy_id: &str,
+        proxy_name: Option<&str>,
+    ) {
+        if !prometheus_helpers::metadata_is_mesh_tcp_stream(metadata) {
+            return;
+        }
+        let marker = prometheus_helpers::MESH_TCP_OPENED_FINALIZED_METADATA.to_string();
+        if metadata.insert(marker, "1".to_string()).is_some() {
+            return;
+        }
+        self.record_mesh_tcp_opened(metadata, proxy_id, proxy_name);
+    }
+
+    /// Record TCP_OPENED_CONNECTIONS under the finalized mesh metadata of a
+    /// stream. Reached only through `finalize_mesh_tcp_opened`.
+    fn record_mesh_tcp_opened(
+        &self,
+        metadata: &std::collections::HashMap<String, String>,
+        proxy_id: &str,
+        proxy_name: Option<&str>,
+    ) {
+        let Some(base) =
+            prometheus_helpers::mesh_stream_key_from_metadata(metadata, proxy_id, proxy_name)
+        else {
+            return;
+        };
+        if !prometheus_helpers::is_mesh_tcp_protocol(base.request_protocol.as_ref()) {
+            return;
+        }
+        if prometheus_helpers::mesh_metric_disabled_metadata(
+            metadata,
+            prometheus_helpers::MeshMetricFamily::TcpOpenedConnections,
+        ) {
+            return;
+        }
+        let key = prometheus_helpers::mesh_request_key_for_family_from_metadata(
+            metadata,
+            &base,
+            prometheus_helpers::MeshMetricFamily::TcpOpenedConnections,
+        );
+        self.mesh_tcp_opened_counter
+            .entry(key)
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+        self.maybe_invalidate_cache();
+    }
+
+    fn record_mesh_tcp_closed_and_bytes(&self, summary: &StreamTransactionSummary) {
+        // The closed/byte families are the disconnect half of a FINALIZED
+        // connection lifecycle. Finalize before emitting the disconnect summary
+        // so opened and closed share the same effective metadata labels.
+        if !prometheus_helpers::mesh_tcp_opened_finalized(&summary.metadata) {
+            return;
+        }
+        let Some(base) = prometheus_helpers::mesh_stream_key_from_metadata(
+            &summary.metadata,
+            summary.proxy_id.as_str(),
+            summary.proxy_name.as_deref(),
+        ) else {
+            return;
+        };
+        if !prometheus_helpers::is_mesh_tcp_protocol(base.request_protocol.as_ref()) {
+            return;
+        }
+        if !prometheus_helpers::mesh_metric_disabled_metadata(
+            &summary.metadata,
+            prometheus_helpers::MeshMetricFamily::TcpClosedConnections,
+        ) {
+            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata(
+                &summary.metadata,
+                &base,
+                prometheus_helpers::MeshMetricFamily::TcpClosedConnections,
+            );
+            self.mesh_tcp_closed_counter
+                .entry(key)
+                .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                .increment(self.epoch);
+        }
+        if !prometheus_helpers::mesh_metric_disabled_metadata(
+            &summary.metadata,
+            prometheus_helpers::MeshMetricFamily::TcpSentBytes,
+        ) {
+            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata(
+                &summary.metadata,
+                &base,
+                prometheus_helpers::MeshMetricFamily::TcpSentBytes,
+            );
+            self.mesh_tcp_sent_bytes_counter
+                .entry(key)
+                .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                // Istio Telemetry defines TCP_SENT_BYTES as response bytes.
+                // StreamTransactionSummary uses Ferrum's gateway-perspective
+                // names, where bytes_received is backend->client.
+                .add(summary.bytes_received, self.epoch);
+        }
+        if !prometheus_helpers::mesh_metric_disabled_metadata(
+            &summary.metadata,
+            prometheus_helpers::MeshMetricFamily::TcpReceivedBytes,
+        ) {
+            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata(
+                &summary.metadata,
+                &base,
+                prometheus_helpers::MeshMetricFamily::TcpReceivedBytes,
+            );
+            self.mesh_tcp_received_bytes_counter
+                .entry(key)
+                .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                // Istio Telemetry defines TCP_RECEIVED_BYTES as request bytes.
+                // StreamTransactionSummary.bytes_sent is client->backend.
+                .add(summary.bytes_sent, self.epoch);
+        }
     }
 
     pub fn record_ws_session(&self, ctx: &WsDisconnectContext) {
@@ -1413,6 +1583,71 @@ impl MetricsRegistry {
                     .or_insert_with(|| HistogramBuckets::new(self.epoch))
                     .observe(summary.latency_total_ms, self.epoch);
             }
+            if !prometheus_helpers::mesh_metric_disabled(
+                summary,
+                prometheus_helpers::MeshMetricFamily::RequestSize,
+            ) {
+                let size_key = prometheus_helpers::mesh_request_key_for_family(
+                    summary,
+                    mesh_key,
+                    prometheus_helpers::MeshMetricFamily::RequestSize,
+                );
+                self.mesh_request_bytes_buckets
+                    .entry(size_key)
+                    .or_insert_with(|| HistogramBuckets::new_bytes(self.epoch))
+                    .observe(summary.bytes_sent as f64, self.epoch);
+            }
+            if !prometheus_helpers::mesh_metric_disabled(
+                summary,
+                prometheus_helpers::MeshMetricFamily::ResponseSize,
+            ) {
+                // Record observed response bytes even when the body did not
+                // complete; deferred logging already finalizes the transferred
+                // count. Incomplete streams still contribute authoritative size.
+                let size_key = prometheus_helpers::mesh_request_key_for_family(
+                    summary,
+                    mesh_key,
+                    prometheus_helpers::MeshMetricFamily::ResponseSize,
+                );
+                self.mesh_response_bytes_buckets
+                    .entry(size_key)
+                    .or_insert_with(|| HistogramBuckets::new_bytes(self.epoch))
+                    .observe(summary.bytes_received as f64, self.epoch);
+            }
+            if prometheus_helpers::is_mesh_grpc_protocol(mesh_key.request_protocol.as_ref()) {
+                if summary.grpc_request_messages > 0
+                    && !prometheus_helpers::mesh_metric_disabled(
+                        summary,
+                        prometheus_helpers::MeshMetricFamily::GrpcRequestMessages,
+                    )
+                {
+                    let key = prometheus_helpers::mesh_request_key_for_family(
+                        summary,
+                        mesh_key,
+                        prometheus_helpers::MeshMetricFamily::GrpcRequestMessages,
+                    );
+                    self.mesh_grpc_request_messages_counter
+                        .entry(key)
+                        .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                        .add(summary.grpc_request_messages, self.epoch);
+                }
+                if summary.grpc_response_messages > 0
+                    && !prometheus_helpers::mesh_metric_disabled(
+                        summary,
+                        prometheus_helpers::MeshMetricFamily::GrpcResponseMessages,
+                    )
+                {
+                    let key = prometheus_helpers::mesh_request_key_for_family(
+                        summary,
+                        mesh_key,
+                        prometheus_helpers::MeshMetricFamily::GrpcResponseMessages,
+                    );
+                    self.mesh_grpc_response_messages_counter
+                        .entry(key)
+                        .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                        .add(summary.grpc_response_messages, self.epoch);
+                }
+            }
         }
 
         // Increment the client-disconnect counter whenever the summary flags
@@ -1523,6 +1758,36 @@ impl MetricsRegistry {
             }
             keep
         });
+
+        for map in [
+            &self.mesh_request_bytes_buckets,
+            &self.mesh_response_bytes_buckets,
+        ] {
+            map.retain(|_, v| {
+                let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+                if !keep {
+                    evicted += 1;
+                }
+                keep
+            });
+        }
+
+        for map in [
+            &self.mesh_tcp_opened_counter,
+            &self.mesh_tcp_closed_counter,
+            &self.mesh_tcp_sent_bytes_counter,
+            &self.mesh_tcp_received_bytes_counter,
+            &self.mesh_grpc_request_messages_counter,
+            &self.mesh_grpc_response_messages_counter,
+        ] {
+            map.retain(|_, v| {
+                let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+                if !keep {
+                    evicted += 1;
+                }
+                keep
+            });
+        }
 
         self.stream_connection_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
@@ -1790,6 +2055,14 @@ impl MetricsRegistry {
             + self.ai_estimated_cost_counter.len() * 300
             + self.mesh_request_counter.len() * 600
             + self.mesh_request_duration_buckets.len() * 1800
+            + self.mesh_request_bytes_buckets.len() * 1800
+            + self.mesh_response_bytes_buckets.len() * 1800
+            + self.mesh_tcp_opened_counter.len() * 600
+            + self.mesh_tcp_closed_counter.len() * 600
+            + self.mesh_tcp_sent_bytes_counter.len() * 600
+            + self.mesh_tcp_received_bytes_counter.len() * 600
+            + self.mesh_grpc_request_messages_counter.len() * 600
+            + self.mesh_grpc_response_messages_counter.len() * 600
             + self.stream_connection_counter.len() * 200
             + self.stream_duration_buckets.len() * 800
             + self.ws_session_counter.len() * 320
@@ -1993,6 +2266,92 @@ impl MetricsRegistry {
                     entry.value(),
                     &gateway_ns_label,
                 );
+            }
+        }
+
+        if !self.mesh_request_bytes_buckets.is_empty() {
+            output.push_str(
+                "# HELP ferrum_mesh_request_bytes Mesh HTTP/gRPC request body size in bytes.\n",
+            );
+            output.push_str("# TYPE ferrum_mesh_request_bytes histogram\n");
+            for entry in self.mesh_request_bytes_buckets.iter() {
+                prometheus_helpers::render_mesh_histogram_named(
+                    &mut output,
+                    "ferrum_mesh_request_bytes",
+                    entry.key(),
+                    entry.value(),
+                    &gateway_ns_label,
+                );
+            }
+        }
+
+        if !self.mesh_response_bytes_buckets.is_empty() {
+            output.push_str(
+                "# HELP ferrum_mesh_response_bytes Mesh HTTP/gRPC response body size in bytes.\n",
+            );
+            output.push_str("# TYPE ferrum_mesh_response_bytes histogram\n");
+            for entry in self.mesh_response_bytes_buckets.iter() {
+                prometheus_helpers::render_mesh_histogram_named(
+                    &mut output,
+                    "ferrum_mesh_response_bytes",
+                    entry.key(),
+                    entry.value(),
+                    &gateway_ns_label,
+                );
+            }
+        }
+
+        for (map, name, help) in [
+            (
+                &self.mesh_tcp_opened_counter,
+                "ferrum_mesh_tcp_connections_opened_total",
+                "Mesh TCP connections opened.",
+            ),
+            (
+                &self.mesh_tcp_closed_counter,
+                "ferrum_mesh_tcp_connections_closed_total",
+                "Mesh TCP connections closed.",
+            ),
+            (
+                &self.mesh_tcp_sent_bytes_counter,
+                "ferrum_mesh_tcp_sent_bytes_total",
+                "Mesh TCP response bytes sent backend->client on closed connections.",
+            ),
+            (
+                &self.mesh_tcp_received_bytes_counter,
+                "ferrum_mesh_tcp_received_bytes_total",
+                "Mesh TCP request bytes received client->backend on closed connections.",
+            ),
+            (
+                &self.mesh_grpc_request_messages_counter,
+                "ferrum_mesh_request_messages_total",
+                "Mesh gRPC request messages.",
+            ),
+            (
+                &self.mesh_grpc_response_messages_counter,
+                "ferrum_mesh_response_messages_total",
+                "Mesh gRPC response messages.",
+            ),
+        ] {
+            if map.is_empty() {
+                continue;
+            }
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            for entry in map.iter() {
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let labels = prometheus_helpers::mesh_label_fragment(entry.key(), None);
+                let counter_gateway_ns_label = if labels.is_empty() {
+                    gateway_ns_label
+                        .strip_prefix(',')
+                        .unwrap_or(gateway_ns_label.as_str())
+                } else {
+                    gateway_ns_label.as_str()
+                };
+                output.push_str(&format!(
+                    "{name}{{{}{}}} {}\n",
+                    labels, counter_gateway_ns_label, count
+                ));
             }
         }
 

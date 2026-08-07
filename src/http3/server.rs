@@ -2429,6 +2429,10 @@ async fn handle_h3_request(
         );
         ctx.bytes_sent_observed
             .fetch_max(body_data.len() as u64, std::sync::atomic::Ordering::Release);
+        // No gRPC message accounting here: this early prebuffer is the CLIENT
+        // representation, which for gRPC-Web is base64 text and/or carries a
+        // terminal trailer frame. The dispatch ladders below count the
+        // backend-visible body once the request-body transforms have run.
         Some(body_data)
     } else {
         None
@@ -2631,6 +2635,9 @@ async fn handle_h3_request(
             );
             ctx.bytes_sent_observed
                 .fetch_max(body_data.len() as u64, std::sync::atomic::Ordering::Release);
+            // Client representation again (see the authenticate-phase prebuffer
+            // above): gRPC message accounting happens on the backend-visible
+            // body at dispatch, never on undecoded gRPC-Web bytes.
         }
     }
 
@@ -3868,6 +3875,14 @@ async fn handle_h3_request(
             body_data,
         )
         .await;
+        // `bytes_sent` above is the raw client-wire length; gRPC messages come
+        // from the transformed, backend-visible body so translated gRPC-Web
+        // requests count native frames instead of base64 / trailer framing.
+        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+            &ctx.metadata,
+            &ctx.grpc_request_messages_observed,
+            &transformed,
+        );
         let final_body_result = crate::proxy::run_final_request_body_hooks(
             &plugins,
             Some(&mut ctx),
@@ -4370,6 +4385,13 @@ async fn handle_h3_request(
             body_data,
         )
         .await;
+        // Same contract as the terminal-hook ladder above: count the
+        // backend-visible native representation, not the client wire bytes.
+        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+            &ctx.metadata,
+            &ctx.grpc_request_messages_observed,
+            &transformed,
+        );
         match crate::proxy::run_final_request_body_hooks(
             &plugins,
             Some(&mut ctx),
@@ -5183,6 +5205,12 @@ async fn handle_h3_request(
             body_completed: outcome.body_completed,
             bytes_sent: outcome.bytes_sent,
             bytes_received: outcome.bytes_streamed,
+            grpc_request_messages: ctx
+                .grpc_request_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire),
+            grpc_response_messages: ctx
+                .grpc_response_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire),
             error_class: outcome.error_class,
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
@@ -5254,6 +5282,11 @@ async fn handle_h3_request(
         // satisfy the shared signature.
         let request_stream_opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let request_upload_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let grpc_request_messages =
+            crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                &ctx.metadata,
+            )
+            .then(|| Arc::clone(&ctx.grpc_request_messages_observed));
 
         let streaming_resp = if let Some(target) = upstream_target.as_deref() {
             state
@@ -5271,6 +5304,7 @@ async fn handle_h3_request(
                     &mut stream,
                     effective_max_request_body_size_bytes,
                     Arc::clone(&request_body_bytes_seen),
+                    grpc_request_messages.clone(),
                     proxy.backend_read_timeout_ms,
                     Arc::clone(&request_stream_opened),
                     Arc::clone(&request_upload_complete),
@@ -5288,6 +5322,7 @@ async fn handle_h3_request(
                     &mut stream,
                     effective_max_request_body_size_bytes,
                     Arc::clone(&request_body_bytes_seen),
+                    grpc_request_messages.clone(),
                     proxy.backend_read_timeout_ms,
                     Arc::clone(&request_stream_opened),
                     Arc::clone(&request_upload_complete),
@@ -5683,6 +5718,12 @@ async fn handle_h3_request(
                 } else {
                     0
                 },
+                grpc_request_messages: ctx
+                    .grpc_request_messages_observed
+                    .load(std::sync::atomic::Ordering::Acquire),
+                grpc_response_messages: ctx
+                    .grpc_response_messages_observed
+                    .load(std::sync::atomic::Ordering::Acquire),
                 mirror: false,
                 metadata: crate::proxy::clone_log_metadata(&ctx),
                 ai_usage_export: ctx.ai_usage_export.clone(),
@@ -6224,6 +6265,12 @@ async fn handle_h3_request(
             // Response bytes delivered to the client — tracked by the
             // streaming loop above as `bytes_streamed`.
             bytes_received: bytes_streamed,
+            grpc_request_messages: ctx
+                .grpc_request_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire),
+            grpc_response_messages: ctx
+                .grpc_response_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire),
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
             ai_usage_export: ctx.ai_usage_export.clone(),
@@ -6822,6 +6869,12 @@ async fn handle_h3_request(
             // count of body bytes pushed to the client's h3 stream. Mirror
             // it into the unified `bytes_received` field.
             bytes_received: h3_stream_result.bytes_streamed,
+            grpc_request_messages: ctx
+                .grpc_request_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire),
+            grpc_response_messages: ctx
+                .grpc_response_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire),
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
             ai_usage_export: ctx.ai_usage_export.clone(),
@@ -9596,6 +9649,7 @@ async fn dispatch_grpc_native_h3(
     // complete), and waiting-on-headers (complete) — so an upload-phase stall is
     // accounted as a neutral client fault, not a backend read timeout.
     let request_upload_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let grpc_request_messages = Some(Arc::clone(&ctx.grpc_request_messages_observed));
 
     // Honor the client gRPC deadline (`grpc-timeout`) as an ABSOLUTE end-to-end
     // RPC deadline anchored at request receipt — exactly like the H2 /
@@ -9653,6 +9707,7 @@ async fn dispatch_grpc_native_h3(
                     stream,
                     effective_max_grpc_recv_size_bytes,
                     Arc::clone(&request_body_bytes_seen),
+                    grpc_request_messages.clone(),
                     grpc_header_read_timeout_ms,
                     Arc::clone(&request_stream_opened),
                     Arc::clone(&request_upload_complete),
@@ -9670,6 +9725,7 @@ async fn dispatch_grpc_native_h3(
                     stream,
                     effective_max_grpc_recv_size_bytes,
                     Arc::clone(&request_body_bytes_seen),
+                    grpc_request_messages.clone(),
                     grpc_header_read_timeout_ms,
                     Arc::clone(&request_stream_opened),
                     Arc::clone(&request_upload_complete),
@@ -10337,6 +10393,11 @@ async fn dispatch_grpc_native_h3(
     let mut body_error_class: Option<crate::retry::ErrorClass> = None;
     let mut client_deadline_expired = false;
     let mut just_received_backend_frame = false;
+    // Count complete length-prefixed messages only after successful client
+    // delivery (failed send_data must not inflate the counter).
+    let mut grpc_response_scanner =
+        crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default();
+    let grpc_response_messages = Arc::clone(&ctx.grpc_response_messages_observed);
     // Backend gRPC terminal status, captured from the trailer (or trailers-only
     // header) for the adaptive-concurrency sample below.
     let mut grpc_trailer_status: Option<u32> = None;
@@ -10497,9 +10558,10 @@ async fn dispatch_grpc_native_h3(
                         ) {
                             let data =
                                 crate::http3::config::copy_remaining_response_chunk(&mut chunk);
-                            if !await_downstream_grpc_write!(stream.send_data(data)) {
+                            if !await_downstream_grpc_write!(stream.send_data(data.clone())) {
                                 break 'outer;
                             }
+                            grpc_response_scanner.push(&data, &grpc_response_messages);
                             bytes_streamed += chunk_len as u64;
                             flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
                             continue;
@@ -10510,9 +10572,10 @@ async fn dispatch_grpc_native_h3(
                         if coalesce_buf.len() >= coalesce_min_bytes {
                             let data = coalesce_buf.split().freeze();
                             let data_len = data.len() as u64;
-                            if !await_downstream_grpc_write!(stream.send_data(data)) {
+                            if !await_downstream_grpc_write!(stream.send_data(data.clone())) {
                                 break 'outer;
                             }
+                            grpc_response_scanner.push(&data, &grpc_response_messages);
                             bytes_streamed += data_len;
                             flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
                         }
@@ -10561,9 +10624,10 @@ async fn dispatch_grpc_native_h3(
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                 let data = coalesce_buf.split().freeze();
                 let data_len = data.len() as u64;
-                if !await_downstream_grpc_write!(stream.send_data(data)) {
+                if !await_downstream_grpc_write!(stream.send_data(data.clone())) {
                     break 'outer;
                 }
+                grpc_response_scanner.push(&data, &grpc_response_messages);
                 bytes_streamed += data_len;
                 flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
             }
@@ -10582,9 +10646,10 @@ async fn dispatch_grpc_native_h3(
             if !coalesce_buf.is_empty() {
                 let data = coalesce_buf.split().freeze();
                 let data_len = data.len() as u64;
-                if !await_downstream_grpc_write!(stream.send_data(data)) {
+                if !await_downstream_grpc_write!(stream.send_data(data.clone())) {
                     break 'outer;
                 }
+                grpc_response_scanner.push(&data, &grpc_response_messages);
                 bytes_streamed += data_len;
             }
             // Terminal trailers carry the gRPC status. Capture `grpc-status`
@@ -11012,6 +11077,12 @@ async fn log_h3_grpc_transaction(
         body_completed,
         bytes_sent,
         bytes_received,
+        grpc_request_messages: ctx
+            .grpc_request_messages_observed
+            .load(std::sync::atomic::Ordering::Acquire),
+        grpc_response_messages: ctx
+            .grpc_response_messages_observed
+            .load(std::sync::atomic::Ordering::Acquire),
         error_class,
         mirror: false,
         metadata: crate::proxy::clone_log_metadata(ctx),

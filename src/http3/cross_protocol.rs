@@ -4134,11 +4134,14 @@ where
     ) = stream_hyper_incoming(
         stream,
         streaming.body,
-        coalesce,
-        max_resp_bytes,
-        streaming.response_read_timeout_ms,
-        streaming.grpc_deadline_at,
-        grpc_web_translation_mode,
+        StreamHyperIncomingOpts {
+            coalesce,
+            max_response_body_size_bytes: max_resp_bytes,
+            response_read_timeout_ms: streaming.response_read_timeout_ms,
+            grpc_deadline_at: streaming.grpc_deadline_at,
+            grpc_web_translation_mode,
+            grpc_response_messages: &ctx.grpc_response_messages_observed,
+        },
     )
     .await;
 
@@ -4760,6 +4763,17 @@ where
     } else {
         body.len() as u64
     };
+    // `body` is already the backend-visible native representation: a prebuffered
+    // body went through `apply_request_body_plugins_with_context` in
+    // `cross_protocol::run` (that is where gRPC-Web text base64 is decoded and
+    // the terminal trailer frame is split off), and the non-prebuffered arm is
+    // reachable only when no body-transforming plugin is configured. `bytes_sent`
+    // above stays the raw client-wire length.
+    crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+        &ctx.metadata,
+        &ctx.grpc_request_messages_observed,
+        &body,
+    );
 
     // Build the backend-facing header map (X-Forwarded-*, Via, Forwarded,
     // Early-Data) via the shared helper so the buffered and streaming H3 gRPC
@@ -5275,6 +5289,10 @@ where
             // trailers.
             let mut response_status = resp.status;
             let mut response_body = resp.body;
+            // Preserve the native gRPC representation for message accounting.
+            // A later gRPC-Web transform may base64/reframe the client-visible
+            // bytes, which are not themselves native length-prefixed frames.
+            let backend_response_body_for_message_count = response_body.clone();
             let mut response_trailers = resp.trailers;
             if normalize_response_body_for_inspection(
                 plugins,
@@ -5498,6 +5516,7 @@ where
                                 &mut authoritative_trailers_only_terminal_metadata,
                             );
                             buffered_initial_response_header_policy_state = None;
+                            response_body_rejected = true;
                             break;
                         }
                     }
@@ -5739,7 +5758,15 @@ where
                     .await
                 };
                 match body_write {
-                    Ok(()) => bytes_streamed = body_len,
+                    Ok(()) => {
+                        bytes_streamed = body_len;
+                        if !response_body_rejected && !terminal_gateway_deadline {
+                            crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
+                                &ctx.grpc_response_messages_observed,
+                                &backend_response_body_for_message_count,
+                            );
+                        }
+                    }
                     Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                         crate::proxy::insert_grpc_error_metadata(
                             &mut ctx.metadata,
@@ -6339,6 +6366,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         None,
         ctx.grpc_deadline_at(),
         &mut held_frontend_grpc_upload,
+        Some(Arc::clone(&ctx.grpc_request_messages_observed)),
     )
     .await;
 
@@ -6965,6 +6993,17 @@ where
     )
 }
 
+/// Bundle streaming/policy knobs for [`stream_hyper_incoming`] so the helper
+/// stays under clippy's argument limit after gRPC response-message accounting.
+struct StreamHyperIncomingOpts<'a> {
+    coalesce: CoalesceConfig,
+    max_response_body_size_bytes: usize,
+    response_read_timeout_ms: u64,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    grpc_web_translation_mode: Option<bool>,
+    grpc_response_messages: &'a AtomicU64,
+}
+
 /// Stream a hyper `Incoming` body into the H3 stream, separating trailer
 /// frames for `send_trailers`. Returns
 /// `(bytes_streamed, body_completed, client_disconnected, body_error_class,
@@ -6972,11 +7011,7 @@ where
 async fn stream_hyper_incoming<S>(
     stream: &mut RequestStream<S, Bytes>,
     mut incoming: Incoming,
-    coalesce: CoalesceConfig,
-    max_response_body_size_bytes: usize,
-    response_read_timeout_ms: u64,
-    grpc_deadline_at: Option<tokio::time::Instant>,
-    grpc_web_translation_mode: Option<bool>,
+    opts: StreamHyperIncomingOpts<'_>,
 ) -> (u64, bool, bool, Option<ErrorClass>, Option<HeaderMap>, bool)
 where
     // Send-only: this loop writes the response (`send_data` / `finish` /
@@ -6985,6 +7020,14 @@ where
     // `split()` send half (streaming-request gRPC path).
     S: SendStream<Bytes>,
 {
+    let StreamHyperIncomingOpts {
+        coalesce,
+        max_response_body_size_bytes,
+        response_read_timeout_ms,
+        grpc_deadline_at,
+        grpc_web_translation_mode,
+        grpc_response_messages,
+    } = opts;
     let mut coalesce_buf = BytesMut::with_capacity(coalesce.max_bytes);
     let mut total_streamed: usize = 0;
     let flush_timer = tokio::time::sleep(coalesce.flush_interval);
@@ -6996,6 +7039,8 @@ where
     let mut trailers: Option<HeaderMap> = None;
     let mut clean_deadline_completion = false;
     let mut client_deadline_expired = false;
+    let mut grpc_response_scanner =
+        crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default();
     let read_timeout_active = response_read_timeout_ms > 0 && grpc_deadline_at.is_none();
     let read_deadline = tokio::time::sleep(std::time::Duration::from_millis(
         response_read_timeout_ms.max(1),
@@ -7124,6 +7169,7 @@ where
                                 data_len,
                                 coalesce.min_bytes,
                             ) {
+                                let metric_data = data.clone();
                                 let out = if let Some(text_mode) = grpc_web_translation_mode {
                                     crate::plugins::grpc_web::encode_streaming_data(data, text_mode)
                                 } else {
@@ -7133,6 +7179,8 @@ where
                                 if !await_downstream_write!(stream.send_data(out)) {
                                     break 'outer;
                                 }
+                                grpc_response_scanner
+                                    .push(&metric_data, grpc_response_messages);
                                 bytes_streamed += out_len;
                                 flush_timer
                                     .as_mut()
@@ -7142,16 +7190,21 @@ where
 
                             coalesce_buf.extend_from_slice(&data);
                             if coalesce_buf.len() >= coalesce.min_bytes {
-                                let out = coalesce_buf.split().freeze();
+                                let metric_data = coalesce_buf.split().freeze();
                                 let out = if let Some(text_mode) = grpc_web_translation_mode {
-                                    crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
+                                    crate::plugins::grpc_web::encode_streaming_data(
+                                        metric_data.clone(),
+                                        text_mode,
+                                    )
                                 } else {
-                                    out
+                                    metric_data.clone()
                                 };
                                 let out_len = out.len() as u64;
                                 if !await_downstream_write!(stream.send_data(out)) {
                                     break 'outer;
                                 }
+                                grpc_response_scanner
+                                    .push(&metric_data, grpc_response_messages);
                                 bytes_streamed += out_len;
                                 flush_timer
                                     .as_mut()
@@ -7175,16 +7228,17 @@ where
                 }
             }
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
-                let out = coalesce_buf.split().freeze();
+                let metric_data = coalesce_buf.split().freeze();
                 let out = if let Some(text_mode) = grpc_web_translation_mode {
-                    crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
+                    crate::plugins::grpc_web::encode_streaming_data(metric_data.clone(), text_mode)
                 } else {
-                    out
+                    metric_data.clone()
                 };
                 let out_len = out.len() as u64;
                 if !await_downstream_write!(stream.send_data(out)) {
                     break 'outer;
                 }
+                grpc_response_scanner.push(&metric_data, grpc_response_messages);
                 bytes_streamed += out_len;
                 flush_timer
                     .as_mut()
@@ -7202,16 +7256,17 @@ where
         }
         if stream_done {
             if !coalesce_buf.is_empty() {
-                let out = coalesce_buf.split().freeze();
+                let metric_data = coalesce_buf.split().freeze();
                 let out = if let Some(text_mode) = grpc_web_translation_mode {
-                    crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
+                    crate::plugins::grpc_web::encode_streaming_data(metric_data.clone(), text_mode)
                 } else {
-                    out
+                    metric_data.clone()
                 };
                 let out_len = out.len() as u64;
                 if !await_downstream_write!(stream.send_data(out)) {
                     break 'outer;
                 }
+                grpc_response_scanner.push(&metric_data, grpc_response_messages);
                 bytes_streamed += out_len;
             }
             // When trailers are present, the caller writes the trailing
