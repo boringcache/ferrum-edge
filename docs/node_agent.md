@@ -331,8 +331,14 @@ it never trusts a persisted ack from an older process generation. A failed map
 update/removal or classifier detach keeps capture degraded and withholds that
 acknowledgement; after a bounded wait
 the producer retains its in-netns fail-closed guard while releasing the producer
-tasks/netns handle instead of tearing down into plaintext. The live
-bind-collision/source-capture verification remains part of #2038.
+tasks/netns handle instead of tearing down into plaintext. Live
+bind-collision/source-capture verification is enforced by
+`functional_mesh_live_source_capture_udp_manager_hbone_round_trip` (closed
+[#2013](https://github.com/ferrum-edge/ferrum-edge/issues/2013) /
+[#2038](https://github.com/ferrum-edge/ferrum-edge/issues/2038)). The
+enrolled-destination two-pod UDP round trip (destination pod-netns relay plus
+tc-inbound admit) is not yet live-gated — tracked on
+[#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621).
 
 The Ambient UDP producer needs the same host access the NodeWaypoint in-netns
 listener needs — the read-only host cgroup mount + host `/proc` to resolve pod
