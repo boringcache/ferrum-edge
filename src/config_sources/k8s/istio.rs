@@ -41,9 +41,7 @@ use crate::config::types::{
     validate_backend_tls_sni, validate_system_trust_roots_skip_verify_pairing,
     validate_tls_material_source_field,
 };
-use crate::plugins::mesh::workload_metrics::{
-    is_recognized_unsupported_istio_metric_family, validate_istio_telemetry_config,
-};
+use crate::plugins::mesh::workload_metrics::validate_istio_telemetry_config;
 
 const URI_LESS_MATCH_LISTEN_PATH: &str = "~.*";
 
@@ -5699,8 +5697,6 @@ fn telemetry(
                             }
                             None => "ALL_METRICS",
                         };
-                    let ignored_metric_family =
-                        is_recognized_unsupported_istio_metric_family(matched_metric);
                     if ovr
                         .get("disabled")
                         .and_then(Value::as_bool)
@@ -5710,40 +5706,33 @@ fn telemetry(
                     }
                     if let Some(tags) = ovr.get("tagOverrides").and_then(Value::as_object) {
                         for (tag_name, tag_spec) in tags {
-                            let operation = if ignored_metric_family {
-                                // Preserve one no-op entry so workload_metrics emits its
-                                // bounded ignored-family diagnostic, but do not validate
-                                // policy for a metric family Ferrum never records.
-                                TagOverrideOperation::Remove
-                            } else {
-                                let op = tag_spec
-                                    .get("operation")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("");
-                                match op {
-                                    "REMOVE" => TagOverrideOperation::Remove,
-                                    "UPSERT" => {
-                                        let value = telemetry_metric_upsert_literal(
-                                            object, tag_name, tag_spec,
-                                        )?;
-                                        TagOverrideOperation::Set { value }
-                                    }
-                                    "" => {
-                                        return Err(invalid_resource(
-                                            object,
-                                            format!(
-                                                "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation is required"
-                                            ),
-                                        ));
-                                    }
-                                    _ => {
-                                        return Err(invalid_resource(
-                                            object,
-                                            format!(
-                                                "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation '{op}' is unsupported"
-                                            ),
-                                        ));
-                                    }
+                            let op = tag_spec
+                                .get("operation")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let operation = match op {
+                                "REMOVE" => TagOverrideOperation::Remove,
+                                "UPSERT" => {
+                                    let value = telemetry_metric_upsert_literal(
+                                        object, tag_name, tag_spec,
+                                    )?;
+                                    TagOverrideOperation::Set { value }
+                                }
+                                "" => {
+                                    return Err(invalid_resource(
+                                        object,
+                                        format!(
+                                            "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation is required"
+                                        ),
+                                    ));
+                                }
+                                _ => {
+                                    return Err(invalid_resource(
+                                        object,
+                                        format!(
+                                            "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation '{op}' is unsupported"
+                                        ),
+                                    ));
                                 }
                             };
                             tag_overrides.push(MetricTagOverride {

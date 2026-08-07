@@ -298,6 +298,13 @@ pub(crate) async fn handle_mesh_tcp_inbound(
             // `connection_error` text matches the generic path's
             // `STREAM_ERR_REJECTED_BY_PLUGIN` prefix so log consumers see
             // consistent wording across the two stream paths.
+            //
+            // Finalize the mesh TCP lifecycle under the metadata the rejecting
+            // (and prior) hooks left, before the zero-byte disconnect summary,
+            // so opened/closed stay balanced.
+            crate::plugins::mesh::prometheus_helpers::finalize_mesh_tcp_opened_stream(
+                &mut stream_ctx,
+            );
             emit_disconnect(
                 &plugins,
                 &mut stream_ctx,
@@ -317,6 +324,10 @@ pub(crate) async fn handle_mesh_tcp_inbound(
             return;
         }
     }
+    // Chain accepted: mesh metadata is final, so finalize the mesh TCP opened
+    // counter once for this captured inbound connection (also covers the
+    // NodeWaypoint transparent ingress capture relay, which funnels here).
+    crate::plugins::mesh::prometheus_helpers::finalize_mesh_tcp_opened_stream(&mut stream_ctx);
 
     // Marked when the entry demands it (NodeWaypoint capture relay): the dial
     // leaves the host netns and must be recognized as an authorized relay dial
