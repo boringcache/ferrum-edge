@@ -56,4 +56,4 @@ For zero-downtime rolling deploys:
 
 During the drain phase, the overload manager's `draining` flag is set, which causes `Connection: close` on all responses. This is independent of the overload manager's `disable_keepalive` action (which is pressure-triggered). Both flags produce the same `Connection: close` behavior — they are OR'd together.
 
-The `GET /overload` endpoint reports `draining: true` during the drain phase.
+During the drain phase, authenticated `GET /overload` detail reports `draining: true`. Unauthenticated callers still receive only `{"level": ...}` and must not be used for drain-state alerting.

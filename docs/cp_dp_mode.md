@@ -176,7 +176,7 @@ The CP/DP architecture is designed so that data source outages are invisible to 
 - **Delta rejection resync**: After any non-empty DELTA parse/validation/apply rejection (or unclassifiable parse / invalid trust side-channel), the DP stops consuming that stream, raises sticky `config_diverged` on `GET /cluster`, increments `ferrum_configsync_delta_rejections_total`, and reconnects for an authoritative FULL_SNAPSHOT. Rejected resource config does not advance `last_config_received_at`. Divergence clears only after a FULL_SNAPSHOT is accepted (`ferrum_configsync_divergence_recoveries_total` / `config_divergence_recoveries_total`).
 - **CP database outage**: If the CP's database goes offline, the CP continues serving its cached config to DPs via gRPC. It does not broadcast stale updates — DPs simply retain their last known config. When the database recovers, the next poll picks up any changes and broadcasts them.
 - **Admin API fallback**: Both CP and DP admin API read endpoints fall back to the in-memory cached config when the database is unavailable. Responses served from cache include an `X-Data-Source: cached` header. Write operations require a live database and return `503` if unavailable.
-- **Health visibility**: The `/health` endpoint reports `cached_config` status (available, loaded_at, proxy/consumer counts) so operators can see whether the node is running on cached data.
+- **Health visibility**: Authenticated `/health` detail reports `cached_config` status (available, loaded_at, proxy/consumer counts) so operators can see whether the node is running on cached data. Unauthenticated probes receive only `status` and `ready`.
 
 ## DP Multi-CP Failover
 
@@ -369,6 +369,6 @@ The Data Plane exposes a read-only Admin API for monitoring:
 - All write operations (create/update/delete proxies, consumers, plugins) return `403 Forbidden`
 - Read operations (list proxies, consumers, plugin configs, health checks) are served from the DP's in-memory cached config
 - Responses include `X-Data-Source: cached` header to indicate the data comes from the cache rather than a live database
-- The `/health` endpoint includes `cached_config` details (availability, loaded_at, proxy/consumer counts)
+- Authenticated `/health` detail includes `cached_config` (availability, loaded_at, proxy/consumer counts); unauthenticated probes receive only `status` and `ready`
 - `GET /cluster` shows CP connection status including whether the DP is on its primary or fallback CP
 - The admin API always reflects the DP's currently cached config received from the CP
