@@ -2912,13 +2912,12 @@ async fn grpc_retry_preserves_duplicate_metadata_on_second_attempt() {
 ///
 /// Fixture notes (hosted jobs 89647762460 / 89765485950 returned a 502 here):
 ///
-/// 1. **Body-size gate (deterministic)**: ordinary (non-SNI) direct-H2 dispatch
-///    requires `FERRUM_MAX_{REQUEST,RESPONSE}_BODY_SIZE_BYTES=0` via
-///    `can_dispatch_direct_http2_pool`. Defaults leave those nonzero, so the
-///    request falls through to reqwest against this ALPN-`h2`-only fixture and
-///    surfaces as `502 {"error":"Backend unavailable"}` with
-///    `error sending request for url (...)` — even when the registry already
-///    shows `h2_tls=supported`. Mirror `bodyless_direct_h2_sse_response_is_governed`.
+/// 1. **Direct-H2 preference**: ordinary (non-SNI) dispatch takes the direct-H2
+///    pool when the capability registry shows `h2_tls=supported` and the
+///    request is body-compat. Nonzero body-size limits are enforced in-path
+///    (issue #3622) and no longer force reqwest. This fixture still zeros the
+///    limits so the ownership assertion is independent of size-limit adapters —
+///    same contract as `bodyless_direct_h2_sse_response_is_governed`.
 ///
 /// 2. **Pooled probe / warmup connections**: capability probing and pool
 ///    warmup dial this backend before the ownership GET. A one-shot script
@@ -2964,9 +2963,9 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
         .file_config(yaml)
         .log_level("info")
         .capture_output()
-        // Opt into capability probing (registry gate below) and zero body
-        // limits so ordinary (non-SNI) dispatch stays on the direct-H2 pool —
-        // same contract as `bodyless_direct_h2_sse_response_is_governed`.
+        // Opt into capability probing (registry gate below). Body limits are
+        // zeroed so the ownership assertion is independent of size-limit
+        // adapters — same contract as `bodyless_direct_h2_sse_response_is_governed`.
         // `repeat_script(true)` absorbs any warmup `HEAD /` on the same
         // connection without tearing it down.
         .pool_warmup_enabled(true)
@@ -3129,4 +3128,254 @@ async fn h2_backend_tls_sni_serves_under_default_body_limits() {
         "expected 200 via direct-H2 SNI under default body limits; body={body}"
     );
     assert_eq!(body, "ok");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #3622 — ordinary direct-H2 under nonzero body limits: in-path 413/502
+// with the same ErrorClass / connection_error contracts as the reqwest path.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Declared Content-Length over the request limit must 413 before dial on
+/// ordinary (non-SNI) direct-H2 — the backend must not see a new stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_h2_rejects_oversized_declared_request_under_nonzero_limits() {
+    let ca = TestCa::new("h2-req-limit-cl").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .repeat_script(true)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::DrainRequestBody)
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+            ("content-length", "2".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from_static(b"ok"),
+            end_stream: true,
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = file_mode_yaml_for_backend_with(
+        backend_port,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+            "pool_enable_http2": true,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("warn")
+        .capture_output()
+        .pool_warmup_enabled(true)
+        // Tiny positive limits: must still prefer direct-H2 (issue #3622).
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "64")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "10485760")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let entry = wait_for_h2_tls_supported(&harness, Duration::from_secs(15))
+        .await
+        .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
+    assert_eq!(
+        entry["plain_http"]["h2_tls"].as_str(),
+        Some("supported"),
+        "precondition: direct-H2 requires h2_tls=supported; entry: {entry:#?}"
+    );
+
+    let streams_before = backend.received_stream_count();
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let response = client
+        .as_reqwest()
+        .post(format!("{}/api/upload", harness.proxy_base_url()))
+        .body(vec![b'x'; 128])
+        .send()
+        .await
+        .expect("oversized declared body must surface a gateway response");
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "expected 413 via direct-H2 in-path request limit; body={body}"
+    );
+    assert!(
+        body.contains("Request body exceeds maximum size"),
+        "unexpected 413 body: {body}"
+    );
+    assert_eq!(
+        backend.received_stream_count(),
+        streams_before,
+        "declared Content-Length overrun must reject before dial/admission \
+         so the H2-only backend never sees the oversized request"
+    );
+}
+
+/// Unknown-length (no Content-Length) upload past the limit must 413
+/// frame-by-frame on ordinary direct-H2 via SizeLimitedIncoming.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_h2_rejects_streaming_oversized_request_under_nonzero_limits() {
+    let ca = TestCa::new("h2-req-limit-stream").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .repeat_script(true)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::DrainRequestBody)
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+            ("content-length", "2".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from_static(b"ok"),
+            end_stream: true,
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = file_mode_yaml_for_backend_with(
+        backend_port,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+            "pool_enable_http2": true,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("warn")
+        .capture_output()
+        .pool_warmup_enabled(true)
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "64")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "10485760")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let _ = wait_for_h2_tls_supported(&harness, Duration::from_secs(15))
+        .await
+        .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
+
+    // Stream frames without Content-Length so the gateway cannot fast-path
+    // reject and must enforce via SizeLimitedIncoming on the H2 sender.
+    let chunks = vec![
+        Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; 32])),
+        Ok(Bytes::from(vec![b'b'; 32])),
+        Ok(Bytes::from(vec![b'c'; 32])),
+    ];
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let send = client
+        .as_reqwest()
+        .post(format!("{}/api/upload", harness.proxy_base_url()))
+        .body(reqwest::Body::wrap_stream(futures_util::stream::iter(chunks)))
+        .send()
+        .await;
+
+    match send {
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            assert_eq!(
+                status,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "expected 413 from frame-by-frame direct-H2 limit; body={body}"
+            );
+            assert!(
+                body.contains("Request body exceeds maximum size"),
+                "unexpected 413 body: {body}"
+            );
+        }
+        // Under HTTP/2 full-duplex a mid-stream size abort can also reset the
+        // client stream before headers arrive — that is an equally valid
+        // fail-closed outcome for an unknown-length overrun.
+        Err(err) => {
+            assert!(
+                err.is_body() || err.is_request() || err.is_connect(),
+                "streaming overrun must fail closed (413 or stream reset), got: {err:?}"
+            );
+        }
+    }
+}
+
+/// Declared backend Content-Length over the response limit must 502 on
+/// ordinary direct-H2 with ResponseBodyTooLarge semantics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_h2_rejects_oversized_declared_response_under_nonzero_limits() {
+    let ca = TestCa::new("h2-resp-limit-cl").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let oversized = Bytes::from(vec![b'z'; 128]);
+    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .repeat_script(true)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::DrainRequestBody)
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "application/octet-stream".into()),
+            ("content-length", oversized.len().to_string()),
+        ]))
+        .step(H2Step::RespondData {
+            data: oversized,
+            end_stream: true,
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = file_mode_yaml_for_backend_with(
+        backend_port,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+            "pool_enable_http2": true,
+            // Buffer mode so the declared-CL fast path rejects with JSON 502
+            // before any body bytes are committed downstream.
+            "response_body_mode": "buffer",
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("warn")
+        .capture_output()
+        .pool_warmup_enabled(true)
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "10485760")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "64")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let _ = wait_for_h2_tls_supported(&harness, Duration::from_secs(15))
+        .await
+        .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let response = client
+        .get(&format!("{}/api/big", harness.proxy_base_url()))
+        .await
+        .expect("oversized response must surface a gateway 502");
+    let body = String::from_utf8_lossy(&response.body_bytes);
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_GATEWAY,
+        "expected 502 via direct-H2 in-path response limit; body={body}"
+    );
+    assert!(
+        body.contains("Backend response body exceeds maximum size"),
+        "unexpected 502 body: {body}"
+    );
 }
