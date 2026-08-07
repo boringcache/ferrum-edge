@@ -63,47 +63,71 @@ fn env_still_overrides_conf_for_metadata_redaction_extras() {
     assert_eq!(extras, ["env_wins"]);
 }
 
+/// Strip all whitespace so these source-shape guards survive rustfmt.
+///
+/// rustfmt splits a long call across lines (it already did for
+/// `resolve_ferrum_var("FERRUM_LOG_REDACT_METADATA_KEYS")`), which breaks a
+/// naive one-line `contains`. The property under test is which *call* is made,
+/// not how it is wrapped.
+fn squeeze(source: &str) -> String {
+    source.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 #[test]
 fn issue_3624_reads_use_conf_aware_resolver_not_std_env_var() {
-    let metadata = include_str!("../../../src/plugins/utils/metadata_redaction.rs");
+    let metadata = squeeze(include_str!(
+        "../../../src/plugins/utils/metadata_redaction.rs"
+    ));
     assert!(
-        metadata.contains("resolve_ferrum_var(\"FERRUM_LOG_REDACT_METADATA_KEYS\")"),
+        metadata.contains(&squeeze(
+            "resolve_ferrum_var(\"FERRUM_LOG_REDACT_METADATA_KEYS\")"
+        )),
         "metadata redaction must resolve through ferrum.conf"
     );
     assert!(
-        !metadata.contains("std::env::var(\"FERRUM_LOG_REDACT_METADATA_KEYS\")"),
+        !metadata.contains(&squeeze(
+            "std::env::var(\"FERRUM_LOG_REDACT_METADATA_KEYS\")"
+        )),
         "metadata redaction must not bypass ferrum.conf"
     );
 
-    let chargeback = include_str!("../../../src/plugins/api_chargeback_sink.rs");
+    let chargeback = squeeze(include_str!("../../../src/plugins/api_chargeback_sink.rs"));
     assert!(
-        chargeback.contains("resolve_ferrum_var(\"FERRUM_NODE_ID\")"),
+        chargeback.contains(&squeeze("resolve_ferrum_var(\"FERRUM_NODE_ID\")")),
         "chargeback node id must resolve through ferrum.conf"
     );
     assert!(
-        !chargeback.contains("std::env::var(\"FERRUM_NODE_ID\")"),
+        !chargeback.contains(&squeeze("std::env::var(\"FERRUM_NODE_ID\")")),
         "chargeback node id must not bypass ferrum.conf"
     );
 
-    let http_client = include_str!("../../../src/plugins/utils/http_client.rs");
+    let http_client = squeeze(include_str!("../../../src/plugins/utils/http_client.rs"));
     assert!(
-        http_client.contains("resolve_ferrum_var(key)"),
+        http_client.contains(&squeeze("resolve_ferrum_var(key)")),
         "compression gates must resolve through ferrum.conf"
     );
     assert!(
-        http_client.contains("resolve_ferrum_var(\"FERRUM_MAX_REQUEST_BODY_SIZE_BYTES\")"),
+        http_client.contains(&squeeze(
+            "resolve_ferrum_var(\"FERRUM_MAX_REQUEST_BODY_SIZE_BYTES\")"
+        )),
         "validation client body ceiling must resolve through ferrum.conf"
     );
     assert!(
-        !http_client.contains("std::env::var(\"FERRUM_COMPRESSION_GZIP_ENABLED\")"),
+        !http_client.contains(&squeeze(
+            "std::env::var(\"FERRUM_COMPRESSION_GZIP_ENABLED\")"
+        )),
         "gzip gate must not bypass ferrum.conf"
     );
     assert!(
-        !http_client.contains("std::env::var(\"FERRUM_COMPRESSION_BROTLI_ENABLED\")"),
+        !http_client.contains(&squeeze(
+            "std::env::var(\"FERRUM_COMPRESSION_BROTLI_ENABLED\")"
+        )),
         "brotli gate must not bypass ferrum.conf"
     );
     assert!(
-        !http_client.contains("std::env::var(\"FERRUM_MAX_REQUEST_BODY_SIZE_BYTES\")"),
+        !http_client.contains(&squeeze(
+            "std::env::var(\"FERRUM_MAX_REQUEST_BODY_SIZE_BYTES\")"
+        )),
         "body ceiling must not bypass ferrum.conf"
     );
 }
