@@ -1966,6 +1966,8 @@ fn grpc_channel_body(max_bytes: usize) -> GrpcChannelBodyFixture {
         cancelled_terminal: false,
         forwarded_bytes: std::sync::Arc::clone(&forwarded),
         upload_observer: None,
+        grpc_messages: None,
+        grpc_scanner: None,
     };
     (tx, body, exceeded, cancelled, forwarded)
 }

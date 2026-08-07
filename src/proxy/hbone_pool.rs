@@ -14,8 +14,8 @@ use http::{Method, Request, StatusCode, Version};
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -145,6 +145,19 @@ pub enum HbonePoolError {
     ConnectStream { authority: String, message: String },
     #[error("HBONE CONNECT rejected for {authority} with status {status}")]
     ConnectRejected { authority: String, status: u16 },
+    /// The destination is already at its DestinationRule
+    /// `connectionPool.tcp.maxConnections` ceiling, so no NEW physical tunnel
+    /// connection may be opened. Nothing was dialed — a pre-wire, health-neutral
+    /// refusal classified `BackendConnectionLimit`, and NOT a capability failure
+    /// (the peer's HBONE/mesh-mTLS support is unchanged; only the gateway's own
+    /// ceiling was reached).
+    #[error("backend maxConnections reached for {host}:{port}: {current} open (cap {cap})")]
+    MaxConnectionsExceeded {
+        host: String,
+        port: u16,
+        current: u64,
+        cap: u64,
+    },
     #[error(
         "peer at {authority} did not negotiate SETTINGS_ENABLE_CONNECT_PROTOCOL; \
          cannot open a WebSocket Extended CONNECT (RFC 8441) stream"
@@ -224,6 +237,12 @@ impl HbonePoolError {
             | Self::ConnectStream { .. }
             | Self::ConnectRejected { .. }
             | Self::ExtendedConnectUnsupported { .. } => ErrorClass::ProtocolError,
+            // Pre-wire, gateway-side ceiling refusal: no socket was opened, so
+            // `retry_on_connect_failure` may rotate to another LB target with
+            // its own admission lane — and the refusal is health-NEUTRAL, so a
+            // saturated ceiling never trips the destination's circuit breaker /
+            // passive health. That is the full raw-TCP over-cap posture.
+            Self::MaxConnectionsExceeded { .. } => ErrorClass::BackendConnectionLimit,
         }
     }
 
@@ -273,6 +292,11 @@ pub struct HboneConnectionPool {
     dns_cache: DnsCache,
     pool_config: PoolConfig,
     last_idle_prune_unix_secs: AtomicU64,
+    /// Shared gateway-wide DestinationRule `connectionPool.tcp.maxConnections`
+    /// counter, installed once by `ProxyState` via
+    /// [`HboneConnectionPool::attach_backend_conn_limit`]. Unset for focused
+    /// tests and standalone callers, in which case no cap is enforced.
+    backend_conn_limit: OnceLock<crate::backend_conn_limit::SharedBackendConnectionLimiter>,
 }
 
 struct HboneSvidIdentityCache {
@@ -370,7 +394,38 @@ impl HboneConnectionPool {
             dns_cache,
             pool_config,
             last_idle_prune_unix_secs: AtomicU64::new(0),
+            backend_conn_limit: OnceLock::new(),
         }
+    }
+
+    /// Install the gateway-wide `connectionPool.tcp.maxConnections` counter so
+    /// HBONE tunnel connections are admitted against the same per-destination
+    /// ceiling as every other transport. Idempotent; later calls are ignored.
+    pub fn attach_backend_conn_limit(
+        &self,
+        limiter: crate::backend_conn_limit::SharedBackendConnectionLimiter,
+    ) {
+        let _ = self.backend_conn_limit.set(limiter);
+    }
+
+    /// Resolve the `maxConnections` admission lane for a tunnel dial.
+    ///
+    /// The lane is keyed by the DIAL host (the peer whose socket is opened) and
+    /// the destination's APP/service policy port — never the `:15008` transport
+    /// listener — so an HBONE tunnel, a WebSocket session, and a raw-TCP relay
+    /// to the same destination share one ceiling.
+    fn conn_admission<'a>(
+        &'a self,
+        proxy: &'a Proxy,
+        dial_host: &'a str,
+        app_policy_port: u16,
+    ) -> Option<crate::backend_conn_limit::PooledConnectionAdmission<'a>> {
+        crate::backend_conn_limit::PooledConnectionAdmission::resolve(
+            self.backend_conn_limit.get().map(|limiter| &**limiter),
+            proxy,
+            dial_host,
+            app_policy_port,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -823,6 +878,14 @@ impl HboneConnectionPool {
             .as_ref()
             .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
+        // Each WebSocket-over-HBONE session dials its OWN 1:1 tunnel, and that
+        // tunnel's `maxConnections` slot is ALREADY held by the caller: the
+        // WebSocket connect loop (`src/proxy/mod.rs`) reserves a session guard
+        // on the caller's logical `(backend host, policy port)` lane before this
+        // dial and holds it for the whole session. Admitting again here would charge the one
+        // socket twice — and at `maxConnections: 1` the dial would refuse
+        // itself, making every WebSocket upgrade to a capped mesh destination
+        // fail. The session guard is the single owner; do NOT re-admit.
         let dial_result: Result<H2ConnectTunnel, HbonePoolError> = async {
             let sender = dial_h2_connect_sender(
                 &self.dns_cache,
@@ -836,6 +899,8 @@ impl HboneConnectionPool {
                 sni_override,
                 &pool_config,
                 keepalive_override,
+                None,
+                // Caller-owned admission (see above).
                 None,
             )
             .await?;
@@ -921,6 +986,7 @@ impl HboneConnectionPool {
         let effective_connect_timeout_ms =
             effective_connect_timeout_ms_for_policy_port(proxy, app_policy_port);
         let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
+        let udp_conn_admission = self.conn_admission(proxy, dial_host, app_policy_port);
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
@@ -934,6 +1000,7 @@ impl HboneConnectionPool {
             &pool_config,
             keepalive_override,
             Some(connect_timeout),
+            udp_conn_admission.as_ref(),
         )
         .await?;
         let baggage = asserted_source.map_or_else(
@@ -1143,6 +1210,7 @@ impl HboneConnectionPool {
             .as_ref()
             .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
+        let pooled_conn_admission = self.conn_admission(proxy, dial_host, app_policy_port);
         let sender = match tokio::time::timeout(
             remaining,
             self.create_sender(
@@ -1156,6 +1224,7 @@ impl HboneConnectionPool {
                 keepalive_override,
                 Some(remaining),
                 crls_before_dial.clone(),
+                pooled_conn_admission.as_ref(),
             ),
         )
         .await
@@ -1358,6 +1427,7 @@ impl HboneConnectionPool {
         keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
         connect_timeout_override: Option<Duration>,
         crls: crate::tls::CrlList,
+        conn_admission: Option<&crate::backend_conn_limit::PooledConnectionAdmission<'_>>,
     ) -> Result<SendRequest<Bytes>, HbonePoolError> {
         // The raw-`h2` dial over SVID-mTLS is the transport primitive shared
         // with the Sidecar mesh-mTLS raw-TCP egress path; only the dial port
@@ -1377,6 +1447,7 @@ impl HboneConnectionPool {
             pool_config,
             keepalive_override,
             connect_timeout_override,
+            conn_admission,
         )
         .await
     }
@@ -1578,7 +1649,31 @@ pub(crate) async fn dial_h2_connect_sender(
     // the WHOLE dial (TCP + TLS + H2 handshake), mirroring the byte-stream
     // inbound relay's `effective_connect_timeout_ms` (codex r5 P2).
     connect_timeout_override: Option<Duration>,
+    // DestinationRule `connectionPool.tcp.maxConnections` admission lane for the
+    // destination's APP/service policy port (again NOT the transport dial port).
+    // `None` means the destination carries no cap and the dial proceeds
+    // unconditionally. When `Some`, one physical-connection slot is reserved
+    // before dialing and handed to the spawned H2 connection driver, so it is
+    // released exactly when this tunnel connection closes — idle prune, pool
+    // drain, SVID rotation drain on reload/update/delete, or shutdown. Reuse of
+    // a pooled tunnel takes no slot, so any number of multiplexed CONNECT
+    // streams ride one admitted connection.
+    conn_admission: Option<&crate::backend_conn_limit::PooledConnectionAdmission<'_>>,
 ) -> Result<SendRequest<Bytes>, HbonePoolError> {
+    let conn_slot = match conn_admission {
+        Some(admission) => match admission.acquire() {
+            Ok(slot) => Some(slot),
+            Err(limit) => {
+                return Err(HbonePoolError::MaxConnectionsExceeded {
+                    host: admission.host().to_string(),
+                    port: admission.policy_port(),
+                    current: limit.current,
+                    cap: limit.cap,
+                });
+            }
+        },
+        None => None,
+    };
     let candidates = dns_cache
         .resolve_candidates(
             target_host,
@@ -1626,6 +1721,9 @@ pub(crate) async fn dial_h2_connect_sender(
     crate::dns::connect_candidates(&candidates, dial_port, connect_timeout, |sock_addr| {
         let connector = connector.clone();
         let server_name = server_name.clone();
+        // One reservation, cloned per DNS candidate: a failed attempt drops its
+        // clone, so only an established tunnel keeps the slot.
+        let conn_slot = conn_slot.clone();
         async move {
             let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                 .await
@@ -1688,6 +1786,9 @@ pub(crate) async fn dial_h2_connect_sender(
             // TLS ALPN already proved H2 for this candidate. Drive it without
             // blocking healthy HBONE peers on a SETTINGS-derived sentinel.
             tokio::spawn(async move {
+                // The `maxConnections` slot lives exactly as long as the
+                // connection driver, i.e. as long as the tunnel socket is open.
+                let _conn_slot = conn_slot;
                 if let Err(e) = connection.await {
                     debug!("mesh h2 connect pool: HTTP/2 connection closed: {}", e);
                 }

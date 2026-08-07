@@ -2103,6 +2103,10 @@ pub struct RequestContext {
     /// admission uses it to reject a retired service-discovery target view
     /// after a structural target-set publication.
     pub lb_generation: u64,
+    /// Configuration generation pinned with this request's route and policy
+    /// snapshot. Transport admission uses it to prevent a late request from a
+    /// retired configuration from re-publishing stale connection limits.
+    pub(crate) config_generation: u64,
     /// Per-proxy lifecycle ownership generation captured at routing/admission
     /// from the published plugin-cache generation. Carried into transaction
     /// summaries so `proxy_alerts` can reject samples from a prior
@@ -2874,6 +2878,13 @@ pub struct RequestContext {
     ///
     /// Clone-safe via `Arc` — all proxy paths share one counter per request.
     pub bytes_sent_observed: Arc<std::sync::atomic::AtomicU64>,
+    /// Complete gRPC length-prefixed request messages observed while forwarding
+    /// the request body. Shared with streaming body adapters; summary builders
+    /// load with `Acquire` at log time.
+    pub grpc_request_messages_observed: Arc<std::sync::atomic::AtomicU64>,
+    /// Complete gRPC length-prefixed response messages observed while streaming
+    /// the response body to the client.
+    pub grpc_response_messages_observed: Arc<std::sync::atomic::AtomicU64>,
     /// Whether this request arrived via TLS 1.3 0-RTT early data.
     /// Set on HTTP/3 via quinn's `into_0rtt()` detection, and on HTTPS via the
     /// `Early-Data: 1` header (RFC 8470) from upstream proxies/CDNs.
@@ -3120,6 +3131,7 @@ impl RequestContext {
             frontend_listen_port: None,
             frontend_sni_hostname: None,
             lb_generation: 1,
+            config_generation: 1,
             proxy_lifecycle_generation: None,
             raw_headers: None,
             headers: HashMap::new(),
@@ -3238,6 +3250,8 @@ impl RequestContext {
             route_request_body_limit_bytes: None,
             route_response_body_limit_bytes: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            grpc_request_messages_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            grpc_response_messages_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
             peer_connection: None,
             mesh_route_dispatch_reject_unmatched: false,
@@ -4161,6 +4175,7 @@ impl RequestContext {
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
             lb_generation: self.lb_generation,
+            config_generation: self.config_generation,
             proxy_lifecycle_generation: self.proxy_lifecycle_generation,
             // Carried, not dropped: the final-request-body stage is where
             // `ai_semantic_cache` derives its replay partition, and that
@@ -4360,6 +4375,8 @@ impl RequestContext {
             route_request_body_limit_bytes: self.route_request_body_limit_bytes,
             route_response_body_limit_bytes: self.route_response_body_limit_bytes,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
+            grpc_request_messages_observed: Arc::clone(&self.grpc_request_messages_observed),
+            grpc_response_messages_observed: Arc::clone(&self.grpc_response_messages_observed),
             is_early_data: self.is_early_data,
             peer_connection: self.peer_connection.clone(),
             mesh_route_dispatch_reject_unmatched: self.mesh_route_dispatch_reject_unmatched,
@@ -6634,6 +6651,13 @@ pub struct TransactionSummary {
     ///   the body counter. On a client disconnect mid-stream this reflects
     ///   bytes actually flushed before the disconnect.
     pub bytes_received: u64,
+    /// Complete gRPC length-prefixed request messages observed for this
+    /// transaction. Zero for non-gRPC traffic. Populated from buffered body
+    /// frame counts or the streaming scanner shared on `RequestContext`.
+    pub grpc_request_messages: u64,
+    /// Complete gRPC length-prefixed response messages observed for this
+    /// transaction. Zero for non-gRPC traffic.
+    pub grpc_response_messages: u64,
     /// True when this summary represents a mirror (shadow) request, not the
     /// actual client-facing proxy traffic. Logged as a separate entry with the
     /// same schema so existing log queries and dashboards work without changes.
@@ -6729,6 +6753,12 @@ impl Serialize for TransactionSummary {
         }
         if self.bytes_received != 0 {
             map.serialize_entry("bytes_received", &self.bytes_received)?;
+        }
+        if self.grpc_request_messages != 0 {
+            map.serialize_entry("grpc_request_messages", &self.grpc_request_messages)?;
+        }
+        if self.grpc_response_messages != 0 {
+            map.serialize_entry("grpc_response_messages", &self.grpc_response_messages)?;
         }
         if self.mirror {
             map.serialize_entry("mirror", &true)?;

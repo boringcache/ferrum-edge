@@ -966,6 +966,7 @@ independently attributable without logging request credentials.
 - `port_exhaustion` — EADDRNOTAVAIL — all ephemeral ports in use
 - `client_disconnect` — client gave up before the gateway could complete the response
 - `graceful_remote_close` — peer closed cleanly (HTTP/3 `H3_NO_ERROR`, RFC 6455 Close frame); informational, not a transport failure
+- `backend_connection_limit` — the destination is at its DestinationRule `connectionPool.tcp.maxConnections` ceiling, so the gateway refused to open one more physical connection; pre-wire and health-neutral (no circuit-breaker, passive-health, or adaptive-concurrency effect)
 - `request_error` — catch-all for unclassified gateway-side rejections
 
 Only set when the gateway itself could not communicate with the backend (or when a streaming body fails after headers — that goes on `body_error_class`). Normal HTTP error responses from the backend (e.g., 404, 500) do not set `error_class`.

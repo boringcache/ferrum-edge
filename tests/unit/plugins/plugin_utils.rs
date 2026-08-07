@@ -239,6 +239,8 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
         body_completed: false,
         bytes_sent: 0,
         bytes_received: 0,
+        grpc_request_messages: 0,
+        grpc_response_messages: 0,
         mirror: false,
         metadata: HashMap::new(),
         ai_usage_export: None,
