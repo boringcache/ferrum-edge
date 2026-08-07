@@ -58,10 +58,122 @@ The `FERRUM_TLS_CA_BUNDLE_PATH` allows you to specify custom Certificate Authori
 
 The gateway resolves backend CA trust in the following order:
 
-1. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with **only** that CA. Webpki/system roots are excluded to prevent public CAs from being trusted alongside your internal CA.
-2. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH` / `FERRUM_TLS_CA_BUNDLE_SOURCE`) — verify with **only** the global CA. Same exclusivity as proxy-specific.
-3. **Neither set** — verify with **bundled webpki roots** (secure default). The gateway does **not** skip verification when no CA is configured.
-4. **Explicit opt-out** — `backend_tls_verify_server_cert: false` on a per-proxy basis, or `FERRUM_TLS_NO_VERIFY=true` globally, skips all certificate verification. These are the **only** ways to disable verification and should never be used in production.
+1. **Explicit system roots** (`backend_tls_server_ca_cert_path: "system://"`) — verify with **only** the bundled webpki/system trust anchors. This is a *pin*, not an absence: steps 2 and 4 are skipped entirely (see below).
+2. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with **only** that CA. Webpki/system roots are excluded to prevent public CAs from being trusted alongside your internal CA.
+3. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH` / `FERRUM_TLS_CA_BUNDLE_SOURCE`) — verify with **only** the global CA. Same exclusivity as proxy-specific.
+4. **Neither set** — verify with **bundled webpki roots** (secure default). The gateway does **not** skip verification when no CA is configured.
+5. **Explicit opt-out** — `backend_tls_verify_server_cert: false` on a per-proxy basis, or `FERRUM_TLS_NO_VERIFY=true` globally, skips all certificate verification. These are the **only** ways to disable verification and should never be used in production.
+
+### `system://` — pinning the built-in trust anchors
+
+`system://` is a reserved, first-class value for `backend_tls_server_ca_cert_path`
+(and `Upstream.backend_tls_server_ca_cert_path`). It differs from leaving the
+field unset in three ways that matter:
+
+- It **does not fall back to `FERRUM_TLS_CA_BUNDLE_PATH`**. Leaving the field
+  unset means "no per-backend CA configured", which the chain above resolves to
+  the cluster-global bundle when one is set — so a cluster-wide private CA would
+  become the sole trust anchor. `system://` refuses that substitution.
+- It **never inherits `FERRUM_TLS_NO_VERIFY`**. Pairing it with
+  `backend_tls_verify_server_cert: false` is a config validation error.
+- It **partitions backend connection pools** like any other trust identity, so a
+  `system://` backend never shares a pooled connection with one verified against
+  a custom CA.
+
+It must be spelled exactly `system://`, with no path or query options, and is
+only valid on a CA-bundle field — `system://corp-ca.pem` and `system://` on a
+client cert/key field are both rejected at config load. It is what Gateway API
+`BackendTLSPolicy` `wellKnownCACertificates: System` translates to.
+
+Ferrum supports exactly one `BackendTLSPolicy.spec.targetRefs` entry, following
+the Gateway API v1.5.1 recommendation while multi-target conflict/status
+semantics remain undefined. Non-empty `spec.options` are not supported. These
+and malformed optional field shapes are rejected fail closed rather than
+silently broadening a targeted backend to plaintext.
+
+`targetRefs[].sectionName` names a Service **port name**, and Ferrum resolves it
+against the Service's actual `spec.ports`. A `sectionName` that matches no port
+makes the policy fail to attach (`Accepted=False`, `reason: TargetNotFound`); it
+does not silently apply elsewhere, and it does not fault the Service's other
+valid ports, because the port the operator meant cannot be inferred.
+
+BackendTLSPolicy applies only to TCP traffic (Gateway API GEP-1897). Eligibility
+is decided on the **port's transport**, and a port is eligible only when its
+`spec.ports[].protocol` is proven to be `TCP` — omitted counts as TCP, since
+Kubernetes defaults the field, and the comparison is case-insensitive. `UDP`,
+`SCTP`, and any protocol value Ferrum does not recognize are all ineligible:
+GEP-1897 names UDP in its examples, but the rule it states is that the policy
+configures TLS for TCP traffic, and no TLS handshake can be originated on an
+SCTP or unknown-transport port.
+
+* A policy that explicitly attaches to an ineligible port — a `sectionName`
+  naming a `UDP`, `SCTP`, or unrecognized-protocol port — is rejected with
+  `Accepted=False`, `reason: Invalid`. The rejection stays scoped to the port the
+  `sectionName` named; sibling TCP ports keep their pre-policy behaviour.
+* A Service-wide policy on a Service with **no** TCP port is rejected the same
+  way: it would govern nothing, so reporting it Accepted would be a misreport.
+* A Service that mixes TCP and non-TCP ports is accepted with a warning in the
+  `Accepted` condition message, and the policy takes effect only on its TCP
+  ports. The non-TCP ports keep their pre-policy behaviour.
+* A Service declaring more than 64 ports exceeds Ferrum's bounded port index, so
+  the transport of the targeted port cannot be proven and every policy targeting
+  that Service is rejected fail closed.
+
+In every rejection case, a route backend that actually selects the policy fails
+closed with an HTTP 500 fault rather than originating TLS onto an ineligible
+transport or falling back to plaintext. Status condition messages name the
+transport from a fixed set (`TCP` / `UDP` / `SCTP` / "not a recognized Kubernetes
+protocol") and never echo the raw, cluster-supplied `protocol` string.
+
+Health probes follow the same trust policy **and the same identity** as proxy
+traffic, and both are fail-closed on explicitly configured material:
+
+* A configured backend CA is the **sole** trust anchor, so when it cannot be
+  loaded or parsed — including a `caCertificateRefs` Secret whose
+  `k8s://…#ca.crt` source becomes unreadable after translation accepted it — the
+  probe client is not built and probes report unhealthy. Ferrum never falls back
+  to the system roots for a backend pinned to a private CA, because that would
+  let any publicly-trusted certificate keep a target marked healthy.
+* A configured backend mTLS client certificate/key pair that cannot be loaded or
+  parsed also fails the probe. Continuing anonymously would measure a different
+  handshake than real requests perform: a backend that merely *prefers* client
+  certificates answers the anonymous probe while refusing proxy traffic, marking
+  a target healthy that no request can use. A **half-configured** pair (a
+  certificate without a key, or a key without a certificate) fails for the same
+  reason instead of being silently ignored.
+* Both rules hold **regardless of verification mode**. Disabling verification
+  (`backend_tls_verify_server_cert: false` or `FERRUM_TLS_NO_VERIFY=true`) is a
+  statement about whether the peer certificate is *checked*; it is not a licence
+  to ignore material the operator explicitly named. An unloadable CA or identity
+  is a configuration fault and surfaces as one in both modes. This applies to the
+  HTTP and gRPC probe paths alike, in their verified and no-verify branches.
+* Probe diagnostics carry the material's source identifier and a failure class
+  only — never certificate or key bytes.
+* A backend TLS **server-name override** (`backend_tls_sni`, which
+  `BackendTLSPolicy` `validation.hostname` and a DestinationRule
+  `trafficPolicy.tls.sni` both project onto) is applied by **HTTP and gRPC
+  probes** as well. A backend whose certificate is valid only for the override
+  name would otherwise serve requests successfully while every probe failed name
+  verification against the target host and ejected it. The probe still dials
+  only the already-resolved, egress-screened target candidate, and the backend
+  still sees its own authority:
+  * the **HTTP** probe puts the override in the probe URL's authority — reqwest
+    derives the rustls server name from the URL and exposes no per-request hook,
+    the same constraint the proxy HTTP/1.1 path works around — while pinning
+    that client's DNS resolver to the **real target host**, so the override
+    hostname is never resolved and the socket cannot leave that target's
+    screened candidate set. `Host` is sent explicitly as the real target
+    authority, and that client's ALPN is restricted to `http/1.1` so the
+    explicit `Host` stays authoritative — over HTTP/2 the authority is rebuilt
+    from the URI, i.e. from the server name, which would show the backend the
+    override instead of the target being probed. Because the pin names one
+    target, an HTTPS probe with an override builds one client per target instead
+    of one per upstream, and fails closed — never degrading to an unpinned,
+    h2-capable client — if no DNS cache is available to pin with.
+  * the **gRPC** probe sets the override as the TLS `domain_name` (verified
+    branch) and as the rustls `ServerName` (no-verify branch), while tonic's
+    `origin` keeps the real target authority for `:authority`.
+  * **TCP** and **UDP** probes perform no TLS handshake and are unaffected.
 
 **CA exclusivity**: When a custom CA is configured, it is the sole trust anchor. This prevents a backend pinned to an internal CA from being MITMed via any publicly-trusted certificate. If you need both internal and public CAs trusted, combine them into a single PEM bundle file.
 

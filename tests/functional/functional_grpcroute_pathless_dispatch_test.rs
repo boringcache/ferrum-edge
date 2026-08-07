@@ -294,8 +294,8 @@ async fn functional_grpcroute_pathless_method_only_dispatch_on_live_gateway() {
     );
     assert_eq!(
         headers.get("grpc-status").map(String::as_str),
-        Some("5"),
-        "HTTP 404 reject_unmatched maps to grpc-status NOT_FOUND(5); headers={headers:?}"
+        Some("12"),
+        "HTTP 404 reject_unmatched maps to grpc-status UNIMPLEMENTED(12); headers={headers:?}"
     );
     assert_eq!(
         backend.hits(),

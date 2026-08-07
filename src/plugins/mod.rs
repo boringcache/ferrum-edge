@@ -2103,6 +2103,10 @@ pub struct RequestContext {
     /// admission uses it to reject a retired service-discovery target view
     /// after a structural target-set publication.
     pub lb_generation: u64,
+    /// Configuration generation pinned with this request's route and policy
+    /// snapshot. Transport admission uses it to prevent a late request from a
+    /// retired configuration from re-publishing stale connection limits.
+    pub(crate) config_generation: u64,
     /// Per-proxy lifecycle ownership generation captured at routing/admission
     /// from the published plugin-cache generation. Carried into transaction
     /// summaries so `proxy_alerts` can reject samples from a prior
@@ -2874,6 +2878,13 @@ pub struct RequestContext {
     ///
     /// Clone-safe via `Arc` — all proxy paths share one counter per request.
     pub bytes_sent_observed: Arc<std::sync::atomic::AtomicU64>,
+    /// Complete gRPC length-prefixed request messages observed while forwarding
+    /// the request body. Shared with streaming body adapters; summary builders
+    /// load with `Acquire` at log time.
+    pub grpc_request_messages_observed: Arc<std::sync::atomic::AtomicU64>,
+    /// Complete gRPC length-prefixed response messages observed while streaming
+    /// the response body to the client.
+    pub grpc_response_messages_observed: Arc<std::sync::atomic::AtomicU64>,
     /// Whether this request arrived via TLS 1.3 0-RTT early data.
     /// Set on HTTP/3 via quinn's `into_0rtt()` detection, and on HTTPS via the
     /// `Early-Data: 1` header (RFC 8470) from upstream proxies/CDNs.
@@ -2933,7 +2944,24 @@ pub struct RequestContext {
     /// Used by mesh L7 route dispatch so route-local policy follows the
     /// matched predicate even when the hot router selected a later fallback
     /// proxy for the same public path.
+    ///
+    /// On the reqwest dispatch path this is the vendored `RequestBuilder::timeout()`
+    /// budget, which reqwest applies from connect through **response body
+    /// completion** — it is a whole-exchange bound, not a per-chunk inactivity
+    /// bound. `Some(0)` deliberately means "no gateway-imposed whole-exchange
+    /// bound" (dispatch only installs a timeout when the effective value is
+    /// non-zero), which is how a long-running streamed generation opts out of the
+    /// placeholder proxy's default.
     pub route_override_backend_read_timeout_ms: Option<u64>,
+    /// Plugin-set override for the proxy's backend connect timeout.
+    ///
+    /// Counterpart to [`Self::route_override_backend_read_timeout_ms`] for
+    /// plugins that repoint a request at a direct third-party destination whose
+    /// operator-configured connect budget differs from the placeholder proxy's.
+    /// Without it, a direct provider claim silently inherits the matched proxy's
+    /// `backend_connect_timeout_ms` and the plugin's own configured connect
+    /// budget is never applied.
+    pub route_override_backend_connect_timeout_ms: Option<u64>,
     /// Plugin-set override for the proxy's retry policy. Outer `None` means
     /// no override; `Some(None)` intentionally clears the selected proxy's
     /// retry policy for this route.
@@ -3103,6 +3131,7 @@ impl RequestContext {
             frontend_listen_port: None,
             frontend_sni_hostname: None,
             lb_generation: 1,
+            config_generation: 1,
             proxy_lifecycle_generation: None,
             raw_headers: None,
             headers: HashMap::new(),
@@ -3221,6 +3250,8 @@ impl RequestContext {
             route_request_body_limit_bytes: None,
             route_response_body_limit_bytes: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            grpc_request_messages_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            grpc_response_messages_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
             peer_connection: None,
             mesh_route_dispatch_reject_unmatched: false,
@@ -3231,6 +3262,7 @@ impl RequestContext {
             route_override_backend_port: None,
             route_override_resolved_tls: None,
             route_override_backend_read_timeout_ms: None,
+            route_override_backend_connect_timeout_ms: None,
             route_override_retry: None,
             route_override_request_transform: None,
             route_override_response_transform: None,
@@ -4143,6 +4175,7 @@ impl RequestContext {
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
             lb_generation: self.lb_generation,
+            config_generation: self.config_generation,
             proxy_lifecycle_generation: self.proxy_lifecycle_generation,
             // Carried, not dropped: the final-request-body stage is where
             // `ai_semantic_cache` derives its replay partition, and that
@@ -4342,6 +4375,8 @@ impl RequestContext {
             route_request_body_limit_bytes: self.route_request_body_limit_bytes,
             route_response_body_limit_bytes: self.route_response_body_limit_bytes,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
+            grpc_request_messages_observed: Arc::clone(&self.grpc_request_messages_observed),
+            grpc_response_messages_observed: Arc::clone(&self.grpc_response_messages_observed),
             is_early_data: self.is_early_data,
             peer_connection: self.peer_connection.clone(),
             mesh_route_dispatch_reject_unmatched: self.mesh_route_dispatch_reject_unmatched,
@@ -4352,6 +4387,8 @@ impl RequestContext {
             route_override_backend_port: self.route_override_backend_port,
             route_override_resolved_tls: self.route_override_resolved_tls.clone(),
             route_override_backend_read_timeout_ms: self.route_override_backend_read_timeout_ms,
+            route_override_backend_connect_timeout_ms: self
+                .route_override_backend_connect_timeout_ms,
             route_override_retry: self.route_override_retry.clone(),
             route_override_request_transform: self.route_override_request_transform.clone(),
             route_override_response_transform: self.route_override_response_transform.clone(),
@@ -4636,6 +4673,7 @@ impl RequestContext {
             || self.route_override_backend_port.is_some()
             || self.route_override_resolved_tls.is_some()
             || self.route_override_backend_read_timeout_ms.is_some()
+            || self.route_override_backend_connect_timeout_ms.is_some()
             || self.route_override_retry.is_some()
     }
 
@@ -4794,6 +4832,9 @@ impl RequestContext {
         let backend_read_timeout_changed = self
             .route_override_backend_read_timeout_ms
             .is_some_and(|timeout| timeout != proxy.backend_read_timeout_ms);
+        let backend_connect_timeout_changed = self
+            .route_override_backend_connect_timeout_ms
+            .is_some_and(|timeout| timeout != proxy.backend_connect_timeout_ms);
         let retry_changed = self
             .route_override_retry
             .as_ref()
@@ -4820,6 +4861,7 @@ impl RequestContext {
             && !dispatch_port_overrides_changed
             && !dispatch_port_override_fallback_changed
             && !backend_read_timeout_changed
+            && !backend_connect_timeout_changed
             && !retry_changed
             && !preserve_host_changed
             && !strip_listen_path_changed
@@ -4862,6 +4904,9 @@ impl RequestContext {
         }
         if let Some(timeout) = self.route_override_backend_read_timeout_ms {
             overridden.backend_read_timeout_ms = timeout;
+        }
+        if let Some(timeout) = self.route_override_backend_connect_timeout_ms {
+            overridden.backend_connect_timeout_ms = timeout;
         }
         if let Some(retry) = &self.route_override_retry {
             overridden.retry = retry.clone();
@@ -6606,6 +6651,13 @@ pub struct TransactionSummary {
     ///   the body counter. On a client disconnect mid-stream this reflects
     ///   bytes actually flushed before the disconnect.
     pub bytes_received: u64,
+    /// Complete gRPC length-prefixed request messages observed for this
+    /// transaction. Zero for non-gRPC traffic. Populated from buffered body
+    /// frame counts or the streaming scanner shared on `RequestContext`.
+    pub grpc_request_messages: u64,
+    /// Complete gRPC length-prefixed response messages observed for this
+    /// transaction. Zero for non-gRPC traffic.
+    pub grpc_response_messages: u64,
     /// True when this summary represents a mirror (shadow) request, not the
     /// actual client-facing proxy traffic. Logged as a separate entry with the
     /// same schema so existing log queries and dashboards work without changes.
@@ -6701,6 +6753,12 @@ impl Serialize for TransactionSummary {
         }
         if self.bytes_received != 0 {
             map.serialize_entry("bytes_received", &self.bytes_received)?;
+        }
+        if self.grpc_request_messages != 0 {
+            map.serialize_entry("grpc_request_messages", &self.grpc_request_messages)?;
+        }
+        if self.grpc_response_messages != 0 {
+            map.serialize_entry("grpc_response_messages", &self.grpc_response_messages)?;
         }
         if self.mirror {
             map.serialize_entry("mirror", &true)?;
@@ -8570,6 +8628,36 @@ pub trait Plugin: Send + Sync {
     /// client (for example cache invalidation) override this.
     fn observe_origin_http_response_status(&self, _ctx: &mut RequestContext, _status: u16) {}
 
+    /// Returns `true` when this plugin bounds what the ORIGIN contributed to the
+    /// response header map for this request.
+    ///
+    /// Checked once per response before the first `after_proxy` hook runs, so a
+    /// plugin that repointed the request at a third-party destination can reduce
+    /// that destination's metadata without also discarding gateway decorations
+    /// (CORS, tracing, correlation, rate-limit headers) that later hooks add.
+    /// Keep this narrow: it must be `false` for every request the plugin did not
+    /// itself route to a foreign origin.
+    fn enforces_origin_response_header_policy(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    /// Reduce the pristine ORIGIN response header map at the backend → gateway
+    /// boundary, before any `after_proxy` hook has decorated it.
+    ///
+    /// This is the response-side counterpart to
+    /// [`Self::enforce_final_backend_header_policy`]. It is synchronous,
+    /// non-rejecting, and must be idempotent; it must never log a header value.
+    /// Only invoked for plugins whose
+    /// [`Self::enforces_origin_response_header_policy`] returned `true` for this
+    /// request.
+    fn enforce_origin_response_header_policy(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
+    }
+
     /// Returns `true` when a [`PluginResult::Reject`] from this plugin's
     /// reject-path [`Self::after_proxy`] hook must replace the still-uncommitted
     /// response.
@@ -10252,217 +10340,6 @@ pub fn create_plugin_with_http_client_and_config_id(
     }
 }
 
-/// Built-in plugins that the request-body-buffering screen must never
-/// construct, because their constructors reach node-local state that a
-/// config-admission screen has no business touching:
-///
-/// - `geo_restriction` opens the configured MaxMind `.mmdb` database,
-/// - `udp_logging` opens node-local DTLS key material,
-/// - `oidc_relying_party` performs OIDC discovery / JWKS work and retains
-///   background refresh state,
-/// - `transaction_log_schema` registers schemas in the process-wide reload
-///   staging map when another thread owns an active reload bracket.
-///
-/// None of them can ever require request-body buffering, so the screen answers
-/// [`RequestBodyBufferingScreen::Streams`] for them without construction. That
-/// claim is not free-floating: the drift coverage in
-/// `tests/unit/plugins/request_body_buffering_screen_tests.rs` fails if any
-/// entry here ever gains a buffering-related `Plugin` override, and fails if a
-/// new shape-only carve-out appears in
-/// [`validate_plugin_config_with_http_client`] without being classified here or
-/// in [`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`].
-pub const REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT: &[&str] = &[
-    "geo_restriction",
-    "oidc_relying_party",
-    "transaction_log_schema",
-    "udp_logging",
-];
-
-/// Built-in plugins the screen constructs through a shape-only path instead of
-/// the ordinary factory.
-///
-/// `body_validator`'s runtime constructor reads the configured protobuf
-/// `FileDescriptorSet` off local disk. Its shape-only constructor parses the
-/// same config and derives the identical `has_request_validation` flag (the
-/// protobuf request/response *targets* come from the config shape, not from the
-/// descriptor file), so `Plugin::requires_request_body_buffering()` on the
-/// shape-only instance is the authoritative runtime answer.
-///
-/// `ai_response_guard` is here for the same reason: its runtime constructor
-/// reads the `grpc.descriptor_path` `FileDescriptorSet`, while its request-body
-/// answer is the trait default and never depends on that file.
-///
-/// `ai_transcript_audit` joins them once native gRPC capture is enrolled: its
-/// runtime constructor loads the same kind of descriptor set off local disk,
-/// but whether it buffers the request body is decided by the config shape
-/// alone.
-pub const REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY: &[&str] =
-    &["ai_response_guard", "ai_transcript_audit", "body_validator"];
-
-/// Why the request-body-buffering screen could not evaluate a plugin config.
-///
-/// Deliberately value-free: the variants classify the gap without echoing any
-/// configuration value back into logs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestBodyBufferingScreenGap {
-    /// Not a built-in plugin — a `custom_plugins/` build-time plugin, or an
-    /// unknown / retired name. The screen refuses to instantiate third-party
-    /// constructors during config admission.
-    NotBuiltin,
-    /// A built-in plugin whose configuration did not construct. The
-    /// configuration is rejected on its own merits by plugin-config validation;
-    /// the buffering question is simply unanswerable here.
-    ConstructionFailed,
-}
-
-impl RequestBodyBufferingScreenGap {
-    /// Stable, value-redacted reason token for structured diagnostics.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::NotBuiltin => "plugin is not a built-in plugin",
-            Self::ConstructionFailed => "plugin configuration did not construct",
-        }
-    }
-}
-
-/// Result of the config-time request-body-buffering screen for one plugin
-/// config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestBodyBufferingScreen {
-    /// The constructed plugin reports
-    /// `Plugin::requires_request_body_buffering() == true`.
-    Buffers,
-    /// The constructed plugin reports
-    /// `Plugin::requires_request_body_buffering() == false`.
-    Streams,
-    /// The screen could not evaluate this plugin config.
-    Indeterminate(RequestBodyBufferingScreenGap),
-}
-
-impl RequestBodyBufferingScreen {
-    fn from_trait_answer(buffers: bool) -> Self {
-        if buffers {
-            Self::Buffers
-        } else {
-            Self::Streams
-        }
-    }
-}
-
-/// Side-effect-free screen for "does this plugin config force request-body
-/// buffering", derived from the authoritative
-/// [`Plugin::requires_request_body_buffering`] implementation.
-///
-/// Backend-TLS SNI admission uses this: plain HTTPS SNI overrides require the
-/// direct-H2 pool, which cannot dispatch when request bodies are pre-buffered.
-/// The screen builds a plugin instance from the SAME parsed configuration the
-/// runtime `PluginCache` builds and asks the same trait method, so there is no
-/// second implementation of "which plugins buffer" to drift out of sync.
-///
-/// Construction here is deliberately inert:
-///
-/// - the plugin is dropped immediately and never enters a cache, so no
-///   candidate state is published,
-/// - `Plugin::start_background_tasks()` is never called, which is where
-///   built-ins normally defer workers, timers, spool files, and registry
-///   publication,
-/// - side-effectful constructors are carved out entirely
-///   ([`REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT`]) or routed through their
-///   existing shape-only constructor
-///   ([`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`]),
-/// - custom (`custom_plugins/`) and unknown names are never instantiated.
-///
-/// The HTTP client carries a default-open egress policy on purpose: the screen
-/// asks a buffering question, and endpoint egress admission is owned by
-/// [`validate_plugin_config_with_policy`]. Screening must not invent a
-/// rejection for an unrelated policy reason.
-pub struct RequestBodyBufferingScreener {
-    http_client: PluginHttpClient,
-}
-
-impl Default for RequestBodyBufferingScreener {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RequestBodyBufferingScreener {
-    /// Build a screener. The client construction is the same one
-    /// [`create_plugin`] uses, so a plugin whose construction depends on
-    /// process-wide compression admission resolves identically here and at
-    /// config-load validation.
-    pub fn new() -> Self {
-        Self {
-            http_client: PluginHttpClient::default().with_process_compression_admission_policy(),
-        }
-    }
-
-    /// Screen one plugin config.
-    pub fn screen(&self, plugin_name: &str, config: &Value) -> RequestBodyBufferingScreen {
-        if REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT.contains(&plugin_name) {
-            return RequestBodyBufferingScreen::Streams;
-        }
-        if REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY.contains(&plugin_name) {
-            return self.screen_shape_only(plugin_name, config);
-        }
-        if !is_builtin_plugin_name(plugin_name) {
-            return RequestBodyBufferingScreen::Indeterminate(
-                RequestBodyBufferingScreenGap::NotBuiltin,
-            );
-        }
-        let client = self.http_client.clone();
-        match create_plugin_with_http_client(plugin_name, config, client) {
-            // The instance is dropped right here: nothing is published and
-            // `Plugin::start_background_tasks()` is never called.
-            Ok(Some(plugin)) => {
-                let buffers = plugin.requires_request_body_buffering();
-                RequestBodyBufferingScreen::from_trait_answer(buffers)
-            }
-            // A registered built-in that yields `None` is a retired/fail-closed
-            // alias; treat it like any other unanswerable name.
-            Ok(None) => {
-                RequestBodyBufferingScreen::Indeterminate(RequestBodyBufferingScreenGap::NotBuiltin)
-            }
-            // The constructor message can echo configured values, so it is
-            // deliberately dropped here — plugin-config validation surfaces the
-            // detailed error on its own path.
-            Err(_) => RequestBodyBufferingScreen::Indeterminate(
-                RequestBodyBufferingScreenGap::ConstructionFailed,
-            ),
-        }
-    }
-
-    /// Screen a plugin listed in [`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`]
-    /// through its shape-only constructor.
-    fn screen_shape_only(&self, plugin_name: &str, config: &Value) -> RequestBodyBufferingScreen {
-        let answer = match plugin_name {
-            "ai_response_guard" => ai_response_guard::AiResponseGuard::new_shape_only(config)
-                .map(|plugin| plugin.requires_request_body_buffering()),
-            "ai_transcript_audit" => ai_transcript_audit::AiTranscriptAudit::new_shape_only(
-                config,
-                self.http_client.clone(),
-            )
-            .map(|plugin| plugin.requires_request_body_buffering()),
-            "body_validator" => body_validator::BodyValidator::new_shape_only(config)
-                .map(|plugin| plugin.requires_request_body_buffering()),
-            // Unreachable today. A name added to the shape-only list without a
-            // branch here must fail unanswerable rather than be silently
-            // mis-screened as non-buffering; the drift test also fails.
-            _ => {
-                return RequestBodyBufferingScreen::Indeterminate(
-                    RequestBodyBufferingScreenGap::ConstructionFailed,
-                );
-            }
-        };
-        match answer {
-            Ok(buffers) => RequestBodyBufferingScreen::from_trait_answer(buffers),
-            Err(_) => RequestBodyBufferingScreen::Indeterminate(
-                RequestBodyBufferingScreenGap::ConstructionFailed,
-            ),
-        }
-    }
-}
-
 /// Validate a plugin configuration by attempting to instantiate the plugin,
 /// with a default-open egress policy.
 ///
@@ -10528,9 +10405,9 @@ pub(crate) fn validate_plugin_config_with_http_client(
         return oidc_relying_party::OidcRelyingParty::validate_config(config, http_client);
     }
     if name == "transaction_log_schema" {
-        // Shape-only: shared Admin / CP validation and the buffering screen must
-        // not stage schemas in the process-wide reload map. Graph validation and
-        // cache reloads construct explicitly inside an open reload bracket.
+        // Shape-only: shared Admin / CP validation must not stage schemas in the
+        // process-wide reload map. Graph validation and cache reloads construct
+        // explicitly inside an open reload bracket.
         return transaction_log_schema::TransactionLogSchema::validate_config(config);
     }
     match create_plugin_with_http_client(name, config, http_client)? {

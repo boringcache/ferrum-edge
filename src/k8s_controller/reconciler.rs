@@ -1113,7 +1113,17 @@ fn log_mesh_overlay_transition(
 }
 
 const K8S_MANAGED_PROXY_ID_PREFIXES: &[&str] = &["gwapi-route-", "gwapi-l4-", "istio-vs-"];
-const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &["gwapi-route-upstream-", "istio-vs-upstream-"];
+/// Every generated-upstream id prefix the translator can emit. A prefix missing
+/// here is never withdrawn from the active snapshot, so each compose appends
+/// another copy of the same upstream — unbounded growth plus a spurious
+/// "config changed" republication on every reconcile. `istio-vs-l4-upstream-`
+/// (VirtualService `tcp[]`/`tls[]` weighted splits) is NOT covered by
+/// `istio-vs-upstream-`; both must be listed.
+const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &[
+    "gwapi-route-upstream-",
+    "istio-vs-upstream-",
+    "istio-vs-l4-upstream-",
+];
 const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] = &[
     "istio-vs-cors-",
     "istio-vs-fi-",

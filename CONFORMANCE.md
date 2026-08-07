@@ -3,8 +3,8 @@
 Ferrum's conformance story spans two surfaces, each with its own owner doc:
 
 1. **Upstream Gateway API conformance** — the `gateway.networking.k8s.io`
-   `GatewayClass` / `Gateway` / `HTTPRoute` surface (plus watched `GRPCRoute`
-   and live black-box `TCPRoute` / `TLSRoute`), validated by the standalone
+   `GatewayClass` / `Gateway` / `HTTPRoute` / `GRPCRoute` surface (plus live
+   black-box `TCPRoute` / `TLSRoute`), validated by the standalone
    **`Gateway API Conformance`** GitHub Actions workflow
    (`.github/workflows/gateway-api-conformance.yml`) against a real
    `kind` data plane.
@@ -32,8 +32,9 @@ citations):
   (Mondays 07:00 UTC), and manual `workflow_dispatch`. A path-filter `changes`
   job skips the heavy lab when no routing / translation / chart / image / proto
   / CI surface changed.
-- **Profile & features.** Gateway API `v1.5.1`, profile `GATEWAY-HTTP`,
-  supported features `Gateway,ReferenceGrant,HTTPRoute`, GatewayClass `ferrum`,
+- **Profile & features.** Gateway API `v1.5.1`, profiles
+  `GATEWAY-HTTP,GATEWAY-GRPC`, supported features
+  `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`, GatewayClass `ferrum`,
   controller `ferrum.io/gateway-controller`. Live `TCPRoute` and `TLSRoute`
   data-plane behavior is release-gated by Ferrum black-box checks in the same
   workflow (not by advertising upstream `GATEWAY-TCP` / `GATEWAY-TLS` profiles
@@ -86,7 +87,9 @@ CRDs plus the xDS type URLs Ferrum subscribes to.
 - **`istio_service_entry_egress`** — `location: MESH_EXTERNAL` vs
   `MESH_INTERNAL`, HTTP-family + stream-family egress materialization
   (T5-A, PR #907), `outboundTrafficPolicy: REGISTRY_ONLY` injection
-  (T5-B, PR #893), hostname normalization.
+  (T5-B, PR #893), workload-scoped `Sidecar.outboundTrafficPolicy`
+  override in both directions plus its fail-closed unsupported variants
+  (issue #3262), hostname normalization.
 - **`xds_type_urls`** — every type URL Ferrum subscribes to in
   `XDS_TYPE_URLS` (CDS, EDS, LDS, RDS, SDS, ECDS, RTDS) plus the ECDS
   DR-carrier inner
@@ -178,14 +181,26 @@ who want to investigate a specific feature can
 
 ## Deferred entries
 
+This section summarizes the in-process suite's `deferred` rows. The
+**authoritative** matrix is the generated artifact from
+`cargo test --test conformance_tests` → `target/conformance/coverage.md`
+(and `coverage.json`); when this page and the generated file disagree, trust
+the generated output from the latest green `main` run.
+
 The current run records these `deferred` entries:
 
 - `istio_destination_rule` —
-  `trafficPolicy.connectionPool.http.{http1MaxPendingRequests, maxRetries,
-  h2UpgradePolicy}` are projected and enforced at top-level /
-  `portLevelSettings` (F5.1 — all three now `supported`); they remain deferred
-  ONLY when set inside a `subsets[].trafficPolicy` (the subset apply path builds
-  a `SubsetTrafficPolicy` that carries no `connectionPool.http`).
+  `trafficPolicy.connectionPool.http.maxRequestsPerConnection` is parsed and
+  validated but not enforced (close-after-N backend requests unsupported) at
+  any scope.
+- `istio_destination_rule` —
+  `subsets[].trafficPolicy.connectionPool.http.{idleTimeout,http2MaxRequests}`
+  are validated like their top-level forms but dropped by the subset apply
+  layer (`ResolvedSubsetTrafficPolicy` carries only `h2UpgradePolicy`,
+  `maxRetries`, and `http1MaxPendingRequests`); set those fields at
+  `trafficPolicy` or `portLevelSettings` scope instead. The three shipped
+  subset fields (`h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`)
+  are `supported` at subset scope (PR #3547).
 
 Previously deferred and now flipped to `supported`:
 

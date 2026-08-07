@@ -20,8 +20,10 @@
 //!   route blocks are translated to stream proxies (port / SNI-passthrough);
 //!   HTTP `mirror`/`rewrite`/`redirect`/`corsPolicy` are translated. L4 match
 //!   predicates (source identity/labels, CIDRs, and gateways) compile onto the
-//!   stream matcher; malformed predicates and weighted splitting are rejected
-//!   fail-closed (`Invalid`).
+//!   stream matcher; weighted multi-destination splits materialize an
+//!   upstream-backed stream proxy, while malformed predicates,
+//!   `destination.subset`, and invalid weights are rejected fail-closed
+//!   (`Invalid`).
 //! - `ServiceEntry` — status reports the resolved `resolution`/`location`
 //!   and host/endpoint/port counts.
 //! - `RequestAuthentication` — status reports the resolved scope and the
@@ -75,10 +77,11 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::config_sources::k8s::{
-    K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
-    route_local_fault_delay_for_rule, service_entry_port_protocol_is_udp,
-    sidecar_selector_from_istio, translate_k8s_objects_collecting_skips,
-    workload_entry_service_key_from_host, workload_selector_from_istio,
+    K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, SidecarOutboundPolicy,
+    classify_sidecar_outbound_traffic_policy, route_local_fault_delay_for_rule,
+    service_entry_port_protocol_is_udp, sidecar_selector_from_istio,
+    translate_k8s_objects_collecting_skips, workload_entry_service_key_from_host,
+    workload_selector_from_istio,
 };
 use crate::k8s_controller::status::StatusTranslationReuse;
 use crate::k8s_controller::status_plan::{
@@ -934,10 +937,12 @@ fn accepted_status(
 /// (incl. `mirror` / `rewrite` / `redirect` / `corsPolicy`) and `spec.tcp` /
 /// `spec.tls` L4 route blocks (translated to stream proxies: port / SNI
 /// passthrough) with supported L4 match predicates compiled onto
-/// `Proxy.stream_match`. Malformed predicates, weighted splitting, and any
-/// other `K8sTranslateError` (bad backend, etc.) surface through the `Invalid`
-/// arm. `corsPolicy` is deferred only for a policy combination Ferrum cannot
-/// represent faithfully (a malformed/unknown origin matcher, an over-budget
+/// `Proxy.stream_match` and weighted multi-destination splits materializing an
+/// upstream-backed stream proxy. Malformed predicates, `destination.subset`,
+/// invalid weights, and any other `K8sTranslateError` (bad backend, etc.)
+/// surface through the `Invalid` arm. `corsPolicy` is deferred only for a
+/// policy combination Ferrum cannot represent faithfully (a
+/// malformed/unknown origin matcher, an over-budget
 /// matcher list or value, an un-compilable/over-complex regex, an unparseable
 /// `maxAge`, or credentialed exact `*`); exact/prefix/regex origin matchers are
 /// otherwise translated.
@@ -1006,15 +1011,19 @@ fn virtual_service_status(
 /// VirtualService HTTP-route fields the translator parses past but never
 /// projects. `tcp` / `tls` route arrays are not listed here: they are
 /// translated to stream proxies (L4 match predicates compile onto
-/// `stream_match`; weighted splitting surfaces via the `Invalid` arm, not as
-/// deferred). `corsPolicy` is translated to a `cors` plugin when the complete
-/// source combination is representable; otherwise it is deferred.
+/// `stream_match`; weighted multi-destination splits materialize an
+/// upstream-backed stream proxy, and a rejected L4 route surfaces via the
+/// `Invalid` arm, not as deferred). `corsPolicy` is translated to a `cors`
+/// plugin when the complete source combination is representable; otherwise it
+/// is deferred.
 fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     let mut deferred: Vec<&'static str> = Vec::new();
     // `spec.tcp[]` / `spec.tls[]` are NOT listed as deferred: the translator
     // materializes them as stream proxies (including L4 match predicates on
-    // `Proxy.stream_match`). Weighted splitting and malformed predicates surface
-    // via the `Invalid` arm of `virtual_service_status`. `mirror` /
+    // `Proxy.stream_match`, and weighted multi-destination splits onto an
+    // upstream-backed stream proxy). Malformed predicates, `destination.subset`,
+    // and invalid weights surface via the `Invalid` arm of
+    // `virtual_service_status`. `mirror` /
     // `mirrorPercentage` / `redirect` / `rewrite` are translated, and
     // `corsPolicy` is translated to a proxy-scoped `cors` plugin when its
     // origins are representable — `allowOrigins[]` `exact`/`prefix`/`regex`
@@ -1369,6 +1378,25 @@ fn workload_entry_status(
 /// listener is modeled while the data plane is still serving the default inbound
 /// behavior in the default dry-run / disabled posture (keeps the translator and
 /// the status writer in lock-step on what is actually applied).
+///
+/// `spec.outboundTrafficPolicy` (issue #3262) is reported the same way: the
+/// translated mode lands on `outbound_traffic_policy`, and
+/// `outbound_traffic_policy_enforced` reports that SAME gate — the slice builder
+/// resolves the workload-scoped policy under the identical predicate, so an
+/// operator reading this status can tell a translated-but-inert policy from an
+/// eligible one. Its meaning is deliberately NARROW and resource-local: `true`
+/// means only that (a) this Sidecar carries a translatable workload-scoped policy
+/// and (b) the rollout gate is on. It does NOT mean this Sidecar was SELECTED for
+/// any workload — selection is per-workload, happens later at slice build
+/// (`select_applicable_sidecar` tier precedence over the workload's own
+/// namespace/labels), and the status writer has no workload in hand. A Sidecar
+/// whose `workloadSelector` matches nothing still reports `true`. A
+/// present-but-unrepresentable block is reported in `deferred_fields` with the
+/// enforced fail-closed outcome (`REGISTRY_ONLY`) named explicitly; the
+/// classification comes from the same shared predicate the translator applies.
+/// A REJECTED Sidecar reports the classified mode with an explicit
+/// `outbound_traffic_policy_enforced: false` — a dropped resource enforces
+/// nothing, and an absent qualifier could read as "enforced".
 fn sidecar_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -1395,6 +1423,9 @@ fn sidecar_status(
         "Namespace"
     };
 
+    let outbound_policy = classify_sidecar_outbound_traffic_policy(&object.spec);
+    let outbound_mode = sidecar_outbound_policy_label(&outbound_policy);
+
     match result {
         Ok(_translation) => {
             let (ingress_modelable, ingress_deferred) =
@@ -1414,6 +1445,12 @@ fn sidecar_status(
             for reason in &ingress_deferred {
                 deferred.push(format!("ingress[] {reason}"));
             }
+            // Issue #3262: a present-but-unrepresentable `outboundTrafficPolicy`
+            // is accepted and enforced fail-closed as REGISTRY_ONLY. Surface the
+            // exact field + outcome so the degradation is never silent.
+            if let Some(reason) = outbound_policy.deferred {
+                deferred.push(reason.to_string());
+            }
             // When ingress modeling is gated off, surface the modelable-but-not-
             // applied count so operators still see the shapes Ferrum WOULD model
             // once they enable enforcement (the gate, not the resource, is why
@@ -1426,23 +1463,46 @@ fn sidecar_status(
                      {ingress_modelable} modelable when enabled)"
                 )
             };
+            // Same gate-honest framing as `ingress_clause`, and deliberately no
+            // stronger: the writer knows the resource and the gate, never which
+            // workloads (if any) this Sidecar is selected for, so it claims
+            // eligibility rather than live enforcement on a specific workload.
+            let outbound_clause = if outbound_policy.policy.is_none() {
+                "outboundTrafficPolicy inherited from the mesh-wide policy".to_string()
+            } else if ingress_enforced {
+                format!(
+                    "outboundTrafficPolicy {outbound_mode} enforced for the workloads this \
+                     Sidecar is selected for"
+                )
+            } else {
+                format!(
+                    "outboundTrafficPolicy {outbound_mode} not applied \
+                     (FERRUM_MESH_SIDECAR_ENFORCED off / dry-run)"
+                )
+            };
             let message = if deferred.is_empty() {
                 format!(
                     "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries; \
-                     {ingress_clause}; egress narrowing gated by FERRUM_MESH_SIDECAR_ENFORCED)"
+                     {ingress_clause}; {outbound_clause}; egress narrowing gated by FERRUM_MESH_SIDECAR_ENFORCED)"
                 )
             } else {
                 format!(
                     "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries; \
-                     {ingress_clause}); deferred fields: {}",
+                     {ingress_clause}; {outbound_clause}); deferred fields: {}",
                     deferred.join(", ")
                 )
             };
+            // Resource-local eligibility, NOT per-workload selection: "this
+            // Sidecar carries a translatable policy AND the rollout gate is on".
+            // Which workloads it actually governs is decided at slice build.
+            let outbound_enforced = outbound_policy.policy.is_some() && ingress_enforced;
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "egress_entries": egress_entry_count,
                     "ingress_modeled": ingress_modeled,
+                    "outbound_traffic_policy": outbound_mode,
+                    "outbound_traffic_policy_enforced": outbound_enforced,
                     "deferred_fields": deferred,
                 }
             });
@@ -1450,15 +1510,39 @@ fn sidecar_status(
         }
         Err(error) => {
             let message = format!("Ferrum rejected this Sidecar: {error}");
+            // A rejected Sidecar is dropped from the translation entirely, so it
+            // enforces nothing regardless of the rollout gate. State that
+            // explicitly: an `outbound_traffic_policy` with no
+            // `outbound_traffic_policy_enforced` sibling reads as enforced to
+            // anyone (or anything) diffing the two Sidecar detail shapes.
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "egress_entries": egress_entry_count,
+                    "outbound_traffic_policy": outbound_mode,
+                    "outbound_traffic_policy_enforced": false,
                     "error": format!("{error}"),
                 }
             });
             accepted_status(object, false, "Invalid", &message, Some(detail))
         }
+    }
+}
+
+/// Render a classified `Sidecar.outboundTrafficPolicy` as the Istio-facing token
+/// operators wrote in their YAML (issue #3262), or `Inherit` when the Sidecar
+/// omitted the block entirely and the mesh-wide policy stays in force.
+///
+/// A fail-closed degradation renders as `REGISTRY_ONLY` — the mode Ferrum
+/// actually enforces — with the reason carried separately in `deferred_fields`,
+/// so the reported mode always matches the enforced one.
+fn sidecar_outbound_policy_label(classified: &SidecarOutboundPolicy) -> &'static str {
+    use crate::modes::mesh::config::OutboundTrafficPolicy;
+
+    match classified.policy {
+        None => "Inherit",
+        Some(OutboundTrafficPolicy::AllowAny) => "ALLOW_ANY",
+        Some(OutboundTrafficPolicy::RegistryOnly) => "REGISTRY_ONLY",
     }
 }
 
@@ -1474,7 +1558,7 @@ fn sidecar_status(
 /// and DUPLICATE listener ports are deferred (the translator still accepts the
 /// resource; only the unmodeled entries surface here).
 ///
-/// The duplicate-port dedup mirrors `resolve_applicable_sidecar_ingress` in
+/// The duplicate-port dedup mirrors `resolve_selected_sidecar_ingress` in
 /// `src/modes/mesh/slice.rs`, which reserves a listener port only for the FIRST
 /// successfully resolved entry on that port and warns + drops later entries with
 /// the same port. Counting each supported entry would over-report `ingress_modeled`

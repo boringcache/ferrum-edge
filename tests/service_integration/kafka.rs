@@ -59,6 +59,8 @@ fn summary(path: &str, client_ip: &str) -> TransactionSummary {
         body_completed: true,
         bytes_sent: 0,
         bytes_received: 0,
+        grpc_request_messages: 0,
+        grpc_response_messages: 0,
         mirror: false,
         metadata: HashMap::new(),
         ai_usage_export: None,

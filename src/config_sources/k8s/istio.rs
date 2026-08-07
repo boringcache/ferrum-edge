@@ -36,15 +36,22 @@ use super::{
 };
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
-    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, MAX_RETRIES, MAX_TARGET_WEIGHT, MAX_TIMEOUT_MS,
-    PluginConfig, Proxy, RetryConfig, validate_backend_tls_san_allow_list_entry,
-    validate_backend_tls_sni,
+    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, MAX_RETRIES, MAX_TARGET_WEIGHT,
+    MAX_TARGETS_PER_UPSTREAM, MAX_TIMEOUT_MS, PluginConfig, Proxy, RetryConfig,
+    validate_backend_tls_san_allow_list_entry, validate_backend_tls_sni,
+    validate_system_trust_roots_skip_verify_pairing, validate_tls_material_source_field,
 };
-use crate::plugins::mesh::workload_metrics::{
-    is_recognized_unsupported_istio_metric_family, validate_istio_telemetry_config,
-};
+use crate::plugins::mesh::workload_metrics::validate_istio_telemetry_config;
 
 const URI_LESS_MATCH_LISTEN_PATH: &str = "~.*";
+
+/// Reserved unreachable hostname for all-zero L4 weighted splits.
+///
+/// Mirrors Gateway API's fail-closed zero-weight blackhole host. The backend
+/// port is taken from the original destination(s) so omitted `match.port` keeps
+/// correct listen-port inference (Gateway API can use a fixed sentinel port
+/// because listener ports come from the Gateway, not destinations).
+const L4_ZERO_WEIGHT_BACKEND_HOST: &str = "ferrum-zero-weight.invalid.";
 
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
@@ -657,9 +664,11 @@ fn peer_authentication(
 ///     `materialize_sidecar_inbound_proxies`). Unix-socket `defaultEndpoint`s
 ///     and non-HTTP-family listeners are parsed but cannot be modeled and stay
 ///     in the `deferred_fields` report (resolved fail-closed downstream).
-///
-/// `outboundTrafficPolicy` is still not translated here — it stays in the
-/// documented "deferred" table until a separate PR lands it.
+///   - `spec.outboundTrafficPolicy.mode` → [`MeshSidecar::outbound_traffic_policy`]
+///     (issue #3262), the workload-scoped override of the mesh-wide policy.
+///     Classification is delegated to the shared, fail-closed
+///     [`classify_sidecar_outbound_traffic_policy`] so the status writer's
+///     `deferred_fields` report can never disagree with what is enforced.
 fn sidecar(
     _acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -805,6 +814,19 @@ fn sidecar(
         }
     }
 
+    // `spec.outboundTrafficPolicy` (issue #3262). A present-but-unrepresentable
+    // block resolves to REGISTRY_ONLY rather than rejecting the resource — see
+    // `classify_sidecar_outbound_traffic_policy` for why dropping the Sidecar
+    // would WIDEN egress instead of failing closed.
+    let outbound_policy = classify_sidecar_outbound_traffic_policy(&object.spec);
+    if let Some(reason) = outbound_policy.deferred {
+        report_sidecar_outbound_policy_degradation(
+            &object.metadata.namespace,
+            &object.metadata.name,
+            reason,
+        );
+    }
+
     Ok(MeshSidecar {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
@@ -813,6 +835,7 @@ fn sidecar(
         egress,
         ingress_declared,
         ingress,
+        outbound_traffic_policy: outbound_policy.policy,
     })
 }
 
@@ -1963,6 +1986,24 @@ fn translate_client_tls_settings(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    if let Some(ca_certificates) = ca_certificates.as_deref()
+        && let Err(error) = validate_tls_material_source_field(
+            "trafficPolicy.tls.caCertificates",
+            ca_certificates,
+            crate::tls::source::MaterialKind::CaBundle,
+        )
+    {
+        return Err(invalid_resource(object, error));
+    }
+    if let Some(error) = validate_system_trust_roots_skip_verify_pairing(
+        "trafficPolicy.tls.caCertificates",
+        "trafficPolicy.tls.insecureSkipVerify",
+        ca_certificates.as_deref(),
+        insecure_skip_verify,
+    ) {
+        return Err(invalid_resource(object, error));
+    }
+
     match mode {
         MtlsMode::IstioMutual => {
             if client_certificate.is_some() || private_key.is_some() || ca_certificates.is_some() {
@@ -2778,16 +2819,24 @@ fn attach_l4_stream_match(
     }
 }
 
-/// Resolve the single backend `(host, port)` of an L4 route block. Weighted
-/// multi-destination L4 splitting is rejected fail-closed: a Ferrum stream proxy
-/// forwards to one backend, so splitting would need an upstream-backed stream
-/// proxy (a separate feature) rather than being silently collapsed to one leg.
-fn l4_route_destination(
+/// Resolve L4 (`tcp[]`/`tls[]`) route destinations into Ferrum backends.
+///
+/// Single-destination routes keep a direct `backend_host`/`backend_port` on the
+/// stream proxy. Multi-destination weighted splits materialize an upstream-backed
+/// stream proxy (same WRR/health/locality selection path HTTP uses). Zero-weight
+/// legs in a multi-destination split are skipped with a translator warning; an
+/// all-zero multi-destination split materializes a fail-closed blackhole backend
+/// so the L4 match remains traffic-capturing (a disappeared block would let a
+/// later broader rule/proxy capture the same traffic). Invalid weights, missing
+/// ports, and `destination.subset` (unrepresentable on L4 weighted upstreams)
+/// fail closed with field-specific diagnostics.
+fn l4_route_backends(
     object: &K8sObject,
     block: &Value,
     kind: &str,
-    acc: &K8sAccumulator,
-) -> Result<(String, u16), K8sTranslateError> {
+    block_index: usize,
+    acc: &mut K8sAccumulator,
+) -> Result<Vec<RouteBackend>, K8sTranslateError> {
     let routes = block
         .get("route")
         .and_then(Value::as_array)
@@ -2797,55 +2846,277 @@ fn l4_route_destination(
                 format!("VirtualService {kind}[] block requires a route destination"),
             )
         })?;
-    if routes.len() > 1 {
+    if routes.is_empty() {
+        return Err(invalid_resource(
+            object,
+            format!("VirtualService {kind}[] block requires a route destination"),
+        ));
+    }
+    // Bound the CRD-controlled route array before capacity allocation / iteration.
+    // Weighted L4 materializes one upstream target per active destination, so the
+    // shared upstream target ceiling is the authoritative limit.
+    if routes.len() > MAX_TARGETS_PER_UPSTREAM {
         return Err(invalid_resource(
             object,
             format!(
-                "VirtualService {kind}[] weighted multi-destination splitting is not supported; use a single destination"
+                "VirtualService {kind}[].route has {} destinations; at most {} are allowed",
+                routes.len(),
+                MAX_TARGETS_PER_UPSTREAM
             ),
         ));
     }
-    let dest = routes
-        .first()
-        .and_then(|r| r.get("destination"))
-        .ok_or_else(|| {
+    let preserve_single_destination = routes.len() == 1;
+    let mut backends = Vec::with_capacity(routes.len());
+    let mut skipped_zero = 0usize;
+    for (route_index, route) in routes.iter().enumerate() {
+        let weight = optional_target_weight_field(
+            object,
+            route,
+            &format!("VirtualService {kind}[].route[{route_index}].weight"),
+            0,
+        )?;
+        let dest = route.get("destination").ok_or_else(|| {
             invalid_resource(
                 object,
-                format!("VirtualService {kind}[] route requires a destination"),
+                format!("VirtualService {kind}[] route[{route_index}] requires a destination"),
             )
         })?;
-    let host = string_field(dest, "host").ok_or_else(|| {
-        invalid_resource(
-            object,
-            format!("VirtualService {kind}[] route.destination.host is required"),
+        if dest.get("subset").is_some() {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[].route[{route_index}].destination.subset is not supported for L4 routing; \
+                     model subset selection with DestinationRule subsets on a single destination host"
+                ),
+            ));
+        }
+        let host = string_field(dest, "host").ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[].route[{route_index}].destination.host is required"
+                ),
+            )
+        })?;
+        let port = resolve_destination_port(object, dest, host, acc)?.ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[].route[{route_index}].destination.port is required for stream routing"
+                ),
+            )
+        })?;
+        // Zero weight disables selection, not admission. Validate the complete
+        // destination first so an ignored leg cannot hide an unsupported
+        // subset, a missing port, or another malformed destination in an
+        // otherwise-active split.
+        if weight == 0 && !preserve_single_destination {
+            skipped_zero += 1;
+            continue;
+        }
+        // A short Istio destination is resolved relative to the VirtualService's
+        // namespace, not the namespace of a sidecar/gateway that consumes an
+        // exported route. Qualify recognized Kubernetes service forms before L4
+        // visibility projection changes `Proxy.namespace`; external hosts remain
+        // byte-for-byte unchanged.
+        let service_identity = service_host_components(
+            host,
+            &object.metadata.namespace,
+            &acc.options.cluster_domain,
         )
-    })?;
-    let port = resolve_destination_port(object, dest, host, acc)?.ok_or_else(|| {
-        invalid_resource(
-            object,
+        .and_then(|(svc, ns)| {
+            acc.service_port_exists(ns, svc, port)
+                .then(|| (ns.to_string(), svc.to_string(), port))
+        });
+        let backend_host = service_host_components(
+            host,
+            &object.metadata.namespace,
+            &acc.options.cluster_domain,
+        )
+        .map(|(service, namespace)| {
             format!(
-                "VirtualService {kind}[] route.destination.port is required for stream routing"
-            ),
-        )
-    })?;
-    // A short Istio destination is resolved relative to the VirtualService's
-    // namespace, not the namespace of a sidecar/gateway that consumes an
-    // exported route. Qualify recognized Kubernetes service forms before L4
-    // visibility projection changes `Proxy.namespace`; external hosts remain
-    // byte-for-byte unchanged.
-    let backend_host = service_host_components(
-        host,
-        &object.metadata.namespace,
-        &acc.options.cluster_domain,
-    )
-    .map(|(service, namespace)| {
-        format!(
-            "{service}.{namespace}.svc.{}",
-            acc.options.cluster_domain.trim_end_matches('.')
-        )
-    })
-    .unwrap_or_else(|| host.to_string());
-    Ok((backend_host, port))
+                "{service}.{namespace}.svc.{}",
+                acc.options.cluster_domain.trim_end_matches('.')
+            )
+        })
+        .unwrap_or_else(|| host.to_string());
+        backends.push(RouteBackend {
+            host: backend_host,
+            port,
+            weight,
+            service_namespace: service_identity
+                .as_ref()
+                .map(|(namespace, _, _)| namespace.clone()),
+            service_name: service_identity
+                .as_ref()
+                .map(|(_, service, _)| service.clone()),
+            service_port: service_identity.map(|(_, _, port)| port),
+        });
+    }
+    if skipped_zero > 0 {
+        if backends.is_empty() {
+            // All-zero multi-destination split: keep the match traffic-capturing
+            // with a deterministic unreachable backend (Gateway API parity).
+            let blackhole = l4_all_zero_blackhole_backends(object, routes, kind, acc)?;
+            acc.warnings.push(format!(
+                "VirtualService '{}' {kind}[] route {block_index} has only zero-weight split destinations; materializing blackhole backend",
+                object.metadata.name
+            ));
+            return Ok(blackhole);
+        }
+        acc.warnings.push(format!(
+            "VirtualService '{}' {kind}[] route {block_index} skipped {skipped_zero} zero-weight split destination(s)",
+            object.metadata.name
+        ));
+    }
+    Ok(backends)
+}
+
+/// Build fail-closed blackhole backends for an all-zero L4 weighted split.
+///
+/// Retains each destination's resolved port so omitted `match.port` listen-port
+/// inference stays honest: agreeing ports collapse to one blackhole backend on
+/// that port; disagreeing ports keep one blackhole leg per destination port so
+/// `l4_destination_port_agreement` still requires an explicit `match.port`.
+fn l4_all_zero_blackhole_backends(
+    object: &K8sObject,
+    routes: &[Value],
+    kind: &str,
+    acc: &mut K8sAccumulator,
+) -> Result<Vec<RouteBackend>, K8sTranslateError> {
+    let mut ports = Vec::with_capacity(routes.len());
+    for (route_index, route) in routes.iter().enumerate() {
+        let dest = route.get("destination").ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!("VirtualService {kind}[] route[{route_index}] requires a destination"),
+            )
+        })?;
+        if dest.get("subset").is_some() {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[].route[{route_index}].destination.subset is not supported for L4 routing; \
+                     model subset selection with DestinationRule subsets on a single destination host"
+                ),
+            ));
+        }
+        let host = string_field(dest, "host").ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[].route[{route_index}].destination.host is required"
+                ),
+            )
+        })?;
+        let port = resolve_destination_port(object, dest, host, acc)?.ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[].route[{route_index}].destination.port is required for stream routing"
+                ),
+            )
+        })?;
+        ports.push(port);
+    }
+    let Some(first) = ports.first().copied() else {
+        return Err(invalid_resource(
+            object,
+            format!("VirtualService {kind}[] block requires a route destination"),
+        ));
+    };
+    if ports.iter().all(|port| *port == first) {
+        return Ok(vec![RouteBackend {
+            host: L4_ZERO_WEIGHT_BACKEND_HOST.to_string(),
+            port: first,
+            weight: 0,
+            service_namespace: None,
+            service_name: None,
+            service_port: None,
+        }]);
+    }
+    Ok(ports
+        .into_iter()
+        .map(|port| RouteBackend {
+            host: L4_ZERO_WEIGHT_BACKEND_HOST.to_string(),
+            port,
+            // Non-zero so a multi-port blackhole upstream remains schedulable;
+            // every dial still targets the reserved unreachable hostname.
+            weight: 1,
+            service_namespace: None,
+            service_name: None,
+            service_port: None,
+        })
+        .collect())
+}
+
+/// Listen-port fallback when `match.port` is omitted: prefer a unanimous
+/// destination port. Differing destination ports without an explicit match
+/// port are unrepresentable on a Ferrum stream listener.
+fn l4_destination_port_agreement(backends: &[RouteBackend]) -> Option<u16> {
+    let first = backends.first()?;
+    backends
+        .iter()
+        .all(|backend| backend.port == first.port)
+        .then_some(first.port)
+}
+
+fn l4_route_backend_binding(
+    object: &K8sObject,
+    kind: &str,
+    block_index: usize,
+    backends: Vec<RouteBackend>,
+) -> Result<
+    (
+        String,
+        u16,
+        Option<String>,
+        Option<crate::config::types::Upstream>,
+    ),
+    K8sTranslateError,
+> {
+    match backends.len() {
+        0 => Err(invalid_resource(
+            object,
+            format!("VirtualService {kind}[] route requires a destination"),
+        )),
+        1 => {
+            let Some(backend) = backends.into_iter().next() else {
+                return Err(invalid_resource(
+                    object,
+                    format!("VirtualService {kind}[] route requires a destination"),
+                ));
+            };
+            Ok((backend.host, backend.port, None, None))
+        }
+        _ => {
+            let upstream_id = resource_id(
+                "istio-vs-l4-upstream",
+                &object.metadata.namespace,
+                &object.metadata.name,
+                &format!("{kind}-{block_index}"),
+            );
+            let Some(first) = backends.first() else {
+                return Err(invalid_resource(
+                    object,
+                    format!("VirtualService {kind}[] route requires a destination"),
+                ));
+            };
+            let fallback_host = first.host.clone();
+            let fallback_port = first.port;
+            let upstream = upstream_for_route(
+                upstream_id.clone(),
+                object.metadata.namespace.clone(),
+                backends,
+            );
+            Ok((
+                fallback_host,
+                fallback_port,
+                Some(upstream_id),
+                Some(upstream),
+            ))
+        }
+    }
 }
 
 fn virtual_service_l4_proxy_id(
@@ -3169,7 +3440,8 @@ fn project_l4_proxy_visibility(
     object: &K8sObject,
     acc: &K8sAccumulator,
     proxies: Vec<Proxy>,
-) -> Result<Vec<Proxy>, K8sTranslateError> {
+    upstream_templates: Vec<crate::config::types::Upstream>,
+) -> Result<(Vec<Proxy>, Vec<crate::config::types::Upstream>), K8sTranslateError> {
     let (mut export_namespaces, public) = l4_export_namespaces(object, acc)?;
     if public {
         export_namespaces.insert(object.metadata.namespace.clone());
@@ -3218,6 +3490,8 @@ fn project_l4_proxy_visibility(
     }
 
     let mut projected = Vec::with_capacity(projected_proxy_count);
+    let mut projected_upstreams = Vec::new();
+    let mut emitted_upstream_keys = HashSet::new();
     for proxy in proxies {
         let Some(criteria) = proxy.stream_match.as_ref() else {
             continue;
@@ -3268,10 +3542,22 @@ fn project_l4_proxy_visibility(
             projected_proxy.namespace = namespace.clone();
             projected_proxy.stream_match = Some(criteria);
             projected_proxy.compiled_stream_match = None;
+            if let Some(upstream_id) = projected_proxy.upstream_id.as_deref() {
+                let upstream_key = (namespace.clone(), upstream_id.to_string());
+                if emitted_upstream_keys.insert(upstream_key)
+                    && let Some(template) = upstream_templates
+                        .iter()
+                        .find(|upstream| upstream.id == upstream_id)
+                {
+                    let mut projected_upstream = template.clone();
+                    projected_upstream.namespace = namespace.clone();
+                    projected_upstreams.push(projected_upstream);
+                }
+            }
             projected.push(projected_proxy);
         }
     }
-    Ok(projected)
+    Ok((projected, projected_upstreams))
 }
 
 /// Translate VirtualService L4 routes into Ferrum stream proxies, reusing the
@@ -3285,25 +3571,35 @@ fn project_l4_proxy_visibility(
 /// when omitted). Optional L4 predicates (`sourceLabels`, `sourceSubnets`,
 /// `destinationSubnets`, `gateways`, `sourceNamespace`) compile onto
 /// `Proxy.stream_match` and are evaluated from trustworthy connection /
-/// workload metadata before route selection. Weighted splitting still fails
-/// closed via `l4_route_destination`.
+/// workload metadata before route selection. Weighted multi-destination splits
+/// materialize an upstream-backed stream proxy via `l4_route_backends`.
 fn virtual_service_l4_proxies(
     object: &K8sObject,
-    acc: &K8sAccumulator,
-) -> Result<Vec<Proxy>, K8sTranslateError> {
+    acc: &mut K8sAccumulator,
+) -> Result<(Vec<Proxy>, Vec<crate::config::types::Upstream>), K8sTranslateError> {
     let namespace = &object.metadata.namespace;
     let vs_name = &object.metadata.name;
     let candidate_count = virtual_service_l4_candidate_count(object)?;
     if candidate_count == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let vs_hosts = parse_l4_hosts(object, object.spec.get("hosts"), "spec.hosts", true)?;
     let vs_gateways = parse_l4_virtual_service_gateways(object)?;
     let mut proxies = Vec::with_capacity(candidate_count);
+    let mut upstream_templates = Vec::new();
 
     if let Some(blocks) = object.spec.get("tls").and_then(Value::as_array) {
         for (bi, block) in blocks.iter().enumerate() {
-            let (backend_host, backend_port) = l4_route_destination(object, block, "tls", acc)?;
+            let backends = l4_route_backends(object, block, "tls", bi, acc)?;
+            if backends.is_empty() {
+                continue;
+            }
+            let agreed_destination_port = l4_destination_port_agreement(&backends);
+            let (backend_host, backend_port, upstream_id, upstream) =
+                l4_route_backend_binding(object, "tls", bi, backends)?;
+            if let Some(upstream) = upstream {
+                upstream_templates.push(upstream);
+            }
             let matches = block
                 .get("match")
                 .and_then(Value::as_array)
@@ -3331,8 +3627,17 @@ fn virtual_service_l4_proxies(
                     }
                 }
                 let sni_hosts = expand_istio_sni_hosts(object, sni_hosts)?;
-                let listen_port = optional_port_field(object, m.get("port"), "tls[].match.port")?
-                    .unwrap_or(backend_port);
+                let listen_port = match optional_port_field(object, m.get("port"), "tls[].match.port")?
+                {
+                    Some(port) => port,
+                    None => agreed_destination_port.ok_or_else(|| {
+                        invalid_resource(
+                            object,
+                            "VirtualService tls[] weighted destinations disagree on destination.port; \
+                             set match.port explicitly to select the listen port",
+                        )
+                    })?,
+                };
                 let mut proxy = super::proxy_for_route(super::RouteProxySpec {
                     id: virtual_service_l4_proxy_id("tls", namespace, vs_name, bi, mi),
                     namespace: namespace.clone(),
@@ -3342,7 +3647,7 @@ fn virtual_service_l4_proxies(
                     preserve_host_header: false,
                     backend_host: backend_host.clone(),
                     backend_port,
-                    upstream_id: None,
+                    upstream_id: upstream_id.clone(),
                     backend_scheme: crate::config::types::BackendScheme::Tcp,
                     listen_port: Some(listen_port),
                     retry: None,
@@ -3357,12 +3662,28 @@ fn virtual_service_l4_proxies(
 
     if let Some(blocks) = object.spec.get("tcp").and_then(Value::as_array) {
         for (bi, block) in blocks.iter().enumerate() {
-            let (backend_host, backend_port) = l4_route_destination(object, block, "tcp", acc)?;
+            let backends = l4_route_backends(object, block, "tcp", bi, acc)?;
+            if backends.is_empty() {
+                continue;
+            }
+            let agreed_destination_port = l4_destination_port_agreement(&backends);
+            let (backend_host, backend_port, upstream_id, upstream) =
+                l4_route_backend_binding(object, "tcp", bi, backends)?;
+            if let Some(upstream) = upstream {
+                upstream_templates.push(upstream);
+            }
             let match_entries: Vec<&Value> = match block.get("match").and_then(Value::as_array) {
                 Some(ms) if !ms.is_empty() => ms.iter().collect(),
                 _ => Vec::new(),
             };
             if match_entries.is_empty() {
+                let listen_port = agreed_destination_port.ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "VirtualService tcp[] weighted destinations disagree on destination.port; \
+                         set match.port explicitly to select the listen port",
+                    )
+                })?;
                 let mut proxy = super::proxy_for_route(super::RouteProxySpec {
                     id: virtual_service_l4_proxy_id("tcp", namespace, vs_name, bi, 0),
                     namespace: namespace.clone(),
@@ -3372,9 +3693,9 @@ fn virtual_service_l4_proxies(
                     preserve_host_header: false,
                     backend_host: backend_host.clone(),
                     backend_port,
-                    upstream_id: None,
+                    upstream_id: upstream_id.clone(),
                     backend_scheme: crate::config::types::BackendScheme::Tcp,
-                    listen_port: Some(backend_port),
+                    listen_port: Some(listen_port),
                     retry: None,
                     backend_read_timeout_ms: None,
                 });
@@ -3396,8 +3717,17 @@ fn virtual_service_l4_proxies(
                             "VirtualService tcp[] match must not set sniHosts; use tls[] for SNI routing",
                         ));
                     }
-                    let port = optional_port_field(object, m.get("port"), "tcp[].match.port")?
-                        .unwrap_or(backend_port);
+                    let listen_port =
+                        match optional_port_field(object, m.get("port"), "tcp[].match.port")? {
+                            Some(port) => port,
+                            None => agreed_destination_port.ok_or_else(|| {
+                                invalid_resource(
+                                    object,
+                                    "VirtualService tcp[] weighted destinations disagree on destination.port; \
+                                     set match.port explicitly to select the listen port",
+                                )
+                            })?,
+                        };
                     let mut proxy = super::proxy_for_route(super::RouteProxySpec {
                         id: virtual_service_l4_proxy_id("tcp", namespace, vs_name, bi, mi),
                         namespace: namespace.clone(),
@@ -3407,9 +3737,9 @@ fn virtual_service_l4_proxies(
                         preserve_host_header: false,
                         backend_host: backend_host.clone(),
                         backend_port,
-                        upstream_id: None,
+                        upstream_id: upstream_id.clone(),
                         backend_scheme: crate::config::types::BackendScheme::Tcp,
-                        listen_port: Some(port),
+                        listen_port: Some(listen_port),
                         retry: None,
                         backend_read_timeout_ms: None,
                     });
@@ -3420,7 +3750,7 @@ fn virtual_service_l4_proxies(
         }
     }
 
-    project_l4_proxy_visibility(object, acc, proxies)
+    project_l4_proxy_visibility(object, acc, proxies, upstream_templates)
 }
 
 fn virtual_service_routes(
@@ -3430,11 +3760,10 @@ fn virtual_service_routes(
     // L4 routing: `spec.tls[]` (SNI passthrough) and `spec.tcp[]` (port) are
     // materialized into Ferrum stream proxies below, reusing the gateway /
     // east-west stream + SNI machinery. Optional L4 match predicates compile
-    // onto `Proxy.stream_match`; weighted splitting fails closed inside
-    // `virtual_service_l4_proxies`.
+    // onto `Proxy.stream_match`; weighted multi-destination splits materialize
+    // upstream-backed stream proxies inside `virtual_service_l4_proxies`.
     let hosts = string_array(&object.spec, "hosts");
-    let mut proxies = virtual_service_l4_proxies(object, acc)?;
-    let mut upstreams = Vec::new();
+    let (mut proxies, mut upstreams) = virtual_service_l4_proxies(object, acc)?;
     let mut plugins = Vec::new();
     let mut deferred_uri_less_proxies = Vec::new();
     let mut deferred_uri_less_plugins = Vec::new();
@@ -5355,6 +5684,161 @@ pub(crate) fn sidecar_ingress_protocol_is_http_family(protocol: Option<&str>) ->
     crate::modes::mesh::config::is_http_family_app_protocol(sidecar_ingress_app_protocol(protocol))
 }
 
+/// Fail-closed deferral reason: `outboundTrafficPolicy` was present but is not a
+/// JSON object.
+pub(crate) const SIDECAR_OUTBOUND_POLICY_MALFORMED: &str =
+    "outboundTrafficPolicy is not an object (enforcing REGISTRY_ONLY)";
+/// Fail-closed deferral reason: `outboundTrafficPolicy.egressProxy` is set and
+/// Ferrum cannot redirect unmatched egress through a named destination.
+pub(crate) const SIDECAR_OUTBOUND_POLICY_EGRESS_PROXY: &str =
+    "outboundTrafficPolicy.egressProxy is not supported (enforcing REGISTRY_ONLY)";
+/// Fail-closed deferral reason: `outboundTrafficPolicy.mode` is not one of the
+/// two supported tokens, or is not a string at all.
+pub(crate) const SIDECAR_OUTBOUND_POLICY_MODE_UNSUPPORTED: &str =
+    "outboundTrafficPolicy.mode is not ALLOW_ANY or REGISTRY_ONLY (enforcing REGISTRY_ONLY)";
+
+/// Outcome of classifying a `Sidecar`'s `spec.outboundTrafficPolicy` block
+/// (issue #3262).
+///
+/// Shared by the translator ([`sidecar`]) and the Istio status writer
+/// (`istio_status::sidecar_status`) — like
+/// [`sidecar_ingress_protocol_is_http_family`] — so what Ferrum ENFORCES and what
+/// the `FerrumAccepted` status REPORTS can never diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SidecarOutboundPolicy {
+    /// The resolved workload-scoped policy, or `None` when the Sidecar OMITTED
+    /// `outboundTrafficPolicy` entirely (inherit the mesh-wide value).
+    pub policy: Option<crate::modes::mesh::config::OutboundTrafficPolicy>,
+    /// Fail-closed degradation reason when a PRESENT block could not be
+    /// represented exactly. `Some` implies `policy == Some(RegistryOnly)`.
+    /// Reported verbatim in `status.ferrum.translation.deferred_fields`; every
+    /// value is a `&'static str`, so no attacker-controlled input is echoed.
+    pub deferred: Option<&'static str>,
+}
+
+/// Classify `Sidecar.spec.outboundTrafficPolicy` into the workload-scoped
+/// outbound traffic policy Ferrum enforces (issue #3262).
+///
+/// Supported, exactly: `mode: ALLOW_ANY` and `mode: REGISTRY_ONLY`.
+///
+/// A present object with **`mode` omitted or null** resolves to `ALLOW_ANY`, the
+/// documented Istio Sidecar API default. This is distinct from omitting the
+/// entire `outboundTrafficPolicy` block, which inherits Ferrum's mesh-wide tier.
+/// The enum's protobuf zero value does not override the API-level default.
+///
+/// Every other unrepresentable PRESENT block **fails closed to `REGISTRY_ONLY`**
+/// and records a field-specific deferral reason:
+///   - **`mode` unrecognized or not a string** (an `ALOW_ANY` typo, the numeric
+///     proto form, …) — the intent is ambiguous, so the restrictive mode applies.
+///     The raw value is never echoed into the status.
+///   - **the block is not an object** — malformed shape. An explicit top-level
+///     `outboundTrafficPolicy: null` is deliberately NOT normalized to "absent":
+///     unlike the inner fields below, the top level is what decides whether a
+///     workload-scoped policy exists AT ALL, and an operator who wrote the key
+///     asked for one, so the ambiguity fails closed instead of silently
+///     inheriting the (possibly laxer) mesh-wide value.
+///   - **`egressProxy` present and non-null** — Ferrum cannot funnel unmatched
+///     egress through a named `Destination`. Ignoring it would send traffic the
+///     operator scoped to an egress gateway straight out instead, so the registry
+///     gate stays on regardless of the declared `mode`. An explicit
+///     `egressProxy: null` IS normalized to absent, matching proto-JSON (and the
+///     `mode: null` handling below): the operator declared no egress proxy, so
+///     the declared `mode` is honored.
+///
+/// The resource is never REJECTED over this field. A rejected Sidecar is dropped
+/// from the translation entirely (`translate_k8s_objects_collecting_skips` skips
+/// it and retries), which would also drop its `egress` narrowing and thereby
+/// WIDEN both the workload's slice service view and the `REGISTRY_ONLY` registry
+/// derived from it — the opposite of failing closed.
+pub(crate) fn classify_sidecar_outbound_traffic_policy(spec: &Value) -> SidecarOutboundPolicy {
+    use crate::modes::mesh::config::OutboundTrafficPolicy;
+
+    let Some(raw) = spec.get("outboundTrafficPolicy") else {
+        return SidecarOutboundPolicy {
+            policy: None,
+            deferred: None,
+        };
+    };
+    let fail_closed = |reason: &'static str| SidecarOutboundPolicy {
+        policy: Some(OutboundTrafficPolicy::RegistryOnly),
+        deferred: Some(reason),
+    };
+    let Some(block) = raw.as_object() else {
+        return fail_closed(SIDECAR_OUTBOUND_POLICY_MALFORMED);
+    };
+    // `egressProxy` changes what the mode MEANS in Istio (unmatched egress is
+    // routed THROUGH the named destination rather than out directly), so it is
+    // checked before the mode and wins over an explicit `ALLOW_ANY`. An explicit
+    // JSON `null` is proto-JSON for "unset" — normalized to absent here exactly
+    // as `mode: null` is below, so `egressProxy: null` does not silently force
+    // REGISTRY_ONLY onto an operator who declared no egress proxy.
+    let egress_proxy = block.get("egressProxy");
+    if egress_proxy.is_some_and(|value| !value.is_null()) {
+        return fail_closed(SIDECAR_OUTBOUND_POLICY_EGRESS_PROXY);
+    }
+    match block.get("mode") {
+        None | Some(Value::Null) => SidecarOutboundPolicy {
+            policy: Some(OutboundTrafficPolicy::AllowAny),
+            deferred: None,
+        },
+        Some(Value::String(mode)) => match mode.as_str() {
+            "ALLOW_ANY" => SidecarOutboundPolicy {
+                policy: Some(OutboundTrafficPolicy::AllowAny),
+                deferred: None,
+            },
+            "REGISTRY_ONLY" => SidecarOutboundPolicy {
+                policy: Some(OutboundTrafficPolicy::RegistryOnly),
+                deferred: None,
+            },
+            _ => fail_closed(SIDECAR_OUTBOUND_POLICY_MODE_UNSUPPORTED),
+        },
+        Some(_) => fail_closed(SIDECAR_OUTBOUND_POLICY_MODE_UNSUPPORTED),
+    }
+}
+
+/// Whether this process has already emitted the `warn!` for a fail-closed
+/// `Sidecar.outboundTrafficPolicy` degradation. One process-wide bool, never a
+/// per-resource map: translation re-runs on every reconcile and every full sync,
+/// so a per-resource `warn!` would re-fire for the lifetime of a Sidecar that is
+/// *permanently* unrepresentable and drown the log in a message whose content
+/// never changes.
+static SIDECAR_OUTBOUND_POLICY_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Report a fail-closed `Sidecar.outboundTrafficPolicy` degradation (issue
+/// #3262) without steady-state log noise.
+///
+/// The authoritative, always-current surface is the resource's own
+/// `FerrumAccepted` status (`deferred_fields`), which carries the same
+/// field-specific reason and is rewritten on every reconcile. So this emits:
+///   - one `debug!` per occurrence, carrying namespace + name + the `&'static`
+///     reason (never the operator-supplied raw value), for operators who turned
+///     debug logging on to chase a specific resource; and
+///   - exactly ONE process-lifetime `warn!` pointing at that status surface, so
+///     the degradation is still discoverable at the default log level.
+fn report_sidecar_outbound_policy_degradation(namespace: &str, name: &str, reason: &'static str) {
+    use std::sync::atomic::Ordering;
+
+    tracing::debug!(
+        namespace = %namespace,
+        sidecar = %name,
+        reason = %reason,
+        "Istio Sidecar outboundTrafficPolicy is not exactly representable; \
+         enforcing REGISTRY_ONLY for the selected workloads",
+    );
+    let first_in_process = SIDECAR_OUTBOUND_POLICY_WARNED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok();
+    if first_in_process {
+        tracing::warn!(
+            "At least one Istio Sidecar declares an outboundTrafficPolicy Ferrum cannot represent \
+             exactly; REGISTRY_ONLY is enforced for the workloads it selects. Per-resource reasons \
+             are in each Sidecar's status.ferrum.translation.deferred_fields (this warning is \
+             emitted once per process; enable debug logging for per-resource detail)",
+        );
+    }
+}
+
 fn telemetry(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -5509,8 +5993,6 @@ fn telemetry(
                             }
                             None => "ALL_METRICS",
                         };
-                    let ignored_metric_family =
-                        is_recognized_unsupported_istio_metric_family(matched_metric);
                     if ovr
                         .get("disabled")
                         .and_then(Value::as_bool)
@@ -5520,40 +6002,33 @@ fn telemetry(
                     }
                     if let Some(tags) = ovr.get("tagOverrides").and_then(Value::as_object) {
                         for (tag_name, tag_spec) in tags {
-                            let operation = if ignored_metric_family {
-                                // Preserve one no-op entry so workload_metrics emits its
-                                // bounded ignored-family diagnostic, but do not validate
-                                // policy for a metric family Ferrum never records.
-                                TagOverrideOperation::Remove
-                            } else {
-                                let op = tag_spec
-                                    .get("operation")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("");
-                                match op {
-                                    "REMOVE" => TagOverrideOperation::Remove,
-                                    "UPSERT" => {
-                                        let value = telemetry_metric_upsert_literal(
-                                            object, tag_name, tag_spec,
-                                        )?;
-                                        TagOverrideOperation::Set { value }
-                                    }
-                                    "" => {
-                                        return Err(invalid_resource(
-                                            object,
-                                            format!(
-                                                "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation is required"
-                                            ),
-                                        ));
-                                    }
-                                    _ => {
-                                        return Err(invalid_resource(
-                                            object,
-                                            format!(
-                                                "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation '{op}' is unsupported"
-                                            ),
-                                        ));
-                                    }
+                            let op = tag_spec
+                                .get("operation")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let operation = match op {
+                                "REMOVE" => TagOverrideOperation::Remove,
+                                "UPSERT" => {
+                                    let value = telemetry_metric_upsert_literal(
+                                        object, tag_name, tag_spec,
+                                    )?;
+                                    TagOverrideOperation::Set { value }
+                                }
+                                "" => {
+                                    return Err(invalid_resource(
+                                        object,
+                                        format!(
+                                            "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation is required"
+                                        ),
+                                    ));
+                                }
+                                _ => {
+                                    return Err(invalid_resource(
+                                        object,
+                                        format!(
+                                            "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation '{op}' is unsupported"
+                                        ),
+                                    ));
                                 }
                             };
                             tag_overrides.push(MetricTagOverride {
@@ -17023,6 +17498,57 @@ extensionProviders:
             .as_ref()
             .expect("tls block");
         assert!(tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn destination_rule_rejects_system_roots_with_insecure_skip_verify() {
+        let error = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "caCertificates": "system://",
+                            "insecureSkipVerify": true
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("system roots with verification disabled must fail translation");
+
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("caCertificates"), "{diagnostic}");
+        assert!(diagnostic.contains("insecureSkipVerify"), "{diagnostic}");
+        assert!(diagnostic.contains("system://"), "{diagnostic}");
+    }
+
+    #[test]
+    fn destination_rule_rejects_noncanonical_system_roots_source() {
+        let error = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "caCertificates": "system://corp-ca.pem"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("a system trust source with a path suffix must fail translation");
+
+        assert!(
+            error.to_string().contains("must be exactly 'system://'"),
+            "{error}"
+        );
     }
 
     #[test]

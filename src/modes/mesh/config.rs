@@ -1609,6 +1609,31 @@ pub struct MeshSidecar {
     /// explicit empty `ingress: []`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingress: Vec<MeshSidecarIngress>,
+    /// Istio `spec.outboundTrafficPolicy.mode` — the workload-scoped override of
+    /// the mesh-wide [`MeshConfig::outbound_traffic_policy`] (issue #3262).
+    ///
+    /// `None` = the Sidecar OMITTED `outboundTrafficPolicy`, so the workload
+    /// inherits the mesh-wide policy (slice `outbound_traffic_policy`, else
+    /// `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`). `Some(_)` REPLACES it for every
+    /// workload this Sidecar applies to — Istio resolves exactly ONE Sidecar per
+    /// workload, so there is no inheritance chain here (unlike `egress`, whose
+    /// omitted-means-inherit walk is a separate, egress-only concern).
+    ///
+    /// On the K8s path, a present object with omitted/null `mode` uses Istio's
+    /// documented `ALLOW_ANY` default. A PRESENT `outboundTrafficPolicy` block
+    /// Ferrum cannot represent exactly — an unrecognized/non-string `mode`, a
+    /// non-object block, or an `egressProxy` Ferrum cannot route through —
+    /// resolves fail-closed to [`OutboundTrafficPolicy::RegistryOnly`] and is
+    /// surfaced in the resource's `deferred_fields` status. The Sidecar itself
+    /// is never REJECTED over this field: dropping it would also drop its egress
+    /// narrowing and thereby WIDEN both the slice's service view and the derived
+    /// outbound registry.
+    ///
+    /// Applied only under `FERRUM_MESH_SIDECAR_ENFORCED && !…_DRY_RUN` (the same
+    /// effective gate as `ingress[]` materialization) — see
+    /// `MeshSlice::sidecar_outbound_traffic_policy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
 }
 
 /// A single ingress listener entry under a [`MeshSidecar`] (`spec.ingress[]`).
@@ -2087,10 +2112,13 @@ pub struct MeshTrafficPolicy {
     /// Old DPs reading new slices see this as a no-op via the serde default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality_lb_setting: Option<MeshLocalityLbSetting>,
-    /// Cap on inflight backend TCP connections per target, mapped from
-    /// Istio `connectionPool.tcp.maxConnections`. Currently enforced only
-    /// by stream-family backend dispatch (TCP / TCP+TLS proxies); HTTP-family
-    /// dispatch ignores the field — that is tracked as a follow-on PR.
+    /// Cap on concurrent OPEN backend connections per destination, mapped from
+    /// Istio `connectionPool.tcp.maxConnections`. Enforced by every transport
+    /// whose physical connection lifecycle Ferrum owns: stream-family (TCP /
+    /// TCP+TLS), HTTP-family WebSocket, the pooled multiplexed transports
+    /// (direct H2, gRPC, native H3, HBONE, mesh-mTLS), and known-HTTP/1.1
+    /// reqwest dispatch. `Some(0)` is rejected by validation on both the K8s
+    /// and native/file paths because it would refuse every connection.
     /// Old DPs reading new slices see this as a no-op via the serde default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<u32>,
@@ -2877,8 +2905,14 @@ pub struct MeshWaypointServiceRef {
     pub name: String,
 }
 
-/// Istio mesh-wide outbound traffic policy. Mirrors
-/// `MeshConfig.outboundTrafficPolicy.mode` in the upstream API.
+/// Istio outbound traffic policy. Mirrors the upstream `OutboundTrafficPolicy`
+/// message, which Istio uses at TWO scopes: mesh-wide
+/// (`MeshConfig.outboundTrafficPolicy.mode`, carried on
+/// [`MeshConfig::outbound_traffic_policy`]) and workload-scoped
+/// (`Sidecar.outboundTrafficPolicy.mode`, carried on
+/// [`MeshSidecar::outbound_traffic_policy`]). The workload-scoped value wins for
+/// the workloads its Sidecar selects; the effective value is resolved once per
+/// slice apply by `MeshSlice::effective_outbound_traffic_policy`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutboundTrafficPolicy {
@@ -3955,7 +3989,7 @@ fn validate_mesh_config_internal(
         // Walk every place a `connectionPool.http` block can ride a DR:
         // top-level `trafficPolicy`, per-port `portLevelSettings`, and each
         // `subsets[].trafficPolicy`.
-        validate_dr_connection_pool_http(
+        validate_dr_connection_pool(
             &format!("MeshDestinationRule '{}'.trafficPolicy", dr.name),
             dr.traffic_policy.as_ref(),
             &mut errors,
@@ -3977,7 +4011,7 @@ fn validate_mesh_config_internal(
                 policy,
                 &mut errors,
             );
-            validate_dr_connection_pool_http(
+            validate_dr_connection_pool(
                 &format!(
                     "MeshDestinationRule '{}'.port_level_settings[{}].trafficPolicy",
                     dr.name, port
@@ -4002,7 +4036,7 @@ fn validate_mesh_config_internal(
                     &mut errors,
                 );
             }
-            validate_dr_connection_pool_http(
+            validate_dr_connection_pool(
                 &format!(
                     "MeshDestinationRule '{}'.subsets[{}].trafficPolicy",
                     dr.name, i
@@ -4346,6 +4380,24 @@ fn validate_mesh_traffic_policy_tls(
     tls: &MeshTrafficPolicyTls,
     errors: &mut Vec<String>,
 ) {
+    if let Some(ca_certificates) = tls.ca_certificates.as_deref()
+        && let Err(error) = crate::config::types::validate_tls_material_source_field(
+            &format!("{context}.ca_certificates"),
+            ca_certificates,
+            crate::tls::source::MaterialKind::CaBundle,
+        )
+    {
+        errors.push(error);
+    }
+    if let Some(error) = crate::config::types::validate_system_trust_roots_skip_verify_pairing(
+        &format!("{context}.ca_certificates"),
+        &format!("{context}.insecure_skip_verify"),
+        tls.ca_certificates.as_deref(),
+        tls.insecure_skip_verify,
+    ) {
+        errors.push(error);
+    }
+
     match tls.mode {
         MtlsMode::Strict | MtlsMode::Permissive => errors.push(format!(
             "{context}.mode: {mode:?} is invalid for DestinationRule client TLS",
@@ -4395,24 +4447,41 @@ fn validate_required_tls_path(context: String, value: Option<&str>, errors: &mut
     }
 }
 
-/// Validate a DestinationRule `connectionPool.http` block from the native/file
-/// mesh slice path, matching the lower-bound checks the K8s translator
-/// (`translate_http_uint32`) enforces at parse time.
+/// Validate a DestinationRule `connectionPool` block from the native/file mesh
+/// slice path, matching the lower-bound checks the K8s translator
+/// (`translate_http_uint32`, `translate_tcp_max_connections`) enforces at parse
+/// time.
 ///
-/// `http1MaxPendingRequests` is load-bearing because the
-/// [`crate::backend_pending_limit::BackendPendingLimiter`] treats `Some(0)` as a
-/// hard-overflow that sheds every HTTP/1.1 request, so an accidental `0` on a
-/// hand-authored native/file DR would silently blackhole all H1 traffic to the
-/// matched destination. The K8s translator rejects 0/negative; this keeps the
-/// native/file path equivalent. `maxRetries: 0` is valid and explicitly
-/// disables an existing retry policy for the selected destination; negatives
-/// are already impossible because both fields deserialize as `u32`.
-fn validate_dr_connection_pool_http(
+/// Two fields are load-bearing because `Some(0)` is a hard-deny at runtime
+/// rather than "unlimited", so an accidental `0` on a hand-authored native/file
+/// DR would silently blackhole traffic to the matched destination:
+///
+/// * `http1MaxPendingRequests` — the
+///   [`crate::backend_pending_limit::BackendPendingLimiter`] sheds every
+///   HTTP/1.1 request at `0`.
+/// * `tcp.maxConnections` — the
+///   [`crate::backend_conn_limit::BackendConnectionLimiter`] refuses every
+///   backend connection at `0`, on every transport (stream, WebSocket, and the
+///   pooled multiplexed pools), so the destination becomes unreachable.
+///
+/// The K8s translator rejects 0/negative for both; this keeps the native/file
+/// path equivalent. `maxRetries: 0` is valid and explicitly disables an existing
+/// retry policy for the selected destination; negatives are already impossible
+/// because these fields deserialize as `u32`.
+fn validate_dr_connection_pool(
     context: &str,
     policy: Option<&MeshTrafficPolicy>,
     errors: &mut Vec<String>,
 ) {
-    let Some(http) = policy.and_then(|p| p.connection_pool_http.as_ref()) else {
+    let Some(policy) = policy else {
+        return;
+    };
+    if policy.max_connections == Some(0) {
+        errors.push(format!(
+            "{context}.connectionPool.tcp.maxConnections must be positive (0 would refuse every backend connection)"
+        ));
+    }
+    let Some(http) = policy.connection_pool_http.as_ref() else {
         return;
     };
     if http.http1_max_pending_requests == Some(0) {

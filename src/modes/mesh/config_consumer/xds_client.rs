@@ -1473,6 +1473,7 @@ fn reverse_translate(
         labels_ambiguous: recovered.labels_ambiguous
             && !recovered_labels_are_authoritative(recovered.labels_ambiguous, &config.labels),
         virtual_service_l4_proxies: recovered.virtual_service_l4_proxies,
+        virtual_service_l4_upstreams: recovered.virtual_service_l4_upstreams,
         // Required xDS types are coherent before a slice is built, so this is
         // the shared observability version for the installed mesh slice.
         version: composite_required_version(accumulator),
@@ -1567,6 +1568,10 @@ fn reverse_translate(
         // GAP-1a: mesh-wide outbound traffic policy recovered from the
         // OutboundTrafficPolicy carrier.
         outbound_traffic_policy: recovered.outbound_traffic_policy,
+        // Issue #3262: workload-scoped Sidecar override, recovered from its own
+        // carrier so an xDS-built slice resolves the same effective policy a
+        // native-built one does. `None` when the CP emitted no such carrier.
+        sidecar_outbound_traffic_policy: recovered.sidecar_outbound_traffic_policy,
         sidecar_egress_scope: recovered.sidecar_egress_scope,
         // GAP-2L.3: xDS-only deployments don't round-trip operator-defined
         // ECDS resources back into the slice today. The carrier paths
@@ -1660,6 +1665,7 @@ struct RecoveredSliceCarriers {
     labels: Option<BTreeMap<String, String>>,
     labels_ambiguous: bool,
     virtual_service_l4_proxies: Vec<serde_json::Value>,
+    virtual_service_l4_upstreams: Vec<serde_json::Value>,
     /// Authoritative config revision (issue #2473) recovered from the
     /// `ConfigRevision` carrier. `None` when the CP's config authority is
     /// unordered (or predates the carrier) — the DP freshness gate then treats
@@ -1679,6 +1685,7 @@ struct RecoveredSliceCarriers {
     proxy_configs: Vec<crate::modes::mesh::config::MeshProxyConfig>,
     trust_bundles: Option<crate::modes::mesh::config::TrustBundleSet>,
     outbound_traffic_policy: Option<crate::modes::mesh::config::OutboundTrafficPolicy>,
+    sidecar_outbound_traffic_policy: Option<crate::modes::mesh::config::OutboundTrafficPolicy>,
     multi_cluster: Option<crate::modes::mesh::config::MultiClusterConfig>,
     sidecar_egress_scope: Option<MeshEgressScopeSnapshot>,
     /// `meshConfig.rootNamespace` recovered from its own carrier (issue
@@ -2066,6 +2073,9 @@ fn apply_recovered_carrier(
         MeshSliceCarrier::VirtualServiceL4Proxies(value) => {
             recovered.virtual_service_l4_proxies = value
         }
+        MeshSliceCarrier::VirtualServiceL4Upstreams(value) => {
+            recovered.virtual_service_l4_upstreams = value
+        }
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
         MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {
             recovered.virtual_service_cors_policies = value
@@ -2080,6 +2090,9 @@ fn apply_recovered_carrier(
         MeshSliceCarrier::TrustBundles(value) => recovered.trust_bundles = Some(value),
         MeshSliceCarrier::OutboundTrafficPolicy(value) => {
             recovered.outbound_traffic_policy = Some(value)
+        }
+        MeshSliceCarrier::SidecarOutboundTrafficPolicy(value) => {
+            recovered.sidecar_outbound_traffic_policy = Some(value)
         }
         MeshSliceCarrier::MultiCluster(value) => recovered.multi_cluster = Some(value),
         MeshSliceCarrier::SidecarEgressScope(value) => recovered.sidecar_egress_scope = Some(value),
@@ -5069,7 +5082,16 @@ mod tests {
                 "backend_host": "db.default.svc.cluster.local",
                 "backend_port": 3306,
                 "listen_port": 3306,
+                "upstream_id": "istio-vs-l4-upstream-default-db-tcp-0",
                 "stream_match": {"arms": [{"gateways": ["mesh"]}]}
+            })],
+            virtual_service_l4_upstreams: vec![serde_json::json!({
+                "id": "istio-vs-l4-upstream-default-db-tcp-0",
+                "namespace": "default",
+                "targets": [
+                    {"host": "db-v1.default.svc.cluster.local", "port": 3306, "weight": 80},
+                    {"host": "db-v2.default.svc.cluster.local", "port": 3306, "weight": 20}
+                ]
             })],
             workloads: vec![workload.clone()],
             ambient_udp_source_workloads: vec![workload.clone()],
@@ -5247,6 +5269,10 @@ mod tests {
         assert_eq!(
             recovered.virtual_service_l4_proxies,
             native.virtual_service_l4_proxies
+        );
+        assert_eq!(
+            recovered.virtual_service_l4_upstreams,
+            native.virtual_service_l4_upstreams
         );
         assert_eq!(recovered.workloads, native.workloads);
         assert_eq!(

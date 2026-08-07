@@ -23,7 +23,7 @@ use crate::connect::uds::UnixSocketProvider;
 use crate::connect::windows_named_pipe::WindowsNamedPipeProvider;
 use crate::connect::{
     sealed::{Conn, Unnameable},
-    BoxedConnectorLayer, BoxedConnectorService, Connector, ConnectorBuilder,
+    BoxedConnectorLayer, BoxedConnectorService, ConnectionAdmission, Connector, ConnectorBuilder,
 };
 #[cfg(feature = "cookies")]
 use crate::cookie;
@@ -200,6 +200,8 @@ struct Config {
     #[cfg(feature = "__tls")]
     tls: TlsBackend,
     connector_layers: Vec<BoxedConnectorLayer>,
+    /// Ferrum patch 003: physical-connection admission hook.
+    connection_admission: Option<Arc<dyn ConnectionAdmission>>,
     http_version_pref: HttpVersionPref,
     http09_responses: bool,
     http1_title_case_headers: bool,
@@ -325,6 +327,7 @@ impl ClientBuilder {
                 #[cfg(feature = "__tls")]
                 tls: TlsBackend::default(),
                 connector_layers: Vec::new(),
+                connection_admission: None,
                 http_version_pref: HttpVersionPref::All,
                 http09_responses: false,
                 http1_title_case_headers: false,
@@ -999,7 +1002,9 @@ impl ClientBuilder {
             Some(format!("{:?}", &config.redirect_policy))
         };
 
-        let hyper_client = builder.build(connector_builder.build(config.connector_layers));
+        let hyper_client = builder.build(
+            connector_builder.build(config.connector_layers, config.connection_admission),
+        );
         let hyper_service = HyperService {
             hyper: hyper_client,
         };
@@ -2444,6 +2449,25 @@ impl ClientBuilder {
 
         self.config.connector_layers.push(layer);
 
+        self
+    }
+
+    /// Ferrum patch 003 — install a physical-connection admission hook.
+    ///
+    /// The hook is consulted immediately before this client dials a **new**
+    /// physical connection, and never for a pooled-connection reuse or an
+    /// HTTP/2 stream multiplexed onto an existing connection. The token it
+    /// returns is owned by the resulting connection, so it is released exactly
+    /// when that connection dies — including handshake failure, idle eviction,
+    /// pool drain, cancellation, and shutdown.
+    ///
+    /// Sharing one hook across several clients makes them share one ceiling,
+    /// which is why this is a hook rather than a per-client counter.
+    pub fn connection_admission(
+        mut self,
+        admission: Arc<dyn ConnectionAdmission>,
+    ) -> ClientBuilder {
+        self.config.connection_admission = Some(admission);
         self
     }
 }

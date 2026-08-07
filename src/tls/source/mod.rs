@@ -69,6 +69,9 @@ pub enum SourceScheme {
     Acme,
     Managed,
     Pkcs11,
+    /// The platform's built-in trust anchors (webpki roots). Carries no
+    /// material to load — see [`SYSTEM_TRUST_ROOTS_SOURCE`].
+    System,
 }
 
 impl SourceScheme {
@@ -83,6 +86,7 @@ impl SourceScheme {
             "acme" => Some(Self::Acme),
             "managed" => Some(Self::Managed),
             "pkcs11" => Some(Self::Pkcs11),
+            "system" => Some(Self::System),
             _ => None,
         }
     }
@@ -98,6 +102,7 @@ impl SourceScheme {
             Self::Acme => "acme",
             Self::Managed => "managed",
             Self::Pkcs11 => "pkcs11",
+            Self::System => "system",
         }
     }
 
@@ -348,6 +353,32 @@ impl CertSourceUri {
 /// Substituted for a secret provider's identifier in operator-facing output.
 const REDACTED_IDENTIFIER: &str = "<redacted source reference>";
 
+/// Canonical configured value selecting the platform's built-in trust anchors.
+///
+/// This is a **first-class source**, not a magic file path: it parses through
+/// [`CertSource::parse`] into a typed [`SourceScheme::System`] URI, so it can be
+/// validated, serialized, compared, and pool-keyed exactly like every other
+/// configured TLS material source — while carrying no material to load.
+///
+/// Semantics on `backend_tls_server_ca_cert_path` (Gateway API
+/// `BackendTLSPolicy` `wellKnownCACertificates: System`): verify the backend
+/// certificate against the built-in webpki roots **and nothing else**. Unlike a
+/// `None` CA path, it does NOT fall back to the cluster-global
+/// `FERRUM_TLS_CA_BUNDLE_PATH`, so a cluster-wide private CA can never silently
+/// replace the trust anchors a policy explicitly asked for; and it never
+/// inherits `FERRUM_TLS_NO_VERIFY`.
+pub const SYSTEM_TRUST_ROOTS_SOURCE: &str = "system://";
+
+/// True when a configured TLS material value selects the built-in system roots.
+///
+/// Deliberately scheme-only (any `system://…` spelling answers `true`): this is
+/// the runtime "there is no file/secret behind this value" predicate, so it must
+/// never fall through to opening a path. Config validation separately rejects a
+/// `system://` value that carries an identifier or query options.
+pub fn is_system_trust_roots_source(value: &str) -> bool {
+    CertSource::parse(value, MaterialKind::CaBundle).is_system_trust_roots()
+}
+
 fn parse_options(query: &str) -> BTreeMap<String, String> {
     url::form_urlencoded::parse(query.as_bytes())
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
@@ -377,6 +408,12 @@ impl CertSource {
     #[allow(dead_code)]
     pub fn from_path(path: impl Into<PathBuf>) -> Self {
         Self::Path(path.into())
+    }
+
+    /// True when this source is the built-in-system-roots sentinel
+    /// ([`SYSTEM_TRUST_ROOTS_SOURCE`]) rather than loadable material.
+    pub fn is_system_trust_roots(&self) -> bool {
+        matches!(self, Self::Uri(uri) if uri.scheme == SourceScheme::System)
     }
 
     #[allow(dead_code)]
@@ -632,6 +669,12 @@ pub fn load_material_blocking(
         CertSource::Uri(uri) if uri.scheme == SourceScheme::Managed => {
             load_managed_material(uri, fallback_kind)
         }
+        // `system://` lands here on purpose. It names the built-in webpki trust
+        // anchors, so there is nothing to materialize; every consumer must
+        // branch on `CertSource::is_system_trust_roots` before reaching a
+        // loader. `UnsupportedScheme` is the non-fatal outcome config
+        // validation already treats as "not a loadable source", which is
+        // exactly right here.
         CertSource::Uri(uri) => Err(MaterialError::UnsupportedScheme {
             scheme: uri.scheme.as_str(),
         }),

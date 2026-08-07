@@ -139,6 +139,12 @@ pub const FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL: &str =
 /// proxies do not otherwise ride `MeshSlice`.
 pub const FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.VirtualServiceL4ProxiesCarrier";
+/// Inner `type_url` for weighted multi-destination upstreams referenced by
+/// VirtualService L4 proxies. Ordinary `GatewayConfig.upstreams` do not ride
+/// `MeshSlice`, so translator-owned weighted stream upstreams are carried
+/// beside the L4 proxies.
+pub const FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.VirtualServiceL4UpstreamsCarrier";
 /// Inner `type_url` for the authorization-policy carrier (`MeshPolicy` list).
 pub const FERRUM_ECDS_MESH_POLICIES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.MeshPoliciesCarrier";
@@ -168,6 +174,17 @@ pub const FERRUM_ECDS_TRUST_BUNDLES_TYPE_URL: &str =
 /// Inner `type_url` for the mesh-wide outbound-traffic-policy carrier.
 pub const FERRUM_ECDS_OUTBOUND_POLICY_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.OutboundTrafficPolicyCarrier";
+/// Inner `type_url` for the WORKLOAD-SCOPED outbound-traffic-policy carrier
+/// resolved from the applicable Istio `Sidecar.outboundTrafficPolicy` (issue
+/// #3262). Carried SEPARATELY from `OutboundTrafficPolicyCarrier` because the two
+/// are distinct precedence tiers: the Sidecar value OVERRIDES the mesh-wide one,
+/// so collapsing them onto a single carrier would make a Sidecar `ALLOW_ANY`
+/// indistinguishable from a mesh-wide `ALLOW_ANY` and lose the ability to fall
+/// back correctly when the Sidecar is deleted. Absence means "no workload-scoped
+/// override", which the DP resolves exactly like a native slice whose
+/// `sidecar_outbound_traffic_policy` is `None`.
+pub const FERRUM_ECDS_SIDECAR_OUTBOUND_POLICY_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.SidecarOutboundTrafficPolicyCarrier";
 /// Inner `type_url` for the multi-cluster-config carrier.
 pub const FERRUM_ECDS_MULTI_CLUSTER_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.MultiClusterCarrier";
@@ -222,6 +239,7 @@ pub enum MeshSliceCarrier {
     /// only emits it when set); see [`FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL`].
     LabelsAmbiguous(bool),
     VirtualServiceL4Proxies(Vec<serde_json::Value>),
+    VirtualServiceL4Upstreams(Vec<serde_json::Value>),
     MeshPolicies(Vec<MeshPolicy>),
     VirtualServiceCorsPolicies(Vec<MeshVirtualServiceCorsPolicy>),
     PeerAuthentications(Vec<PeerAuthentication>),
@@ -231,6 +249,9 @@ pub enum MeshSliceCarrier {
     ProxyConfigs(Vec<MeshProxyConfig>),
     TrustBundles(TrustBundleSet),
     OutboundTrafficPolicy(OutboundTrafficPolicy),
+    /// Workload-scoped `Sidecar.outboundTrafficPolicy` override (issue #3262);
+    /// see [`FERRUM_ECDS_SIDECAR_OUTBOUND_POLICY_TYPE_URL`].
+    SidecarOutboundTrafficPolicy(OutboundTrafficPolicy),
     MultiCluster(MultiClusterConfig),
     SidecarEgressScope(MeshEgressScopeSnapshot),
     /// `meshConfig.rootNamespace` (issue #2469). Emitted only when non-empty
@@ -279,6 +300,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
             MeshSliceCarrier::LabelsAmbiguous(_) => FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL,
             MeshSliceCarrier::VirtualServiceL4Proxies(_) => FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL,
+            MeshSliceCarrier::VirtualServiceL4Upstreams(_) => FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
             MeshSliceCarrier::VirtualServiceCorsPolicies(_) => {
                 FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL
@@ -290,6 +312,9 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::ProxyConfigs(_) => FERRUM_ECDS_PROXY_CONFIGS_TYPE_URL,
             MeshSliceCarrier::TrustBundles(_) => FERRUM_ECDS_TRUST_BUNDLES_TYPE_URL,
             MeshSliceCarrier::OutboundTrafficPolicy(_) => FERRUM_ECDS_OUTBOUND_POLICY_TYPE_URL,
+            MeshSliceCarrier::SidecarOutboundTrafficPolicy(_) => {
+                FERRUM_ECDS_SIDECAR_OUTBOUND_POLICY_TYPE_URL
+            }
             MeshSliceCarrier::MultiCluster(_) => FERRUM_ECDS_MULTI_CLUSTER_TYPE_URL,
             MeshSliceCarrier::SidecarEgressScope(_) => FERRUM_ECDS_SIDECAR_EGRESS_SCOPE_TYPE_URL,
             MeshSliceCarrier::IstioRootNamespace(_) => FERRUM_ECDS_ISTIO_ROOT_NAMESPACE_TYPE_URL,
@@ -318,6 +343,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
             MeshSliceCarrier::LabelsAmbiguous(_) => "workload-labels-ambiguous",
             MeshSliceCarrier::VirtualServiceL4Proxies(_) => "virtual-service-l4-proxies",
+            MeshSliceCarrier::VirtualServiceL4Upstreams(_) => "virtual-service-l4-upstreams",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
             MeshSliceCarrier::VirtualServiceCorsPolicies(_) => "virtual-service-cors-policies",
             MeshSliceCarrier::PeerAuthentications(_) => "peer-authentications",
@@ -327,6 +353,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::ProxyConfigs(_) => "proxy-configs",
             MeshSliceCarrier::TrustBundles(_) => "trust-bundles",
             MeshSliceCarrier::OutboundTrafficPolicy(_) => "outbound-traffic-policy",
+            MeshSliceCarrier::SidecarOutboundTrafficPolicy(_) => "sidecar-outbound-traffic-policy",
             MeshSliceCarrier::MultiCluster(_) => "multi-cluster",
             MeshSliceCarrier::SidecarEgressScope(_) => "sidecar-egress-scope",
             MeshSliceCarrier::IstioRootNamespace(_) => "istio-root-namespace",
@@ -352,6 +379,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::WorkloadLabels(value) => encode(value),
             MeshSliceCarrier::LabelsAmbiguous(value) => encode(value),
             MeshSliceCarrier::VirtualServiceL4Proxies(value) => encode(value),
+            MeshSliceCarrier::VirtualServiceL4Upstreams(value) => encode(value),
             MeshSliceCarrier::MeshPolicies(value) => encode(value),
             MeshSliceCarrier::VirtualServiceCorsPolicies(value) => encode(value),
             MeshSliceCarrier::PeerAuthentications(value) => encode(value),
@@ -361,6 +389,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::ProxyConfigs(value) => encode(value),
             MeshSliceCarrier::TrustBundles(value) => encode(value),
             MeshSliceCarrier::OutboundTrafficPolicy(value) => encode(value),
+            MeshSliceCarrier::SidecarOutboundTrafficPolicy(value) => encode(value),
             MeshSliceCarrier::MultiCluster(value) => encode(value),
             MeshSliceCarrier::SidecarEgressScope(value) => encode(value),
             MeshSliceCarrier::IstioRootNamespace(value) => encode(value),
@@ -429,6 +458,9 @@ impl MeshSliceCarrier {
             FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL => {
                 MeshSliceCarrier::VirtualServiceL4Proxies(decode_json(value)?)
             }
+            FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL => {
+                MeshSliceCarrier::VirtualServiceL4Upstreams(decode_json(value)?)
+            }
             FERRUM_ECDS_MESH_POLICIES_TYPE_URL => {
                 MeshSliceCarrier::MeshPolicies(decode_json(value)?)
             }
@@ -463,6 +495,9 @@ impl MeshSliceCarrier {
             }
             FERRUM_ECDS_OUTBOUND_POLICY_TYPE_URL => {
                 MeshSliceCarrier::OutboundTrafficPolicy(decode_json(value)?)
+            }
+            FERRUM_ECDS_SIDECAR_OUTBOUND_POLICY_TYPE_URL => {
+                MeshSliceCarrier::SidecarOutboundTrafficPolicy(decode_json(value)?)
             }
             FERRUM_ECDS_MULTI_CLUSTER_TYPE_URL => {
                 MeshSliceCarrier::MultiCluster(decode_json(value)?)
@@ -530,6 +565,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL => {
             Some("ferrum-mesh-carrier/virtual-service-l4-proxies")
         }
+        FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL => {
+            Some("ferrum-mesh-carrier/virtual-service-l4-upstreams")
+        }
         FERRUM_ECDS_MESH_POLICIES_TYPE_URL => Some("ferrum-mesh-carrier/mesh-policies"),
         FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL => {
             Some("ferrum-mesh-carrier/virtual-service-cors-policies")
@@ -541,6 +579,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         FERRUM_ECDS_PROXY_CONFIGS_TYPE_URL => Some("ferrum-mesh-carrier/proxy-configs"),
         FERRUM_ECDS_TRUST_BUNDLES_TYPE_URL => Some("ferrum-mesh-carrier/trust-bundles"),
         FERRUM_ECDS_OUTBOUND_POLICY_TYPE_URL => Some("ferrum-mesh-carrier/outbound-traffic-policy"),
+        FERRUM_ECDS_SIDECAR_OUTBOUND_POLICY_TYPE_URL => {
+            Some("ferrum-mesh-carrier/sidecar-outbound-traffic-policy")
+        }
         FERRUM_ECDS_MULTI_CLUSTER_TYPE_URL => Some("ferrum-mesh-carrier/multi-cluster"),
         FERRUM_ECDS_SIDECAR_EGRESS_SCOPE_TYPE_URL => {
             Some("ferrum-mesh-carrier/sidecar-egress-scope")
@@ -674,6 +715,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
             slice.virtual_service_l4_proxies.clone(),
         ));
     }
+    if !slice.virtual_service_l4_upstreams.is_empty() {
+        carriers.push(MeshSliceCarrier::VirtualServiceL4Upstreams(
+            slice.virtual_service_l4_upstreams.clone(),
+        ));
+    }
     if !slice.mesh_policies.is_empty() {
         carriers.push(MeshSliceCarrier::MeshPolicies(slice.mesh_policies.clone()));
     }
@@ -710,6 +756,16 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     }
     if let Some(policy) = slice.outbound_traffic_policy {
         carriers.push(MeshSliceCarrier::OutboundTrafficPolicy(policy));
+    }
+    // Workload-scoped Sidecar override (issue #3262). Emitted only when the CP
+    // resolved one, so its ABSENCE is the wire form of "inherit the mesh-wide
+    // policy" — identical to a native slice's `None`. ECDS is state-of-the-world,
+    // so a Sidecar deletion (or an operator flipping the enforcement gate off)
+    // simply stops emitting this resource and the DP's freshly built
+    // `RecoveredMeshSlice` falls back to the mesh-wide value; nothing has to
+    // publish an explicit "cleared" sentinel.
+    if let Some(policy) = slice.sidecar_outbound_traffic_policy {
+        carriers.push(MeshSliceCarrier::SidecarOutboundTrafficPolicy(policy));
     }
     if let Some(multi_cluster) = slice.multi_cluster.as_ref() {
         carriers.push(MeshSliceCarrier::MultiCluster(multi_cluster.clone()));
@@ -766,6 +822,9 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         MeshSliceCarrier::VirtualServiceL4Proxies(value) => {
             slice.virtual_service_l4_proxies = value
         }
+        MeshSliceCarrier::VirtualServiceL4Upstreams(value) => {
+            slice.virtual_service_l4_upstreams = value
+        }
         MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
         MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {
             slice.virtual_service_cors_policies = value
@@ -778,6 +837,9 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         MeshSliceCarrier::TrustBundles(value) => slice.trust_bundles = Some(value),
         MeshSliceCarrier::OutboundTrafficPolicy(value) => {
             slice.outbound_traffic_policy = Some(value)
+        }
+        MeshSliceCarrier::SidecarOutboundTrafficPolicy(value) => {
+            slice.sidecar_outbound_traffic_policy = Some(value)
         }
         MeshSliceCarrier::MultiCluster(value) => slice.multi_cluster = Some(value),
         MeshSliceCarrier::SidecarEgressScope(value) => slice.sidecar_egress_scope = Some(value),
@@ -959,6 +1021,9 @@ mod tests {
             MeshSliceCarrier::VirtualServiceL4Proxies(vec![serde_json::json!({
                 "id": "istio-vs-l4_tcp__default__db__0-0"
             })]),
+            MeshSliceCarrier::VirtualServiceL4Upstreams(vec![serde_json::json!({
+                "id": "istio-vs-l4-upstream-default-db-tcp-0"
+            })]),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),
@@ -1058,6 +1123,7 @@ mod tests {
             )])),
             MeshSliceCarrier::LabelsAmbiguous(true),
             MeshSliceCarrier::VirtualServiceL4Proxies(Vec::new()),
+            MeshSliceCarrier::VirtualServiceL4Upstreams(Vec::new()),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),

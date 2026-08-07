@@ -9,9 +9,64 @@
 //! `PluginResult::RejectBinary` with the normalized response. The normal proxy
 //! dispatch is skipped entirely. Native gRPC is deliberately outside this
 //! OpenAI Chat Completions JSON contract.
-//! Streaming Chat Completions are intentionally unsupported by this buffered
-//! execution path: matched requests with `"stream": true` are rejected with a
-//! clear 501 error instead of being forwarded to an unimplemented SSE path.
+//!
+//! ## Streaming Chat Completions (issue #3298)
+//!
+//! `"stream": true` is served by a SECOND execution path that never buffers the
+//! generation. Enabling the root `streaming` block makes `before_proxy` claim a
+//! streaming request, commit exactly one provider, rewrite the routing decision
+//! through `RequestContext.route_override_*`, and let the ordinary proxy
+//! dispatch relay the provider's SSE incrementally. Time to first token,
+//! cancellation, byte budgets, and shutdown accounting therefore come from the
+//! shared streaming response machinery rather than a plugin-private relay.
+//!
+//! **The commit boundary is fail-closed.** Provider fallback happens only inside
+//! `before_proxy`, before any downstream-visible byte exists: an open circuit, an
+//! ineligible provider, or an unusable endpoint moves to the next matching
+//! provider. Once the claim is written the provider, credential, destination,
+//! backend TLS, DNS decision, and backend-visible query are committed exactly
+//! once. After that:
+//!
+//! * a non-2xx provider response still has a real status and is relayed as the
+//!   provider's own error envelope — no second provider is tried;
+//! * a failure once body bytes are committed can only TRUNCATE, so the SSE
+//!   contract guard emits one gateway-authored terminal `error` event and ends
+//!   the body. A second provider is never spliced into the same logical stream.
+//!
+//! **Eligibility is narrow by construction.** A provider may serve a stream only
+//! when its NATIVE streaming wire format already is the OpenAI Chat Completions
+//! SSE contract (`openai`, `mistral`, `xai`, `deepseek`, `meta_llama`,
+//! `hugging_face`, `azure_openai`) and its credential is a static request header.
+//! Providers with a provider-native event representation (`anthropic`,
+//! `google_gemini`, `google_vertex`, `aws_bedrock`, `cohere`) and providers
+//! authenticating with AWS SigV4 or refreshed Google OAuth2 are fail-closed with
+//! a field-specific `501`: SigV4 signs the exact final body that only exists
+//! after the claim, and OAuth2 has no per-attempt refresh boundary here. Use
+//! `ai_stream_router` for Anthropic/Gemini streaming translation.
+//!
+//! **Bounds.** The streaming path retains at most one partial SSE event per
+//! response — or, once the provider frames its completion, the single terminal
+//! event alone — capped by `streaming.max_event_bytes`; it creates no queues, no
+//! channels, and no detached tasks of its own. Oversized events, data after the
+//! terminal marker, a duplicated terminal marker, a truncated stream, a
+//! content-coded stream, and a non-event-stream 2xx all fail closed with
+//! fixed-cardinality reasons that never echo a provider byte.
+//!
+//! **The terminal marker is held until upstream EOF.** Ordinary events stream
+//! out as soon as they are complete, so time to first token is unchanged, but
+//! `data: [DONE]` is retained until the provider's body actually ends. A client
+//! following the OpenAI contract may stop reading at `[DONE]`, so releasing it
+//! before EOF would let a client accept a successful completion and never see a
+//! post-terminal violation reported afterwards. Any provider byte after that
+//! retained marker fails the stream closed and the marker is dropped: the client
+//! receives the gateway-authored `error` event and no completion marker.
+//!
+//! Enabling `streaming` makes this plugin declare a backend-boundary header
+//! policy and request header/destination mutation, so it can no longer be
+//! composed with `request_deduplication` or `response_caching` on the same
+//! proxy — a before-proxy fingerprint cannot witness the final provider
+//! boundary. Non-streaming federation behavior is unchanged when the block is
+//! absent.
 //!
 //! ## Supported Providers
 //!
@@ -51,13 +106,20 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 use url::{Host, Url};
 
+use super::ai_stream_router::{
+    AiStreamRouterClaim, ExternalProviderClaimParts, mint_external_provider_claim,
+    next_provider_claim_owner_id, remove_header_ci, strip_client_credentials,
+    strip_gateway_identity_assertions,
+};
 use super::utils::aws_sigv4;
-use super::utils::body_transform::is_json_content_type;
+use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use super::{
     AiUsageExport, EXTERNAL_OPERATION_COMPLETED_METADATA_KEY, Plugin, PluginHttpClient,
-    PluginResult, RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext,
+    PluginResult, RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, ResponseStreamAction,
+    ResponseStreamInspector, ResponseStreamInspectorStage, SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY,
 };
+use crate::config::types::{BackendScheme, BackendTlsConfig};
 
 const DEFAULT_MAX_PROVIDER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -73,6 +135,23 @@ const MAX_MODEL_PATTERNS_PER_PROVIDER: usize = 128;
 const MAX_MODEL_MAPPINGS_PER_PROVIDER: usize = 1024;
 const MAX_FORWARDED_PROVIDER_HEADERS: usize = 32;
 const MAX_FORWARDED_PROVIDER_HEADER_VALUE_BYTES: usize = 1024;
+
+// --- Streaming (issue #3298) -----------------------------------------------
+
+/// Default ceiling for one buffered SSE event on the streaming path.
+const DEFAULT_MAX_STREAM_EVENT_BYTES: usize = 256 * 1024;
+/// Hard upper bound an operator may configure for one SSE event.
+const MAX_STREAM_EVENT_BYTES: usize = 1024 * 1024;
+/// Hard lower bound: below this a legitimate tool-call delta cannot fit.
+const MIN_STREAM_EVENT_BYTES: usize = 4 * 1024;
+/// Upper bound an operator may configure for the streaming whole-exchange
+/// budget (24 hours). `0` means no gateway-imposed bound at all.
+const MAX_STREAM_READ_TIMEOUT_SECONDS: u64 = 86_400;
+/// Retained-state ceiling for one claimed stream is exactly one event — either
+/// the partial event being assembled or the held terminal marker, never both —
+/// so the whole streaming path costs O(max_event_bytes) regardless of how long
+/// the provider streams. Asserted here so a later edit cannot quietly widen it.
+const _: () = assert!(MAX_STREAM_EVENT_BYTES <= 4 * 1024 * 1024);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -547,7 +626,10 @@ struct ResolvedProvider {
     /// Overall per-request deadline applied via reqwest's `.timeout()`.
     read_timeout: Duration,
     max_response_body_bytes: usize,
-    circuit: Option<ProviderCircuit>,
+    /// Shared so a claimed STREAM can hold its admission across hooks and into
+    /// the response-stream inspector, which outlives every borrow of the plugin
+    /// instance (it is driven by a detached body task).
+    circuit: Option<Arc<ProviderCircuit>>,
     /// Operator-supplied URL override. Used directly by Anthropic and Cohere
     /// dispatch paths that build their own URLs without going through
     /// `url_template`.
@@ -1046,8 +1128,21 @@ pub struct AiFederation {
     fallback_on_ambiguous_errors: bool,
     fail_on_missing_model: bool,
     fail_on_no_matching_provider: bool,
-    request_slots: Semaphore,
+    /// `max_concurrent_requests`. Shared so a claimed STREAM can hold an OWNED
+    /// permit for the whole life of the response — the buffered path's borrowed
+    /// permit cannot outlive `dispatch_finalized_request_egress`, but a stream's
+    /// provider chain outlives every hook.
+    request_slots: Arc<Semaphore>,
     http_client: PluginHttpClient,
+    /// Incremental provider streaming policy (issue #3298).
+    streaming: StreamingPolicy,
+    /// Opaque per-INSTANCE provider-claim ownership token
+    /// (`GHSA-xhp5-hqj8-3mwg`). Allocated from the same process-wide counter
+    /// `ai_stream_router` uses, so no two claim owners of either plugin type can
+    /// collide. Never rendered into metadata, logs, configuration, or a
+    /// response. Allocated even when streaming is disabled: it costs one relaxed
+    /// atomic increment at construction and keeps the ownership check total.
+    stream_owner_id: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,8 +1154,9 @@ impl AiFederation {
         let config_object = config
             .as_object()
             .ok_or_else(|| "ai_federation: config must be an object".to_string())?;
-        reject_unsupported_streaming_config(config, "config")?;
+        reject_unsupported_streaming_config(config, "config", true)?;
         reject_unknown_config_keys(config_object, "config", AI_FEDERATION_CONFIG_KEYS)?;
+        let streaming = parse_streaming_policy(config)?;
 
         let providers_val = config
             .get("providers")
@@ -1087,7 +1183,7 @@ impl AiFederation {
             let provider_object = pv
                 .as_object()
                 .ok_or_else(|| format!("ai_federation: provider[{i}] must be an object"))?;
-            reject_unsupported_streaming_config(pv, &format!("provider[{i}]"))?;
+            reject_unsupported_streaming_config(pv, &format!("provider[{i}]"), false)?;
             reject_unknown_config_keys(
                 provider_object,
                 &format!("provider[{i}]"),
@@ -1186,7 +1282,8 @@ impl AiFederation {
             let connect_timeout = Duration::from_secs(connect_timeout_seconds);
             let read_timeout = Duration::from_secs(read_timeout_seconds);
             let max_response_body_bytes = parse_provider_response_limit(pv, &name)?;
-            let circuit = parse_provider_circuit(pv, &name)?.map(ProviderCircuit::new);
+            let circuit = parse_provider_circuit(pv, &name)?
+                .map(|config| Arc::new(ProviderCircuit::new(config)));
 
             let base_url = optional_str(pv, "base_url")?.map(String::from);
             let allow_plaintext = optional_bool(pv, "allow_plaintext")?.unwrap_or(false);
@@ -1291,8 +1388,10 @@ impl AiFederation {
             fallback_on_ambiguous_errors,
             fail_on_missing_model,
             fail_on_no_matching_provider,
-            request_slots: Semaphore::new(max_concurrent_requests),
+            request_slots: Arc::new(Semaphore::new(max_concurrent_requests)),
             http_client,
+            streaming,
+            stream_owner_id: next_provider_claim_owner_id(),
         })
     }
 }
@@ -1307,7 +1406,12 @@ const AI_FEDERATION_CONFIG_KEYS: &[&str] = &[
     "fail_on_missing_model",
     "fail_on_no_matching_provider",
     "max_concurrent_requests",
+    "streaming",
 ];
+
+/// Accepted keys inside the root `streaming` block (issue #3298).
+const AI_FEDERATION_STREAMING_KEYS: &[&str] =
+    &["enabled", "max_event_bytes", "read_timeout_seconds"];
 
 const AI_FEDERATION_PROVIDER_KEYS: &[&str] = &[
     "name",
@@ -1446,23 +1550,109 @@ fn parse_provider_circuit(
     }))
 }
 
-fn reject_unsupported_streaming_config(config: &Value, scope: &str) -> Result<(), String> {
-    const UNSUPPORTED_STREAMING_FIELDS: &[&str] = &[
-        "stream",
-        "streaming",
-        "streaming_enabled",
-        "enable_streaming",
-    ];
+/// Reject the ambiguous streaming toggles that never existed.
+///
+/// The one supported spelling is the root `streaming` OBJECT (issue #3298).
+/// `allow_streaming_block` is true only at root scope; per-provider streaming is
+/// not configurable, so a provider entry still rejects all four names with a
+/// field-specific diagnostic rather than silently ignoring them.
+fn reject_unsupported_streaming_config(
+    config: &Value,
+    scope: &str,
+    allow_streaming_block: bool,
+) -> Result<(), String> {
+    const UNSUPPORTED_STREAMING_FIELDS: &[&str] =
+        &["stream", "streaming_enabled", "enable_streaming"];
 
     for field in UNSUPPORTED_STREAMING_FIELDS {
         if config.get(*field).is_some() {
             return Err(format!(
-                "ai_federation: {scope} field '{field}' is unsupported; ai_federation does not implement provider response streaming and rejects matched OpenAI Chat Completions requests with \"stream\": true"
+                "ai_federation: {scope} field '{field}' is unsupported; configure incremental provider streaming with the root 'streaming' object ({{\"enabled\": true}})"
+            ));
+        }
+    }
+    match config.get("streaming") {
+        None => {}
+        Some(Value::Object(_)) if allow_streaming_block => {}
+        Some(_) if allow_streaming_block => {
+            return Err(format!(
+                "ai_federation: {scope} field 'streaming' must be an object with keys: {}",
+                AI_FEDERATION_STREAMING_KEYS.join(", ")
+            ));
+        }
+        Some(_) => {
+            return Err(format!(
+                "ai_federation: {scope} field 'streaming' is unsupported; streaming is configured once at the root of the plugin config, not per provider"
             ));
         }
     }
 
     Ok(())
+}
+
+/// Root streaming policy (issue #3298).
+#[derive(Debug, Clone, Copy)]
+struct StreamingPolicy {
+    enabled: bool,
+    /// Ceiling on one retained partial SSE event. Bounds every buffer the
+    /// streaming path keeps: there is exactly one carry buffer per response.
+    max_event_bytes: usize,
+    /// Streaming-only override for the WHOLE-EXCHANGE provider budget.
+    ///
+    /// `None` inherits the selected provider's `read_timeout_seconds`. `Some(0)`
+    /// removes the gateway-imposed bound entirely, which is the only way to
+    /// serve a generation that legitimately runs longer than the per-call budget
+    /// configured for the same provider's buffered requests.
+    read_timeout_seconds: Option<u64>,
+}
+
+impl Default for StreamingPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_event_bytes: DEFAULT_MAX_STREAM_EVENT_BYTES,
+            read_timeout_seconds: None,
+        }
+    }
+}
+
+fn parse_streaming_policy(config: &Value) -> Result<StreamingPolicy, String> {
+    let Some(value) = config.get("streaming") else {
+        return Ok(StreamingPolicy::default());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "ai_federation: 'streaming' must be an object".to_string())?;
+    reject_unknown_config_keys(object, "streaming", AI_FEDERATION_STREAMING_KEYS)?;
+
+    let enabled = optional_bool(value, "enabled")?.unwrap_or(false);
+    let max_event_bytes = match optional_u64(value, "max_event_bytes")? {
+        None => DEFAULT_MAX_STREAM_EVENT_BYTES,
+        Some(raw) => usize::try_from(raw).map_err(|_| {
+            format!(
+                "ai_federation: streaming max_event_bytes must be between {MIN_STREAM_EVENT_BYTES} and {MAX_STREAM_EVENT_BYTES}"
+            )
+        })?,
+    };
+    if !(MIN_STREAM_EVENT_BYTES..=MAX_STREAM_EVENT_BYTES).contains(&max_event_bytes) {
+        return Err(format!(
+            "ai_federation: streaming max_event_bytes must be between {MIN_STREAM_EVENT_BYTES} and {MAX_STREAM_EVENT_BYTES}"
+        ));
+    }
+    let read_timeout_seconds = optional_u64(value, "read_timeout_seconds")?;
+    if let Some(seconds) = read_timeout_seconds
+        && seconds > MAX_STREAM_READ_TIMEOUT_SECONDS
+    {
+        return Err(format!(
+            "ai_federation: streaming read_timeout_seconds must be between 0 (unbounded) and {MAX_STREAM_READ_TIMEOUT_SECONDS}"
+        ));
+    }
+
+    Ok(StreamingPolicy {
+        enabled,
+        max_event_bytes,
+        read_timeout_seconds,
+    })
 }
 
 fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
@@ -4970,6 +5160,1478 @@ fn is_safe_provider_response_header(name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Incremental provider streaming (issue #3298)
+// ---------------------------------------------------------------------------
+
+/// Shared metadata marker telling response-side plugins that this request asked
+/// for a streamed response even without `Accept: text/event-stream`.
+const META_STREAMING_SHARED: &str = "ai_request_streaming";
+const META_STREAM_CLAIMED: &str = "ai_federation.streaming_claimed";
+const META_STREAM_PROVIDER_TYPE: &str = "ai_federation.streaming_provider_type";
+const META_STREAM_ATTEMPTS: &str = "ai_federation.streaming_provider_attempts";
+const META_STREAM_OUTCOME: &str = "ai_federation.streaming_outcome";
+
+/// How a committed streaming provider chain finished.
+///
+/// Exactly one of these is recorded per claim, by whichever terminal point wins
+/// the reservation. A non-2xx provider status known at response headers is
+/// staged first and applied when the body ends or the lifecycle drops, so a
+/// client disconnect after those headers still scores the provider verdict
+/// rather than falling through to [`StreamOutcome::Released`]. Only paths with
+/// no staged provider verdict — including a dropped request context before
+/// headers, a dropped inspector with no header verdict, and a pre-dispatch
+/// fail-closed rejection — land on [`StreamOutcome::Released`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOutcome {
+    /// The provider proved a complete generation: a 2xx event stream terminated
+    /// by exactly one valid `[DONE]` marker, or a non-2xx envelope the buffered
+    /// path would also have scored as a provider success.
+    Succeeded,
+    /// The provider produced a fault: a configured fallback status, a redirect,
+    /// an unusable 2xx representation, or a stream that never proved a valid
+    /// terminal marker.
+    Failed,
+    /// No provider verdict exists. Client disconnect before headers, a
+    /// downstream policy cut of an unresolved 2xx body, a pre-dispatch
+    /// fail-closed rejection, and plain cancellation all land here: capacity
+    /// and the half-open probe slot are returned WITHOUT scoring the circuit,
+    /// because scoring an outcome the provider never produced would either
+    /// open a healthy circuit or close a broken one.
+    Released,
+}
+
+impl StreamOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Released => "released",
+        }
+    }
+}
+
+/// The capacity and circuit admission a committed stream holds until it reaches
+/// a terminal state.
+///
+/// Held inside [`FederationStreamLifecycle`] and taken exactly once, so the
+/// permit is returned and the circuit is scored at most once no matter how many
+/// terminal paths fire.
+struct FederationStreamReservation {
+    /// `max_concurrent_requests` slot. Returned by DROP, so every cancellation
+    /// path frees it without needing to run any code of ours.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    circuit: Option<Arc<ProviderCircuit>>,
+    /// The admission the circuit actually granted. A `HalfOpenProbe` admission
+    /// owns the circuit's single probe slot until this reservation resolves.
+    admission: CircuitAdmission,
+    provider_name: Arc<str>,
+}
+
+/// Cancellation-safe, clone-safe lifecycle reservation for ONE committed
+/// streaming provider chain (issue #3298).
+///
+/// The claim holds an `Arc` of this and so does the response-stream inspector,
+/// which the proxy moves into a detached body task. Both may be dropped in any
+/// order; whichever terminal point runs first resolves the reservation, and the
+/// last `Arc` to drop releases anything still unresolved. That makes the
+/// concurrency permit and the circuit's half-open probe slot exactly-once under
+/// client disconnect, downstream policy cuts, pre-header cancellation, and a
+/// dropped request context alike.
+///
+/// A non-2xx provider status is staged at response headers without taking the
+/// reservation: the permit stays held while the error body streams, and the
+/// staged verdict is applied exactly once when the body ends or this lifecycle
+/// drops (so a client disconnect after those headers still scores the provider,
+/// never a gateway-neutral release).
+///
+/// Nothing here is serialized, logged, or exposed: it is reached only through
+/// the private claim, and only after an owner match.
+struct FederationStreamLifecycle {
+    /// `None` once resolved. The mutex is touched only at terminal points — a
+    /// claim, a header decision, a stream terminal, or a drop — never per chunk.
+    reservation: std::sync::Mutex<Option<FederationStreamReservation>>,
+    /// Provider outcome known from non-2xx response headers before the body
+    /// ends. Consumed exactly once when [`Self::resolve`] takes the reservation.
+    staged_outcome: std::sync::Mutex<Option<StreamOutcome>>,
+    /// The outcome that actually resolved the reservation, for the terminal
+    /// metadata write-back. Written under the same take.
+    resolved_outcome: std::sync::Mutex<Option<StreamOutcome>>,
+}
+
+impl FederationStreamLifecycle {
+    fn new(reservation: FederationStreamReservation) -> Self {
+        Self {
+            reservation: std::sync::Mutex::new(Some(reservation)),
+            staged_outcome: std::sync::Mutex::new(None),
+            resolved_outcome: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Stage a provider outcome known from response headers without releasing
+    /// capacity or scoring the circuit yet.
+    ///
+    /// Used for non-2xx envelopes whose body may still be streaming. First stage
+    /// wins; later stages and stages after a resolve are no-ops.
+    fn stage(&self, outcome: StreamOutcome) {
+        let still_open = match self.reservation.lock() {
+            Ok(slot) => slot.is_some(),
+            Err(_) => return,
+        };
+        if !still_open {
+            return;
+        }
+        if let Ok(mut staged) = self.staged_outcome.lock()
+            && staged.is_none()
+        {
+            *staged = Some(outcome);
+        }
+    }
+
+    /// Resolve the reservation exactly once.
+    ///
+    /// When a non-2xx provider verdict was staged at headers, that staged
+    /// outcome wins over `outcome` so body termination and Drop apply the
+    /// already-known circuit score instead of converting it to
+    /// [`StreamOutcome::Released`]. Later calls are no-ops, so a stream that
+    /// terminates through the inspector and is then dropped never
+    /// double-releases capacity nor scores the circuit twice. A poisoned mutex
+    /// cannot occur (nothing here can panic while holding it) but is handled
+    /// without `unwrap` regardless: the permit is then returned by the
+    /// reservation's own drop instead.
+    fn resolve(&self, outcome: StreamOutcome) {
+        let taken = match self.reservation.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => return,
+        };
+        let Some(reservation) = taken else {
+            return;
+        };
+        let outcome = match self.staged_outcome.lock() {
+            Ok(mut staged) => staged.take().unwrap_or(outcome),
+            Err(_) => outcome,
+        };
+        if let Ok(mut recorded) = self.resolved_outcome.lock() {
+            *recorded = Some(outcome);
+        }
+        if let Some(circuit) = reservation.circuit.as_ref() {
+            match outcome {
+                StreamOutcome::Succeeded => {
+                    circuit.record_success(&reservation.provider_name, reservation.admission);
+                }
+                StreamOutcome::Failed => {
+                    circuit.record_failure(&reservation.provider_name, reservation.admission);
+                }
+                StreamOutcome::Released => {
+                    // No provider verdict: give the single half-open probe slot
+                    // back so the next request can probe, and leave the failure
+                    // and success counters exactly where they were.
+                    circuit.release_probe(reservation.admission);
+                }
+            }
+        }
+        // `reservation` drops here, returning the concurrency permit.
+    }
+
+    /// The outcome this lifecycle resolved to, if it already resolved.
+    fn outcome(&self) -> Option<StreamOutcome> {
+        self.resolved_outcome.lock().ok().and_then(|slot| *slot)
+    }
+}
+
+impl Drop for FederationStreamLifecycle {
+    fn drop(&mut self) {
+        // Cancellation / body-end backstop. Reached when the request context and
+        // any inspector are both gone. A staged non-2xx provider verdict is
+        // preserved by [`Self::resolve`]; only an unresolved claim releases
+        // without scoring.
+        self.resolve(StreamOutcome::Released);
+    }
+}
+
+/// Why a matched provider cannot serve an INCREMENTAL stream.
+///
+/// Streaming commits exactly one provider before the first downstream byte, so
+/// an ineligible provider is skipped during the pre-commit selection loop and,
+/// if no provider survives, the request fails closed with the last reason. Every
+/// variant is fixed-cardinality and echoes no configuration value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamIneligibility {
+    /// The provider speaks a native streaming representation that is not the
+    /// OpenAI Chat Completions SSE contract (Anthropic Messages events, Gemini
+    /// `streamGenerateContent`, Bedrock `application/vnd.amazon.eventstream`,
+    /// Cohere v2 events). Relaying it unchanged would break the documented
+    /// client contract, and translating it belongs to `ai_stream_router`.
+    Representation,
+    /// The provider's credential is not a static request header, so it cannot be
+    /// committed at claim time: AWS SigV4 signs the exact final body (which the
+    /// dispatch layer produces after the claim), and Google OAuth2 resolves a
+    /// short-lived token whose refresh has no per-attempt boundary here.
+    Auth,
+    /// The rendered provider endpoint cannot be decomposed into a committed
+    /// scheme / host / port / absolute path destination.
+    Endpoint,
+}
+
+impl StreamIneligibility {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Representation => "streaming_provider_representation_unsupported",
+            Self::Auth => "streaming_provider_auth_unsupported",
+            Self::Endpoint => "streaming_provider_endpoint_unsupported",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Representation => {
+                "No ai_federation provider for this model can stream the OpenAI Chat Completions SSE contract; providers with a native non-OpenAI streaming representation are not eligible"
+            }
+            Self::Auth => {
+                "No ai_federation provider for this model can stream; the matched providers authenticate with request signing or a refreshed OAuth2 token, which cannot be committed before the stream starts"
+            }
+            Self::Endpoint => {
+                "No ai_federation provider for this model can stream; the configured provider endpoint could not be committed as a streaming destination"
+            }
+        }
+    }
+}
+
+/// The destination a streaming claim commits to, derived from the provider's
+/// already SSRF-validated rendered endpoint.
+struct CommittedStreamTarget {
+    scheme: BackendScheme,
+    /// Dial host, normalized (no brackets, no port).
+    host: String,
+    port: u16,
+    /// Absolute backend path. Any endpoint-configured query (for example Azure's
+    /// `api-version`) is already folded in.
+    path: String,
+    /// `Host` / `:authority` exactly as committed.
+    authority: String,
+    /// Whether the endpoint carried its own query, in which case the claim
+    /// commits an EMPTY appendable query so a later generic query rule cannot
+    /// append a normal-backend secret to the third-party URL.
+    endpoint_owns_query: bool,
+}
+
+/// Decide whether `provider` can serve an incremental stream and, if so, what
+/// destination the claim would commit.
+///
+/// Fail-closed by construction: every unsupported provider shape returns an
+/// error rather than falling through to a best-effort relay.
+fn stream_target_for(
+    provider: &ResolvedProvider,
+    resolved_model: &str,
+) -> Result<CommittedStreamTarget, StreamIneligibility> {
+    // Only providers whose NATIVE streaming wire format already is the OpenAI
+    // Chat Completions SSE contract are eligible. Everything else needs a
+    // provider-native SSE normalizer, which lives in `ai_stream_router`.
+    if !provider.provider_type.is_openai_compatible() {
+        return Err(StreamIneligibility::Representation);
+    }
+    match &provider.auth {
+        AuthMethod::BearerToken { .. } | AuthMethod::CustomHeader { .. } => {}
+        AuthMethod::AwsSigV4 { .. } | AuthMethod::GoogleOAuth2 { .. } => {
+            return Err(StreamIneligibility::Auth);
+        }
+    }
+
+    let rendered = build_provider_url(provider, resolved_model);
+    // Re-run the dispatch URL policy: the buffered path checks it per request,
+    // and a streaming claim must not be weaker.
+    validate_dispatch_url(&rendered).map_err(|_| StreamIneligibility::Endpoint)?;
+    let url = Url::parse(&rendered).map_err(|_| StreamIneligibility::Endpoint)?;
+    let scheme = match url.scheme() {
+        "https" => BackendScheme::Https,
+        "http" => BackendScheme::Http,
+        _ => return Err(StreamIneligibility::Endpoint),
+    };
+    let host = normalized_url_hostname(&url).ok_or(StreamIneligibility::Endpoint)?;
+    let port = url
+        .port_or_known_default()
+        .ok_or(StreamIneligibility::Endpoint)?;
+    // `Url::host_str` keeps IPv6 brackets, which is exactly what a `Host`
+    // header needs; the dial host above is the unbracketed form.
+    let host_for_authority = url.host_str().ok_or(StreamIneligibility::Endpoint)?;
+    let default_port = matches!(
+        (scheme, port),
+        (BackendScheme::Https, 443) | (BackendScheme::Http, 80)
+    );
+    let authority = if default_port {
+        host_for_authority.to_string()
+    } else {
+        format!("{host_for_authority}:{port}")
+    };
+
+    let mut path = url.path().to_string();
+    if path.is_empty() {
+        path.push('/');
+    }
+    let endpoint_owns_query = match url.query() {
+        Some(query) if !query.is_empty() => {
+            path.push('?');
+            path.push_str(query);
+            true
+        }
+        _ => false,
+    };
+
+    Ok(CommittedStreamTarget {
+        scheme,
+        host,
+        port,
+        path,
+        authority,
+        endpoint_owns_query,
+    })
+}
+
+/// Whether the model still satisfies this provider's configured pattern policy.
+///
+/// Same rule as [`AiFederation::find_providers_for_model`] (empty patterns are a
+/// deliberate catch-all), factored out so the final backend-visible revalidation
+/// re-applies exactly the selection policy rather than a lookalike.
+fn provider_matches_model(provider: &ResolvedProvider, model: &str) -> bool {
+    provider.model_patterns.is_empty()
+        || provider
+            .model_patterns
+            .iter()
+            .any(|pattern| simple_glob_match(pattern, model))
+}
+
+/// The complete set of request headers a streaming claim owns at the provider
+/// boundary (`GHSA-xhp5-hqj8-3mwg`).
+///
+/// Applied twice by design: once when `before_proxy` claims the request, and
+/// again over the FINAL backend-visible header map after every later generic
+/// header transform. Idempotent, and it never logs a value.
+///
+/// Unlike the buffered path — which builds a fresh provider request and never
+/// exposes the client's own header map to the provider — this route-override
+/// path forwards the client's headers, so client credentials and gateway
+/// identity assertions must be stripped every time.
+fn apply_stream_boundary_headers(
+    provider: &ResolvedProvider,
+    authority: &str,
+    headers: &mut HashMap<String, String>,
+) {
+    strip_client_credentials(headers);
+    strip_gateway_identity_assertions(headers);
+    match &provider.auth {
+        AuthMethod::BearerToken { api_key } => {
+            // `strip_client_credentials` already removed every case variant of
+            // `authorization`, so this insert is the canonical one.
+            headers.insert("authorization".to_string(), format!("Bearer {api_key}"));
+        }
+        AuthMethod::CustomHeader {
+            header_name,
+            api_key,
+        } => {
+            remove_header_ci(headers, header_name);
+            headers.insert(header_name.clone(), api_key.clone());
+        }
+        // Unreachable for a claimed request: `stream_target_for` refuses these
+        // auth methods before a claim exists. Installing nothing is the
+        // fail-closed choice — the provider rejects the unauthenticated call
+        // rather than the gateway forwarding a client credential.
+        AuthMethod::AwsSigV4 { .. } | AuthMethod::GoogleOAuth2 { .. } => {}
+    }
+    remove_header_ci(headers, "host");
+    headers.insert("host".to_string(), authority.to_string());
+    remove_header_ci(headers, "content-type");
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    remove_header_ci(headers, "accept");
+    headers.insert("accept".to_string(), "text/event-stream".to_string());
+    // The SSE contract guard parses line-delimited plaintext events. Ask for
+    // identity so a content coding can never be misread as event bytes;
+    // `after_proxy` still fails closed if the provider ignores this.
+    remove_header_ci(headers, "accept-encoding");
+    headers.insert("accept-encoding".to_string(), "identity".to_string());
+}
+
+/// Fixed-cardinality client-visible reasons for a post-commit streaming
+/// failure. None of them echoes a provider byte, header, model, or URL.
+const STREAM_REASON_OVERSIZED_EVENT: &str =
+    "upstream provider emitted an oversized server-sent event";
+const STREAM_REASON_TRUNCATED: &str =
+    "upstream provider stream ended before the terminal completion marker";
+const STREAM_REASON_AFTER_TERMINAL: &str =
+    "upstream provider emitted stream data after the terminal completion marker";
+const STREAM_REASON_UNSUPPORTED_MEDIA: &str =
+    "upstream provider returned a successful response that is not an event stream";
+const STREAM_REASON_UNSUPPORTED_ENCODING: &str =
+    "upstream provider returned a content-encoded stream";
+const STREAM_REASON_MALFORMED_EVENT: &str =
+    "upstream provider emitted a malformed server-sent event";
+
+/// Build the single terminal SSE error frame emitted when a committed stream
+/// fails after the response was already committed downstream.
+///
+/// Post-commit there is no status left to change and no second provider that may
+/// be spliced into the same logical stream, so the only protocol-correct action
+/// is one OpenAI-shaped error event followed by end of body. Deliberately does
+/// NOT emit `data: [DONE]`: a client must be able to tell a completed generation
+/// from a truncated one.
+fn stream_error_frame(reason: &'static str) -> Bytes {
+    let payload = json!({
+        "error": {
+            "message": reason,
+            "type": "upstream_error",
+            "param": Value::Null,
+            "code": "provider_stream_failed",
+        }
+    });
+    // `reason` is one of the fixed constants above and the envelope is built by
+    // `serde_json`, so this string is bounded and fully gateway-authored.
+    let mut frame = String::with_capacity(reason.len() + 128);
+    frame.push_str("event: error\ndata: ");
+    frame.push_str(&payload.to_string());
+    frame.push_str("\n\n");
+    Bytes::from(frame)
+}
+
+/// Terminal marker of the OpenAI Chat Completions SSE contract.
+const SSE_DONE_PAYLOAD: &str = "[DONE]";
+
+/// Return the drained carry allocation to the allocator once it exceeds this
+/// size, so one early large event cannot pin memory for the whole stream.
+const SSE_CARRY_COMPACT_BYTES: usize = 8 * 1024;
+
+/// Longest legal blank-line terminator (`\r\n\r\n`). Used only as slack for the
+/// per-byte early refusal; every authoritative ceiling check is exact.
+const SSE_TERMINATOR_MAX_BYTES: usize = 4;
+
+/// Incremental blank-line recognition over an SSE byte stream (WHATWG
+/// `server-sent events` §9.2.4).
+///
+/// A line terminator is CRLF, CR, or LF, and an event ends at the first EMPTY
+/// line — so `\n\n`, `\r\r`, `\r\n\r\n`, `\r\n\n`, `\n\r\n`, and `\r\r\n` are all
+/// legal boundaries. Matching a fixed set of two/four-byte needles misses the
+/// mixed forms and rescans the retained buffer from the front for every event,
+/// which is quadratic on a chunk carrying many events. This state machine is fed
+/// each byte exactly once and never rescans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SseFrameState {
+    /// Inside a line (including the very start of an event).
+    Text,
+    /// Saw CR inside a line: undecided between a CR terminator and CRLF.
+    TextCr,
+    /// A complete line terminator was just consumed. Another terminator here
+    /// means an empty line, which ends the event.
+    LineStart,
+    /// At a line start and saw CR. The empty line is already established, so the
+    /// event ends either way; only the byte count differs (CRLF vs bare CR).
+    LineStartCr,
+}
+
+/// What feeding one byte to [`SseFrameState`] decided.
+enum SseFrameStep {
+    /// Keep accumulating.
+    Continue,
+    /// The event ends INCLUDING this byte.
+    EndInclusive,
+    /// The event ends BEFORE this byte; the byte starts the next event and must
+    /// be fed again from [`SseFrameState::Text`].
+    EndExclusive,
+}
+
+impl SseFrameState {
+    fn step(&mut self, byte: u8) -> SseFrameStep {
+        match (*self, byte) {
+            (Self::Text, b'\r') => {
+                *self = Self::TextCr;
+                SseFrameStep::Continue
+            }
+            (Self::Text, b'\n') => {
+                *self = Self::LineStart;
+                SseFrameStep::Continue
+            }
+            (Self::Text, _) => SseFrameStep::Continue,
+            // CRLF: one terminator, so the next line has not started empty yet.
+            (Self::TextCr, b'\n') => {
+                *self = Self::LineStart;
+                SseFrameStep::Continue
+            }
+            // Bare CR terminated the line; this CR opens the empty line's own
+            // terminator.
+            (Self::TextCr, b'\r') => {
+                *self = Self::LineStartCr;
+                SseFrameStep::Continue
+            }
+            (Self::TextCr, _) => {
+                *self = Self::Text;
+                SseFrameStep::Continue
+            }
+            (Self::LineStart, b'\n') => {
+                *self = Self::Text;
+                SseFrameStep::EndInclusive
+            }
+            (Self::LineStart, b'\r') => {
+                *self = Self::LineStartCr;
+                SseFrameStep::Continue
+            }
+            (Self::LineStart, _) => {
+                *self = Self::Text;
+                SseFrameStep::Continue
+            }
+            // The empty line was terminated by CRLF.
+            (Self::LineStartCr, b'\n') => {
+                *self = Self::Text;
+                SseFrameStep::EndInclusive
+            }
+            // The empty line was terminated by the bare CR already consumed.
+            (Self::LineStartCr, _) => {
+                *self = Self::Text;
+                SseFrameStep::EndExclusive
+            }
+        }
+    }
+}
+
+/// Terminal / data classification of one COMPLETE raw event block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SseEventKind {
+    /// The combined `data` payload is exactly the terminal marker.
+    Terminal,
+    /// The event dispatches a non-empty `data` payload that is not the marker.
+    Data,
+    /// Comments (`: keep-alive`), bare `id`/`retry`/`event` fields, and empty
+    /// blocks: forwarded verbatim, but they are not stream data.
+    NonData,
+}
+
+/// Parse a complete raw event block per the SSE field grammar.
+///
+/// Returns `None` for a block that is not valid UTF-8, which fails the stream
+/// closed rather than forwarding bytes whose field structure cannot be decided.
+///
+/// The terminal decision is made on the CONCATENATED data payload, not on any
+/// single line: SSE joins every `data` field of one event with `\n`, so
+/// `data: [DONE]\ndata: <attacker>` dispatches `[DONE]\n<attacker>` and is NOT
+/// the terminal event. Treating any `[DONE]` line as terminal would let a
+/// provider (or anything that can inject one event) end the client's stream
+/// while smuggling a further payload past the post-terminal check.
+fn classify_sse_event(event: &[u8]) -> Option<SseEventKind> {
+    let text = std::str::from_utf8(event).ok()?;
+    let terminal = SSE_DONE_PAYLOAD.as_bytes();
+    let mut data_len = 0usize;
+    let mut matches_terminal = true;
+    let mut saw_data_field = false;
+    for line in split_sse_lines(text) {
+        if line.is_empty() || line.starts_with(':') {
+            // Blank line (the event terminator) or a comment.
+            continue;
+        }
+        let (field, raw_value) = match line.find(':') {
+            Some(index) => (&line[..index], &line[index + 1..]),
+            // A field line with no colon is the field name with an empty value.
+            None => (line, ""),
+        };
+        if field != "data" {
+            continue;
+        }
+        // Exactly one leading SPACE is removed, per spec. No other trimming:
+        // `data:  [DONE]` is a two-space payload and is deliberately not the
+        // terminal marker.
+        let value = raw_value.strip_prefix(' ').unwrap_or(raw_value);
+        if saw_data_field {
+            matches_terminal &= terminal.get(data_len) == Some(&b'\n');
+            data_len = data_len.saturating_add(1);
+        }
+        saw_data_field = true;
+        for byte in value.bytes() {
+            matches_terminal &= terminal.get(data_len) == Some(&byte);
+            data_len = data_len.saturating_add(1);
+        }
+    }
+    if !saw_data_field || data_len == 0 {
+        return Some(SseEventKind::NonData);
+    }
+    if matches_terminal && data_len == terminal.len() {
+        return Some(SseEventKind::Terminal);
+    }
+    Some(SseEventKind::Data)
+}
+
+/// Split an event block into lines on CRLF, CR, or LF.
+///
+/// `str::lines` only splits on LF (tolerating a trailing CR), so a CR-delimited
+/// provider would collapse every field of an event onto one line.
+fn split_sse_lines(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        match rest.find(['\r', '\n']) {
+            Some(index) => {
+                let line = &rest[..index];
+                let skip = if rest.as_bytes()[index] == b'\r'
+                    && rest.as_bytes().get(index + 1) == Some(&b'\n')
+                {
+                    2
+                } else {
+                    1
+                };
+                rest = &rest[index + skip..];
+                Some(line)
+            }
+            None => {
+                let line = rest;
+                rest = "";
+                Some(line)
+            }
+        }
+    })
+}
+
+/// Bounded, incremental guard over an OpenAI Chat Completions SSE stream.
+///
+/// The eligible providers already emit the client-visible contract, so this
+/// inspector forwards events verbatim and in order — preserving time to first
+/// token — while enforcing the parts of the contract a relay must not lose:
+///
+/// * every event, complete or partial, is checked against `max_event_bytes`
+///   BEFORE any of its bytes are retained or released, so neither a single huge
+///   event nor a single huge transport chunk can be allocated first and refused
+///   afterwards;
+/// * the ONE terminal event whose combined `data` payload is `[DONE]` is
+///   RETAINED rather than forwarded, until upstream EOF proves it was the last
+///   thing the provider wrote. An OpenAI streaming client is entitled to stop
+///   reading at `[DONE]`, so releasing a success-shaped marker before that proof
+///   would let it accept a completed generation and never observe an error
+///   appended afterwards — the fail-closed terminal contract below would be
+///   advisory rather than enforced;
+/// * consequently ANY provider byte that follows the retained terminal — a
+///   second terminal, a data event, a comment / `id` / `retry` line, an
+///   oversized or structurally undecidable block, or a trailing partial line at
+///   EOF — fails the stream closed, and the retained `[DONE]` is dropped instead
+///   of released. The client sees the gateway-authored `error` event and no
+///   completion marker at all;
+/// * a non-UTF-8 / structurally undecidable event fails closed rather than being
+///   forwarded;
+/// * a truncated stream (clean EOF with no terminal marker, or a trailing
+///   partial event) fails closed with one gateway-authored error frame.
+///
+/// Retained state is independent of stream length AND of transport chunk size:
+/// at most one partial event OR the single retained terminal event, each
+/// hard-capped at the configured ceiling. The two are never held together —
+/// the first byte after the terminal ends the stream — so retention stays at one
+/// ceiling. The release buffer is proportional only to the bytes released in the
+/// current call.
+struct FederationSseGuard {
+    /// Bytes of the current, not-yet-complete event. Never exceeds
+    /// `max_event_bytes`.
+    carry: Vec<u8>,
+    /// Blank-line recognition state carried across the carry/chunk boundary, so
+    /// no byte is ever scanned twice.
+    frame: SseFrameState,
+    max_event_bytes: usize,
+    /// The provider's own terminal event, held verbatim until EOF proves it
+    /// final. `Some` implies `carry` is empty and no further provider byte has
+    /// been seen.
+    retained_terminal: Option<Vec<u8>>,
+    terminated: bool,
+    /// Shared reservation; resolved exactly once from the COMPLETE body outcome.
+    lifecycle: Option<Arc<FederationStreamLifecycle>>,
+}
+
+impl FederationSseGuard {
+    fn new(max_event_bytes: usize, lifecycle: Option<Arc<FederationStreamLifecycle>>) -> Self {
+        Self {
+            carry: Vec::new(),
+            frame: SseFrameState::Text,
+            max_event_bytes,
+            retained_terminal: None,
+            terminated: false,
+            lifecycle,
+        }
+    }
+
+    /// Drop retained provider bytes and record the terminal outcome exactly
+    /// once.
+    ///
+    /// This includes a retained terminal event: every path that reaches here
+    /// without having already released it is a path on which the client must not
+    /// receive a completion marker.
+    fn finish(&mut self, outcome: StreamOutcome) {
+        self.terminated = true;
+        self.carry = Vec::new();
+        self.retained_terminal = None;
+        if let Some(lifecycle) = self.lifecycle.as_ref() {
+            lifecycle.resolve(outcome);
+        }
+    }
+
+    /// Terminate the stream with one gateway-authored error frame. `released`
+    /// carries bytes already cleared for the client in this same call; they are
+    /// still delivered, with the error frame appended.
+    fn fail_closed(&mut self, reason: &'static str, released: Vec<u8>) -> ResponseStreamAction {
+        // A provider that violated the SSE contract IS a provider fault, so the
+        // circuit is scored against it.
+        self.finish(StreamOutcome::Failed);
+        let frame = stream_error_frame(reason);
+        if released.is_empty() {
+            return ResponseStreamAction::Terminate(Some(frame));
+        }
+        let mut out = released;
+        out.extend_from_slice(&frame);
+        ResponseStreamAction::Terminate(Some(Bytes::from(out)))
+    }
+
+    /// Admit one COMPLETE event whose bytes are `carry` + `tail`.
+    ///
+    /// The ceiling is enforced before anything is copied anywhere. A terminal
+    /// event is retained instead of released; every other kind is released in
+    /// order.
+    fn admit_event(&mut self, tail: &[u8], released: &mut Vec<u8>) -> Result<(), &'static str> {
+        let total = self.carry.len().saturating_add(tail.len());
+        if total > self.max_event_bytes {
+            return Err(STREAM_REASON_OVERSIZED_EVENT);
+        }
+        if self.retained_terminal.is_some() {
+            // NOTHING may follow the terminal event — not a second terminal, not
+            // data, not even a comment or a bare `id:` line. Forwarding a repeat
+            // would emit two completions, and dropping any of them would
+            // silently accept a provider that cannot frame its own stream.
+            // Refused here, BEFORE the retained `[DONE]` was ever released, so
+            // the client cannot have already accepted the generation.
+            return Err(STREAM_REASON_AFTER_TERMINAL);
+        }
+        // Avoid a second copy in the common case where the whole event arrived
+        // inside this chunk.
+        let kind = if self.carry.is_empty() {
+            classify_sse_event(tail)
+        } else {
+            self.carry.extend_from_slice(tail);
+            classify_sse_event(&self.carry)
+        };
+        let Some(kind) = kind else {
+            return Err(STREAM_REASON_MALFORMED_EVENT);
+        };
+        match kind {
+            // Held verbatim, bounded by the same ceiling every other event is
+            // checked against, until `on_end` proves the provider wrote nothing
+            // after it.
+            SseEventKind::Terminal => {
+                let event = if self.carry.is_empty() {
+                    tail.to_vec()
+                } else {
+                    std::mem::take(&mut self.carry)
+                };
+                self.retained_terminal = Some(event);
+            }
+            SseEventKind::Data | SseEventKind::NonData => {
+                if self.carry.is_empty() {
+                    released.extend_from_slice(tail);
+                } else {
+                    released.extend_from_slice(&self.carry);
+                }
+            }
+        }
+        self.carry.clear();
+        // A single early large event must not pin the ceiling for the rest of
+        // the stream.
+        if self.carry.capacity() > SSE_CARRY_COMPACT_BYTES {
+            self.carry = Vec::new();
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for FederationSseGuard {
+    fn stage(&self) -> ResponseStreamInspectorStage {
+        // Provider/protocol contract adapter: run before policy inspectors so a
+        // guardrail sees exactly the client-visible event sequence.
+        ResponseStreamInspectorStage::Normalize
+    }
+
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        if self.terminated {
+            return ResponseStreamAction::Forward(Bytes::new());
+        }
+        if self.retained_terminal.is_some() && !chunk.is_empty() {
+            // The provider kept writing after the completion marker it already
+            // framed. Refuse the whole stream while `[DONE]` is still retained,
+            // so no success-shaped terminal ever precedes this error.
+            return self.fail_closed(STREAM_REASON_AFTER_TERMINAL, Vec::new());
+        }
+        let mut released: Vec<u8> = Vec::new();
+        // Start of the current event's bytes WITHIN this chunk. Everything
+        // before it has already been released or refused.
+        let mut segment_start = 0usize;
+        let mut index = 0usize;
+        while index < chunk.len() {
+            // Refuse as soon as the CURRENT partial event exceeds the ceiling,
+            // so a hostile chunk with no event terminator is not even scanned to
+            // its end. One terminator's worth of slack keeps an event of exactly
+            // the ceiling from being refused by this early exit; the exact bound
+            // is applied by `admit_event` and by the trailing check below, both
+            // of which run BEFORE any of these bytes are copied anywhere.
+            let pending = self.carry.len().saturating_add(index + 1 - segment_start);
+            if pending
+                > self
+                    .max_event_bytes
+                    .saturating_add(SSE_TERMINATOR_MAX_BYTES)
+            {
+                return self.fail_closed(STREAM_REASON_OVERSIZED_EVENT, released);
+            }
+            match self.frame.step(chunk[index]) {
+                SseFrameStep::Continue => {
+                    index += 1;
+                }
+                SseFrameStep::EndInclusive => {
+                    let end = index + 1;
+                    if let Err(reason) = self.admit_event(&chunk[segment_start..end], &mut released)
+                    {
+                        return self.fail_closed(reason, released);
+                    }
+                    segment_start = end;
+                    index = end;
+                }
+                SseFrameStep::EndExclusive => {
+                    // This byte belongs to the NEXT event; re-feed it from a
+                    // fresh state without advancing.
+                    if let Err(reason) =
+                        self.admit_event(&chunk[segment_start..index], &mut released)
+                    {
+                        return self.fail_closed(reason, released);
+                    }
+                    segment_start = index;
+                }
+            }
+        }
+
+        let trailing = chunk.len() - segment_start;
+        if trailing > 0 && self.retained_terminal.is_some() {
+            // A partial event opened after the terminal event completed in this
+            // same chunk. Same refusal as a complete post-terminal event, and it
+            // keeps the retained-terminal invariant: `retained_terminal` is only
+            // ever held with an empty carry.
+            return self.fail_closed(STREAM_REASON_AFTER_TERMINAL, released);
+        }
+        if self.carry.len().saturating_add(trailing) > self.max_event_bytes {
+            return self.fail_closed(STREAM_REASON_OVERSIZED_EVENT, released);
+        }
+        if trailing > 0 {
+            self.carry.extend_from_slice(&chunk[segment_start..]);
+        }
+        ResponseStreamAction::Forward(Bytes::from(released))
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        if self.terminated {
+            return ResponseStreamAction::Forward(Bytes::new());
+        }
+        let mut released: Vec<u8> = Vec::new();
+        // EOF resolves the ONE framing state a byte stream cannot decide on its
+        // own: a bare CR at a line start terminates the blank line unless a LF
+        // follows it, and end of body proves no LF is coming. The retained event
+        // is therefore complete rather than truncated.
+        if self.frame == SseFrameState::LineStartCr && !self.carry.is_empty() {
+            self.frame = SseFrameState::Text;
+            let complete = std::mem::take(&mut self.carry);
+            if let Err(reason) = self.admit_event(&complete, &mut released) {
+                return self.fail_closed(reason, released);
+            }
+        }
+        // A trailing partial event or a missing terminal marker both mean the
+        // client would otherwise be unable to distinguish a complete generation
+        // from a cut connection. Either way `finish` drops any retained
+        // terminal, so the client never receives a completion marker here.
+        if !self.carry.is_empty() {
+            return self.fail_closed(STREAM_REASON_TRUNCATED, released);
+        }
+        let Some(terminal) = self.retained_terminal.take() else {
+            return self.fail_closed(STREAM_REASON_TRUNCATED, released);
+        };
+        // Terminal proof: clean EOF, nothing retained, and exactly one terminal
+        // event. Only now is the provider's ORIGINAL marker released verbatim,
+        // and this is the only path that scores the stream as a provider
+        // success.
+        released.extend_from_slice(&terminal);
+        self.finish(StreamOutcome::Succeeded);
+        ResponseStreamAction::Forward(Bytes::from(released))
+    }
+
+    fn on_downstream_terminated(&mut self) {
+        // A LATER inspector cut the chain (a guardrail, a byte budget, a client
+        // disconnect). The provider produced no verdict we may score, so the
+        // reservation is released rather than failed.
+        self.finish(StreamOutcome::Released);
+    }
+}
+
+/// Emit exactly one gateway-authored terminal error frame and end the body.
+///
+/// Used when a claimed 2xx response is already committed downstream but is not a
+/// usable event stream (wrong media type, or a content coding the guard refuses
+/// to parse). Headers are gone by then, so truncation with a typed error event
+/// is the only protocol-correct answer.
+struct FederationImmediateStreamError {
+    reason: &'static str,
+    emitted: bool,
+    lifecycle: Option<Arc<FederationStreamLifecycle>>,
+}
+
+impl FederationImmediateStreamError {
+    fn new(reason: &'static str, lifecycle: Option<Arc<FederationStreamLifecycle>>) -> Self {
+        Self {
+            reason,
+            emitted: false,
+            lifecycle,
+        }
+    }
+
+    fn take(&mut self) -> ResponseStreamAction {
+        if self.emitted {
+            return ResponseStreamAction::Forward(Bytes::new());
+        }
+        self.emitted = true;
+        if let Some(lifecycle) = self.lifecycle.as_ref() {
+            lifecycle.resolve(StreamOutcome::Failed);
+        }
+        ResponseStreamAction::Terminate(Some(stream_error_frame(self.reason)))
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for FederationImmediateStreamError {
+    fn stage(&self) -> ResponseStreamInspectorStage {
+        ResponseStreamInspectorStage::Normalize
+    }
+
+    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        self.take()
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        self.take()
+    }
+
+    fn on_downstream_terminated(&mut self) {
+        if self.emitted {
+            return;
+        }
+        self.emitted = true;
+        if let Some(lifecycle) = self.lifecycle.as_ref() {
+            lifecycle.resolve(StreamOutcome::Released);
+        }
+    }
+}
+
+impl AiFederation {
+    /// Resolve the provider claim owned by THIS instance, if any.
+    ///
+    /// Ownership comes from the private typed claim, never from
+    /// `ai_federation_provider` metadata: multiple `ai_federation` instances may
+    /// be effective on one proxy and two of them may carry the same provider
+    /// NAME with different endpoints and different keys, so a name match would
+    /// let the losing instance install the wrong credential
+    /// (`GHSA-xhp5-hqj8-3mwg`).
+    fn owned_stream_claim<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+    ) -> Option<(&'a AiStreamRouterClaim, &'a ResolvedProvider)> {
+        let claim = ctx.ai_stream_router_claim.as_deref()?;
+        if claim.owner() != self.stream_owner_id {
+            return None;
+        }
+        let provider = self.providers.get(claim.provider_index())?;
+        Some((claim, provider))
+    }
+
+    /// The lifecycle reservation attached to THIS instance's claim.
+    ///
+    /// Reached only through the private claim and only after the ownership
+    /// match, then downcast to this plugin's own private type — a foreign
+    /// owner's reservation can never be resolved by us.
+    fn owned_stream_lifecycle(
+        &self,
+        ctx: &RequestContext,
+    ) -> Option<Arc<FederationStreamLifecycle>> {
+        let (claim, _) = self.owned_stream_claim(ctx)?;
+        claim
+            .lifecycle()
+            .and_then(|lifecycle| Arc::clone(lifecycle).downcast().ok())
+    }
+
+    /// Resolve THIS instance's streaming reservation, if the request carries
+    /// one. A no-op when the reservation was already resolved.
+    fn resolve_owned_stream(&self, ctx: &RequestContext, outcome: StreamOutcome) {
+        if let Some(lifecycle) = self.owned_stream_lifecycle(ctx) {
+            lifecycle.resolve(outcome);
+        }
+    }
+
+    /// Stage a known provider outcome on THIS instance's streaming reservation
+    /// without releasing capacity. A no-op when already resolved or staged.
+    fn stage_owned_stream(&self, ctx: &RequestContext, outcome: StreamOutcome) {
+        if let Some(lifecycle) = self.owned_stream_lifecycle(ctx) {
+            lifecycle.stage(outcome);
+        }
+    }
+
+    /// Fail a claimed stream closed and hand its reservation back immediately.
+    ///
+    /// Every gateway-side refusal of a committed claim comes through here so the
+    /// concurrency permit and the half-open probe slot are returned at the
+    /// moment the request stops, rather than lingering until the last `Arc` to
+    /// the claim happens to drop. The circuit is NOT scored: the gateway, not the
+    /// provider, made this decision — except where the caller already resolved a
+    /// provider fault before calling.
+    fn reject_claimed_stream(
+        &self,
+        ctx: &RequestContext,
+        status: u16,
+        message: &str,
+        error_type: &str,
+        param: Option<&str>,
+        code: &str,
+    ) -> PluginResult {
+        let outcome = if status == 502 {
+            // A refused provider representation IS a provider fault.
+            StreamOutcome::Failed
+        } else {
+            StreamOutcome::Released
+        };
+        self.resolve_owned_stream(ctx, outcome);
+        self.openai_error_response(status, message, error_type, param, Some(code))
+    }
+
+    /// Pre-commit provider selection and route commitment for a streaming
+    /// request (issue #3298).
+    ///
+    /// THE COMMIT BOUNDARY: everything in this function runs before a single
+    /// downstream-visible response byte exists, so trying the next matching
+    /// provider here is safe and is the ONLY place federation fallback may
+    /// happen for a stream. Once the claim is written the routing decision, the
+    /// credential, and the destination are committed exactly once and consumed
+    /// by the ordinary dispatch path; no later phase may splice a second
+    /// provider into the same logical stream.
+    fn claim_streaming_request(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        openai_body: &Value,
+        model: &str,
+    ) -> PluginResult {
+        // Index-based selection: the claim records an INDEX into this
+        // instance's own provider list (a name could be duplicated across
+        // instances), so selection must yield indices rather than borrows.
+        // Same predicate and same priority order as
+        // [`AiFederation::find_providers_for_model`].
+        let matching_providers: Vec<usize> = self
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| provider_matches_model(provider, model))
+            .map(|(index, _)| index)
+            .collect();
+        if matching_providers.is_empty() {
+            if self.fail_on_no_matching_provider {
+                let echoed_model = truncate_model_for_error(model);
+                return self.openai_error_response(
+                    404,
+                    &format!("No ai_federation provider is configured for model '{echoed_model}'"),
+                    "invalid_request_error",
+                    Some("model"),
+                    Some("model_not_found"),
+                );
+            }
+            return PluginResult::Continue;
+        }
+
+        // Client-representation validation reuses the buffered path's rules so a
+        // streaming request is not admitted under a weaker contract. Multimodal
+        // relaxation is deliberately NOT offered here: the eligible providers
+        // are OpenAI-compatible, so the strict check is the provider contract.
+        if let Err(message) = validate_openai_request(openai_body, false) {
+            return self.openai_error_response(
+                400,
+                &message,
+                "invalid_request_error",
+                None,
+                Some("invalid_request"),
+            );
+        }
+
+        // `max_concurrent_requests` is documented as the maximum number of
+        // simultaneous federation provider chains, so a stream must hold a slot
+        // exactly like a buffered call does. Acquired BEFORE any provider is
+        // admitted and non-queuing (`try_acquire_owned`, never `acquire`): a
+        // stream that waits here would hold a request open behind an unrelated
+        // long generation. The permit is owned rather than borrowed because a
+        // stream's provider chain outlives every hook that could hold a guard.
+        let permit = match Arc::clone(&self.request_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return self.openai_error_response(
+                    503,
+                    "ai_federation provider concurrency limit reached",
+                    "server_error",
+                    None,
+                    Some("provider_concurrency_exhausted"),
+                );
+            }
+        };
+
+        let mut attempts: u32 = 0;
+        let mut last_ineligibility: Option<StreamIneligibility> = None;
+        let mut skipped_open_circuit = false;
+        // A half-open probe RESERVED for a candidate that then turned out to be
+        // ineligible. Released before moving on so one ineligible provider
+        // cannot hold the circuit's single probe slot for a cooldown window;
+        // whatever is still armed when this function returns is released by the
+        // guard's own `Drop`.
+        let mut half_open_probe_guard: Option<HalfOpenProbeGuard<'_>> = None;
+        let mut selected: Option<(usize, CommittedStreamTarget, CircuitAdmission)> = None;
+
+        for provider_index in matching_providers {
+            if let Some(guard) = half_open_probe_guard.as_mut() {
+                guard.release();
+            }
+            half_open_probe_guard = None;
+            let Some(provider) = self.providers.get(provider_index) else {
+                continue;
+            };
+            // RESERVE the admission (`admit`, not `may_admit`): a half-open
+            // circuit grants exactly ONE probe, and only a compare-and-swap
+            // reservation can keep concurrent streams from all probing at once.
+            // The reservation is held until the committed stream resolves.
+            let admission = provider
+                .circuit
+                .as_ref()
+                .map(|circuit| circuit.admit())
+                .unwrap_or(CircuitAdmission::Closed);
+            if let (Some(circuit), CircuitAdmission::HalfOpenProbe) =
+                (provider.circuit.as_ref(), admission)
+            {
+                half_open_probe_guard = Some(HalfOpenProbeGuard::new(circuit));
+            }
+            // A provider whose circuit is open is skipped exactly like the
+            // buffered path; with fallback disabled the first such provider is
+            // terminal.
+            if admission == CircuitAdmission::Open {
+                skipped_open_circuit = true;
+                super::prometheus_metrics::global_registry().record_ai_federation_open_skip();
+                ctx.metadata.insert(
+                    "ai_federation_circuit_last_provider".to_string(),
+                    provider.name.clone(),
+                );
+                ctx.metadata.insert(
+                    "ai_federation_circuit_last_state".to_string(),
+                    "open".to_string(),
+                );
+                if !self.fallback_enabled {
+                    return self.openai_error_response(
+                        503,
+                        "The selected AI provider circuit is open and fallback is disabled",
+                        "server_error",
+                        None,
+                        Some("provider_circuit_open"),
+                    );
+                }
+                continue;
+            }
+
+            let resolved_model = Self::resolve_model(provider, model);
+            if provider_embeds_model_in_url(provider.provider_type)
+                && !is_valid_url_model_component(&resolved_model)
+            {
+                // Same rule as the buffered path: never fall through to another
+                // provider with an attacker-shaped URL path component.
+                return self.openai_error_response(
+                    400,
+                    "Invalid 'model' field: must contain only alphanumeric characters, dot, hyphen, underscore, or colon",
+                    "invalid_request_error",
+                    Some("model"),
+                    Some("invalid_model"),
+                );
+            }
+
+            let target = match stream_target_for(provider, &resolved_model) {
+                Ok(target) => target,
+                Err(reason) => {
+                    last_ineligibility = Some(reason);
+                    attempts = attempts.saturating_add(1);
+                    if self.fallback_enabled {
+                        continue;
+                    }
+                    break;
+                }
+            };
+            attempts = attempts.saturating_add(1);
+            selected = Some((provider_index, target, admission));
+            break;
+        }
+
+        let Some((provider_index, target, admission)) = selected else {
+            // No provider was committed. The permit and any reserved half-open
+            // probe are released by their own drops on the way out.
+            ctx.metadata
+                .insert(META_STREAM_ATTEMPTS.to_string(), attempts.to_string());
+            if let Some(reason) = last_ineligibility {
+                return self.openai_error_response(
+                    501,
+                    reason.message(),
+                    "invalid_request_error",
+                    Some("stream"),
+                    Some(reason.code()),
+                );
+            }
+            if skipped_open_circuit {
+                return self.openai_error_response(
+                    503,
+                    "All matching AI provider circuits are open",
+                    "server_error",
+                    None,
+                    Some("provider_circuit_open"),
+                );
+            }
+            return self.openai_error_response(
+                502,
+                "No matching AI provider could be committed for streaming",
+                "server_error",
+                None,
+                Some("provider_error"),
+            );
+        };
+        let Some(provider) = self.providers.get(provider_index) else {
+            return self.openai_error_response(
+                500,
+                "The selected AI provider could not be committed for streaming",
+                "api_error",
+                None,
+                Some("provider_policy_violation"),
+            );
+        };
+
+        {
+            // --- COMMIT. Nothing below may fail over to another provider. ---
+            let committed_query = if target.endpoint_owns_query {
+                // The endpoint carries its own query and it is already folded
+                // into the absolute override path; commit an EMPTY appendable
+                // query so no later rule can add a second `?` or a
+                // normal-backend secret.
+                String::new()
+            } else {
+                crate::proxy::effective_backend_query_string(ctx).into_owned()
+            };
+
+            ctx.route_override_backend_scheme = Some(target.scheme);
+            ctx.route_override_backend_host = Some(target.host.clone());
+            ctx.route_override_backend_port = Some(target.port);
+            ctx.route_override_path = Some(target.path.clone());
+            ctx.route_override_path_is_absolute = true;
+            ctx.route_override_authority = Some(target.authority.clone());
+            // A direct provider endpoint, never an upstream/load-balancer
+            // identity: a load balancer must not pick the dial target while this
+            // provider's credential is installed (`GHSA-xhp5-hqj8-3mwg`).
+            ctx.route_override_upstream_id = None;
+            // Host TEXT equality is not destination equality: revoke any
+            // inherited `Proxy.dns_override` explicitly.
+            ctx.route_override_dns_policy = super::RouteOverrideDnsPolicy::ClearInherited;
+            ctx.route_override_resolved_tls = if target.scheme == BackendScheme::Https {
+                Some(BackendTlsConfig::default_verify())
+            } else {
+                // Plaintext provider: no committed TLS configuration at all,
+                // pinned so the witness cannot be satisfied by a later plugin
+                // ADDING one.
+                None
+            };
+            // The DISPATCH BUDGETS come from the selected provider, never from
+            // the placeholder proxy the router happened to match. Without this
+            // the stream inherits `Proxy.backend_read_timeout_ms` (30s by
+            // default), which silently caps every long generation, and the
+            // operator's own `connect_timeout_seconds` / `read_timeout_seconds`
+            // are never applied to the destination they were configured for.
+            ctx.route_override_backend_connect_timeout_ms =
+                Some(duration_as_millis_u64(provider.connect_timeout));
+            ctx.route_override_backend_read_timeout_ms =
+                Some(self.streaming_read_timeout_ms(provider));
+
+            apply_stream_boundary_headers(provider, &target.authority, headers);
+
+            let committed_tls = ctx.route_override_resolved_tls.clone();
+            let lifecycle: Arc<dyn std::any::Any + Send + Sync> = Arc::new(
+                FederationStreamLifecycle::new(FederationStreamReservation {
+                    _permit: permit,
+                    circuit: provider.circuit.clone(),
+                    admission,
+                    provider_name: Arc::from(provider.name.as_str()),
+                }),
+            );
+            // The circuit reservation now belongs to the lifecycle, which
+            // releases or scores it exactly once. Disarm the pre-commit
+            // cancellation guard so it cannot double-release the probe slot.
+            if let Some(guard) = half_open_probe_guard.as_mut() {
+                guard.resolve();
+            }
+            ctx.ai_stream_router_claim = Some(Box::new(mint_external_provider_claim(
+                ExternalProviderClaimParts {
+                    owner: self.stream_owner_id,
+                    provider_index,
+                    model: model.to_string(),
+                    scheme: target.scheme,
+                    host: target.host,
+                    port: target.port,
+                    path: target.path,
+                    authority: target.authority,
+                    resolved_tls: committed_tls,
+                    committed_query,
+                    committed_connect_timeout_ms: ctx.route_override_backend_connect_timeout_ms,
+                    committed_read_timeout_ms: ctx.route_override_backend_read_timeout_ms,
+                    lifecycle: Some(lifecycle),
+                },
+            )));
+
+            // Metadata is observability / cross-plugin coordination ONLY. No
+            // enforcement point below reads any of it back.
+            ctx.metadata
+                .insert(META_STREAM_CLAIMED.to_string(), "true".to_string());
+            ctx.metadata
+                .insert(META_STREAMING_SHARED.to_string(), "true".to_string());
+            ctx.metadata
+                .insert("ai_federation_provider".to_string(), provider.name.clone());
+            ctx.metadata.insert(
+                META_STREAM_PROVIDER_TYPE.to_string(),
+                provider.provider_type.as_str().to_string(),
+            );
+            ctx.metadata
+                .insert(META_STREAM_ATTEMPTS.to_string(), attempts.to_string());
+            // The provider is a third party: proxy core must not append the
+            // gateway-asserted `x-consumer-*` identity headers after the strip
+            // above. The final header policy removes any a later rule adds back.
+            ctx.metadata.insert(
+                SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY.to_string(),
+                "true".to_string(),
+            );
+
+            debug!(
+                provider = %provider.name,
+                provider_type = %provider.provider_type.as_str(),
+                "ai_federation: committed streaming provider and rewrote route"
+            );
+            PluginResult::Continue
+        }
+    }
+
+    /// Whole-exchange budget applied to a claimed stream's effective route.
+    ///
+    /// Defaults to the SELECTED PROVIDER's `read_timeout_seconds`, so the knob an
+    /// operator already configured for that provider governs its streams too.
+    /// `streaming.read_timeout_seconds` overrides it for streams only, and `0`
+    /// there means "no gateway-imposed whole-exchange bound" for generations
+    /// that legitimately run longer than any per-call budget.
+    fn streaming_read_timeout_ms(&self, provider: &ResolvedProvider) -> u64 {
+        match self.streaming.read_timeout_seconds {
+            Some(seconds) => seconds.saturating_mul(1000),
+            None => duration_as_millis_u64(provider.read_timeout),
+        }
+    }
+}
+
+/// Saturating `Duration` → milliseconds for a route-override budget.
+///
+/// Provider timeouts are already validated into a bounded range at config load,
+/// so this only exists so the conversion can never panic on the request path.
+fn duration_as_millis_u64(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Representation fields the streaming relay must be able to DECIDE on, so they
+/// survive the origin reduction and are re-authored by `after_proxy` instead.
+fn is_stream_representation_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("content-type")
+        || name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("content-encoding")
+}
+
+/// Media type the gateway authors for every relayed 2xx stream.
+const STREAM_RESPONSE_CONTENT_TYPE: &str = "text/event-stream";
+/// Cache directive the gateway authors for every relayed 2xx stream.
+///
+/// Deliberately just `no-cache`: adding `no-transform` here would contradict a
+/// `Content-Encoding` that `compression` (4050) may already have committed for
+/// this response, and honestly declaring that through
+/// `may_add_response_cache_control_no_transform` would also require simulating
+/// this hook's output for the pre-flight gate. The relayed representation is an
+/// unbounded event stream, which the gateway never buffers or re-encodes.
+const STREAM_RESPONSE_CACHE_CONTROL: &str = "no-cache";
+
+/// Reduce a third-party provider's response header map to the bounded set the
+/// buffered federation path already publishes, plus the representation fields
+/// the relay itself decides on.
+///
+/// Closed by construction: anything not explicitly allowed is dropped, so a
+/// provider cannot introduce `Set-Cookie` on the gateway's origin, a `Location`
+/// redirect, an auth challenge, a validator/digest describing bytes the SSE
+/// guard is about to replace, `Alt-Svc`/`Link` steering, or unbounded custom
+/// metadata. Values are length-capped, control characters are refused, and names
+/// are normalized to lower case so two case variants cannot both survive as an
+/// ambiguous duplicate.
+///
+/// Never logs a header name or value.
+fn reduce_provider_stream_response_headers(headers: &mut HashMap<String, String>) {
+    // Deterministic order so a count cap can never depend on `HashMap`
+    // iteration order.
+    let mut candidates: Vec<(String, String)> = headers
+        .iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .filter(|(name, value)| is_relayable_provider_response_header(name, value))
+        .collect();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    headers.clear();
+    for (name, value) in candidates {
+        let representation = is_stream_representation_header(&name);
+        if !representation && headers.len() >= MAX_FORWARDED_PROVIDER_HEADERS {
+            continue;
+        }
+        // Singular protocol/correlation metadata: keep the first value in the
+        // deterministic order above rather than folding case variants into an
+        // ambiguous list.
+        headers.entry(name).or_insert(value);
+    }
+}
+
+/// Whether one lower-cased provider response field may survive the reduction.
+fn is_relayable_provider_response_header(name: &str, value: &str) -> bool {
+    if !is_safe_provider_response_header(name) && !is_stream_representation_header(name) {
+        return false;
+    }
+    if value.len() > MAX_FORWARDED_PROVIDER_HEADER_VALUE_BYTES {
+        return false;
+    }
+    // A control character in a relayed field is never legitimate here and is the
+    // shape header-splitting attempts take.
+    !value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+}
+
+/// Author the representation of a relayed 2xx event stream.
+///
+/// The provider's own framing metadata cannot describe the bytes the SSE guard
+/// releases, so the media type is canonical, `Content-Length` is removed (the
+/// relayed body is unbounded), and the SSE `no-cache` contract is stated by the
+/// gateway so an intermediary cannot serve a stale generation.
+fn stamp_stream_response_representation(headers: &mut HashMap<String, String>) {
+    remove_header_ci(headers, "content-length");
+    remove_header_ci(headers, "content-encoding");
+    remove_header_ci(headers, "content-type");
+    headers.insert(
+        "content-type".to_string(),
+        STREAM_RESPONSE_CONTENT_TYPE.to_string(),
+    );
+    remove_header_ci(headers, "cache-control");
+    headers.insert(
+        "cache-control".to_string(),
+        STREAM_RESPONSE_CACHE_CONTROL.to_string(),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Plugin trait implementation
 // ---------------------------------------------------------------------------
 
@@ -5003,14 +6665,549 @@ impl Plugin for AiFederation {
         true
     }
 
+    /// A claimed stream decides on the exact backend-visible representation in
+    /// `on_final_request_body_with_context` and can REFUSE it (destination drift,
+    /// ambiguous duplicate JSON members, a model that no longer satisfies the
+    /// routed policy, a request that no longer asks for a stream). That promise
+    /// is only real if nothing egressed the body earlier, so composition
+    /// admission must refuse a chain in which a plugin still declares
+    /// `egresses_request_body_before_finalization()`.
+    ///
+    /// Deliberately conditional rather than the unconditional `true` the source
+    /// scan in `plugin_cache_tests` inventories: with `streaming` absent this
+    /// plugin has no rejecting final request-body hook at all. The value is
+    /// authoritative at candidate admission too, because `ai_federation` is fully
+    /// constructed there (`SECURITY_COMPOSITION_PLUGIN_NAMES`) rather than
+    /// admitted through a static capability view.
+    fn enforces_finalized_request_policy(&self) -> bool {
+        self.streaming.enabled
+    }
+
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         if ctx.method != "POST" {
             return false;
+        }
+        // Once THIS instance owns a streaming claim, its final model and
+        // destination policy must run with a RequestContext even if a later
+        // header transform temporarily relabels the body as non-JSON. The final
+        // backend-header policy restores the provider's JSON contract, so a
+        // mutable `Content-Type` must not be able to suppress the claim owner's
+        // revalidation.
+        if self.owned_stream_claim(ctx).is_some() {
+            return true;
         }
         let Some(content_type) = ctx.headers.get("content-type") else {
             return false;
         };
         is_json_content_type(content_type)
+    }
+
+    /// The streaming claim is decided from the CLIENT representation, which the
+    /// proxy only publishes into `ctx.metadata["request_body"]` when a plugin
+    /// asks for the pre-`before_proxy` buffer.
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.streaming.enabled
+    }
+
+    fn modifies_request_headers(&self) -> bool {
+        // A claimed stream strips client credentials and installs the provider
+        // credential, `Host`, `Accept`, and `Accept-Encoding`.
+        self.streaming.enabled
+    }
+
+    fn modifies_request_destination(&self) -> bool {
+        // A claimed stream replaces the backend scheme/host/port, authority,
+        // path, and dispatch budgets with the committed provider destination.
+        self.streaming.enabled
+    }
+
+    fn modifies_request_body(&self) -> bool {
+        // A claimed stream rewrites the provider-visible top-level `model` to
+        // the resolved generation the claim froze (`model_mapping` /
+        // `default_model`).
+        self.streaming.enabled
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        // The final revalidation consumes the private claim, so the H1/H2
+        // dispatch path must supply the request context to that hook.
+        self.streaming.enabled
+    }
+
+    fn requires_response_stream_hooks(&self) -> bool {
+        self.streaming.enabled
+    }
+
+    fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
+        // Only for requests THIS instance claimed, so the SSE contract guard is
+        // guaranteed to be wired. Everything else stays on the fast path.
+        self.streaming.enabled && self.owned_stream_claim(ctx).is_some()
+    }
+
+    /// Provider selection can reserve concurrency/circuit admission and writes
+    /// the committed third-party destination. When backend-path policy is
+    /// active, that work must not happen until the effective path is authorized
+    /// (GHSA-4vr5-4wm3-x5xv). The ordinary ordering is unchanged on proxies
+    /// without such a policy.
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        self.streaming.enabled
+    }
+
+    /// Claim a streaming Chat Completions request and commit exactly one
+    /// provider before any downstream-visible byte exists (issue #3298).
+    ///
+    /// This is the ONLY federation phase that may choose between providers for a
+    /// stream. It runs before dispatch, so a pre-commit failure is invisible to
+    /// the client and safe to fail over; after it returns, the provider is fixed
+    /// for the life of the response.
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if !self.streaming.enabled || ctx.method != "POST" {
+            return PluginResult::Continue;
+        }
+        // First claim wins, across BOTH plugin types. `ai_stream_router` claims
+        // at priority 2984 and this hook runs at 4060, so a router-claimed
+        // request is already bound to a provider and must not be re-routed
+        // (`GHSA-xhp5-hqj8-3mwg`). A second `ai_federation` instance yields for
+        // the same reason.
+        if ctx.ai_stream_router_claim.is_some() {
+            return PluginResult::Continue;
+        }
+        // Intentional router pass-through: the operator disabled fail-closed
+        // missing/unmatched-model behavior there, so the request is genuinely
+        // unclaimed and this plugin may still decide it.
+        let content_type = headers
+            .get("content-type")
+            .map(String::as_str)
+            .unwrap_or("");
+        if !is_json_content_type(content_type) {
+            return PluginResult::Continue;
+        }
+        // Only a UTF-8 JSON client body can carry an OpenAI streaming request.
+        // A missing/non-UTF-8 body is not claimable here; the buffered egress
+        // hook still applies its own fail-closed policy to it.
+        let Some(body_str) = ctx.metadata.get("request_body") else {
+            return PluginResult::Continue;
+        };
+        let Ok(openai_body) = serde_json::from_str::<Value>(body_str) else {
+            return PluginResult::Continue;
+        };
+        // Non-streaming requests keep the existing buffered behavior verbatim.
+        if !request_wants_streaming(&openai_body) {
+            return PluginResult::Continue;
+        }
+
+        let model = match openai_body.get("model") {
+            Some(Value::String(model)) if !model.is_empty() => model.clone(),
+            _ => {
+                if self.fail_on_missing_model {
+                    return self.openai_error_response(
+                        400,
+                        "Missing or invalid 'model' field: expected a non-empty string",
+                        "invalid_request_error",
+                        Some("model"),
+                        Some("missing_model"),
+                    );
+                }
+                return PluginResult::Continue;
+            }
+        };
+        if !is_valid_model_identifier(&model) {
+            return self.openai_error_response(
+                400,
+                "Invalid 'model' field: use a bounded provider model identifier without URL query, fragment, userinfo, traversal, whitespace, or control characters",
+                "invalid_request_error",
+                Some("model"),
+                Some("invalid_model"),
+            );
+        }
+
+        self.claim_streaming_request(ctx, headers, &openai_body, &model)
+    }
+
+    /// Rewrite the provider-visible generation to the model the claim resolved
+    /// (issue #3298).
+    ///
+    /// `model_mapping` / `default_model` mean the model the CLIENT named is
+    /// frequently not the model the PROVIDER must be asked for, and the buffered
+    /// path applies that resolution when it builds its own provider request. The
+    /// streaming path forwards the client's body, so without this hook a
+    /// configured mapping produces a body whose `model` can never satisfy the
+    /// final revalidation — every such request would fail closed.
+    ///
+    /// Owner-scoped: a losing `ai_federation` instance, an `ai_stream_router`
+    /// claim, and an unclaimed request all return `None` so no plugin rewrites
+    /// another owner's provider body.
+    async fn transform_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        _content_type: Option<&str>,
+        _request_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        // Read every decision out of the PRIVATE claim, never metadata: which
+        // instance owns the request, and the exact model that selected the
+        // provider.
+        let (provider_index, committed_model) = {
+            let (claim, _) = self.owned_stream_claim(ctx)?;
+            (claim.provider_index(), claim.model().to_string())
+        };
+        // A duplicate top-level member makes the provider-visible generation
+        // parser-dependent. Re-serializing here would silently COLLAPSE the
+        // duplicate and hand the provider an unambiguous body the gateway never
+        // proved, so leave the bytes exactly as they are: the final-body hook
+        // screens the same bytes with the shared scanner and fails closed.
+        if ctx.json_scan_memo.ambiguity(body).is_some() {
+            return None;
+        }
+        let provider = self.providers.get(provider_index)?;
+        let resolved_model = Self::resolve_model(provider, &committed_model);
+
+        let mut value: Value = serde_json::from_slice(body).ok()?;
+        let object = value.as_object_mut()?;
+        // Only rewrite when the provider-visible generation actually differs, so
+        // the ordinary no-mapping case costs no serialization at all.
+        if object.get("model").and_then(Value::as_str) == Some(resolved_model.as_str()) {
+            return None;
+        }
+        object.insert("model".to_string(), Value::String(resolved_model));
+        // `stream: true` is the reason this request was claimed; the response
+        // pipeline is already shaped for an event stream, so it is re-asserted
+        // rather than merely preserved.
+        object.insert("stream".to_string(), Value::Bool(true));
+        // Bounded serialization: an oversized rewrite is refused during
+        // construction rather than allocated and then rejected.
+        serialize_json_bounded(&value, MAX_TRANSLATED_REQUEST_BYTES).ok()
+    }
+
+    fn enforces_final_backend_header_policy(&self) -> bool {
+        self.streaming.enabled
+    }
+
+    /// Re-assert the provider credential boundary over the FINAL backend-visible
+    /// header map (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// `before_proxy` already applied it, but a later generic header rule, a
+    /// deferred routing pass, or a `pre_proxy` backend overlay can add,
+    /// overwrite, or rename the credential afterwards. The gateway calls this
+    /// wherever the outbound map is complete, so the last word is this policy.
+    fn enforce_final_backend_header_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        let Some((claim, provider)) = self.owned_stream_claim(ctx) else {
+            return;
+        };
+        apply_stream_boundary_headers(provider, claim.authority(), headers);
+    }
+
+    /// Revalidate the FINAL provider-visible body and route against the policy
+    /// that selected the provider (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// Fail-closed with fixed-cardinality diagnostics: the offending model,
+    /// header, or body bytes are never echoed or logged.
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        let (provider_index, destination_intact, committed_model) = {
+            let Some((claim, _)) = self.owned_stream_claim(ctx) else {
+                return PluginResult::Continue;
+            };
+            (
+                claim.provider_index(),
+                claim.destination_intact(ctx),
+                claim.model().to_string(),
+            )
+        };
+
+        // The credential installed at the boundary is only safe if it still goes
+        // to the destination that claimed it: same visible endpoint, no upstream
+        // identity, byte-identical backend TLS, provider-DNS decision intact,
+        // and the committed connect / whole-exchange budgets unchanged.
+        // The backend-visible QUERY needs no check here — it is re-asserted from
+        // the claim at `crate::proxy::effective_backend_query_string*`, the
+        // single capture funnel every dispatcher and retry goes through.
+        if !destination_intact {
+            return self.reject_claimed_stream(
+                ctx,
+                500,
+                "The routed AI provider destination changed after provider selection",
+                "api_error",
+                None,
+                "provider_policy_violation",
+            );
+        }
+
+        // A duplicate `model` member makes the provider-visible generation
+        // parser-dependent (`serde_json` keeps the last occurrence, a first-wins
+        // provider parser reads the other), so an equality check against either
+        // proves nothing. Screen with the shared bounded scanner before parsing.
+        if ctx.json_scan_memo.ambiguity(body).is_some() {
+            return self.reject_claimed_stream(
+                ctx,
+                400,
+                "The final AI provider request body has ambiguous duplicate JSON members",
+                "invalid_request_error",
+                Some("model"),
+                "model_policy_violation",
+            );
+        }
+
+        let Some(provider) = self.providers.get(provider_index) else {
+            return self.reject_claimed_stream(
+                ctx,
+                500,
+                "The routed AI provider could not be revalidated before dispatch",
+                "api_error",
+                None,
+                "provider_policy_violation",
+            );
+        };
+        let Ok(final_body) = serde_json::from_slice::<Value>(body) else {
+            return self.reject_claimed_stream(
+                ctx,
+                400,
+                "The final AI provider request body is not valid JSON after request transforms",
+                "invalid_request_error",
+                Some("model"),
+                "model_policy_violation",
+            );
+        };
+        let final_model = match final_body.get("model") {
+            Some(Value::String(model)) if !model.is_empty() => model.clone(),
+            _ => {
+                return self.reject_claimed_stream(
+                    ctx,
+                    400,
+                    "The final AI provider request body has no usable 'model' field",
+                    "invalid_request_error",
+                    Some("model"),
+                    "model_policy_violation",
+                );
+            }
+        };
+        // The provider sees the RESOLVED model, which `model_mapping` /
+        // `default_model` may rename and which this plugin's own request
+        // transform installs; compare against the resolution of the committed
+        // client model rather than the client model itself, then re-check the
+        // committed model against this provider's configured pattern policy.
+        let expected_model = Self::resolve_model(provider, &committed_model);
+        if final_model != expected_model || !provider_matches_model(provider, &committed_model) {
+            return self.reject_claimed_stream(
+                ctx,
+                400,
+                "The final AI provider request model does not match the routed model policy",
+                "invalid_request_error",
+                Some("model"),
+                "model_policy_violation",
+            );
+        }
+        // A streaming claim is only committed for a request that asked for one;
+        // a later transform must not be able to turn it into a buffered call the
+        // response pipeline is no longer shaped for.
+        if !request_wants_streaming(&final_body) {
+            return self.reject_claimed_stream(
+                ctx,
+                400,
+                "The final AI provider request no longer requests a streamed response",
+                "invalid_request_error",
+                Some("stream"),
+                "model_policy_violation",
+            );
+        }
+
+        PluginResult::Continue
+    }
+
+    fn enforces_origin_response_header_policy(&self, ctx: &RequestContext) -> bool {
+        // Only for a stream THIS instance routed to a third-party provider.
+        self.streaming.enabled && self.owned_stream_claim(ctx).is_some()
+    }
+
+    /// Bound what the third-party provider contributed to the client-visible
+    /// header map.
+    ///
+    /// The buffered path never exposes provider headers wholesale: it rebuilds
+    /// its response from [`safe_provider_response_headers`]. The streaming path
+    /// relays the provider's own response, so the same reduction has to happen
+    /// here or a provider could set `Set-Cookie` on the gateway's origin, send a
+    /// `Location` redirect, mount an auth challenge, or attach content-bound
+    /// validators/digests describing bytes the guard is about to rewrite.
+    ///
+    /// Runs BEFORE the `after_proxy` chain, so gateway decorations added later
+    /// (CORS, tracing, correlation, rate-limit headers, `security_headers`) are
+    /// untouched by design. Representation fields (`content-type`,
+    /// `content-length`, `content-encoding`) deliberately survive this pass:
+    /// this plugin's own `after_proxy` still has to decide on them, and it is
+    /// what finally strips and re-authors them.
+    fn enforce_origin_response_header_policy(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        reduce_provider_stream_response_headers(response_headers);
+    }
+
+    /// Response-header handling for a claimed stream.
+    ///
+    /// Runs before any body byte is released, so this is the LAST point a
+    /// claimed stream can still fail with a real status. Stages the circuit
+    /// outcome for a non-2xx without releasing capacity (the error body may
+    /// still be streaming), refuses a content-coded or non-event-stream 2xx,
+    /// and re-authors the representation fields an SSE relay owns.
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if self.owned_stream_claim(ctx).is_none() {
+            return PluginResult::Continue;
+        }
+
+        ctx.metadata.insert(
+            "ai_federation_status".to_string(),
+            response_status.to_string(),
+        );
+        // The provider produced response headers, so the billable operation has
+        // a committed outcome. Same marker discipline as the buffered path.
+        ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
+        ctx.metadata.insert(
+            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+
+        if !(200..300).contains(&response_status) {
+            // Same circuit rule as the buffered path: a configured fallback
+            // status and a redirect are provider faults, and every OTHER
+            // non-2xx (an ordinary 400/401/404 the provider chose to return) is
+            // a provider that answered correctly. Penalising those would open a
+            // healthy circuit on client errors.
+            //
+            // Stage only — do not resolve yet. `max_concurrent_requests` bounds
+            // the whole provider response, so the owned permit stays held while
+            // a slow non-2xx error body streams. Body termination /
+            // `on_response_stream_terminated` / Drop apply the staged verdict
+            // exactly once (including a client disconnect after these headers).
+            let outcome = if self.fallback_status_codes.contains(&response_status)
+                || (300..400).contains(&response_status)
+            {
+                StreamOutcome::Failed
+            } else {
+                StreamOutcome::Succeeded
+            };
+            self.stage_owned_stream(ctx, outcome);
+            // A provider error envelope reaches the client with its real status.
+            // This is still PRE-commit for the body, so no stream was spliced
+            // and none is owed.
+            return PluginResult::Continue;
+        }
+
+        let content_encoding_present = response_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-encoding")
+                && !value.trim().is_empty()
+                && !value.trim().eq_ignore_ascii_case("identity")
+        });
+        if content_encoding_present {
+            // The boundary asked for `identity`. A content-coded stream cannot
+            // be contract-checked incrementally here, and silently relaying it
+            // would hand the client bytes the guard never validated.
+            return self.reject_claimed_stream(
+                ctx,
+                502,
+                STREAM_REASON_UNSUPPORTED_ENCODING,
+                "upstream_error",
+                None,
+                "unsupported_content_encoding",
+            );
+        }
+        let content_type_is_event_stream = response_headers
+            .get("content-type")
+            .is_some_and(|value| is_event_stream_content_type(value));
+        if !content_type_is_event_stream {
+            return self.reject_claimed_stream(
+                ctx,
+                502,
+                STREAM_REASON_UNSUPPORTED_MEDIA,
+                "upstream_error",
+                None,
+                "unsupported_content_type",
+            );
+        }
+        // The relayed representation is gateway-owned from here: an event stream
+        // is unbounded (a provider framing length is never correct for it), and
+        // the canonical media type plus the SSE no-cache contract are authored
+        // rather than inherited.
+        stamp_stream_response_representation(response_headers);
+        PluginResult::Continue
+    }
+
+    /// Install the bounded SSE contract guard over a claimed provider stream.
+    fn response_stream_inspector(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        content_type: Option<&str>,
+    ) -> Option<Box<dyn ResponseStreamInspector>> {
+        if !self.streaming.enabled {
+            return None;
+        }
+        // Ownership from the private claim, never from metadata: a second
+        // instance must not install a guard over another instance's stream.
+        self.owned_stream_claim(ctx)?;
+        if !(200..300).contains(&response_status) {
+            return None;
+        }
+        // The inspector carries the SAME reservation the claim holds, so the
+        // body outcome — not the response headers — is what finally scores a 2xx.
+        let lifecycle = self.owned_stream_lifecycle(ctx);
+        match content_type {
+            Some(value) if is_event_stream_content_type(value) => Some(Box::new(
+                FederationSseGuard::new(self.streaming.max_event_bytes, lifecycle),
+            )),
+            // `after_proxy` already refuses this shape with a real status; this
+            // arm is the fail-closed backstop for a dispatch path that reaches
+            // the body without it, where truncation is the only answer left.
+            _ => Some(Box::new(FederationImmediateStreamError::new(
+                STREAM_REASON_UNSUPPORTED_MEDIA,
+                lifecycle,
+            ))),
+        }
+    }
+
+    /// Fold the streamed provider outcome into the transaction record.
+    ///
+    /// A 2xx SSE body is ordinarily already resolved by the inspector; a
+    /// non-2xx envelope was only staged at headers and resolves here (or on
+    /// Drop) so capacity covers the whole error body. This hook also covers a
+    /// body that ended without any inspector verdict.
+    async fn on_response_stream_terminated(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _outcome: &crate::proxy::deferred_log::BodyOutcome,
+    ) {
+        let Some(lifecycle) = self.owned_stream_lifecycle(ctx) else {
+            return;
+        };
+        // Prefer a staged non-2xx provider verdict; otherwise release without
+        // scoring (client gone before headers, unresolved 2xx cut, shutdown).
+        // Exact-once: a prior inspector resolve makes this a no-op.
+        lifecycle.resolve(StreamOutcome::Released);
+        if let Some(outcome) = lifecycle.outcome() {
+            ctx.metadata.insert(
+                META_STREAM_OUTCOME.to_string(),
+                outcome.as_str().to_string(),
+            );
+        }
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -5202,22 +7399,29 @@ impl Plugin for AiFederation {
             return PluginResult::Continue;
         }
 
-        // Streaming is not supported by the terminate-and-respond design. We
-        // only check after model routing has found a provider; missing models
-        // and unmatched models have already followed the configured fail-closed
-        // or explicit pass-through policy. Reject with a clear, OpenAI-shaped
-        // error rather than forwarding `stream: true` to the provider — which
-        // would either yield an SSE body that fails JSON normalization (opaque
-        // 502) or silently degrade to a single buffered object for the
-        // translating providers. See finding #11.
+        // A streaming request that reaches the BUFFERED egress phase was not
+        // claimed by the streaming path: either `streaming.enabled` is false, or
+        // the claim declined this request (no model, no matching provider, or a
+        // non-JSON/non-UTF-8 client body under an explicit pass-through opt-in).
+        // The terminate-and-respond path cannot serve it — forwarding
+        // `stream: true` would either yield an SSE body that fails JSON
+        // normalization (opaque 502) or silently degrade to one buffered object
+        // for the translating providers — so fail closed with a diagnostic that
+        // names the supported configuration (issue #3298).
         if request_wants_streaming(&openai_body) {
             debug!(
                 model = %model,
-                "ai_federation: rejecting streaming request — streaming responses are not supported"
+                streaming_enabled = self.streaming.enabled,
+                "ai_federation: rejecting streaming request on the buffered execution path"
             );
+            let message = if self.streaming.enabled {
+                "Streaming responses (\"stream\": true) were not committed to a provider by ai_federation for this request"
+            } else {
+                "Streaming responses (\"stream\": true) are disabled for ai_federation; enable the 'streaming' block to relay provider streams incrementally"
+            };
             return self.openai_error_response(
                 501,
-                "Streaming responses (\"stream\": true) are not supported by ai_federation",
+                message,
                 "invalid_request_error",
                 Some("stream"),
                 Some("streaming_not_supported"),
@@ -5276,12 +7480,12 @@ impl Plugin for AiFederation {
                 candidate
                     .circuit
                     .as_ref()
-                    .is_none_or(ProviderCircuit::may_admit)
+                    .is_none_or(|circuit| circuit.may_admit())
             });
             let admission = provider
                 .circuit
                 .as_ref()
-                .map(ProviderCircuit::admit)
+                .map(|circuit| circuit.admit())
                 .unwrap_or(CircuitAdmission::Closed);
             let mut half_open_probe_guard = match (provider.circuit.as_ref(), admission) {
                 (Some(circuit), CircuitAdmission::HalfOpenProbe) => {
@@ -5945,6 +8149,202 @@ pub mod test_helpers {
     /// the deterministic pre-I/O concurrency rejection path.
     pub fn close_request_slots_for_test(plugin: &AiFederation) {
         plugin.request_slots.close();
+    }
+
+    /// Streaming bound constants used by external schema/parity tests.
+    pub fn streaming_bounds_for_test() -> (usize, usize, usize, u64) {
+        (
+            DEFAULT_MAX_STREAM_EVENT_BYTES,
+            MIN_STREAM_EVENT_BYTES,
+            MAX_STREAM_EVENT_BYTES,
+            MAX_STREAM_READ_TIMEOUT_SECONDS,
+        )
+    }
+
+    /// Whether this instance admits streaming requests, and its event ceiling.
+    pub fn streaming_policy_for_test(plugin: &AiFederation) -> (bool, usize) {
+        (plugin.streaming.enabled, plugin.streaming.max_event_bytes)
+    }
+
+    /// Streaming-only whole-exchange override, if configured.
+    pub fn streaming_read_timeout_seconds_for_test(plugin: &AiFederation) -> Option<u64> {
+        plugin.streaming.read_timeout_seconds
+    }
+
+    /// The closed runtime key set for the root `streaming` block, for schema
+    /// parity tests.
+    pub fn streaming_config_keys_for_test() -> &'static [&'static str] {
+        AI_FEDERATION_STREAMING_KEYS
+    }
+
+    /// Effective streaming dispatch budgets (connect ms, whole-exchange ms) for
+    /// a configured provider index.
+    pub fn streaming_dispatch_budgets_for_test(
+        plugin: &AiFederation,
+        index: usize,
+    ) -> Option<(u64, u64)> {
+        let provider = plugin.providers.get(index)?;
+        Some((
+            duration_as_millis_u64(provider.connect_timeout),
+            plugin.streaming_read_timeout_ms(provider),
+        ))
+    }
+
+    /// Terminal outcome the claim's reservation resolved to, as a stable string.
+    /// `None` when the request carries no reservation or it is still unresolved.
+    pub fn stream_outcome_for_test(
+        plugin: &AiFederation,
+        ctx: &RequestContext,
+    ) -> Option<&'static str> {
+        plugin
+            .owned_stream_lifecycle(ctx)
+            .and_then(|lifecycle| lifecycle.outcome())
+            .map(StreamOutcome::as_str)
+    }
+
+    /// Whether a non-2xx provider outcome has been staged but not yet resolved.
+    pub fn stream_outcome_staged_for_test(
+        plugin: &AiFederation,
+        ctx: &RequestContext,
+    ) -> Option<&'static str> {
+        let lifecycle = plugin.owned_stream_lifecycle(ctx)?;
+        lifecycle
+            .staged_outcome
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .map(StreamOutcome::as_str)
+    }
+
+    /// Free permits left in this instance's `max_concurrent_requests` semaphore.
+    pub fn available_request_slots_for_test(plugin: &AiFederation) -> usize {
+        plugin.request_slots.available_permits()
+    }
+
+    /// Whether the provider circuit at `index` is currently closed.
+    pub fn circuit_is_closed_for_test(plugin: &AiFederation, index: usize) -> Option<bool> {
+        let circuit = plugin.providers.get(index)?.circuit.as_ref()?;
+        Some(circuit.open_until_monotonic_ms.load(Ordering::Acquire) == 0)
+    }
+
+    /// Whether the provider at `index` currently has a half-open probe reserved.
+    pub fn half_open_probe_in_flight_for_test(plugin: &AiFederation, index: usize) -> Option<bool> {
+        let circuit = plugin.providers.get(index)?.circuit.as_ref()?;
+        Some(circuit.half_open_in_flight.load(Ordering::Acquire))
+    }
+
+    /// Force the provider at `index` into the cooled-down (half-open eligible)
+    /// state without a wall-clock sleep.
+    pub fn open_and_cool_down_circuit_for_test(plugin: &AiFederation, index: usize) -> bool {
+        let Some(circuit) = plugin.providers.get(index).and_then(|p| p.circuit.as_ref()) else {
+            return false;
+        };
+        circuit.open("test", "forced_open_for_test");
+        // Backdate the cooldown so `admit()` sees an expired open window. The
+        // shared circuit clock reserves 0 for "closed" and is always >= 1.
+        circuit.open_until_monotonic_ms.store(1, Ordering::Release);
+        true
+    }
+
+    /// Reduce a provider response header map exactly as the origin boundary
+    /// does, for hostile-header regression tests.
+    pub fn reduce_provider_stream_response_headers_for_test(headers: &mut HashMap<String, String>) {
+        reduce_provider_stream_response_headers(headers);
+    }
+
+    /// Observable projection of the private streaming claim THIS instance owns.
+    ///
+    /// Returns `(provider_name, committed_absolute_path, committed_query)`.
+    /// Deliberately never exposes the ownership token, credential, or TLS
+    /// material — tests assert routing, not claim internals.
+    pub fn owned_stream_claim_for_test(
+        plugin: &AiFederation,
+        ctx: &RequestContext,
+    ) -> Option<(String, String, String)> {
+        let (claim, provider) = plugin.owned_stream_claim(ctx)?;
+        Some((
+            provider.name.clone(),
+            ctx.route_override_path.clone().unwrap_or_default(),
+            claim.committed_query().to_string(),
+        ))
+    }
+
+    /// Whether any provider claim (this plugin's or `ai_stream_router`'s) is
+    /// recorded on the context.
+    pub fn has_provider_claim_for_test(ctx: &RequestContext) -> bool {
+        ctx.ai_stream_router_claim.is_some()
+    }
+
+    /// Construct the bounded SSE contract guard for direct behavioral tests.
+    pub fn sse_guard_for_test(max_event_bytes: usize) -> Box<dyn ResponseStreamInspector> {
+        Box::new(FederationSseGuard::new(max_event_bytes, None))
+    }
+
+    /// Retained carry size of a guard, so bounded-state regressions can assert
+    /// that persistent state never exceeds the configured ceiling.
+    pub struct SseGuardProbe {
+        guard: FederationSseGuard,
+    }
+
+    impl SseGuardProbe {
+        pub fn new(max_event_bytes: usize) -> Self {
+            Self {
+                guard: FederationSseGuard::new(max_event_bytes, None),
+            }
+        }
+
+        pub async fn on_chunk(&mut self, chunk: &[u8]) -> (Vec<u8>, bool) {
+            match self.guard.on_chunk(chunk).await {
+                ResponseStreamAction::Forward(bytes) => (bytes.to_vec(), false),
+                ResponseStreamAction::Terminate(bytes) => {
+                    (bytes.map(|b| b.to_vec()).unwrap_or_default(), true)
+                }
+            }
+        }
+
+        pub async fn on_end(&mut self) -> (Vec<u8>, bool) {
+            match self.guard.on_end().await {
+                ResponseStreamAction::Forward(bytes) => (bytes.to_vec(), false),
+                ResponseStreamAction::Terminate(bytes) => {
+                    (bytes.map(|b| b.to_vec()).unwrap_or_default(), true)
+                }
+            }
+        }
+
+        /// Bytes of the partial event currently retained across transport calls.
+        pub fn retained_bytes(&self) -> usize {
+            self.guard.carry.len()
+        }
+
+        /// Capacity currently reserved for retained bytes.
+        pub fn retained_capacity(&self) -> usize {
+            self.guard.carry.capacity()
+        }
+
+        /// Bytes of the terminal event currently held back from the client
+        /// (`0` when none is held), so retention bounds can be asserted over the
+        /// COMPLETE retained state rather than the carry buffer alone.
+        pub fn retained_terminal_bytes(&self) -> usize {
+            self.guard
+                .retained_terminal
+                .as_ref()
+                .map_or(0, |terminal| terminal.len())
+        }
+    }
+
+    /// Streaming eligibility decision for a configured provider index, as a
+    /// stable diagnostic code (`None` when the provider is eligible).
+    pub fn stream_ineligibility_code_for_test(
+        plugin: &AiFederation,
+        index: usize,
+        model: &str,
+    ) -> Option<&'static str> {
+        let provider = plugin.providers.get(index)?;
+        let resolved = AiFederation::resolve_model(provider, model);
+        match stream_target_for(provider, &resolved) {
+            Ok(_) => None,
+            Err(reason) => Some(reason.code()),
+        }
     }
 
     /// Resource-bound constants used by external runtime/schema parity tests.

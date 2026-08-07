@@ -215,6 +215,7 @@ use chrono::Utc;
 use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 use url::{Host, Url};
@@ -580,6 +581,30 @@ pub(crate) struct AiStreamRouterClaim {
     /// The exact backend-visible query the dispatch layer may append. Empty
     /// when the committed `path` already carries every pair.
     committed_query: String,
+    /// Exactly the `route_override_backend_connect_timeout_ms` this claim
+    /// committed, so the dispatch policy the credential was approved under is
+    /// part of the destination witness. `None` for a claim that inherits the
+    /// matched proxy's connect budget (every `ai_stream_router` claim).
+    committed_connect_timeout_ms: Option<u64>,
+    /// Exactly the `route_override_backend_read_timeout_ms` this claim
+    /// committed. Same witness role as
+    /// [`Self::committed_connect_timeout_ms`]; `Some(0)` is the explicit
+    /// "no gateway-imposed whole-exchange bound" commitment and is distinct
+    /// from `None`.
+    committed_read_timeout_ms: Option<u64>,
+    /// Opaque, clone-safe lifecycle reservation owned by an EXTERNAL claim
+    /// owner (`ai_federation`'s streaming path today).
+    ///
+    /// It carries capacity and provider-circuit admission that must be released
+    /// exactly once when the request/stream reaches ANY terminal state,
+    /// including cancellation. Cloning the claim (the final-request-body hook
+    /// context) shares the same reservation rather than duplicating it, and the
+    /// reservation's own `Drop` is the cancellation-safe backstop.
+    ///
+    /// `None` for every `ai_stream_router` claim: this plugin reserves no
+    /// external capacity. Deliberately `dyn Any` so the claim type carries no
+    /// knowledge of any particular owner's accounting.
+    lifecycle: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl AiStreamRouterClaim {
@@ -587,6 +612,129 @@ impl AiStreamRouterClaim {
     pub(crate) fn committed_query(&self) -> &str {
         &self.committed_query
     }
+
+    /// Opaque owning-instance identity. Only equality against the reader's own
+    /// id is meaningful; the value is never rendered anywhere.
+    #[inline]
+    pub(crate) fn owner(&self) -> u64 {
+        self.owner
+    }
+
+    /// Index into the OWNING plugin instance's own provider list. Meaningless
+    /// to any other instance, and only read after an [`owner`](Self::owner)
+    /// match.
+    #[inline]
+    pub(crate) fn provider_index(&self) -> usize {
+        self.provider_index
+    }
+
+    /// The exact model string that selected the committed provider.
+    ///
+    /// Never log this: model enforcement is fixed-cardinality and must not echo
+    /// a client-controlled value.
+    #[inline]
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The committed backend-visible authority (`Host` / `:authority`).
+    ///
+    /// Read by an external owner's final backend-header policy so the `Host`
+    /// it re-installs is the one the claim committed, never a later transform's
+    /// value.
+    #[inline]
+    pub(crate) fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    /// Whether the request context still targets exactly what this claim
+    /// committed (`GHSA-xhp5-hqj8-3mwg`). Shared with every non-`ai_stream_router`
+    /// owner so the destination witness cannot drift between claim owners.
+    #[inline]
+    pub(crate) fn destination_intact(&self, ctx: &RequestContext) -> bool {
+        route_override_still_targets(ctx, self)
+    }
+
+    /// The opaque lifecycle reservation an external owner attached at claim
+    /// time, if any. Only the owner can make sense of it: it downcasts to its
+    /// own private type after an [`owner`](Self::owner) match.
+    #[inline]
+    pub(crate) fn lifecycle(&self) -> Option<&Arc<dyn std::any::Any + Send + Sync>> {
+        self.lifecycle.as_ref()
+    }
+}
+
+/// The complete set of values another plugin must commit to mint a provider
+/// claim of its own (`GHSA-xhp5-hqj8-3mwg`).
+///
+/// `ai_federation`'s streaming path is the only external owner today. Keeping
+/// ONE claim type — rather than a second parallel one — is load-bearing: the
+/// stand-down signal every other built-in reads
+/// ([`RequestContext::has_ai_stream_router_claim`]) and the committed-query
+/// re-assertion funnel ([`RequestContext::committed_provider_query`]) are both
+/// defined over this type, so a second type would silently bypass both.
+pub(crate) struct ExternalProviderClaimParts {
+    pub(crate) owner: u64,
+    pub(crate) provider_index: usize,
+    pub(crate) model: String,
+    pub(crate) scheme: BackendScheme,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) path: String,
+    pub(crate) authority: String,
+    pub(crate) resolved_tls: Option<BackendTlsConfig>,
+    pub(crate) committed_query: String,
+    /// The exact `route_override_backend_connect_timeout_ms` the owner
+    /// committed for this destination.
+    pub(crate) committed_connect_timeout_ms: Option<u64>,
+    /// The exact `route_override_backend_read_timeout_ms` the owner committed
+    /// for this destination.
+    pub(crate) committed_read_timeout_ms: Option<u64>,
+    /// Opaque, clone-safe lifecycle reservation (capacity + circuit admission)
+    /// whose `Drop` releases anything still unresolved exactly once.
+    pub(crate) lifecycle: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+/// Mint a provider claim owned by a plugin other than `ai_stream_router`.
+///
+/// The owner id MUST come from [`next_provider_claim_owner_id`] so ownership is
+/// decidable across plugin types: every `ai_stream_router` claim-dependent hook
+/// compares `claim.owner` against its own instance id and stands down on a
+/// mismatch, which is exactly the behavior an externally owned claim needs.
+///
+/// `tool_choice_none` and `request_translated` are deliberately fixed to
+/// `false`: they gate `ai_stream_router`'s own Anthropic/Gemini translation
+/// witnesses, and an external owner that performs no translation must not be
+/// able to set either.
+pub(crate) fn mint_external_provider_claim(
+    parts: ExternalProviderClaimParts,
+) -> AiStreamRouterClaim {
+    AiStreamRouterClaim {
+        owner: parts.owner,
+        provider_index: parts.provider_index,
+        model: parts.model,
+        tool_choice_none: false,
+        request_translated: false,
+        scheme: parts.scheme,
+        host: parts.host,
+        port: parts.port,
+        path: parts.path,
+        authority: parts.authority,
+        resolved_tls: parts.resolved_tls,
+        committed_query: parts.committed_query,
+        committed_connect_timeout_ms: parts.committed_connect_timeout_ms,
+        committed_read_timeout_ms: parts.committed_read_timeout_ms,
+        lifecycle: parts.lifecycle,
+    }
+}
+
+/// Allocate a process-unique provider-claim owner identity.
+///
+/// Shared with every claim owner (this plugin's instances and `ai_federation`'s
+/// streaming path) so two different plugin types can never mint colliding
+/// ownership tokens.
+pub(crate) fn next_provider_claim_owner_id() -> u64 {
+    NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Deliberately opaque: `RequestContext` derives `Debug`, and a derived
@@ -2472,6 +2620,11 @@ fn openai_error_response(
 ///   own client certificate to a third-party connection. `None` (plaintext) is a
 ///   distinct committed state, not "unset".
 ///
+/// The committed dispatch budgets are compared for the same reason: a claim that
+/// pinned a provider's own connect / whole-exchange timeouts must not be
+/// dispatched under a different budget than the one it was approved with, and an
+/// inherited (`None`) commitment must stay inherited.
+///
 /// The claim is a private typed struct, not serialized metadata, so none of
 /// these values can be forged by a plugin that can only write metadata.
 fn route_override_still_targets(ctx: &RequestContext, claim: &AiStreamRouterClaim) -> bool {
@@ -2484,6 +2637,8 @@ fn route_override_still_targets(ctx: &RequestContext, claim: &AiStreamRouterClai
         && ctx.route_override_authority.as_deref() == Some(claim.authority.as_str())
         && ctx.route_override_path.as_deref() == Some(claim.path.as_str())
         && ctx.route_override_resolved_tls == claim.resolved_tls
+        && ctx.route_override_backend_connect_timeout_ms == claim.committed_connect_timeout_ms
+        && ctx.route_override_backend_read_timeout_ms == claim.committed_read_timeout_ms
 }
 
 /// Fail-closed envelope for a broken provider-boundary invariant. Fixed
@@ -2873,6 +3028,13 @@ impl Plugin for AiStreamRouter {
             authority: provider.authority.clone(),
             resolved_tls: committed_tls,
             committed_query,
+            // This plugin never overrides the matched proxy's dispatch budgets,
+            // so the witness pins "inherited" and a later plugin cannot install
+            // one without breaking the destination check.
+            committed_connect_timeout_ms: ctx.route_override_backend_connect_timeout_ms,
+            committed_read_timeout_ms: ctx.route_override_backend_read_timeout_ms,
+            // No external capacity is reserved for an `ai_stream_router` claim.
+            lifecycle: None,
         }));
 
         // --- Metadata (observability + downstream-hook coordination ONLY). ---
@@ -3416,7 +3578,7 @@ impl Plugin for AiStreamRouter {
 /// session-bearing headers (`cookie`, `proxy-authorization`) must be stripped
 /// alongside the API-key/auth headers or browser/application session
 /// credentials would reach the third-party provider.
-fn strip_client_credentials(headers: &mut HashMap<String, String>) {
+pub(crate) fn strip_client_credentials(headers: &mut HashMap<String, String>) {
     const CREDENTIAL_HEADERS: &[&str] = &[
         "authorization",
         "proxy-authorization",
@@ -3447,7 +3609,7 @@ fn strip_client_credentials(headers: &mut HashMap<String, String>) {
 /// `SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY` so proxy core stops
 /// appending them; this strip additionally removes any value a later generic
 /// header rule reintroduced (`GHSA-xhp5-hqj8-3mwg`).
-fn strip_gateway_identity_assertions(headers: &mut HashMap<String, String>) {
+pub(crate) fn strip_gateway_identity_assertions(headers: &mut HashMap<String, String>) {
     headers.retain(|name, _| {
         !name.eq_ignore_ascii_case("x-consumer-username")
             && !name.eq_ignore_ascii_case("x-consumer-custom-id")
@@ -3521,7 +3683,7 @@ fn apply_provider_boundary_headers(
     }
 }
 
-fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
+pub(crate) fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
     headers.retain(|k, _| !k.eq_ignore_ascii_case(name));
 }
 
