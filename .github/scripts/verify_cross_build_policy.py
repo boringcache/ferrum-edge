@@ -16092,6 +16092,8 @@ pre_build = []
         "    steps:\n"
         "      - run: bash scripts/lab.sh\n"
     )
+    benign_build_script = "#!/bin/sh\necho building\n"
+    benign_lab_script = "#!/bin/sh\necho lab\n"
     cross_sensitive_script = "#!/bin/sh\ncross build --target aarch64-unknown-linux-gnu\n"
     cross_sensitive_script_edit = (
         "#!/bin/sh\n# a comment the freeze used to forbid\n"
@@ -16106,8 +16108,14 @@ pre_build = []
         scoped_workflows,
         {"setup/action.yml": safe_action},
         {"setup/action.yml": safe_action},
-        {"scripts/lab.sh": cross_sensitive_script},
-        {"scripts/lab.sh": cross_sensitive_script_edit},
+        {
+            "scripts/build_arm64.sh": benign_build_script,
+            "scripts/lab.sh": cross_sensitive_script,
+        },
+        {
+            "scripts/build_arm64.sh": benign_build_script,
+            "scripts/lab.sh": cross_sensitive_script_edit,
+        },
         "self-test build-scoped automation",
     ):
         failures.append(
@@ -16118,8 +16126,14 @@ pre_build = []
         scoped_workflows,
         {"setup/action.yml": safe_action},
         {"setup/action.yml": safe_action},
-        {"scripts/build_arm64.sh": cross_sensitive_script},
-        {"scripts/build_arm64.sh": cross_sensitive_script_edit},
+        {
+            "scripts/build_arm64.sh": cross_sensitive_script,
+            "scripts/lab.sh": benign_lab_script,
+        },
+        {
+            "scripts/build_arm64.sh": cross_sensitive_script_edit,
+            "scripts/lab.sh": benign_lab_script,
+        },
         "self-test build-scoped automation",
     ):
         failures.append("automation inside the trusted ARM64 build was not frozen")
@@ -16128,8 +16142,14 @@ pre_build = []
         scoped_workflows,
         {"setup/action.yml": safe_action},
         {"setup/action.yml": safe_action},
-        {"scripts/build_arm64.sh": cross_sensitive_script},
-        {"scripts/build_arm64.sh": cross_sensitive_script},
+        {
+            "scripts/build_arm64.sh": cross_sensitive_script,
+            "scripts/lab.sh": benign_lab_script,
+        },
+        {
+            "scripts/build_arm64.sh": cross_sensitive_script,
+            "scripts/lab.sh": benign_lab_script,
+        },
         "self-test build-scoped automation",
     ):
         failures.append(
