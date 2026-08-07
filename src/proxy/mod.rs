@@ -25825,7 +25825,10 @@ async fn handle_proxy_request_inner(
     // `ctx.orig_dst` (the captured SO_ORIGINAL_DST on mesh capture listeners)
     // enables true PASSTHROUGH load balancing when the upstream's algorithm is
     // Passthrough; it is ignored for every other algorithm.
-    let selection = backend_dispatch::select_upstream_target(
+    // `selection` stays whole (fields are moved out with `Option::take`) because
+    // `balancer` / `is_fallback` / `sticky_cookie_needed` are read much later,
+    // after the deferred-override rebind below may have replaced it.
+    let mut selection = backend_dispatch::select_upstream_target(
         &proxy,
         &state,
         &epoch,
@@ -25833,9 +25836,9 @@ async fn handle_proxy_request_inner(
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
         ctx.orig_dst,
     );
-    let mut lb_hash_key = selection.lb_hash_key;
+    let mut lb_hash_key = selection.lb_hash_key.take();
     let mut upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
-        selection.target,
+        selection.target.take(),
         request_host.as_deref(),
     );
 
@@ -26037,22 +26040,55 @@ async fn handle_proxy_request_inner(
         // credentials installed by that hook can reach a backend. Otherwise
         // the headers can describe the claimed provider while `proxy`, `path`,
         // and `upstream_target` still point at the pre-claim destination.
+        //
+        // Each rebind is gated on that input actually moving. Re-running
+        // load-balancer selection unconditionally would advance round-robin,
+        // re-read the health snapshot, and re-derive the hash key for every
+        // policy-bound request that never had a deferred override at all,
+        // perturbing target choice, retry rotation, and least-connections
+        // accounting well beyond the destinations this rebind exists to honor.
+        let previous_proxy = Arc::clone(&proxy);
         proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
-        ctx.matched_proxy = Some(Arc::clone(&proxy));
-        path = rebase_route_override_path(&mut ctx, path);
-        let selection = backend_dispatch::select_upstream_target(
-            &proxy,
-            &state,
-            &epoch,
-            &ctx.client_ip,
-            owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
-            ctx.orig_dst,
-        );
-        lb_hash_key = selection.lb_hash_key;
-        upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
-            selection.target,
-            request_host.as_deref(),
-        );
+        // `apply_route_overrides_with_upstreams` is idempotent: it hands back
+        // the SAME `Arc` when the already-baked proxy reflects every override,
+        // so pointer identity against the retained pre-pass `Arc` is an exact,
+        // allocation-free "a deferred hook committed a new destination" test.
+        let destination_rebound = !Arc::ptr_eq(&previous_proxy, &proxy);
+        if destination_rebound {
+            ctx.matched_proxy = Some(Arc::clone(&proxy));
+        }
+        // A deferred hook can also rewrite only the backend path (the Istio
+        // `rewrite.uri` shape) without moving the destination. `path` and
+        // `ctx.path` already carry the rewrite bound before the deferred
+        // passes, so a divergence from the current override is exactly the
+        // case where re-basing changes what is dispatched.
+        let path_rebase_pending = ctx
+            .route_override_path
+            .as_deref()
+            .is_some_and(|rewrite| rewrite != path || rewrite != ctx.path);
+        if path_rebase_pending {
+            path = rebase_route_override_path(&mut ctx, path);
+        }
+        if destination_rebound {
+            // Replace the whole selection rather than only the target:
+            // `balancer`, `is_fallback`, and `sticky_cookie_needed` are read
+            // after this point, so same-generation load-balancer accounting,
+            // the unhealthy-fallback warning, and sticky-cookie issuance must
+            // describe the target that is actually dialed.
+            selection = backend_dispatch::select_upstream_target(
+                &proxy,
+                &state,
+                &epoch,
+                &ctx.client_ip,
+                owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
+                ctx.orig_dst,
+            );
+            lb_hash_key = selection.lb_hash_key.take();
+            upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
+                selection.target.take(),
+                request_host.as_deref(),
+            );
+        }
     }
 
     // The effective PeerAuthentication app port is not authoritative until

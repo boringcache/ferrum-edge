@@ -591,6 +591,9 @@ fn test_deferred_destination_override_is_rebound_before_dispatch() {
     let rebind = after_deferred
         .find("proxy = ctx.apply_route_overrides_with_upstreams(")
         .expect("deferred destination overrides must rebind the effective proxy");
+    let moved = after_deferred
+        .find("let destination_rebound = !Arc::ptr_eq(&previous_proxy, &proxy);")
+        .expect("the rebind must detect a committed destination by proxy identity");
     let rebase = after_deferred
         .find("path = rebase_route_override_path(&mut ctx, path);")
         .expect("deferred destination overrides must rebase the dispatch path");
@@ -601,7 +604,46 @@ fn test_deferred_destination_override_is_rebound_before_dispatch() {
         .find("let backend_url = build_backend_url_with_target(")
         .expect("generic backend URL construction must remain present");
 
-    assert!(rebind < rebase && rebase < reselect && reselect < backend_url);
+    assert!(rebind < moved && moved < rebase && rebase < reselect && reselect < backend_url);
+
+    // Re-selection must stay gated on the destination actually moving. An
+    // unconditional second `select_upstream_target` advances round-robin,
+    // re-reads the health snapshot, and re-derives the hash key for EVERY
+    // policy-bound request, changing which target the first dial and the retry
+    // rotation start from even when no deferred hook set a route override.
+    let gate = after_deferred[..reselect]
+        .rfind("if destination_rebound {")
+        .expect("deferred re-selection must be gated on the destination having moved");
+    assert!(gate > rebase);
+}
+
+/// The rebind above must leave the load-balancer bookkeeping describing the
+/// target that is actually dialed: `balancer`, `is_fallback`, and
+/// `sticky_cookie_needed` are read long after the deferred pass, so the gated
+/// branch has to replace the whole `UpstreamSelection` rather than only the
+/// target and hash key.
+#[test]
+fn test_deferred_destination_rebind_replaces_whole_upstream_selection() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let handler = source
+        .split_once("async fn handle_proxy_request_inner(")
+        .map(|(_, handler)| handler)
+        .expect("H1/H2 request handler must remain present");
+    let deferred = handler
+        .find("BackendPathBeforeProxyPass::RemainingDeferred")
+        .expect("remaining deferred pass must remain present");
+    let after_deferred = &handler[deferred..];
+    let reselect = after_deferred
+        .find("selection = backend_dispatch::select_upstream_target(")
+        .expect("the gated rebind must re-run upstream selection");
+    let accounting = after_deferred
+        .find("let upstream_balancer = selection.balancer;")
+        .expect("load-balancer accounting must still read the live selection");
+
+    assert!(
+        reselect < accounting,
+        "re-selection must overwrite `selection` before it is consumed"
+    );
 }
 
 #[test]
