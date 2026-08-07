@@ -12,6 +12,7 @@ use dashmap::mapref::entry::Entry;
 
 use crate::identity::ca::PublishedTrustBundle;
 use crate::identity::spiffe::SpiffeId;
+use crate::plugins::StreamConnectionContext;
 use crate::plugins::TransactionSummary;
 use crate::plugins::prometheus_metrics::{HistogramBuckets, escape_label_value};
 
@@ -84,22 +85,107 @@ pub struct MeshRequestKey {
 }
 
 pub(crate) const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
+/// Stamped by `workload_metrics::on_stream_connect` when that plugin actually
+/// observed the stream. Stream-path lifecycle finalizers require this marker:
+/// mesh routing/security setup may pre-populate other `mesh.*` metadata before
+/// the plugin chain runs, and an earlier rejecting plugin must not create
+/// workload-metric series that no workload-metrics instance observed.
+///
+/// The `mesh.metrics.` prefix also keeps this internal lifecycle signal out of
+/// trace attributes.
+pub const MESH_WORKLOAD_METRICS_OBSERVED_METADATA: &str = "mesh.metrics.workload_metrics_observed";
+/// Stamped once per mesh TCP stream when `TCP_OPENED_CONNECTIONS` is finalized
+/// under the metadata that path will also use for closed/byte series.
+///
+/// This is a connection-lifecycle marker, not an authorization-success flag:
+/// every TCP stream path that reaches workload-metrics observation finalizes
+/// exactly once after the last hook that actually ran (accepted chain, plugin
+/// rejection, or client-disconnect-during-admission), before the disconnect
+/// summary is emitted. Captured mesh egress TCP finalizes after selected
+/// target metadata is stamped (or at teardown when no target was selected).
+///
+/// Ferrum allows several effective `workload_metrics` instances on one proxy,
+/// so the plugin hook itself runs once per instance over intermediate metadata.
+/// The opened counter therefore cannot be emitted from the hook: the marker is
+/// what makes the TCP lifecycle counters exactly-once per connection under the
+/// FINAL policy for that path. It also gates the closed/byte half so opened and
+/// closed stay balanced.
+///
+/// The `mesh.metrics.` prefix keeps it out of `mesh_trace_attributes`, exactly
+/// like the disable/tag-override plans.
+pub const MESH_TCP_OPENED_FINALIZED_METADATA: &str = "mesh.metrics.tcp_opened_finalized";
 pub(crate) const MESH_REQUEST_COUNT_OVERRIDES_METADATA: &str =
     "mesh.metrics.request_count.tag_overrides";
 pub(crate) const MESH_REQUEST_DURATION_OVERRIDES_METADATA: &str =
     "mesh.metrics.request_duration.tag_overrides";
+pub(crate) const MESH_REQUEST_SIZE_OVERRIDES_METADATA: &str =
+    "mesh.metrics.request_size.tag_overrides";
+pub(crate) const MESH_RESPONSE_SIZE_OVERRIDES_METADATA: &str =
+    "mesh.metrics.response_size.tag_overrides";
+pub(crate) const MESH_TCP_OPENED_OVERRIDES_METADATA: &str =
+    "mesh.metrics.tcp_opened_connections.tag_overrides";
+pub(crate) const MESH_TCP_CLOSED_OVERRIDES_METADATA: &str =
+    "mesh.metrics.tcp_closed_connections.tag_overrides";
+pub(crate) const MESH_TCP_SENT_OVERRIDES_METADATA: &str =
+    "mesh.metrics.tcp_sent_bytes.tag_overrides";
+pub(crate) const MESH_TCP_RECEIVED_OVERRIDES_METADATA: &str =
+    "mesh.metrics.tcp_received_bytes.tag_overrides";
+pub(crate) const MESH_GRPC_REQUEST_MESSAGES_OVERRIDES_METADATA: &str =
+    "mesh.metrics.grpc_request_messages.tag_overrides";
+pub(crate) const MESH_GRPC_RESPONSE_MESSAGES_OVERRIDES_METADATA: &str =
+    "mesh.metrics.grpc_response_messages.tag_overrides";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Istio Telemetry metric families Ferrum emits with mesh identity labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MeshMetricFamily {
     RequestCount,
     RequestDuration,
+    RequestSize,
+    ResponseSize,
+    TcpOpenedConnections,
+    TcpClosedConnections,
+    TcpSentBytes,
+    TcpReceivedBytes,
+    GrpcRequestMessages,
+    GrpcResponseMessages,
 }
 
 impl MeshMetricFamily {
+    pub(crate) const ALL: [Self; 10] = [
+        Self::RequestCount,
+        Self::RequestDuration,
+        Self::RequestSize,
+        Self::ResponseSize,
+        Self::TcpOpenedConnections,
+        Self::TcpClosedConnections,
+        Self::TcpSentBytes,
+        Self::TcpReceivedBytes,
+        Self::GrpcRequestMessages,
+        Self::GrpcResponseMessages,
+    ];
+
     pub(crate) fn from_config_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_uppercase().as_str() {
             "REQUEST_COUNT" | "FERRUM_MESH_REQUESTS_TOTAL" => Some(Self::RequestCount),
             "REQUEST_DURATION" | "FERRUM_MESH_REQUEST_DURATION_MS" => Some(Self::RequestDuration),
+            "REQUEST_SIZE" | "FERRUM_MESH_REQUEST_BYTES" => Some(Self::RequestSize),
+            "RESPONSE_SIZE" | "FERRUM_MESH_RESPONSE_BYTES" => Some(Self::ResponseSize),
+            "TCP_OPENED_CONNECTIONS" | "FERRUM_MESH_TCP_CONNECTIONS_OPENED_TOTAL" => {
+                Some(Self::TcpOpenedConnections)
+            }
+            "TCP_CLOSED_CONNECTIONS" | "FERRUM_MESH_TCP_CONNECTIONS_CLOSED_TOTAL" => {
+                Some(Self::TcpClosedConnections)
+            }
+            "TCP_SENT_BYTES" | "FERRUM_MESH_TCP_SENT_BYTES_TOTAL" => Some(Self::TcpSentBytes),
+            "TCP_RECEIVED_BYTES" | "FERRUM_MESH_TCP_RECEIVED_BYTES_TOTAL" => {
+                Some(Self::TcpReceivedBytes)
+            }
+            "GRPC_REQUEST_MESSAGES" | "FERRUM_MESH_REQUEST_MESSAGES_TOTAL" => {
+                Some(Self::GrpcRequestMessages)
+            }
+            "GRPC_RESPONSE_MESSAGES" | "FERRUM_MESH_RESPONSE_MESSAGES_TOTAL" => {
+                Some(Self::GrpcResponseMessages)
+            }
             _ => None,
         }
     }
@@ -108,13 +194,107 @@ impl MeshMetricFamily {
         match self {
             Self::RequestCount => MESH_REQUEST_COUNT_OVERRIDES_METADATA,
             Self::RequestDuration => MESH_REQUEST_DURATION_OVERRIDES_METADATA,
+            Self::RequestSize => MESH_REQUEST_SIZE_OVERRIDES_METADATA,
+            Self::ResponseSize => MESH_RESPONSE_SIZE_OVERRIDES_METADATA,
+            Self::TcpOpenedConnections => MESH_TCP_OPENED_OVERRIDES_METADATA,
+            Self::TcpClosedConnections => MESH_TCP_CLOSED_OVERRIDES_METADATA,
+            Self::TcpSentBytes => MESH_TCP_SENT_OVERRIDES_METADATA,
+            Self::TcpReceivedBytes => MESH_TCP_RECEIVED_OVERRIDES_METADATA,
+            Self::GrpcRequestMessages => MESH_GRPC_REQUEST_MESSAGES_OVERRIDES_METADATA,
+            Self::GrpcResponseMessages => MESH_GRPC_RESPONSE_MESSAGES_OVERRIDES_METADATA,
         }
     }
 
-    fn disabled_name(self) -> &'static str {
+    pub(crate) fn disabled_name(self) -> &'static str {
         match self {
             Self::RequestCount => "request_count",
             Self::RequestDuration => "request_duration",
+            Self::RequestSize => "request_size",
+            Self::ResponseSize => "response_size",
+            Self::TcpOpenedConnections => "tcp_opened_connections",
+            Self::TcpClosedConnections => "tcp_closed_connections",
+            Self::TcpSentBytes => "tcp_sent_bytes",
+            Self::TcpReceivedBytes => "tcp_received_bytes",
+            Self::GrpcRequestMessages => "grpc_request_messages",
+            Self::GrpcResponseMessages => "grpc_response_messages",
+        }
+    }
+
+    pub(crate) fn is_tcp(self) -> bool {
+        matches!(
+            self,
+            Self::TcpOpenedConnections
+                | Self::TcpClosedConnections
+                | Self::TcpSentBytes
+                | Self::TcpReceivedBytes
+        )
+    }
+}
+
+/// Count complete gRPC length-prefixed messages in a contiguous byte buffer.
+///
+/// Incomplete trailing frames are ignored (authoritative completed-message
+/// accounting). Does not allocate message payloads.
+pub fn count_grpc_length_prefixed_messages(data: &[u8]) -> u64 {
+    let mut pos = 0;
+    let mut count = 0u64;
+    while pos + 5 <= data.len() {
+        let len = u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+            as usize;
+        pos += 5;
+        if pos.checked_add(len).is_none_or(|end| end > data.len()) {
+            break;
+        }
+        pos += len;
+        count = count.saturating_add(1);
+    }
+    count
+}
+
+/// Incremental scanner for gRPC length-prefixed messages spanning DATA frames.
+#[derive(Debug, Default)]
+pub struct GrpcLengthPrefixedScanner {
+    header: [u8; 5],
+    header_filled: u8,
+    remaining: Option<u32>,
+}
+
+impl GrpcLengthPrefixedScanner {
+    pub fn push(&mut self, mut data: &[u8], messages: &AtomicU64) {
+        while !data.is_empty() {
+            if let Some(left) = self.remaining {
+                let take = (left as usize).min(data.len());
+                data = &data[take..];
+                let next = left.saturating_sub(take as u32);
+                if next == 0 {
+                    self.remaining = None;
+                    messages.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.remaining = Some(next);
+                }
+                continue;
+            }
+            let need = 5usize.saturating_sub(self.header_filled as usize);
+            let take = need.min(data.len());
+            self.header[self.header_filled as usize..self.header_filled as usize + take]
+                .copy_from_slice(&data[..take]);
+            self.header_filled = self.header_filled.saturating_add(take as u8);
+            data = &data[take..];
+            if self.header_filled < 5 {
+                return;
+            }
+            let len = u32::from_be_bytes([
+                self.header[1],
+                self.header[2],
+                self.header[3],
+                self.header[4],
+            ]);
+            self.header_filled = 0;
+            if len == 0 {
+                messages.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.remaining = Some(len);
+            }
         }
     }
 }
@@ -1207,14 +1387,7 @@ pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> 
 }
 
 pub(crate) fn mesh_metric_disabled(summary: &TransactionSummary, family: MeshMetricFamily) -> bool {
-    summary
-        .metadata
-        .get(MESH_METRICS_DISABLED_METADATA)
-        .is_some_and(|disabled| {
-            disabled
-                .split(',')
-                .any(|name| name == family.disabled_name())
-        })
+    mesh_metric_disabled_metadata(&summary.metadata, family)
 }
 
 /// Apply the prevalidated, length-prefixed metric override plan emitted by
@@ -1436,20 +1609,36 @@ pub fn render_mesh_histogram(
     histogram: &HistogramBuckets,
     gateway_ns_label: &str,
 ) {
+    render_mesh_histogram_named(
+        output,
+        "ferrum_mesh_request_duration_ms",
+        key,
+        histogram,
+        gateway_ns_label,
+    );
+}
+
+pub fn render_mesh_histogram_named(
+    output: &mut String,
+    metric_name: &str,
+    key: &MeshRequestKey,
+    histogram: &HistogramBuckets,
+    gateway_ns_label: &str,
+) {
     let base_labels = mesh_label_base_fragment(key);
     let le_separator = if base_labels.is_empty() { "" } else { "," };
     for (i, boundary) in histogram.boundaries.iter().enumerate() {
         let count = histogram.counts[i].load(Ordering::Relaxed);
         let _ = writeln!(
             output,
-            "ferrum_mesh_request_duration_ms_bucket{{{}{le_separator}le=\"{}\"{}}} {}",
+            "{metric_name}_bucket{{{}{le_separator}le=\"{}\"{}}} {}",
             base_labels, boundary, gateway_ns_label, count
         );
     }
     let total_count = histogram.count.load(Ordering::Relaxed);
     let _ = writeln!(
         output,
-        "ferrum_mesh_request_duration_ms_bucket{{{}{le_separator}le=\"+Inf\"{}}} {}",
+        "{metric_name}_bucket{{{}{le_separator}le=\"+Inf\"{}}} {}",
         base_labels, gateway_ns_label, total_count
     );
     let aggregate_gateway_ns_label = if base_labels.is_empty() {
@@ -1462,14 +1651,199 @@ pub fn render_mesh_histogram(
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
     let _ = writeln!(
         output,
-        "ferrum_mesh_request_duration_ms_sum{{{}{}}} {:.2}",
+        "{metric_name}_sum{{{}{}}} {:.2}",
         base_labels, aggregate_gateway_ns_label, sum
     );
     let _ = writeln!(
         output,
-        "ferrum_mesh_request_duration_ms_count{{{}{}}} {}",
+        "{metric_name}_count{{{}{}}} {}",
         base_labels, aggregate_gateway_ns_label, total_count
     );
+}
+
+/// Build a mesh identity key from stream metadata (TCP/UDP connect or disconnect).
+///
+/// TCP families omit `response_code` from the rendered label set (Istio parity).
+pub fn mesh_stream_key_from_metadata(
+    metadata: &HashMap<String, String>,
+    proxy_id: &str,
+    proxy_name: Option<&str>,
+) -> Option<MeshRequestKey> {
+    if !metadata.keys().any(|key| key.starts_with("mesh.")) {
+        return None;
+    }
+    let destination_default = proxy_name.unwrap_or(proxy_id);
+    let source_workload = metadata_arc(metadata, "mesh.source.workload", "unknown");
+    let source_namespace = metadata_arc(metadata, "mesh.source.namespace", "unknown");
+    let source_principal = metadata_arc(metadata, "mesh.source.principal", "unknown");
+    let source_app = metadata_arc_or_clone(metadata, "mesh.source.app", &source_workload);
+    let source_service = metadata_arc_or_clone(metadata, "mesh.source.service", &source_workload);
+    let destination_workload =
+        metadata_arc(metadata, "mesh.destination.workload", destination_default);
+    let destination_namespace = metadata_arc(metadata, "mesh.destination.namespace", "unknown");
+    let destination_principal = metadata_arc(metadata, "mesh.destination.principal", "unknown");
+    let destination_app =
+        metadata_arc_or_clone(metadata, "mesh.destination.app", &destination_workload);
+    let destination_service =
+        metadata_arc_or_clone(metadata, "mesh.destination.service", &destination_workload);
+    let request_protocol = metadata_arc_any(
+        metadata,
+        &["mesh.request_protocol", "request_protocol"],
+        "tcp",
+    );
+    let response_flags = metadata_arc(metadata, "mesh.response_flags", "-");
+    let connection_security_policy =
+        metadata_arc(metadata, "mesh.connection_security_policy", "none");
+    let mut key = MeshRequestKey {
+        source_workload,
+        source_namespace,
+        source_principal,
+        source_app,
+        source_service,
+        destination_workload,
+        destination_namespace,
+        destination_principal,
+        destination_app,
+        destination_service,
+        request_protocol,
+        response_code: 0,
+        response_code_override: None,
+        response_flags,
+        connection_security_policy,
+        removed_labels: 1u16 << MeshMetricLabel::ResponseCode.index(),
+    };
+    normalize_removed_labels(&mut key);
+    Some(key)
+}
+
+pub(crate) fn mesh_metric_disabled_metadata(
+    metadata: &HashMap<String, String>,
+    family: MeshMetricFamily,
+) -> bool {
+    metadata
+        .get(MESH_METRICS_DISABLED_METADATA)
+        .is_some_and(|disabled| {
+            disabled
+                .split(',')
+                .any(|name| name == family.disabled_name())
+        })
+}
+
+pub(crate) fn mesh_request_key_for_family_from_metadata(
+    metadata: &HashMap<String, String>,
+    base: &MeshRequestKey,
+    family: MeshMetricFamily,
+) -> MeshRequestKey {
+    let Some(plan) = metadata.get(family.override_metadata_key()) else {
+        return base.clone();
+    };
+    let mut key = base.clone();
+    apply_metric_override_plan(&mut key, plan);
+    // TCP families never carry an HTTP response-code dimension. Preserve that
+    // fixed schema even when an ALL_METRICS plan contains a response-code
+    // UPSERT/rename intended for the HTTP/gRPC families.
+    if family.is_tcp() {
+        key.removed_labels |= 1u16 << MeshMetricLabel::ResponseCode.index();
+    }
+    normalize_removed_labels(&mut key);
+    key
+}
+
+/// True when `workload_metrics` actually observed a mesh TCP connection.
+///
+/// Other mesh paths stamp routing/security `mesh.*` metadata before the plugin
+/// chain. Requiring the observation marker prevents an earlier plugin rejection
+/// from synthesizing workload-metric lifecycle series under incomplete/default
+/// labels. The request protocol still defaults to `tcp` exactly as the key
+/// builder does.
+pub fn metadata_is_mesh_tcp_stream(metadata: &HashMap<String, String>) -> bool {
+    metadata.contains_key(MESH_WORKLOAD_METRICS_OBSERVED_METADATA)
+        && metadata
+            .get("mesh.request_protocol")
+            .or_else(|| metadata.get("request_protocol"))
+            .is_none_or(|protocol| is_mesh_tcp_protocol(protocol))
+}
+
+/// True when `TCP_OPENED_CONNECTIONS` was already finalized for this stream.
+pub fn mesh_tcp_opened_finalized(metadata: &HashMap<String, String>) -> bool {
+    metadata.contains_key(MESH_TCP_OPENED_FINALIZED_METADATA)
+}
+
+/// Finalize mesh `TCP_OPENED_CONNECTIONS` once for a stream that reached
+/// workload-metrics observation (proved by
+/// [`MESH_WORKLOAD_METRICS_OBSERVED_METADATA`]).
+///
+/// Call from the stream path after the last `on_stream_connect` hook that
+/// actually ran — and, for captured mesh egress TCP, after selected target
+/// metadata is stamped — never from a plugin hook. Idempotent: a second call
+/// is a no-op. UDP/DTLS remain excluded by request protocol.
+pub(crate) fn finalize_mesh_tcp_opened_stream(ctx: &mut StreamConnectionContext) {
+    let proxy_id = ctx.proxy_id.as_str();
+    let proxy_name = ctx.proxy_name.as_deref();
+    let Some(metadata) = ctx.metadata.as_mut() else {
+        return;
+    };
+    let registry = crate::plugins::prometheus_metrics::global_registry();
+    registry.finalize_mesh_tcp_opened(metadata, proxy_id, proxy_name);
+}
+
+pub fn is_mesh_tcp_protocol(protocol: &str) -> bool {
+    matches!(
+        protocol.trim().to_ascii_lowercase().as_str(),
+        "tcp" | "tcp_tls" | "tls"
+    )
+}
+
+pub fn is_mesh_grpc_protocol(protocol: &str) -> bool {
+    let normalized = protocol.trim().to_ascii_lowercase();
+    normalized == "grpc" || normalized.starts_with("grpc-")
+}
+
+/// True when request metadata identifies a gRPC (or gRPC-Web) transaction that
+/// should populate authoritative length-prefixed message counters.
+pub fn metadata_observes_grpc_messages(metadata: &HashMap<String, String>) -> bool {
+    metadata
+        .get("request_protocol")
+        .or_else(|| metadata.get("mesh.request_protocol"))
+        .is_some_and(|protocol| is_mesh_grpc_protocol(protocol))
+}
+
+/// Record a complete buffered gRPC body with store/fetch_max semantics so
+/// retry/replay of the same bytes cannot inflate the counter.
+///
+/// `body` must already be the NATIVE length-prefixed gRPC representation. The
+/// client-visible gRPC-Web representation is not: text mode base64-armours the
+/// whole body, and both modes may carry a `0x80`-flagged terminal trailer frame
+/// that is metadata rather than a message. See
+/// [`record_native_grpc_message_count`] for the guarded entry point every
+/// dispatch ladder uses.
+pub fn record_complete_grpc_message_count(counter: &AtomicU64, body: &[u8]) {
+    let count = count_grpc_length_prefixed_messages(body);
+    counter.fetch_max(count, Ordering::Release);
+}
+
+/// Guarded recorder for a complete, protocol-native gRPC body.
+///
+/// Ordering contract, enforced by the call sites rather than by this function:
+///
+/// * REQUEST bodies are counted from the BACKEND-VISIBLE bytes, i.e. after
+///   `apply_request_body_plugins_with_context` has run, because that is where
+///   the `grpc_web` plugin base64-decodes text mode and splits off the terminal
+///   gRPC-Web trailer frame.
+/// * RESPONSE bodies are counted from the BACKEND-PRODUCED bytes, i.e. before
+///   any gRPC-Web re-encoding appends a trailer frame or base64-armours the
+///   stream.
+///
+/// Both directions therefore describe the native gRPC representation exchanged
+/// with the backend, and `fetch_max` keeps retried/replayed buffers idempotent.
+pub fn record_native_grpc_message_count(
+    metadata: &HashMap<String, String>,
+    counter: &AtomicU64,
+    body: &[u8],
+) {
+    if metadata_observes_grpc_messages(metadata) {
+        record_complete_grpc_message_count(counter, body);
+    }
 }
 
 pub fn mesh_label_fragment(key: &MeshRequestKey, le: Option<&str>) -> String {

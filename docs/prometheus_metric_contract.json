@@ -1604,7 +1604,7 @@
   {
     "name": "ferrum_mesh_bpf_tcp_events_total",
     "type": "counter",
-    "help": "TCP-layer events captured by the BPF SOCK_OPS program. event=\"rst\" counts abnormal ESTABLISHED→CLOSE transitions without sent/received attribution (SOCK_OPS state callbacks cannot distinguish direction).",
+    "help": "TCP-layer events captured by the BPF SOCK_OPS program. event=\"rst\" counts abnormal ESTABLISHED\u2192CLOSE transitions without sent/received attribution (SOCK_OPS state callbacks cannot distinguish direction).",
     "labels": [
       "event"
     ],
@@ -1966,6 +1966,33 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_request_bytes",
+    "type": "histogram",
+    "help": "Mesh HTTP/gRPC request body size in bytes.",
+    "labels": [
+      "source_workload",
+      "source_namespace",
+      "source_principal",
+      "source_app",
+      "source_service",
+      "destination_workload",
+      "destination_namespace",
+      "destination_principal",
+      "destination_app",
+      "destination_service",
+      "request_protocol",
+      "response_code",
+      "response_flags",
+      "connection_security_policy",
+      "gateway_namespace",
+      "le"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_request_duration_ms",
     "type": "histogram",
     "help": "Mesh request duration in milliseconds.",
@@ -1993,6 +2020,32 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_request_messages_total",
+    "type": "counter",
+    "help": "Mesh gRPC request messages.",
+    "labels": [
+      "source_workload",
+      "source_namespace",
+      "source_principal",
+      "source_app",
+      "source_service",
+      "destination_workload",
+      "destination_namespace",
+      "destination_principal",
+      "destination_app",
+      "destination_service",
+      "request_protocol",
+      "response_code",
+      "response_flags",
+      "connection_security_policy",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_requests_total",
     "type": "counter",
     "help": "Mesh requests by Istio/GAMMA identity labels.",
@@ -2016,6 +2069,59 @@
     "subsystem": "mesh",
     "export_surface": "/metrics",
     "bundled": "alert_and_dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_response_bytes",
+    "type": "histogram",
+    "help": "Mesh HTTP/gRPC response body size in bytes.",
+    "labels": [
+      "source_workload",
+      "source_namespace",
+      "source_principal",
+      "source_app",
+      "source_service",
+      "destination_workload",
+      "destination_namespace",
+      "destination_principal",
+      "destination_app",
+      "destination_service",
+      "request_protocol",
+      "response_code",
+      "response_flags",
+      "connection_security_policy",
+      "gateway_namespace",
+      "le"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_response_messages_total",
+    "type": "counter",
+    "help": "Mesh gRPC response messages.",
+    "labels": [
+      "source_workload",
+      "source_namespace",
+      "source_principal",
+      "source_app",
+      "source_service",
+      "destination_workload",
+      "destination_namespace",
+      "destination_principal",
+      "destination_app",
+      "destination_service",
+      "request_protocol",
+      "response_code",
+      "response_flags",
+      "connection_security_policy",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
     "emission": "conditional"
   },
   {
@@ -2058,6 +2164,56 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_tcp_connections_closed_total",
+    "type": "counter",
+    "help": "Mesh TCP connections closed.",
+    "labels": [
+      "source_workload",
+      "source_namespace",
+      "source_principal",
+      "source_app",
+      "source_service",
+      "destination_workload",
+      "destination_namespace",
+      "destination_principal",
+      "destination_app",
+      "destination_service",
+      "request_protocol",
+      "response_flags",
+      "connection_security_policy",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_tcp_connections_opened_total",
+    "type": "counter",
+    "help": "Mesh TCP connections opened.",
+    "labels": [
+      "source_workload",
+      "source_namespace",
+      "source_principal",
+      "source_app",
+      "source_service",
+      "destination_workload",
+      "destination_namespace",
+      "destination_principal",
+      "destination_app",
+      "destination_service",
+      "request_protocol",
+      "response_flags",
+      "connection_security_policy",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_tcp_egress_connections_total",
     "type": "counter",
     "help": "Raw-TCP mesh egress relay connections by transport and outcome.",
@@ -2065,6 +2221,56 @@
       "transport",
       "result",
       "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_tcp_received_bytes_total",
+    "type": "counter",
+    "help": "Mesh TCP request bytes received client->backend on closed connections.",
+    "labels": [
+      "source_workload",
+      "source_namespace",
+      "source_principal",
+      "source_app",
+      "source_service",
+      "destination_workload",
+      "destination_namespace",
+      "destination_principal",
+      "destination_app",
+      "destination_service",
+      "request_protocol",
+      "response_flags",
+      "connection_security_policy",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_tcp_sent_bytes_total",
+    "type": "counter",
+    "help": "Mesh TCP response bytes sent backend->client on closed connections.",
+    "labels": [
+      "source_workload",
+      "source_namespace",
+      "source_principal",
+      "source_app",
+      "source_service",
+      "destination_workload",
+      "destination_namespace",
+      "destination_principal",
+      "destination_app",
+      "destination_service",
+      "request_protocol",
+      "response_flags",
+      "connection_security_policy",
+      "gateway_namespace"
     ],
     "subsystem": "mesh",
     "export_surface": "/metrics",
@@ -2590,7 +2796,7 @@
   {
     "name": "ferrum_request_mirror_request_failures_total",
     "type": "counter",
-    "help": "request_mirror pre-response transport failures (DNS, refused, reset, TLS, …).",
+    "help": "request_mirror pre-response transport failures (DNS, refused, reset, TLS, \u2026).",
     "labels": [
       "namespace"
     ],

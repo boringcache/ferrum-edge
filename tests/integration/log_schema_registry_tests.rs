@@ -57,6 +57,8 @@ fn fully_populated_http() -> TransactionSummary {
         body_completed: true,
         bytes_sent: 100,
         bytes_received: 200,
+        grpc_request_messages: 0,
+        grpc_response_messages: 0,
         mirror: true,
         metadata: HashMap::from([
             ("trace_id".to_string(), "abc".to_string()),

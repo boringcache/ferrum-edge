@@ -660,6 +660,8 @@ mod tests {
             response_status_code: 200,
             latency_total_ms: 12.5,
             bytes_received: 1024,
+            grpc_request_messages: 0,
+            grpc_response_messages: 0,
             metadata: HashMap::from([
                 ("trace_id".to_string(), "abc-123".to_string()),
                 ("authorization".to_string(), "Bearer secret".to_string()),
