@@ -3985,6 +3985,7 @@ mod tests {
             allowed_ws_origins: vec![],
             udp_max_response_amplification_factor: None,
             stream_proxy_protocol: None,
+            backend_proxy_protocol: None,
             stream_match: None,
             compiled_stream_match: None,
             created_at: Utc::now(),

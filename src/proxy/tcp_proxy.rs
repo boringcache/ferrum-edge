@@ -1607,7 +1607,8 @@ async fn run_tcp_accept_loop(
                         .unwrap_or(false);
 
                     // `client_ip` will be overwritten if PROXY protocol supplies a forwarded addr.
-                    let client_ip = if proxy_protocol_enabled {
+                    // `client_port` tracks the matching TCP port (forwarded src port, or peer).
+                    let (client_ip, client_port) = if proxy_protocol_enabled {
                         let peer_addr = remote_addr;
                         let peer_ip = peer_addr.ip();
                         // Only honor the PROXY header when the LB's IP is in FERRUM_TRUSTED_PROXIES.
@@ -1627,11 +1628,20 @@ async fn run_tcp_accept_loop(
                         .await
                         {
                             Ok(result) => {
+                                let forwarded_port = match &result {
+                                    crate::proxy::proxy_protocol::ProxyProtocolResult::Forwarded {
+                                        src,
+                                        ..
+                                    } => src.port(),
+                                    crate::proxy::proxy_protocol::ProxyProtocolResult::NoAddress => {
+                                        peer_addr.port()
+                                    }
+                                };
                                 let (resolved, _direct) =
                                     crate::proxy::proxy_protocol::apply_proxy_result(
                                         result, &peer_addr,
                                     );
-                                resolved
+                                (resolved, forwarded_port)
                             }
                             Err(e) => {
                                 crate::proxy::proxy_protocol::warn_invalid_proxy_header(
@@ -1643,7 +1653,7 @@ async fn run_tcp_accept_loop(
                             }
                         }
                     } else {
-                        direct_client_ip.clone()
+                        (direct_client_ip.clone(), remote_addr.port())
                     };
 
                     // Node-waypoint per-pod policy scoping (parity with the
@@ -1696,6 +1706,7 @@ async fn run_tcp_accept_loop(
                     // identity; the disconnect path below reads it back so
                     // plugin/lifecycle lookups stay on the right tenant.
                     stream_ctx.proxy_namespace = proxy_namespace.to_string();
+                    stream_ctx.client_port = client_port;
                     stream_ctx.proxy_lifecycle_generation = base_proxy.and_then(|p| {
                         epoch
                             .plugin_cache
@@ -2008,6 +2019,9 @@ struct TcpConnParams {
     /// retries. This is independent from `lb_port_lane`: a passive-health-only
     /// port override must scope ejection caps without changing LB lane selection.
     health_port_scope: Option<u16>,
+    /// When `Some(V2)`, prepend a PROXY protocol v2 header on the backend
+    /// TCP socket immediately after connect (before TLS handshake / relay).
+    backend_proxy_protocol: Option<crate::config::types::BackendProxyProtocol>,
 }
 
 /// Lightweight snapshot of the proxy fields needed per TCP connection.
@@ -2453,6 +2467,10 @@ async fn handle_tcp_connection_inner(
         None
     };
 
+    // Capture before TLS wrap / relay move so outbound PROXY v2 can fall back
+    // to the listener address when SO_ORIGINAL_DST is unavailable.
+    let client_local_addr = client_stream.local_addr().ok();
+
     // --- Shared-port proxy resolution (SNI and/or L4 stream_match) ---
     // When multiple proxies share a listen_port, candidates arrive in
     // `sni_proxy_ids`. Passthrough groups peek SNI then apply stream_match;
@@ -2659,6 +2677,7 @@ async fn handle_tcp_connection_inner(
             dispatch_port_overrides: proxy.dispatch_port_overrides.clone(),
             lb_port_lane,
             health_port_scope,
+            backend_proxy_protocol: proxy.backend_proxy_protocol,
         };
 
         (params, cb_info)
@@ -2893,7 +2912,7 @@ async fn handle_tcp_connection_inner(
 
         // Connect plain TCP to backend (no TLS origination — the client's encrypted
         // stream passes through directly to the backend which terminates TLS).
-        let (backend_stream, addr) = crate::dns::connect_candidates(
+        let (mut backend_stream, addr) = crate::dns::connect_candidates(
             &candidates,
             params.backend_port,
             connect_timeout,
@@ -2931,6 +2950,17 @@ async fn handle_tcp_connection_inner(
             &backend_stream,
             passthrough_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
         );
+
+        // Outbound PROXY v2 must precede every relayed byte — including the
+        // client's encrypted ClientHello on the splice/kTLS-free passthrough
+        // fast path — so write it before handing the sockets to the kernel.
+        if let Some(header) = resolve_outbound_proxy_v2_header(
+            params.backend_proxy_protocol,
+            stream_ctx,
+            client_local_addr,
+        )? {
+            write_outbound_proxy_v2_header(&mut backend_stream, &header).await?;
+        }
 
         let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
         let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
@@ -3205,6 +3235,14 @@ async fn handle_tcp_connection_inner(
     // with a different load-balanced target on each attempt. Once a backend
     // connection is established, bidirectional_copy begins and no further
     // retries are possible (bytes may have been exchanged).
+    //
+    // Resolve outbound PROXY framing once before the loop — the advertised
+    // client/destination 4-tuple does not change across connect retries.
+    let outbound_proxy_v2_header = resolve_outbound_proxy_v2_header(
+        params.backend_proxy_protocol,
+        stream_ctx,
+        client_local_addr,
+    )?;
     let can_retry = params
         .retry
         .as_ref()
@@ -3445,6 +3483,7 @@ async fn handle_tcp_connection_inner(
         // Attempt backend TCP connection (with optional TLS origination)
         let current_host_ref = current_host.as_str();
         let params_ref = &params;
+        let outbound_pp = outbound_proxy_v2_header.as_deref();
         let connect_result = crate::dns::connect_candidates(
             &candidates,
             current_port,
@@ -3460,25 +3499,29 @@ async fn handle_tcp_connection_inner(
                         overload,
                         current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
                         proxy_id,
+                        outbound_pp,
                     )
                     .await
                     .map(|stream| BackendStream::Tls(Box::new(stream)))
                 } else {
-                    connect_backend_plain(
+                    let mut stream = connect_backend_plain(
                         addr,
                         connect_timeout,
                         params_ref.tcp_fastopen_enabled,
                         overload,
                     )
-                    .await
-                    .inspect(|stream| {
-                        apply_backend_tcp_keepalive(
-                            proxy_id,
-                            stream,
-                            current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
-                        );
-                    })
-                    .map(BackendStream::Plain)
+                    .await?;
+                    apply_backend_tcp_keepalive(
+                        proxy_id,
+                        &stream,
+                        current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
+                    );
+                    // Plain backends: write PROXY before any application bytes
+                    // (including the inspected first-bytes prefix below).
+                    if let Some(header) = outbound_pp {
+                        write_outbound_proxy_v2_header(&mut stream, header).await?;
+                    }
+                    Ok(BackendStream::Plain(stream))
                 }
             },
         )
@@ -4155,6 +4198,7 @@ mod backend_target_selection_tests {
             dispatch_port_overrides: None,
             lb_port_lane: None,
             health_port_scope: None,
+            backend_proxy_protocol: None,
         }
     }
 
@@ -5559,10 +5603,18 @@ async fn connect_backend_tls_cached(
     overload: &crate::overload::OverloadState,
     keepalive: Option<&crate::config::types::TcpKeepaliveCfg>,
     proxy_id: &str,
+    outbound_proxy_v2_header: Option<&[u8]>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, anyhow::Error> {
     let connect_started = Instant::now();
-    let tcp_stream = connect_backend_plain(addr, connect_timeout, tcp_fastopen, overload).await?;
+    let mut tcp_stream = connect_backend_plain(addr, connect_timeout, tcp_fastopen, overload).await?;
     apply_backend_tcp_keepalive(proxy_id, &tcp_stream, keepalive);
+
+    // PROXY protocol is TCP-borne framing that precedes the TLS handshake
+    // (HAProxy / nginx `send-proxy-v2` semantics). Write it on the raw socket
+    // before rustls starts the ClientHello.
+    if let Some(header) = outbound_proxy_v2_header {
+        write_outbound_proxy_v2_header(&mut tcp_stream, header).await?;
+    }
 
     let tls_config = cached_tls
         .map(|c| c.config.clone())
@@ -5608,6 +5660,62 @@ async fn connect_backend_tls_cached(
         })?;
 
     Ok(tls_stream)
+}
+
+/// Build an outbound PROXY protocol v2 header for the trusted stream identity,
+/// or `None` when the feature is disabled. Fails closed when enabled but the
+/// client/destination addresses cannot be resolved — inventing addresses would
+/// mislead backend IP allowlists and audit logs.
+fn resolve_outbound_proxy_v2_header(
+    enabled: Option<crate::config::types::BackendProxyProtocol>,
+    stream_ctx: &StreamConnectionContext,
+    client_local_addr: Option<SocketAddr>,
+) -> Result<Option<Vec<u8>>, anyhow::Error> {
+    match enabled {
+        None => Ok(None),
+        Some(crate::config::types::BackendProxyProtocol::V2) => {
+            let client_ip = stream_ctx.canonical_client_ip().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "outbound PROXY v2 enabled but client_ip {:?} is not a valid IP",
+                    stream_ctx.client_ip
+                )
+            })?;
+            if stream_ctx.client_port == 0 {
+                return Err(anyhow::anyhow!(
+                    "outbound PROXY v2 enabled but client_port is unset"
+                ));
+            }
+            let (src, dst) = crate::proxy::proxy_protocol::outbound_v2_addrs(
+                client_ip,
+                stream_ctx.client_port,
+                stream_ctx.destination_ip,
+                stream_ctx.listen_port,
+                client_local_addr,
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "outbound PROXY v2 enabled but destination address is unavailable"
+                )
+            })?;
+            Ok(Some(crate::proxy::proxy_protocol::encode_v2_proxy_header(
+                src, dst,
+            )))
+        }
+    }
+}
+
+async fn write_outbound_proxy_v2_header(
+    stream: &mut TcpStream,
+    header: &[u8],
+) -> Result<(), anyhow::Error> {
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(header).await.map_err(|e| {
+        anyhow::anyhow!("failed writing outbound PROXY protocol v2 header to backend: {e}")
+    })?;
+    stream.flush().await.map_err(|e| {
+        anyhow::anyhow!("failed flushing outbound PROXY protocol v2 header to backend: {e}")
+    })?;
+    Ok(())
 }
 
 /// How long to wait for the opposite direction to drain after the first half

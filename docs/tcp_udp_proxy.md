@@ -555,7 +555,45 @@ This mirrors the HTTP-path semantics of `X-Forwarded-For` + `FERRUM_TRUSTED_PROX
 - **TCP and TCP+TLS only.** PROXY protocol is a TCP-borne framing; it cannot be used on `udp` or `dtls` proxies. Setting `stream_proxy_protocol: true` on a non-TCP proxy produces a validation error.
 - **Shared (SNI-passthrough) ports must agree.** The PROXY header is read from the raw stream before the TLS ClientHello, so SNI-based proxy resolution has not happened yet — the accept loop applies one per-listener decision. Every passthrough proxy sharing a `listen_port` must set the same `stream_proxy_protocol` value; mixing is a validation error.
 - **Not supported on mesh inbound relay paths.** Mesh tunnel peers (Sidecar mTLS, Ambient HBONE) carry cryptographic peer identity rather than PROXY headers; mesh inbound TCP relay never reads PROXY protocol headers.
-- **No outbound PROXY protocol.** Ferrum currently does not prepend PROXY headers to backend connections (outbound PROXY protocol support is a future enhancement).
+
+## Outbound PROXY Protocol
+
+Ferrum can prepend a [PROXY protocol v2](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) binary header on backend TCP connects so L4 backends (PostgreSQL, MySQL, Redis, MQTT, custom TCP) see the originating client identity instead of the gateway egress IP. HTTP paths already have `X-Forwarded-For` / `Forwarded`; this is the L4 equivalent.
+
+### Enabling outbound PROXY
+
+Set `backend_proxy_protocol: v2` on any `tcp` or `tcp_tls` proxy:
+
+```yaml
+proxies:
+  - id: db-proxy
+    name: Postgres
+    backend_scheme: tcp
+    listen_port: 5432
+    targets:
+      - host: db.internal
+        port: 5432
+    backend_proxy_protocol: v2   # prepend PROXY v2 on every backend connect
+```
+
+The header is written **immediately after** the backend TCP connect and **before** any relayed application bytes — including before backend TLS handshake when originating TLS, and before splice/kTLS engagement on the Linux fast paths. Passthrough proxies are supported: the PROXY header precedes the client's encrypted ClientHello on the wire.
+
+### Address selection
+
+| Field | Value |
+|-------|-------|
+| Source IP / port | Trusted stream `client_ip` + port (after inbound PROXY trust gating when enabled; otherwise the accept-time socket peer) |
+| Destination IP / port | Original destination when known (`SO_ORIGINAL_DST` / capture metadata), otherwise the listener local address; port is the stream `listen_port` |
+
+IPv4 pairs encode as `AF_INET`; mixed or IPv6 pairs encode as `AF_INET6` (IPv4 addresses are promoted to IPv4-mapped form). There are no TLVs.
+
+Outbound PROXY can be combined with inbound `stream_proxy_protocol: true`: Ferrum consumes the LB's header, then re-advertises the forwarded client identity to the backend.
+
+### Limitations (outbound)
+
+- **TCP and TCP+TLS only.** Setting `backend_proxy_protocol` on `udp`, `dtls`, or HTTP proxies is a validation error. UDP outbound PROXY is intentionally out of scope (session semantics differ).
+- **Opt-in per proxy.** There is no global `FERRUM_*` default; backends that do not expect PROXY framing must leave the field unset.
+- **Fail closed.** If outbound PROXY is enabled but the client or destination address cannot be resolved, the connection is rejected rather than dialing without a header or inventing addresses.
 
 ## Validation Rules
 
@@ -564,6 +602,7 @@ This mirrors the HTTP-path semantics of `X-Forwarded-For` + `FERRUM_TRUSTED_PROX
 - `listen_port` must not conflict with gateway reserved ports — the proxy HTTP/HTTPS ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`), admin HTTP/HTTPS ports (`FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`), or CP gRPC port (`FERRUM_CP_GRPC_LISTEN_ADDR`)
 - HTTP proxies must not set `listen_port`
 - `stream_proxy_protocol` may only be set on `tcp` / `tcp_tls` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
+- `backend_proxy_protocol` may only be set on `tcp` / `tcp_tls` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - Stream proxies are excluded from the HTTP router (routed by port, not path)
 
 ### Port Availability Enforcement

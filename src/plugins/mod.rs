@@ -7044,6 +7044,13 @@ pub struct StreamConnectionContext {
     /// When PROXY protocol is disabled or the peer is not trusted, this equals
     /// `direct_client_ip` (the raw socket peer).
     pub client_ip: String,
+    /// Client TCP port paired with [`Self::client_ip`].
+    ///
+    /// When inbound PROXY protocol supplies a forwarded source address this is
+    /// the port from that header; otherwise it is the accept-time socket peer
+    /// port. Used when emitting outbound PROXY v2 headers so backends see the
+    /// same client 4-tuple Ferrum resolved for stream plugins.
+    pub client_port: u16,
     /// Immediate socket-peer IP captured at accept(), before any PROXY-protocol
     /// header is applied. For stream proxies without inbound PROXY protocol
     /// this is always equal to `client_ip`. For proxies behind a trusted L4
@@ -7190,6 +7197,9 @@ impl StreamConnectionContext {
             first_bytes_kind: None,
             destination_ip: None,
             trusted_gateway_ref: None,
+            // Callers that know the peer/forwarded port (TCP accept path) set
+            // this after construction; UDP/DTLS leave it at 0.
+            client_port: 0,
         }
     }
 

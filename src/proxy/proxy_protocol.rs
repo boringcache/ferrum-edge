@@ -1,9 +1,15 @@
-//! Inbound PROXY protocol v1 (text) and v2 (binary) parser.
+//! Inbound PROXY protocol v1 (text) and v2 (binary) parser, plus outbound
+//! PROXY protocol v2 encoder.
 //!
 //! This module parses the PROXY protocol header that a load balancer or
 //! reverse proxy prepends to each TCP connection before forwarding it. The
 //! header carries the original client address so the backend can see the real
 //! source IP rather than the LB's own IP.
+//!
+//! Outbound encoding ([`encode_v2_proxy_header`] / [`write_v2_proxy_header`])
+//! prepends the same v2 binary framing to backend TCP connections when a
+//! stream proxy opts in via `backend_proxy_protocol: v2`, so L4 backends
+//! (PostgreSQL, MySQL, Redis, …) can see the originating client identity.
 //!
 //! # Security model
 //!
@@ -18,6 +24,12 @@
 //! set. An un-trusted peer causes the connection to be closed; silently
 //! ignoring the header would mislead downstream authz plugins.
 //!
+//! Outbound PROXY is separately opt-in (`backend_proxy_protocol`). It
+//! advertises the already-trusted `client_ip` from
+//! [`crate::plugins::StreamConnectionContext`] — never an untrusted
+//! application header — so enabling it does not widen the inbound trust
+//! boundary.
+//!
 //! # Spec references
 //!
 //! - PROXY protocol v1: <https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt>
@@ -25,7 +37,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::warn;
 
 /// Outcome of parsing the PROXY protocol header from an inbound TCP stream.
@@ -504,4 +516,110 @@ pub fn warn_invalid_proxy_header(
         "Closing connection: inbound PROXY protocol is required on this listener but the \
          connection did not start with a valid PROXY header"
     );
+}
+
+// ── v2 encoder (outbound) ────────────────────────────────────────────────────
+
+/// Maximum encoded PROXY v2 header size this module emits (signature + fixed
+/// header + AF_INET6 address block). Callers may stack-allocate against this.
+pub const V2_ENCODED_MAX_LEN: usize = V2_SIG.len() + 4 + 36;
+
+/// Build source/destination socket addresses for an outbound PROXY v2 header.
+///
+/// - `client_ip` / `client_port` are the trusted stream identity (after inbound
+///   PROXY trust gating when that is enabled).
+/// - `destination_ip` is the original destination when known (`SO_ORIGINAL_DST`
+///   / capture metadata); otherwise `local_fallback` supplies the listener
+///   address the client connected to.
+/// - Destination port is always the stream proxy `listen_port`.
+///
+/// Returns `None` only when neither a destination IP nor a local fallback is
+/// available — callers must fail closed rather than invent addresses.
+pub fn outbound_v2_addrs(
+    client_ip: IpAddr,
+    client_port: u16,
+    destination_ip: Option<IpAddr>,
+    listen_port: u16,
+    local_fallback: Option<SocketAddr>,
+) -> Option<(SocketAddr, SocketAddr)> {
+    let dst_ip = match destination_ip {
+        Some(ip) => crate::util::client_identity::canonical_ip(ip),
+        None => crate::util::client_identity::canonical_ip(local_fallback?.ip()),
+    };
+    let src_ip = crate::util::client_identity::canonical_ip(client_ip);
+    Some((
+        SocketAddr::new(src_ip, client_port),
+        SocketAddr::new(dst_ip, listen_port),
+    ))
+}
+
+/// Encode a PROXY protocol v2 binary header (PROXY command, STREAM transport).
+///
+/// When `src` and `dst` share an IPv4 family (after IPv4-mapped canonicalization)
+/// the header uses `AF_INET` (28 bytes total). Mixed or IPv6 pairs are encoded
+/// as `AF_INET6`, promoting any IPv4 address to its IPv4-mapped form so a
+/// single address family is advertised (spec requirement).
+///
+/// The returned buffer never exceeds [`V2_ENCODED_MAX_LEN`] and contains no
+/// TLVs — only the fixed address block.
+pub fn encode_v2_proxy_header(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
+    let src_ip = crate::util::client_identity::canonical_ip(src.ip());
+    let dst_ip = crate::util::client_identity::canonical_ip(dst.ip());
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => {
+            encode_v2_inet(s, d, src.port(), dst.port())
+        }
+        (s, d) => encode_v2_inet6(ip_to_v6(s), ip_to_v6(d), src.port(), dst.port()),
+    }
+}
+
+fn ip_to_v6(ip: IpAddr) -> Ipv6Addr {
+    match ip {
+        IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+        IpAddr::V6(v6) => v6,
+    }
+}
+
+fn encode_v2_inet(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
+    // 12 sig + 4 fixed + 12 addr = 28
+    let mut buf = Vec::with_capacity(28);
+    buf.extend_from_slice(V2_SIG);
+    buf.push(0x21); // version=2, command=PROXY
+    buf.push(0x11); // AF_INET + STREAM
+    buf.extend_from_slice(&12u16.to_be_bytes());
+    buf.extend_from_slice(&src.octets());
+    buf.extend_from_slice(&dst.octets());
+    buf.extend_from_slice(&src_port.to_be_bytes());
+    buf.extend_from_slice(&dst_port.to_be_bytes());
+    buf
+}
+
+fn encode_v2_inet6(src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
+    // 12 sig + 4 fixed + 36 addr = 52
+    let mut buf = Vec::with_capacity(V2_ENCODED_MAX_LEN);
+    buf.extend_from_slice(V2_SIG);
+    buf.push(0x21); // version=2, command=PROXY
+    buf.push(0x21); // AF_INET6 + STREAM
+    buf.extend_from_slice(&36u16.to_be_bytes());
+    buf.extend_from_slice(&src.octets());
+    buf.extend_from_slice(&dst.octets());
+    buf.extend_from_slice(&src_port.to_be_bytes());
+    buf.extend_from_slice(&dst_port.to_be_bytes());
+    buf
+}
+
+/// Write a PROXY protocol v2 header to `writer` and flush so the first relayed
+/// application byte cannot race ahead of the framing on a coalesced write.
+pub async fn write_v2_proxy_header<W>(
+    writer: &mut W,
+    src: SocketAddr,
+    dst: SocketAddr,
+) -> Result<(), std::io::Error>
+where
+    W: AsyncWrite + Unpin,
+{
+    let header = encode_v2_proxy_header(src, dst);
+    writer.write_all(&header).await?;
+    writer.flush().await?;
+    Ok(())
 }

@@ -326,6 +326,120 @@ fn apply_result_canonicalizes_mapped_ipv4_before_stream_plugins() {
     assert_eq!(direct_ip, "10.0.0.1");
 }
 
+// ── PROXY v2 encoder (outbound) ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn encode_v2_ipv4_round_trips_through_parser() {
+    use ferrum_edge::proxy::proxy_protocol::encode_v2_proxy_header;
+    use std::net::Ipv4Addr;
+
+    let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 12345);
+    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 5432);
+    let header = encode_v2_proxy_header(src, dst);
+    assert_eq!(header.len(), 28, "AF_INET header is signature+fixed+12");
+
+    let result = parse_bytes(&header).await.expect("encoded header must parse");
+    match result {
+        ProxyProtocolResult::Forwarded {
+            src: parsed_src,
+            dst: parsed_dst,
+        } => {
+            assert_eq!(parsed_src, src);
+            assert_eq!(parsed_dst, dst);
+        }
+        ProxyProtocolResult::NoAddress => panic!("expected Forwarded"),
+    }
+}
+
+#[tokio::test]
+async fn encode_v2_ipv6_round_trips_through_parser() {
+    use ferrum_edge::proxy::proxy_protocol::encode_v2_proxy_header;
+    use std::net::Ipv6Addr;
+
+    let src = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 50000);
+    let dst = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)), 443);
+    let header = encode_v2_proxy_header(src, dst);
+    assert_eq!(header.len(), 52, "AF_INET6 header is signature+fixed+36");
+
+    let result = parse_bytes(&header).await.expect("encoded header must parse");
+    match result {
+        ProxyProtocolResult::Forwarded {
+            src: parsed_src,
+            dst: parsed_dst,
+        } => {
+            assert_eq!(parsed_src, src);
+            assert_eq!(parsed_dst, dst);
+        }
+        ProxyProtocolResult::NoAddress => panic!("expected Forwarded"),
+    }
+}
+
+#[tokio::test]
+async fn encode_v2_mixed_family_promotes_to_ipv6_mapped() {
+    use ferrum_edge::proxy::proxy_protocol::encode_v2_proxy_header;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 4000);
+    let dst = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 443);
+    let header = encode_v2_proxy_header(src, dst);
+    assert_eq!(header.len(), 52);
+
+    let result = parse_bytes(&header)
+        .await
+        .expect("mixed-family header must parse as AF_INET6");
+    match result {
+        ProxyProtocolResult::Forwarded {
+            src: parsed_src,
+            dst: parsed_dst,
+        } => {
+            assert_eq!(
+                parsed_src.ip(),
+                IpAddr::V6(Ipv4Addr::new(203, 0, 113, 10).to_ipv6_mapped())
+            );
+            assert_eq!(parsed_src.port(), 4000);
+            assert_eq!(parsed_dst, dst);
+        }
+        ProxyProtocolResult::NoAddress => panic!("expected Forwarded"),
+    }
+}
+
+#[test]
+fn outbound_v2_addrs_prefer_destination_ip_and_listen_port() {
+    use ferrum_edge::proxy::proxy_protocol::outbound_v2_addrs;
+    use std::net::Ipv4Addr;
+
+    let client = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+    let dest = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9999);
+    let (src, dst) = outbound_v2_addrs(client, 4321, Some(dest), 5432, Some(local))
+        .expect("addrs should resolve");
+    assert_eq!(src, SocketAddr::new(client, 4321));
+    assert_eq!(dst, SocketAddr::new(dest, 5432));
+}
+
+#[test]
+fn outbound_v2_addrs_fall_back_to_local_listener() {
+    use ferrum_edge::proxy::proxy_protocol::outbound_v2_addrs;
+    use std::net::Ipv4Addr;
+
+    let client = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9999);
+    let (src, dst) =
+        outbound_v2_addrs(client, 4321, None, 5432, Some(local)).expect("fallback should work");
+    assert_eq!(src.port(), 4321);
+    assert_eq!(dst.ip(), local.ip());
+    assert_eq!(dst.port(), 5432, "destination port is listen_port, not local ephemeral");
+}
+
+#[test]
+fn outbound_v2_addrs_fail_closed_without_destination() {
+    use ferrum_edge::proxy::proxy_protocol::outbound_v2_addrs;
+    use std::net::Ipv4Addr;
+
+    let client = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+    assert!(outbound_v2_addrs(client, 4321, None, 5432, None).is_none());
+}
+
 // ── Boundary size test ────────────────────────────────────────────────────────
 
 #[tokio::test]
