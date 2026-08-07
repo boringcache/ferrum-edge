@@ -111,6 +111,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fabricating samples. The metric has fixed microsecond buckets with saturating
   count/bucket counters, drops sum overflow, and adds no per-flow labels (#3309).
 - **SECURITY (`a2a_gateway`)**: `endpoint.grpc_services` now recognizes both the
+  canonical A2A 0.3 service `a2a.v1.A2AService` and A2A 1.0's
+  `lf.a2a.v1.A2AService` by default. Dropping the 1.0 identity from the defaults
+  meant a deployment that had relied on the former default silently stopped
+  applying method policy to 1.0 traffic after upgrading — an authorization
+  bypass. Both identities are now detected and policed; the two remain
+  distinct card layouts, so a 1.0 Agent Card is still never decoded as 0.3 and
+  card rewriting on the 1.0 service continues to fail closed with
+  `agent_card_grpc_schema_unsupported` (#3297).
 - Gateway API `BackendTLSPolicy` is watched and translated for Service-backed
   `HTTPRoute`/`GRPCRoute` backends (issue #3276). `validation.hostname` projects
   to upstream `backend_tls_sni`, optional `subjectAltNames` to
