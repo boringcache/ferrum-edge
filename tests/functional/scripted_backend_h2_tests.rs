@@ -3200,9 +3200,11 @@ async fn direct_h2_rejects_oversized_declared_request_under_nonzero_limits() {
         .send()
         .await
         .expect("oversized declared body must surface a gateway response");
+    // Capture the status before `text()` consumes the response.
+    let status = response.status();
     let body = response.text().await.unwrap_or_default();
     assert_eq!(
-        response.status(),
+        status,
         StatusCode::PAYLOAD_TOO_LARGE,
         "expected 413 via direct-H2 in-path request limit; body={body}"
     );
