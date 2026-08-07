@@ -23,7 +23,8 @@ FERRUM_MAX_REQUEST_BODY_SIZE_BYTES = 2048
 fn conf_file_values_honored_for_metadata_redaction_extras() {
     let conf = ConfFile::parse(ISSUE_3624_CONF).unwrap();
     let extras = parse_extras_from_resolved(
-        conf.get("FERRUM_LOG_REDACT_METADATA_KEYS").map(|s| s.to_string()),
+        conf.get("FERRUM_LOG_REDACT_METADATA_KEYS")
+            .map(|s| s.to_string()),
     );
     assert_eq!(extras, ["conf_only_redact", "tenant_marker"]);
 }
@@ -31,8 +32,7 @@ fn conf_file_values_honored_for_metadata_redaction_extras() {
 #[test]
 fn conf_file_values_honored_for_chargeback_node_id() {
     let conf = ConfFile::parse(ISSUE_3624_CONF).unwrap();
-    let node_id =
-        resolve_node_id_with_primary(conf.get("FERRUM_NODE_ID").map(|s| s.to_string()));
+    let node_id = resolve_node_id_with_primary(conf.get("FERRUM_NODE_ID").map(|s| s.to_string()));
     assert_eq!(node_id, "conf-chargeback-node");
 }
 

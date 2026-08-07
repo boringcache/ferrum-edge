@@ -89,9 +89,9 @@ fn extra_redacted_keys() -> &'static [String] {
 /// Parse the comma-separated extras env var into a normalized list.
 /// Public for tests — production callers go through the `OnceLock`.
 pub fn parse_extras_from_env() -> Vec<String> {
-    parse_extras_from_resolved(
-        crate::config::conf_file::resolve_ferrum_var("FERRUM_LOG_REDACT_METADATA_KEYS"),
-    )
+    parse_extras_from_resolved(crate::config::conf_file::resolve_ferrum_var(
+        "FERRUM_LOG_REDACT_METADATA_KEYS",
+    ))
 }
 
 /// Parse extras from an already-resolved `FERRUM_LOG_REDACT_METADATA_KEYS` value

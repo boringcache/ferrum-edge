@@ -15887,7 +15887,9 @@ pub fn new_ulid() -> String {
 }
 
 fn resolve_node_id() -> String {
-    resolve_node_id_with_primary(crate::config::conf_file::resolve_ferrum_var("FERRUM_NODE_ID"))
+    resolve_node_id_with_primary(crate::config::conf_file::resolve_ferrum_var(
+        "FERRUM_NODE_ID",
+    ))
 }
 
 /// Resolve chargeback node identity from the conf-aware `FERRUM_NODE_ID` value,
