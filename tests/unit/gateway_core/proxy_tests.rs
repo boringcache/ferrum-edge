@@ -578,6 +578,33 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
 }
 
 #[test]
+fn test_deferred_destination_override_is_rebound_before_dispatch() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let handler = source
+        .split_once("async fn handle_proxy_request_inner(")
+        .map(|(_, handler)| handler)
+        .expect("H1/H2 request handler must remain present");
+    let deferred = handler
+        .find("BackendPathBeforeProxyPass::RemainingDeferred")
+        .expect("remaining deferred pass must remain present");
+    let after_deferred = &handler[deferred..];
+    let rebind = after_deferred
+        .find("proxy = ctx.apply_route_overrides_with_upstreams(")
+        .expect("deferred destination overrides must rebind the effective proxy");
+    let rebase = after_deferred
+        .find("path = rebase_route_override_path(&mut ctx, path);")
+        .expect("deferred destination overrides must rebase the dispatch path");
+    let reselect = after_deferred
+        .find("upstream_target = backend_dispatch::concretize_wildcard_target_for_request(")
+        .expect("deferred destination overrides must replace the pinned target");
+    let backend_url = after_deferred
+        .find("let backend_url = build_backend_url_with_target(")
+        .expect("generic backend URL construction must remain present");
+
+    assert!(rebind < rebase && rebase < reselect && reselect < backend_url);
+}
+
+#[test]
 fn test_h1_h2_route_rejects_keep_websocket_precedence_and_grpc_web_headers() {
     let source = include_str!("../../../src/proxy/mod.rs");
     let handler = source

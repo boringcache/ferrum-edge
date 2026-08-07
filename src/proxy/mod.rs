@@ -25802,7 +25802,8 @@ async fn handle_proxy_request_inner(
     // downstream pool keys, capability-registry lookups, URL construction,
     // and circuit-breaker target keys all derive from the effective
     // destination (pool-poisoning invariant).
-    let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
+    let mut proxy =
+        ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
@@ -25818,7 +25819,7 @@ async fn handle_proxy_request_inner(
     // override so finalized-egress plugins can recover the selected backend
     // path while their public `ctx.path` view is temporarily restored to the
     // client path. No allocation when no rewrite is set.
-    let path = rebase_route_override_path(&mut ctx, path);
+    let mut path = rebase_route_override_path(&mut ctx, path);
 
     // Resolve upstream target and hash key from the request epoch.
     // `ctx.orig_dst` (the captured SO_ORIGINAL_DST on mesh capture listeners)
@@ -25832,8 +25833,8 @@ async fn handle_proxy_request_inner(
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
         ctx.orig_dst,
     );
-    let lb_hash_key = selection.lb_hash_key;
-    let upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
+    let mut lb_hash_key = selection.lb_hash_key;
+    let mut upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
         selection.target,
         request_host.as_deref(),
     );
@@ -26029,6 +26030,29 @@ async fn handle_proxy_request_inner(
                 return Ok(build_response_from_normalized_reject(reject));
             }
         }
+
+        // A remaining deferred hook may commit a destination only after the
+        // original backend-effective path has passed policy (for example, an
+        // AI federation streaming claim). Rebind every dispatch input before
+        // credentials installed by that hook can reach a backend. Otherwise
+        // the headers can describe the claimed provider while `proxy`, `path`,
+        // and `upstream_target` still point at the pre-claim destination.
+        proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
+        ctx.matched_proxy = Some(Arc::clone(&proxy));
+        path = rebase_route_override_path(&mut ctx, path);
+        let selection = backend_dispatch::select_upstream_target(
+            &proxy,
+            &state,
+            &epoch,
+            &ctx.client_ip,
+            owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
+            ctx.orig_dst,
+        );
+        lb_hash_key = selection.lb_hash_key;
+        upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
+            selection.target,
+            request_host.as_deref(),
+        );
     }
 
     // The effective PeerAuthentication app port is not authoritative until
