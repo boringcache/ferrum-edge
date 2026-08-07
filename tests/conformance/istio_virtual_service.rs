@@ -370,7 +370,7 @@ fn vs_tls_l4_sni_passthrough() {
         category = CATEGORY,
         feature = "spec.tls[] SNI L4 routing",
         status = Status::Supported,
-        notes = "Passthrough TCP proxy keyed by sniHosts. L4 predicates (sourceLabels/sourceSubnets/destinationSubnets/gateways/sourceNamespace) compile onto Proxy.stream_match; weighted splitting fails closed.",
+        notes = "Passthrough TCP proxy keyed by sniHosts. L4 predicates (sourceLabels/sourceSubnets/destinationSubnets/gateways/sourceNamespace) compile onto Proxy.stream_match; weighted multi-destination splits materialize an upstream-backed stream proxy.",
     );
     let result = translate_k8s_objects(
         &[virtual_service(json!({
@@ -401,7 +401,7 @@ fn vs_tcp_l4_port_routing() {
         category = CATEGORY,
         feature = "spec.tcp[] L4 routing",
         status = Status::Supported,
-        notes = "Plain TCP proxy keyed by listen_port. L4 predicates (sourceLabels/sourceSubnets/destinationSubnets/gateways/sourceNamespace) compile onto Proxy.stream_match; weighted splitting fails closed.",
+        notes = "Plain TCP proxy keyed by listen_port. L4 predicates (sourceLabels/sourceSubnets/destinationSubnets/gateways/sourceNamespace) compile onto Proxy.stream_match; weighted multi-destination splits materialize an upstream-backed stream proxy.",
     );
     let result = translate_k8s_objects(
         &[virtual_service(json!({
@@ -423,6 +423,51 @@ fn vs_tcp_l4_port_routing() {
     assert!(!proxy.passthrough, "plain tcp[] is not passthrough");
     assert_eq!(proxy.backend_host, "mysql.default.svc.cluster.local");
     assert_eq!(proxy.backend_port, 3306);
+}
+
+/// VS `tcp[]` weighted multi-destination splits materialize an upstream-backed
+/// stream proxy with relative WRR weights.
+#[test]
+fn vs_tcp_l4_weighted_multi_destination() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "spec.tcp[]/tls[] weighted multi-destination",
+        status = Status::Supported,
+        notes = "Weighted L4 routes materialize istio-vs-l4-upstream-* with WRR; zero-weight legs skipped; all-zero splits materialize a fail-closed blackhole backend; invalid weights/subset/missing ports fail closed; upstreams ride MeshSlice for reload/delete.",
+    );
+    let result = translate_k8s_objects(
+        &[virtual_service(json!({
+            "hosts": ["db.example.com"],
+            "tcp": [{
+                "match": [{"port": 3306}],
+                "route": [
+                    {"destination": {"host": "mysql-v1.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 80},
+                    {"destination": {"host": "mysql-v2.default.svc.cluster.local", "port": {"number": 3306}}, "weight": 20}
+                ]
+            }]
+        }))],
+        options(),
+    )
+    .expect("weighted tcp[] L4 translates");
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_port == Some(3306))
+        .expect("tcp[] materializes a stream proxy");
+    let upstream = result
+        .config
+        .upstreams
+        .iter()
+        .find(|u| proxy.upstream_id.as_deref() == Some(u.id.as_str()))
+        .expect("weighted L4 upstream");
+    assert_eq!(upstream.targets.len(), 2);
+    assert_eq!(upstream.targets[0].weight, 80);
+    assert_eq!(upstream.targets[1].weight, 20);
+    assert_eq!(
+        upstream.algorithm,
+        ferrum_edge::config::types::LoadBalancerAlgorithm::WeightedRoundRobin
+    );
 }
 
 /// VS `tcp[]`/`tls[]` L4 match predicates compile onto `Proxy.stream_match`

@@ -329,7 +329,7 @@ injector:
 
 ## Liveness and Readiness Probes
 
-Ferrum Edge serves unauthenticated `/health` and `/status` on the admin listener. The response includes `status`, `mode`, `database`, `cached_config`, and `admin_writes_enabled`.
+Ferrum Edge serves unauthenticated `/health` and `/status` on the admin listener. That coarse response includes only `status` and `ready`. Authenticated detail (admin JWT, metrics bearer token, or an allowed metrics CIDR) additionally includes fields such as `mode`, `database`, `cached_config`, and `admin_writes_enabled`.
 
 Important behavior:
 
@@ -398,7 +398,7 @@ readinessProbe:
   periodSeconds: 10
 ```
 
-`proxy_count` is reported inside `cached_config` in the `/health` JSON response, not as a top-level field.
+In authenticated `/health` detail, `proxy_count` is reported inside `cached_config`, not as a top-level field. It is not exposed to unauthenticated probes.
 
 If you enable admin TLS and want probes over HTTPS, point the probe at `9443` with `scheme: HTTPS`:
 

@@ -96,6 +96,10 @@ pub struct ProxyBody {
     /// coalescing overlap — matches the design rule preserved from the
     /// original deferred-log investigation.
     bytes_streamed: AtomicU64,
+    /// Optional gRPC length-prefixed response message counter shared with
+    /// `RequestContext.grpc_response_messages_observed`.
+    grpc_messages: Option<Arc<AtomicU64>>,
+    grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
     /// Treat Drop after exactly this many yielded response-body DATA bytes as a
     /// successful backend body completion instead of a client disconnect. Used
     /// for native H3 responses with a trusted `Content-Length` on an HTTP/1.x
@@ -542,6 +546,8 @@ impl ProxyBody {
             grpc_web_terminal_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
+            grpc_messages: None,
+            grpc_scanner: None,
             success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
             _held_frontend_grpc_upload: None,
@@ -568,6 +574,8 @@ impl ProxyBody {
             grpc_web_terminal_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
+            grpc_messages: None,
+            grpc_scanner: None,
             success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
             _held_frontend_grpc_upload: None,
@@ -894,6 +902,14 @@ impl ProxyBody {
         self
     }
 
+    /// Enable authoritative gRPC length-prefixed response message counting.
+    pub fn with_grpc_message_counter(mut self, messages: Arc<AtomicU64>) -> Self {
+        self.grpc_messages = Some(messages);
+        self.grpc_scanner =
+            Some(crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default());
+        self
+    }
+
     /// Detach the deferred logger so the caller can fire it explicitly with a
     /// specific outcome. Used on response-builder failure paths where dropping
     /// the body would otherwise be misclassified as a client disconnect.
@@ -931,6 +947,8 @@ impl ProxyBody {
             grpc_web_terminal_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
+            grpc_messages: None,
+            grpc_scanner: None,
             success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
             _held_frontend_grpc_upload: None,
@@ -1178,6 +1196,14 @@ impl http_body::Body for ProxyBody {
                     client_deadline_fired && frame.data_ref().is_some();
                 let is_grpc_web_streaming_terminal =
                     grpc_web_terminal_status.is_some() && frame.data_ref().is_some();
+                if !is_grpc_web_deadline_terminal
+                    && !is_grpc_web_streaming_terminal
+                    && let (Some(messages), Some(scanner)) =
+                        (this.grpc_messages.as_ref(), this.grpc_scanner.as_mut())
+                    && let Some(data) = frame.data_ref()
+                {
+                    scanner.push(data, messages);
+                }
                 let grpc_status = frame
                     .trailers_ref()
                     .and_then(|trailers| trailers.get("grpc-status"))
@@ -1582,6 +1608,10 @@ pub struct SizeLimitedIncoming {
     /// from here: the `h2::SendStream` that could do it is owned by hyper's
     /// detached task and never exposed.
     cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Optional gRPC length-prefixed request message counter shared with
+    /// `RequestContext.grpc_request_messages_observed`.
+    grpc_messages: Option<Arc<AtomicU64>>,
+    grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
 }
 
 /// Outcome to report when the adapter is dropped without having reached a
@@ -1654,6 +1684,8 @@ impl SizeLimitedIncoming {
             exceeded,
             completion: None,
             cancel: None,
+            grpc_messages: None,
+            grpc_scanner: None,
         }
     }
 
@@ -1680,6 +1712,8 @@ impl SizeLimitedIncoming {
             exceeded,
             completion: Some(completion),
             cancel: Some(cancel),
+            grpc_messages: None,
+            grpc_scanner: None,
         }
     }
 
@@ -1694,6 +1728,17 @@ impl SizeLimitedIncoming {
     #[must_use]
     pub fn with_cancel(mut self, cancel: tokio::sync::oneshot::Receiver<()>) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Enable authoritative gRPC length-prefixed message counting while
+    /// streaming the request body under a size limit. Incomplete trailing
+    /// frames are ignored. Hostile declared lengths never allocate.
+    #[must_use]
+    pub fn with_grpc_message_counter(mut self, messages: Arc<AtomicU64>) -> Self {
+        self.grpc_messages = Some(messages);
+        self.grpc_scanner =
+            Some(crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default());
         self
     }
 
@@ -1842,6 +1887,11 @@ impl http_body::Body for SizeLimitedIncoming {
                         this.signal_completion(RequestBodyOutcome::Exceeded);
                         return Poll::Ready(Some(Err("request body exceeds maximum size".into())));
                     }
+                    if let (Some(messages), Some(scanner)) =
+                        (this.grpc_messages.as_ref(), this.grpc_scanner.as_mut())
+                    {
+                        scanner.push(data, messages);
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -1886,6 +1936,8 @@ impl http_body::Body for SizeLimitedIncoming {
 pub struct CountingIncoming {
     inner: Incoming,
     bytes_seen: Arc<std::sync::atomic::AtomicU64>,
+    grpc_messages: Option<Arc<std::sync::atomic::AtomicU64>>,
+    grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
 }
 
 impl CountingIncoming {
@@ -1916,7 +1968,21 @@ impl CountingIncoming {
         Self {
             inner: incoming,
             bytes_seen,
+            grpc_messages: None,
+            grpc_scanner: None,
         }
+    }
+
+    /// Enable authoritative gRPC length-prefixed message counting while
+    /// streaming the request body. Incomplete trailing frames are ignored.
+    pub fn with_grpc_message_counter(
+        mut self,
+        messages: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.grpc_messages = Some(messages);
+        self.grpc_scanner =
+            Some(crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default());
+        self
     }
 
     /// Clone the internal byte counter so the caller can observe `bytes_seen`
@@ -1964,6 +2030,11 @@ impl http_body::Body for CountingIncoming {
                     // may poll the body vs read the handle.
                     this.bytes_seen
                         .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Release);
+                    if let (Some(messages), Some(scanner)) =
+                        (this.grpc_messages.as_ref(), this.grpc_scanner.as_mut())
+                    {
+                        scanner.push(data, messages);
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }

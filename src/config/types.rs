@@ -597,13 +597,27 @@ pub struct UpstreamPortOverride {
     /// of N×cap (equivalent to Envoy's per-cluster total for a single-host
     /// destination).
     ///
-    /// The pooled, multiplexed HTTP-family transports (reqwest H1/H2, direct
-    /// H2, gRPC, HTTP/3, HBONE) do **not** enforce this field: their backend
-    /// connections are created and reused inside connection pools, so "open a
-    /// new backend connection" is decoupled from the request hot path by pool
-    /// reuse, sharding, and idle eviction, and a request-keyed counter would
-    /// measure request concurrency rather than open connections. See
-    /// `docs/mesh.md` and `src/backend_conn_limit.rs` for the rationale.
+    /// The pooled, multiplexed HTTP-family transports (direct H2, gRPC,
+    /// HTTP/3, HBONE, mesh-mTLS) enforce it too: each acquires a shared RAII
+    /// slot at the moment a new physical connection is constructed and hands it
+    /// to that connection's driver, so the count tracks open sockets — never
+    /// request concurrency — and unlimited multiplexed streams still ride one
+    /// admitted connection.
+    ///
+    /// The reqwest transports (HTTP/1.1 **and** ALPN-negotiated HTTP/2) are
+    /// admitted the same way, inside reqwest's own connector — the one place a
+    /// NEW physical socket is dialed — through the vendored
+    /// `ClientBuilder::connection_admission` hook
+    /// (`docs/upstream-reqwest-patches/003-connection-admission-hook/`). A
+    /// checkout that reuses an idle pooled socket, and an HTTP/2 stream
+    /// multiplexed onto an open connection, never reach the connector and so
+    /// take no slot. The admitted token is owned by the connection object, so
+    /// the slot is released exactly when that socket closes — including while
+    /// reqwest keeps it idle after the request that opened it has finished.
+    /// This is a physical-connection bound on both reqwest protocols; it is NOT
+    /// a request-lifetime slot (which would read zero while sockets stayed open)
+    /// and NOT a stream counter. See `docs/mesh.md` and
+    /// `src/backend_conn_limit.rs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<u32>,
     /// Per-port TCP keepalive overrides, mapped from DestinationRule
@@ -748,6 +762,21 @@ pub struct ResolvedPortOverride {
     pub h2_upgrade_policy: Option<H2UpgradePolicy>,
     pub max_retries: Option<u32>,
     pub http1_max_pending_requests: Option<u32>,
+    /// DestinationRule policy port this entry was resolved from, recorded ONLY
+    /// on the per-dispatch clone built by
+    /// `resolve_backend_connection_proxy_for_target` when a Kubernetes
+    /// `targetPort` remap mirrored a service-port policy onto the dial port.
+    ///
+    /// The socket-owning HTTP pools read `dispatch_port_overrides` by
+    /// `proxy.backend_port` (the dial port), so without this they could not
+    /// recover the service port the policy actually belongs to. It is the
+    /// `connectionPool.tcp.maxConnections` counter-lane key, keeping a pooled
+    /// socket and a WebSocket/raw-TCP session to the same destination on ONE
+    /// ceiling. `None` (the common case) means the lookup port already IS the
+    /// policy port. Never set by `from_upstream_override`, never serialized,
+    /// and deliberately excluded from `is_empty()` because it carries no policy
+    /// of its own.
+    pub policy_port: Option<u16>,
 }
 
 impl ResolvedPortOverride {
@@ -771,6 +800,9 @@ impl ResolvedPortOverride {
             h2_upgrade_policy: value.h2_upgrade_policy,
             max_retries: value.max_retries,
             http1_max_pending_requests: value.http1_max_pending_requests,
+            // Per-dispatch derived state only; a projected upstream override is
+            // always keyed by the policy port it came from.
+            policy_port: None,
         };
         (!resolved.is_empty()).then_some(resolved)
     }

@@ -102,6 +102,39 @@
       ]
     },
     {
+      "id": "reqwest-003-connection-admission-hook",
+      "label": "reqwest physical-connection admission hook",
+      "crate": "reqwest",
+      "vendored_version": "0.13.3",
+      "vendor_path": "vendor/reqwest-0.13.3-ferrum-patched",
+      "docs_path": "docs/upstream-reqwest-patches/003-connection-admission-hook/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "DestinationRule connectionPool.tcp.maxConnections is a physical-connection ceiling. reqwest owns its socket pool internally and exposes no connection-lifetime hook: connector_layer sees an opaque Unnameable request and a sealed Conn response, so no public API can admit a new socket and release the slot when that socket closes.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "seanmonstar/reqwest",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Reqwest exposes a connection-lifecycle/admission hook, or un-seals the connector connection type so a connector_layer can own a drop guard for the connection's lifetime.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/integration/mesh_destination_rule_connection_pool_audit_tests.rs::sequential_requests_never_exceed_the_cap_while_a_socket_sits_idle",
+        "tests/integration/mesh_destination_rule_connection_pool_audit_tests.rs::cap_exhaustion_refuses_the_second_physical_dial",
+        "tests/integration/mesh_destination_rule_connection_pool_audit_tests.rs::distinct_reqwest_pool_keys_share_one_destination_ceiling",
+        "tests/integration/mesh_destination_rule_connection_pool_audit_tests.rs::h2_streams_multiplex_without_consuming_extra_slots"
+      ]
+    },
+    {
       "id": "h3-001-recv-frame-drain-on-quic-close",
       "label": "h3 frame-drain on QUIC close",
       "crate": "h3",
