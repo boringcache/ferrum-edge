@@ -70,7 +70,11 @@ fn env_still_overrides_conf_for_metadata_redaction_extras() {
 /// naive one-line `contains`. The property under test is which *call* is made,
 /// not how it is wrapped.
 fn squeeze(source: &str) -> String {
-    source.chars().filter(|c| !c.is_whitespace()).collect()
+    let stripped: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    // rustfmt also inserts a trailing comma when it breaks a call across lines,
+    // so `f("X")` becomes `f(\n    "X",\n)` -> `f("X",)`. Drop that comma too,
+    // or the needle never matches the reflowed source.
+    stripped.replace(",)", ")")
 }
 
 #[test]
