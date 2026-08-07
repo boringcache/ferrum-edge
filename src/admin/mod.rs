@@ -701,6 +701,10 @@ fn note_read_only_rejection() {
     );
 }
 
+// Consumed only by the external `tests/` crates. `src/lib.rs` and `src/main.rs`
+// both declare the full module tree, so in the BIN target this has no caller and
+// `-D warnings` would reject it as dead code.
+#[allow(dead_code)]
 #[doc(hidden)]
 pub fn reset_read_only_rejection_observability_for_test() {
     READ_ONLY_REJECTION_LOG_COUNT.store(0, Ordering::Relaxed);

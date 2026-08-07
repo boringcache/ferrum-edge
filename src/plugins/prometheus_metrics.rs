@@ -916,6 +916,8 @@ impl MetricsRegistry {
         previous
     }
 
+    // Test-crate-only; dead code in the BIN target (see `src/admin/mod.rs`).
+    #[allow(dead_code)]
     #[doc(hidden)]
     pub fn reset_admin_read_only_rejection_metrics_for_test(&self) {
         self.admin_read_only_rejected_mutations
@@ -923,6 +925,8 @@ impl MetricsRegistry {
         self.maybe_invalidate_cache();
     }
 
+    // Test-crate-only; dead code in the BIN target.
+    #[allow(dead_code)]
     pub fn admin_read_only_rejected_mutations_total(&self) -> u64 {
         self.admin_read_only_rejected_mutations
             .load(Ordering::Relaxed)
