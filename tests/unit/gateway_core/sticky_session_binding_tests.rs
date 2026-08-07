@@ -198,6 +198,53 @@ fn predictable_route_and_backend_metadata_cannot_forge_a_binding() {
 }
 
 #[test]
+fn a_reload_keeps_outstanding_bindings_resolvable() {
+    let pinned = target("10.1.0.10", 8080);
+    let targets = vec![pinned.clone(), target("10.1.0.11", 8080)];
+    let cache = cache_for(sticky_upstream(targets.clone()));
+    let token = token_for(NAMESPACE, UPSTREAM_ID, &pinned);
+
+    assert!(
+        LoadBalancerCache::select_sticky_from(
+            &cache.load(),
+            NAMESPACE,
+            UPSTREAM_ID,
+            &token,
+            None,
+            None,
+            None,
+        )
+        .is_some(),
+        "the freshly minted binding must resolve before the reload"
+    );
+
+    // The authentication key is process-local, NOT per-balancer. A reload
+    // rebuilds every binding index from the configured targets, and those
+    // indexes must still be keyed by the tokens clients are already holding.
+    // Were the key re-derived per build, every outstanding session would miss,
+    // fall back to ordinary selection, and be handed a fresh cookie on every
+    // response — the reissue churn that mint/index disagreement produces.
+    cache.rebuild(&GatewayConfig {
+        upstreams: vec![sticky_upstream(targets)],
+        ..GatewayConfig::default()
+    });
+
+    let after = cache.load();
+    let bound = LoadBalancerCache::select_sticky_from(
+        &after,
+        NAMESPACE,
+        UPSTREAM_ID,
+        &token,
+        None,
+        None,
+        None,
+    )
+    .expect("a reload must not invalidate an outstanding binding");
+    assert_eq!(bound.host, pinned.host);
+    assert_eq!(bound.port, pinned.port);
+}
+
+#[test]
 fn malformed_and_oversized_tokens_are_rejected_at_the_boundary() {
     let pinned = target("10.1.0.10", 8080);
     let targets = vec![pinned.clone(), target("10.1.0.11", 8080)];

@@ -2036,7 +2036,7 @@ static STICKY_SESSION_TOKEN_KEY: LazyLock<crate::fips::approved::HmacSha256Key> 
             .expect("HMAC-SHA-256 accepts a 32-byte key")
     });
 
-/// A sticky-session token is a lowercase hex SHA-256 digest: 64 characters.
+/// A sticky-session token is a lowercase hex HMAC-SHA-256 tag: 64 characters.
 pub const STICKY_SESSION_TOKEN_LEN: usize = 64;
 
 /// Derive the opaque sticky-session token that binds a client to one concrete

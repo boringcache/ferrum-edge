@@ -37037,7 +37037,7 @@ fn buffered_collect_retain_failure(
 /// Build a `Set-Cookie` header value for sticky session cookie injection.
 ///
 /// The cookie value is the opaque backend-bound token from
-/// [`crate::load_balancer::sticky_session_token`]: a SHA-256 digest over the
+/// [`crate::load_balancer::sticky_session_token`]: an HMAC-SHA-256 tag over the
 /// namespace-qualified upstream identity and the selected target's full sticky
 /// identity (dial `host:port`, per-port policy key, tags, locality, and path
 /// override), never the address itself. It therefore leaks no backend topology,
@@ -37063,8 +37063,21 @@ fn buffered_collect_retain_failure(
 /// backend that did not produce its response, and every retry-capable path can
 /// rotate off the target selection bound.
 ///
-/// The derivation is unkeyed and deterministic, so affinity survives a gateway
-/// restart and is identical across replicas of a horizontally scaled gateway.
+/// The derivation is keyed under a process-local authentication key, so a
+/// client cannot forge a binding from predictable route and endpoint metadata.
+/// Affinity survives a config reload; a gateway restart, or a request that
+/// reaches another replica, treats the cookie as stale and transparently
+/// re-pins the client through ordinary selection.
+///
+/// Minting and resolution therefore agree by construction rather than by
+/// coincidence: this site and the per-upstream binding index
+/// (`LoadBalancer::sticky_token_index`) both derive through the single public
+/// [`crate::load_balancer::sticky_session_token`], over the same
+/// namespace-qualified runtime key and the same CONFIGURED target identity.
+/// Deriving a token here from anything else — a per-request dial clone, or an
+/// upstream id that is not namespace-qualified — would produce a value absent
+/// from the index, so every returning client would miss and be re-issued a
+/// fresh cookie on every response.
 pub(crate) fn build_sticky_cookie_header(
     cookie_name: &str,
     namespace: &str,
