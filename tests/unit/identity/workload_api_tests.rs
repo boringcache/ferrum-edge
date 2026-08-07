@@ -911,10 +911,10 @@ async fn fetch_x509svid_rejects_missing_workload_metadata_before_attestation() {
 
 #[tokio::test]
 async fn jwt_svid_rpcs_return_unimplemented_fail_closed() {
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
     use ferrum_edge::identity::workload_api::proto::{
         JwtBundlesRequest, JwtsvidRequest, ValidateJwtsvidRequest,
     };
-    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
     use tonic::Code;
 
     let trust_domain = TrustDomain::new("td.test").unwrap();
@@ -950,9 +950,7 @@ async fn jwt_svid_rpcs_return_unimplemented_fail_closed() {
         .fetch_jwt_bundles(workload_request(JwtBundlesRequest {}))
         .await
     {
-        Ok(_) => panic!(
-            "FetchJWTBundles must return UNIMPLEMENTED, not an empty bundle stream"
-        ),
+        Ok(_) => panic!("FetchJWTBundles must return UNIMPLEMENTED, not an empty bundle stream"),
         Err(err) => err,
     };
     assert_eq!(bundles_err.code(), Code::Unimplemented);
@@ -982,10 +980,10 @@ async fn jwt_svid_rpcs_return_unimplemented_fail_closed() {
 
 #[tokio::test]
 async fn jwt_svid_rpcs_reject_missing_workload_metadata_before_unimplemented() {
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
     use ferrum_edge::identity::workload_api::proto::{
         JwtBundlesRequest, JwtsvidRequest, ValidateJwtsvidRequest,
     };
-    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
     use tonic::Code;
 
     let trust_domain = TrustDomain::new("td.test").unwrap();
