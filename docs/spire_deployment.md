@@ -409,6 +409,17 @@ via plugin HTTP, independent of SPIRE. There is therefore no JWT-SVID
 registration entry you need to add for Ferrum, and `default_jwt_svid_ttl` on
 the Server is irrelevant for Ferrum's identity consumption today.
 
+When Ferrum itself exposes the in-process SPIFFE Workload API server
+(`src/identity/workload_api/server.rs`), JWT-SVID RPCs are **not** available
+yet ([#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617)):
+`FetchJWTSVID`, `ValidateJWTSVID`, and `FetchJWTBundles` all return gRPC
+`UNIMPLEMENTED`. Do not deploy workloads that depend on JWT-SVID mint,
+validate, or JWT trust-bundle streaming against Ferrum's Workload API.
+`FetchJWTBundles` deliberately does **not** stream an empty `bundles` map —
+SPIFFE Workload API §6.2.2 requires at least the local trust-domain JWT
+bundle, and an empty map would be misread as "zero trusted JWT authorities"
+rather than "unsupported".
+
 If you also issue JWT-SVIDs to non-Ferrum workloads in the same SPIRE
 deployment, that is unaffected.
 

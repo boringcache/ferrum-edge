@@ -50,6 +50,7 @@ Current mesh HBONE/DNS perf status lives in
 | Live OIDC / OAuth2 introspection coverage | [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333) | |
 | NodeWaypoint observability + promotion gates | [#3334](https://github.com/ferrum-edge/ferrum-edge/issues/3334) | |
 | Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Replaces #3335 as the sole tracker |
+| SPIFFE Workload API JWT-SVID mint/validate | [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617) | X.509-SVID path complete; JWT RPCs (`FetchJWTSVID` / `FetchJWTBundles` / `ValidateJWTSVID`) return `UNIMPLEMENTED` fail-closed — empty JWT bundle streams are not conformant |
 
 ## Documented deferrals without a dedicated issue (in-place docs)
 
@@ -64,7 +65,6 @@ Current mesh HBONE/DNS perf status lives in
 
 | Item | Notes |
 |---|---|
-| SPIFFE Workload API JWT-SVID mint/validate | X.509-SVID path complete; JWT-SVID still deferred in `src/identity/workload_api/` |
 | Admin CRUD refactor (retired `REFACTORING_PLAN.md` remainder) | Discretionary; fold into future admin-surface work |
 
 ## Explicit non-goals (unchanged)

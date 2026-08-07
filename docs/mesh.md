@@ -45,6 +45,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
 - [Gateway-to-Mesh Bridge](#gateway-to-mesh-bridge)
 - [Mesh Identity](#mesh-identity)
   - [SPIRE Agent CA](#spire-agent-ca)
+  - [Workload API JWT-SVID (deferred)](#workload-api-jwt-svid-deferred)
   - [Internal Dev CA and Production Guardrails](#internal-dev-ca-and-production-guardrails)
 - [Node Agent Mode](#node-agent-mode)
 - [VirtualService Translation](#virtualservice-translation)
@@ -2749,6 +2750,10 @@ Identity baggage from the client request is stripped from tunneled inner HBONE r
 | `FERRUM_MESH_WORKLOAD_SPIFFE_ID` | none | Required when `spire_agent` or `internal` is the selected identity source; identifies the local workload SVID to fetch or mint |
 
 The SPIRE backend is the recommended production path for mesh identity. `internal` is intended for development and testing only -- it generates a self-signed root CA at startup with no external trust anchor. Explicit file-based `FERRUM_GATEWAY_SVID_*` material takes precedence over `FERRUM_MESH_CA_BACKEND`; when both are configured Ferrum uses the file SVID and does not start automatic CA-backed issuance.
+
+### Workload API JWT-SVID (deferred)
+
+Ferrum's supported mesh identity surface is **X.509-SVID** (mTLS / HBONE peer verification). When Ferrum acts as a SPIFFE Workload API server for local workloads, JWT-SVID mint (`FetchJWTSVID`), validation (`ValidateJWTSVID`), and JWT trust-bundle streaming (`FetchJWTBundles`) return gRPC `UNIMPLEMENTED` fail-closed ([#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617)). Operators must not point JWT-SVID-dependent workloads at Ferrum's Workload API until that tracker closes. Mesh `RequestAuthentication` / `jwks_auth` continues to validate application JWTs via its own JWKS fetch and is unrelated to Workload API JWT-SVIDs. See [docs/spire_deployment.md](spire_deployment.md#jwt-svids).
 
 ### Internal Dev CA and Production Guardrails
 

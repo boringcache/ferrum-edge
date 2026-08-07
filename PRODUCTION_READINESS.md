@@ -33,7 +33,7 @@ review loop + full CI + orchestrator review on every PR) → merged.
 | PR-001 | Ambient live-gate row not firewall-proven | Medium (test integrity) | FIXED (PR #2105) |
 | PR-002 | Outbound mesh SPIFFE verification skipped CRLs (inbound-only asymmetry) | Medium (security) | FIXED (PR #2113, 3 codex rounds incl. live-reload slot + race guards) |
 | PR-003 | InternalCa CSR path lacked proof-of-possession | Low (hardening) | FIXED (PR #2114 — real PoP verification) |
-| PR-004 | SPIFFE Workload API JWT-SVID unimplemented (X.509 complete) | Low | STILL OPEN — historical register #2110; X.509-SVID path remains the supported surface |
+| PR-004 | SPIFFE Workload API JWT-SVID unimplemented (X.509 complete) | Low | STILL OPEN — live tracker [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617); X.509-SVID path remains the supported surface; JWT RPCs return `UNIMPLEMENTED` (including `FetchJWTBundles`, which must not stream an empty map) |
 | PR-005 | k8s controller Merge-Patch status writes (SSA TODO); naming-convention proxy-id | Low | FIXED (PR #2152) — intentional mixed strategy: resourceVersion-guarded RMW for Route `status.parents[]` (Gateway API list ownership), SSA + stable `fieldManager` for Gateway/GatewayClass conditions, plus typed proxy-id mapping. Not a blanket "convert everything to SSA" TODO. |
 | PR-006 | Stale "F3 §3.3 UDP not implemented" message | Low (accuracy) | FIXED (PR #2114) |
 | PR-007 | Log schema not applied to WsDisconnectLogEntry | Low | FIXED — `WsDisconnectLogEntry` implements `SchemaSerializable`; see `docs/log_schema.md` WebSocket disconnect family |
@@ -100,7 +100,7 @@ issue body alone.
 | Live OIDC / OAuth2 introspection coverage | #3333 | |
 | NodeWaypoint observability + promotion gates | #3334 | |
 | Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Repository-owned lifecycle inventory; closes #3335 |
-| SPIFFE Workload API JWT-SVID mint/validate | #2110 (historical) | X.509 complete; JWT-SVID still deferred in code |
+| SPIFFE Workload API JWT-SVID mint/validate | #3617 | X.509 complete; JWT RPCs return `UNIMPLEMENTED` fail-closed until mint/validate ships |
 | Admin CRUD refactor (retired plan remainder) | #2110 (historical) | Discretionary; fold into future admin-surface work |
 
 **Implemented since the epic (do not re-open from stale checklists):** remote-discovery
