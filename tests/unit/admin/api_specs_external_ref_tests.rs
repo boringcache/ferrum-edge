@@ -1341,6 +1341,15 @@ async fn hostname_redirect_hops_are_allowlisted_resolved_and_pinned() {
         }
     });
     let mut process = process_enabled(None);
+    // This is a success-path DNS/redirect/pinning test, not a timeout test.
+    // The shared helper's 100/200 ms budgets intentionally make negative
+    // fixtures fast, but coverage instrumentation can consume a complete hop
+    // budget while the blocking loader or localhost resolver is merely waiting
+    // to be scheduled. Keep the live path bounded while giving instrumented CI
+    // enough headroom; the dedicated deadline tests below retain tight budgets.
+    process.connect_timeout = Duration::from_secs(2);
+    process.request_timeout = Duration::from_secs(5);
+    process.total_timeout = Duration::from_secs(10);
     process.allow_http_origins = vec![
         format!("http://127.0.0.1:{redirect_port}"),
         format!("http://localhost:{destination_port}"),

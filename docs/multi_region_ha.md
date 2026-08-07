@@ -420,13 +420,21 @@ FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET
 
 ## Operational Notes
 
+### Failover writes and admin audit
+
+`FERRUM_DB_FAILOVER_ALLOW_WRITES=true` is an explicit opt-in for config-database mutations while the active pool is on a failover URL. Use it only when you assert synchronously replicated multi-primary replication, and treat it as **single-replica-only**: each gateway process arms its own process-local primary-failback fence that is not coordinated across replicas. Shipped default is `false` (fail closed on failover writes).
+
+For regulated deployments, Ferrum recommends (but does not ship by default) `FERRUM_ADMIN_AUDIT_ENABLED=true`, `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed`, and a persistent non-empty `FERRUM_ADMIN_AUDIT_SPOOL_DIR`. Shipped defaults are audit disabled with `fail_open` unavailable policy. See [configuration.md](configuration.md).
+
 ### Monitoring
 
-- Each CP's `/health` endpoint shows `db_available` status — monitor this to detect DB connectivity issues
-- Authenticated `/health` reports `database.failover_topology` and
+Observability endpoints are tiered. Unauthenticated `/health` and `/status` return only `status` and `ready`; unauthenticated `/overload` returns only `{"level": ...}`. Detailed fields require observability auth (admin JWT, `FERRUM_METRICS_BEARER_TOKEN`, or `FERRUM_METRICS_ALLOWED_CIDRS`).
+
+- Each CP's authenticated `/health` detail shows database connectivity and pool stats — monitor these to detect DB issues
+- Authenticated `/health` also reports `database.failover_topology` and
   `admin_writes_enabled` while on a failover URL (see [admin_api.md](admin_api.md))
-- Each DP's `/health` endpoint shows `cached_config` status with `loaded_at` timestamp — stale timestamps indicate CP disconnection
-- Each CP's `/overload` endpoint shows resource pressure — useful for capacity planning
+- Each DP's authenticated `/health` detail shows `cached_config` with `loaded_at` — stale timestamps indicate CP disconnection
+- Authenticated `/overload` detail shows resource pressure — useful for capacity planning
 
 ### Scaling CPs
 
