@@ -3636,12 +3636,17 @@ fn route_materialized_parent_ref_keys_for_namespace(
     refs
 }
 
-fn l4_route_listener_ports_for_namespace(
+fn l4_route_listener_bindings_for_namespace(
     object: &K8sObject,
     acc: &K8sAccumulator,
     namespace_filter: Option<&str>,
-) -> Vec<u16> {
-    let mut ports = Vec::new();
+) -> Vec<(u16, Vec<String>)> {
+    let requested_hostnames: Vec<String> = string_array(&object.spec, "hostnames")
+        .into_iter()
+        .map(|hostname| normalize_gateway_hostname(&hostname))
+        .collect();
+    let route_hostnames = hostnames_for_listener_intersection(&requested_hostnames);
+    let mut bindings: BTreeMap<u16, Vec<String>> = BTreeMap::new();
     for parent_ref in object
         .spec
         .get("parentRefs")
@@ -3665,13 +3670,24 @@ fn l4_route_listener_ports_for_namespace(
                 && route_listener_policy_materializes_route(acc, object, parent_namespace, policy)
                 && let Some(port) = policy.port.and_then(|port| u16::try_from(port).ok())
             {
-                ports.push(port);
+                let hosts = bindings.entry(port).or_default();
+                if object.kind == "TLSRoute" {
+                    let listener_hostname = policy.hostname.as_deref().unwrap_or("*");
+                    hosts.extend(route_hostnames.iter().filter_map(|route_hostname| {
+                        intersect_hostnames(route_hostname, listener_hostname)
+                    }));
+                }
             }
         }
     }
-    ports.sort();
-    ports.dedup();
-    ports
+    bindings
+        .into_iter()
+        .filter_map(|(port, mut hosts)| {
+            hosts.sort();
+            hosts.dedup();
+            (object.kind != "TLSRoute" || !hosts.is_empty()).then_some((port, hosts))
+        })
+        .collect()
 }
 
 fn parse_k8s_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -5598,14 +5614,14 @@ fn l4_route_proxies(
         acc,
         Some(&object.metadata.namespace),
     );
-    let materialized_listener_ports =
-        l4_route_listener_ports_for_namespace(object, acc, Some(&object.metadata.namespace));
+    let materialized_listener_bindings =
+        l4_route_listener_bindings_for_namespace(object, acc, Some(&object.metadata.namespace));
     let has_gateway_parent_ref = object
         .spec
         .get("parentRefs")
         .and_then(Value::as_array)
         .is_some_and(|parent_refs| parent_refs.iter().any(parent_ref_is_gateway));
-    if has_gateway_parent_ref && materialized_listener_ports.is_empty() {
+    if has_gateway_parent_ref && materialized_listener_bindings.is_empty() {
         // A parented L4 route has no standalone/default listener semantics.
         // Falling back to backend_port here would expose traffic after its
         // named Gateway listener was rejected or left unmaterialized.
@@ -5640,13 +5656,13 @@ fn l4_route_proxies(
             "TCPRoute/TLSRoute backendRefs[].port",
         )?;
 
-        let listen_ports = if materialized_listener_ports.is_empty() {
-            vec![backend_port]
+        let listen_bindings = if materialized_listener_bindings.is_empty() {
+            vec![(backend_port, string_array(&object.spec, "hostnames"))]
         } else {
-            materialized_listener_ports.clone()
+            materialized_listener_bindings.clone()
         };
-        for (listen_port_index, listen_port) in listen_ports.iter().copied().enumerate() {
-            let suffix = if listen_ports.len() == 1 {
+        for (listen_port_index, (listen_port, hosts)) in listen_bindings.iter().enumerate() {
+            let suffix = if listen_bindings.len() == 1 {
                 rule_index.to_string()
             } else {
                 format!("{rule_index}-{listen_port_index}")
@@ -5659,7 +5675,7 @@ fn l4_route_proxies(
                     &suffix,
                 ),
                 namespace: object.metadata.namespace.clone(),
-                hosts: string_array(&object.spec, "hostnames"),
+                hosts: hosts.clone(),
                 listen_path: None,
                 strip_listen_path: false,
                 preserve_host_header: false,
@@ -5671,7 +5687,7 @@ fn l4_route_proxies(
                 backend_port,
                 upstream_id: None,
                 backend_scheme: scheme,
-                listen_port: Some(listen_port),
+                listen_port: Some(*listen_port),
                 retry: None,
                 backend_read_timeout_ms: None,
             }));
@@ -11398,6 +11414,71 @@ mod tests {
         assert!(
             !proxy.frontend_tls,
             "passthrough and frontend_tls are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn tls_route_is_bounded_by_gateway_listener_hostname() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls",
+                    "hostname": "allowed.example.com",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Passthrough"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TLSRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "tls"}],
+                "hostnames": ["evil.example.com"],
+                "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
+            }),
+        );
+
+        let result =
+            translate_k8s_objects(&[gateway, route], options()).expect("translation succeeds");
+
+        assert!(result.config.proxies.is_empty());
+    }
+
+    #[test]
+    fn tls_route_without_hostnames_inherits_gateway_listener_hostname() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls",
+                    "hostname": "allowed.example.com",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Passthrough"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TLSRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "tls"}],
+                "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
+            }),
+        );
+
+        let result =
+            translate_k8s_objects(&[gateway, route], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].hosts,
+            vec!["allowed.example.com".to_string()]
         );
     }
 
