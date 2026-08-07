@@ -16451,10 +16451,15 @@ components:
 
         Auto-injected by mesh mode on every applicable topology; reserved
         plugin id `__mesh_authz`. PolicyScope filtering (`MeshWide` /
-        `Namespace` / `WorkloadSelector`) is applied at construction time
-        from the slice-embedded workload identity, except in node-waypoint
-        topology where the filter runs per-request against the pod-scoped
-        cache attached to `RequestContext`.
+        `Namespace` / `WorkloadSelector` / `TargetRefs`) is applied at
+        construction time from the slice-embedded workload identity, except in
+        node-waypoint topology where the filter runs per-request against the
+        pod-scoped cache attached to `RequestContext`. `TargetRefs`
+        (AuthorizationPolicy `spec.targetRefs`) is waypoint-only and is
+        additionally re-checked per request against the exact destination
+        Service and waypoint Gateway/GatewayClass identity — construction-time
+        retention is OR over the attachment list and never widens a targeted
+        policy onto another destination. See `docs/mesh.md`.
       properties:
         mesh_slice:
           type: object

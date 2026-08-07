@@ -1527,6 +1527,7 @@ fn scoped_policy_label(policy: &MeshPolicy) -> String {
         PolicyScope::MeshWide => "mesh-wide",
         PolicyScope::Namespace { .. } => "namespace",
         PolicyScope::WorkloadSelector { .. } => "selector",
+        PolicyScope::TargetRefs { .. } => "targetRefs",
     };
     format!("{}/{} ({scope})", policy.namespace, policy.name)
 }
@@ -10082,7 +10083,7 @@ fn merge_applicable_telemetry(mesh_slice: &MeshSlice) -> MeshTelemetryConfig {
             let specificity = match &t.scope {
                 PolicyScope::MeshWide => 0,
                 PolicyScope::Namespace { .. } => 1,
-                PolicyScope::WorkloadSelector { .. } => 2,
+                PolicyScope::WorkloadSelector { .. } | PolicyScope::TargetRefs { .. } => 2,
             };
             (
                 specificity,
@@ -23349,6 +23350,7 @@ mod tests {
         let mesh_slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
+            waypoint_gateway_class: None,
             istio_root_namespace: "istio-system".to_string(),
             workload_spiffe_id: None,
             waypoint_name: None,
