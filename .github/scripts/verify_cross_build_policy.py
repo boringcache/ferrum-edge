@@ -16155,6 +16155,29 @@ pre_build = []
         failures.append(
             "newly reaching an existing trusted-build Cross surface was allowed"
         )
+    # The attack this narrowing could otherwise enable: drop the reachability
+    # edge and edit the file in the SAME commit, so the proposed revision alone
+    # says the file is out of scope. `build_reachable` unions both revisions
+    # precisely so the merge base still vouches for it.
+    if not compare_pr_automation_collection(
+        scoped_workflows,
+        {"ci.yml": protected_build_workflow_without_script, "lab.yml": lab_only_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        {
+            "scripts/build_arm64.sh": cross_sensitive_script,
+            "scripts/lab.sh": benign_lab_script,
+        },
+        {
+            "scripts/build_arm64.sh": cross_sensitive_script_edit,
+            "scripts/lab.sh": benign_lab_script,
+        },
+        "self-test build-scoped automation",
+    ):
+        failures.append(
+            "dropping the trusted-build reachability edge released the file "
+            "for editing in the same commit"
+        )
     # Scope unknown (no protected job on either revision) must freeze everything,
     # exactly as before this narrowing existed.
     if not compare_pr_automation_collection(
