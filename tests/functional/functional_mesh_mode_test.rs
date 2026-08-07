@@ -9980,6 +9980,9 @@ fn sidecar_ingress_mesh_document(
         // the decoupled path (F6 §6.2), not through egress narrowing.
         egress_inherits_defaults: true,
         egress: Vec::new(),
+        // No explicit `spec.outboundTrafficPolicy`, so this Sidecar inherits the
+        // mesh-wide policy (issue #3262).
+        outbound_traffic_policy: None,
         ingress_declared: true,
         ingress: ingress
             .iter()
